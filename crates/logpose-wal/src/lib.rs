@@ -71,12 +71,15 @@ impl WalWriter {
             LogPoseError::Message(format!("failed to serialize WAL record: {error}"))
         })?;
         let checksum = hash(&payload);
+        let mut frame =
+            Vec::with_capacity(FRAME_HEADER_BYTES + payload.len() + FRAME_TRAILER_BYTES);
+        frame.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&checksum.to_le_bytes());
 
         self.file
-            .write_all(&WAL_MAGIC.to_le_bytes())
-            .and_then(|_| self.file.write_all(&(payload.len() as u64).to_le_bytes()))
-            .and_then(|_| self.file.write_all(&payload))
-            .and_then(|_| self.file.write_all(&checksum.to_le_bytes()))
+            .write_all(&frame)
             .map_err(|error| io_message("failed to append WAL frame", error))?;
         self.file
             .sync_data()

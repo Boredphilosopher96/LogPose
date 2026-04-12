@@ -1,6 +1,6 @@
 //! Metadata and collection catalog abstractions.
 
-use logpose_types::{CollectionId, DistanceMetric, RemoteBlobConfig, WriteOperation};
+use logpose_types::{CollectionId, DistanceMetric, LogPoseError, RemoteBlobConfig, WriteOperation};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -57,8 +57,69 @@ impl CollectionDescriptor {
         }
     }
 
+    /// Validate collection-level configuration values.
+    pub fn validate(&self) -> logpose_types::Result<()> {
+        if self.flush_threshold_ops == 0 {
+            return Err(LogPoseError::Message(
+                "flush_threshold_ops must be greater than 0".to_owned(),
+            ));
+        }
+        if self.flush_threshold_bytes == 0 {
+            return Err(LogPoseError::Message(
+                "flush_threshold_bytes must be greater than 0".to_owned(),
+            ));
+        }
+        if self.compaction_threshold_segments <= 1 {
+            return Err(LogPoseError::Message(
+                "compaction_threshold_segments must be greater than 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate whether an operation matches this collection's configured dimensions.
     pub fn validate_operation(&self, operation: &WriteOperation) -> logpose_types::Result<()> {
+        self.validate()?;
         operation.validate_dimensions(self.dimensions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_positive_maintenance_thresholds() {
+        let root = Path::new("/tmp/catalog-validation");
+
+        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        descriptor.flush_threshold_ops = 0;
+        assert!(
+            descriptor
+                .validate()
+                .expect_err("zero flush ops should fail")
+                .to_string()
+                .contains("flush_threshold_ops")
+        );
+
+        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        descriptor.flush_threshold_bytes = 0;
+        assert!(
+            descriptor
+                .validate()
+                .expect_err("zero flush bytes should fail")
+                .to_string()
+                .contains("flush_threshold_bytes")
+        );
+
+        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        descriptor.compaction_threshold_segments = 1;
+        assert!(
+            descriptor
+                .validate()
+                .expect_err("compaction threshold of one should fail")
+                .to_string()
+                .contains("compaction_threshold_segments")
+        );
     }
 }
