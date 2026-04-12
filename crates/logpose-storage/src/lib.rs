@@ -206,6 +206,7 @@ impl LocalStorageEngine {
         manifest_generation: Option<u64>,
     ) -> Result<CollectionState> {
         let descriptor = self.find_collection_descriptor(collection_name)?;
+        self.recover_persisted_maintenance(&descriptor)?;
         let manifest = self.load_manifest(&descriptor, manifest_generation)?;
         let delta = replay_dir(descriptor.root_path.join("wal"))?
             .into_iter()
@@ -248,6 +249,7 @@ impl LocalStorageEngine {
 
             let descriptor = read_json::<CollectionDescriptor>(&path)?;
             if descriptor.name == name {
+                descriptor.validate()?;
                 return Ok(descriptor);
             }
         }
@@ -269,6 +271,12 @@ impl LocalStorageEngine {
 
         let path = Self::manifest_file_path(descriptor, generation);
         if !path.exists() {
+            if generation_override.is_some() && generation != 0 {
+                return Err(LogPoseError::Message(format!(
+                    "invalid snapshot: manifest generation {} does not exist",
+                    generation
+                )));
+            }
             return Ok(Manifest::empty(generation));
         }
         read_json(&path)
@@ -397,6 +405,48 @@ impl LocalStorageEngine {
         Ok(())
     }
 
+    fn recover_persisted_maintenance(&self, descriptor: &CollectionDescriptor) -> Result<()> {
+        let key = descriptor.root_path.clone();
+        {
+            let coordinator = maintenance_coordinator()
+                .lock()
+                .expect("maintenance coordinator lock should not be poisoned");
+            if coordinator.contains_key(&key) {
+                return Ok(());
+            }
+        }
+
+        let status_lock = maintenance_status_lock(&descriptor.root_path);
+        let operations = {
+            let _guard = status_lock
+                .lock()
+                .expect("maintenance status lock should not be poisoned");
+            let mut status = self.load_maintenance_status(descriptor)?;
+            let mut needs_persist = false;
+            if let Some(in_progress) = status.in_progress.take() {
+                if !status.pending.iter().any(|pending| pending == &in_progress) {
+                    status.pending.insert(0, in_progress);
+                }
+                needs_persist = true;
+            }
+            let operations = status
+                .pending
+                .iter()
+                .filter_map(|label| MaintenanceOperation::from_str(label))
+                .collect::<Vec<_>>();
+            if needs_persist {
+                self.persist_maintenance_status(descriptor, &status)?;
+            }
+            operations
+        };
+
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        self.enqueue_maintenance(descriptor, operations)
+    }
+
     fn run_maintenance_worker(self, collection_name: String, coordinator_key: PathBuf) {
         loop {
             let operation = {
@@ -432,14 +482,23 @@ impl LocalStorageEngine {
 
             let result = self.perform_maintenance_operation(&collection_name, operation);
 
-            let schedule_compaction = result.as_ref().is_ok()
-                && matches!(operation, MaintenanceOperation::Flush)
-                && self
-                    .load_collection_state(&collection_name, None)
+            let follow_up_operations = if result.is_ok() {
+                self.load_collection_state(&collection_name, None)
                     .ok()
-                    .is_some_and(|state| {
-                        self.should_compact(&state.descriptor, state.manifest.segments.len())
-                    });
+                    .map(|state| {
+                        let mut operations = Vec::new();
+                        if self.should_flush(&state.descriptor, &state.delta) {
+                            operations.push(MaintenanceOperation::Flush);
+                        }
+                        if self.should_compact(&state.descriptor, state.manifest.segments.len()) {
+                            operations.push(MaintenanceOperation::Compact);
+                        }
+                        operations
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             if let Ok(_guard) = status_lock.lock()
                 && let Ok(mut status) = self.load_maintenance_status(&descriptor)
@@ -457,8 +516,8 @@ impl LocalStorageEngine {
                 let _ = self.persist_maintenance_status(&descriptor, &status);
             }
 
-            if schedule_compaction {
-                let _ = self.enqueue_maintenance(&descriptor, vec![MaintenanceOperation::Compact]);
+            if !follow_up_operations.is_empty() {
+                let _ = self.enqueue_maintenance(&descriptor, follow_up_operations);
             }
         }
     }
@@ -811,7 +870,9 @@ impl StorageEngine for LocalStorageEngine {
     }
 
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        self.find_collection_descriptor(name)
+        let descriptor = self.find_collection_descriptor(name)?;
+        self.recover_persisted_maintenance(&descriptor)?;
+        Ok(descriptor)
     }
 
     async fn write(
@@ -914,10 +975,7 @@ impl StorageEngine for LocalStorageEngine {
             collection_name,
             snapshot.as_ref().map(|value| value.manifest_generation),
         )?;
-        let effective_snapshot = snapshot.unwrap_or(Snapshot {
-            manifest_generation: state.manifest.generation,
-            visible_seq_no: state.visible_seq_no(),
-        });
+        let effective_snapshot = resolve_snapshot(&state, snapshot)?;
         let resolved =
             resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
         let mut live_record_count = 0usize;
@@ -1020,10 +1078,7 @@ impl LocalStorageEngine {
             collection_name,
             snapshot.as_ref().map(|value| value.manifest_generation),
         )?;
-        let snapshot = snapshot.unwrap_or(Snapshot {
-            manifest_generation: state.manifest.generation,
-            visible_seq_no: state.visible_seq_no(),
-        });
+        let snapshot = resolve_snapshot(&state, snapshot)?;
 
         let resolved = resolve_latest_state_selected(
             &state,
@@ -1063,6 +1118,44 @@ impl MaintenanceOperation {
             Self::Compact => "compact",
         }
     }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "flush" => Some(Self::Flush),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
+fn resolve_snapshot(state: &CollectionState, snapshot: Option<Snapshot>) -> Result<Snapshot> {
+    let snapshot = snapshot.unwrap_or(Snapshot {
+        manifest_generation: state.manifest.generation,
+        visible_seq_no: state.visible_seq_no(),
+    });
+
+    if snapshot.manifest_generation != state.manifest.generation {
+        return Err(LogPoseError::Message(format!(
+            "invalid snapshot: manifest generation {} is unavailable",
+            snapshot.manifest_generation
+        )));
+    }
+
+    let max_visible = state.visible_seq_no();
+    if snapshot.visible_seq_no > max_visible {
+        return Err(LogPoseError::Message(format!(
+            "invalid snapshot: visible sequence {} exceeds maximum {} for manifest generation {}",
+            snapshot.visible_seq_no, max_visible, snapshot.manifest_generation
+        )));
+    }
+    if snapshot.visible_seq_no < state.manifest.checkpoint_seq_no {
+        return Err(LogPoseError::Message(format!(
+            "invalid snapshot: visible sequence {} is below checkpoint {} for manifest generation {}",
+            snapshot.visible_seq_no, state.manifest.checkpoint_seq_no, snapshot.manifest_generation
+        )));
+    }
+
+    Ok(snapshot)
 }
 
 #[derive(Default)]

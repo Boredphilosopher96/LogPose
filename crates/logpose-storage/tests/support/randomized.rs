@@ -6,7 +6,11 @@ use logpose_types::{
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 #[path = "fs.rs"]
 mod fs_support;
@@ -214,6 +218,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
         .unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))
         });
+    disable_background_maintenance(&descriptor.root_path);
     model.register_collection(descriptor.collection_id.clone(), descriptor.metric);
     assert_stats_match(&engine, &model, seed, &trace).await;
     assert_current_scan_matches(&engine, &model, seed, &trace).await;
@@ -776,6 +781,22 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         predicate: None,
         explain: logpose_query::ExplainMode::None,
     }
+}
+
+fn disable_background_maintenance(root_path: &Path) {
+    let descriptor_path = root_path.join("descriptor.json");
+    let mut descriptor = serde_json::from_slice::<Value>(
+        &fs::read(&descriptor_path).expect("descriptor should exist"),
+    )
+    .expect("descriptor should parse");
+    descriptor["flush_threshold_ops"] = json!(usize::MAX);
+    descriptor["flush_threshold_bytes"] = json!(usize::MAX);
+    descriptor["compaction_threshold_segments"] = json!(usize::MAX);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor).expect("descriptor should serialize"),
+    )
+    .expect("descriptor should be updated");
 }
 
 fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRequest {
