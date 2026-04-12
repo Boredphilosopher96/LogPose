@@ -441,7 +441,10 @@ fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue>
     }
 }
 
-fn read_jsonl_put_batches(path: &Path, max_batch_bytes: usize) -> anyhow::Result<Vec<Vec<WriteOperation>>> {
+fn read_jsonl_put_batches(
+    path: &Path,
+    max_batch_bytes: usize,
+) -> anyhow::Result<Vec<Vec<WriteOperation>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open JSONL input '{}'", path.display()))?;
     let reader = BufReader::new(file);
