@@ -2,6 +2,8 @@
 
 Contributing guidance is defined in the root `CONTRIBUTING.md`.
 
+The canonical testing doctrine for the repository lives in [Testing](./testing.md). Use that chapter as the source of truth for harness design, test placement, and the long-term TigerBeetle-inspired layering strategy.
+
 Before opening a pull request, run:
 
 ```bash

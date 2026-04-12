@@ -64,6 +64,8 @@ mdbook build docs
 
 Primary guides live in `docs/src/` and cover architecture, setup, operations, APIs, security, and contribution workflows.
 
+The repository testing doctrine, including the TigerBeetle-inspired harness strategy and CI layering, is documented in `docs/src/testing.md`.
+
 ## Developer Workflow
 
 - `cargo fmt --all --check`

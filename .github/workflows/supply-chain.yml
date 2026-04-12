@@ -1,0 +1,31 @@
+---
+name: Supply Chain
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo deny
+        run: cargo install cargo-deny --locked && cargo deny check
+
+      - name: Cargo audit
+        run: cargo install cargo-audit --locked && cargo audit
+
+      - name: Cargo machete
+        run: cargo install cargo-machete --locked && cargo machete

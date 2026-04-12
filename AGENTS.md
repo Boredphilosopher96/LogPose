@@ -31,3 +31,8 @@ Keep commits small and imperative. Existing history favors short subjects like `
 ## Security & Configuration Tips
 
 Do not commit generated secrets, local state, or ignored planning material. Keep configuration changes explicit and update `docs/src/`, `proto/`, or `openapi/` when public behavior or contracts change.
+
+## Agent workflow rules
+
+Always prefer using subagents and using multiple parallel agents as much as possible. Especially for exploration and discovery.
+Even when implementing plans, parallel implementation using subagents if possible

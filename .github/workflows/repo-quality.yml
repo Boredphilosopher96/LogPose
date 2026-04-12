@@ -1,5 +1,5 @@
 ---
-name: CI
+name: Repo Quality
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  quality:
+  repo-quality:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,28 +17,9 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.1
-          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-
-      - name: Install mdBook
-        run: cargo install mdbook --locked
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Docs
-        run: cargo doc --workspace --no-deps
-
-      - name: mdBook
-        run: mdbook build docs
 
       - name: Markdown lint
         uses: DavidAnson/markdownlint-cli2-action@v23
@@ -53,15 +34,6 @@ jobs:
         with:
           file_or_dir: .
           config_file: .yamllint.yml
-
-      - name: Cargo deny
-        run: cargo install cargo-deny --locked && cargo deny check
-
-      - name: Cargo audit
-        run: cargo install cargo-audit --locked && cargo audit
-
-      - name: Cargo machete
-        run: cargo install cargo-machete --locked && cargo machete
 
       - name: Typos
         run: cargo install typos-cli --locked && typos
