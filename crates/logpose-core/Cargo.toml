@@ -10,6 +10,6 @@ workspace = true
 
 [dependencies]
 logpose-config = { path = "../logpose-config" }
+logpose-service = { path = "../logpose-service" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
-

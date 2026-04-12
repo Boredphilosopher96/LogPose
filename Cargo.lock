@@ -572,10 +572,18 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "logpose-api-grpc"
 version = "0.1.0"
 dependencies = [
+ "logpose-catalog",
+ "logpose-config",
  "logpose-core",
+ "logpose-query",
+ "logpose-service",
+ "logpose-storage",
+ "logpose-types",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "serde_json",
+ "tokio",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -588,9 +596,16 @@ name = "logpose-api-rest"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "http-body-util",
+ "logpose-catalog",
  "logpose-config",
  "logpose-core",
+ "logpose-query",
+ "logpose-service",
+ "logpose-storage",
+ "logpose-types",
  "serde",
+ "serde_json",
  "tokio",
  "tower",
  "tower-http",
@@ -645,6 +660,7 @@ name = "logpose-core"
 version = "0.1.0"
 dependencies = [
  "logpose-config",
+ "logpose-service",
  "logpose-types",
  "serde",
 ]
@@ -679,6 +695,28 @@ dependencies = [
  "logpose-telemetry",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "logpose-service"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http-body-util",
+ "logpose-api-grpc",
+ "logpose-api-rest",
+ "logpose-catalog",
+ "logpose-config",
+ "logpose-core",
+ "logpose-query",
+ "logpose-storage",
+ "logpose-types",
+ "rand",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower",
 ]
 
 [[package]]

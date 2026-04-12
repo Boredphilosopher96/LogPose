@@ -3,7 +3,7 @@ openapi: 3.1.0
 info:
   title: LogPose REST API
   version: 0.1.0
-  description: Versioned REST surface for LogPose cluster metadata and control-plane operations.
+  description: Versioned REST surface for LogPose metadata, data workflows, and operator actions.
 servers:
   - url: http://127.0.0.1:8080
 paths:
@@ -21,3 +21,445 @@ paths:
       responses:
         "200":
           description: Metadata payload
+  /v1/collections:
+    post:
+      summary: Create a collection
+      operationId: createCollection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCollectionRequest"
+      responses:
+        "201":
+          description: Collection created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionDescriptor"
+        "409":
+          description: Collection already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}:
+    get:
+      summary: Get collection metadata
+      operationId: getCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Collection descriptor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionDescriptor"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/writes:
+    post:
+      summary: Write a mixed put/delete batch
+      operationId: writeCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WriteCollectionRequest"
+      responses:
+        "200":
+          description: Write committed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommitAck"
+        "400":
+          description: Invalid write request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/query:
+    post:
+      summary: Execute an exact vector query
+      operationId: queryCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryCollectionRequest"
+      responses:
+        "200":
+          description: Ranked exact query results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "400":
+          description: Invalid query request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/stats:
+    get:
+      summary: Get collection stats
+      operationId: getCollectionStats
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Collection stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionStats"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/flush:
+    post:
+      summary: Flush the mutable delta into a new segment
+      operationId: flushCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Flush snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/compact:
+    post:
+      summary: Compact immutable segments
+      operationId: compactCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Compaction snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/inspect:
+    get:
+      summary: Inspect collection storage state
+      operationId: inspectCollection
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: target
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [manifest, wal, segment]
+        - name: segment_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Inspection report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InspectReport"
+        "400":
+          description: Invalid inspect request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Collection or segment not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  schemas:
+    DistanceMetric:
+      type: string
+      enum: [cosine, dot, l2]
+    MetadataResponse:
+      type: object
+      required: [product, node_name, version, profile]
+      properties:
+        product:
+          type: string
+        node_name:
+          type: string
+        version:
+          type: string
+        profile:
+          type: string
+    CreateCollectionRequest:
+      type: object
+      required: [name, dimensions, metric]
+      properties:
+        name:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+        metric:
+          $ref: "#/components/schemas/DistanceMetric"
+    CollectionDescriptor:
+      type: object
+      required:
+        - collection_id
+        - name
+        - dimensions
+        - metric
+        - root_path
+        - remote_blob
+        - flush_threshold_ops
+        - flush_threshold_bytes
+        - compaction_threshold_segments
+      properties:
+        collection_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        dimensions:
+          type: integer
+        metric:
+          $ref: "#/components/schemas/DistanceMetric"
+        root_path:
+          type: string
+        remote_blob:
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [endpoint, bucket, prefix]
+              properties:
+                endpoint:
+                  type: string
+                bucket:
+                  type: string
+                prefix:
+                  type: string
+        flush_threshold_ops:
+          type: integer
+        flush_threshold_bytes:
+          type: integer
+        compaction_threshold_segments:
+          type: integer
+    PutOperation:
+      type: object
+      required: [op, id, vector, metadata]
+      properties:
+        op:
+          type: string
+          enum: [put]
+        id:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+        metadata:
+          type: object
+    DeleteOperation:
+      type: object
+      required: [op, id]
+      properties:
+        op:
+          type: string
+          enum: [delete]
+        id:
+          type: string
+    WriteOperation:
+      oneOf:
+        - $ref: "#/components/schemas/PutOperation"
+        - $ref: "#/components/schemas/DeleteOperation"
+    WriteCollectionRequest:
+      type: object
+      required: [operations]
+      properties:
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/WriteOperation"
+    CommitAck:
+      type: object
+      required: [last_seq_no, applied_ops]
+      properties:
+        last_seq_no:
+          type: integer
+        applied_ops:
+          type: integer
+    Snapshot:
+      type: object
+      required: [manifest_generation, visible_seq_no]
+      properties:
+        manifest_generation:
+          type: integer
+        visible_seq_no:
+          type: integer
+    QueryFilterValue:
+      oneOf:
+        - type: string
+        - type: number
+        - type: boolean
+        - type: "null"
+    QueryCollectionRequest:
+      type: object
+      required: [vector, top_k]
+      properties:
+        vector:
+          type: array
+          items:
+            type: number
+        top_k:
+          type: integer
+          minimum: 1
+        snapshot:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Snapshot"
+        filters:
+          type: object
+          description: Top-level AND-only equality filters over scalar metadata values.
+          additionalProperties:
+            $ref: "#/components/schemas/QueryFilterValue"
+    QueryMatch:
+      type: object
+      required: [id, value, metadata]
+      properties:
+        id:
+          type: string
+        value:
+          type: number
+        metadata:
+          nullable: true
+    QueryResponse:
+      type: object
+      required: [metric, top_k, returned, snapshot, matches]
+      properties:
+        metric:
+          $ref: "#/components/schemas/DistanceMetric"
+        top_k:
+          type: integer
+        returned:
+          type: integer
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+        matches:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryMatch"
+    CollectionStats:
+      type: object
+      required:
+        - collection_id
+        - collection_name
+        - manifest_generation
+        - visible_seq_no
+        - mutable_op_count
+        - segment_count
+        - live_record_count
+        - deleted_record_count
+      properties:
+        collection_id:
+          type: string
+          format: uuid
+        collection_name:
+          type: string
+        manifest_generation:
+          type: integer
+        visible_seq_no:
+          type: integer
+        mutable_op_count:
+          type: integer
+        segment_count:
+          type: integer
+        live_record_count:
+          type: integer
+        deleted_record_count:
+          type: integer
+    InspectReport:
+      type: object
+      required: [target, payload]
+      properties:
+        target:
+          type: string
+        payload:
+          nullable: true
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

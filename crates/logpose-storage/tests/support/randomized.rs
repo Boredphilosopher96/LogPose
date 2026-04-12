@@ -586,6 +586,7 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         vector,
         top_k: EXACT_QUERY_TOP_K,
         snapshot: None,
+        filters: Vec::new(),
     }
 }
 
@@ -595,6 +596,7 @@ fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRe
         vector,
         top_k: EXACT_QUERY_TOP_K,
         snapshot: Some(snapshot),
+        filters: Vec::new(),
     }
 }
 

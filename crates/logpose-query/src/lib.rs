@@ -24,6 +24,32 @@ pub struct QueryRequest {
     pub top_k: usize,
     /// Optional caller-selected read snapshot.
     pub snapshot: Option<Snapshot>,
+    /// Optional top-level metadata equality filters combined with AND semantics.
+    #[serde(default)]
+    pub filters: Vec<MetadataFilter>,
+}
+
+/// Top-level metadata equality filter for exact queries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetadataFilter {
+    /// Top-level metadata field to match.
+    pub field: String,
+    /// Required scalar value for the field.
+    pub value: ScalarMetadataValue,
+}
+
+/// Scalar metadata value supported by the first filtered-query slice.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScalarMetadataValue {
+    /// Match a string metadata value.
+    String(String),
+    /// Match a numeric metadata value.
+    Number(f64),
+    /// Match a boolean metadata value.
+    Bool(bool),
+    /// Match a null metadata value.
+    Null,
 }
 
 /// A single query match returned to callers.
@@ -111,11 +137,12 @@ where
     let records = storage
         .scan_exact(&request.collection_name, Some(snapshot.clone()))
         .await?;
+    let filtered = filter_records(records, &request.filters);
 
     let matches = rank_matches_with(
         descriptor.metric,
         &request.vector,
-        records,
+        filtered,
         request.top_k,
         |record, error| match error {
             QueryError::VectorDimensionMismatch { expected, actual } => {
@@ -135,6 +162,17 @@ where
         snapshot,
         matches,
     ))
+}
+
+/// Filter visible records using top-level metadata equality semantics.
+pub fn filter_records<I>(records: I, filters: &[MetadataFilter]) -> Vec<VisibleRecord>
+where
+    I: IntoIterator<Item = VisibleRecord>,
+{
+    records
+        .into_iter()
+        .filter(|record| record_matches_filters(record, filters))
+        .collect()
 }
 
 /// Compute the raw metric value for two vectors.
@@ -230,6 +268,33 @@ fn compare_matches(metric: DistanceMetric, left: &QueryMatch, right: &QueryMatch
     value_order.then_with(|| left.id.cmp(&right.id))
 }
 
+fn record_matches_filters(record: &VisibleRecord, filters: &[MetadataFilter]) -> bool {
+    filters
+        .iter()
+        .all(|filter| filter_matches_metadata(&record.metadata, filter))
+}
+
+fn filter_matches_metadata(metadata: &Value, filter: &MetadataFilter) -> bool {
+    match metadata {
+        Value::Object(fields) => fields
+            .get(&filter.field)
+            .is_some_and(|value| scalar_value_matches_json(&filter.value, value)),
+        _ => false,
+    }
+}
+
+fn scalar_value_matches_json(expected: &ScalarMetadataValue, actual: &Value) -> bool {
+    match (expected, actual) {
+        (ScalarMetadataValue::String(expected), Value::String(actual)) => expected == actual,
+        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => {
+            actual.as_f64().is_some_and(|actual| actual == *expected)
+        }
+        (ScalarMetadataValue::Bool(expected), Value::Bool(actual)) => expected == actual,
+        (ScalarMetadataValue::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
 fn rank_matches_with<I, F>(
     metric: DistanceMetric,
     query: &[f32],
@@ -317,6 +382,7 @@ mod tests {
                 manifest_generation: 7,
                 visible_seq_no: 11,
             }),
+            filters: Vec::new(),
         };
 
         let matches = rank_matches(
@@ -382,6 +448,7 @@ mod tests {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: Some(snapshot.clone()),
+            filters: Vec::new(),
         };
 
         let truncated = rank_matches(
@@ -422,6 +489,7 @@ mod tests {
             vector: vec![1.0, 0.0],
             top_k: 4,
             snapshot: None,
+            filters: Vec::new(),
         };
 
         let empty = rank_matches(
@@ -465,6 +533,79 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn filters_records_by_top_level_scalar_equality_before_ranking() {
+        let matches = rank_matches(
+            DistanceMetric::Dot,
+            &[1.0, 0.0],
+            filter_records(
+                vec![
+                    VisibleRecord {
+                        id: RecordId::from("matching"),
+                        vector: vec![2.0, 0.0],
+                        metadata: json!({
+                            "color": "red",
+                            "active": true,
+                            "score": 7,
+                            "missing": null,
+                        }),
+                        seq_no: 1,
+                    },
+                    VisibleRecord {
+                        id: RecordId::from("wrong-color"),
+                        vector: vec![9.0, 0.0],
+                        metadata: json!({
+                            "color": "blue",
+                            "active": true,
+                            "score": 7,
+                            "missing": null,
+                        }),
+                        seq_no: 2,
+                    },
+                    VisibleRecord {
+                        id: RecordId::from("nested"),
+                        vector: vec![8.0, 0.0],
+                        metadata: json!({
+                            "color": { "name": "red" },
+                            "active": true,
+                            "score": 7,
+                            "missing": null,
+                        }),
+                        seq_no: 3,
+                    },
+                ],
+                &[
+                    MetadataFilter {
+                        field: "color".to_owned(),
+                        value: ScalarMetadataValue::String("red".to_owned()),
+                    },
+                    MetadataFilter {
+                        field: "active".to_owned(),
+                        value: ScalarMetadataValue::Bool(true),
+                    },
+                    MetadataFilter {
+                        field: "score".to_owned(),
+                        value: ScalarMetadataValue::Number(7.0),
+                    },
+                    MetadataFilter {
+                        field: "missing".to_owned(),
+                        value: ScalarMetadataValue::Null,
+                    },
+                ],
+            ),
+            3,
+        )
+        .expect("ranking should succeed");
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|match_| match_.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["matching"]
+        );
+    }
+
     #[tokio::test]
     async fn preserves_storage_errors_without_string_flattening() {
         let result = query_exact(
@@ -474,6 +615,7 @@ mod tests {
                 vector: vec![1.0],
                 top_k: 1,
                 snapshot: None,
+                filters: Vec::new(),
             },
         )
         .await;
@@ -494,6 +636,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                filters: Vec::new(),
             },
         )
         .await;
@@ -573,6 +716,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn query_exact_applies_filters_and_preserves_snapshot() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 2,
+                snapshot: Some(Snapshot {
+                    manifest_generation: 3,
+                    visible_seq_no: 8,
+                }),
+                filters: vec![MetadataFilter {
+                    field: "kind".to_owned(),
+                    value: ScalarMetadataValue::String("keep".to_owned()),
+                }],
+            },
+        )
+        .await
+        .expect("query should succeed");
+
+        assert_eq!(result.snapshot.manifest_generation, 3);
+        assert_eq!(
+            result
+                .matches
+                .iter()
+                .map(|match_| match_.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "gamma"]
+        );
+    }
+
     struct MalformedStorageEngine;
 
     #[async_trait]
@@ -623,6 +798,93 @@ mod tests {
                 metadata: json!(null),
                 seq_no: 9,
             }])
+        }
+
+        async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn inspect(
+            &self,
+            _collection_name: &str,
+            _target: InspectTarget,
+        ) -> logpose_types::Result<InspectReport> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+    }
+
+    struct FilteredStorageEngine;
+
+    #[async_trait]
+    impl StorageEngine for FilteredStorageEngine {
+        async fn engine_name(&self) -> &'static str {
+            "filtered"
+        }
+
+        async fn create_collection(
+            &self,
+            _request: CreateCollectionRequest,
+        ) -> logpose_types::Result<CollectionDescriptor> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
+            Ok(CollectionDescriptor::new(
+                name,
+                2,
+                DistanceMetric::Dot,
+                Path::new("/tmp"),
+            ))
+        }
+
+        async fn write(
+            &self,
+            _collection_name: &str,
+            _operations: Vec<WriteOperation>,
+        ) -> logpose_types::Result<CommitAck> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn snapshot(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+            Ok(Snapshot {
+                manifest_generation: 99,
+                visible_seq_no: 101,
+            })
+        }
+
+        async fn scan_exact(
+            &self,
+            _collection_name: &str,
+            _snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<Vec<VisibleRecord>> {
+            Ok(vec![
+                VisibleRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![3.0, 0.0],
+                    metadata: json!({ "kind": "keep" }),
+                    seq_no: 4,
+                },
+                VisibleRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![9.0, 0.0],
+                    metadata: json!({ "kind": "drop" }),
+                    seq_no: 5,
+                },
+                VisibleRecord {
+                    id: RecordId::new("gamma"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({ "kind": "keep" }),
+                    seq_no: 6,
+                },
+            ])
         }
 
         async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {

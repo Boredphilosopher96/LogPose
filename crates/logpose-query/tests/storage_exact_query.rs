@@ -59,6 +59,7 @@ async fn queries_storage_records_and_honors_snapshots() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            filters: Vec::new(),
         },
     )
     .await
@@ -102,6 +103,7 @@ async fn queries_storage_records_and_honors_snapshots() {
             vector: vec![1.0, 0.0],
             top_k: 3,
             snapshot: Some(snapshot.clone()),
+            filters: Vec::new(),
         },
     )
     .await
@@ -139,6 +141,7 @@ async fn returns_empty_matches_for_empty_collection() {
             vector: vec![1.0, 0.0, 0.0],
             top_k: 5,
             snapshot: None,
+            filters: Vec::new(),
         },
     )
     .await
@@ -178,6 +181,7 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            filters: Vec::new(),
         },
     )
     .await;
@@ -252,6 +256,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             vector: vec![0.0, 0.0],
             top_k: 2,
             snapshot: Some(before_delete),
+            filters: Vec::new(),
         },
     )
     .await
@@ -292,6 +297,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             vector: vec![0.0, 0.0],
             top_k: 3,
             snapshot: None,
+            filters: Vec::new(),
         },
     )
     .await
@@ -319,6 +325,7 @@ async fn surfaces_unknown_collection_errors_from_storage() {
             vector: vec![1.0],
             top_k: 1,
             snapshot: None,
+            filters: Vec::new(),
         },
     )
     .await;
