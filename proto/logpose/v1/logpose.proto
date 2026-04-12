@@ -4,6 +4,14 @@ package logpose.v1;
 
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
+  rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
+  rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
+  rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
+  rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
+  rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
+  rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
+  rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
+  rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
 }
 
 message GetMetadataRequest {}
@@ -14,3 +22,143 @@ message GetMetadataReply {
   string version = 3;
 }
 
+enum DistanceMetric {
+  DISTANCE_METRIC_UNSPECIFIED = 0;
+  DISTANCE_METRIC_COSINE = 1;
+  DISTANCE_METRIC_DOT = 2;
+  DISTANCE_METRIC_L2 = 3;
+}
+
+message CreateCollectionRequest {
+  string name = 1;
+  uint64 dimensions = 2;
+  DistanceMetric metric = 3;
+}
+
+message GetCollectionRequest {
+  string collection_name = 1;
+}
+
+message CollectionDescriptorReply {
+  string collection_id = 1;
+  string name = 2;
+  uint64 dimensions = 3;
+  DistanceMetric metric = 4;
+  string root_path = 5;
+  uint64 flush_threshold_ops = 6;
+  uint64 flush_threshold_bytes = 7;
+  uint64 compaction_threshold_segments = 8;
+}
+
+message PutRecord {
+  string id = 1;
+  repeated float vector = 2;
+  string metadata_json = 3;
+}
+
+message DeleteRecord {
+  string id = 1;
+}
+
+message WriteOperation {
+  oneof operation {
+    PutRecord put = 1;
+    DeleteRecord delete = 2;
+  }
+}
+
+message WriteCollectionRequest {
+  string collection_name = 1;
+  repeated WriteOperation operations = 2;
+}
+
+message CommitAckReply {
+  uint64 last_seq_no = 1;
+  uint64 applied_ops = 2;
+}
+
+message Snapshot {
+  uint64 manifest_generation = 1;
+  uint64 visible_seq_no = 2;
+}
+
+message SnapshotReply {
+  uint64 manifest_generation = 1;
+  uint64 visible_seq_no = 2;
+}
+
+message ScalarValue {
+  oneof kind {
+    string string_value = 1;
+    double number_value = 2;
+    bool bool_value = 3;
+    bool null_value = 4;
+  }
+}
+
+message MetadataFilter {
+  string field = 1;
+  ScalarValue value = 2;
+}
+
+message QueryCollectionRequest {
+  string collection_name = 1;
+  repeated float vector = 2;
+  uint64 top_k = 3;
+  Snapshot snapshot = 4;
+  repeated MetadataFilter filters = 5;
+}
+
+message QueryMatch {
+  string id = 1;
+  float value = 2;
+  string metadata_json = 3;
+}
+
+message QueryCollectionReply {
+  DistanceMetric metric = 1;
+  uint64 top_k = 2;
+  uint64 returned = 3;
+  Snapshot snapshot = 4;
+  repeated QueryMatch matches = 5;
+}
+
+message GetCollectionStatsRequest {
+  string collection_name = 1;
+}
+
+message CollectionStatsReply {
+  string collection_id = 1;
+  string collection_name = 2;
+  uint64 manifest_generation = 3;
+  uint64 visible_seq_no = 4;
+  uint64 mutable_op_count = 5;
+  uint64 segment_count = 6;
+  uint64 live_record_count = 7;
+  uint64 deleted_record_count = 8;
+}
+
+message FlushCollectionRequest {
+  string collection_name = 1;
+}
+
+message CompactCollectionRequest {
+  string collection_name = 1;
+}
+
+enum InspectTarget {
+  INSPECT_TARGET_MANIFEST = 0;
+  INSPECT_TARGET_WAL = 1;
+  INSPECT_TARGET_SEGMENT = 2;
+}
+
+message InspectCollectionRequest {
+  string collection_name = 1;
+  InspectTarget target = 2;
+  string segment_id = 3;
+}
+
+message InspectCollectionReply {
+  string target = 1;
+  string payload_json = 2;
+}

@@ -11,6 +11,7 @@ members = [
     "crates/logpose-core",
     "crates/logpose-index",
     "crates/logpose-query",
+    "crates/logpose-service",
     "crates/logpose-storage",
     "crates/logpose-telemetry",
     "crates/logpose-types",

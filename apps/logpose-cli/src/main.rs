@@ -230,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
                     vector: args.vector.0,
                     top_k: args.top_k,
                     snapshot: None,
+                    filters: Vec::new(),
                 },
             )
             .await
