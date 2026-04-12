@@ -5,7 +5,7 @@ use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_core::AppState;
 use logpose_query::{MetadataFilter, QueryMatch, QueryRequest, QueryResponse, ScalarMetadataValue};
 use logpose_service::LogPoseDataService;
-use logpose_storage::CreateCollectionRequest;
+use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId, SeqNo, Snapshot,
     VisibleRecord, WriteOperation,
@@ -50,6 +50,8 @@ enum ServiceAction {
     Compact,
     Stats,
     InspectManifest,
+    InspectWal,
+    InspectSegment,
 }
 
 #[derive(Clone, Debug)]
@@ -260,7 +262,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
     model.register_collection(descriptor.collection_id.to_string(), descriptor.metric);
 
     for _ in 0..steps {
-        let action = next_action(&mut rng, snapshots.len());
+        let action = next_action(&mut rng, snapshots.len(), model.segment_count);
         trace.push(action.clone());
 
         match action {
@@ -386,7 +388,31 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 assert_stats_parity(&service, &rest, &grpc, &model, seed, &trace).await;
             }
             ServiceAction::InspectManifest => {
-                assert_inspect_parity(&service, &rest, &grpc, seed, &trace).await;
+                assert_inspect_parity(
+                    &service,
+                    &rest,
+                    &grpc,
+                    &model,
+                    InspectTarget::Manifest,
+                    seed,
+                    &trace,
+                )
+                .await;
+            }
+            ServiceAction::InspectWal => {
+                assert_inspect_parity(
+                    &service,
+                    &rest,
+                    &grpc,
+                    &model,
+                    InspectTarget::Wal,
+                    seed,
+                    &trace,
+                )
+                .await;
+            }
+            ServiceAction::InspectSegment => {
+                assert_inspect_segment_parity(&service, &rest, &grpc, &model, seed, &trace).await;
             }
         }
     }
@@ -408,7 +434,7 @@ fn scenario_seeds() -> Vec<u64> {
     }
 }
 
-fn next_action(rng: &mut StdRng, snapshot_count: usize) -> ServiceAction {
+fn next_action(rng: &mut StdRng, snapshot_count: usize, segment_count: usize) -> ServiceAction {
     let roll = rng.random_range(0..100);
     match roll {
         0..=34 => ServiceAction::PutBatch(generate_put_batch(rng)),
@@ -425,9 +451,12 @@ fn next_action(rng: &mut StdRng, snapshot_count: usize) -> ServiceAction {
             vector_index: rng.random_range(0..EXACT_QUERY_VECTORS.len()),
             keep_only: rng.random_bool(0.5),
         },
-        78..=85 => ServiceAction::Flush,
-        86..=91 => ServiceAction::Compact,
-        92..=96 => ServiceAction::Stats,
+        78..=84 => ServiceAction::Flush,
+        85..=89 => ServiceAction::Compact,
+        90..=93 => ServiceAction::Stats,
+        94..=95 => ServiceAction::InspectManifest,
+        96..=97 => ServiceAction::InspectWal,
+        98..=99 if segment_count > 0 => ServiceAction::InspectSegment,
         _ => ServiceAction::InspectManifest,
     }
 }
@@ -605,7 +634,27 @@ async fn assert_stats_parity(
         .expect("rest stats should respond");
     let rest_body = json_body(rest_response).await;
     assert_eq!(
+        rest_body["manifest_generation"], expected.manifest_generation,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        rest_body["visible_seq_no"], expected.visible_seq_no,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        rest_body["mutable_op_count"], expected.mutable_op_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        rest_body["segment_count"], expected.segment_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
         rest_body["live_record_count"], expected.live_record_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        rest_body["deleted_record_count"], expected.deleted_record_count,
         "seed={seed} trace={trace:?}"
     );
 
@@ -619,7 +668,27 @@ async fn assert_stats_parity(
         })
         .into_inner();
     assert_eq!(
+        grpc_stats.manifest_generation, expected.manifest_generation,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        grpc_stats.visible_seq_no, expected.visible_seq_no,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        grpc_stats.mutable_op_count as usize, expected.mutable_op_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        grpc_stats.segment_count as usize, expected.segment_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
         grpc_stats.live_record_count as usize, expected.live_record_count,
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        grpc_stats.deleted_record_count as usize, expected.deleted_record_count,
         "seed={seed} trace={trace:?}"
     );
 }
@@ -628,43 +697,213 @@ async fn assert_inspect_parity(
     service: &LogPoseDataService,
     rest: &axum::Router,
     grpc: &GrpcLogPoseService,
+    model: &ExpectedModel,
+    target: InspectTarget,
     seed: u64,
     trace: &[ServiceAction],
 ) {
+    let target_label = match &target {
+        InspectTarget::Manifest => "manifest",
+        InspectTarget::Wal => "wal",
+        InspectTarget::Segment(_) => "segment",
+    };
+
     let actual = service
-        .inspect_manifest(COLLECTION_NAME)
+        .inspect(COLLECTION_NAME, target.clone())
         .await
         .unwrap_or_else(|error| {
             panic_with_context(seed, trace, format!("service inspect failed: {error}"))
         });
-    assert_eq!(actual.target, "manifest");
+    assert_eq!(actual.target, target_label);
 
     let rest_response = rest
         .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .uri(format!(
-                    "/v1/collections/{COLLECTION_NAME}/inspect?target=manifest"
-                ))
-                .body(Body::empty())
-                .expect("request should build"),
-        )
+        .oneshot(inspect_request(target.clone()))
         .await
         .expect("rest inspect should respond");
-    assert_eq!(json_body(rest_response).await["target"], "manifest");
+    let rest_body = json_body(rest_response).await;
+    assert_eq!(rest_body["target"], target_label);
+    match target_label {
+        "manifest" => assert_eq!(
+            rest_body["payload"]["segments"]
+                .as_array()
+                .expect("manifest segments should be an array")
+                .len(),
+            model.segment_count
+        ),
+        "wal" => assert_eq!(
+            rest_body["payload"]["records"]
+                .as_array()
+                .expect("wal records should be an array")
+                .len(),
+            model.mutable_op_count()
+        ),
+        _ => {}
+    }
 
     let grpc_response = grpc
         .inspect_collection(Request::new(proto::InspectCollectionRequest {
             collection_name: COLLECTION_NAME.to_owned(),
-            target: proto::InspectTarget::Manifest as i32,
-            segment_id: String::new(),
+            target: match &target {
+                InspectTarget::Manifest => proto::InspectTarget::Manifest as i32,
+                InspectTarget::Wal => proto::InspectTarget::Wal as i32,
+                InspectTarget::Segment(_) => proto::InspectTarget::Segment as i32,
+            },
+            segment_id: match &target {
+                InspectTarget::Segment(segment_id) => segment_id.clone(),
+                InspectTarget::Manifest | InspectTarget::Wal => String::new(),
+            },
         }))
         .await
         .unwrap_or_else(|error| {
             panic_with_context(seed, trace, format!("grpc inspect failed: {error}"))
         })
         .into_inner();
-    assert_eq!(grpc_response.target, "manifest");
+    assert_eq!(grpc_response.target, target_label);
+    let grpc_payload =
+        serde_json::from_str::<Value>(&grpc_response.payload_json).unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("grpc inspect payload failed: {error}"))
+        });
+    match target_label {
+        "manifest" => assert_eq!(
+            grpc_payload["segments"]
+                .as_array()
+                .expect("manifest segments should be an array")
+                .len(),
+            model.segment_count
+        ),
+        "wal" => assert_eq!(
+            grpc_payload["records"]
+                .as_array()
+                .expect("wal records should be an array")
+                .len(),
+            model.mutable_op_count()
+        ),
+        _ => {}
+    }
+}
+
+async fn assert_inspect_segment_parity(
+    service: &LogPoseDataService,
+    rest: &axum::Router,
+    grpc: &GrpcLogPoseService,
+    model: &ExpectedModel,
+    seed: u64,
+    trace: &[ServiceAction],
+) {
+    let manifest = service
+        .inspect_manifest(COLLECTION_NAME)
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("manifest inspect failed: {error}"))
+        });
+    let segment_id = manifest
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(|segment| segment.get("segment_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic_with_context(
+                seed,
+                trace,
+                "segment inspect requested without a segment".to_owned(),
+            )
+        })
+        .to_owned();
+
+    let actual = service
+        .inspect_segment(COLLECTION_NAME, segment_id.clone())
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(
+                seed,
+                trace,
+                format!("service segment inspect failed: {error}"),
+            )
+        });
+    assert_eq!(actual.target, format!("segment:{segment_id}"));
+    assert!(
+        actual
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .is_some_and(|records| !records.is_empty()),
+        "segment inspect should return records"
+    );
+    assert!(
+        model.segment_count > 0,
+        "segment inspect should only run when segments exist"
+    );
+
+    let rest_response = rest
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/v1/collections/{COLLECTION_NAME}/inspect?target=segment&segment_id={segment_id}"
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("rest segment inspect should respond");
+    let rest_body = json_body(rest_response).await;
+    assert_eq!(
+        rest_body["target"]
+            .as_str()
+            .expect("segment target should be a string"),
+        format!("segment:{segment_id}")
+    );
+    assert!(
+        rest_body["payload"]["records"]
+            .as_array()
+            .is_some_and(|records| !records.is_empty()),
+        "segment inspect should return records"
+    );
+
+    let grpc_response = grpc
+        .inspect_collection(Request::new(proto::InspectCollectionRequest {
+            collection_name: COLLECTION_NAME.to_owned(),
+            target: proto::InspectTarget::Segment as i32,
+            segment_id: segment_id.clone(),
+        }))
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("grpc segment inspect failed: {error}"))
+        })
+        .into_inner();
+    assert_eq!(grpc_response.target, format!("segment:{segment_id}"));
+    let grpc_payload =
+        serde_json::from_str::<Value>(&grpc_response.payload_json).unwrap_or_else(|error| {
+            panic_with_context(
+                seed,
+                trace,
+                format!("grpc segment inspect payload failed: {error}"),
+            )
+        });
+    assert!(
+        grpc_payload["records"]
+            .as_array()
+            .is_some_and(|records| !records.is_empty()),
+        "segment inspect should return records"
+    );
+}
+
+fn inspect_request(target: InspectTarget) -> axum::http::Request<Body> {
+    let uri = match target {
+        InspectTarget::Manifest => "/v1/collections/randomized/inspect?target=manifest".to_owned(),
+        InspectTarget::Wal => "/v1/collections/randomized/inspect?target=wal".to_owned(),
+        InspectTarget::Segment(segment_id) => {
+            format!("/v1/collections/randomized/inspect?target=segment&segment_id={segment_id}")
+        }
+    };
+
+    axum::http::Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request should build")
 }
 
 fn assert_ack_matches(

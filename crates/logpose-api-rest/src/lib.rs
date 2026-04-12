@@ -373,6 +373,32 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(stats.status(), StatusCode::OK);
+        let stats_body = json_body(stats).await;
+        assert_eq!(stats_body["live_record_count"], 3);
+        assert_eq!(stats_body["deleted_record_count"], 0);
+        assert_eq!(stats_body["mutable_op_count"], 3);
+        assert_eq!(stats_body["segment_count"], 0);
+
+        let wal = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?target=wal")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(wal.status(), StatusCode::OK);
+        let wal_body = json_body(wal).await;
+        assert_eq!(wal_body["target"], "wal");
+        assert_eq!(
+            wal_body["payload"]["records"]
+                .as_array()
+                .expect("wal records should be an array")
+                .len(),
+            3
+        );
 
         let flush = app
             .clone()
@@ -401,6 +427,7 @@ mod tests {
         assert_eq!(compact.status(), StatusCode::OK);
 
         let inspect = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/v1/collections/documents/inspect?target=manifest")
@@ -410,7 +437,155 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(inspect.status(), StatusCode::OK);
-        assert_eq!(json_body(inspect).await["target"], "manifest");
+        let inspect_body = json_body(inspect).await;
+        assert_eq!(inspect_body["target"], "manifest");
+        let segment_id = inspect_body["payload"]["segments"][0]["segment_id"]
+            .as_str()
+            .expect("segment id should be a string")
+            .to_owned();
+
+        let segment = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/v1/collections/documents/inspect?target=segment&segment_id={segment_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(segment.status(), StatusCode::OK);
+        let segment_body = json_body(segment).await;
+        assert_eq!(
+            segment_body["target"]
+                .as_str()
+                .expect("segment target should be a string"),
+            format!("segment:{segment_id}")
+        );
+        assert_eq!(
+            segment_body["payload"]["records"]
+                .as_array()
+                .expect("segment records should be an array")
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_endpoints_support_wal_and_segment_targets_after_flush() {
+        let state = Arc::new(AppState::new(test_config("rest-inspect-targets")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "put",
+                                    "id": "alpha",
+                                    "vector": [1.0, 0.0],
+                                    "metadata": {"kind": "keep"}
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "beta",
+                                    "vector": [0.0, 1.0],
+                                    "metadata": {"kind": "drop"}
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/flush")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        let manifest = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?target=manifest")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let manifest_body = json_body(manifest).await;
+        let segment_id = manifest_body["payload"]["segments"][0]["segment_id"]
+            .as_str()
+            .expect("segment id should be a string")
+            .to_owned();
+
+        let wal = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?target=wal")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(json_body(wal).await["target"], "wal");
+
+        let segment = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/v1/collections/documents/inspect?target=segment&segment_id={segment_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let segment_body = json_body(segment).await;
+        assert_eq!(
+            segment_body["target"]
+                .as_str()
+                .expect("segment target should be a string"),
+            format!("segment:{segment_id}")
+        );
     }
 
     #[tokio::test]

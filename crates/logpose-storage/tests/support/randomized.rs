@@ -1,5 +1,5 @@
 use logpose_query::{QueryMatch, QueryRequest, QueryResponse, query_exact};
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
     CollectionId, CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId,
     SeqNo, Snapshot, VisibleRecord, WriteOperation,
@@ -30,6 +30,9 @@ pub enum StorageAction {
     Flush,
     Compact,
     Stats,
+    InspectManifest,
+    InspectWal,
+    InspectSegment,
     Reopen,
 }
 
@@ -215,7 +218,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
     assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
 
     for _ in 0..steps {
-        let action = next_action(&mut rng, snapshots.len());
+        let action = next_action(&mut rng, snapshots.len(), model.segment_count);
         trace.push(action.clone());
 
         match action {
@@ -358,6 +361,15 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
             StorageAction::Stats => {
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
+            StorageAction::InspectManifest => {
+                assert_manifest_inspect_matches(&engine, &model, seed, &trace).await;
+            }
+            StorageAction::InspectWal => {
+                assert_wal_inspect_matches(&engine, &model, seed, &trace).await;
+            }
+            StorageAction::InspectSegment => {
+                assert_segment_inspect_matches(&engine, &model, seed, &trace).await;
+            }
             StorageAction::Reopen => {
                 engine = LocalStorageEngine::new(&root);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
@@ -390,7 +402,7 @@ fn parse_seed(seed: &str) -> u64 {
     }
 }
 
-fn next_action(rng: &mut StdRng, snapshot_count: usize) -> StorageAction {
+fn next_action(rng: &mut StdRng, snapshot_count: usize, segment_count: usize) -> StorageAction {
     let roll = rng.random_range(0..100);
     match roll {
         0..=34 => StorageAction::PutBatch(generate_put_batch(rng)),
@@ -402,9 +414,12 @@ fn next_action(rng: &mut StdRng, snapshot_count: usize) -> StorageAction {
         70..=77 if snapshot_count > 0 => StorageAction::ScanSnapshot {
             snapshot_index: rng.random_range(0..snapshot_count),
         },
-        78..=85 => StorageAction::Flush,
-        86..=92 => StorageAction::Compact,
-        93..=96 => StorageAction::Stats,
+        78..=82 => StorageAction::Flush,
+        83..=87 => StorageAction::Compact,
+        88..=90 => StorageAction::Stats,
+        91..=93 => StorageAction::InspectManifest,
+        94..=96 => StorageAction::InspectWal,
+        97..=98 if segment_count > 0 => StorageAction::InspectSegment,
         _ => StorageAction::Reopen,
     }
 }
@@ -519,6 +534,109 @@ async fn assert_stats_match(
         .unwrap_or_else(|error| panic_with_context(seed, trace, format!("stats failed: {error}")));
     let expected = model.expected_stats();
     assert_eq_with_context(seed, trace, "stats mismatch", &expected, &actual);
+}
+
+async fn assert_manifest_inspect_matches(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    let report = engine
+        .inspect(COLLECTION_NAME, InspectTarget::Manifest)
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("manifest inspect failed: {error}"))
+        });
+    assert_eq!(report.target, "manifest");
+    let segments = report
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .expect("manifest segments should be an array");
+    assert_eq!(segments.len(), model.segment_count);
+}
+
+async fn assert_wal_inspect_matches(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    let report = engine
+        .inspect(COLLECTION_NAME, InspectTarget::Wal)
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("wal inspect failed: {error}"))
+        });
+    assert_eq!(report.target, "wal");
+    let records = report
+        .payload
+        .get("records")
+        .and_then(Value::as_array)
+        .expect("wal records should be an array");
+    assert_eq!(records.len(), model.mutable_op_count());
+}
+
+async fn assert_segment_inspect_matches(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    let manifest = engine
+        .inspect(COLLECTION_NAME, InspectTarget::Manifest)
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(
+                seed,
+                trace,
+                format!("segment manifest inspect failed: {error}"),
+            )
+        });
+    let segment_id = manifest
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(|segment| segment.get("segment_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic_with_context(
+                seed,
+                trace,
+                "segment inspect requested without a segment".to_owned(),
+            )
+        })
+        .to_owned();
+    let report = engine
+        .inspect(COLLECTION_NAME, InspectTarget::Segment(segment_id.clone()))
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("segment inspect failed: {error}"))
+        });
+    assert_eq!(report.target, format!("segment:{segment_id}"));
+    assert_eq!(
+        report
+            .payload
+            .get("segment")
+            .and_then(Value::as_object)
+            .and_then(|segment| segment.get("segment_id"))
+            .and_then(Value::as_str),
+        Some(segment_id.as_str())
+    );
+    assert!(
+        report
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .is_some_and(|records| !records.is_empty()),
+        "seed={seed} trace={trace:?} expected a non-empty segment payload with {segment_id}"
+    );
+    assert!(
+        model.segment_count > 0,
+        "segment inspect should only run when segments exist"
+    );
 }
 
 fn assert_ack_matches(

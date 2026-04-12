@@ -387,6 +387,7 @@ fn status_from_service_error(error: ServiceError) -> Status {
 mod tests {
     use super::*;
     use logpose_config::LogPoseConfig;
+    use serde_json::Value;
     use std::{
         fs,
         path::PathBuf,
@@ -472,6 +473,9 @@ mod tests {
             .expect("stats should succeed")
             .into_inner();
         assert_eq!(stats.live_record_count, 3);
+        assert_eq!(stats.deleted_record_count, 0);
+        assert_eq!(stats.mutable_op_count, 3);
+        assert_eq!(stats.segment_count, 0);
 
         let flush = service
             .flush_collection(Request::new(FlushCollectionRequest {
@@ -501,6 +505,128 @@ mod tests {
             .expect("inspect should succeed")
             .into_inner();
         assert_eq!(inspect.target, "manifest");
+    }
+
+    #[tokio::test]
+    async fn grpc_service_supports_wal_and_segment_inspection_targets() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-inspect-targets"))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        service
+            .write_collection(Request::new(WriteCollectionRequest {
+                collection_name: "documents".to_owned(),
+                operations: vec![
+                    proto::WriteOperation {
+                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                            id: "alpha".to_owned(),
+                            vector: vec![1.0, 0.0],
+                            metadata_json: r#"{"kind":"keep"}"#.to_owned(),
+                        })),
+                    },
+                    proto::WriteOperation {
+                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                            id: "beta".to_owned(),
+                            vector: vec![0.0, 1.0],
+                            metadata_json: r#"{"kind":"drop"}"#.to_owned(),
+                        })),
+                    },
+                ],
+            }))
+            .await
+            .expect("write should succeed");
+
+        service
+            .flush_collection(Request::new(FlushCollectionRequest {
+                collection_name: "documents".to_owned(),
+            }))
+            .await
+            .expect("flush should succeed");
+
+        service
+            .write_collection(Request::new(WriteCollectionRequest {
+                collection_name: "documents".to_owned(),
+                operations: vec![proto::WriteOperation {
+                    operation: Some(proto::write_operation::Operation::Delete(
+                        proto::DeleteRecord {
+                            id: "alpha".to_owned(),
+                        },
+                    )),
+                }],
+            }))
+            .await
+            .expect("delete should succeed");
+
+        let manifest = service
+            .inspect_collection(Request::new(InspectCollectionRequest {
+                collection_name: "documents".to_owned(),
+                target: proto::InspectTarget::Manifest as i32,
+                segment_id: String::new(),
+            }))
+            .await
+            .expect("manifest inspect should succeed")
+            .into_inner();
+        assert_eq!(manifest.target, "manifest");
+        let manifest_segments = manifest
+            .payload_json
+            .parse::<Value>()
+            .expect("manifest payload should be valid json");
+        let segment_id = manifest_segments["segments"][0]["segment_id"]
+            .as_str()
+            .expect("segment id should be a string")
+            .to_owned();
+
+        let wal = service
+            .inspect_collection(Request::new(InspectCollectionRequest {
+                collection_name: "documents".to_owned(),
+                target: proto::InspectTarget::Wal as i32,
+                segment_id: String::new(),
+            }))
+            .await
+            .expect("wal inspect should succeed")
+            .into_inner();
+        assert_eq!(wal.target, "wal");
+        let wal_payload = wal
+            .payload_json
+            .parse::<Value>()
+            .expect("wal payload should be valid json");
+        assert_eq!(
+            wal_payload["records"]
+                .as_array()
+                .expect("wal records should be an array")
+                .len(),
+            1
+        );
+
+        let segment = service
+            .inspect_collection(Request::new(InspectCollectionRequest {
+                collection_name: "documents".to_owned(),
+                target: proto::InspectTarget::Segment as i32,
+                segment_id: segment_id.clone(),
+            }))
+            .await
+            .expect("segment inspect should succeed")
+            .into_inner();
+        assert_eq!(segment.target, format!("segment:{segment_id}"));
+        let segment_payload = segment
+            .payload_json
+            .parse::<Value>()
+            .expect("segment payload should be valid json");
+        assert_eq!(
+            segment_payload["records"]
+                .as_array()
+                .expect("segment records should be an array")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
