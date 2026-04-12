@@ -1,6 +1,8 @@
 //! Storage engine abstractions.
 
 #[cfg(test)]
+use logpose_query as _;
+#[cfg(test)]
 use rand as _;
 
 use async_trait::async_trait;

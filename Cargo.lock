@@ -615,6 +615,7 @@ dependencies = [
  "anyhow",
  "clap",
  "logpose-config",
+ "logpose-query",
  "logpose-storage",
  "logpose-telemetry",
  "logpose-types",
@@ -655,6 +656,16 @@ version = "0.1.0"
 [[package]]
 name = "logpose-query"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "logpose-catalog",
+ "logpose-storage",
+ "logpose-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "logpose-server"
@@ -677,6 +688,7 @@ dependencies = [
  "async-trait",
  "crc32fast",
  "logpose-catalog",
+ "logpose-query",
  "logpose-types",
  "logpose-wal",
  "rand",
