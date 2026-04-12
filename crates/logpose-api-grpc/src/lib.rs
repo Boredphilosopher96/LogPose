@@ -307,7 +307,9 @@ fn inspect_target_from_proto(
     target: i32,
     segment_id: String,
 ) -> Result<logpose_storage::InspectTarget, Status> {
-    match InspectTarget::try_from(target).unwrap_or(InspectTarget::Manifest) {
+    match InspectTarget::try_from(target)
+        .map_err(|_| Status::invalid_argument(format!("unsupported inspect target '{target}'")))?
+    {
         InspectTarget::Manifest => Ok(logpose_storage::InspectTarget::Manifest),
         InspectTarget::Wal => Ok(logpose_storage::InspectTarget::Wal),
         InspectTarget::Segment => {
@@ -499,6 +501,23 @@ mod tests {
             .expect_err("missing collection should error");
 
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn grpc_service_rejects_unknown_inspect_targets() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-invalid-target"))));
+
+        let error = service
+            .inspect_collection(Request::new(InspectCollectionRequest {
+                collection_name: "documents".to_owned(),
+                target: 999,
+                segment_id: String::new(),
+            }))
+            .await
+            .expect_err("unknown inspect target should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     fn test_config(label: &str) -> LogPoseConfig {

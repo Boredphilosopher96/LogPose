@@ -211,14 +211,37 @@ fn classify_message(message: String) -> ServiceError {
         ServiceError::AlreadyExists(message)
     } else if message.contains("does not exist") {
         ServiceError::NotFound(message)
-    } else if message.contains("expected")
-        || message.contains("unsupported")
+    } else if message.contains("unsupported")
         || message.contains("duplicate record id")
         || message.contains("must include at least one operation")
         || message.contains("must not be empty")
+        || is_dimension_validation_error(&message)
     {
         ServiceError::InvalidArgument(message)
     } else {
         ServiceError::Internal(message)
+    }
+}
+
+fn is_dimension_validation_error(message: &str) -> bool {
+    message.contains("record '")
+        && message.contains(" dimensions")
+        && message.contains(" expected ")
+        && message.contains(" found ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_checksum_style_expected_messages_as_internal_errors() {
+        let error = ServiceError::from(LogPoseError::Message(
+            "checksum mismatch while reading segment 'abc': expected 10, got 11".to_owned(),
+        ));
+
+        assert!(
+            matches!(error, ServiceError::Internal(message) if message.contains("checksum mismatch"))
+        );
     }
 }
