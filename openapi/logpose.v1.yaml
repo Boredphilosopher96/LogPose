@@ -1,0 +1,23 @@
+openapi: 3.1.0
+info:
+  title: LogPose REST API
+  version: 0.1.0
+  description: Versioned REST surface for LogPose cluster metadata and control-plane operations.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /health:
+    get:
+      summary: Health probe
+      operationId: health
+      responses:
+        "200":
+          description: Healthy
+  /v1/metadata:
+    get:
+      summary: Cluster metadata
+      operationId: metadata
+      responses:
+        "200":
+          description: Metadata payload
+

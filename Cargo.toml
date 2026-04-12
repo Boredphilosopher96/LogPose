@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "apps/logpose-cli",
+    "apps/logpose-server",
+    "crates/logpose-api-grpc",
+    "crates/logpose-api-rest",
+    "crates/logpose-auth",
+    "crates/logpose-catalog",
+    "crates/logpose-client",
+    "crates/logpose-config",
+    "crates/logpose-core",
+    "crates/logpose-index",
+    "crates/logpose-query",
+    "crates/logpose-storage",
+    "crates/logpose-telemetry",
+    "crates/logpose-types",
+    "crates/logpose-wal",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["Sumukh Nitundila"]
+description = "High-performance, reliable vector database platform."
+repository = "https://github.com/logpose/logpose"
+homepage = "https://github.com/logpose/logpose"
+documentation = "https://github.com/logpose/logpose/tree/main/docs"
+readme = "README.md"
+keywords = ["vector-database", "search", "retrieval", "grpc", "rest"]
+categories = ["database", "database-implementations", "command-line-utilities"]
+rust-version = "1.94.1"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+http = "1.2"
+prost = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "0.8"
+tonic = { version = "0.12", features = ["transport"] }
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.15", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+unused_crate_dependencies = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+panic = "warn"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

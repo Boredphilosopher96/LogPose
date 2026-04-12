@@ -1,0 +1,22 @@
+[package]
+name = "logpose-api-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+logpose-core = { path = "../logpose-core" }
+prost.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3.1"
+tonic-build = "0.12"

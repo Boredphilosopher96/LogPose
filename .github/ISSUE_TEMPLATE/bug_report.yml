@@ -1,0 +1,16 @@
+name: Bug report
+description: Report a defect affecting LogPose behavior or operations.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: Description
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+

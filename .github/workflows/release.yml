@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+
+      - name: Build server
+        run: cargo build --release -p logpose-server
+
+      - name: Build CLI
+        run: cargo build --release -p logpose-cli
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/logpose-server dist/
+          cp target/release/logpose-cli dist/
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logpose-release
+          path: dist/
+

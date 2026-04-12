@@ -1,0 +1,8 @@
+[book]
+authors = ["LogPose Contributors"]
+language = "en"
+src = "src"
+title = "LogPose Documentation"
+
+[build]
+build-dir = "../book"

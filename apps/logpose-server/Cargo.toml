@@ -1,0 +1,20 @@
+[package]
+name = "logpose-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+logpose-api-grpc = { path = "../../crates/logpose-api-grpc" }
+logpose-api-rest = { path = "../../crates/logpose-api-rest" }
+logpose-config = { path = "../../crates/logpose-config" }
+logpose-core = { path = "../../crates/logpose-core" }
+logpose-telemetry = { path = "../../crates/logpose-telemetry" }
+tokio.workspace = true
+tracing.workspace = true
+

@@ -1,0 +1,14 @@
+[package]
+name = "logpose-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+logpose-types = { path = "../logpose-types" }
+serde.workspace = true
+toml.workspace = true

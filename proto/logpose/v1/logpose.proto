@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package logpose.v1;
+
+service LogPoseService {
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
+}
+
+message GetMetadataRequest {}
+
+message GetMetadataReply {
+  string product = 1;
+  string node_name = 2;
+  string version = 3;
+}
+

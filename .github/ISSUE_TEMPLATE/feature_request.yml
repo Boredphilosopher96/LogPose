@@ -1,0 +1,16 @@
+name: Feature request
+description: Propose an enhancement for LogPose.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
