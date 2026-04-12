@@ -14,7 +14,7 @@ use uuid as _;
 mod support;
 
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
-use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -420,6 +420,8 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
         stats.segment_count == 1
             && stats.mutable_op_count == 0
             && stats.maintenance.completed_runs >= 3
+            && stats.maintenance.pending.is_empty()
+            && stats.maintenance.in_progress.is_none()
     })
     .await;
 
@@ -487,6 +489,244 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
 
     let stats = engine.stats("events").await.expect("stats should succeed");
     assert_eq!(stats.maintenance.last_error, None);
+}
+
+#[tokio::test]
+async fn background_maintenance_requeues_follow_up_flushes_after_inflight_writes() {
+    let root = support::unique_temp_dir("storage-follow-up-background-flush");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 200_000,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+    configure_thresholds(&descriptor.root_path, 1, usize::MAX, 99);
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0; 200_000],
+                metadata: json!({"kind":"keep","version":1}),
+            })],
+        )
+        .await
+        .expect("first write should succeed");
+
+    wait_for_condition(&engine, "events", |stats| {
+        stats.maintenance.in_progress.as_deref() == Some("flush")
+    })
+    .await;
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-2"),
+                vector: vec![2.0; 200_000],
+                metadata: json!({"kind":"keep","version":2}),
+            })],
+        )
+        .await
+        .expect("second write should succeed");
+
+    wait_for_condition(&engine, "events", |stats| {
+        stats.mutable_op_count == 0
+            && stats.segment_count >= 1
+            && stats.maintenance.pending.is_empty()
+            && stats.maintenance.in_progress.is_none()
+    })
+    .await;
+
+    let stats = engine.stats("events").await.expect("stats should succeed");
+    assert_eq!(stats.live_record_count, 2);
+    assert_eq!(stats.mutable_op_count, 0);
+    assert!(stats.maintenance.completed_runs >= 2);
+}
+
+#[tokio::test]
+async fn reopening_resumes_persisted_background_maintenance() {
+    let root = support::unique_temp_dir("storage-resume-background-maintenance");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let maintenance_path = descriptor.root_path.join("maintenance.json");
+    fs::write(
+        &maintenance_path,
+        serde_json::to_vec_pretty(&json!({
+            "pending": [],
+            "in_progress": "flush",
+            "last_error": null,
+            "completed_runs": 0
+        }))
+        .expect("status should serialize"),
+    )
+    .expect("maintenance status should be updated");
+
+    let reopened = LocalStorageEngine::new(&root);
+    reopened
+        .open_collection("events")
+        .await
+        .expect("open should succeed");
+
+    wait_for_condition(&reopened, "events", |stats| {
+        stats.mutable_op_count == 0
+            && stats.segment_count == 1
+            && stats.maintenance.pending.is_empty()
+            && stats.maintenance.in_progress.is_none()
+            && stats.maintenance.completed_runs >= 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejects_impossible_snapshots() {
+    let root = support::unique_temp_dir("storage-invalid-snapshot");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let invalid_snapshot = Snapshot {
+        manifest_generation: 0,
+        visible_seq_no: 99,
+    };
+
+    let scan_error = engine
+        .scan_exact("events", Some(invalid_snapshot.clone()))
+        .await
+        .expect_err("invalid snapshot should fail");
+    assert!(scan_error.to_string().contains("invalid snapshot"));
+
+    let stats_error = engine
+        .stats_snapshot("events", Some(invalid_snapshot))
+        .await
+        .expect_err("invalid snapshot should fail");
+    assert!(stats_error.to_string().contains("invalid snapshot"));
+}
+
+#[tokio::test]
+async fn rejects_snapshots_below_manifest_checkpoint() {
+    let root = support::unique_temp_dir("storage-below-checkpoint-snapshot");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let flushed = engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    assert_eq!(flushed.last_seq_no, 1);
+
+    let snapshot = engine.flush("events").await.expect("flush should succeed");
+    let invalid_snapshot = Snapshot {
+        manifest_generation: snapshot.manifest_generation,
+        visible_seq_no: snapshot.visible_seq_no - 1,
+    };
+
+    let scan_error = engine
+        .scan_exact("events", Some(invalid_snapshot.clone()))
+        .await
+        .expect_err("below-checkpoint snapshot should fail");
+    assert!(scan_error.to_string().contains("invalid snapshot"));
+
+    let stats_error = engine
+        .stats_snapshot("events", Some(invalid_snapshot))
+        .await
+        .expect_err("below-checkpoint snapshot should fail");
+    assert!(stats_error.to_string().contains("invalid snapshot"));
+}
+
+#[tokio::test]
+async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
+    let root = support::unique_temp_dir("storage-invalid-thresholds");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let descriptor_path = descriptor.root_path.join("descriptor.json");
+    let mut descriptor_json: Value =
+        serde_json::from_slice(&fs::read(&descriptor_path).expect("descriptor should exist"))
+            .expect("descriptor JSON should parse");
+    descriptor_json["flush_threshold_ops"] = json!(0);
+    descriptor_json["flush_threshold_bytes"] = json!(0);
+    descriptor_json["compaction_threshold_segments"] = json!(1);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor_json).expect("descriptor JSON should serialize"),
+    )
+    .expect("descriptor should be rewritten");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let error = reopened
+        .open_collection("events")
+        .await
+        .expect_err("invalid thresholds should be rejected");
+    assert!(error.to_string().contains("threshold"));
 }
 
 #[tokio::test]

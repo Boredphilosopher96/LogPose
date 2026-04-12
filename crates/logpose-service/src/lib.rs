@@ -214,6 +214,7 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("duplicate record id")
         || message.contains("must include at least one operation")
         || message.contains("must not be empty")
+        || message.contains("invalid snapshot")
         || is_dimension_validation_error(&message)
     {
         ServiceError::InvalidArgument(message)

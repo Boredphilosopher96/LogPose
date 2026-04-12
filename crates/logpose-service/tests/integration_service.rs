@@ -17,7 +17,7 @@ use logpose_query::{
 };
 use logpose_service::{LogPoseDataService, ServiceError};
 use logpose_storage::CreateCollectionRequest;
-use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
 use rand as _;
 use serde_json::{Value, json};
 use std::{
@@ -124,6 +124,107 @@ async fn service_runs_filtered_query_and_storage_workflow() {
         .await
         .expect("compact should succeed");
     assert!(compacted.manifest_generation >= snapshot.manifest_generation);
+}
+
+#[tokio::test]
+async fn service_rejects_impossible_snapshots() {
+    let root = unique_temp_dir("service-invalid-snapshot");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let error = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: Some(Snapshot {
+                manifest_generation: 0,
+                visible_seq_no: 99,
+            }),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect_err("invalid snapshot should error");
+
+    assert!(matches!(
+        error,
+        ServiceError::InvalidArgument(message) if message.contains("invalid snapshot")
+    ));
+}
+
+#[tokio::test]
+async fn service_rejects_snapshots_below_manifest_checkpoint() {
+    let root = unique_temp_dir("service-below-checkpoint-snapshot");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let flushed = service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let error = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: Some(Snapshot {
+                manifest_generation: flushed.manifest_generation,
+                visible_seq_no: flushed.visible_seq_no - 1,
+            }),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect_err("below-checkpoint snapshot should error");
+
+    assert!(matches!(
+        error,
+        ServiceError::InvalidArgument(message) if message.contains("invalid snapshot")
+    ));
 }
 
 #[tokio::test]
