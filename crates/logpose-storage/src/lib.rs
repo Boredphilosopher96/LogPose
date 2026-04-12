@@ -8,19 +8,27 @@ use rand as _;
 use async_trait::async_trait;
 use crc32fast::hash;
 use logpose_catalog::CollectionDescriptor;
+use logpose_index::{
+    FlatIndexEntrySource, FlatIndexSidecar, build_flat_index, read_flat_index, write_flat_index,
+};
 use logpose_types::{
-    CollectionStats, CommitAck, DistanceMetric, LogPoseError, PutRecord, RecordId, Result, SeqNo,
-    Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus, PutRecord,
+    QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    thread,
 };
 use uuid::Uuid;
 
@@ -56,6 +64,19 @@ pub trait StorageEngine: Send + Sync {
         snapshot: Option<Snapshot>,
     ) -> Result<Vec<VisibleRecord>>;
 
+    /// Resolve visible records for an explicit subset of mutable and immutable units.
+    async fn scan_exact_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let _ = include_mutable;
+        let _ = immutable_unit_ids;
+        self.scan_exact(collection_name, snapshot).await
+    }
+
     /// Flush the mutable delta into a new immutable segment.
     async fn flush(&self, collection_name: &str) -> Result<Snapshot>;
 
@@ -64,6 +85,16 @@ pub trait StorageEngine: Send + Sync {
 
     /// Return collection-level visibility and storage statistics.
     async fn stats(&self, collection_name: &str) -> Result<CollectionStats>;
+
+    /// Return collection-level statistics for a specific read snapshot.
+    async fn stats_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let _ = snapshot;
+        self.stats(collection_name).await
+    }
 
     /// Inspect on-disk storage state for operator debugging.
     async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport>;
@@ -87,6 +118,8 @@ pub enum InspectTarget {
     Manifest,
     /// Inspect WAL records that remain above the current checkpoint.
     Wal,
+    /// Inspect persisted maintenance state.
+    Maintenance,
     /// Inspect a specific immutable segment by segment id.
     Segment(String),
 }
@@ -108,6 +141,7 @@ pub trait BlobStore: Send + Sync {
 }
 
 /// Local filesystem-backed storage engine.
+#[derive(Clone)]
 pub struct LocalStorageEngine {
     root: PathBuf,
     blob_store: Option<Arc<dyn BlobStore>>,
@@ -140,11 +174,22 @@ impl LocalStorageEngine {
         descriptor.root_path.join("wal").join("active.wal")
     }
 
+    fn index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
+        descriptor
+            .root_path
+            .join("indexes")
+            .join(format!("{segment_id}.flat.json"))
+    }
+
     fn manifest_file_path(descriptor: &CollectionDescriptor, generation: u64) -> PathBuf {
         descriptor
             .root_path
             .join("manifests")
             .join(format!("{generation:020}.json"))
+    }
+
+    fn maintenance_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("maintenance.json")
     }
 
     fn current_manifest_pointer(descriptor: &CollectionDescriptor) -> PathBuf {
@@ -178,6 +223,7 @@ impl LocalStorageEngine {
         fs::create_dir_all(descriptor.root_path.join("manifests"))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("wal")))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("segments")))
+            .and_then(|_| fs::create_dir_all(descriptor.root_path.join("indexes")))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("tmp")))
             .map_err(|error| io_message("failed to create collection directories", error))
     }
@@ -269,6 +315,169 @@ impl LocalStorageEngine {
             .map(|record| approximate_record_bytes(&record.op))
             .sum::<usize>();
         approx_bytes >= descriptor.flush_threshold_bytes
+    }
+
+    fn should_compact(&self, descriptor: &CollectionDescriptor, segment_count: usize) -> bool {
+        segment_count >= descriptor.compaction_threshold_segments
+    }
+
+    fn load_maintenance_status(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        let path = Self::maintenance_file_path(descriptor);
+        if !path.exists() {
+            return Ok(MaintenanceStatus::default());
+        }
+        read_json(&path)
+    }
+
+    fn persist_maintenance_status(
+        &self,
+        descriptor: &CollectionDescriptor,
+        status: &MaintenanceStatus,
+    ) -> Result<()> {
+        atomic_write(
+            &Self::maintenance_file_path(descriptor),
+            serde_json::to_vec_pretty(status).map_err(json_message)?,
+        )
+    }
+
+    fn enqueue_maintenance(
+        &self,
+        descriptor: &CollectionDescriptor,
+        operations: Vec<MaintenanceOperation>,
+    ) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+
+        let status_lock = maintenance_status_lock(&descriptor.root_path);
+        {
+            let _guard = status_lock
+                .lock()
+                .expect("maintenance status lock should not be poisoned");
+            let mut persisted = self.load_maintenance_status(descriptor)?;
+            for operation in &operations {
+                let label = operation.as_str().to_owned();
+                if persisted.in_progress.as_deref() == Some(label.as_str())
+                    || persisted.pending.iter().any(|pending| pending == &label)
+                {
+                    continue;
+                }
+                persisted.pending.push(label);
+            }
+            self.persist_maintenance_status(descriptor, &persisted)?;
+        }
+
+        let key = descriptor.root_path.clone();
+        let should_spawn = {
+            let mut coordinator = maintenance_coordinator()
+                .lock()
+                .expect("maintenance coordinator lock should not be poisoned");
+            let state = coordinator.entry(key.clone()).or_default();
+            for operation in operations {
+                if !state.queue.iter().any(|pending| pending == &operation) {
+                    state.queue.push_back(operation);
+                }
+            }
+            if state.running {
+                false
+            } else {
+                state.running = true;
+                true
+            }
+        };
+
+        if should_spawn {
+            let engine = self.clone();
+            let collection_name = descriptor.name.clone();
+            thread::spawn(move || engine.run_maintenance_worker(collection_name, key));
+        }
+        Ok(())
+    }
+
+    fn run_maintenance_worker(self, collection_name: String, coordinator_key: PathBuf) {
+        loop {
+            let operation = {
+                let mut coordinator = maintenance_coordinator()
+                    .lock()
+                    .expect("maintenance coordinator lock should not be poisoned");
+                let Some(state) = coordinator.get_mut(&coordinator_key) else {
+                    return;
+                };
+                match state.queue.pop_front() {
+                    Some(operation) => operation,
+                    None => {
+                        coordinator.remove(&coordinator_key);
+                        return;
+                    }
+                }
+            };
+
+            let descriptor = match self.find_collection_descriptor(&collection_name) {
+                Ok(descriptor) => descriptor,
+                Err(_) => return,
+            };
+
+            let status_lock = maintenance_status_lock(&descriptor.root_path);
+            if let Ok(_guard) = status_lock.lock()
+                && let Ok(mut status) = self.load_maintenance_status(&descriptor)
+            {
+                let label = operation.as_str().to_owned();
+                status.pending.retain(|pending| pending != &label);
+                status.in_progress = Some(label);
+                let _ = self.persist_maintenance_status(&descriptor, &status);
+            }
+
+            let result = self.perform_maintenance_operation(&collection_name, operation);
+
+            let schedule_compaction = result.as_ref().is_ok()
+                && matches!(operation, MaintenanceOperation::Flush)
+                && self
+                    .load_collection_state(&collection_name, None)
+                    .ok()
+                    .is_some_and(|state| {
+                        self.should_compact(&state.descriptor, state.manifest.segments.len())
+                    });
+
+            if let Ok(_guard) = status_lock.lock()
+                && let Ok(mut status) = self.load_maintenance_status(&descriptor)
+            {
+                status.in_progress = None;
+                match result {
+                    Ok(_) => {
+                        status.completed_runs += 1;
+                        status.last_error = None;
+                    }
+                    Err(error) => {
+                        status.last_error = Some(error.to_string());
+                    }
+                }
+                let _ = self.persist_maintenance_status(&descriptor, &status);
+            }
+
+            if schedule_compaction {
+                let _ = self.enqueue_maintenance(&descriptor, vec![MaintenanceOperation::Compact]);
+            }
+        }
+    }
+
+    fn perform_maintenance_operation(
+        &self,
+        collection_name: &str,
+        operation: MaintenanceOperation,
+    ) -> Result<Snapshot> {
+        let descriptor = self.find_collection_descriptor(collection_name)?;
+        let operation_lock = maintenance_operation_lock(&descriptor.root_path);
+        let _guard = operation_lock
+            .lock()
+            .expect("maintenance operation lock should not be poisoned");
+        let state = self.load_collection_state(collection_name, None)?;
+        match operation {
+            MaintenanceOperation::Flush => self.flush_state(state),
+            MaintenanceOperation::Compact => self.compact_state(state),
+        }
     }
 
     fn flush_state(&self, state: CollectionState) -> Result<Snapshot> {
@@ -365,11 +574,17 @@ impl LocalStorageEngine {
             .root_path
             .join("segments")
             .join(format!("{segment_id}.lps"));
+        let sidecar_temp_path = descriptor
+            .root_path
+            .join("tmp")
+            .join(format!("{segment_id}.flat.json.tmp"));
+        let sidecar_path = Self::index_file_path(descriptor, &segment_id);
 
         let mut ids = Vec::new();
         let mut vectors = Vec::new();
         let mut metadata = Vec::new();
         let mut entries = Vec::new();
+        let mut sidecar_entries = Vec::new();
         let mut put_count = 0usize;
         let mut delete_count = 0usize;
         let mut min_seq_no = u64::MAX;
@@ -404,6 +619,14 @@ impl LocalStorageEngine {
                         metadata_offset,
                         metadata_len: metadata_bytes.len() as u32,
                     });
+                    sidecar_entries.push(FlatIndexEntrySource {
+                        is_put: true,
+                        record_id_offset: id_offset,
+                        vector_offset,
+                        metadata_offset,
+                        vector: Some(put.vector.clone()),
+                        metadata: Some(put.metadata.clone()),
+                    });
                 }
                 WriteOperation::Delete(_) => {
                     delete_count += 1;
@@ -416,6 +639,14 @@ impl LocalStorageEngine {
                         vector_dimensions: 0,
                         metadata_offset: 0,
                         metadata_len: 0,
+                    });
+                    sidecar_entries.push(FlatIndexEntrySource {
+                        is_put: false,
+                        record_id_offset: id_offset,
+                        vector_offset: 0,
+                        metadata_offset: 0,
+                        vector: None,
+                        metadata: None,
                     });
                 }
             }
@@ -459,9 +690,15 @@ impl LocalStorageEngine {
         bytes.extend_from_slice(&metadata);
         bytes.extend_from_slice(&footer_bytes);
 
-        atomic_write(&temp_path, bytes)?;
-        fs::rename(&temp_path, &final_path)
-            .map_err(|error| io_message("failed to publish segment file", error))?;
+        let flat_index = build_flat_index(segment_id.clone(), &sidecar_entries);
+        publish_segment_artifacts(
+            &temp_path,
+            &final_path,
+            &sidecar_temp_path,
+            &sidecar_path,
+            bytes,
+            &flat_index,
+        )?;
 
         let remote = descriptor
             .remote_blob
@@ -479,7 +716,7 @@ impl LocalStorageEngine {
             });
 
         Ok(SegmentMeta {
-            segment_id,
+            segment_id: segment_id.clone(),
             file_name: final_path
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
@@ -490,9 +727,50 @@ impl LocalStorageEngine {
             delete_count,
             dimensions: descriptor.dimensions,
             checksum: footer.payload_checksum,
+            approx_bytes: final_path
+                .metadata()
+                .map(|metadata| metadata.len() as usize)
+                .unwrap_or_default(),
+            index_kind: flat_index.index_kind.as_str().to_owned(),
+            index_file_name: sidecar_path
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{segment_id}.flat.json")),
+            scalar_fields: flat_index.scalar_fields,
             remote,
         })
     }
+}
+
+fn publish_segment_artifacts(
+    temp_path: &Path,
+    final_path: &Path,
+    sidecar_temp_path: &Path,
+    sidecar_path: &Path,
+    segment_bytes: Vec<u8>,
+    flat_index: &FlatIndexSidecar,
+) -> Result<()> {
+    atomic_write(temp_path, segment_bytes)?;
+    if let Err(error) = write_flat_index(sidecar_temp_path, flat_index) {
+        cleanup_file(temp_path);
+        cleanup_file(sidecar_temp_path);
+        return Err(io_message("failed to publish flat index sidecar", error));
+    }
+    if let Err(error) = fs::rename(temp_path, final_path) {
+        cleanup_file(temp_path);
+        cleanup_file(sidecar_temp_path);
+        return Err(io_message("failed to publish segment file", error));
+    }
+    if let Err(error) = fs::rename(sidecar_temp_path, sidecar_path) {
+        cleanup_file(final_path);
+        cleanup_file(sidecar_temp_path);
+        return Err(io_message("failed to publish flat index sidecar", error));
+    }
+    Ok(())
+}
+
+fn cleanup_file(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 #[async_trait]
@@ -526,6 +804,7 @@ impl StorageEngine for LocalStorageEngine {
             serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
         )?;
         self.publish_manifest(&descriptor, &Manifest::empty(0))?;
+        self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
         let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
         wal_writer.truncate()?;
         Ok(descriptor)
@@ -572,11 +851,9 @@ impl StorageEngine for LocalStorageEngine {
         }
 
         if self.should_flush(&state.descriptor, &delta_after_write) {
-            self.flush_state(CollectionState {
-                descriptor: state.descriptor.clone(),
-                manifest: state.manifest.clone(),
-                delta: delta_after_write,
-            })?;
+            self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Flush])?;
+        } else if self.should_compact(&state.descriptor, state.manifest.segments.len()) {
+            self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Compact])?;
         }
 
         Ok(CommitAck {
@@ -598,40 +875,51 @@ impl StorageEngine for LocalStorageEngine {
         collection_name: &str,
         snapshot: Option<Snapshot>,
     ) -> Result<Vec<VisibleRecord>> {
+        self.scan_exact_internal(collection_name, snapshot, true, None)
+    }
+
+    async fn scan_exact_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        self.scan_exact_internal(
+            collection_name,
+            snapshot,
+            include_mutable,
+            Some(immutable_unit_ids.into_iter().collect()),
+        )
+    }
+
+    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        self.perform_maintenance_operation(collection_name, MaintenanceOperation::Flush)
+    }
+
+    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        self.perform_maintenance_operation(collection_name, MaintenanceOperation::Compact)
+    }
+
+    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
+        self.stats_snapshot(collection_name, None).await
+    }
+
+    async fn stats_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
         let state = self.load_collection_state(
             collection_name,
             snapshot.as_ref().map(|value| value.manifest_generation),
         )?;
-        let snapshot = snapshot.unwrap_or(Snapshot {
+        let effective_snapshot = snapshot.unwrap_or(Snapshot {
             manifest_generation: state.manifest.generation,
             visible_seq_no: state.visible_seq_no(),
         });
-
-        let resolved = resolve_latest_state(&state, snapshot.visible_seq_no)?;
-        let mut records = resolved
-            .into_values()
-            .filter_map(|state| match state {
-                ResolvedState::Visible(record) => Some(record),
-                ResolvedState::Deleted { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(records)
-    }
-
-    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        let state = self.load_collection_state(collection_name, None)?;
-        self.flush_state(state)
-    }
-
-    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        let state = self.load_collection_state(collection_name, None)?;
-        self.compact_state(state)
-    }
-
-    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        let state = self.load_collection_state(collection_name, None)?;
-        let resolved = resolve_latest_state(&state, state.visible_seq_no())?;
+        let resolved =
+            resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
         let mut live_record_count = 0usize;
         let mut deleted_record_count = 0usize;
         for value in resolved.values() {
@@ -640,17 +928,27 @@ impl StorageEngine for LocalStorageEngine {
                 ResolvedState::Deleted { .. } => deleted_record_count += 1,
             }
         }
-        let visible_seq_no = state.visible_seq_no();
+        let maintenance = self.load_maintenance_status(&state.descriptor)?;
+        let delta_records = state
+            .delta
+            .iter()
+            .filter(|record| record.seq_no <= effective_snapshot.visible_seq_no)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut query_units = vec![mutable_query_unit(&delta_records)];
+        query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
 
         Ok(CollectionStats {
             collection_id: state.descriptor.collection_id.clone(),
             collection_name: state.descriptor.name.clone(),
-            manifest_generation: state.manifest.generation,
-            visible_seq_no,
-            mutable_op_count: state.delta.len(),
+            manifest_generation: effective_snapshot.manifest_generation,
+            visible_seq_no: effective_snapshot.visible_seq_no,
+            mutable_op_count: delta_records.len(),
             segment_count: state.manifest.segments.len(),
             live_record_count,
             deleted_record_count,
+            maintenance,
+            query_units,
         })
     }
 
@@ -668,6 +966,11 @@ impl StorageEngine for LocalStorageEngine {
                     "records": state.delta,
                 }),
             }),
+            InspectTarget::Maintenance => Ok(InspectReport {
+                target: "maintenance".to_owned(),
+                payload: serde_json::to_value(self.load_maintenance_status(&state.descriptor)?)
+                    .map_err(json_message)?,
+            }),
             InspectTarget::Segment(segment_id) => {
                 let segment = state
                     .manifest
@@ -684,10 +987,19 @@ impl StorageEngine for LocalStorageEngine {
                         .join("segments")
                         .join(&segment.file_name),
                 )?;
+                let index = read_flat_index(
+                    &state
+                        .descriptor
+                        .root_path
+                        .join("indexes")
+                        .join(&segment.index_file_name),
+                )
+                .map_err(|error| io_message("failed to read flat index sidecar", error))?;
                 Ok(InspectReport {
                     target: format!("segment:{segment_id}"),
                     payload: json!({
                         "segment": segment,
+                        "index": index,
                         "records": records,
                     }),
                 })
@@ -696,11 +1008,103 @@ impl StorageEngine for LocalStorageEngine {
     }
 }
 
+impl LocalStorageEngine {
+    fn scan_exact_internal(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let state = self.load_collection_state(
+            collection_name,
+            snapshot.as_ref().map(|value| value.manifest_generation),
+        )?;
+        let snapshot = snapshot.unwrap_or(Snapshot {
+            manifest_generation: state.manifest.generation,
+            visible_seq_no: state.visible_seq_no(),
+        });
+
+        let resolved = resolve_latest_state_selected(
+            &state,
+            snapshot.visible_seq_no,
+            include_mutable,
+            immutable_unit_ids,
+        )?;
+        let mut records = resolved
+            .into_values()
+            .filter_map(|state| match state {
+                ResolvedState::Visible(record) => Some(record),
+                ResolvedState::Deleted { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CollectionState {
     descriptor: CollectionDescriptor,
     manifest: Manifest,
     delta: Vec<WalRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintenanceOperation {
+    Flush,
+    Compact,
+}
+
+impl MaintenanceOperation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Flush => "flush",
+            Self::Compact => "compact",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RuntimeMaintenanceState {
+    running: bool,
+    queue: VecDeque<MaintenanceOperation>,
+}
+
+fn maintenance_coordinator() -> &'static Mutex<BTreeMap<PathBuf, RuntimeMaintenanceState>> {
+    static COORDINATOR: OnceLock<Mutex<BTreeMap<PathBuf, RuntimeMaintenanceState>>> =
+        OnceLock::new();
+    COORDINATOR.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn maintenance_operation_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn maintenance_operation_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = maintenance_operation_locks()
+        .lock()
+        .expect("maintenance operation lock map should not be poisoned");
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn maintenance_status_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn maintenance_status_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = maintenance_status_locks()
+        .lock()
+        .expect("maintenance status lock map should not be poisoned");
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 impl CollectionState {
@@ -748,7 +1152,36 @@ struct SegmentMeta {
     delete_count: usize,
     dimensions: usize,
     checksum: u32,
+    #[serde(default)]
+    approx_bytes: usize,
+    #[serde(default = "default_index_kind")]
+    index_kind: String,
+    #[serde(default)]
+    index_file_name: String,
+    #[serde(default)]
+    scalar_fields: BTreeMap<String, ScalarFieldStats>,
     remote: Option<RemoteArtifact>,
+}
+
+fn default_index_kind() -> String {
+    "flat".to_owned()
+}
+
+impl From<&SegmentMeta> for QueryUnitStats {
+    fn from(segment: &SegmentMeta) -> Self {
+        Self {
+            unit_id: segment.segment_id.clone(),
+            tier: "immutable".to_owned(),
+            index_kind: segment.index_kind.clone(),
+            index_file_name: segment.index_file_name.clone(),
+            min_seq_no: segment.min_seq_no,
+            max_seq_no: segment.max_seq_no,
+            put_count: segment.put_count,
+            delete_count: segment.delete_count,
+            approx_bytes: segment.approx_bytes,
+            scalar_fields: segment.scalar_fields.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -801,22 +1234,30 @@ enum ResolvedState {
     Deleted { id: RecordId, seq_no: SeqNo },
 }
 
-fn resolve_latest_state(
+fn resolve_latest_state_selected(
     state: &CollectionState,
     visible_seq_no: SeqNo,
+    include_mutable: bool,
+    immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
 ) -> Result<BTreeMap<RecordId, ResolvedState>> {
     let mut resolved = BTreeMap::new();
 
-    for record in state
-        .delta
-        .iter()
-        .rev()
-        .filter(|record| record.seq_no <= visible_seq_no)
-    {
-        apply_resolved_record(&mut resolved, record.clone());
+    if include_mutable {
+        for record in state
+            .delta
+            .iter()
+            .rev()
+            .filter(|record| record.seq_no <= visible_seq_no)
+        {
+            apply_resolved_record(&mut resolved, record.clone());
+        }
     }
 
-    for segment in state.manifest.segments.iter().rev() {
+    for segment in state.manifest.segments.iter().rev().filter(|segment| {
+        immutable_unit_ids
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&segment.segment_id))
+    }) {
         let records = read_segment_file(
             &state
                 .descriptor
@@ -853,6 +1294,49 @@ fn resolve_latest_from_segments(
         }
     }
     Ok(resolved)
+}
+
+fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
+    let sidecar = build_flat_index(
+        "mutable-delta",
+        &delta
+            .iter()
+            .map(|record| match &record.op {
+                WriteOperation::Put(put) => FlatIndexEntrySource {
+                    is_put: true,
+                    record_id_offset: 0,
+                    vector_offset: 0,
+                    metadata_offset: 0,
+                    vector: Some(put.vector.clone()),
+                    metadata: Some(put.metadata.clone()),
+                },
+                WriteOperation::Delete(_) => FlatIndexEntrySource {
+                    is_put: false,
+                    record_id_offset: 0,
+                    vector_offset: 0,
+                    metadata_offset: 0,
+                    vector: None,
+                    metadata: None,
+                },
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    QueryUnitStats {
+        unit_id: "mutable-delta".to_owned(),
+        tier: "mutable".to_owned(),
+        index_kind: "raw".to_owned(),
+        index_file_name: String::new(),
+        min_seq_no: delta.first().map(|record| record.seq_no).unwrap_or(0),
+        max_seq_no: delta.last().map(|record| record.seq_no).unwrap_or(0),
+        put_count: sidecar.put_count,
+        delete_count: sidecar.delete_count,
+        approx_bytes: delta
+            .iter()
+            .map(|record| approximate_record_bytes(&record.op))
+            .sum(),
+        scalar_fields: sidecar.scalar_fields,
+    }
 }
 
 fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, record: WalRecord) {
@@ -1027,11 +1511,14 @@ fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
         fs::create_dir_all(parent)
             .map_err(|error| io_message("failed to create parent directory", error))?;
     }
-    let temp_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
+    static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_path = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
             .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "tmp".to_owned())
+            .unwrap_or_else(|| "file".to_owned()),
+        std::process::id(),
+        ATOMIC_WRITE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
     ));
     let mut file = File::create(&temp_path)
         .map_err(|error| io_message("failed to create temp file", error))?;
@@ -1066,6 +1553,7 @@ fn json_message(error: serde_json::Error) -> LogPoseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logpose_index::FlatIndexEntrySource;
     use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
     use rand as _;
     use serde_json::json;
@@ -1120,6 +1608,55 @@ mod tests {
         let result = std::panic::catch_unwind(|| read_segment_file(&segment_path));
         assert!(result.is_ok(), "truncated segment should not panic");
         assert!(result.expect("result should exist").is_err());
+    }
+
+    #[test]
+    fn sidecar_publish_failure_cleans_up_published_segment_file() {
+        let root = unique_temp_dir("storage-sidecar-cleanup");
+        let temp_path = root.join("tmp").join("segment.lps.tmp");
+        let final_path = root.join("segments").join("segment.lps");
+        let sidecar_temp_path = root.join("tmp").join("segment.flat.json.tmp");
+        let sidecar_path = root.join("indexes").join("segment.flat.json");
+        fs::create_dir_all(final_path.parent().expect("segment parent should exist"))
+            .expect("segment parent should be created");
+        fs::create_dir_all(sidecar_path.parent().expect("index parent should exist"))
+            .expect("index parent should be created");
+        fs::create_dir_all(&sidecar_path).expect("directory should force sidecar publish failure");
+
+        let flat_index = build_flat_index(
+            "segment",
+            &[FlatIndexEntrySource {
+                is_put: true,
+                record_id_offset: 0,
+                vector_offset: 0,
+                metadata_offset: 0,
+                vector: Some(vec![1.0, 0.0]),
+                metadata: Some(json!({"kind":"keep"})),
+            }],
+        );
+
+        let result = publish_segment_artifacts(
+            &temp_path,
+            &final_path,
+            &sidecar_temp_path,
+            &sidecar_path,
+            b"segment-bytes".to_vec(),
+            &flat_index,
+        );
+
+        assert!(result.is_err(), "sidecar publish should fail");
+        assert!(
+            !final_path.exists(),
+            "segment file should be removed after sidecar publish failure"
+        );
+        assert!(
+            !temp_path.exists(),
+            "temporary segment file should be cleaned up after failure"
+        );
+        assert!(
+            !sidecar_temp_path.exists(),
+            "temporary sidecar file should be cleaned up after failure"
+        );
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

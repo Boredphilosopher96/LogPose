@@ -683,6 +683,11 @@ dependencies = [
 [[package]]
 name = "logpose-index"
 version = "0.1.0"
+dependencies = [
+ "logpose-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "logpose-query"
@@ -741,6 +746,7 @@ dependencies = [
  "async-trait",
  "crc32fast",
  "logpose-catalog",
+ "logpose-index",
  "logpose-query",
  "logpose-types",
  "logpose-wal",

@@ -12,6 +12,7 @@ workspace = true
 async-trait.workspace = true
 crc32fast = "1.4"
 logpose-catalog = { path = "../logpose-catalog" }
+logpose-index = { path = "../logpose-index" }
 logpose-types = { path = "../logpose-types" }
 logpose-wal = { path = "../logpose-wal" }
 serde.workspace = true

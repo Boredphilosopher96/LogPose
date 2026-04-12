@@ -113,6 +113,27 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert_eq!(matches[0]["id"], "alpha");
     assert_eq!(matches[1]["id"], "gamma");
 
+    let profiled_query = fixture.run_cli([
+        "data",
+        "query",
+        "--collection",
+        "colors",
+        "--top-k",
+        "1",
+        "--where",
+        "kind:eq:keep",
+        "--profile",
+        "--vector",
+        "1.0,0.0",
+    ]);
+    let profiled_query_stdout =
+        String::from_utf8(profiled_query.stdout).expect("stdout should be utf8");
+    let profiled_query_body: Value =
+        serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
+    assert_eq!(profiled_query_body["matches"][0]["id"], "alpha");
+    assert!(profiled_query_body["diagnostics"].is_object());
+    assert!(profiled_query_body["diagnostics"]["stage_timings"].is_object());
+
     let stats = fixture.run_cli(["data", "stats", "--collection", "colors"]);
     let stats_stdout = String::from_utf8(stats.stdout).expect("stdout should be utf8");
     let stats_body: Value =
@@ -122,6 +143,14 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert_eq!(stats_body["deleted_record_count"], 0);
     assert_eq!(stats_body["mutable_op_count"], 3);
     assert_eq!(stats_body["segment_count"], 0);
+    assert!(stats_body["maintenance"].is_object());
+    assert_eq!(
+        stats_body["query_units"]
+            .as_array()
+            .expect("query_units should be an array")
+            .len(),
+        1
+    );
 
     let wal = fixture.run_cli(["data", "inspect", "--collection", "colors", "--wal"]);
     let wal_stdout = String::from_utf8(wal.stdout).expect("stdout should be utf8");
@@ -135,6 +164,13 @@ fn data_commands_run_against_the_server_over_grpc() {
             .len(),
         3
     );
+
+    let maintenance =
+        fixture.run_cli(["data", "inspect", "--collection", "colors", "--maintenance"]);
+    let maintenance_stdout = String::from_utf8(maintenance.stdout).expect("stdout should be utf8");
+    let maintenance_body: Value =
+        serde_json::from_str(&maintenance_stdout).expect("maintenance output should be valid json");
+    assert_eq!(maintenance_body["target"], "maintenance");
 
     let flush = fixture.run_cli(["data", "flush", "--collection", "colors"]);
     let flush_stdout = String::from_utf8(flush.stdout).expect("stdout should be utf8");

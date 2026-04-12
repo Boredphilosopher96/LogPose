@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use logpose_core::AppState;
-use logpose_query::{MetadataFilter, QueryRequest, ScalarMetadataValue};
+use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, ScalarMetadataValue};
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{DistanceMetric, Snapshot, WriteOperation};
@@ -98,7 +98,7 @@ async fn query_collection(
         .filters
         .into_iter()
         .map(|(field, value)| {
-            scalar_metadata_value_from_json(&value)
+            ScalarMetadataValue::from_json(&value)
                 .map(|value| MetadataFilter { field, value })
                 .ok_or_else(|| {
                     ApiError(ServiceError::InvalidArgument(
@@ -117,6 +117,8 @@ async fn query_collection(
                 top_k: request.top_k,
                 snapshot: request.snapshot,
                 filters,
+                predicate: request.predicate,
+                explain: request.explain,
             })
             .await?,
     ))
@@ -177,6 +179,10 @@ struct QueryCollectionBody {
     snapshot: Option<Snapshot>,
     #[serde(default)]
     filters: Map<String, Value>,
+    #[serde(default)]
+    predicate: Option<Predicate>,
+    #[serde(default)]
+    explain: ExplainMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,19 +225,10 @@ fn inspect_target_from_params(params: InspectCollectionParams) -> Result<Inspect
                     "inspect target 'segment' requires segment_id".to_owned(),
                 ))
             }),
+        "maintenance" => Ok(InspectTarget::Maintenance),
         other => Err(ApiError(ServiceError::InvalidArgument(format!(
             "unsupported inspect target '{other}'"
         )))),
-    }
-}
-
-fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue> {
-    match value {
-        Value::String(value) => Some(ScalarMetadataValue::String(value.clone())),
-        Value::Number(value) => Some(ScalarMetadataValue::Number(value.clone())),
-        Value::Bool(value) => Some(ScalarMetadataValue::Bool(*value)),
-        Value::Null => Some(ScalarMetadataValue::Null),
-        Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -765,6 +762,224 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["higher"]
         );
+    }
+
+    #[tokio::test]
+    async fn query_accepts_predicate_and_profile_diagnostics() {
+        let state = Arc::new(AppState::new(test_config("rest-predicate-profile")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "put",
+                                    "id": "alpha",
+                                    "vector": [1.0, 0.0],
+                                    "metadata": {"kind": "keep", "version": 1}
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "beta",
+                                    "vector": [2.0, 0.0],
+                                    "metadata": {"kind": "drop", "version": 2}
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "gamma",
+                                    "vector": [3.0, 0.0],
+                                    "metadata": {"kind": "drop", "version": 3}
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "delta",
+                                    "vector": [4.0, 0.0],
+                                    "metadata": {"kind": "drop", "version": 4}
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "epsilon",
+                                    "vector": [5.0, 0.0],
+                                    "metadata": {"kind": "keep", "version": 5}
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(write.status(), StatusCode::OK);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 1,
+                            "predicate": {
+                                "kind": "comparison",
+                                "field": "kind",
+                                "operator": "eq",
+                                "value": "keep"
+                            },
+                            "explain": "profile"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(query.status(), StatusCode::OK);
+        let query_body = json_body(query).await;
+        assert_eq!(
+            query_body["matches"]
+                .as_array()
+                .expect("matches should be an array")
+                .iter()
+                .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+                .collect::<Vec<_>>(),
+            vec!["epsilon"]
+        );
+        assert_eq!(
+            query_body["diagnostics"]["chosen_plan"],
+            "predicate_first_exact"
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["planning_micros"]
+                .as_u64()
+                .is_some(),
+            "profile mode should include stage timings"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_supports_maintenance_target() {
+        let state = Arc::new(AppState::new(test_config("rest-maintenance")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let inspect = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?target=maintenance")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(inspect.status(), StatusCode::OK);
+        let inspect_body = json_body(inspect).await;
+        assert_eq!(inspect_body["target"], "maintenance");
+        assert!(inspect_body["payload"]["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn query_rejects_malformed_predicates() {
+        let state = Arc::new(AppState::new(test_config("rest-invalid-predicate")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 1,
+                            "predicate": {
+                                "kind": "comparison",
+                                "field": "kind",
+                                "operator": "eq"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn json_body(response: axum::response::Response) -> Value {

@@ -12,11 +12,16 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_config as _;
 #[cfg(test)]
 use logpose_core as _;
-use logpose_query::{MetadataFilter, QueryMatch, QueryRequest, QueryResponse, ScalarMetadataValue};
+use logpose_query::{
+    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator,
+    QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings,
+    ScalarMetadataValue,
+};
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionStats, CommitAck, DistanceMetric, LogPoseError, NodeMetadata, RecordId,
-    RemoteBlobConfig, Snapshot, WriteOperation,
+    CollectionId, CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus,
+    NodeMetadata, QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -164,6 +169,8 @@ impl LogPoseClient {
                     .into_iter()
                     .map(metadata_filter_to_proto)
                     .collect::<Result<Vec<_>>>()?,
+                predicate: request.predicate.map(predicate_to_proto).transpose()?,
+                explain: explain_mode_to_proto(request.explain) as i32,
             }))
             .await?
             .into_inner();
@@ -180,6 +187,10 @@ impl LogPoseClient {
                 .into_iter()
                 .map(query_match_from_proto)
                 .collect::<Result<Vec<_>>>()?,
+            diagnostics: response
+                .diagnostics
+                .map(query_diagnostics_from_proto)
+                .transpose()?,
         })
     }
 
@@ -202,6 +213,16 @@ impl LogPoseClient {
             segment_count: response.segment_count as usize,
             live_record_count: response.live_record_count as usize,
             deleted_record_count: response.deleted_record_count as usize,
+            maintenance: response
+                .maintenance
+                .map(maintenance_status_from_proto)
+                .transpose()?
+                .unwrap_or_default(),
+            query_units: response
+                .query_units
+                .into_iter()
+                .map(query_unit_stats_from_proto)
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -328,6 +349,61 @@ fn metadata_filter_to_proto(filter: MetadataFilter) -> Result<proto::MetadataFil
     })
 }
 
+fn predicate_to_proto(predicate: Predicate) -> Result<proto::Predicate> {
+    let node = match predicate {
+        Predicate::And { children } => proto::predicate::Node::And(proto::PredicateList {
+            children: children
+                .into_iter()
+                .map(predicate_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Predicate::Or { children } => proto::predicate::Node::Or(proto::PredicateList {
+            children: children
+                .into_iter()
+                .map(predicate_to_proto)
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        Predicate::Not { child } => proto::predicate::Node::Not(Box::new(proto::PredicateNot {
+            child: Some(Box::new(predicate_to_proto(*child)?)),
+        })),
+        Predicate::Comparison(comparison) => {
+            proto::predicate::Node::Comparison(predicate_comparison_to_proto(comparison)?)
+        }
+    };
+    Ok(proto::Predicate { node: Some(node) })
+}
+
+fn predicate_comparison_to_proto(
+    comparison: PredicateComparison,
+) -> Result<proto::PredicateComparison> {
+    Ok(proto::PredicateComparison {
+        field: comparison.field,
+        operator: predicate_operator_to_proto(comparison.operator) as i32,
+        value: comparison.value.map(scalar_value_to_proto).transpose()?,
+    })
+}
+
+fn predicate_operator_to_proto(operator: PredicateOperator) -> proto::PredicateOperator {
+    match operator {
+        PredicateOperator::Eq => proto::PredicateOperator::Eq,
+        PredicateOperator::Ne => proto::PredicateOperator::Ne,
+        PredicateOperator::Lt => proto::PredicateOperator::Lt,
+        PredicateOperator::Lte => proto::PredicateOperator::Lte,
+        PredicateOperator::Gt => proto::PredicateOperator::Gt,
+        PredicateOperator::Gte => proto::PredicateOperator::Gte,
+        PredicateOperator::Exists => proto::PredicateOperator::Exists,
+        PredicateOperator::IsNull => proto::PredicateOperator::IsNull,
+    }
+}
+
+fn explain_mode_to_proto(mode: ExplainMode) -> proto::ExplainMode {
+    match mode {
+        ExplainMode::None => proto::ExplainMode::None,
+        ExplainMode::Plan => proto::ExplainMode::Plan,
+        ExplainMode::Profile => proto::ExplainMode::Profile,
+    }
+}
+
 fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue> {
     let kind = match value {
         ScalarMetadataValue::String(value) => proto::scalar_value::Kind::StringValue(value),
@@ -351,6 +427,30 @@ fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue> {
     Ok(ScalarValue { kind: Some(kind) })
 }
 
+fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue> {
+    match value.kind {
+        Some(proto::scalar_value::Kind::StringValue(value)) => {
+            Ok(ScalarMetadataValue::String(value))
+        }
+        Some(proto::scalar_value::Kind::Int64Value(value)) => {
+            Ok(ScalarMetadataValue::Number(value.into()))
+        }
+        Some(proto::scalar_value::Kind::Uint64Value(value)) => {
+            Ok(ScalarMetadataValue::Number(value.into()))
+        }
+        Some(proto::scalar_value::Kind::DoubleValue(value)) => serde_json::Number::from_f64(value)
+            .map(ScalarMetadataValue::Number)
+            .ok_or_else(|| {
+                ClientError::InvalidResponse("numeric scalar value must be finite".to_owned())
+            }),
+        Some(proto::scalar_value::Kind::BoolValue(value)) => Ok(ScalarMetadataValue::Bool(value)),
+        Some(proto::scalar_value::Kind::NullValue(_)) => Ok(ScalarMetadataValue::Null),
+        None => Err(ClientError::InvalidResponse(
+            "scalar value kind is required".to_owned(),
+        )),
+    }
+}
+
 fn snapshot_to_proto(snapshot: Snapshot) -> proto::Snapshot {
     proto::Snapshot {
         manifest_generation: snapshot.manifest_generation,
@@ -372,6 +472,47 @@ fn snapshot_reply_from_proto(snapshot: proto::SnapshotReply) -> Snapshot {
     }
 }
 
+fn query_diagnostics_from_proto(diagnostics: proto::QueryDiagnostics) -> Result<QueryDiagnostics> {
+    Ok(QueryDiagnostics {
+        chosen_plan: query_plan_kind_from_proto(diagnostics.chosen_plan)?,
+        planner_reason: diagnostics.planner_reason,
+        estimated_selectivity: diagnostics.estimated_selectivity,
+        units_considered: diagnostics.units_considered as usize,
+        units_pruned: diagnostics.units_pruned as usize,
+        units_scanned: diagnostics.units_scanned as usize,
+        candidates_before_filter: diagnostics.candidates_before_filter as usize,
+        candidates_after_filter: diagnostics.candidates_after_filter as usize,
+        rerank_count: diagnostics.rerank_count as usize,
+        stage_timings: diagnostics
+            .stage_timings
+            .map(query_stage_timings_from_proto),
+    })
+}
+
+fn query_plan_kind_from_proto(kind: i32) -> Result<QueryPlanKind> {
+    match proto::QueryPlanKind::try_from(kind)
+        .map_err(|_| ClientError::InvalidResponse(format!("unknown query plan kind '{kind}'")))?
+    {
+        proto::QueryPlanKind::Unspecified => Err(ClientError::InvalidResponse(
+            "query plan kind must be set".to_owned(),
+        )),
+        proto::QueryPlanKind::UnfilteredExactScan => Ok(QueryPlanKind::UnfilteredExactScan),
+        proto::QueryPlanKind::PredicateFirstExact => Ok(QueryPlanKind::PredicateFirstExact),
+        proto::QueryPlanKind::VectorFirstExact => Ok(QueryPlanKind::VectorFirstExact),
+        proto::QueryPlanKind::TinyPopulationExactFallback => {
+            Ok(QueryPlanKind::TinyPopulationExactFallback)
+        }
+    }
+}
+
+fn query_stage_timings_from_proto(timings: proto::QueryStageTimings) -> QueryStageTimings {
+    QueryStageTimings {
+        planning_micros: timings.planning_micros,
+        predicate_micros: timings.predicate_micros,
+        ranking_micros: timings.ranking_micros,
+    }
+}
+
 fn query_match_from_proto(candidate: proto::QueryMatch) -> Result<QueryMatch> {
     Ok(QueryMatch {
         id: RecordId::new(candidate.id),
@@ -380,18 +521,62 @@ fn query_match_from_proto(candidate: proto::QueryMatch) -> Result<QueryMatch> {
     })
 }
 
+fn maintenance_status_from_proto(status: proto::MaintenanceStatus) -> Result<MaintenanceStatus> {
+    Ok(MaintenanceStatus {
+        pending: status.pending,
+        in_progress: status.in_progress,
+        last_error: status.last_error,
+        completed_runs: status.completed_runs as usize,
+    })
+}
+
+fn query_unit_stats_from_proto(stats: proto::QueryUnitStats) -> Result<QueryUnitStats> {
+    Ok(QueryUnitStats {
+        unit_id: stats.unit_id,
+        tier: stats.tier,
+        index_kind: stats.index_kind,
+        index_file_name: stats.index_file_name,
+        min_seq_no: stats.min_seq_no,
+        max_seq_no: stats.max_seq_no,
+        put_count: stats.put_count as usize,
+        delete_count: stats.delete_count as usize,
+        approx_bytes: stats.approx_bytes as usize,
+        scalar_fields: stats
+            .scalar_fields
+            .into_iter()
+            .map(|(field, stats)| scalar_field_stats_from_proto(stats).map(|stats| (field, stats)))
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn scalar_field_stats_from_proto(stats: proto::ScalarFieldStats) -> Result<ScalarFieldStats> {
+    Ok(ScalarFieldStats {
+        present_count: stats.present_count as usize,
+        null_count: stats.null_count as usize,
+        value_counts: stats
+            .value_counts
+            .into_iter()
+            .map(|(value, count)| (value, count as usize))
+            .collect(),
+        min: stats.min.map(scalar_value_from_proto).transpose()?,
+        max: stats.max.map(scalar_value_from_proto).transpose()?,
+        distinct_count: stats.distinct_count as usize,
+    })
+}
+
 fn inspect_target_to_proto(target: &InspectTarget) -> proto::InspectTarget {
     match target {
         InspectTarget::Manifest => proto::InspectTarget::Manifest,
         InspectTarget::Wal => proto::InspectTarget::Wal,
         InspectTarget::Segment(_) => proto::InspectTarget::Segment,
+        InspectTarget::Maintenance => proto::InspectTarget::Maintenance,
     }
 }
 
 fn inspect_segment_id(target: &InspectTarget) -> String {
     match target {
         InspectTarget::Segment(segment_id) => segment_id.clone(),
-        InspectTarget::Manifest | InspectTarget::Wal => String::new(),
+        InspectTarget::Manifest | InspectTarget::Wal | InspectTarget::Maintenance => String::new(),
     }
 }
 

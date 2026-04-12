@@ -112,12 +112,55 @@ message MetadataFilter {
   ScalarValue value = 2;
 }
 
+enum PredicateOperator {
+  PREDICATE_OPERATOR_UNSPECIFIED = 0;
+  PREDICATE_OPERATOR_EQ = 1;
+  PREDICATE_OPERATOR_NE = 2;
+  PREDICATE_OPERATOR_LT = 3;
+  PREDICATE_OPERATOR_LTE = 4;
+  PREDICATE_OPERATOR_GT = 5;
+  PREDICATE_OPERATOR_GTE = 6;
+  PREDICATE_OPERATOR_EXISTS = 7;
+  PREDICATE_OPERATOR_IS_NULL = 8;
+}
+
+message PredicateComparison {
+  string field = 1;
+  PredicateOperator operator = 2;
+  ScalarValue value = 3;
+}
+
+message PredicateList {
+  repeated Predicate children = 1;
+}
+
+message PredicateNot {
+  Predicate child = 1;
+}
+
+message Predicate {
+  oneof node {
+    PredicateList and = 1;
+    PredicateList or = 2;
+    PredicateNot not = 3;
+    PredicateComparison comparison = 4;
+  }
+}
+
+enum ExplainMode {
+  EXPLAIN_MODE_NONE = 0;
+  EXPLAIN_MODE_PLAN = 1;
+  EXPLAIN_MODE_PROFILE = 2;
+}
+
 message QueryCollectionRequest {
   string collection_name = 1;
   repeated float vector = 2;
   uint64 top_k = 3;
   Snapshot snapshot = 4;
   repeated MetadataFilter filters = 5;
+  Predicate predicate = 6;
+  ExplainMode explain = 7;
 }
 
 message QueryMatch {
@@ -126,12 +169,40 @@ message QueryMatch {
   string metadata_json = 3;
 }
 
+enum QueryPlanKind {
+  QUERY_PLAN_KIND_UNSPECIFIED = 0;
+  QUERY_PLAN_KIND_UNFILTERED_EXACT_SCAN = 1;
+  QUERY_PLAN_KIND_PREDICATE_FIRST_EXACT = 2;
+  QUERY_PLAN_KIND_VECTOR_FIRST_EXACT = 3;
+  QUERY_PLAN_KIND_TINY_POPULATION_EXACT_FALLBACK = 4;
+}
+
+message QueryStageTimings {
+  uint64 planning_micros = 1;
+  uint64 predicate_micros = 2;
+  uint64 ranking_micros = 3;
+}
+
+message QueryDiagnostics {
+  QueryPlanKind chosen_plan = 1;
+  string planner_reason = 2;
+  float estimated_selectivity = 3;
+  uint64 units_considered = 4;
+  uint64 units_pruned = 5;
+  uint64 units_scanned = 6;
+  uint64 candidates_before_filter = 7;
+  uint64 candidates_after_filter = 8;
+  uint64 rerank_count = 9;
+  QueryStageTimings stage_timings = 10;
+}
+
 message QueryCollectionReply {
   DistanceMetric metric = 1;
   uint64 top_k = 2;
   uint64 returned = 3;
   Snapshot snapshot = 4;
   repeated QueryMatch matches = 5;
+  QueryDiagnostics diagnostics = 6;
 }
 
 message GetCollectionStatsRequest {
@@ -147,6 +218,8 @@ message CollectionStatsReply {
   uint64 segment_count = 6;
   uint64 live_record_count = 7;
   uint64 deleted_record_count = 8;
+  MaintenanceStatus maintenance = 9;
+  repeated QueryUnitStats query_units = 10;
 }
 
 message FlushCollectionRequest {
@@ -161,6 +234,7 @@ enum InspectTarget {
   INSPECT_TARGET_MANIFEST = 0;
   INSPECT_TARGET_WAL = 1;
   INSPECT_TARGET_SEGMENT = 2;
+  INSPECT_TARGET_MAINTENANCE = 3;
 }
 
 message InspectCollectionRequest {
@@ -172,4 +246,33 @@ message InspectCollectionRequest {
 message InspectCollectionReply {
   string target = 1;
   string payload_json = 2;
+}
+
+message MaintenanceStatus {
+  repeated string pending = 1;
+  optional string in_progress = 2;
+  optional string last_error = 3;
+  uint64 completed_runs = 4;
+}
+
+message ScalarFieldStats {
+  uint64 present_count = 1;
+  uint64 null_count = 2;
+  map<string, uint64> value_counts = 3;
+  ScalarValue min = 4;
+  ScalarValue max = 5;
+  uint64 distinct_count = 6;
+}
+
+message QueryUnitStats {
+  string unit_id = 1;
+  string tier = 2;
+  string index_kind = 3;
+  string index_file_name = 4;
+  uint64 min_seq_no = 5;
+  uint64 max_seq_no = 6;
+  uint64 put_count = 7;
+  uint64 delete_count = 8;
+  uint64 approx_bytes = 9;
+  map<string, ScalarFieldStats> scalar_fields = 10;
 }

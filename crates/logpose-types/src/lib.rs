@@ -1,8 +1,8 @@
 //! Shared domain types for LogPose.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::fmt;
+use serde_json::{Number, Value};
+use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -272,6 +272,100 @@ pub struct VisibleRecord {
     pub seq_no: SeqNo,
 }
 
+/// Scalar metadata value supported by query predicates and planner statistics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ScalarMetadataValue {
+    /// Match a string metadata value.
+    String(String),
+    /// Match a numeric metadata value without losing integer precision.
+    Number(Number),
+    /// Match a boolean metadata value.
+    Bool(bool),
+    /// Match a null metadata value.
+    Null,
+}
+
+impl ScalarMetadataValue {
+    /// Convert a JSON value into a supported top-level scalar, if possible.
+    #[must_use]
+    pub fn from_json(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(value) => Some(Self::String(value.clone())),
+            Value::Number(value) => Some(Self::Number(value.clone())),
+            Value::Bool(value) => Some(Self::Bool(*value)),
+            Value::Null => Some(Self::Null),
+            Value::Array(_) | Value::Object(_) => None,
+        }
+    }
+
+    /// Render a stable string key for planner summaries.
+    #[must_use]
+    pub fn summary_key(&self) -> String {
+        match self {
+            Self::String(value) => format!("string:{value}"),
+            Self::Number(value) => format!("number:{value}"),
+            Self::Bool(value) => format!("bool:{value}"),
+            Self::Null => "null".to_owned(),
+        }
+    }
+}
+
+/// Planner-visible scalar field summary for a queryable unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScalarFieldStats {
+    /// Number of records where the field exists.
+    pub present_count: usize,
+    /// Number of records where the field is explicitly null.
+    pub null_count: usize,
+    /// Number of distinct scalar values seen for the field.
+    pub distinct_count: usize,
+    /// Minimum scalar value when an ordered comparison exists.
+    pub min: Option<ScalarMetadataValue>,
+    /// Maximum scalar value when an ordered comparison exists.
+    pub max: Option<ScalarMetadataValue>,
+    /// Stable value histogram keyed by scalar summary string.
+    pub value_counts: BTreeMap<String, usize>,
+}
+
+/// Background maintenance state surfaced to operators.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceStatus {
+    /// Operations waiting to run.
+    pub pending: Vec<String>,
+    /// Operation currently executing, if any.
+    pub in_progress: Option<String>,
+    /// Most recent maintenance failure.
+    pub last_error: Option<String>,
+    /// Number of successfully completed maintenance operations.
+    pub completed_runs: usize,
+}
+
+/// Planner-visible description of a mutable or immutable queryable unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryUnitStats {
+    /// Stable identifier for the unit.
+    pub unit_id: String,
+    /// Logical storage tier for the unit.
+    pub tier: String,
+    /// Index family available for the unit.
+    pub index_kind: String,
+    /// Sidecar or index file name when one exists.
+    pub index_file_name: String,
+    /// Lowest sequence number represented by the unit.
+    pub min_seq_no: SeqNo,
+    /// Highest sequence number represented by the unit.
+    pub max_seq_no: SeqNo,
+    /// Number of put entries in the unit.
+    pub put_count: usize,
+    /// Number of delete entries in the unit.
+    pub delete_count: usize,
+    /// Approximate on-disk or in-memory bytes attributable to the unit.
+    pub approx_bytes: usize,
+    /// Planner-visible scalar summaries for top-level metadata fields.
+    pub scalar_fields: BTreeMap<String, ScalarFieldStats>,
+}
+
 /// Collection-level storage statistics surfaced to the CLI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionStats {
@@ -291,4 +385,8 @@ pub struct CollectionStats {
     pub live_record_count: usize,
     /// Number of tombstoned record identifiers still present in storage state.
     pub deleted_record_count: usize,
+    /// Current background maintenance state.
+    pub maintenance: MaintenanceStatus,
+    /// Planner-visible mutable and immutable queryable units.
+    pub query_units: Vec<QueryUnitStats>,
 }

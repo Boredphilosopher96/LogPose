@@ -197,9 +197,8 @@ impl From<QueryError> for ServiceError {
     fn from(error: QueryError) -> Self {
         match error {
             QueryError::RequestVectorDimensionMismatch { .. }
-            | QueryError::VectorDimensionMismatch { .. } => {
-                Self::InvalidArgument(error.to_string())
-            }
+            | QueryError::VectorDimensionMismatch { .. }
+            | QueryError::InvalidPredicate(_) => Self::InvalidArgument(error.to_string()),
             QueryError::StoredVectorDimensionMismatch { .. } => Self::Internal(error.to_string()),
             QueryError::Storage(error) => error.into(),
         }

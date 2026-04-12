@@ -1,4 +1,6 @@
-# Phase 2: Write-Friendly Storage
+# ~~Phase 2: Write-Friendly Storage~~
+
+**Done marker:** Phase 2 is complete.
 
 ## Goal
 
@@ -34,6 +36,10 @@ The system should still prefer correctness and predictable maintenance over inde
 - storage stats are informative enough to explain backlog, tier sizes, and maintenance cost
 - the query path no longer depends on a monolithic storage view that hides tier differences
 
+## Status
+
+Phase 2 is done.
+
 ## Testing Direction
 
 Phase 2 should move the testing ladder upward, not just widen the unit suite:
@@ -49,4 +55,4 @@ This is the bridge from today's generative harnesses toward future simulation-or
 
 Planner quality depends on real storage structure.
 
-Once the engine has mutable and immutable tiers, tombstones, and per-unit statistics, LogPose can begin choosing query strategies based on actual data layout instead of only fixed exact-query behavior. That is the foundation for Phase 3.
+The engine now has mutable and immutable tiers, tombstones, per-unit statistics, background maintenance, and exact flat sidecars for immutable units. That foundation is in place, and Phase 3 can build planner behavior on top of real storage structure instead of a monolithic exact-scan view.
