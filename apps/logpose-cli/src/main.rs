@@ -1,11 +1,21 @@
 //! LogPose operator CLI.
 
+#[cfg(test)]
+use logpose_api_grpc as _;
+#[cfg(test)]
+use logpose_api_rest as _;
+#[cfg(test)]
+use logpose_core as _;
+
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
-use logpose_query::{QueryRequest, query_exact};
-use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
-use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
-use serde::Deserialize;
+use logpose_client::LogPoseClient;
+use logpose_query::{MetadataFilter, QueryRequest, ScalarMetadataValue};
+use logpose_storage::{CreateCollectionRequest, InspectTarget};
+use logpose_types::{
+    DeleteRecord, DistanceMetric, NodeMetadata, PutRecord, RecordId, Snapshot, WriteOperation,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs::File,
@@ -57,8 +67,10 @@ enum DiagnosticsCommand {
 
 #[derive(Debug, Subcommand)]
 enum DataCommand {
-    /// Create a new local collection.
+    /// Create a new collection.
     CreateCollection(CreateCollectionArgs),
+    /// Fetch collection metadata.
+    GetCollection(CollectionArgs),
     /// Ingest JSONL records into a collection.
     Put(PutArgs),
     /// Tombstone a record id in a collection.
@@ -115,10 +127,22 @@ struct QueryArgs {
     top_k: usize,
     #[arg(long, value_parser = parse_query_vector)]
     vector: QueryVector,
+    #[arg(long = "filter", value_parser = parse_query_filter)]
+    filters: Vec<QueryFilter>,
+    #[arg(long)]
+    snapshot_manifest_generation: Option<u64>,
+    #[arg(long)]
+    snapshot_visible_seq_no: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 struct QueryVector(Vec<f32>);
+
+#[derive(Clone, Debug)]
+struct QueryFilter {
+    field: String,
+    value: ScalarMetadataValue,
+}
 
 #[derive(Debug, Args)]
 struct InspectArgs {
@@ -140,35 +164,45 @@ struct JsonlRecord {
     metadata: Value,
 }
 
+#[derive(Debug, Serialize)]
+struct DiagnosticsStatus {
+    #[serde(flatten)]
+    metadata: NodeMetadata,
+    rest_endpoint: String,
+    grpc_endpoint: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = logpose_config::LogPoseConfig::load().context("failed to load configuration")?;
     logpose_telemetry::init(&config.log_filter);
-    let engine = LocalStorageEngine::new(&config.storage_root);
 
     match cli.command {
         Commands::Admin {
             command: AdminCommand::ShowConfig,
         } => {
-            println!("{config:#?}");
+            print_json(&config)?;
         }
         Commands::Diagnostics {
             command: DiagnosticsCommand::Status,
         } => {
-            println!(
-                "LogPose node '{}' listening on REST {}:{} and gRPC {}:{}",
-                config.node_name,
-                config.rest_host,
-                config.rest_port,
-                config.grpc_host,
-                config.grpc_port
-            );
+            let client = connect_client(&config).await?;
+            let metadata = client
+                .metadata()
+                .await
+                .context("failed to fetch server metadata")?;
+            print_json(&DiagnosticsStatus {
+                metadata,
+                rest_endpoint: rest_endpoint(&config),
+                grpc_endpoint: grpc_endpoint(&config),
+            })?;
         }
         Commands::Data {
             command: DataCommand::CreateCollection(args),
         } => {
-            let descriptor = engine
+            let client = connect_client(&config).await?;
+            let descriptor = client
                 .create_collection(CreateCollectionRequest {
                     name: args.name,
                     dimensions: args.dimensions,
@@ -179,10 +213,21 @@ async fn main() -> anyhow::Result<()> {
             print_json(&descriptor)?;
         }
         Commands::Data {
+            command: DataCommand::GetCollection(args),
+        } => {
+            let client = connect_client(&config).await?;
+            let descriptor = client
+                .get_collection(&args.collection)
+                .await
+                .context("failed to fetch collection")?;
+            print_json(&descriptor)?;
+        }
+        Commands::Data {
             command: DataCommand::Put(args),
         } => {
             let operations = read_jsonl_puts(&args.input)?;
-            let ack = engine
+            let client = connect_client(&config).await?;
+            let ack = client
                 .write(&args.collection, operations)
                 .await
                 .context("failed to write records")?;
@@ -191,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Delete(args),
         } => {
-            let ack = engine
+            let client = connect_client(&config).await?;
+            let ack = client
                 .write(
                     &args.collection,
                     vec![WriteOperation::Delete(DeleteRecord {
@@ -205,7 +251,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Flush(args),
         } => {
-            let snapshot = engine
+            let client = connect_client(&config).await?;
+            let snapshot = client
                 .flush(&args.collection)
                 .await
                 .context("failed to flush collection")?;
@@ -214,7 +261,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Compact(args),
         } => {
-            let snapshot = engine
+            let client = connect_client(&config).await?;
+            let snapshot = client
                 .compact(&args.collection)
                 .await
                 .context("failed to compact collection")?;
@@ -223,24 +271,33 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Query(args),
         } => {
-            let response = query_exact(
-                &engine,
-                QueryRequest {
+            let snapshot = query_snapshot_from_args(&args)?;
+            let filters = args
+                .filters
+                .into_iter()
+                .map(|filter| MetadataFilter {
+                    field: filter.field,
+                    value: filter.value,
+                })
+                .collect();
+            let client = connect_client(&config).await?;
+            let response = client
+                .query(QueryRequest {
                     collection_name: args.collection,
                     vector: args.vector.0,
                     top_k: args.top_k,
-                    snapshot: None,
-                    filters: Vec::new(),
-                },
-            )
-            .await
-            .context("failed to query collection")?;
+                    snapshot,
+                    filters,
+                })
+                .await
+                .context("failed to query collection")?;
             print_json(&response)?;
         }
         Commands::Data {
             command: DataCommand::Stats(args),
         } => {
-            let stats = engine
+            let client = connect_client(&config).await?;
+            let stats = client
                 .stats(&args.collection)
                 .await
                 .context("failed to read collection stats")?;
@@ -249,8 +306,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Inspect(args),
         } => {
+            let client = connect_client(&config).await?;
             let target = inspect_target_from_args(&args);
-            let report = engine
+            let report = client
                 .inspect(&args.collection, target)
                 .await
                 .context("failed to inspect collection")?;
@@ -261,6 +319,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn connect_client(config: &logpose_config::LogPoseConfig) -> anyhow::Result<LogPoseClient> {
+    LogPoseClient::connect(grpc_endpoint(config))
+        .await
+        .with_context(|| format!("failed to connect to {}", grpc_endpoint(config)))
+}
+
+fn rest_endpoint(config: &logpose_config::LogPoseConfig) -> String {
+    format!("http://{}:{}", config.rest_host, config.rest_port)
+}
+
+fn grpc_endpoint(config: &logpose_config::LogPoseConfig) -> String {
+    format!("http://{}:{}", config.grpc_host, config.grpc_port)
+}
+
 fn inspect_target_from_args(args: &InspectArgs) -> InspectTarget {
     if args.wal {
         InspectTarget::Wal
@@ -268,6 +340,22 @@ fn inspect_target_from_args(args: &InspectArgs) -> InspectTarget {
         InspectTarget::Segment(segment_id.clone())
     } else {
         InspectTarget::Manifest
+    }
+}
+
+fn query_snapshot_from_args(args: &QueryArgs) -> anyhow::Result<Option<Snapshot>> {
+    match (
+        args.snapshot_manifest_generation,
+        args.snapshot_visible_seq_no,
+    ) {
+        (Some(manifest_generation), Some(visible_seq_no)) => Ok(Some(Snapshot {
+            manifest_generation,
+            visible_seq_no,
+        })),
+        (None, None) => Ok(None),
+        _ => bail!(
+            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+        ),
     }
 }
 
@@ -293,6 +381,39 @@ fn parse_query_vector(value: &str) -> Result<QueryVector, String> {
         })
         .collect::<Result<Vec<_>, _>>()
         .map(QueryVector)
+}
+
+fn parse_query_filter(value: &str) -> Result<QueryFilter, String> {
+    let (field, raw_value) = value
+        .split_once('=')
+        .ok_or_else(|| "filters must use field=value syntax".to_owned())?;
+    let field = field.trim();
+    if field.is_empty() {
+        return Err("filter field must not be empty".to_owned());
+    }
+
+    let scalar = parse_scalar_metadata_value(raw_value.trim())?;
+    Ok(QueryFilter {
+        field: field.to_owned(),
+        value: scalar,
+    })
+}
+
+fn parse_scalar_metadata_value(value: &str) -> Result<ScalarMetadataValue, String> {
+    let json_value =
+        serde_json::from_str::<Value>(value).unwrap_or_else(|_| Value::String(value.to_owned()));
+    scalar_metadata_value_from_json(&json_value)
+        .ok_or_else(|| "query filters must contain only scalar JSON values".to_owned())
+}
+
+fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue> {
+    match value {
+        Value::String(value) => Some(ScalarMetadataValue::String(value.clone())),
+        Value::Number(value) => Some(ScalarMetadataValue::Number(value.clone())),
+        Value::Bool(value) => Some(ScalarMetadataValue::Bool(*value)),
+        Value::Null => Some(ScalarMetadataValue::Null),
+        Value::Array(_) | Value::Object(_) => None,
+    }
 }
 
 fn read_jsonl_puts(path: &Path) -> anyhow::Result<Vec<WriteOperation>> {

@@ -9,5 +9,17 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+logpose-api-grpc = { path = "../logpose-api-grpc" }
+logpose-catalog = { path = "../logpose-catalog" }
+logpose-query = { path = "../logpose-query" }
+logpose-storage = { path = "../logpose-storage" }
+logpose-types = { path = "../logpose-types" }
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
 
+[dev-dependencies]
+logpose-config = { path = "../logpose-config" }
+logpose-core = { path = "../logpose-core" }
+tokio.workspace = true

@@ -629,7 +629,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "logpose-api-grpc",
+ "logpose-api-rest",
+ "logpose-client",
  "logpose-config",
+ "logpose-core",
  "logpose-query",
  "logpose-storage",
  "logpose-telemetry",
@@ -643,7 +647,18 @@ dependencies = [
 name = "logpose-client"
 version = "0.1.0"
 dependencies = [
+ "logpose-api-grpc",
+ "logpose-catalog",
+ "logpose-config",
+ "logpose-core",
+ "logpose-query",
+ "logpose-storage",
+ "logpose-types",
  "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

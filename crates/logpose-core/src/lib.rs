@@ -2,7 +2,7 @@
 
 use logpose_config::LogPoseConfig;
 use logpose_service::LogPoseDataService;
-use logpose_types::BuildInfo;
+use logpose_types::{BuildInfo, NodeMetadata};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -27,5 +27,11 @@ impl AppState {
             config,
             build: BuildInfo::current(),
         }
+    }
+
+    /// Canonical node metadata exposed through operator-visible surfaces.
+    #[must_use]
+    pub fn metadata(&self) -> NodeMetadata {
+        NodeMetadata::new(self.config.node_name.clone(), &self.build)
     }
 }
