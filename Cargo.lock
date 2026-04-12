@@ -213,6 +213,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -573,6 +582,10 @@ version = "0.1.0"
 [[package]]
 name = "logpose-catalog"
 version = "0.1.0"
+dependencies = [
+ "logpose-types",
+ "serde",
+]
 
 [[package]]
 name = "logpose-cli"
@@ -581,7 +594,12 @@ dependencies = [
  "anyhow",
  "clap",
  "logpose-config",
+ "logpose-storage",
  "logpose-telemetry",
+ "logpose-types",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -636,6 +654,14 @@ name = "logpose-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "crc32fast",
+ "logpose-catalog",
+ "logpose-types",
+ "logpose-wal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -650,6 +676,7 @@ name = "logpose-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
@@ -657,6 +684,12 @@ dependencies = [
 [[package]]
 name = "logpose-wal"
 version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "logpose-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "matchers"
