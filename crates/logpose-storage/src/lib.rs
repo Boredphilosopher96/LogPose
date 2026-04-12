@@ -7,7 +7,7 @@ use logpose_types::{
     CollectionStats, CommitAck, DistanceMetric, LogPoseError, PutRecord, RecordId, Result, SeqNo,
     Snapshot, VisibleRecord, WriteOperation,
 };
-use logpose_wal::{WalRecord, WalWriter, replay_dir};
+use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -291,8 +291,12 @@ impl LocalStorageEngine {
         };
         self.publish_manifest(&state.descriptor, &next_manifest)?;
 
-        let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
-        wal_writer.truncate()?;
+        let rolled_path = state
+            .descriptor
+            .root_path
+            .join("wal")
+            .join(format!("{checkpoint_seq_no:020}.wal"));
+        rotate_active(Self::active_wal_path(&state.descriptor), rolled_path)?;
 
         Ok(Snapshot {
             manifest_generation: next_manifest.generation,
@@ -884,37 +888,45 @@ fn read_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
     }
 
     let mut offset = 4usize;
-    let read_len = |bytes: &[u8], offset: &mut usize| -> usize {
+    let read_len = |bytes: &[u8], offset: &mut usize| -> Result<usize> {
+        let slice = checked_slice(bytes, *offset, 8, "segment length header")?;
         let value = u64::from_le_bytes(
-            bytes[*offset..*offset + 8]
+            slice
                 .try_into()
-                .expect("segment length slice should fit"),
+                .expect("segment length slice should fit after bounds check"),
         ) as usize;
         *offset += 8;
-        value
+        Ok(value)
     };
-    let header_len = read_len(&bytes, &mut offset);
-    let entry_len = read_len(&bytes, &mut offset);
-    let ids_len = read_len(&bytes, &mut offset);
-    let vectors_len = read_len(&bytes, &mut offset);
-    let metadata_len = read_len(&bytes, &mut offset);
-    let footer_len = read_len(&bytes, &mut offset);
+    let header_len = read_len(&bytes, &mut offset)?;
+    let entry_len = read_len(&bytes, &mut offset)?;
+    let ids_len = read_len(&bytes, &mut offset)?;
+    let vectors_len = read_len(&bytes, &mut offset)?;
+    let metadata_len = read_len(&bytes, &mut offset)?;
+    let footer_len = read_len(&bytes, &mut offset)?;
 
     let header: SegmentHeader =
-        serde_json::from_slice(&bytes[offset..offset + header_len]).map_err(json_message)?;
+        serde_json::from_slice(checked_slice(&bytes, offset, header_len, "segment header")?)
+            .map_err(json_message)?;
     offset += header_len;
-    let entries: Vec<SegmentEntry> =
-        serde_json::from_slice(&bytes[offset..offset + entry_len]).map_err(json_message)?;
+    let entries: Vec<SegmentEntry> = serde_json::from_slice(checked_slice(
+        &bytes,
+        offset,
+        entry_len,
+        "segment entry table",
+    )?)
+    .map_err(json_message)?;
     offset += entry_len;
 
-    let ids = &bytes[offset..offset + ids_len];
+    let ids = checked_slice(&bytes, offset, ids_len, "segment id section")?;
     offset += ids_len;
-    let vectors = &bytes[offset..offset + vectors_len];
+    let vectors = checked_slice(&bytes, offset, vectors_len, "segment vector section")?;
     offset += vectors_len;
-    let metadata = &bytes[offset..offset + metadata_len];
+    let metadata = checked_slice(&bytes, offset, metadata_len, "segment metadata section")?;
     offset += metadata_len;
     let footer: SegmentFooter =
-        serde_json::from_slice(&bytes[offset..offset + footer_len]).map_err(json_message)?;
+        serde_json::from_slice(checked_slice(&bytes, offset, footer_len, "segment footer")?)
+            .map_err(json_message)?;
 
     let actual_checksum = hash(&[ids, vectors, metadata].concat());
     if actual_checksum != footer.payload_checksum {
@@ -928,8 +940,12 @@ fn read_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
 
     let mut records = Vec::with_capacity(header.entry_count);
     for entry in entries {
-        let id_slice = &ids[entry.record_id_offset as usize
-            ..entry.record_id_offset as usize + entry.record_id_len as usize];
+        let id_slice = checked_slice(
+            ids,
+            entry.record_id_offset as usize,
+            entry.record_id_len as usize,
+            "segment record id",
+        )?;
         let id = RecordId::new(std::str::from_utf8(id_slice).map_err(|error| {
             LogPoseError::Message(format!("failed to decode record id from segment: {error}"))
         })?);
@@ -939,16 +955,27 @@ fn read_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
                 let mut vector = Vec::with_capacity(entry.vector_dimensions as usize);
                 let vector_start = entry.vector_offset as usize;
                 let vector_end = vector_start + entry.vector_dimensions as usize * 4;
-                for chunk in vectors[vector_start..vector_end].chunks_exact(4) {
+                for chunk in checked_slice(
+                    vectors,
+                    vector_start,
+                    vector_end.saturating_sub(vector_start),
+                    "segment vector payload",
+                )?
+                .chunks_exact(4)
+                {
                     vector.push(f32::from_le_bytes(
                         chunk.try_into().expect("vector chunk should be four bytes"),
                     ));
                 }
                 let metadata_start = entry.metadata_offset as usize;
                 let metadata_end = metadata_start + entry.metadata_len as usize;
-                let metadata_value =
-                    serde_json::from_slice(&metadata[metadata_start..metadata_end])
-                        .map_err(json_message)?;
+                let metadata_value = serde_json::from_slice(checked_slice(
+                    metadata,
+                    metadata_start,
+                    metadata_end.saturating_sub(metadata_start),
+                    "segment metadata payload",
+                )?)
+                .map_err(json_message)?;
                 WriteOperation::Put(PutRecord {
                     id,
                     vector,
@@ -1006,6 +1033,19 @@ fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
         .map_err(|error| io_message("failed to write temp file", error))?;
     fs::rename(&temp_path, path)
         .map_err(|error| io_message("failed to atomically rename file", error))
+}
+
+fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> Result<&'a [u8]> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| LogPoseError::Message(format!("overflow while reading {label}")))?;
+    if end > bytes.len() {
+        return Err(LogPoseError::Message(format!(
+            "truncated segment while reading {label}: need {end} bytes but file has {}",
+            bytes.len()
+        )));
+    }
+    Ok(&bytes[start..end])
 }
 
 fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
@@ -1211,6 +1251,105 @@ mod tests {
             .find(|record| record.id.as_str() == "alpha")
             .expect("alpha should be present");
         assert_eq!(alpha.vector, vec![2.0, 2.0]);
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_remains_readable_after_flush() {
+        let root = unique_temp_dir("storage-snapshot-flush");
+        let engine = LocalStorageEngine::new(&root);
+
+        let descriptor = engine
+            .create_collection(CreateCollectionRequest {
+                name: "events".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Cosine,
+            })
+            .await
+            .expect("collection should be created");
+
+        engine
+            .write(
+                "events",
+                vec![WriteOperation::Put(PutRecord {
+                    id: RecordId::new("evt-1"),
+                    vector: vec![1.0, 2.0],
+                    metadata: json!({"kind":"login"}),
+                })],
+            )
+            .await
+            .expect("write should succeed");
+
+        let snapshot = engine
+            .snapshot("events")
+            .await
+            .expect("snapshot should succeed");
+        engine.flush("events").await.expect("flush should succeed");
+
+        let visible = engine
+            .scan_exact("events", Some(snapshot))
+            .await
+            .expect("old snapshot should still scan");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id.as_str(), "evt-1");
+
+        let wal_dir = descriptor.root_path.join("wal");
+        let rolled = fs::read_dir(wal_dir)
+            .expect("wal dir should exist")
+            .filter_map(|entry| entry.ok().map(|value| value.path()))
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name != "active.wal")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(rolled, 1);
+    }
+
+    #[test]
+    fn truncated_segment_returns_error_instead_of_panicking() {
+        let root = unique_temp_dir("storage-truncated-segment");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+
+        let segment_path = runtime.block_on(async {
+            let engine = LocalStorageEngine::new(&root);
+            let descriptor = engine
+                .create_collection(CreateCollectionRequest {
+                    name: "broken".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Cosine,
+                })
+                .await
+                .expect("collection should be created");
+
+            engine
+                .write(
+                    "broken",
+                    vec![WriteOperation::Put(PutRecord {
+                        id: RecordId::new("id-1"),
+                        vector: vec![1.0, 1.0],
+                        metadata: json!({"status":"ok"}),
+                    })],
+                )
+                .await
+                .expect("write should succeed");
+            engine.flush("broken").await.expect("flush should succeed");
+
+            let manifest = engine
+                .inspect("broken", InspectTarget::Manifest)
+                .await
+                .expect("inspect should succeed");
+            let segment_file = manifest.payload["segments"][0]["file_name"]
+                .as_str()
+                .expect("segment file should exist");
+            descriptor.root_path.join("segments").join(segment_file)
+        });
+
+        let bytes = fs::read(&segment_path).expect("segment file should exist");
+        fs::write(&segment_path, &bytes[..10]).expect("truncate should succeed");
+
+        let result = std::panic::catch_unwind(|| read_segment_file(&segment_path));
+        assert!(result.is_ok(), "truncated segment should not panic");
+        assert!(result.expect("result should exist").is_err());
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
