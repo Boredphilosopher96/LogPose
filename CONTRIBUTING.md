@@ -8,6 +8,7 @@ Thanks for helping build LogPose.
 2. Clone the repository.
 3. Run `cargo metadata --format-version 1`.
 4. Run `scripts/check.sh`.
+5. Enable the tracked pre-push hook with `git config core.hooksPath .githooks`.
 
 ## Standards
 
@@ -15,6 +16,7 @@ Thanks for helping build LogPose.
 - Add tests with behavior changes and new code paths.
 - Keep public interfaces documented.
 - Run formatting, linting, tests, and docs checks before opening a pull request.
+- Keep the pre-push supply-chain hook enabled so `cargo deny`, `cargo audit`, and `cargo machete` run before pushes.
 
 ## Pull Requests
 

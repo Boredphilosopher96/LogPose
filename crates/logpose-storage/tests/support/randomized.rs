@@ -3,7 +3,7 @@ use logpose_types::{
     CollectionId, CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId,
     SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,7 +12,7 @@ mod fs_support;
 
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 40;
-const DEFAULT_SCENARIO_SEEDS: [u64; 5] = [1, 7, 42, 97, 20260411];
+const DEFAULT_RANDOM_SCENARIOS: usize = 5;
 const RECORD_DIMENSIONS: usize = 2;
 const RECORD_ID_POOL: usize = 8;
 
@@ -173,7 +173,7 @@ impl ExpectedModel {
     }
 }
 
-pub async fn run_seeded_storage_scenarios() {
+pub async fn run_storage_scenarios() {
     let seeds = scenario_seeds();
     for seed in seeds {
         run_seeded_storage_scenario(seed, DEFAULT_SCENARIO_STEPS).await;
@@ -353,7 +353,12 @@ fn scenario_seeds() -> Vec<u64> {
         Ok(value) if !value.trim().is_empty() => {
             value.split(',').map(str::trim).map(parse_seed).collect()
         }
-        _ => DEFAULT_SCENARIO_SEEDS.to_vec(),
+        _ => {
+            let mut random = rng();
+            (0..DEFAULT_RANDOM_SCENARIOS)
+                .map(|_| random.random::<u64>())
+                .collect()
+        }
     }
 }
 
@@ -366,16 +371,16 @@ fn parse_seed(seed: &str) -> u64 {
 }
 
 fn next_action(rng: &mut StdRng, snapshot_count: usize) -> StorageAction {
-    let roll = rng.gen_range(0..100);
+    let roll = rng.random_range(0..100);
     match roll {
         0..=34 => StorageAction::PutBatch(generate_put_batch(rng)),
         35..=49 => StorageAction::Delete {
-            id: format!("id-{}", rng.gen_range(0..RECORD_ID_POOL)),
+            id: format!("id-{}", rng.random_range(0..RECORD_ID_POOL)),
         },
         50..=59 => StorageAction::Snapshot,
         60..=69 => StorageAction::ScanCurrent,
         70..=77 if snapshot_count > 0 => StorageAction::ScanSnapshot {
-            snapshot_index: rng.gen_range(0..snapshot_count),
+            snapshot_index: rng.random_range(0..snapshot_count),
         },
         78..=85 => StorageAction::Flush,
         86..=92 => StorageAction::Compact,
@@ -385,21 +390,21 @@ fn next_action(rng: &mut StdRng, snapshot_count: usize) -> StorageAction {
 }
 
 fn generate_put_batch(rng: &mut StdRng) -> Vec<TestRecord> {
-    let batch_size = rng.gen_range(1..=3);
+    let batch_size = rng.random_range(1..=3);
     let mut selected = BTreeSet::new();
     while selected.len() < batch_size {
-        selected.insert(rng.gen_range(0..RECORD_ID_POOL));
+        selected.insert(rng.random_range(0..RECORD_ID_POOL));
     }
 
     selected
         .into_iter()
         .map(|slot| {
-            let version = rng.gen_range(0..=999u64);
+            let version = rng.random_range(0..=999u64);
             TestRecord {
                 id: format!("id-{slot}"),
                 vector: vec![
-                    rng.gen_range(0..=10) as f32 + (slot as f32 / 10.0),
-                    rng.gen_range(0..=10) as f32 + (version as f32 / 1000.0),
+                    rng.random_range(0..=10u64) as f32 + (slot as f32 / 10.0),
+                    rng.random_range(0..=10u64) as f32 + (version as f32 / 1000.0),
                 ],
                 metadata: json!({
                     "slot": slot,
