@@ -1,3 +1,4 @@
+---
 name: Bug report
 description: Report a defect affecting LogPose behavior or operations.
 title: "[bug] "
@@ -13,4 +14,3 @@ body:
       label: Steps to reproduce
     validations:
       required: true
-
