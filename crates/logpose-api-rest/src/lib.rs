@@ -982,6 +982,57 @@ mod tests {
         assert_eq!(query.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn query_rejects_empty_logical_predicates() {
+        let state = Arc::new(AppState::new(test_config("rest-empty-logical-predicate")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 1,
+                            "predicate": {
+                                "kind": "and",
+                                "children": []
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = response
             .into_body()

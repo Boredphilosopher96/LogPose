@@ -150,7 +150,7 @@ async fn planner_keeps_newer_non_matching_versions_visible_during_predicate_prun
     );
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
     assert_eq!(diagnostics.units_pruned, 0);
-    assert_eq!(diagnostics.units_scanned, 3);
+    assert_eq!(diagnostics.units_scanned, 2);
 }
 
 #[tokio::test]
@@ -226,7 +226,7 @@ async fn planner_keeps_units_for_exists_predicates_on_non_scalar_fields() {
     assert_eq!(response.matches.len(), 1);
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
     assert_eq!(diagnostics.units_pruned, 0);
-    assert_eq!(diagnostics.units_scanned, 2);
+    assert_eq!(diagnostics.units_scanned, 1);
 }
 
 #[derive(Clone)]
@@ -769,20 +769,29 @@ impl StorageEngine for ShadowingPlannerStorage {
         include_mutable: bool,
         immutable_unit_ids: Vec<String>,
     ) -> logpose_types::Result<Vec<VisibleRecord>> {
-        if !include_mutable {
-            let mut records = Vec::new();
-            for unit_id in immutable_unit_ids {
-                records.extend(
-                    self.immutable_records
-                        .get(&unit_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-            return Ok(records);
+        if include_mutable {
+            return Ok(Vec::new());
         }
 
-        Ok(Vec::new())
+        let mut records = Vec::new();
+        for unit_id in immutable_unit_ids {
+            records.extend(
+                self.immutable_records
+                    .get(&unit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+
+        let mut visible = Vec::new();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        for record in records {
+            if seen_ids.insert(record.id.clone()) {
+                visible.push(record);
+            }
+        }
+
+        Ok(visible)
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {

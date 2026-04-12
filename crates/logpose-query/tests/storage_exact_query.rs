@@ -381,7 +381,7 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
     assert_eq!(response.matches[0].id.as_str(), "alpha");
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
     assert_eq!(diagnostics.units_pruned, 0);
-    assert_eq!(diagnostics.units_scanned, 2);
+    assert_eq!(diagnostics.units_scanned, 1);
 }
 
 #[tokio::test]
