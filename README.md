@@ -75,6 +75,14 @@ The repository testing doctrine, including the TigerBeetle-inspired harness stra
 
 Use `scripts/check.sh` for the standard local verification flow.
 
+To run supply-chain checks automatically before every push, enable the tracked Git hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That hook runs `cargo deny check`, `cargo audit`, and `cargo machete` through `scripts/pre-push-checks.sh`.
+
 ## License
 
 LogPose is available under the MIT License. See `LICENSE` for details.

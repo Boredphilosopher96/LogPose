@@ -12,5 +12,5 @@ mod support;
 
 #[tokio::test]
 async fn randomized_storage_scenarios_match_the_expected_model() {
-    support::run_seeded_storage_scenarios().await;
+    support::run_storage_scenarios().await;
 }
