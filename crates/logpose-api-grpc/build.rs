@@ -7,10 +7,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../../proto/logpose/v1/logpose.proto");
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos_with_config(
+        .compile_with_config(
             config,
             &["../../proto/logpose/v1/logpose.proto"],
             &["../../proto"],

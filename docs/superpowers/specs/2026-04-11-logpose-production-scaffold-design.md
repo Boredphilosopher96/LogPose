@@ -278,4 +278,3 @@ The design is successful if:
 - The workspace builds and quality tooling can run from day one
 - The documentation and README present LogPose as a credible, production-grade system
 - Future implementation work can proceed subsystem by subsystem without reorganizing the repository
-

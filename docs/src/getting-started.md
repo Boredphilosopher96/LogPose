@@ -18,4 +18,3 @@ Run the server:
 ```bash
 cargo run -p logpose-server
 ```
-

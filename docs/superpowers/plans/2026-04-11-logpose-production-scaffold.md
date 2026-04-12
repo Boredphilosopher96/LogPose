@@ -10,9 +10,10 @@
 
 ---
 
-### Task 1: Create workspace and repository metadata
+## Task 1: Create workspace and repository metadata
 
 **Files:**
+
 - Create: `Cargo.toml`
 - Create: `rust-toolchain.toml`
 - Create: `rustfmt.toml`
@@ -26,9 +27,10 @@
 - [ ] **Step 3: Add formatting, editor, and git metadata defaults**
 - [ ] **Step 4: Verify manifest parses with `cargo metadata`**
 
-### Task 2: Scaffold crates and applications
+## Task 2: Scaffold crates and applications
 
 **Files:**
+
 - Create: `apps/logpose-server/**`
 - Create: `apps/logpose-cli/**`
 - Create: `crates/logpose-*/**`
@@ -40,9 +42,10 @@
 - [ ] **Step 3: Add REST and gRPC scaffold wiring**
 - [ ] **Step 4: Verify `cargo test` reaches a green baseline**
 
-### Task 3: Add tests, benchmarks, and scripts
+## Task 3: Add tests, benchmarks, and scripts
 
 **Files:**
+
 - Create: `tests/smoke_workspace.rs`
 - Create: `benches/bootstrap.rs`
 - Create: `scripts/check.sh`
@@ -53,9 +56,10 @@
 - [ ] **Step 3: Add helper scripts for local quality runs**
 - [ ] **Step 4: Verify tests and benches build**
 
-### Task 4: Add docs and governance
+## Task 4: Add docs and governance
 
 **Files:**
+
 - Create: `README.md`
 - Create: `LICENSE`
 - Create: `CONTRIBUTING.md`
@@ -70,9 +74,10 @@
 - [ ] **Step 3: Add issue templates, PR template, and CODEOWNERS**
 - [ ] **Step 4: Verify docs build with `mdbook build docs`**
 
-### Task 5: Add CI/CD and supply-chain tooling
+## Task 5: Add CI/CD and supply-chain tooling
 
 **Files:**
+
 - Create: `.github/workflows/ci.yml`
 - Create: `.github/workflows/release.yml`
 - Create: `.github/dependabot.yml`
@@ -87,9 +92,10 @@
 - [ ] **Step 3: Add repository quality and dependency scanning configuration**
 - [ ] **Step 4: Verify workflow YAML and local commands are internally consistent**
 
-### Task 6: Final verification
+## Task 6: Final verification
 
 **Files:**
+
 - Modify: all created files as needed
 
 - [ ] **Step 1: Run `cargo fmt --all --check`**

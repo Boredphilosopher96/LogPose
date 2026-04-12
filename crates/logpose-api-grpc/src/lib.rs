@@ -22,7 +22,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         state.config.grpc_port,
     ));
 
-    let (mut health_reporter, health_service) = health_reporter();
+    let (health_reporter, health_service) = health_reporter();
     health_reporter
         .set_serving::<LogPoseServiceServer<GrpcLogPoseService>>()
         .await;

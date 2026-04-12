@@ -10,4 +10,3 @@ The repository includes configuration for:
 - markdown and workflow validation
 
 Sensitive findings should be reported privately according to `SECURITY.md`.
-

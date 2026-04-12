@@ -76,4 +76,3 @@ Use `scripts/check.sh` for the standard local verification flow.
 ## License
 
 LogPose is available under the MIT License. See `LICENSE` for details.
-
