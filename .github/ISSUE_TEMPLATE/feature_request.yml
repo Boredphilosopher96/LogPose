@@ -1,3 +1,4 @@
+---
 name: Feature request
 description: Propose an enhancement for LogPose.
 title: "[feature] "
@@ -13,4 +14,3 @@ body:
       label: Proposed solution
     validations:
       required: true
-

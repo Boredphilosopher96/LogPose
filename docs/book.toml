@@ -6,3 +6,6 @@ title = "LogPose Documentation"
 
 [build]
 build-dir = "../book"
+
+[output.html]
+site-url = "/LogPose/"
