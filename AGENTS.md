@@ -36,3 +36,7 @@ Do not commit generated secrets, local state, or ignored planning material. Keep
 
 Always prefer using subagents and using multiple parallel agents as much as possible. Especially for exploration and discovery.
 Even when implementing plans, parallel implementation using subagents if possible
+
+## Backwards compatibility
+
+Do not care about backwards compatibility. Care only about the best design decisions. The product is still being built and has no users
