@@ -7,8 +7,8 @@ use logpose_catalog as _;
 use logpose_storage::StorageEngine;
 pub use logpose_types::ScalarMetadataValue;
 use logpose_types::{
-    CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId, Snapshot,
-    VisibleRecord,
+    CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId, ScalarFieldStats,
+    Snapshot, VisibleRecord,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -541,6 +541,11 @@ fn filters_to_predicate(filters: &[MetadataFilter]) -> Option<Predicate> {
 fn validate_predicate(predicate: &Predicate) -> Result<()> {
     match predicate {
         Predicate::And { children } | Predicate::Or { children } => {
+            if children.is_empty() {
+                return Err(QueryError::InvalidPredicate(
+                    "logical predicates must include at least one child".to_owned(),
+                ));
+            }
             for child in children {
                 validate_predicate(child)?;
             }
@@ -561,9 +566,22 @@ fn validate_predicate(predicate: &Predicate) -> Result<()> {
             | PredicateOperator::Lte
             | PredicateOperator::Gt
             | PredicateOperator::Gte => {
-                if comparison.value.is_none() {
+                let Some(value) = comparison.value.as_ref() else {
                     return Err(QueryError::InvalidPredicate(format!(
                         "predicate operator '{}' requires a value",
+                        predicate_operator_name(comparison.operator)
+                    )));
+                };
+                if matches!(
+                    comparison.operator,
+                    PredicateOperator::Lt
+                        | PredicateOperator::Lte
+                        | PredicateOperator::Gt
+                        | PredicateOperator::Gte
+                ) && !supports_ordered_comparison(value)
+                {
+                    return Err(QueryError::InvalidPredicate(format!(
+                        "predicate operator '{}' requires a string or number value",
                         predicate_operator_name(comparison.operator)
                     )));
                 }
@@ -607,7 +625,10 @@ fn select_query_units(stats: &CollectionStats, predicate: Option<&Predicate>) ->
         units_considered: stats.query_units.len(),
         ..UnitSelection::default()
     };
-    selection.include_mutable = stats.query_units.iter().any(|unit| unit.tier == "mutable");
+    selection.include_mutable = stats
+        .query_units
+        .iter()
+        .any(|unit| unit.tier == "mutable" && (unit.put_count > 0 || unit.delete_count > 0));
 
     let mut immutable_units = stats
         .query_units
@@ -725,31 +746,39 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
         | PredicateOperator::Lte
         | PredicateOperator::Gt
         | PredicateOperator::Gte => {
+            let Some(value) = comparison.value.as_ref() else {
+                return 0.0;
+            };
+            let comparable_count = comparable_value_count(field_stats, value);
+            if comparable_count == 0 {
+                return 0.0;
+            }
+            let comparable_share = comparable_count as f32 / total;
             match (
-                comparison.value.as_ref(),
-                field_stats.min.as_ref(),
-                field_stats.max.as_ref(),
+                field_stats
+                    .min
+                    .as_ref()
+                    .and_then(|min| compare_ordered_scalars(value, min)),
+                field_stats
+                    .max
+                    .as_ref()
+                    .and_then(|max| compare_ordered_scalars(value, max)),
             ) {
-                (Some(value), Some(min), Some(max)) => match comparison.operator {
-                    PredicateOperator::Lt if compare_scalars(value, min) != Ordering::Greater => {
-                        0.0
-                    }
-                    PredicateOperator::Lt if compare_scalars(value, max) == Ordering::Greater => {
-                        1.0
-                    }
-                    PredicateOperator::Lte if compare_scalars(value, min) == Ordering::Less => 0.0,
-                    PredicateOperator::Lte if compare_scalars(value, max) != Ordering::Less => 1.0,
-                    PredicateOperator::Gt if compare_scalars(value, max) != Ordering::Less => 0.0,
-                    PredicateOperator::Gt if compare_scalars(value, min) == Ordering::Less => 1.0,
-                    PredicateOperator::Gte if compare_scalars(value, max) == Ordering::Greater => {
-                        0.0
-                    }
-                    PredicateOperator::Gte if compare_scalars(value, min) != Ordering::Greater => {
-                        1.0
-                    }
-                    _ => 0.6,
-                },
-                _ => 0.0,
+                (Some(min_ordering), Some(max_ordering)) => {
+                    let estimate = match comparison.operator {
+                        PredicateOperator::Lt if min_ordering != Ordering::Greater => 0.0,
+                        PredicateOperator::Lt if max_ordering == Ordering::Greater => 1.0,
+                        PredicateOperator::Lte if min_ordering == Ordering::Less => 0.0,
+                        PredicateOperator::Lte if max_ordering != Ordering::Less => 1.0,
+                        PredicateOperator::Gt if max_ordering != Ordering::Less => 0.0,
+                        PredicateOperator::Gt if min_ordering == Ordering::Less => 1.0,
+                        PredicateOperator::Gte if max_ordering == Ordering::Greater => 0.0,
+                        PredicateOperator::Gte if min_ordering != Ordering::Greater => 1.0,
+                        _ => 0.6,
+                    };
+                    (estimate * comparable_share).clamp(0.0, 1.0)
+                }
+                _ => (0.6 * comparable_share).clamp(0.0, 1.0),
             }
         }
     }
@@ -822,7 +851,8 @@ fn compare_field_value(
     actual
         .and_then(ScalarMetadataValue::from_json)
         .zip(expected.cloned())
-        .is_some_and(|(actual, expected)| compare_scalars(&actual, &expected) == ordering)
+        .and_then(|(actual, expected)| compare_ordered_scalars(&actual, &expected))
+        .is_some_and(|actual_ordering| actual_ordering == ordering)
 }
 
 fn build_diagnostics(
@@ -903,59 +933,96 @@ fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitS
                 .get(&value.summary_key())
                 .is_none_or(|count| *count < unit.put_count)
         }),
-        PredicateOperator::Lt | PredicateOperator::Lte => comparison
-            .value
-            .as_ref()
-            .zip(field_stats.min.as_ref())
-            .zip(field_stats.max.as_ref())
-            .is_some_and(|((value, min), _max)| match comparison.operator {
-                PredicateOperator::Lt => compare_scalars(min, value) == Ordering::Less,
-                PredicateOperator::Lte => compare_scalars(min, value) != Ordering::Greater,
-                _ => false,
-            }),
-        PredicateOperator::Gt | PredicateOperator::Gte => comparison
-            .value
-            .as_ref()
-            .zip(field_stats.min.as_ref())
-            .zip(field_stats.max.as_ref())
-            .is_some_and(|((value, _min), max)| match comparison.operator {
-                PredicateOperator::Gt => compare_scalars(max, value) == Ordering::Greater,
-                PredicateOperator::Gte => compare_scalars(max, value) != Ordering::Less,
-                _ => false,
-            }),
+        PredicateOperator::Lt | PredicateOperator::Lte => {
+            let Some(value) = comparison.value.as_ref() else {
+                return false;
+            };
+            if comparable_value_count(field_stats, value) == 0 {
+                return false;
+            }
+            field_stats
+                .min
+                .as_ref()
+                .and_then(|min| compare_ordered_scalars(min, value))
+                .is_none_or(|ordering| match comparison.operator {
+                    PredicateOperator::Lt => ordering == Ordering::Less,
+                    PredicateOperator::Lte => ordering != Ordering::Greater,
+                    _ => false,
+                })
+        }
+        PredicateOperator::Gt | PredicateOperator::Gte => {
+            let Some(value) = comparison.value.as_ref() else {
+                return false;
+            };
+            if comparable_value_count(field_stats, value) == 0 {
+                return false;
+            }
+            field_stats
+                .max
+                .as_ref()
+                .and_then(|max| compare_ordered_scalars(max, value))
+                .is_none_or(|ordering| match comparison.operator {
+                    PredicateOperator::Gt => ordering == Ordering::Greater,
+                    PredicateOperator::Gte => ordering != Ordering::Less,
+                    _ => false,
+                })
+        }
     }
 }
 
-fn compare_scalars(left: &ScalarMetadataValue, right: &ScalarMetadataValue) -> Ordering {
-    match (left, right) {
-        (ScalarMetadataValue::String(left), ScalarMetadataValue::String(right)) => left.cmp(right),
-        (ScalarMetadataValue::Bool(left), ScalarMetadataValue::Bool(right)) => left.cmp(right),
-        (ScalarMetadataValue::Number(left), ScalarMetadataValue::Number(right)) => {
-            if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
-                left.cmp(&right)
-            } else if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
-                left.cmp(&right)
-            } else {
-                left.as_f64()
-                    .unwrap_or_default()
-                    .partial_cmp(&right.as_f64().unwrap_or_default())
-                    .unwrap_or(Ordering::Equal)
-            }
-        }
-        (ScalarMetadataValue::Null, ScalarMetadataValue::Null) => Ordering::Equal,
-        (ScalarMetadataValue::Null, _) => Ordering::Less,
-        (_, ScalarMetadataValue::Null) => Ordering::Greater,
-        (
-            ScalarMetadataValue::Bool(_),
-            ScalarMetadataValue::Number(_) | ScalarMetadataValue::String(_),
-        ) => Ordering::Less,
-        (ScalarMetadataValue::Number(_), ScalarMetadataValue::String(_)) => Ordering::Less,
-        (
-            ScalarMetadataValue::Number(_) | ScalarMetadataValue::String(_),
-            ScalarMetadataValue::Bool(_),
-        ) => Ordering::Greater,
-        (ScalarMetadataValue::String(_), ScalarMetadataValue::Number(_)) => Ordering::Greater,
+fn supports_ordered_comparison(value: &ScalarMetadataValue) -> bool {
+    matches!(
+        value,
+        ScalarMetadataValue::String(_) | ScalarMetadataValue::Number(_)
+    )
+}
+
+fn ordered_summary_prefix(value: &ScalarMetadataValue) -> Option<&'static str> {
+    match value {
+        ScalarMetadataValue::String(_) => Some("string:"),
+        ScalarMetadataValue::Number(_) => Some("number:"),
+        ScalarMetadataValue::Bool(_) | ScalarMetadataValue::Null => None,
     }
+}
+
+fn comparable_value_count(field_stats: &ScalarFieldStats, value: &ScalarMetadataValue) -> usize {
+    let Some(prefix) = ordered_summary_prefix(value) else {
+        return 0;
+    };
+    field_stats
+        .value_counts
+        .iter()
+        .filter(|(summary_key, _)| summary_key.starts_with(prefix))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+fn compare_ordered_scalars(
+    left: &ScalarMetadataValue,
+    right: &ScalarMetadataValue,
+) -> Option<Ordering> {
+    match (left, right) {
+        (ScalarMetadataValue::String(left), ScalarMetadataValue::String(right)) => {
+            Some(left.cmp(right))
+        }
+        (ScalarMetadataValue::Number(left), ScalarMetadataValue::Number(right)) => {
+            Some(compare_numbers(left, right))
+        }
+        _ => None,
+    }
+}
+
+fn compare_numbers(left: &serde_json::Number, right: &serde_json::Number) -> Ordering {
+    if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+        return left.cmp(&right);
+    }
+    if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+        return left.cmp(&right);
+    }
+    left.as_f64()
+        .unwrap_or_default()
+        .partial_cmp(&right.as_f64().unwrap_or_default())
+        .unwrap_or(Ordering::Equal)
 }
 
 #[derive(Default)]
@@ -1480,6 +1547,82 @@ mod tests {
             Err(QueryError::InvalidPredicate(message))
                 if message.contains("does not accept a value")
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_logical_predicates() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(Predicate::And {
+                    children: Vec::new(),
+                }),
+                explain: ExplainMode::None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(QueryError::InvalidPredicate(message))
+                if message.contains("at least one child")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_unordered_values_for_range_predicates() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(Predicate::Comparison(PredicateComparison {
+                    field: "kind".to_owned(),
+                    operator: PredicateOperator::Gt,
+                    value: Some(ScalarMetadataValue::Bool(true)),
+                })),
+                explain: ExplainMode::None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(QueryError::InvalidPredicate(message))
+                if message.contains("string or number value")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordered_predicates_do_not_match_incompatible_actual_types() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 3,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(Predicate::Comparison(PredicateComparison {
+                    field: "kind".to_owned(),
+                    operator: PredicateOperator::Gt,
+                    value: Some(ScalarMetadataValue::Number(Number::from(1))),
+                })),
+                explain: ExplainMode::None,
+            },
+        )
+        .await
+        .expect("query should succeed");
+
+        assert!(result.matches.is_empty());
     }
 
     struct MissingCollectionStorage;

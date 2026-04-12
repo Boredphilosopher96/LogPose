@@ -1099,6 +1099,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_query_rejects_empty_logical_predicates() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
+            "grpc-empty-logical-predicate",
+        ))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        let error = service
+            .query_collection(Request::new(QueryCollectionRequest {
+                collection_name: "documents".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(proto::Predicate {
+                    node: Some(proto::predicate::Node::And(proto::PredicateList {
+                        children: Vec::new(),
+                    })),
+                }),
+                explain: proto::ExplainMode::None as i32,
+            }))
+            .await
+            .expect_err("empty logical predicate should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn grpc_query_rejects_unknown_explain_modes() {
         let service =
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-invalid-explain"))));
