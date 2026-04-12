@@ -45,6 +45,7 @@ jobs:
           config: .markdownlint.json
           globs: |
             **/*.md
+            !target/**/*.md
 
       - name: YAML lint
         uses: ibiqlik/action-yamllint@v3

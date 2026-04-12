@@ -7,4 +7,3 @@ Before opening a pull request, run:
 ```bash
 scripts/check.sh
 ```
-

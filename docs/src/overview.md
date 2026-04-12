@@ -8,4 +8,3 @@ The workspace is organized for long-term maintainability:
 - separate server and CLI applications
 - REST and gRPC integration surfaces
 - documentation, security, and quality automation embedded into the repository
-

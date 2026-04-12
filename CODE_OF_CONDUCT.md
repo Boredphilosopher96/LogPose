@@ -20,4 +20,3 @@ Project maintainers are responsible for clarifying and enforcing these standards
 ## Reporting
 
 Report incidents to `security@logpose.dev`.
-

@@ -18,4 +18,3 @@ Do not open public issues for suspected vulnerabilities.
 ## Security Practices
 
 The repository includes dependency, advisory, and lint-driven quality checks in CI. Release workflows should only be promoted from passing commits.
-

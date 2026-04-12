@@ -26,4 +26,3 @@ Thanks for helping build LogPose.
 ## Documentation
 
 Update `README.md`, `docs/src/`, OpenAPI, or protobuf contracts when behavior changes affect users or operators.
-

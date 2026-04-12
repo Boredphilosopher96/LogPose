@@ -9,4 +9,3 @@ Contract sources live in:
 
 - `openapi/logpose.v1.yaml`
 - `proto/logpose/v1/logpose.proto`
-
