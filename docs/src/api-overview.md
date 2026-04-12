@@ -9,7 +9,7 @@ Current public workflows include:
 
 - create and inspect collections
 - write mixed put/delete batches
-- exact vector query with optional top-level metadata equality filters
+- exact vector query with optional top-level metadata equality filters, including lossless 64-bit integer matching
 - collection stats, flush, compact, and inspect operations
 
 Contract sources live in:

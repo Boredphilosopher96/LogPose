@@ -5,7 +5,7 @@ use logpose_query::{MetadataFilter, QueryRequest, ScalarMetadataValue};
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_health::server::health_reporter;
@@ -294,9 +294,15 @@ fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue, St
         Some(proto::scalar_value::Kind::StringValue(value)) => {
             Ok(ScalarMetadataValue::String(value))
         }
-        Some(proto::scalar_value::Kind::NumberValue(value)) => {
-            Ok(ScalarMetadataValue::Number(value))
+        Some(proto::scalar_value::Kind::Int64Value(value)) => {
+            Ok(ScalarMetadataValue::Number(Number::from(value)))
         }
+        Some(proto::scalar_value::Kind::Uint64Value(value)) => {
+            Ok(ScalarMetadataValue::Number(Number::from(value)))
+        }
+        Some(proto::scalar_value::Kind::DoubleValue(value)) => Number::from_f64(value)
+            .map(ScalarMetadataValue::Number)
+            .ok_or_else(|| Status::invalid_argument("double scalar value must be finite")),
         Some(proto::scalar_value::Kind::BoolValue(value)) => Ok(ScalarMetadataValue::Bool(value)),
         Some(proto::scalar_value::Kind::NullValue(_)) => Ok(ScalarMetadataValue::Null),
         None => Err(Status::invalid_argument("scalar value kind is required")),
@@ -518,6 +524,70 @@ mod tests {
             .expect_err("unknown inspect target should error");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn grpc_query_filters_preserve_large_integer_precision() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-large-integers"))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        service
+            .write_collection(Request::new(WriteCollectionRequest {
+                collection_name: "documents".to_owned(),
+                operations: vec![
+                    proto::WriteOperation {
+                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                            id: "lower".to_owned(),
+                            vector: vec![1.0, 0.0],
+                            metadata_json: r#"{"score":9007199254740992}"#.to_owned(),
+                        })),
+                    },
+                    proto::WriteOperation {
+                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                            id: "higher".to_owned(),
+                            vector: vec![2.0, 0.0],
+                            metadata_json: r#"{"score":9007199254740993}"#.to_owned(),
+                        })),
+                    },
+                ],
+            }))
+            .await
+            .expect("write should succeed");
+
+        let query = service
+            .query_collection(Request::new(QueryCollectionRequest {
+                collection_name: "documents".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 5,
+                snapshot: None,
+                filters: vec![proto::MetadataFilter {
+                    field: "score".to_owned(),
+                    value: Some(proto::ScalarValue {
+                        kind: Some(proto::scalar_value::Kind::Uint64Value(9007199254740993)),
+                    }),
+                }],
+            }))
+            .await
+            .expect("query should succeed")
+            .into_inner();
+
+        assert_eq!(
+            query
+                .matches
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["higher"]
+        );
     }
 
     fn test_config(label: &str) -> LogPoseConfig {

@@ -693,9 +693,7 @@ fn record_matches_filters(record: &VisibleRecord, filters: &[MetadataFilter]) ->
 fn scalar_matches_value(expected: &ScalarMetadataValue, actual: &Value) -> bool {
     match (expected, actual) {
         (ScalarMetadataValue::String(expected), Value::String(actual)) => expected == actual,
-        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => {
-            actual.as_f64().is_some_and(|actual| actual == *expected)
-        }
+        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => expected == actual,
         (ScalarMetadataValue::Bool(expected), Value::Bool(actual)) => expected == actual,
         (ScalarMetadataValue::Null, Value::Null) => true,
         _ => false,

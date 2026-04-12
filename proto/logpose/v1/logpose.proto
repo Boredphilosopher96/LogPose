@@ -90,9 +90,11 @@ message SnapshotReply {
 message ScalarValue {
   oneof kind {
     string string_value = 1;
-    double number_value = 2;
-    bool bool_value = 3;
-    bool null_value = 4;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    double double_value = 4;
+    bool bool_value = 5;
+    bool null_value = 6;
   }
 }
 
