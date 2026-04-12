@@ -6,9 +6,9 @@ use logpose_config::LogPoseConfig;
 use logpose_core::AppState;
 use logpose_query::QueryRequest;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
-use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde as _;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     fs,
     net::{SocketAddr, TcpListener, TcpStream},
@@ -93,6 +93,9 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 
     let stats = client.stats("documents").await.expect("stats should load");
     assert_eq!(stats.live_record_count, 2);
+    assert_eq!(stats.deleted_record_count, 0);
+    assert_eq!(stats.mutable_op_count, 2);
+    assert_eq!(stats.segment_count, 0);
 
     let flush = client
         .flush("documents")
@@ -100,17 +103,75 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .expect("flush should succeed");
     assert!(flush.manifest_generation >= 1);
 
+    client
+        .write(
+            "documents",
+            vec![WriteOperation::Delete(DeleteRecord {
+                id: RecordId::new("beta"),
+            })],
+        )
+        .await
+        .expect("delete should succeed");
+
     let compact = client
         .compact("documents")
         .await
         .expect("compact should succeed");
     assert!(compact.manifest_generation >= flush.manifest_generation);
 
+    let stats = client
+        .stats("documents")
+        .await
+        .expect("stats should reload");
+    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.deleted_record_count, 1);
+    assert_eq!(stats.mutable_op_count, 1);
+    assert_eq!(stats.segment_count, 1);
+
     let inspect = client
         .inspect("documents", InspectTarget::Manifest)
         .await
         .expect("inspect should succeed");
     assert_eq!(inspect.target, "manifest");
+    let manifest_segments = inspect
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .expect("manifest segments should be an array");
+    assert_eq!(manifest_segments.len(), 1);
+    let segment_id = manifest_segments[0]["segment_id"]
+        .as_str()
+        .expect("segment id should be a string")
+        .to_owned();
+
+    let wal = client
+        .inspect("documents", InspectTarget::Wal)
+        .await
+        .expect("wal inspect should succeed");
+    assert_eq!(wal.target, "wal");
+    assert_eq!(
+        wal.payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("wal records should be an array")
+            .len(),
+        1
+    );
+
+    let segment = client
+        .inspect("documents", InspectTarget::Segment(segment_id.clone()))
+        .await
+        .expect("segment inspect should succeed");
+    assert_eq!(segment.target, format!("segment:{segment_id}"));
+    assert_eq!(
+        segment
+            .payload
+            .get("segment")
+            .and_then(Value::as_object)
+            .and_then(|segment| segment.get("segment_id"))
+            .and_then(Value::as_str),
+        Some(segment_id.as_str())
+    );
 
     server.abort();
     let _ = server.await;

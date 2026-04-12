@@ -119,6 +119,22 @@ fn data_commands_run_against_the_server_over_grpc() {
         serde_json::from_str(&stats_stdout).expect("stats output should be valid json");
     assert_eq!(stats_body["collection_name"], "colors");
     assert_eq!(stats_body["live_record_count"], 3);
+    assert_eq!(stats_body["deleted_record_count"], 0);
+    assert_eq!(stats_body["mutable_op_count"], 3);
+    assert_eq!(stats_body["segment_count"], 0);
+
+    let wal = fixture.run_cli(["data", "inspect", "--collection", "colors", "--wal"]);
+    let wal_stdout = String::from_utf8(wal.stdout).expect("stdout should be utf8");
+    let wal_body: Value =
+        serde_json::from_str(&wal_stdout).expect("wal output should be valid json");
+    assert_eq!(wal_body["target"], "wal");
+    assert_eq!(
+        wal_body["payload"]["records"]
+            .as_array()
+            .expect("wal records should be an array")
+            .len(),
+        3
+    );
 
     let flush = fixture.run_cli(["data", "flush", "--collection", "colors"]);
     let flush_stdout = String::from_utf8(flush.stdout).expect("stdout should be utf8");
@@ -126,17 +142,46 @@ fn data_commands_run_against_the_server_over_grpc() {
         serde_json::from_str(&flush_stdout).expect("flush output should be valid json");
     assert!(flush_body["manifest_generation"].as_u64().is_some());
 
+    let manifest = fixture.run_cli(["data", "inspect", "--collection", "colors", "--manifest"]);
+    let manifest_stdout = String::from_utf8(manifest.stdout).expect("stdout should be utf8");
+    let manifest_body: Value =
+        serde_json::from_str(&manifest_stdout).expect("manifest output should be valid json");
+    assert_eq!(manifest_body["target"], "manifest");
+    let segment_id = manifest_body["payload"]["segments"][0]["segment_id"]
+        .as_str()
+        .expect("segment id should be a string")
+        .to_owned();
+
+    let segment = fixture.run_cli([
+        "data",
+        "inspect",
+        "--collection",
+        "colors",
+        "--segment",
+        &segment_id,
+    ]);
+    let segment_stdout = String::from_utf8(segment.stdout).expect("stdout should be utf8");
+    let segment_body: Value =
+        serde_json::from_str(&segment_stdout).expect("segment output should be valid json");
+    assert_eq!(
+        segment_body["target"]
+            .as_str()
+            .expect("segment target should be a string"),
+        format!("segment:{segment_id}")
+    );
+    assert_eq!(
+        segment_body["payload"]["records"]
+            .as_array()
+            .expect("segment records should be an array")
+            .len(),
+        3
+    );
+
     let compact = fixture.run_cli(["data", "compact", "--collection", "colors"]);
     let compact_stdout = String::from_utf8(compact.stdout).expect("stdout should be utf8");
     let compact_body: Value =
         serde_json::from_str(&compact_stdout).expect("compact output should be valid json");
     assert!(compact_body["manifest_generation"].as_u64().is_some());
-
-    let inspect = fixture.run_cli(["data", "inspect", "--collection", "colors", "--manifest"]);
-    let inspect_stdout = String::from_utf8(inspect.stdout).expect("stdout should be utf8");
-    let inspect_body: Value =
-        serde_json::from_str(&inspect_stdout).expect("inspect output should be valid json");
-    assert_eq!(inspect_body["target"], "manifest");
 }
 
 struct TestServerFixture {

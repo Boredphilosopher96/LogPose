@@ -12,9 +12,9 @@ use uuid as _;
 #[path = "support/fs.rs"]
 mod support;
 
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs;
 
 #[tokio::test]
@@ -117,8 +117,12 @@ async fn flush_persists_visible_records_for_reopen() {
         .stats("documents")
         .await
         .expect("stats should succeed");
+    assert_eq!(stats.manifest_generation, 1);
+    assert_eq!(stats.visible_seq_no, 1);
     assert_eq!(stats.segment_count, 1);
     assert_eq!(stats.mutable_op_count, 0);
+    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.deleted_record_count, 0);
 }
 
 #[tokio::test]
@@ -178,6 +182,8 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
         .stats("profiles")
         .await
         .expect("stats should succeed");
+    assert_eq!(before.live_record_count, 2);
+    assert_eq!(before.deleted_record_count, 0);
     assert_eq!(before.segment_count, 2);
 
     engine
@@ -189,6 +195,8 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
         .stats("profiles")
         .await
         .expect("stats should succeed");
+    assert_eq!(after.live_record_count, 2);
+    assert_eq!(after.deleted_record_count, 0);
     assert_eq!(after.segment_count, 1);
 
     let visible = engine
@@ -201,6 +209,117 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
         .find(|record| record.id.as_str() == "alpha")
         .expect("alpha should be present");
     assert_eq!(alpha.vector, vec![2.0, 2.0]);
+}
+
+#[tokio::test]
+async fn inspect_reports_manifest_wal_and_segment_targets() {
+    let root = support::unique_temp_dir("storage-inspect");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Cosine,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"version":1}),
+                }),
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"version":1}),
+                }),
+            ],
+        )
+        .await
+        .expect("write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Delete(DeleteRecord {
+                id: RecordId::new("alpha"),
+            })],
+        )
+        .await
+        .expect("delete should succeed");
+
+    let manifest = engine
+        .inspect("documents", InspectTarget::Manifest)
+        .await
+        .expect("manifest inspect should succeed");
+    assert_eq!(manifest.target, "manifest");
+
+    let manifest_body = manifest
+        .payload
+        .as_object()
+        .expect("manifest payload should be an object");
+    let segments = manifest_body["segments"]
+        .as_array()
+        .expect("manifest segments should be an array");
+    assert_eq!(segments.len(), 1);
+    let segment_id = segments[0]["segment_id"]
+        .as_str()
+        .expect("segment id should be a string")
+        .to_owned();
+
+    let wal = engine
+        .inspect("documents", InspectTarget::Wal)
+        .await
+        .expect("wal inspect should succeed");
+    assert_eq!(wal.target, "wal");
+    let wal_records = wal
+        .payload
+        .get("records")
+        .and_then(Value::as_array)
+        .expect("wal records should be an array");
+    assert_eq!(wal_records.len(), 1);
+
+    let segment = engine
+        .inspect("documents", InspectTarget::Segment(segment_id.clone()))
+        .await
+        .expect("segment inspect should succeed");
+    assert_eq!(segment.target, format!("segment:{segment_id}"));
+    assert_eq!(
+        segment
+            .payload
+            .get("segment")
+            .and_then(Value::as_object)
+            .and_then(|segment| segment.get("segment_id"))
+            .and_then(Value::as_str),
+        Some(segment_id.as_str())
+    );
+    assert_eq!(
+        segment
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("segment records should be an array")
+            .len(),
+        2
+    );
+
+    let stats = engine
+        .stats("documents")
+        .await
+        .expect("stats should succeed");
+    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.deleted_record_count, 1);
+    assert_eq!(stats.mutable_op_count, 1);
+    assert_eq!(stats.segment_count, 1);
 }
 
 #[tokio::test]
