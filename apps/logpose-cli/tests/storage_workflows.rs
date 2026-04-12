@@ -86,7 +86,7 @@ fn query_rejects_non_scalar_filter_values_as_cli_validation() {
             "--vector",
             "1.0,0.0",
             "--filter",
-            r#"kind={"nested":true}"#,
+            r#"kind=json:{"nested":true}"#,
         ],
     );
 
