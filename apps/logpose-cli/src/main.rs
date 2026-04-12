@@ -172,6 +172,8 @@ struct DiagnosticsStatus {
     grpc_endpoint: String,
 }
 
+const CLI_PUT_BATCH_BYTES: usize = 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -225,12 +227,22 @@ async fn main() -> anyhow::Result<()> {
         Commands::Data {
             command: DataCommand::Put(args),
         } => {
-            let operations = read_jsonl_puts(&args.input)?;
+            let batches = read_jsonl_put_batches(&args.input, CLI_PUT_BATCH_BYTES)?;
             let client = connect_client(&config).await?;
-            let ack = client
-                .write(&args.collection, operations)
-                .await
-                .context("failed to write records")?;
+            let mut last_seq_no = 0;
+            let mut applied_ops = 0;
+            for operations in batches {
+                let ack = client
+                    .write(&args.collection, operations)
+                    .await
+                    .context("failed to write records")?;
+                last_seq_no = ack.last_seq_no;
+                applied_ops += ack.applied_ops;
+            }
+            let ack = logpose_types::CommitAck {
+                last_seq_no,
+                applied_ops,
+            };
             print_json(&ack)?;
         }
         Commands::Data {
@@ -409,8 +421,12 @@ fn parse_query_filter(value: &str) -> Result<QueryFilter, String> {
 }
 
 fn parse_scalar_metadata_value(value: &str) -> Result<ScalarMetadataValue, String> {
-    let json_value =
-        serde_json::from_str::<Value>(value).unwrap_or_else(|_| Value::String(value.to_owned()));
+    let json_value = if let Some(raw_json) = value.strip_prefix("json:") {
+        serde_json::from_str::<Value>(raw_json)
+            .map_err(|error| format!("invalid json: filter value: {error}"))?
+    } else {
+        Value::String(value.to_owned())
+    };
     scalar_metadata_value_from_json(&json_value)
         .ok_or_else(|| "query filters must contain only scalar JSON values".to_owned())
 }
@@ -425,11 +441,13 @@ fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue>
     }
 }
 
-fn read_jsonl_puts(path: &Path) -> anyhow::Result<Vec<WriteOperation>> {
+fn read_jsonl_put_batches(path: &Path, max_batch_bytes: usize) -> anyhow::Result<Vec<Vec<WriteOperation>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open JSONL input '{}'", path.display()))?;
     let reader = BufReader::new(file);
-    let mut operations = Vec::new();
+    let mut batches = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_batch_bytes = 0usize;
 
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
@@ -442,23 +460,36 @@ fn read_jsonl_puts(path: &Path) -> anyhow::Result<Vec<WriteOperation>> {
         if line.trim().is_empty() {
             continue;
         }
+
+        let line_bytes = line.len() + 1;
+        if !current_batch.is_empty() && current_batch_bytes + line_bytes > max_batch_bytes {
+            batches.push(current_batch);
+            current_batch = Vec::new();
+            current_batch_bytes = 0;
+        }
+
         let record = serde_json::from_str::<JsonlRecord>(&line)
             .with_context(|| format!("failed to parse JSONL record on line {}", index + 1))?;
-        operations.push(WriteOperation::Put(PutRecord {
+        current_batch.push(WriteOperation::Put(PutRecord {
             id: RecordId::new(record.id),
             vector: record.vector,
             metadata: record.metadata,
         }));
+        current_batch_bytes += line_bytes;
     }
 
-    if operations.is_empty() {
+    if current_batch.is_empty() && batches.is_empty() {
         bail!(
             "JSONL input '{}' did not contain any records",
             path.display()
         );
     }
 
-    Ok(operations)
+    if !current_batch.is_empty() {
+        batches.push(current_batch);
+    }
+
+    Ok(batches)
 }
 
 fn print_json<T>(value: &T) -> anyhow::Result<()>
@@ -492,5 +523,43 @@ mod tests {
 
         assert_eq!(rest_endpoint(&config), "http://[::1]:18080");
         assert_eq!(grpc_endpoint(&config), "http://[::1]:15051");
+    }
+
+    #[test]
+    fn bare_filter_values_are_preserved_as_strings() {
+        let parsed = parse_query_filter("code=123").expect("filter should parse");
+
+        assert_eq!(parsed.field, "code");
+        assert_eq!(parsed.value, ScalarMetadataValue::String("123".to_owned()));
+    }
+
+    #[test]
+    fn json_prefixed_filter_values_support_non_string_scalars() {
+        let parsed = parse_query_filter("enabled=json:true").expect("filter should parse");
+
+        assert_eq!(parsed.field, "enabled");
+        assert_eq!(parsed.value, ScalarMetadataValue::Bool(true));
+    }
+
+    #[test]
+    fn read_jsonl_put_batches_splits_records_by_size_budget() {
+        let path = std::env::temp_dir().join(format!(
+            "logpose-cli-batch-test-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"id":"alpha","vector":[1.0],"metadata":{"label":"aaaaaaaaaa"}}
+{"id":"beta","vector":[2.0],"metadata":{"label":"bbbbbbbbbb"}}"#,
+        )
+        .expect("jsonl should be written");
+
+        let batches = read_jsonl_put_batches(&path, 70).expect("batches should parse");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+
+        std::fs::remove_file(&path).expect("temp file should be removed");
     }
 }

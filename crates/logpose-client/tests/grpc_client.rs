@@ -11,10 +11,10 @@ use serde as _;
 use serde_json::json;
 use std::{
     fs,
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror as _;
 use tonic as _;
@@ -27,7 +27,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_port(grpc_addr).await;
 
     let endpoint = format!("http://{grpc_addr}");
     let client = LogPoseClient::connect(endpoint.clone())
@@ -133,6 +133,21 @@ fn reserve_local_addr() -> SocketAddr {
     let address = listener.local_addr().expect("listener should expose addr");
     drop(listener);
     address
+}
+
+async fn wait_for_port(address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if TcpStream::connect(address).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        TcpStream::connect(address).is_ok(),
+        "timed out waiting for server at {address}"
+    );
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
