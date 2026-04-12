@@ -57,7 +57,7 @@ The phase pages refer to logical components rather than only one specific file o
 
 | Phase | Program Shift | Primary Outcome | Testing Shift | Details |
 | --- | --- | --- | --- | --- |
-| 1. Local Database Core | Finish the single-node exact-search database contract | Crisp APIs, explicit visibility rules, operator-ready workflows | Broaden unit, integration, and seeded generative harnesses | [Phase 1](./future-milestones/phase-1-local-database-core.md) |
+| ~~1. Local Database Core~~ | ~~Finish the single-node exact-search database contract~~ | ~~Crisp APIs, explicit visibility rules, operator-ready workflows~~ | ~~Broaden unit, integration, and seeded generative harnesses~~ | ~~[Phase 1](./future-milestones/phase-1-local-database-core.md)~~ |
 | 2. Write-Friendly Storage | Move from simple local durability to a real mutable plus immutable storage model | Delta tier, tombstone-aware merge, compaction planning, richer storage stats | Add fuzz/property tests for WAL, manifests, and storage metadata | [Phase 2](./future-milestones/phase-2-write-friendly-storage.md) |
 | 3. Query Planning | Move from handcrafted exact query execution to plan-directed retrieval | Planner statistics, explain surfaces, scalar plus vector path selection | Planner oracles, explain snapshots, richer generative query scenarios | [Phase 3](./future-milestones/phase-3-query-planning.md) |
 | 4. ANN and Hybrid Execution | Add ANN as a physical operator family under planner control | Exact and ANN hybrid execution with filtered retrieval strategies | Exact-vs-ANN correctness checks, codec fuzzing, benchmark discipline | [Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md) |
@@ -82,3 +82,5 @@ Use the roadmap in two passes:
 - then use the matching phase page to understand the intended component changes, testing direction, and exit criteria
 
 If future design work changes the end-state architecture, update [Better Vector DB Architecture](./better-vector-db.md) first, then realign these milestones to match.
+
+**Done marker:** Phase 1 is complete and the documents on this page now reflect that status.

@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 /// Common result type for workspace crates.
 pub type Result<T> = std::result::Result<T, LogPoseError>;
+/// Product name surfaced by operator-visible metadata endpoints.
+pub const PRODUCT_NAME: &str = "LogPose";
 
 /// Top-level workspace error.
 #[derive(Debug, Error)]
@@ -38,6 +40,35 @@ impl BuildInfo {
                 .unwrap_or("development")
                 .to_owned(),
             profile: option_env!("PROFILE").unwrap_or("debug").to_owned(),
+        }
+    }
+}
+
+/// Canonical node metadata exposed through operator surfaces.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetadata {
+    /// Product identifier.
+    pub product: String,
+    /// Human-readable node name.
+    pub node_name: String,
+    /// Semantic version for the distribution.
+    pub version: String,
+    /// Source control revision when available.
+    pub git_sha: String,
+    /// Build profile used for compilation.
+    pub profile: String,
+}
+
+impl NodeMetadata {
+    /// Build canonical node metadata from a node name and build information.
+    #[must_use]
+    pub fn new(node_name: impl Into<String>, build: &BuildInfo) -> Self {
+        Self {
+            product: PRODUCT_NAME.to_owned(),
+            node_name: node_name.into(),
+            version: build.version.clone(),
+            git_sha: build.git_sha.clone(),
+            profile: build.profile.clone(),
         }
     }
 }

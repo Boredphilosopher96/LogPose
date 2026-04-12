@@ -23,7 +23,7 @@ use proto::{
     CreateCollectionRequest, FlushCollectionRequest, GetCollectionRequest,
     GetCollectionStatsRequest, GetMetadataReply, GetMetadataRequest, InspectCollectionReply,
     InspectCollectionRequest, InspectTarget, QueryCollectionReply, QueryCollectionRequest,
-    QueryMatch, ScalarValue, SnapshotReply, WriteCollectionRequest,
+    QueryMatch, RemoteBlobConfig, ScalarValue, SnapshotReply, WriteCollectionRequest,
 };
 
 /// Serve the gRPC API until shutdown.
@@ -69,10 +69,13 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         _request: Request<GetMetadataRequest>,
     ) -> Result<Response<GetMetadataReply>, Status> {
+        let metadata = self.state.metadata();
         Ok(Response::new(GetMetadataReply {
-            product: "LogPose".to_owned(),
-            node_name: self.state.config.node_name.clone(),
-            version: self.state.build.version.clone(),
+            product: metadata.product,
+            node_name: metadata.node_name,
+            version: metadata.version,
+            git_sha: metadata.git_sha,
+            profile: metadata.profile,
         }))
     }
 
@@ -363,6 +366,11 @@ fn collection_descriptor_reply(
         flush_threshold_ops: descriptor.flush_threshold_ops as u64,
         flush_threshold_bytes: descriptor.flush_threshold_bytes as u64,
         compaction_threshold_segments: descriptor.compaction_threshold_segments as u64,
+        remote_blob: descriptor.remote_blob.map(|remote_blob| RemoteBlobConfig {
+            endpoint: remote_blob.endpoint,
+            bucket: remote_blob.bucket,
+            prefix: remote_blob.prefix,
+        }),
     }
 }
 
@@ -496,6 +504,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_metadata_reports_build_identity_fields() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-metadata"))));
+
+        let metadata = service
+            .get_metadata(Request::new(GetMetadataRequest {}))
+            .await
+            .expect("metadata should succeed")
+            .into_inner();
+
+        assert_eq!(metadata.product, "LogPose");
+        assert_eq!(metadata.node_name, "grpc-metadata");
+        assert!(!metadata.version.is_empty());
+        assert!(!metadata.git_sha.is_empty());
+        assert_eq!(metadata.profile, "debug");
+    }
+
+    #[tokio::test]
     async fn grpc_service_maps_missing_collections_to_not_found() {
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-missing"))));
 
@@ -592,6 +618,7 @@ mod tests {
 
     fn test_config(label: &str) -> LogPoseConfig {
         LogPoseConfig {
+            node_name: label.to_owned(),
             storage_root: unique_temp_dir(label),
             ..LogPoseConfig::default()
         }

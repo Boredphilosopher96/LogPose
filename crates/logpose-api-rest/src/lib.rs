@@ -56,12 +56,7 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn metadata(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(MetadataResponse {
-        product: "LogPose",
-        node_name: state.config.node_name.clone(),
-        version: state.build.version.clone(),
-        profile: state.build.profile.clone(),
-    })
+    Json(state.metadata())
 }
 
 async fn create_collection(
@@ -160,14 +155,6 @@ async fn inspect_collection(
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct MetadataResponse {
-    product: &'static str,
-    node_name: String,
-    version: String,
-    profile: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,6 +414,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_endpoint_reports_build_identity_fields() {
+        let state = Arc::new(AppState::new(test_config("rest-metadata")));
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["product"], "LogPose");
+        assert_eq!(body["node_name"], "rest-metadata");
+        assert_eq!(body["profile"], "debug");
+        assert!(
+            body["version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            body["git_sha"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
     async fn missing_collection_returns_not_found() {
         let state = Arc::new(AppState::new(test_config("rest-missing")));
         let app = router(state);
@@ -585,6 +604,7 @@ mod tests {
 
     fn test_config(label: &str) -> LogPoseConfig {
         LogPoseConfig {
+            node_name: label.to_owned(),
             storage_root: unique_temp_dir(label),
             ..LogPoseConfig::default()
         }

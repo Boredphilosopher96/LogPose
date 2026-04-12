@@ -1,4 +1,6 @@
-# Phase 1: Local Database Core
+# ~~Phase 1: Local Database Core~~
+
+**Done marker:** Phase 1 is complete.
 
 ## Goal
 
@@ -29,6 +31,10 @@ The emphasis is not on ANN or distribution yet. It is on correctness, visibility
 - shared service orchestration is the default integration path for new transport work
 - contract drift between implementation, OpenAPI, and proto becomes the exception instead of the norm
 - the seeded generative harnesses are normal infrastructure rather than one-off experiments
+
+## Status
+
+Phase 1 is done.
 
 ## Testing Direction
 

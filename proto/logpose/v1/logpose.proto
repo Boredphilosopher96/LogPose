@@ -20,6 +20,14 @@ message GetMetadataReply {
   string product = 1;
   string node_name = 2;
   string version = 3;
+  string git_sha = 4;
+  string profile = 5;
+}
+
+message RemoteBlobConfig {
+  string endpoint = 1;
+  string bucket = 2;
+  string prefix = 3;
 }
 
 enum DistanceMetric {
@@ -48,6 +56,7 @@ message CollectionDescriptorReply {
   uint64 flush_threshold_ops = 6;
   uint64 flush_threshold_bytes = 7;
   uint64 compaction_threshold_segments = 8;
+  RemoteBlobConfig remote_blob = 9;
 }
 
 message PutRecord {

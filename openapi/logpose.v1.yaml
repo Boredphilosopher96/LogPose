@@ -20,7 +20,11 @@ paths:
       operationId: metadata
       responses:
         "200":
-          description: Metadata payload
+          description: Normalized node metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetadataResponse"
   /v1/collections:
     post:
       summary: Create a collection
@@ -253,13 +257,15 @@ components:
       enum: [cosine, dot, l2]
     MetadataResponse:
       type: object
-      required: [product, node_name, version, profile]
+      required: [product, node_name, version, git_sha, profile]
       properties:
         product:
           type: string
         node_name:
           type: string
         version:
+          type: string
+        git_sha:
           type: string
         profile:
           type: string
