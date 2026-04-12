@@ -326,11 +326,20 @@ async fn connect_client(config: &logpose_config::LogPoseConfig) -> anyhow::Resul
 }
 
 fn rest_endpoint(config: &logpose_config::LogPoseConfig) -> String {
-    format!("http://{}:{}", config.rest_host, config.rest_port)
+    endpoint_url(&config.rest_host, config.rest_port)
 }
 
 fn grpc_endpoint(config: &logpose_config::LogPoseConfig) -> String {
-    format!("http://{}:{}", config.grpc_host, config.grpc_port)
+    endpoint_url(&config.grpc_host, config.grpc_port)
+}
+
+fn endpoint_url(host: &str, port: u16) -> String {
+    let authority = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]"),
+        Ok(std::net::IpAddr::V4(_)) | Err(_) => host.to_owned(),
+    };
+
+    format!("http://{authority}:{port}")
 }
 
 fn inspect_target_from_args(args: &InspectArgs) -> InspectTarget {
@@ -465,4 +474,23 @@ where
 
 fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_helpers_bracket_ipv6_hosts() {
+        let config = logpose_config::LogPoseConfig {
+            rest_host: "::1".to_owned(),
+            rest_port: 18080,
+            grpc_host: "::1".to_owned(),
+            grpc_port: 15051,
+            ..logpose_config::LogPoseConfig::default()
+        };
+
+        assert_eq!(rest_endpoint(&config), "http://[::1]:18080");
+        assert_eq!(grpc_endpoint(&config), "http://[::1]:15051");
+    }
 }
