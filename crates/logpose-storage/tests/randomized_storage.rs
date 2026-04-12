@@ -3,6 +3,7 @@
 use async_trait as _;
 use crc32fast as _;
 use logpose_catalog as _;
+use logpose_index as _;
 use logpose_query as _;
 use logpose_wal as _;
 use serde as _;

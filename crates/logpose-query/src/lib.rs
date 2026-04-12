@@ -5,10 +5,16 @@ use async_trait as _;
 #[cfg(test)]
 use logpose_catalog as _;
 use logpose_storage::StorageEngine;
-use logpose_types::{DistanceMetric, LogPoseError, RecordId, Snapshot, VisibleRecord};
+pub use logpose_types::ScalarMetadataValue;
+use logpose_types::{
+    CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId, Snapshot,
+    VisibleRecord,
+};
 use serde::{Deserialize, Serialize};
-use serde_json::{Number, Value};
-use std::cmp::Ordering;
+#[cfg(test)]
+use serde_json::Number;
+use serde_json::Value;
+use std::{cmp::Ordering, time::Instant};
 use thiserror::Error;
 #[cfg(test)]
 use tokio as _;
@@ -27,6 +33,12 @@ pub struct QueryRequest {
     /// Optional top-level metadata equality filters combined with AND semantics.
     #[serde(default)]
     pub filters: Vec<MetadataFilter>,
+    /// Optional structured predicate tree over top-level scalar metadata.
+    #[serde(default)]
+    pub predicate: Option<Predicate>,
+    /// Optional explain/profile mode for planner diagnostics.
+    #[serde(default)]
+    pub explain: ExplainMode,
 }
 
 /// Top-level metadata equality filter for exact queries.
@@ -38,18 +50,125 @@ pub struct MetadataFilter {
     pub value: ScalarMetadataValue,
 }
 
-/// Scalar metadata value supported by the first filtered-query slice.
+/// Structured predicate tree used for planner-aware metadata filtering.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ScalarMetadataValue {
-    /// Match a string metadata value.
-    String(String),
-    /// Match a numeric metadata value without losing integer precision.
-    Number(Number),
-    /// Match a boolean metadata value.
-    Bool(bool),
-    /// Match a null metadata value.
-    Null,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Predicate {
+    /// Conjunction over child predicates.
+    And {
+        /// Child predicates.
+        children: Vec<Predicate>,
+    },
+    /// Disjunction over child predicates.
+    Or {
+        /// Child predicates.
+        children: Vec<Predicate>,
+    },
+    /// Negation over a child predicate.
+    Not {
+        /// Child predicate.
+        child: Box<Predicate>,
+    },
+    /// Comparison over a top-level scalar field.
+    Comparison(PredicateComparison),
+}
+
+/// Single field comparison inside a predicate tree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PredicateComparison {
+    /// Target top-level field.
+    pub field: String,
+    /// Comparison operator.
+    pub operator: PredicateOperator,
+    /// Optional scalar value for operators that need one.
+    #[serde(default)]
+    pub value: Option<ScalarMetadataValue>,
+}
+
+/// Operator used by a predicate comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateOperator {
+    /// Exact scalar equality.
+    Eq,
+    /// Scalar inequality.
+    Ne,
+    /// Strictly less-than comparison.
+    Lt,
+    /// Less-than-or-equal comparison.
+    Lte,
+    /// Strictly greater-than comparison.
+    Gt,
+    /// Greater-than-or-equal comparison.
+    Gte,
+    /// Field existence check.
+    Exists,
+    /// Explicit null check.
+    IsNull,
+}
+
+/// Diagnostics verbosity requested by the caller.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainMode {
+    /// Do not emit plan diagnostics.
+    #[default]
+    None,
+    /// Emit chosen plan and planner estimates.
+    Plan,
+    /// Emit chosen plan plus per-stage timings.
+    Profile,
+}
+
+/// Planner-selected physical plan for an exact or hybrid-exact query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryPlanKind {
+    /// Scan all visible records without predicate pruning.
+    UnfilteredExactScan,
+    /// Apply predicates before ranking candidate vectors.
+    PredicateFirstExact,
+    /// Rank all candidate vectors before applying the predicate.
+    VectorFirstExact,
+    /// Use a small exact fallback when the predicate is highly selective.
+    TinyPopulationExactFallback,
+}
+
+/// Optional per-stage timings reported for profile mode.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryStageTimings {
+    /// Time spent planning the query.
+    pub planning_micros: u64,
+    /// Time spent evaluating predicates.
+    pub predicate_micros: u64,
+    /// Time spent ranking candidate vectors.
+    pub ranking_micros: u64,
+}
+
+/// Planner and execution diagnostics surfaced to operators.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QueryDiagnostics {
+    /// Physical plan selected for execution.
+    pub chosen_plan: QueryPlanKind,
+    /// Short human-readable reason for the plan choice.
+    pub planner_reason: String,
+    /// Estimated predicate selectivity in the visible snapshot.
+    pub estimated_selectivity: f32,
+    /// Total mutable plus immutable units considered by the planner.
+    pub units_considered: usize,
+    /// Units proven impossible and pruned before scan.
+    pub units_pruned: usize,
+    /// Units actually scanned for this query.
+    pub units_scanned: usize,
+    /// Candidate count before predicate application.
+    pub candidates_before_filter: usize,
+    /// Candidate count after predicate application.
+    pub candidates_after_filter: usize,
+    /// Number of rerank passes used by the plan.
+    pub rerank_count: usize,
+    /// Optional stage timings when profile mode is requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_timings: Option<QueryStageTimings>,
 }
 
 /// A single query match returned to callers.
@@ -76,6 +195,9 @@ pub struct QueryResponse {
     pub snapshot: Snapshot,
     /// Ranked matches.
     pub matches: Vec<QueryMatch>,
+    /// Optional planner and execution diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<QueryDiagnostics>,
 }
 
 /// Query-scoped error returned when a request cannot be ranked.
@@ -109,6 +231,9 @@ pub enum QueryError {
         /// Actual stored dimensionality.
         actual: usize,
     },
+    /// Predicate structure is malformed for the requested operators.
+    #[error("{0}")]
+    InvalidPredicate(String),
     /// Storage failures are surfaced directly from the read path.
     #[error(transparent)]
     Storage(#[from] LogPoseError),
@@ -122,6 +247,7 @@ pub async fn query_exact<S>(storage: &S, request: QueryRequest) -> Result<QueryR
 where
     S: StorageEngine + ?Sized,
 {
+    let planning_started = Instant::now();
     let descriptor = storage.open_collection(&request.collection_name).await?;
     if request.vector.len() != descriptor.dimensions {
         return Err(QueryError::RequestVectorDimensionMismatch {
@@ -130,37 +256,156 @@ where
         });
     }
 
-    let snapshot = match request.snapshot {
+    let predicate = combined_predicate(&request);
+    if let Some(predicate) = predicate.as_ref() {
+        validate_predicate(predicate)?;
+    }
+    let snapshot = match request.snapshot.clone() {
         Some(snapshot) => snapshot,
         None => storage.snapshot(&request.collection_name).await?,
     };
-    let records = storage
-        .scan_exact(&request.collection_name, Some(snapshot.clone()))
+    let stats = storage
+        .stats_snapshot(&request.collection_name, Some(snapshot.clone()))
         .await?;
-    let filtered = filter_records(records, &request.filters);
-
-    let matches = rank_matches_with(
-        descriptor.metric,
-        &request.vector,
-        filtered,
+    let unit_selection = select_query_units(&stats, predicate.as_ref());
+    let estimated_selectivity = predicate
+        .as_ref()
+        .map(|predicate| estimate_selectivity(predicate, &stats))
+        .unwrap_or(1.0);
+    let plan = choose_plan(
+        predicate.as_ref(),
+        estimated_selectivity,
         request.top_k,
-        |record, error| match error {
-            QueryError::VectorDimensionMismatch { expected, actual } => {
-                QueryError::StoredVectorDimensionMismatch {
-                    record_id: record.id.clone(),
-                    expected,
-                    actual,
-                }
-            }
-            other => other,
-        },
-    )?;
+        unit_selection.scanned_put_count,
+    );
+    let planning_micros = planning_started.elapsed().as_micros() as u64;
 
-    Ok(build_query_response(
+    let records = storage
+        .scan_exact_selected(
+            &request.collection_name,
+            Some(snapshot.clone()),
+            unit_selection.include_mutable,
+            unit_selection.immutable_unit_ids.clone(),
+        )
+        .await?;
+
+    let candidates_before_filter = records.len();
+    let (matches, predicate_micros, ranking_micros, candidates_after_filter) = match plan {
+        QueryPlanKind::UnfilteredExactScan => {
+            let ranking_started = Instant::now();
+            let matches = rank_matches_with(
+                descriptor.metric,
+                &request.vector,
+                records,
+                request.top_k,
+                |record, error| match error {
+                    QueryError::VectorDimensionMismatch { expected, actual } => {
+                        QueryError::StoredVectorDimensionMismatch {
+                            record_id: record.id.clone(),
+                            expected,
+                            actual,
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            (
+                matches,
+                0,
+                ranking_started.elapsed().as_micros() as u64,
+                candidates_before_filter,
+            )
+        }
+        QueryPlanKind::PredicateFirstExact | QueryPlanKind::TinyPopulationExactFallback => {
+            let predicate_started = Instant::now();
+            let filtered = filter_records_by_predicate(records, predicate.as_ref());
+            let predicate_micros = predicate_started.elapsed().as_micros() as u64;
+            let candidates_after_filter = filtered.len();
+
+            let ranking_started = Instant::now();
+            let matches = rank_matches_with(
+                descriptor.metric,
+                &request.vector,
+                filtered,
+                request.top_k,
+                |record, error| match error {
+                    QueryError::VectorDimensionMismatch { expected, actual } => {
+                        QueryError::StoredVectorDimensionMismatch {
+                            record_id: record.id.clone(),
+                            expected,
+                            actual,
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            (
+                matches,
+                predicate_micros,
+                ranking_started.elapsed().as_micros() as u64,
+                candidates_after_filter,
+            )
+        }
+        QueryPlanKind::VectorFirstExact => {
+            let ranking_started = Instant::now();
+            let ranked = rank_matches_with(
+                descriptor.metric,
+                &request.vector,
+                records,
+                candidates_before_filter,
+                |record, error| match error {
+                    QueryError::VectorDimensionMismatch { expected, actual } => {
+                        QueryError::StoredVectorDimensionMismatch {
+                            record_id: record.id.clone(),
+                            expected,
+                            actual,
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            let ranking_micros = ranking_started.elapsed().as_micros() as u64;
+
+            let predicate_started = Instant::now();
+            let mut filtered = ranked
+                .into_iter()
+                .filter(|candidate| {
+                    predicate.as_ref().is_none_or(|predicate| {
+                        predicate_matches_metadata(&candidate.metadata, predicate)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let predicate_micros = predicate_started.elapsed().as_micros() as u64;
+            let candidates_after_filter = filtered.len();
+            filtered.truncate(request.top_k);
+            (
+                filtered,
+                predicate_micros,
+                ranking_micros,
+                candidates_after_filter,
+            )
+        }
+    };
+    let diagnostics = build_diagnostics(
+        &request,
+        plan,
+        estimated_selectivity,
+        &unit_selection,
+        DiagnosticMeasurements {
+            candidates_before_filter,
+            candidates_after_filter,
+            planning_micros,
+            predicate_micros,
+            ranking_micros,
+        },
+    );
+
+    Ok(build_query_response_with_diagnostics(
         descriptor.metric,
         request.top_k,
         snapshot,
         matches,
+        diagnostics,
     ))
 }
 
@@ -245,7 +490,491 @@ pub fn build_query_response(
         returned,
         snapshot,
         matches,
+        diagnostics: None,
     }
+}
+
+/// Build a query response with optional diagnostics.
+#[must_use]
+pub fn build_query_response_with_diagnostics(
+    metric: DistanceMetric,
+    top_k: usize,
+    snapshot: Snapshot,
+    matches: Vec<QueryMatch>,
+    diagnostics: Option<QueryDiagnostics>,
+) -> QueryResponse {
+    let mut response = build_query_response(metric, top_k, snapshot, matches);
+    response.diagnostics = diagnostics;
+    response
+}
+
+fn combined_predicate(request: &QueryRequest) -> Option<Predicate> {
+    let legacy = filters_to_predicate(&request.filters);
+    match (legacy, request.predicate.clone()) {
+        (None, None) => None,
+        (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
+        (Some(left), Some(right)) => Some(Predicate::And {
+            children: vec![left, right],
+        }),
+    }
+}
+
+fn filters_to_predicate(filters: &[MetadataFilter]) -> Option<Predicate> {
+    if filters.is_empty() {
+        None
+    } else {
+        Some(Predicate::And {
+            children: filters
+                .iter()
+                .map(|filter| {
+                    Predicate::Comparison(PredicateComparison {
+                        field: filter.field.clone(),
+                        operator: PredicateOperator::Eq,
+                        value: Some(filter.value.clone()),
+                    })
+                })
+                .collect(),
+        })
+    }
+}
+
+fn validate_predicate(predicate: &Predicate) -> Result<()> {
+    match predicate {
+        Predicate::And { children } | Predicate::Or { children } => {
+            for child in children {
+                validate_predicate(child)?;
+            }
+        }
+        Predicate::Not { child } => validate_predicate(child)?,
+        Predicate::Comparison(comparison) => match comparison.operator {
+            PredicateOperator::Exists | PredicateOperator::IsNull => {
+                if comparison.value.is_some() {
+                    return Err(QueryError::InvalidPredicate(format!(
+                        "predicate operator '{}' does not accept a value",
+                        predicate_operator_name(comparison.operator)
+                    )));
+                }
+            }
+            PredicateOperator::Eq
+            | PredicateOperator::Ne
+            | PredicateOperator::Lt
+            | PredicateOperator::Lte
+            | PredicateOperator::Gt
+            | PredicateOperator::Gte => {
+                if comparison.value.is_none() {
+                    return Err(QueryError::InvalidPredicate(format!(
+                        "predicate operator '{}' requires a value",
+                        predicate_operator_name(comparison.operator)
+                    )));
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+fn predicate_operator_name(operator: PredicateOperator) -> &'static str {
+    match operator {
+        PredicateOperator::Eq => "eq",
+        PredicateOperator::Ne => "ne",
+        PredicateOperator::Lt => "lt",
+        PredicateOperator::Lte => "lte",
+        PredicateOperator::Gt => "gt",
+        PredicateOperator::Gte => "gte",
+        PredicateOperator::Exists => "exists",
+        PredicateOperator::IsNull => "is_null",
+    }
+}
+
+fn choose_plan(
+    predicate: Option<&Predicate>,
+    estimated_selectivity: f32,
+    top_k: usize,
+    scanned_put_count: usize,
+) -> QueryPlanKind {
+    match predicate {
+        None => QueryPlanKind::UnfilteredExactScan,
+        Some(_) if (scanned_put_count as f32 * estimated_selectivity).ceil() <= top_k as f32 => {
+            QueryPlanKind::TinyPopulationExactFallback
+        }
+        Some(_) if estimated_selectivity <= 0.45 => QueryPlanKind::PredicateFirstExact,
+        Some(_) => QueryPlanKind::VectorFirstExact,
+    }
+}
+
+fn select_query_units(stats: &CollectionStats, predicate: Option<&Predicate>) -> UnitSelection {
+    let mut selection = UnitSelection {
+        units_considered: stats.query_units.len(),
+        ..UnitSelection::default()
+    };
+    selection.include_mutable = stats.query_units.iter().any(|unit| unit.tier == "mutable");
+
+    let mut immutable_units = stats
+        .query_units
+        .iter()
+        .filter(|unit| unit.tier != "mutable")
+        .collect::<Vec<_>>();
+    immutable_units.sort_by(|left, right| {
+        right
+            .max_seq_no
+            .cmp(&left.max_seq_no)
+            .then(right.min_seq_no.cmp(&left.min_seq_no))
+            .then(left.unit_id.cmp(&right.unit_id))
+    });
+
+    let mut included_immutable_count = immutable_units.len();
+    while included_immutable_count > 0 {
+        let unit = immutable_units[included_immutable_count - 1];
+        let can_match = unit.delete_count > 0
+            || predicate.is_none_or(|predicate| predicate_may_match_unit(predicate, unit));
+        if can_match {
+            break;
+        }
+        included_immutable_count -= 1;
+    }
+
+    for (index, unit) in immutable_units.into_iter().enumerate() {
+        if index < included_immutable_count {
+            selection.immutable_unit_ids.push(unit.unit_id.clone());
+        } else {
+            selection.units_pruned += 1;
+        }
+    }
+
+    selection.units_scanned =
+        selection.immutable_unit_ids.len() + usize::from(selection.include_mutable);
+    selection.scanned_put_count = stats
+        .query_units
+        .iter()
+        .filter(|unit| {
+            (unit.tier == "mutable" && selection.include_mutable)
+                || selection
+                    .immutable_unit_ids
+                    .iter()
+                    .any(|unit_id| unit_id == &unit.unit_id)
+        })
+        .map(|unit| unit.put_count)
+        .sum();
+    selection
+}
+
+fn estimate_selectivity(predicate: &Predicate, stats: &CollectionStats) -> f32 {
+    let total_records = stats
+        .query_units
+        .iter()
+        .map(|unit| unit.put_count)
+        .sum::<usize>()
+        .max(1) as f32;
+
+    let estimated_matches = stats
+        .query_units
+        .iter()
+        .map(|unit| estimate_unit_selectivity(predicate, unit) * unit.put_count as f32)
+        .sum::<f32>();
+
+    (estimated_matches / total_records).clamp(0.0, 1.0)
+}
+
+fn estimate_unit_selectivity(predicate: &Predicate, unit: &QueryUnitStats) -> f32 {
+    match predicate {
+        Predicate::And { children } => children.iter().fold(1.0, |current, child| {
+            (current * estimate_unit_selectivity(child, unit)).clamp(0.0, 1.0)
+        }),
+        Predicate::Or { children } => {
+            1.0 - children.iter().fold(1.0, |current, child| {
+                current * (1.0 - estimate_unit_selectivity(child, unit))
+            })
+        }
+        Predicate::Not { child } => 1.0 - estimate_unit_selectivity(child, unit),
+        Predicate::Comparison(comparison) => estimate_comparison_selectivity(comparison, unit),
+    }
+}
+
+fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &QueryUnitStats) -> f32 {
+    let Some(field_stats) = unit.scalar_fields.get(&comparison.field) else {
+        return 0.0;
+    };
+    let total = unit.put_count.max(1) as f32;
+
+    match comparison.operator {
+        PredicateOperator::Exists => (field_stats.present_count as f32 / total).clamp(0.0, 1.0),
+        PredicateOperator::IsNull => (field_stats.null_count as f32 / total).clamp(0.0, 1.0),
+        PredicateOperator::Eq => comparison
+            .value
+            .as_ref()
+            .map(|value| {
+                field_stats
+                    .value_counts
+                    .get(&value.summary_key())
+                    .copied()
+                    .unwrap_or_default() as f32
+                    / total
+            })
+            .unwrap_or(0.0),
+        PredicateOperator::Ne => {
+            1.0 - estimate_comparison_selectivity(
+                &PredicateComparison {
+                    field: comparison.field.clone(),
+                    operator: PredicateOperator::Eq,
+                    value: comparison.value.clone(),
+                },
+                unit,
+            )
+        }
+        PredicateOperator::Lt
+        | PredicateOperator::Lte
+        | PredicateOperator::Gt
+        | PredicateOperator::Gte => {
+            match (
+                comparison.value.as_ref(),
+                field_stats.min.as_ref(),
+                field_stats.max.as_ref(),
+            ) {
+                (Some(value), Some(min), Some(max)) => match comparison.operator {
+                    PredicateOperator::Lt if compare_scalars(value, min) != Ordering::Greater => {
+                        0.0
+                    }
+                    PredicateOperator::Lt if compare_scalars(value, max) == Ordering::Greater => {
+                        1.0
+                    }
+                    PredicateOperator::Lte if compare_scalars(value, min) == Ordering::Less => 0.0,
+                    PredicateOperator::Lte if compare_scalars(value, max) != Ordering::Less => 1.0,
+                    PredicateOperator::Gt if compare_scalars(value, max) != Ordering::Less => 0.0,
+                    PredicateOperator::Gt if compare_scalars(value, min) == Ordering::Less => 1.0,
+                    PredicateOperator::Gte if compare_scalars(value, max) == Ordering::Greater => {
+                        0.0
+                    }
+                    PredicateOperator::Gte if compare_scalars(value, min) != Ordering::Greater => {
+                        1.0
+                    }
+                    _ => 0.6,
+                },
+                _ => 0.0,
+            }
+        }
+    }
+}
+
+fn filter_records_by_predicate<I>(records: I, predicate: Option<&Predicate>) -> Vec<VisibleRecord>
+where
+    I: IntoIterator<Item = VisibleRecord>,
+{
+    records
+        .into_iter()
+        .filter(|record| {
+            predicate
+                .is_none_or(|predicate| predicate_matches_metadata(&record.metadata, predicate))
+        })
+        .collect()
+}
+
+fn predicate_matches_metadata(metadata: &Value, predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::And { children } => children
+            .iter()
+            .all(|child| predicate_matches_metadata(metadata, child)),
+        Predicate::Or { children } => children
+            .iter()
+            .any(|child| predicate_matches_metadata(metadata, child)),
+        Predicate::Not { child } => !predicate_matches_metadata(metadata, child),
+        Predicate::Comparison(comparison) => comparison_matches_metadata(metadata, comparison),
+    }
+}
+
+fn comparison_matches_metadata(metadata: &Value, comparison: &PredicateComparison) -> bool {
+    let field_value = metadata
+        .as_object()
+        .and_then(|fields| fields.get(&comparison.field));
+
+    match comparison.operator {
+        PredicateOperator::Exists => field_value.is_some(),
+        PredicateOperator::IsNull => matches!(field_value, Some(Value::Null)),
+        PredicateOperator::Eq => field_value
+            .and_then(ScalarMetadataValue::from_json)
+            .zip(comparison.value.clone())
+            .is_some_and(|(actual, expected)| actual == expected),
+        PredicateOperator::Ne => field_value
+            .and_then(ScalarMetadataValue::from_json)
+            .zip(comparison.value.clone())
+            .is_some_and(|(actual, expected)| actual != expected),
+        PredicateOperator::Lt => {
+            compare_field_value(field_value, comparison.value.as_ref(), Ordering::Less)
+        }
+        PredicateOperator::Lte => {
+            compare_field_value(field_value, comparison.value.as_ref(), Ordering::Less)
+                || compare_field_value(field_value, comparison.value.as_ref(), Ordering::Equal)
+        }
+        PredicateOperator::Gt => {
+            compare_field_value(field_value, comparison.value.as_ref(), Ordering::Greater)
+        }
+        PredicateOperator::Gte => {
+            compare_field_value(field_value, comparison.value.as_ref(), Ordering::Greater)
+                || compare_field_value(field_value, comparison.value.as_ref(), Ordering::Equal)
+        }
+    }
+}
+
+fn compare_field_value(
+    actual: Option<&Value>,
+    expected: Option<&ScalarMetadataValue>,
+    ordering: Ordering,
+) -> bool {
+    actual
+        .and_then(ScalarMetadataValue::from_json)
+        .zip(expected.cloned())
+        .is_some_and(|(actual, expected)| compare_scalars(&actual, &expected) == ordering)
+}
+
+fn build_diagnostics(
+    request: &QueryRequest,
+    chosen_plan: QueryPlanKind,
+    estimated_selectivity: f32,
+    unit_selection: &UnitSelection,
+    measurements: DiagnosticMeasurements,
+) -> Option<QueryDiagnostics> {
+    match request.explain {
+        ExplainMode::None => None,
+        ExplainMode::Plan | ExplainMode::Profile => Some(QueryDiagnostics {
+            chosen_plan,
+            planner_reason: planner_reason(chosen_plan, estimated_selectivity).to_owned(),
+            estimated_selectivity,
+            units_considered: unit_selection.units_considered,
+            units_pruned: unit_selection.units_pruned,
+            units_scanned: unit_selection.units_scanned,
+            candidates_before_filter: measurements.candidates_before_filter,
+            candidates_after_filter: measurements.candidates_after_filter,
+            rerank_count: 0,
+            stage_timings: match request.explain {
+                ExplainMode::Profile => Some(QueryStageTimings {
+                    planning_micros: measurements.planning_micros,
+                    predicate_micros: measurements.predicate_micros,
+                    ranking_micros: measurements.ranking_micros,
+                }),
+                ExplainMode::None | ExplainMode::Plan => None,
+            },
+        }),
+    }
+}
+
+fn planner_reason(plan: QueryPlanKind, estimated_selectivity: f32) -> &'static str {
+    match plan {
+        QueryPlanKind::UnfilteredExactScan => "no predicate supplied",
+        QueryPlanKind::PredicateFirstExact if estimated_selectivity <= 0.45 => {
+            "predicate is selective enough to filter before ranking"
+        }
+        QueryPlanKind::VectorFirstExact => {
+            "predicate is broad enough that ranking first is cheaper"
+        }
+        QueryPlanKind::TinyPopulationExactFallback => {
+            "estimated predicate population is small enough for an exact fallback"
+        }
+        QueryPlanKind::PredicateFirstExact => "predicate-first exact scan selected",
+    }
+}
+
+fn predicate_may_match_unit(predicate: &Predicate, unit: &QueryUnitStats) -> bool {
+    match predicate {
+        Predicate::And { children } => children
+            .iter()
+            .all(|child| predicate_may_match_unit(child, unit)),
+        Predicate::Or { children } => children
+            .iter()
+            .any(|child| predicate_may_match_unit(child, unit)),
+        Predicate::Not { .. } => true,
+        Predicate::Comparison(comparison) => comparison_may_match_unit(comparison, unit),
+    }
+}
+
+fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitStats) -> bool {
+    let Some(field_stats) = unit.scalar_fields.get(&comparison.field) else {
+        return false;
+    };
+
+    match comparison.operator {
+        PredicateOperator::Exists => field_stats.present_count > 0,
+        PredicateOperator::IsNull => field_stats.null_count > 0,
+        PredicateOperator::Eq => comparison
+            .value
+            .as_ref()
+            .is_some_and(|value| field_stats.value_counts.contains_key(&value.summary_key())),
+        PredicateOperator::Ne => comparison.value.as_ref().is_none_or(|value| {
+            field_stats
+                .value_counts
+                .get(&value.summary_key())
+                .is_none_or(|count| *count < unit.put_count)
+        }),
+        PredicateOperator::Lt | PredicateOperator::Lte => comparison
+            .value
+            .as_ref()
+            .zip(field_stats.min.as_ref())
+            .zip(field_stats.max.as_ref())
+            .is_some_and(|((value, min), _max)| match comparison.operator {
+                PredicateOperator::Lt => compare_scalars(min, value) == Ordering::Less,
+                PredicateOperator::Lte => compare_scalars(min, value) != Ordering::Greater,
+                _ => false,
+            }),
+        PredicateOperator::Gt | PredicateOperator::Gte => comparison
+            .value
+            .as_ref()
+            .zip(field_stats.min.as_ref())
+            .zip(field_stats.max.as_ref())
+            .is_some_and(|((value, _min), max)| match comparison.operator {
+                PredicateOperator::Gt => compare_scalars(max, value) == Ordering::Greater,
+                PredicateOperator::Gte => compare_scalars(max, value) != Ordering::Less,
+                _ => false,
+            }),
+    }
+}
+
+fn compare_scalars(left: &ScalarMetadataValue, right: &ScalarMetadataValue) -> Ordering {
+    match (left, right) {
+        (ScalarMetadataValue::String(left), ScalarMetadataValue::String(right)) => left.cmp(right),
+        (ScalarMetadataValue::Bool(left), ScalarMetadataValue::Bool(right)) => left.cmp(right),
+        (ScalarMetadataValue::Number(left), ScalarMetadataValue::Number(right)) => {
+            if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+                left.cmp(&right)
+            } else if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+                left.cmp(&right)
+            } else {
+                left.as_f64()
+                    .unwrap_or_default()
+                    .partial_cmp(&right.as_f64().unwrap_or_default())
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+        (ScalarMetadataValue::Null, ScalarMetadataValue::Null) => Ordering::Equal,
+        (ScalarMetadataValue::Null, _) => Ordering::Less,
+        (_, ScalarMetadataValue::Null) => Ordering::Greater,
+        (
+            ScalarMetadataValue::Bool(_),
+            ScalarMetadataValue::Number(_) | ScalarMetadataValue::String(_),
+        ) => Ordering::Less,
+        (ScalarMetadataValue::Number(_), ScalarMetadataValue::String(_)) => Ordering::Less,
+        (
+            ScalarMetadataValue::Number(_) | ScalarMetadataValue::String(_),
+            ScalarMetadataValue::Bool(_),
+        ) => Ordering::Greater,
+        (ScalarMetadataValue::String(_), ScalarMetadataValue::Number(_)) => Ordering::Greater,
+    }
+}
+
+#[derive(Default)]
+struct UnitSelection {
+    include_mutable: bool,
+    immutable_unit_ids: Vec<String>,
+    units_considered: usize,
+    units_pruned: usize,
+    units_scanned: usize,
+    scanned_put_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiagnosticMeasurements {
+    candidates_before_filter: usize,
+    candidates_after_filter: usize,
+    planning_micros: u64,
+    predicate_micros: u64,
+    ranking_micros: u64,
 }
 
 fn ensure_dimensions(query: &[f32], candidate: &[f32]) -> Result<()> {
@@ -327,9 +1056,11 @@ mod tests {
     use async_trait::async_trait;
     use logpose_catalog::CollectionDescriptor;
     use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine};
-    use logpose_types::{CollectionStats, CommitAck, LogPoseError, WriteOperation};
+    use logpose_types::{
+        CollectionStats, CommitAck, LogPoseError, MaintenanceStatus, QueryUnitStats, WriteOperation,
+    };
     use serde_json::json;
-    use std::path::Path;
+    use std::{collections::BTreeMap, path::Path};
 
     fn record(id: &str, vector: Vec<f32>) -> VisibleRecord {
         VisibleRecord {
@@ -381,6 +1112,8 @@ mod tests {
                 visible_seq_no: 11,
             }),
             filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
         };
 
         let matches = rank_matches(
@@ -447,6 +1180,8 @@ mod tests {
             top_k: 2,
             snapshot: Some(snapshot.clone()),
             filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
         };
 
         let truncated = rank_matches(
@@ -488,6 +1223,8 @@ mod tests {
             top_k: 4,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
         };
 
         let empty = rank_matches(
@@ -652,6 +1389,8 @@ mod tests {
                 top_k: 1,
                 snapshot: None,
                 filters: Vec::new(),
+                predicate: None,
+                explain: ExplainMode::None,
             },
         )
         .await;
@@ -673,6 +1412,8 @@ mod tests {
                 top_k: 1,
                 snapshot: None,
                 filters: Vec::new(),
+                predicate: None,
+                explain: ExplainMode::None,
             },
         )
         .await;
@@ -684,6 +1425,60 @@ mod tests {
                 expected: 2,
                 actual: 1
             }) if record_id.as_str() == "bad-record"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_values_for_binary_predicates() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(Predicate::Comparison(PredicateComparison {
+                    field: "kind".to_owned(),
+                    operator: PredicateOperator::Eq,
+                    value: None,
+                })),
+                explain: ExplainMode::None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(QueryError::InvalidPredicate(message))
+                if message.contains("requires a value")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_values_for_unary_predicates() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: Some(Predicate::Comparison(PredicateComparison {
+                    field: "kind".to_owned(),
+                    operator: PredicateOperator::Exists,
+                    value: Some(ScalarMetadataValue::String("keep".to_owned())),
+                })),
+                explain: ExplainMode::None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(QueryError::InvalidPredicate(message))
+                if message.contains("does not accept a value")
         ));
     }
 
@@ -743,6 +1538,14 @@ mod tests {
             Err(LogPoseError::Message("not implemented".to_owned()))
         }
 
+        async fn stats_snapshot(
+            &self,
+            _collection_name: &str,
+            _snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<CollectionStats> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
         async fn inspect(
             &self,
             _collection_name: &str,
@@ -768,6 +1571,8 @@ mod tests {
                     field: "kind".to_owned(),
                     value: ScalarMetadataValue::String("keep".to_owned()),
                 }],
+                predicate: None,
+                explain: ExplainMode::None,
             },
         )
         .await
@@ -845,7 +1650,49 @@ mod tests {
         }
 
         async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Ok(CollectionStats {
+                collection_id: CollectionDescriptor::new(
+                    "broken",
+                    2,
+                    DistanceMetric::Dot,
+                    Path::new("/tmp"),
+                )
+                .collection_id,
+                collection_name: "broken".to_owned(),
+                manifest_generation: 4,
+                visible_seq_no: 9,
+                mutable_op_count: 1,
+                segment_count: 0,
+                live_record_count: 1,
+                deleted_record_count: 0,
+                maintenance: MaintenanceStatus::default(),
+                query_units: vec![QueryUnitStats {
+                    unit_id: "mutable-delta".to_owned(),
+                    tier: "mutable".to_owned(),
+                    index_kind: "raw".to_owned(),
+                    index_file_name: String::new(),
+                    min_seq_no: 9,
+                    max_seq_no: 9,
+                    put_count: 1,
+                    delete_count: 0,
+                    approx_bytes: 32,
+                    scalar_fields: BTreeMap::new(),
+                }],
+            })
+        }
+
+        async fn stats_snapshot(
+            &self,
+            collection_name: &str,
+            snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<CollectionStats> {
+            self.stats(collection_name).await.map(|mut stats| {
+                if let Some(snapshot) = snapshot {
+                    stats.manifest_generation = snapshot.manifest_generation;
+                    stats.visible_seq_no = snapshot.visible_seq_no;
+                }
+                stats
+            })
         }
 
         async fn inspect(
@@ -932,7 +1779,62 @@ mod tests {
         }
 
         async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Ok(CollectionStats {
+                collection_id: CollectionDescriptor::new(
+                    "filtered",
+                    2,
+                    DistanceMetric::Dot,
+                    Path::new("/tmp"),
+                )
+                .collection_id,
+                collection_name: "filtered".to_owned(),
+                manifest_generation: 3,
+                visible_seq_no: 8,
+                mutable_op_count: 3,
+                segment_count: 0,
+                live_record_count: 3,
+                deleted_record_count: 0,
+                maintenance: MaintenanceStatus::default(),
+                query_units: vec![QueryUnitStats {
+                    unit_id: "mutable-delta".to_owned(),
+                    tier: "mutable".to_owned(),
+                    index_kind: "raw".to_owned(),
+                    index_file_name: String::new(),
+                    min_seq_no: 4,
+                    max_seq_no: 6,
+                    put_count: 3,
+                    delete_count: 0,
+                    approx_bytes: 64,
+                    scalar_fields: BTreeMap::from([(
+                        "kind".to_owned(),
+                        logpose_types::ScalarFieldStats {
+                            present_count: 3,
+                            null_count: 0,
+                            distinct_count: 2,
+                            min: Some(ScalarMetadataValue::String("drop".to_owned())),
+                            max: Some(ScalarMetadataValue::String("keep".to_owned())),
+                            value_counts: BTreeMap::from([
+                                ("string:keep".to_owned(), 2),
+                                ("string:drop".to_owned(), 1),
+                            ]),
+                        },
+                    )]),
+                }],
+            })
+        }
+
+        async fn stats_snapshot(
+            &self,
+            collection_name: &str,
+            snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<CollectionStats> {
+            self.stats(collection_name).await.map(|mut stats| {
+                if let Some(snapshot) = snapshot {
+                    stats.manifest_generation = snapshot.manifest_generation;
+                    stats.visible_seq_no = snapshot.visible_seq_no;
+                }
+                stats
+            })
         }
 
         async fn inspect(

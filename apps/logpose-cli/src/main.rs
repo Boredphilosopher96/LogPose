@@ -10,7 +10,10 @@ use logpose_core as _;
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
 use logpose_client::LogPoseClient;
-use logpose_query::{MetadataFilter, QueryRequest, ScalarMetadataValue};
+use logpose_query::{
+    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator, QueryRequest,
+    ScalarMetadataValue,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     DeleteRecord, DistanceMetric, NodeMetadata, PutRecord, RecordId, Snapshot, WriteOperation,
@@ -129,6 +132,14 @@ struct QueryArgs {
     vector: QueryVector,
     #[arg(long = "filter", value_parser = parse_query_filter)]
     filters: Vec<QueryFilter>,
+    #[arg(long = "where", value_parser = parse_query_where)]
+    where_clauses: Vec<Predicate>,
+    #[arg(long)]
+    predicate_json: Option<PathBuf>,
+    #[arg(long, conflicts_with = "profile")]
+    explain: bool,
+    #[arg(long, conflicts_with = "explain")]
+    profile: bool,
     #[arg(long)]
     snapshot_manifest_generation: Option<u64>,
     #[arg(long)]
@@ -148,12 +159,14 @@ struct QueryFilter {
 struct InspectArgs {
     #[arg(long)]
     collection: String,
-    #[arg(long, conflicts_with_all = ["wal", "segment"])]
+    #[arg(long, conflicts_with_all = ["wal", "segment", "maintenance"])]
     manifest: bool,
-    #[arg(long, conflicts_with_all = ["manifest", "segment"])]
+    #[arg(long, conflicts_with_all = ["manifest", "segment", "maintenance"])]
     wal: bool,
-    #[arg(long, conflicts_with_all = ["manifest", "wal"])]
+    #[arg(long, conflicts_with_all = ["manifest", "wal", "maintenance"])]
     segment: Option<String>,
+    #[arg(long, conflicts_with_all = ["manifest", "wal", "segment"])]
+    maintenance: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +297,8 @@ async fn main() -> anyhow::Result<()> {
             command: DataCommand::Query(args),
         } => {
             let snapshot = query_snapshot_from_args(&args)?;
+            let predicate = query_predicate_from_args(&args)?;
+            let explain = query_explain_mode_from_args(&args);
             let filters = args
                 .filters
                 .into_iter()
@@ -300,6 +315,8 @@ async fn main() -> anyhow::Result<()> {
                     top_k: args.top_k,
                     snapshot,
                     filters,
+                    predicate,
+                    explain,
                 })
                 .await
                 .context("failed to query collection")?;
@@ -357,6 +374,8 @@ fn endpoint_url(host: &str, port: u16) -> String {
 fn inspect_target_from_args(args: &InspectArgs) -> InspectTarget {
     if args.wal {
         InspectTarget::Wal
+    } else if args.maintenance {
+        InspectTarget::Maintenance
     } else if let Some(segment_id) = &args.segment {
         InspectTarget::Segment(segment_id.clone())
     } else {
@@ -377,6 +396,35 @@ fn query_snapshot_from_args(args: &QueryArgs) -> anyhow::Result<Option<Snapshot>
         _ => bail!(
             "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
         ),
+    }
+}
+
+fn query_predicate_from_args(args: &QueryArgs) -> anyhow::Result<Option<Predicate>> {
+    let mut predicates = args.where_clauses.clone();
+    if let Some(path) = &args.predicate_json {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open predicate json '{}'", path.display()))?;
+        let predicate = serde_json::from_reader::<_, Predicate>(file)
+            .with_context(|| format!("failed to parse predicate json '{}'", path.display()))?;
+        predicates.push(predicate);
+    }
+
+    Ok(match predicates.len() {
+        0 => None,
+        1 => predicates.into_iter().next(),
+        _ => Some(Predicate::And {
+            children: predicates,
+        }),
+    })
+}
+
+fn query_explain_mode_from_args(args: &QueryArgs) -> ExplainMode {
+    if args.profile {
+        ExplainMode::Profile
+    } else if args.explain {
+        ExplainMode::Plan
+    } else {
+        ExplainMode::None
     }
 }
 
@@ -418,6 +466,76 @@ fn parse_query_filter(value: &str) -> Result<QueryFilter, String> {
         field: field.to_owned(),
         value: scalar,
     })
+}
+
+fn parse_query_where(value: &str) -> Result<Predicate, String> {
+    let mut parts = value.splitn(3, ':');
+    let field = parts
+        .next()
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| "where clauses must use field:op:value syntax".to_owned())?;
+    let operator = parts
+        .next()
+        .map(str::trim)
+        .filter(|operator| !operator.is_empty())
+        .ok_or_else(|| "where clauses must use field:op:value syntax".to_owned())?;
+    let raw_value = parts.next().map(str::trim);
+
+    let operator = parse_predicate_operator(operator)?;
+    let value = match operator {
+        PredicateOperator::Exists | PredicateOperator::IsNull => {
+            if raw_value.is_some() {
+                return Err(format!(
+                    "where operator '{}' does not accept a value",
+                    operator_name(operator)
+                ));
+            }
+            None
+        }
+        _ => {
+            let raw_value = raw_value.ok_or_else(|| {
+                format!(
+                    "where operator '{}' requires a value",
+                    operator_name(operator)
+                )
+            })?;
+            Some(parse_scalar_metadata_value(raw_value)?)
+        }
+    };
+
+    Ok(Predicate::Comparison(PredicateComparison {
+        field: field.to_owned(),
+        operator,
+        value,
+    }))
+}
+
+fn parse_predicate_operator(value: &str) -> Result<PredicateOperator, String> {
+    match value {
+        "eq" => Ok(PredicateOperator::Eq),
+        "ne" => Ok(PredicateOperator::Ne),
+        "lt" => Ok(PredicateOperator::Lt),
+        "lte" => Ok(PredicateOperator::Lte),
+        "gt" => Ok(PredicateOperator::Gt),
+        "gte" => Ok(PredicateOperator::Gte),
+        "exists" => Ok(PredicateOperator::Exists),
+        "is_null" => Ok(PredicateOperator::IsNull),
+        _ => Err(format!("unsupported where operator '{value}'")),
+    }
+}
+
+fn operator_name(operator: PredicateOperator) -> &'static str {
+    match operator {
+        PredicateOperator::Eq => "eq",
+        PredicateOperator::Ne => "ne",
+        PredicateOperator::Lt => "lt",
+        PredicateOperator::Lte => "lte",
+        PredicateOperator::Gt => "gt",
+        PredicateOperator::Gte => "gte",
+        PredicateOperator::Exists => "exists",
+        PredicateOperator::IsNull => "is_null",
+    }
 }
 
 fn parse_scalar_metadata_value(value: &str) -> Result<ScalarMetadataValue, String> {
@@ -542,6 +660,34 @@ mod tests {
 
         assert_eq!(parsed.field, "enabled");
         assert_eq!(parsed.value, ScalarMetadataValue::Bool(true));
+    }
+
+    #[test]
+    fn where_clauses_parse_scalar_comparisons() {
+        let parsed = parse_query_where("score:gte:json:7").expect("where clause should parse");
+
+        assert_eq!(
+            parsed,
+            Predicate::Comparison(PredicateComparison {
+                field: "score".to_owned(),
+                operator: PredicateOperator::Gte,
+                value: Some(ScalarMetadataValue::Number(7.into())),
+            })
+        );
+    }
+
+    #[test]
+    fn where_clauses_parse_unary_operators_without_values() {
+        let parsed = parse_query_where("archived:is_null").expect("where clause should parse");
+
+        assert_eq!(
+            parsed,
+            Predicate::Comparison(PredicateComparison {
+                field: "archived".to_owned(),
+                operator: PredicateOperator::IsNull,
+                value: None,
+            })
+        );
     }
 
     #[test]

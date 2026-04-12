@@ -4,7 +4,10 @@ use logpose_catalog as _;
 use logpose_client::LogPoseClient;
 use logpose_config::LogPoseConfig;
 use logpose_core::AppState;
-use logpose_query::QueryRequest;
+use logpose_query::{
+    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
+    ScalarMetadataValue,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde as _;
@@ -82,20 +85,33 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
-            filters: vec![logpose_query::MetadataFilter {
+            filters: Vec::new(),
+            predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
-                value: logpose_query::ScalarMetadataValue::String("keep".to_owned()),
-            }],
+                operator: PredicateOperator::Eq,
+                value: Some(ScalarMetadataValue::String("keep".to_owned())),
+            })),
+            explain: ExplainMode::Profile,
         })
         .await
         .expect("query should succeed");
     assert_eq!(query.matches[0].id.as_str(), "alpha");
+    assert_eq!(
+        query
+            .diagnostics
+            .as_ref()
+            .expect("diagnostics should be present")
+            .chosen_plan,
+        QueryPlanKind::TinyPopulationExactFallback
+    );
 
     let stats = client.stats("documents").await.expect("stats should load");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.deleted_record_count, 0);
     assert_eq!(stats.mutable_op_count, 2);
     assert_eq!(stats.segment_count, 0);
+    assert_eq!(stats.maintenance.completed_runs, 0);
+    assert_eq!(stats.query_units.len(), 1);
 
     let flush = client
         .flush("documents")
@@ -127,6 +143,9 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert_eq!(stats.deleted_record_count, 1);
     assert_eq!(stats.mutable_op_count, 1);
     assert_eq!(stats.segment_count, 1);
+    assert_eq!(stats.maintenance.completed_runs, 0);
+    assert!(stats.maintenance.in_progress.is_none());
+    assert_eq!(stats.query_units.len(), 2);
 
     let inspect = client
         .inspect("documents", InspectTarget::Manifest)
@@ -172,6 +191,12 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             .and_then(Value::as_str),
         Some(segment_id.as_str())
     );
+
+    let maintenance = client
+        .inspect("documents", InspectTarget::Maintenance)
+        .await
+        .expect("maintenance inspect should succeed");
+    assert_eq!(maintenance.target, "maintenance");
 
     server.abort();
     let _ = server.await;

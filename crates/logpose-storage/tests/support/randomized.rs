@@ -139,6 +139,8 @@ impl ExpectedModel {
             segment_count: self.segment_count,
             live_record_count,
             deleted_record_count,
+            maintenance: Default::default(),
+            query_units: Vec::new(),
         }
     }
 
@@ -533,7 +535,72 @@ async fn assert_stats_match(
         .await
         .unwrap_or_else(|error| panic_with_context(seed, trace, format!("stats failed: {error}")));
     let expected = model.expected_stats();
-    assert_eq_with_context(seed, trace, "stats mismatch", &expected, &actual);
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.collection_id,
+        &actual.collection_id,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.collection_name,
+        &actual.collection_name,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.manifest_generation,
+        &actual.manifest_generation,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.visible_seq_no,
+        &actual.visible_seq_no,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.mutable_op_count,
+        &actual.mutable_op_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.segment_count,
+        &actual.segment_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.live_record_count,
+        &actual.live_record_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "stats mismatch",
+        &expected.deleted_record_count,
+        &actual.deleted_record_count,
+    );
+    assert!(
+        !actual.query_units.is_empty(),
+        "seed={seed} trace={trace:?} query_units={:?}",
+        actual.query_units
+    );
+    assert_eq!(
+        actual.query_units[0].tier, "mutable",
+        "seed={seed} trace={trace:?} query_units={:?}",
+        actual.query_units
+    );
 }
 
 async fn assert_manifest_inspect_matches(
@@ -669,6 +736,7 @@ impl ExpectedModel {
             returned: matches.len(),
             snapshot,
             matches,
+            diagnostics: None,
         }
     }
 
@@ -705,6 +773,8 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         top_k: EXACT_QUERY_TOP_K,
         snapshot: None,
         filters: Vec::new(),
+        predicate: None,
+        explain: logpose_query::ExplainMode::None,
     }
 }
 
@@ -715,6 +785,8 @@ fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRe
         top_k: EXACT_QUERY_TOP_K,
         snapshot: Some(snapshot),
         filters: Vec::new(),
+        predicate: None,
+        explain: logpose_query::ExplainMode::None,
     }
 }
 

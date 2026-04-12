@@ -1,4 +1,6 @@
-# Phase 3: Query Planning
+# ~~Phase 3: Query Planning~~
+
+**Done marker:** Phase 3 is complete.
 
 ## Goal
 
@@ -35,6 +37,10 @@ The planner does not need full relational optimizer complexity immediately. It d
 - scalar and vector work are no longer separate conceptual subsystems glued together ad hoc
 - planner decisions can evolve without rewriting external APIs
 
+## Status
+
+Phase 3 is done.
+
 ## Testing Direction
 
 Phase 3 should add planner-focused verification layers:
@@ -49,6 +55,6 @@ This is the phase where the testing ladder starts validating "why that plan was 
 
 ## What This Unlocks
 
-Once planning is real, ANN can become an operator family instead of a special mode.
+Planning is now real for exact and hybrid-exact execution, with planner diagnostics exposed consistently through REST, gRPC, client, and CLI surfaces.
 
 That makes Phase 4 cleaner: LogPose can add ANN under the planner instead of restructuring the whole engine around one index type.

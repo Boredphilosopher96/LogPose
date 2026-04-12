@@ -2,7 +2,10 @@
 
 use async_trait as _;
 use logpose_catalog as _;
-use logpose_query::{QueryError, QueryRequest, query_exact};
+use logpose_query::{
+    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryError, QueryRequest,
+    query_exact,
+};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation};
 use serde as _;
@@ -60,6 +63,8 @@ async fn queries_storage_records_and_honors_snapshots() {
             top_k: 2,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await
@@ -104,6 +109,8 @@ async fn queries_storage_records_and_honors_snapshots() {
             top_k: 3,
             snapshot: Some(snapshot.clone()),
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await
@@ -142,6 +149,8 @@ async fn returns_empty_matches_for_empty_collection() {
             top_k: 5,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await
@@ -182,6 +191,8 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
             top_k: 1,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await;
@@ -257,6 +268,8 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             top_k: 2,
             snapshot: Some(before_delete),
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await
@@ -298,6 +311,8 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             top_k: 3,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await
@@ -314,6 +329,62 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 }
 
 #[tokio::test]
+async fn exists_predicates_match_non_scalar_fields_after_flush() {
+    let root = unique_temp_dir("query-exists-non-scalar-after-flush");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({ "details": { "kind": "keep" } }),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let response = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: Some(Predicate::Comparison(PredicateComparison {
+                field: "details".to_owned(),
+                operator: PredicateOperator::Exists,
+                value: None,
+            })),
+            explain: ExplainMode::Plan,
+        },
+    )
+    .await
+    .expect("exists query should succeed");
+
+    assert_eq!(response.matches.len(), 1);
+    assert_eq!(response.matches[0].id.as_str(), "alpha");
+    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    assert_eq!(diagnostics.units_pruned, 0);
+    assert_eq!(diagnostics.units_scanned, 2);
+}
+
+#[tokio::test]
 async fn surfaces_unknown_collection_errors_from_storage() {
     let root = unique_temp_dir("query-missing-collection");
     let engine = LocalStorageEngine::new(&root);
@@ -326,6 +397,8 @@ async fn surfaces_unknown_collection_errors_from_storage() {
             top_k: 1,
             snapshot: None,
             filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
         },
     )
     .await;

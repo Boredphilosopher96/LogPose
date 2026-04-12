@@ -96,6 +96,58 @@ fn query_rejects_non_scalar_filter_values_as_cli_validation() {
 }
 
 #[test]
+fn query_rejects_unsupported_where_operators_as_cli_validation() {
+    let temp_root = unique_temp_dir("cli-query-invalid-where");
+
+    let output = run_cli_without_assert(
+        &temp_root,
+        [
+            "data",
+            "query",
+            "--collection",
+            "colors",
+            "--top-k",
+            "1",
+            "--vector",
+            "1.0,0.0",
+            "--where",
+            "kind:between:keep",
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("unsupported where operator"));
+}
+
+#[test]
+fn query_surfaces_local_predicate_json_errors_before_connection_failures() {
+    let temp_root = unique_temp_dir("cli-query-invalid-predicate-json");
+    let predicate_path = temp_root.join("predicate.json");
+    fs::write(&predicate_path, "{not-valid-json").expect("predicate json should be written");
+
+    let output = run_cli_without_assert(
+        &temp_root,
+        [
+            "data",
+            "query",
+            "--collection",
+            "colors",
+            "--top-k",
+            "1",
+            "--vector",
+            "1.0,0.0",
+            "--predicate-json",
+            predicate_path.to_str().expect("path should be utf8"),
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("failed to parse predicate json"));
+}
+
+#[test]
 fn put_surfaces_local_input_errors_before_connection_failures() {
     let temp_root = unique_temp_dir("cli-put-invalid-input");
 

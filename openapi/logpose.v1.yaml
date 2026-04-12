@@ -225,7 +225,7 @@ paths:
           required: false
           schema:
             type: string
-            enum: [manifest, wal, segment]
+            enum: [manifest, wal, segment, maintenance]
         - name: segment_id
           in: query
           required: false
@@ -374,12 +374,75 @@ components:
           type: integer
         visible_seq_no:
           type: integer
-    QueryFilterValue:
+    ScalarMetadataValue:
       oneOf:
         - type: string
         - type: number
         - type: boolean
         - type: "null"
+    PredicateOperator:
+      type: string
+      enum: [eq, ne, lt, lte, gt, gte, exists, is_null]
+    ExplainMode:
+      type: string
+      enum: [none, plan, profile]
+    QueryPlanKind:
+      type: string
+      enum:
+        - unfiltered_exact_scan
+        - predicate_first_exact
+        - vector_first_exact
+        - tiny_population_exact_fallback
+    Predicate:
+      oneOf:
+        - $ref: "#/components/schemas/AndPredicate"
+        - $ref: "#/components/schemas/OrPredicate"
+        - $ref: "#/components/schemas/NotPredicate"
+        - $ref: "#/components/schemas/ComparisonPredicate"
+    AndPredicate:
+      type: object
+      required: [kind, children]
+      properties:
+        kind:
+          type: string
+          const: and
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/Predicate"
+    OrPredicate:
+      type: object
+      required: [kind, children]
+      properties:
+        kind:
+          type: string
+          const: or
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/Predicate"
+    NotPredicate:
+      type: object
+      required: [kind, child]
+      properties:
+        kind:
+          type: string
+          const: not
+        child:
+          $ref: "#/components/schemas/Predicate"
+    ComparisonPredicate:
+      type: object
+      required: [kind, field, operator]
+      properties:
+        kind:
+          type: string
+          const: comparison
+        field:
+          type: string
+        operator:
+          $ref: "#/components/schemas/PredicateOperator"
+        value:
+          $ref: "#/components/schemas/ScalarMetadataValue"
     QueryCollectionRequest:
       type: object
       required: [vector, top_k]
@@ -397,9 +460,15 @@ components:
             - $ref: "#/components/schemas/Snapshot"
         filters:
           type: object
-          description: Top-level AND-only equality filters over scalar metadata values.
+          description: Legacy top-level AND-only equality filters over scalar metadata values.
           additionalProperties:
-            $ref: "#/components/schemas/QueryFilterValue"
+            $ref: "#/components/schemas/ScalarMetadataValue"
+        predicate:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Predicate"
+        explain:
+          $ref: "#/components/schemas/ExplainMode"
     QueryMatch:
       type: object
       required: [id, value, metadata]
@@ -410,6 +479,51 @@ components:
           type: number
         metadata:
           nullable: true
+    QueryStageTimings:
+      type: object
+      required: [planning_micros, predicate_micros, ranking_micros]
+      properties:
+        planning_micros:
+          type: integer
+        predicate_micros:
+          type: integer
+        ranking_micros:
+          type: integer
+    QueryDiagnostics:
+      type: object
+      required:
+        - chosen_plan
+        - planner_reason
+        - estimated_selectivity
+        - units_considered
+        - units_pruned
+        - units_scanned
+        - candidates_before_filter
+        - candidates_after_filter
+        - rerank_count
+      properties:
+        chosen_plan:
+          $ref: "#/components/schemas/QueryPlanKind"
+        planner_reason:
+          type: string
+        estimated_selectivity:
+          type: number
+        units_considered:
+          type: integer
+        units_pruned:
+          type: integer
+        units_scanned:
+          type: integer
+        candidates_before_filter:
+          type: integer
+        candidates_after_filter:
+          type: integer
+        rerank_count:
+          type: integer
+        stage_timings:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QueryStageTimings"
     QueryResponse:
       type: object
       required: [metric, top_k, returned, snapshot, matches]
@@ -426,6 +540,86 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/QueryMatch"
+        diagnostics:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/QueryDiagnostics"
+    MaintenanceStatus:
+      type: object
+      required: [pending, completed_runs]
+      properties:
+        pending:
+          type: array
+          items:
+            type: string
+        in_progress:
+          oneOf:
+            - type: "null"
+            - type: string
+        last_error:
+          oneOf:
+            - type: "null"
+            - type: string
+        completed_runs:
+          type: integer
+    ScalarFieldStats:
+      type: object
+      required: [present_count, null_count, distinct_count, value_counts]
+      properties:
+        present_count:
+          type: integer
+        null_count:
+          type: integer
+        distinct_count:
+          type: integer
+        value_counts:
+          type: object
+          additionalProperties:
+            type: integer
+        min:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/ScalarMetadataValue"
+        max:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/ScalarMetadataValue"
+    QueryUnitStats:
+      type: object
+      required:
+        - unit_id
+        - tier
+        - index_kind
+        - index_file_name
+        - min_seq_no
+        - max_seq_no
+        - put_count
+        - delete_count
+        - approx_bytes
+        - scalar_fields
+      properties:
+        unit_id:
+          type: string
+        tier:
+          type: string
+        index_kind:
+          type: string
+        index_file_name:
+          type: string
+        min_seq_no:
+          type: integer
+        max_seq_no:
+          type: integer
+        put_count:
+          type: integer
+        delete_count:
+          type: integer
+        approx_bytes:
+          type: integer
+        scalar_fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ScalarFieldStats"
     CollectionStats:
       type: object
       required:
@@ -437,6 +631,8 @@ components:
         - segment_count
         - live_record_count
         - deleted_record_count
+        - maintenance
+        - query_units
       properties:
         collection_id:
           type: string
@@ -455,6 +651,12 @@ components:
           type: integer
         deleted_record_count:
           type: integer
+        maintenance:
+          $ref: "#/components/schemas/MaintenanceStatus"
+        query_units:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryUnitStats"
     InspectReport:
       type: object
       required: [target, payload]

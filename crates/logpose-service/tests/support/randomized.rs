@@ -3,12 +3,14 @@ use http_body_util::BodyExt;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_core::AppState;
-use logpose_query::{MetadataFilter, QueryMatch, QueryRequest, QueryResponse, ScalarMetadataValue};
+use logpose_query::{
+    ExplainMode, MetadataFilter, QueryMatch, QueryRequest, QueryResponse, ScalarMetadataValue,
+};
 use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId, SeqNo, Snapshot,
-    VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DeleteRecord, DistanceMetric, MaintenanceStatus, PutRecord,
+    RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -160,6 +162,8 @@ impl ExpectedModel {
             segment_count: self.segment_count,
             live_record_count,
             deleted_record_count,
+            maintenance: MaintenanceStatus::default(),
+            query_units: Vec::new(),
         }
     }
 
@@ -202,6 +206,7 @@ impl ExpectedModel {
             returned: matches.len(),
             snapshot,
             matches,
+            diagnostics: None,
         }
     }
 
@@ -515,6 +520,8 @@ async fn assert_query_parity(
         } else {
             Vec::new()
         },
+        predicate: None,
+        explain: ExplainMode::None,
     };
     let actual = service
         .query(request.clone())
@@ -584,6 +591,8 @@ async fn assert_query_parity(
             } else {
                 Vec::new()
             },
+            predicate: None,
+            explain: proto::ExplainMode::None as i32,
         }))
         .await
         .unwrap_or_else(|error| {
@@ -620,7 +629,67 @@ async fn assert_stats_parity(
             panic_with_context(seed, trace, format!("service stats failed: {error}"))
         });
     let expected = model.expected_stats();
-    assert_eq_with_context(seed, trace, "service stats mismatch", &expected, &actual);
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats collection_id mismatch",
+        &expected.collection_id,
+        &actual.collection_id,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats collection_name mismatch",
+        &expected.collection_name,
+        &actual.collection_name,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats manifest_generation mismatch",
+        &expected.manifest_generation,
+        &actual.manifest_generation,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats visible_seq_no mismatch",
+        &expected.visible_seq_no,
+        &actual.visible_seq_no,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats mutable_op_count mismatch",
+        &expected.mutable_op_count,
+        &actual.mutable_op_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats segment_count mismatch",
+        &expected.segment_count,
+        &actual.segment_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats live_record_count mismatch",
+        &expected.live_record_count,
+        &actual.live_record_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "service stats deleted_record_count mismatch",
+        &expected.deleted_record_count,
+        &actual.deleted_record_count,
+    );
+    assert_eq!(
+        actual.query_units.len(),
+        actual.segment_count + 1,
+        "seed={seed} trace={trace:?}"
+    );
 
     let rest_response = rest
         .clone()
@@ -657,6 +726,18 @@ async fn assert_stats_parity(
         rest_body["deleted_record_count"], expected.deleted_record_count,
         "seed={seed} trace={trace:?}"
     );
+    assert!(
+        rest_body["maintenance"].is_object(),
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        rest_body["query_units"]
+            .as_array()
+            .expect("query_units should be an array")
+            .len(),
+        actual.query_units.len(),
+        "seed={seed} trace={trace:?}"
+    );
 
     let grpc_stats = grpc
         .get_collection_stats(Request::new(proto::GetCollectionStatsRequest {
@@ -691,6 +772,15 @@ async fn assert_stats_parity(
         grpc_stats.deleted_record_count as usize, expected.deleted_record_count,
         "seed={seed} trace={trace:?}"
     );
+    assert!(
+        grpc_stats.maintenance.is_some(),
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        grpc_stats.query_units.len(),
+        actual.query_units.len(),
+        "seed={seed} trace={trace:?}"
+    );
 }
 
 async fn assert_inspect_parity(
@@ -706,6 +796,7 @@ async fn assert_inspect_parity(
         InspectTarget::Manifest => "manifest",
         InspectTarget::Wal => "wal",
         InspectTarget::Segment(_) => "segment",
+        InspectTarget::Maintenance => "maintenance",
     };
 
     let actual = service
@@ -748,10 +839,13 @@ async fn assert_inspect_parity(
                 InspectTarget::Manifest => proto::InspectTarget::Manifest as i32,
                 InspectTarget::Wal => proto::InspectTarget::Wal as i32,
                 InspectTarget::Segment(_) => proto::InspectTarget::Segment as i32,
+                InspectTarget::Maintenance => proto::InspectTarget::Maintenance as i32,
             },
             segment_id: match &target {
                 InspectTarget::Segment(segment_id) => segment_id.clone(),
-                InspectTarget::Manifest | InspectTarget::Wal => String::new(),
+                InspectTarget::Manifest | InspectTarget::Wal | InspectTarget::Maintenance => {
+                    String::new()
+                }
             },
         }))
         .await
@@ -897,6 +991,9 @@ fn inspect_request(target: InspectTarget) -> axum::http::Request<Body> {
         InspectTarget::Wal => "/v1/collections/randomized/inspect?target=wal".to_owned(),
         InspectTarget::Segment(segment_id) => {
             format!("/v1/collections/randomized/inspect?target=segment&segment_id={segment_id}")
+        }
+        InspectTarget::Maintenance => {
+            "/v1/collections/randomized/inspect?target=maintenance".to_owned()
         }
     };
 

@@ -3,6 +3,7 @@
 use async_trait as _;
 use crc32fast as _;
 use logpose_catalog as _;
+use logpose_index as _;
 use logpose_query as _;
 use logpose_wal as _;
 use rand as _;
@@ -15,7 +16,10 @@ mod support;
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde_json::{Value, json};
-use std::fs;
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
@@ -123,6 +127,19 @@ async fn flush_persists_visible_records_for_reopen() {
     assert_eq!(stats.mutable_op_count, 0);
     assert_eq!(stats.live_record_count, 1);
     assert_eq!(stats.deleted_record_count, 0);
+    assert_eq!(stats.query_units.len(), 2);
+    assert!(stats.maintenance.pending.is_empty());
+    assert!(stats.maintenance.in_progress.is_none());
+    assert_eq!(stats.maintenance.last_error, None);
+
+    let immutable = stats
+        .query_units
+        .iter()
+        .find(|unit| unit.tier == "immutable")
+        .expect("immutable unit should be reported");
+    assert_eq!(immutable.index_kind, "flat");
+    assert!(immutable.index_file_name.ends_with(".flat.json"));
+    assert_eq!(immutable.scalar_fields["topic"].present_count, 1);
 }
 
 #[tokio::test]
@@ -305,11 +322,44 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
     assert_eq!(
         segment
             .payload
+            .get("index")
+            .and_then(Value::as_object)
+            .and_then(|index| index.get("index_kind"))
+            .and_then(Value::as_str),
+        Some("flat")
+    );
+    assert_eq!(
+        segment
+            .payload
+            .get("index")
+            .and_then(Value::as_object)
+            .and_then(|index| index.get("vector_norms"))
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        segment
+            .payload
             .get("records")
             .and_then(Value::as_array)
             .expect("segment records should be an array")
             .len(),
         2
+    );
+
+    let maintenance = engine
+        .inspect("documents", InspectTarget::Maintenance)
+        .await
+        .expect("maintenance inspect should succeed");
+    assert_eq!(maintenance.target, "maintenance");
+    assert_eq!(
+        maintenance
+            .payload
+            .get("pending")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
     );
 
     let stats = engine
@@ -320,6 +370,160 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
     assert_eq!(stats.deleted_record_count, 1);
     assert_eq!(stats.mutable_op_count, 1);
     assert_eq!(stats.segment_count, 1);
+}
+
+#[tokio::test]
+async fn background_maintenance_flushes_and_compacts_using_thresholds() {
+    let root = support::unique_temp_dir("storage-background-maintenance");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+    configure_thresholds(&descriptor.root_path, 1, 1024, 2);
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep","shard":1}),
+            })],
+        )
+        .await
+        .expect("first write should succeed");
+
+    wait_for_condition(&engine, "events", |stats| {
+        stats.segment_count == 1 && stats.mutable_op_count == 0
+    })
+    .await;
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-2"),
+                vector: vec![2.0, 0.0],
+                metadata: json!({"kind":"keep","shard":2}),
+            })],
+        )
+        .await
+        .expect("second write should succeed");
+
+    wait_for_condition(&engine, "events", |stats| {
+        stats.segment_count == 1
+            && stats.mutable_op_count == 0
+            && stats.maintenance.completed_runs >= 3
+    })
+    .await;
+
+    let stats = engine.stats("events").await.expect("stats should succeed");
+    assert_eq!(stats.live_record_count, 2);
+    assert_eq!(stats.deleted_record_count, 0);
+    assert_eq!(stats.segment_count, 1);
+    assert!(stats.maintenance.pending.is_empty());
+    assert!(stats.maintenance.in_progress.is_none());
+    assert_eq!(stats.maintenance.last_error, None);
+}
+
+#[tokio::test]
+async fn manual_flush_and_background_maintenance_do_not_race() {
+    let root = support::unique_temp_dir("storage-manual-background-race");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+    configure_thresholds(&descriptor.root_path, 1, 1024, 2);
+
+    let writer = engine.clone();
+    let manual = engine.clone();
+    let write_task = tokio::spawn(async move {
+        for index in 0..12 {
+            writer
+                .write(
+                    "events",
+                    vec![WriteOperation::Put(PutRecord {
+                        id: RecordId::new(format!("evt-{index}")),
+                        vector: vec![index as f32, 0.0],
+                        metadata: json!({"kind":"keep","version":index}),
+                    })],
+                )
+                .await?;
+        }
+        logpose_types::Result::<()>::Ok(())
+    });
+    let manual_task = tokio::spawn(async move {
+        for _ in 0..12 {
+            let _ = manual.flush("events").await?;
+        }
+        logpose_types::Result::<()>::Ok(())
+    });
+
+    write_task
+        .await
+        .expect("write task should join")
+        .expect("writes should succeed");
+    manual_task
+        .await
+        .expect("manual maintenance task should join")
+        .expect("manual flushes should succeed");
+
+    wait_for_condition(&engine, "events", |stats| {
+        stats.maintenance.in_progress.is_none() && stats.maintenance.pending.is_empty()
+    })
+    .await;
+
+    let stats = engine.stats("events").await.expect("stats should succeed");
+    assert_eq!(stats.maintenance.last_error, None);
+}
+
+#[tokio::test]
+async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
+    let root = support::unique_temp_dir("storage-empty-immutable-selection");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "events".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    engine.flush("events").await.expect("flush should succeed");
+
+    let visible = engine
+        .scan_exact_selected("events", None, false, Vec::new())
+        .await
+        .expect("selected scan should succeed");
+    assert!(
+        visible.is_empty(),
+        "empty immutable selection should scan no segments"
+    );
 }
 
 #[tokio::test]
@@ -454,4 +658,46 @@ async fn dimension_error_batch_rejects_without_committing_anything() {
         .await
         .expect("scan should succeed");
     assert!(visible.is_empty(), "invalid batch should commit nothing");
+}
+
+fn configure_thresholds(
+    root_path: &std::path::Path,
+    flush_ops: usize,
+    flush_bytes: usize,
+    compact_segments: usize,
+) {
+    let descriptor_path = root_path.join("descriptor.json");
+    let mut descriptor = serde_json::from_slice::<Value>(
+        &fs::read(&descriptor_path).expect("descriptor should exist"),
+    )
+    .expect("descriptor should parse");
+    descriptor["flush_threshold_ops"] = json!(flush_ops);
+    descriptor["flush_threshold_bytes"] = json!(flush_bytes);
+    descriptor["compaction_threshold_segments"] = json!(compact_segments);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor).expect("descriptor should serialize"),
+    )
+    .expect("descriptor should be updated");
+}
+
+async fn wait_for_condition<F>(engine: &LocalStorageEngine, collection_name: &str, predicate: F)
+where
+    F: Fn(&logpose_types::CollectionStats) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let stats = engine
+            .stats(collection_name)
+            .await
+            .expect("stats should succeed");
+        if predicate(&stats) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for background maintenance: {stats:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
