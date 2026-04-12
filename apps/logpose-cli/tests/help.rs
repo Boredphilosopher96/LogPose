@@ -3,6 +3,7 @@
 use anyhow as _;
 use clap as _;
 use logpose_config as _;
+use logpose_query as _;
 use logpose_storage as _;
 use logpose_telemetry as _;
 use logpose_types as _;
@@ -41,6 +42,7 @@ fn data_help_includes_storage_workflows() {
     assert!(stdout.contains("delete"));
     assert!(stdout.contains("flush"));
     assert!(stdout.contains("compact"));
+    assert!(stdout.contains("query"));
     assert!(stdout.contains("stats"));
     assert!(stdout.contains("inspect"));
 }

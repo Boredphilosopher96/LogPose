@@ -1,0 +1,341 @@
+//! Storage-backed exact query integration tests.
+
+use async_trait as _;
+use logpose_catalog as _;
+use logpose_query::{QueryError, QueryRequest, query_exact};
+use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use logpose_types::{DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation};
+use serde as _;
+use serde_json::json;
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use thiserror as _;
+
+#[tokio::test]
+async fn queries_storage_records_and_honors_snapshots() {
+    let root = unique_temp_dir("query-storage-snapshots");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({ "tag": "alpha" }),
+                }),
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.5, 0.0],
+                    metadata: json!({ "tag": "beta" }),
+                }),
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("gamma"),
+                    vector: vec![-1.0, 0.0],
+                    metadata: json!({ "tag": "gamma" }),
+                }),
+            ],
+        )
+        .await
+        .expect("write should succeed");
+
+    let current = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+        },
+    )
+    .await
+    .expect("query should succeed");
+
+    let snapshot = engine
+        .snapshot("documents")
+        .await
+        .expect("snapshot should succeed");
+    assert_eq!(current.metric, DistanceMetric::Dot);
+    assert_eq!(current.top_k, 2);
+    assert_eq!(current.returned, 2);
+    assert_eq!(current.snapshot, snapshot);
+    assert_eq!(
+        current
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+    assert!((current.matches[0].value - 1.0).abs() < 1e-6);
+    assert!((current.matches[1].value - 0.5).abs() < 1e-6);
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("delta"),
+                vector: vec![3.0, 0.0],
+                metadata: json!({ "tag": "delta" }),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let historical = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 3,
+            snapshot: Some(snapshot.clone()),
+        },
+    )
+    .await
+    .expect("historical query should succeed");
+
+    assert_eq!(historical.snapshot, snapshot);
+    assert_eq!(
+        historical
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
+}
+
+#[tokio::test]
+async fn returns_empty_matches_for_empty_collection() {
+    let root = unique_temp_dir("query-empty-collection");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "empty".to_owned(),
+            dimensions: 3,
+            metric: DistanceMetric::Cosine,
+        })
+        .await
+        .expect("collection should be created");
+
+    let response = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "empty".to_owned(),
+            vector: vec![1.0, 0.0, 0.0],
+            top_k: 5,
+            snapshot: None,
+        },
+    )
+    .await
+    .expect("query should succeed");
+
+    assert_eq!(response.metric, DistanceMetric::Cosine);
+    assert_eq!(response.top_k, 5);
+    assert_eq!(response.returned, 0);
+    assert_eq!(response.matches.len(), 0);
+    assert_eq!(
+        response.snapshot,
+        Snapshot {
+            manifest_generation: 0,
+            visible_seq_no: 0
+        }
+    );
+}
+
+#[tokio::test]
+async fn rejects_query_vector_with_wrong_collection_dimensions() {
+    let root = unique_temp_dir("query-dimension-mismatch");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "embeddings".to_owned(),
+            dimensions: 3,
+            metric: DistanceMetric::L2,
+        })
+        .await
+        .expect("collection should be created");
+
+    let result = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "embeddings".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(QueryError::RequestVectorDimensionMismatch {
+            expected: 3,
+            actual: 2
+        })
+    ));
+}
+
+#[tokio::test]
+async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
+    let root = unique_temp_dir("query-delete-flush-compact");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "profiles".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::L2,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "profiles",
+            vec![
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![0.0, 0.0],
+                    metadata: json!({ "version": 1 }),
+                }),
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({ "version": 1 }),
+                }),
+            ],
+        )
+        .await
+        .expect("write should succeed");
+
+    let before_delete = engine
+        .snapshot("profiles")
+        .await
+        .expect("snapshot should succeed");
+
+    engine
+        .write(
+            "profiles",
+            vec![WriteOperation::Delete(logpose_types::DeleteRecord {
+                id: RecordId::new("alpha"),
+            })],
+        )
+        .await
+        .expect("delete should succeed");
+    engine
+        .flush("profiles")
+        .await
+        .expect("flush should succeed");
+
+    let reopened = LocalStorageEngine::new(&root);
+
+    let historical = query_exact(
+        &reopened,
+        QueryRequest {
+            collection_name: "profiles".to_owned(),
+            vector: vec![0.0, 0.0],
+            top_k: 2,
+            snapshot: Some(before_delete),
+        },
+    )
+    .await
+    .expect("historical query should succeed");
+    assert_eq!(
+        historical
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+
+    reopened
+        .write(
+            "profiles",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("gamma"),
+                vector: vec![0.5, 0.0],
+                metadata: json!({ "version": 1 }),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    reopened
+        .flush("profiles")
+        .await
+        .expect("flush should succeed");
+    reopened
+        .compact("profiles")
+        .await
+        .expect("compaction should succeed");
+
+    let current = query_exact(
+        &reopened,
+        QueryRequest {
+            collection_name: "profiles".to_owned(),
+            vector: vec![0.0, 0.0],
+            top_k: 3,
+            snapshot: None,
+        },
+    )
+    .await
+    .expect("current query should succeed");
+
+    assert_eq!(
+        current
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gamma", "beta"]
+    );
+}
+
+#[tokio::test]
+async fn surfaces_unknown_collection_errors_from_storage() {
+    let root = unique_temp_dir("query-missing-collection");
+    let engine = LocalStorageEngine::new(&root);
+
+    let result = query_exact(
+        &engine,
+        QueryRequest {
+            collection_name: "missing".to_owned(),
+            vector: vec![1.0],
+            top_k: 1,
+            snapshot: None,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(QueryError::Storage(LogPoseError::Message(message)))
+            if message.contains("does not exist")
+    ));
+}
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("logpose-query-{label}-{suffix}"));
+    fs::create_dir_all(&path).expect("temp dir should be created");
+    path
+}

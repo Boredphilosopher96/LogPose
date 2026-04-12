@@ -12,6 +12,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 logpose-config = { path = "../../crates/logpose-config" }
+logpose-query = { path = "../../crates/logpose-query" }
 logpose-storage = { path = "../../crates/logpose-storage" }
 logpose-telemetry = { path = "../../crates/logpose-telemetry" }
 logpose-types = { path = "../../crates/logpose-types" }

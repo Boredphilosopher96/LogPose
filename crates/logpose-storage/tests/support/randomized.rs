@@ -1,3 +1,4 @@
+use logpose_query::{QueryMatch, QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{
     CollectionId, CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId,
@@ -15,6 +16,8 @@ const DEFAULT_SCENARIO_STEPS: usize = 40;
 const DEFAULT_RANDOM_SCENARIOS: usize = 5;
 const RECORD_DIMENSIONS: usize = 2;
 const RECORD_ID_POOL: usize = 8;
+const EXACT_QUERY_TOP_K: usize = 3;
+const EXACT_QUERY_VECTORS: [[f32; RECORD_DIMENSIONS]; 3] = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
 
 #[derive(Clone, Debug)]
 pub enum StorageAction {
@@ -46,6 +49,7 @@ enum ExpectedState {
 #[derive(Debug)]
 struct ExpectedModel {
     collection_id: Option<CollectionId>,
+    metric: Option<DistanceMetric>,
     manifest_generation: u64,
     checkpoint_seq_no: SeqNo,
     next_seq_no: SeqNo,
@@ -57,6 +61,7 @@ impl ExpectedModel {
     fn new() -> Self {
         Self {
             collection_id: None,
+            metric: None,
             manifest_generation: 0,
             checkpoint_seq_no: 0,
             next_seq_no: 0,
@@ -65,8 +70,9 @@ impl ExpectedModel {
         }
     }
 
-    fn register_collection(&mut self, collection_id: CollectionId) {
+    fn register_collection(&mut self, collection_id: CollectionId, metric: DistanceMetric) {
         self.collection_id = Some(collection_id);
+        self.metric = Some(metric);
     }
 
     fn record_write(&mut self, operations: &[WriteOperation]) {
@@ -180,6 +186,10 @@ pub async fn run_storage_scenarios() {
     }
 }
 
+pub fn current_exact_query_request_for_test(vector: Vec<f32>) -> QueryRequest {
+    current_exact_query_request(vector)
+}
+
 async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
     let root = fs_support::unique_temp_dir(&format!("storage-random-{seed}"));
     let mut engine = LocalStorageEngine::new(&root);
@@ -199,9 +209,10 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
         .unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))
         });
-    model.register_collection(descriptor.collection_id.clone());
+    model.register_collection(descriptor.collection_id.clone(), descriptor.metric);
     assert_stats_match(&engine, &model, seed, &trace).await;
     assert_current_scan_matches(&engine, &model, seed, &trace).await;
+    assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
 
     for _ in 0..steps {
         let action = next_action(&mut rng, snapshots.len());
@@ -231,6 +242,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 model.record_write(&operations);
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::Delete { id } => {
@@ -246,6 +258,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 model.record_write(&operations);
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::Snapshot => {
@@ -259,10 +272,13 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 assert_eq_with_context(seed, &trace, "snapshot mismatch", &expected, &snapshot);
                 snapshots.push(snapshot.clone());
                 assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
+                assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::ScanCurrent => {
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::ScanSnapshot { snapshot_index } => {
                 let snapshot = snapshots.get(snapshot_index).cloned().unwrap_or_else(|| {
@@ -273,6 +289,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                     )
                 });
                 assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
+                assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
             }
             StorageAction::Flush => {
                 let snapshot = engine.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
@@ -288,6 +305,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                     &snapshot,
                 );
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::Compact => {
@@ -334,6 +352,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                     &after,
                 );
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::Stats => {
@@ -342,6 +361,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
             StorageAction::Reopen => {
                 engine = LocalStorageEngine::new(&root);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, seed, &trace).await;
             }
         }
@@ -446,6 +466,47 @@ async fn assert_scan_matches_snapshot(
     assert_eq_with_context(seed, trace, "snapshot scan mismatch", &expected, &actual);
 }
 
+async fn assert_current_exact_queries_match(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    assert_exact_queries_match(engine, model, None, seed, trace).await;
+}
+
+async fn assert_exact_queries_match_snapshot(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    snapshot: &Snapshot,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    assert_exact_queries_match(engine, model, Some(snapshot.clone()), seed, trace).await;
+}
+
+async fn assert_exact_queries_match(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    snapshot: Option<Snapshot>,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    for vector in EXACT_QUERY_VECTORS {
+        let request = match snapshot.clone() {
+            Some(snapshot) => snapshot_exact_query_request(vector.to_vec(), snapshot),
+            None => current_exact_query_request(vector.to_vec()),
+        };
+        let actual = query_exact(engine, request.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic_with_context(seed, trace, format!("query failed: {error}"))
+            });
+        let expected = model.expected_query_response(request);
+        assert_eq_with_context(seed, trace, "exact query mismatch", &expected, &actual);
+    }
+}
+
 async fn assert_stats_match(
     engine: &LocalStorageEngine,
     model: &ExpectedModel,
@@ -472,6 +533,120 @@ fn assert_ack_matches(
         applied_ops,
     };
     assert_eq_with_context(seed, trace, "commit ack mismatch", &expected, ack);
+}
+
+impl ExpectedModel {
+    fn expected_query_response(&self, request: QueryRequest) -> QueryResponse {
+        let metric = self.metric.expect("collection metric should be registered");
+        let snapshot = request.snapshot.unwrap_or_else(|| self.current_snapshot());
+        let matches = self.expected_query_matches(
+            metric,
+            request.vector.as_slice(),
+            request.top_k,
+            snapshot.visible_seq_no,
+        );
+        QueryResponse {
+            metric,
+            top_k: request.top_k,
+            returned: matches.len(),
+            snapshot,
+            matches,
+        }
+    }
+
+    fn expected_query_matches(
+        &self,
+        metric: DistanceMetric,
+        query: &[f32],
+        top_k: usize,
+        visible_seq_no: SeqNo,
+    ) -> Vec<QueryMatch> {
+        let mut matches = self
+            .expected_visible(visible_seq_no)
+            .into_iter()
+            .map(|record| {
+                let value = expected_match_value(metric, query, &record.vector);
+                QueryMatch {
+                    id: record.id,
+                    value,
+                    metadata: record.metadata,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| compare_query_matches(metric, left, right));
+        matches.truncate(top_k);
+        matches
+    }
+}
+
+fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
+    QueryRequest {
+        collection_name: COLLECTION_NAME.to_owned(),
+        vector,
+        top_k: EXACT_QUERY_TOP_K,
+        snapshot: None,
+    }
+}
+
+fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRequest {
+    QueryRequest {
+        collection_name: COLLECTION_NAME.to_owned(),
+        vector,
+        top_k: EXACT_QUERY_TOP_K,
+        snapshot: Some(snapshot),
+    }
+}
+
+fn expected_match_value(metric: DistanceMetric, query: &[f32], candidate: &[f32]) -> f32 {
+    match metric {
+        DistanceMetric::Dot => query
+            .iter()
+            .zip(candidate)
+            .map(|(lhs, rhs)| lhs * rhs)
+            .sum(),
+        DistanceMetric::Cosine => {
+            let dot: f32 = query
+                .iter()
+                .zip(candidate)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum();
+            let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let candidate_norm = candidate
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+
+            if query_norm == 0.0 || candidate_norm == 0.0 {
+                0.0
+            } else {
+                dot / (query_norm * candidate_norm)
+            }
+        }
+        DistanceMetric::L2 => query
+            .iter()
+            .zip(candidate)
+            .map(|(lhs, rhs)| {
+                let delta = lhs - rhs;
+                delta * delta
+            })
+            .sum::<f32>()
+            .sqrt(),
+    }
+}
+
+fn compare_query_matches(
+    metric: DistanceMetric,
+    left: &QueryMatch,
+    right: &QueryMatch,
+) -> std::cmp::Ordering {
+    let value_order = match metric {
+        DistanceMetric::Cosine | DistanceMetric::Dot => right.value.total_cmp(&left.value),
+        DistanceMetric::L2 => left.value.total_cmp(&right.value),
+    };
+
+    value_order.then_with(|| left.id.cmp(&right.id))
 }
 
 fn assert_eq_with_context<T>(

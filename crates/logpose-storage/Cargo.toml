@@ -19,5 +19,6 @@ serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+logpose-query = { path = "../logpose-query" }
 rand = "0.10.1"
 tokio.workspace = true

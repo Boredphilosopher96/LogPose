@@ -2,6 +2,7 @@
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
+use logpose_query::{QueryRequest, query_exact};
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde::Deserialize;
@@ -66,6 +67,8 @@ enum DataCommand {
     Flush(CollectionArgs),
     /// Compact immutable segments into a replacement segment.
     Compact(CollectionArgs),
+    /// Query a collection with an exact vector search.
+    Query(QueryArgs),
     /// Show collection-level storage statistics.
     Stats(CollectionArgs),
     /// Inspect manifest, WAL, or a single segment.
@@ -103,6 +106,19 @@ struct CollectionArgs {
     #[arg(long)]
     collection: String,
 }
+
+#[derive(Debug, Args)]
+struct QueryArgs {
+    #[arg(long)]
+    collection: String,
+    #[arg(long)]
+    top_k: usize,
+    #[arg(long, value_parser = parse_query_vector)]
+    vector: QueryVector,
+}
+
+#[derive(Clone, Debug)]
+struct QueryVector(Vec<f32>);
 
 #[derive(Debug, Args)]
 struct InspectArgs {
@@ -205,6 +221,22 @@ async fn main() -> anyhow::Result<()> {
             print_json(&snapshot)?;
         }
         Commands::Data {
+            command: DataCommand::Query(args),
+        } => {
+            let response = query_exact(
+                &engine,
+                QueryRequest {
+                    collection_name: args.collection,
+                    vector: args.vector.0,
+                    top_k: args.top_k,
+                    snapshot: None,
+                },
+            )
+            .await
+            .context("failed to query collection")?;
+            print_json(&response)?;
+        }
+        Commands::Data {
             command: DataCommand::Stats(args),
         } => {
             let stats = engine
@@ -242,6 +274,24 @@ fn parse_distance_metric(value: &str) -> Result<DistanceMetric, String> {
     value
         .parse::<DistanceMetric>()
         .map_err(|error| error.to_string())
+}
+
+fn parse_query_vector(value: &str) -> Result<QueryVector, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("vector must not be empty".to_owned());
+    }
+
+    trimmed
+        .split(',')
+        .map(|component| {
+            component
+                .trim()
+                .parse::<f32>()
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(QueryVector)
 }
 
 fn read_jsonl_puts(path: &Path) -> anyhow::Result<Vec<WriteOperation>> {
