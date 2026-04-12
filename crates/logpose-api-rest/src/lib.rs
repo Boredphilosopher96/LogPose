@@ -225,6 +225,7 @@ fn inspect_target_from_params(params: InspectCollectionParams) -> Result<Inspect
         "wal" => Ok(InspectTarget::Wal),
         "segment" => params
             .segment_id
+            .filter(|segment_id| !segment_id.is_empty())
             .map(InspectTarget::Segment)
             .ok_or_else(|| {
                 ApiError(ServiceError::InvalidArgument(
@@ -240,7 +241,7 @@ fn inspect_target_from_params(params: InspectCollectionParams) -> Result<Inspect
 fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue> {
     match value {
         Value::String(value) => Some(ScalarMetadataValue::String(value.clone())),
-        Value::Number(value) => value.as_f64().map(ScalarMetadataValue::Number),
+        Value::Number(value) => Some(ScalarMetadataValue::Number(value.clone())),
         Value::Bool(value) => Some(ScalarMetadataValue::Bool(*value)),
         Value::Null => Some(ScalarMetadataValue::Null),
         Value::Array(_) | Value::Object(_) => None,
@@ -441,6 +442,135 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn segment_inspect_rejects_empty_segment_id() {
+        let state = Arc::new(AppState::new(test_config("rest-empty-segment")));
+        let app = router(state.clone());
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?target=segment&segment_id=")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn query_filters_preserve_large_integer_precision() {
+        let state = Arc::new(AppState::new(test_config("rest-large-integers")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "put",
+                                    "id": "lower",
+                                    "vector": [1.0, 0.0],
+                                    "metadata": { "score": 9007199254740992u64 }
+                                },
+                                {
+                                    "op": "put",
+                                    "id": "higher",
+                                    "vector": [2.0, 0.0],
+                                    "metadata": { "score": 9007199254740993u64 }
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(write.status(), StatusCode::OK);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 5,
+                            "filters": { "score": 9007199254740993u64 }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(query.status(), StatusCode::OK);
+        let query_body = json_body(query).await;
+        assert_eq!(
+            query_body["matches"]
+                .as_array()
+                .expect("matches should be an array")
+                .iter()
+                .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+                .collect::<Vec<_>>(),
+            vec!["higher"]
+        );
     }
 
     async fn json_body(response: axum::response::Response) -> Value {

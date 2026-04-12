@@ -7,7 +7,7 @@ use logpose_catalog as _;
 use logpose_storage::StorageEngine;
 use logpose_types::{DistanceMetric, LogPoseError, RecordId, Snapshot, VisibleRecord};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use std::cmp::Ordering;
 use thiserror::Error;
 #[cfg(test)]
@@ -44,8 +44,8 @@ pub struct MetadataFilter {
 pub enum ScalarMetadataValue {
     /// Match a string metadata value.
     String(String),
-    /// Match a numeric metadata value.
-    Number(f64),
+    /// Match a numeric metadata value without losing integer precision.
+    Number(Number),
     /// Match a boolean metadata value.
     Bool(bool),
     /// Match a null metadata value.
@@ -286,9 +286,7 @@ fn filter_matches_metadata(metadata: &Value, filter: &MetadataFilter) -> bool {
 fn scalar_value_matches_json(expected: &ScalarMetadataValue, actual: &Value) -> bool {
     match (expected, actual) {
         (ScalarMetadataValue::String(expected), Value::String(actual)) => expected == actual,
-        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => {
-            actual.as_f64().is_some_and(|actual| actual == *expected)
-        }
+        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => expected == actual,
         (ScalarMetadataValue::Bool(expected), Value::Bool(actual)) => expected == actual,
         (ScalarMetadataValue::Null, Value::Null) => true,
         _ => false,
@@ -585,7 +583,7 @@ mod tests {
                     },
                     MetadataFilter {
                         field: "score".to_owned(),
-                        value: ScalarMetadataValue::Number(7.0),
+                        value: ScalarMetadataValue::Number(Number::from(7)),
                     },
                     MetadataFilter {
                         field: "missing".to_owned(),
@@ -603,6 +601,44 @@ mod tests {
                 .map(|match_| match_.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["matching"]
+        );
+    }
+
+    #[test]
+    fn large_integer_filters_do_not_collapse_distinct_values() {
+        let matches = rank_matches(
+            DistanceMetric::Dot,
+            &[1.0, 0.0],
+            filter_records(
+                vec![
+                    VisibleRecord {
+                        id: RecordId::from("lower"),
+                        vector: vec![1.0, 0.0],
+                        metadata: json!({ "score": 9007199254740992u64 }),
+                        seq_no: 1,
+                    },
+                    VisibleRecord {
+                        id: RecordId::from("higher"),
+                        vector: vec![2.0, 0.0],
+                        metadata: json!({ "score": 9007199254740993u64 }),
+                        seq_no: 2,
+                    },
+                ],
+                &[MetadataFilter {
+                    field: "score".to_owned(),
+                    value: ScalarMetadataValue::Number(Number::from(9007199254740993u64)),
+                }],
+            ),
+            5,
+        )
+        .expect("ranking should succeed");
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|match_| match_.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["higher"]
         );
     }
 
