@@ -543,10 +543,6 @@ impl StorageEngine for LocalStorageEngine {
 
         let state = self.load_collection_state(collection_name, None)?;
         let existing_max = state.visible_seq_no();
-        let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
-        let mut last_seq_no = existing_max;
-        let mut delta_after_write = state.delta.clone();
-
         let mut seen_ids = BTreeMap::<RecordId, ()>::new();
         for operation in &operations {
             state.descriptor.validate_operation(operation)?;
@@ -556,6 +552,12 @@ impl StorageEngine for LocalStorageEngine {
                     operation.id()
                 )));
             }
+        }
+
+        let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
+        let mut last_seq_no = existing_max;
+        let mut delta_after_write = state.delta.clone();
+        for operation in &operations {
             last_seq_no += 1;
             wal_writer.append(last_seq_no, operation)?;
             delta_after_write.push(WalRecord {
@@ -1303,6 +1305,88 @@ mod tests {
             })
             .count();
         assert_eq!(rolled, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_batch_rejects_without_committing_anything() {
+        let root = unique_temp_dir("storage-duplicate-batch");
+        let engine = LocalStorageEngine::new(&root);
+
+        engine
+            .create_collection(CreateCollectionRequest {
+                name: "items".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Cosine,
+            })
+            .await
+            .expect("collection should be created");
+
+        let error = engine
+            .write(
+                "items",
+                vec![
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new("dup"),
+                        vector: vec![1.0, 0.0],
+                        metadata: json!({"version":1}),
+                    }),
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new("dup"),
+                        vector: vec![2.0, 0.0],
+                        metadata: json!({"version":2}),
+                    }),
+                ],
+            )
+            .await
+            .expect_err("duplicate batch should fail");
+        assert!(error.to_string().contains("duplicate"));
+
+        let visible = engine
+            .scan_exact("items", None)
+            .await
+            .expect("scan should succeed");
+        assert!(visible.is_empty(), "invalid batch should commit nothing");
+    }
+
+    #[tokio::test]
+    async fn dimension_error_batch_rejects_without_committing_anything() {
+        let root = unique_temp_dir("storage-dimension-batch");
+        let engine = LocalStorageEngine::new(&root);
+
+        engine
+            .create_collection(CreateCollectionRequest {
+                name: "embeddings".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Cosine,
+            })
+            .await
+            .expect("collection should be created");
+
+        let error = engine
+            .write(
+                "embeddings",
+                vec![
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new("ok"),
+                        vector: vec![1.0, 1.0],
+                        metadata: json!({"kind":"valid"}),
+                    }),
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new("bad"),
+                        vector: vec![1.0, 1.0, 1.0],
+                        metadata: json!({"kind":"invalid"}),
+                    }),
+                ],
+            )
+            .await
+            .expect_err("dimension mismatch batch should fail");
+        assert!(error.to_string().contains("expected 2 dimensions"));
+
+        let visible = engine
+            .scan_exact("embeddings", None)
+            .await
+            .expect("scan should succeed");
+        assert!(visible.is_empty(), "invalid batch should commit nothing");
     }
 
     #[test]
