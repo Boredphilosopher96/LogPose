@@ -9,18 +9,21 @@ use async_trait::async_trait;
 use crc32fast::hash;
 use logpose_catalog::CollectionDescriptor;
 use logpose_index::{
-    FlatIndexEntrySource, FlatIndexSidecar, build_flat_index, read_flat_index, write_flat_index,
+    FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
+    HnswIndexSidecar, build_flat_index, build_hnsw_index, read_flat_index, read_hnsw_index,
+    write_flat_index, write_hnsw_index,
 };
 use logpose_types::{
-    CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus, PutRecord,
-    QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation,
+    AnnCandidate, AnnSearchRequest, CollectionStats, CommitAck, DistanceMetric, LogPoseError,
+    MaintenanceStatus, PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result,
+    ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -75,6 +78,77 @@ pub trait StorageEngine: Send + Sync {
         let _ = include_mutable;
         let _ = immutable_unit_ids;
         self.scan_exact(collection_name, snapshot).await
+    }
+
+    /// Search immutable ANN-capable units for candidate ids before latest-visible resolution.
+    async fn ann_search_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        immutable_unit_ids: Vec<String>,
+        request: AnnSearchRequest,
+        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
+    ) -> Result<Vec<AnnCandidate>> {
+        let descriptor = self.open_collection(collection_name).await?;
+        let records = self
+            .scan_exact_selected(collection_name, snapshot, false, immutable_unit_ids)
+            .await?;
+        let filtered_records = if let Some(predicate) = filter.as_ref() {
+            let mut filtered_records = Vec::new();
+            for record in records {
+                if predicate.as_ref()(&record.metadata) {
+                    filtered_records.push(record);
+                }
+            }
+            filtered_records
+        } else {
+            records
+        };
+        let mut scored = filtered_records
+            .into_iter()
+            .map(|record| {
+                storage_metric_value(descriptor.metric, &request.vector, &record.vector)
+                    .map(|value| (record, value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scored.sort_by(|(left_record, left_value), (right_record, right_value)| {
+            storage_metric_compare(descriptor.metric, *right_value, *left_value)
+                .then(left_record.id.cmp(&right_record.id))
+        });
+        scored.truncate(request.candidate_budget.max(request.top_k));
+        Ok(scored
+            .into_iter()
+            .map(|(record, value)| AnnCandidate {
+                unit_id: "exact-fallback".to_owned(),
+                record_id: record.id,
+                seq_no: record.seq_no,
+                value,
+            })
+            .collect())
+    }
+
+    /// Resolve latest visible records for a focused set of ids across selected units.
+    async fn latest_visible_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        record_ids: Vec<RecordId>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let wanted = record_ids.into_iter().collect::<BTreeSet<_>>();
+        let records = self
+            .scan_exact_selected(
+                collection_name,
+                snapshot,
+                include_mutable,
+                immutable_unit_ids,
+            )
+            .await?;
+        Ok(records
+            .into_iter()
+            .filter(|record| wanted.contains(&record.id))
+            .collect())
     }
 
     /// Flush the mutable delta into a new immutable segment.
@@ -174,11 +248,18 @@ impl LocalStorageEngine {
         descriptor.root_path.join("wal").join("active.wal")
     }
 
-    fn index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
+    fn flat_index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
         descriptor
             .root_path
             .join("indexes")
             .join(format!("{segment_id}.flat.json"))
+    }
+
+    fn hnsw_index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
+        descriptor
+            .root_path
+            .join("indexes")
+            .join(format!("{segment_id}.hnsw.bin"))
     }
 
     fn manifest_file_path(descriptor: &CollectionDescriptor, generation: u64) -> PathBuf {
@@ -640,13 +721,19 @@ impl LocalStorageEngine {
             .root_path
             .join("tmp")
             .join(format!("{segment_id}.flat.json.tmp"));
-        let sidecar_path = Self::index_file_path(descriptor, &segment_id);
+        let sidecar_path = Self::flat_index_file_path(descriptor, &segment_id);
+        let hnsw_temp_path = descriptor
+            .root_path
+            .join("tmp")
+            .join(format!("{segment_id}.hnsw.bin.tmp"));
+        let hnsw_path = Self::hnsw_index_file_path(descriptor, &segment_id);
 
         let mut ids = Vec::new();
         let mut vectors = Vec::new();
         let mut metadata = Vec::new();
         let mut entries = Vec::new();
         let mut sidecar_entries = Vec::new();
+        let mut hnsw_entry_sources = Vec::new();
         let mut put_count = 0usize;
         let mut delete_count = 0usize;
         let mut min_seq_no = u64::MAX;
@@ -689,6 +776,13 @@ impl LocalStorageEngine {
                         vector: Some(put.vector.clone()),
                         metadata: Some(put.metadata.clone()),
                     });
+                    hnsw_entry_sources.push(Some(HnswIndexEntrySource {
+                        entry_offset_index: entries.len() - 1,
+                        record_id: put.id.clone(),
+                        seq_no: record.seq_no,
+                        vector: put.vector.clone(),
+                        metadata: put.metadata.clone(),
+                    }));
                 }
                 WriteOperation::Delete(_) => {
                     delete_count += 1;
@@ -710,6 +804,7 @@ impl LocalStorageEngine {
                         vector: None,
                         metadata: None,
                     });
+                    hnsw_entry_sources.push(None);
                 }
             }
         }
@@ -753,14 +848,60 @@ impl LocalStorageEngine {
         bytes.extend_from_slice(&footer_bytes);
 
         let flat_index = build_flat_index(segment_id.clone(), &sidecar_entries);
+        let visible_hnsw_entries =
+            visible_hnsw_entries(records, &hnsw_entry_sources, descriptor.dimensions);
+        let hnsw_index = build_hnsw_index(
+            segment_id.clone(),
+            descriptor.metric,
+            HnswBuildParams::default(),
+            &visible_hnsw_entries,
+        )
+        .map_err(|error| io_message("failed to build hnsw sidecar", error))?;
         publish_segment_artifacts(
-            &temp_path,
-            &final_path,
-            &sidecar_temp_path,
-            &sidecar_path,
+            SegmentArtifactPaths {
+                segment_temp_path: &temp_path,
+                segment_path: &final_path,
+                flat_temp_path: &sidecar_temp_path,
+                flat_path: &sidecar_path,
+                hnsw_temp_path: &hnsw_temp_path,
+                hnsw_path: &hnsw_path,
+            },
             bytes,
             &flat_index,
+            &hnsw_index,
         )?;
+
+        let segment_bytes = final_path
+            .metadata()
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or_default();
+        let flat_bytes = sidecar_path
+            .metadata()
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or_default();
+        let hnsw_bytes = hnsw_path
+            .metadata()
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or_default();
+        let artifacts = vec![
+            QueryUnitArtifactStats {
+                kind: "flat_exact".to_owned(),
+                file_name: sidecar_path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{segment_id}.flat.json")),
+                approx_bytes: flat_bytes,
+            },
+            QueryUnitArtifactStats {
+                kind: "hnsw".to_owned(),
+                file_name: hnsw_path
+                    .file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{segment_id}.hnsw.bin")),
+                approx_bytes: hnsw_bytes,
+            },
+        ];
+        let component_bytes = segment_component_bytes(&hnsw_index, segment_bytes, flat_bytes);
 
         let remote = descriptor
             .remote_blob
@@ -789,44 +930,62 @@ impl LocalStorageEngine {
             delete_count,
             dimensions: descriptor.dimensions,
             checksum: footer.payload_checksum,
-            approx_bytes: final_path
-                .metadata()
-                .map(|metadata| metadata.len() as usize)
-                .unwrap_or_default(),
-            index_kind: flat_index.index_kind.as_str().to_owned(),
-            index_file_name: sidecar_path
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("{segment_id}.flat.json")),
+            approx_bytes: segment_bytes + flat_bytes + hnsw_bytes,
+            index_kind: hnsw_index.index_kind.as_str().to_owned(),
             scalar_fields: flat_index.scalar_fields,
+            artifacts,
+            component_bytes,
             remote,
         })
     }
 }
 
+struct SegmentArtifactPaths<'a> {
+    segment_temp_path: &'a Path,
+    segment_path: &'a Path,
+    flat_temp_path: &'a Path,
+    flat_path: &'a Path,
+    hnsw_temp_path: &'a Path,
+    hnsw_path: &'a Path,
+}
+
 fn publish_segment_artifacts(
-    temp_path: &Path,
-    final_path: &Path,
-    sidecar_temp_path: &Path,
-    sidecar_path: &Path,
+    paths: SegmentArtifactPaths<'_>,
     segment_bytes: Vec<u8>,
     flat_index: &FlatIndexSidecar,
+    hnsw_index: &HnswIndexSidecar,
 ) -> Result<()> {
-    atomic_write(temp_path, segment_bytes)?;
-    if let Err(error) = write_flat_index(sidecar_temp_path, flat_index) {
-        cleanup_file(temp_path);
-        cleanup_file(sidecar_temp_path);
+    atomic_write(paths.segment_temp_path, segment_bytes)?;
+    if let Err(error) = write_flat_index(paths.flat_temp_path, flat_index) {
+        cleanup_file(paths.segment_temp_path);
+        cleanup_file(paths.flat_temp_path);
+        cleanup_file(paths.hnsw_temp_path);
         return Err(io_message("failed to publish flat index sidecar", error));
     }
-    if let Err(error) = fs::rename(temp_path, final_path) {
-        cleanup_file(temp_path);
-        cleanup_file(sidecar_temp_path);
+    if let Err(error) = write_hnsw_index(paths.hnsw_temp_path, hnsw_index) {
+        cleanup_file(paths.segment_temp_path);
+        cleanup_file(paths.flat_temp_path);
+        cleanup_file(paths.hnsw_temp_path);
+        return Err(io_message("failed to publish hnsw sidecar", error));
+    }
+    if let Err(error) = fs::rename(paths.segment_temp_path, paths.segment_path) {
+        cleanup_file(paths.segment_temp_path);
+        cleanup_file(paths.flat_temp_path);
+        cleanup_file(paths.hnsw_temp_path);
         return Err(io_message("failed to publish segment file", error));
     }
-    if let Err(error) = fs::rename(sidecar_temp_path, sidecar_path) {
-        cleanup_file(final_path);
-        cleanup_file(sidecar_temp_path);
+    if let Err(error) = fs::rename(paths.flat_temp_path, paths.flat_path) {
+        cleanup_file(paths.segment_path);
+        cleanup_file(paths.flat_temp_path);
+        cleanup_file(paths.hnsw_temp_path);
         return Err(io_message("failed to publish flat index sidecar", error));
+    }
+    if let Err(error) = fs::rename(paths.hnsw_temp_path, paths.hnsw_path) {
+        cleanup_file(paths.segment_path);
+        cleanup_file(paths.flat_path);
+        cleanup_file(paths.flat_temp_path);
+        cleanup_file(paths.hnsw_temp_path);
+        return Err(io_message("failed to publish hnsw sidecar", error));
     }
     Ok(())
 }
@@ -957,6 +1116,115 @@ impl StorageEngine for LocalStorageEngine {
         )
     }
 
+    async fn ann_search_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        immutable_unit_ids: Vec<String>,
+        request: AnnSearchRequest,
+        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
+    ) -> Result<Vec<AnnCandidate>> {
+        let state = self.load_collection_state(
+            collection_name,
+            snapshot.as_ref().map(|value| value.manifest_generation),
+        )?;
+        let snapshot = resolve_snapshot(&state, snapshot)?;
+        let metric = state.descriptor.metric;
+        let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
+        let mut candidates_by_record_id = BTreeMap::<RecordId, AnnCandidate>::new();
+        let request_budget = request.candidate_budget.max(request.top_k);
+
+        for segment in state
+            .manifest
+            .segments
+            .iter()
+            .rev()
+            .filter(|segment| selected.contains(&segment.segment_id))
+        {
+            let hnsw_path = state.descriptor.root_path.join("indexes").join(
+                segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
+                    LogPoseError::Message(format!(
+                        "segment '{}' is missing hnsw artifact metadata",
+                        segment.segment_id
+                    ))
+                })?,
+            );
+            let hnsw = read_hnsw_index(&hnsw_path)
+                .map_err(|error| io_message("failed to read hnsw sidecar", error))?;
+            let search = logpose_index::search_hnsw(
+                &hnsw,
+                &request.vector,
+                request_budget,
+                filter.as_deref(),
+            )
+            .map_err(|error| io_message("failed to search hnsw sidecar", error))?;
+            for candidate in search
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
+                .map(|candidate| AnnCandidate {
+                    unit_id: segment.segment_id.clone(),
+                    record_id: candidate.record_id,
+                    seq_no: candidate.seq_no,
+                    value: candidate.value,
+                })
+            {
+                match candidates_by_record_id.entry(candidate.record_id.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if candidate.seq_no > entry.get().seq_no {
+                            entry.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidates = candidates_by_record_id.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            storage_metric_compare(metric, right.value, left.value)
+                .then(right.seq_no.cmp(&left.seq_no))
+                .then(left.record_id.cmp(&right.record_id))
+                .then(left.unit_id.cmp(&right.unit_id))
+        });
+        candidates.truncate(request_budget);
+
+        Ok(candidates)
+    }
+
+    async fn latest_visible_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        record_ids: Vec<RecordId>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let state = self.load_collection_state(
+            collection_name,
+            snapshot.as_ref().map(|value| value.manifest_generation),
+        )?;
+        let snapshot = resolve_snapshot(&state, snapshot)?;
+        let resolved = resolve_latest_state_for_ids_selected(
+            &state,
+            snapshot.visible_seq_no,
+            &record_ids.into_iter().collect(),
+            include_mutable,
+            Some(immutable_unit_ids.into_iter().collect()),
+        )?;
+        let mut records = resolved
+            .into_values()
+            .filter_map(|state| match state {
+                ResolvedState::Visible(record) => Some(record),
+                ResolvedState::Deleted { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
     async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
         self.perform_maintenance_operation(collection_name, MaintenanceOperation::Flush)
     }
@@ -1048,19 +1316,42 @@ impl StorageEngine for LocalStorageEngine {
                         .join("segments")
                         .join(&segment.file_name),
                 )?;
-                let index = read_flat_index(
-                    &state
-                        .descriptor
-                        .root_path
-                        .join("indexes")
-                        .join(&segment.index_file_name),
-                )
+                let index = read_flat_index(&state.descriptor.root_path.join("indexes").join(
+                    segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
+                        LogPoseError::Message(format!(
+                            "segment '{}' is missing flat artifact metadata",
+                            segment.segment_id
+                        ))
+                    })?,
+                ))
                 .map_err(|error| io_message("failed to read flat index sidecar", error))?;
+                let hnsw = read_hnsw_index(&state.descriptor.root_path.join("indexes").join(
+                    segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
+                        LogPoseError::Message(format!(
+                            "segment '{}' is missing hnsw artifact metadata",
+                            segment.segment_id
+                        ))
+                    })?,
+                ))
+                .map_err(|error| io_message("failed to read hnsw sidecar", error))?;
                 Ok(InspectReport {
                     target: format!("segment:{segment_id}"),
                     payload: json!({
                         "segment": segment,
-                        "index": index,
+                        "artifacts": segment.artifacts,
+                        "flat_index": index,
+                        "hnsw_index": {
+                            "index_kind": hnsw.index_kind.as_str(),
+                            "dimensions": hnsw.dimensions,
+                            "entry_point": hnsw.entry_point,
+                            "max_level": hnsw.max_level,
+                            "node_count": hnsw.nodes.len(),
+                            "params": {
+                                "max_neighbors": hnsw.params.max_neighbors,
+                                "ef_construction": hnsw.params.ef_construction,
+                                "ef_search": hnsw.params.ef_search,
+                            },
+                        },
                         "records": records,
                     }),
                 })
@@ -1260,14 +1551,16 @@ struct SegmentMeta {
     #[serde(default = "default_index_kind")]
     index_kind: String,
     #[serde(default)]
-    index_file_name: String,
-    #[serde(default)]
     scalar_fields: BTreeMap<String, ScalarFieldStats>,
+    #[serde(default)]
+    artifacts: Vec<QueryUnitArtifactStats>,
+    #[serde(default)]
+    component_bytes: BTreeMap<String, usize>,
     remote: Option<RemoteArtifact>,
 }
 
 fn default_index_kind() -> String {
-    "flat".to_owned()
+    "hnsw".to_owned()
 }
 
 impl From<&SegmentMeta> for QueryUnitStats {
@@ -1276,13 +1569,14 @@ impl From<&SegmentMeta> for QueryUnitStats {
             unit_id: segment.segment_id.clone(),
             tier: "immutable".to_owned(),
             index_kind: segment.index_kind.clone(),
-            index_file_name: segment.index_file_name.clone(),
             min_seq_no: segment.min_seq_no,
             max_seq_no: segment.max_seq_no,
             put_count: segment.put_count,
             delete_count: segment.delete_count,
             approx_bytes: segment.approx_bytes,
             scalar_fields: segment.scalar_fields.clone(),
+            artifact_stats: segment.artifacts.clone(),
+            component_bytes: segment.component_bytes.clone(),
         }
     }
 }
@@ -1399,6 +1693,58 @@ fn resolve_latest_from_segments(
     Ok(resolved)
 }
 
+fn resolve_latest_state_for_ids_selected(
+    state: &CollectionState,
+    visible_seq_no: SeqNo,
+    wanted_ids: &BTreeSet<RecordId>,
+    include_mutable: bool,
+    immutable_unit_ids: Option<BTreeSet<String>>,
+) -> Result<BTreeMap<RecordId, ResolvedState>> {
+    let mut resolved = BTreeMap::new();
+
+    if include_mutable {
+        for record in state
+            .delta
+            .iter()
+            .rev()
+            .filter(|record| record.seq_no <= visible_seq_no)
+        {
+            if wanted_ids.contains(record.op.id()) {
+                apply_resolved_record(&mut resolved, record.clone());
+            }
+            if resolved.len() == wanted_ids.len() {
+                return Ok(resolved);
+            }
+        }
+    }
+
+    for segment in state.manifest.segments.iter().rev().filter(|segment| {
+        immutable_unit_ids
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&segment.segment_id))
+    }) {
+        let records = read_segment_file(
+            &state
+                .descriptor
+                .root_path
+                .join("segments")
+                .join(&segment.file_name),
+        )?;
+        for record in records
+            .into_iter()
+            .rev()
+            .filter(|record| record.seq_no <= visible_seq_no && wanted_ids.contains(record.op.id()))
+        {
+            apply_resolved_record(&mut resolved, record);
+        }
+        if resolved.len() == wanted_ids.len() {
+            return Ok(resolved);
+        }
+    }
+
+    Ok(resolved)
+}
+
 fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
     let sidecar = build_flat_index(
         "mutable-delta",
@@ -1429,7 +1775,6 @@ fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
         unit_id: "mutable-delta".to_owned(),
         tier: "mutable".to_owned(),
         index_kind: "raw".to_owned(),
-        index_file_name: String::new(),
         min_seq_no: delta.first().map(|record| record.seq_no).unwrap_or(0),
         max_seq_no: delta.last().map(|record| record.seq_no).unwrap_or(0),
         put_count: sidecar.put_count,
@@ -1439,6 +1784,145 @@ fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
             .map(|record| approximate_record_bytes(&record.op))
             .sum(),
         scalar_fields: sidecar.scalar_fields,
+        artifact_stats: vec![QueryUnitArtifactStats {
+            kind: "mutable_delta".to_owned(),
+            file_name: String::new(),
+            approx_bytes: delta
+                .iter()
+                .map(|record| approximate_record_bytes(&record.op))
+                .sum(),
+        }],
+        component_bytes: BTreeMap::from([(
+            "mutable_delta".to_owned(),
+            delta
+                .iter()
+                .map(|record| approximate_record_bytes(&record.op))
+                .sum(),
+        )]),
+    }
+}
+
+fn visible_hnsw_entries(
+    records: &[WalRecord],
+    entry_sources: &[Option<HnswIndexEntrySource>],
+    dimensions: usize,
+) -> Vec<HnswIndexEntrySource> {
+    let mut seen = BTreeSet::new();
+    let mut visible = Vec::new();
+    for (index, record) in records.iter().enumerate().rev() {
+        let record_id = record.op.id().clone();
+        if !seen.insert(record_id) {
+            continue;
+        }
+        let Some(entry) = entry_sources.get(index).and_then(|entry| entry.clone()) else {
+            continue;
+        };
+        if entry.vector.len() == dimensions {
+            visible.push(entry);
+        }
+    }
+    visible.reverse();
+    visible
+}
+
+fn segment_component_bytes(
+    hnsw_index: &HnswIndexSidecar,
+    raw_segment_bytes: usize,
+    flat_bytes: usize,
+) -> BTreeMap<String, usize> {
+    let ann_vectors = hnsw_index
+        .nodes
+        .iter()
+        .map(|node| node.record.vector.len() * std::mem::size_of::<f32>())
+        .sum::<usize>();
+    let ann_metadata = hnsw_index
+        .nodes
+        .iter()
+        .map(|node| node.record.metadata.to_string().len())
+        .sum::<usize>();
+    let ann_graph = hnsw_index
+        .nodes
+        .iter()
+        .map(|node| {
+            std::mem::size_of::<u32>()
+                + std::mem::size_of::<u8>()
+                + node.neighbors_by_level.len() * std::mem::size_of::<u32>()
+                + node
+                    .neighbors_by_level
+                    .iter()
+                    .map(|neighbors| neighbors.len() * std::mem::size_of::<u32>())
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+
+    BTreeMap::from([
+        ("raw_segment".to_owned(), raw_segment_bytes),
+        ("exact_flat".to_owned(), flat_bytes),
+        ("ann_graph".to_owned(), ann_graph),
+        ("ann_vectors".to_owned(), ann_vectors),
+        ("ann_metadata".to_owned(), ann_metadata),
+    ])
+}
+
+fn segment_artifact_file_name<'a>(segment: &'a SegmentMeta, kind: &str) -> Option<&'a str> {
+    segment
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == kind)
+        .map(|artifact| artifact.file_name.as_str())
+}
+
+fn storage_metric_value(metric: DistanceMetric, query: &[f32], candidate: &[f32]) -> Result<f32> {
+    if query.len() != candidate.len() {
+        return Err(LogPoseError::Message(format!(
+            "vector expected {} dimensions but found {}",
+            query.len(),
+            candidate.len()
+        )));
+    }
+
+    Ok(match metric {
+        DistanceMetric::Dot => query
+            .iter()
+            .zip(candidate)
+            .map(|(lhs, rhs)| lhs * rhs)
+            .sum(),
+        DistanceMetric::Cosine => {
+            let dot: f32 = query
+                .iter()
+                .zip(candidate)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum();
+            let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let candidate_norm = candidate
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            if query_norm == 0.0 || candidate_norm == 0.0 {
+                0.0
+            } else {
+                dot / (query_norm * candidate_norm)
+            }
+        }
+        DistanceMetric::L2 => query
+            .iter()
+            .zip(candidate)
+            .map(|(lhs, rhs)| {
+                let delta = lhs - rhs;
+                delta * delta
+            })
+            .sum::<f32>()
+            .sqrt(),
+    })
+}
+
+fn storage_metric_compare(metric: DistanceMetric, left: f32, right: f32) -> Ordering {
+    match metric {
+        DistanceMetric::Dot | DistanceMetric::Cosine => {
+            left.partial_cmp(&right).unwrap_or(Ordering::Equal)
+        }
+        DistanceMetric::L2 => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
     }
 }
 
@@ -1720,6 +2204,8 @@ mod tests {
         let final_path = root.join("segments").join("segment.lps");
         let sidecar_temp_path = root.join("tmp").join("segment.flat.json.tmp");
         let sidecar_path = root.join("indexes").join("segment.flat.json");
+        let hnsw_temp_path = root.join("tmp").join("segment.hnsw.bin.tmp");
+        let hnsw_path = root.join("indexes").join("segment.hnsw.bin");
         fs::create_dir_all(final_path.parent().expect("segment parent should exist"))
             .expect("segment parent should be created");
         fs::create_dir_all(sidecar_path.parent().expect("index parent should exist"))
@@ -1737,14 +2223,32 @@ mod tests {
                 metadata: Some(json!({"kind":"keep"})),
             }],
         );
+        let hnsw_index = build_hnsw_index(
+            "segment",
+            DistanceMetric::Dot,
+            HnswBuildParams::default(),
+            &[HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            }],
+        )
+        .expect("hnsw index should build");
 
         let result = publish_segment_artifacts(
-            &temp_path,
-            &final_path,
-            &sidecar_temp_path,
-            &sidecar_path,
+            SegmentArtifactPaths {
+                segment_temp_path: &temp_path,
+                segment_path: &final_path,
+                flat_temp_path: &sidecar_temp_path,
+                flat_path: &sidecar_path,
+                hnsw_temp_path: &hnsw_temp_path,
+                hnsw_path: &hnsw_path,
+            },
             b"segment-bytes".to_vec(),
             &flat_index,
+            &hnsw_index,
         );
 
         assert!(result.is_err(), "sidecar publish should fail");
@@ -1759,6 +2263,10 @@ mod tests {
         assert!(
             !sidecar_temp_path.exists(),
             "temporary sidecar file should be cleaned up after failure"
+        );
+        assert!(
+            !hnsw_temp_path.exists(),
+            "temporary hnsw file should be cleaned up after failure"
         );
     }
 

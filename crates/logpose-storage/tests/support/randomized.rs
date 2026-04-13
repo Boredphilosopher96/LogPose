@@ -1,4 +1,6 @@
-use logpose_query::{QueryMatch, QueryRequest, QueryResponse, query_exact};
+use logpose_query::{
+    ExplainMode, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, query_exact,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
     CollectionId, CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId,
@@ -524,8 +526,48 @@ async fn assert_exact_queries_match(
             .unwrap_or_else(|error| {
                 panic_with_context(seed, trace, format!("query failed: {error}"))
             });
-        let expected = model.expected_query_response(request);
-        assert_eq_with_context(seed, trace, "exact query mismatch", &expected, &actual);
+        let expected = model.expected_query_response(request.clone());
+        let exact_ranking = model.expected_query_ranking(&request);
+
+        let profiled = query_exact(engine, profiled_request(&request))
+            .await
+            .unwrap_or_else(|error| {
+                panic_with_context(seed, trace, format!("profile query failed: {error}"))
+            });
+        let diagnostics = profiled.diagnostics.as_ref().unwrap_or_else(|| {
+            panic_with_context(seed, trace, "profile query missing diagnostics".to_owned())
+        });
+        assert_query_response_matches_oracle(
+            seed,
+            trace,
+            diagnostics.chosen_plan,
+            &expected,
+            &exact_ranking,
+            &actual,
+        );
+        assert_query_response_matches_oracle(
+            seed,
+            trace,
+            diagnostics.chosen_plan,
+            &expected,
+            &exact_ranking,
+            &profiled,
+        );
+        let timings = diagnostics.stage_timings.as_ref().unwrap_or_else(|| {
+            panic_with_context(
+                seed,
+                trace,
+                "profile query missing stage timings".to_owned(),
+            )
+        });
+        assert!(
+            timings.planning_micros > 0,
+            "seed={seed} trace={trace:?} diagnostics={diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.units_scanned == 0 || !diagnostics.unit_scan_mix.is_empty(),
+            "seed={seed} trace={trace:?} diagnostics={diagnostics:#?}"
+        );
     }
 }
 
@@ -606,6 +648,37 @@ async fn assert_stats_match(
         "seed={seed} trace={trace:?} query_units={:?}",
         actual.query_units
     );
+    if model.segment_count > 0 {
+        let immutable = actual
+            .query_units
+            .iter()
+            .find(|unit| unit.tier == "immutable")
+            .unwrap_or_else(|| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!("missing immutable unit in stats: {:?}", actual.query_units),
+                )
+            });
+        assert!(
+            immutable
+                .artifact_stats
+                .iter()
+                .any(|artifact| artifact.file_name.ends_with(".flat.json")),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+        assert!(
+            immutable
+                .artifact_stats
+                .iter()
+                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+        assert!(
+            immutable.component_bytes.contains_key("ann_graph"),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+    }
 }
 
 async fn assert_manifest_inspect_matches(
@@ -745,6 +818,20 @@ impl ExpectedModel {
         }
     }
 
+    fn expected_query_ranking(&self, request: &QueryRequest) -> Vec<QueryMatch> {
+        let metric = self.metric.expect("collection metric should be registered");
+        let snapshot = request
+            .snapshot
+            .clone()
+            .unwrap_or_else(|| self.current_snapshot());
+        self.expected_query_matches(
+            metric,
+            request.vector.as_slice(),
+            self.expected_visible(snapshot.visible_seq_no).len(),
+            snapshot.visible_seq_no,
+        )
+    }
+
     fn expected_query_matches(
         &self,
         metric: DistanceMetric,
@@ -811,6 +898,12 @@ fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRe
     }
 }
 
+fn profiled_request(request: &QueryRequest) -> QueryRequest {
+    let mut profiled = request.clone();
+    profiled.explain = ExplainMode::Profile;
+    profiled
+}
+
 fn expected_match_value(metric: DistanceMetric, query: &[f32], candidate: &[f32]) -> f32 {
     match metric {
         DistanceMetric::Dot => query
@@ -860,6 +953,139 @@ fn compare_query_matches(
     };
 
     value_order.then_with(|| left.id.cmp(&right.id))
+}
+
+fn assert_query_response_matches_oracle(
+    seed: u64,
+    trace: &[StorageAction],
+    plan: QueryPlanKind,
+    expected: &QueryResponse,
+    exact_ranking: &[QueryMatch],
+    actual: &QueryResponse,
+) {
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query metric mismatch",
+        &expected.metric,
+        &actual.metric,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query top_k mismatch",
+        &expected.top_k,
+        &actual.top_k,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query snapshot mismatch",
+        &expected.snapshot,
+        &actual.snapshot,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query returned count mismatch",
+        &actual.matches.len(),
+        &actual.returned,
+    );
+
+    if !uses_ann(plan) {
+        assert_eq_with_context(
+            seed,
+            trace,
+            "exact query matches mismatch",
+            &expected.matches,
+            &actual.matches,
+        );
+        return;
+    }
+
+    let expected_top_ids = expected
+        .matches
+        .iter()
+        .map(|candidate| candidate.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let actual_ids = actual
+        .matches
+        .iter()
+        .map(|candidate| candidate.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let hits = expected_top_ids
+        .iter()
+        .filter(|id| actual_ids.contains(*id))
+        .count();
+    assert!(
+        hits >= minimum_required_hits(expected_top_ids.len()),
+        "seed={seed} trace={trace:?} plan={plan:?} expected_top={expected_top_ids:?} actual={actual_ids:?}"
+    );
+    if let Some(first_expected) = expected_top_ids.first() {
+        assert_eq!(
+            actual_ids.first(),
+            Some(first_expected),
+            "seed={seed} trace={trace:?} plan={plan:?} expected_top={expected_top_ids:?} actual={actual_ids:?}"
+        );
+    }
+
+    let exact_lookup = exact_ranking
+        .iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            (
+                candidate.id.as_str().to_owned(),
+                (rank, candidate.value, candidate.metadata.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_ranks = Vec::with_capacity(actual.matches.len());
+    for candidate in &actual.matches {
+        let Some((rank, exact_value, exact_metadata)) =
+            exact_lookup.get(candidate.id.as_str()).cloned()
+        else {
+            panic_with_context(
+                seed,
+                trace,
+                format!("ann query returned unknown id '{}'", candidate.id),
+            );
+        };
+        observed_ranks.push(rank);
+        assert!(
+            (candidate.value - exact_value).abs() <= f32::EPSILON,
+            "seed={seed} trace={trace:?} id={} expected_value={exact_value} actual_value={}",
+            candidate.id,
+            candidate.value
+        );
+        assert_eq_with_context(
+            seed,
+            trace,
+            "ann query metadata mismatch",
+            &exact_metadata,
+            &candidate.metadata,
+        );
+    }
+    assert!(
+        observed_ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+        "seed={seed} trace={trace:?} plan={plan:?} exact_ranks={observed_ranks:?}"
+    );
+}
+
+fn uses_ann(plan: QueryPlanKind) -> bool {
+    matches!(
+        plan,
+        QueryPlanKind::VectorFirstAnn
+            | QueryPlanKind::CooperativeFilteredAnn
+            | QueryPlanKind::HybridExactAnnMerge
+    )
+}
+
+fn minimum_required_hits(top_k: usize) -> usize {
+    if top_k == 0 {
+        0
+    } else {
+        (top_k * 2).div_ceil(3)
+    }
 }
 
 fn assert_eq_with_context<T>(
