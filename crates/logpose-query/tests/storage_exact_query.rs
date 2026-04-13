@@ -1,6 +1,7 @@
 //! Storage-backed exact query integration tests.
 
 use async_trait as _;
+use criterion as _;
 use logpose_catalog as _;
 use logpose_query::{
     ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryError, QueryRequest,
