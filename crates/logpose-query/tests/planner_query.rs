@@ -229,6 +229,61 @@ async fn planner_keeps_units_for_exists_predicates_on_non_scalar_fields() {
     assert_eq!(diagnostics.units_scanned, 1);
 }
 
+#[tokio::test]
+async fn planner_treats_sparse_ne_predicates_as_selective() {
+    let storage = PlannerStorage::new(
+        Vec::new(),
+        BTreeMap::from([
+            (
+                "segment-a-old-sparse".to_owned(),
+                vec![
+                    visible_record("alpha", vec![0.5, 0.0], json!({"kind":"keep"})),
+                    visible_record("beta", vec![0.25, 0.0], json!({"details":{"kind":"keep"}})),
+                ],
+            ),
+            (
+                "segment-b-new-drop".to_owned(),
+                vec![visible_record(
+                    "gamma",
+                    vec![1.0, 0.0],
+                    json!({"kind":"drop"}),
+                )],
+            ),
+        ]),
+    );
+
+    let response = query_exact(
+        &storage,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: Some(Predicate::Comparison(PredicateComparison {
+                field: "kind".to_owned(),
+                operator: PredicateOperator::Ne,
+                value: Some(ScalarMetadataValue::String("keep".to_owned())),
+            })),
+            explain: ExplainMode::Plan,
+        },
+    )
+    .await
+    .expect("query should succeed");
+
+    assert_eq!(response.matches.len(), 1);
+    assert_eq!(response.matches[0].id.as_str(), "gamma");
+
+    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    assert_eq!(
+        diagnostics.chosen_plan,
+        QueryPlanKind::TinyPopulationExactFallback
+    );
+    assert_eq!(diagnostics.units_pruned, 1);
+    assert_eq!(diagnostics.units_scanned, 1);
+    assert!((diagnostics.estimated_selectivity - (1.0 / 3.0)).abs() < 1e-6);
+}
+
 #[derive(Clone)]
 struct PlannerStorage {
     descriptor: CollectionDescriptor,
