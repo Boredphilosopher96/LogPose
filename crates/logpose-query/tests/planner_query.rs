@@ -14,8 +14,8 @@ use logpose_types::{
     WriteOperation,
 };
 use serde as _;
-use serde_json::json;
-use std::{collections::BTreeMap, path::Path};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use thiserror as _;
 
 #[tokio::test]
@@ -124,6 +124,45 @@ async fn planner_uses_vector_first_ann_for_unfiltered_immutable_queries() {
     );
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
     assert_eq!(diagnostics.chosen_plan, QueryPlanKind::VectorFirstAnn);
+}
+
+#[tokio::test]
+async fn planner_requires_full_ann_coverage_before_using_ann_paths() {
+    let storage = MixedImmutableIndexPlannerStorage::new();
+
+    let response = query_exact(
+        &storage,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::Plan,
+        },
+    )
+    .await
+    .expect("query should succeed");
+
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exact-best", "ann-second"]
+    );
+    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::UnfilteredExactScan);
+    assert_eq!(
+        diagnostics.unit_scan_mix.get("immutable_exact").copied(),
+        Some(2)
+    );
+    assert!(
+        !diagnostics.unit_scan_mix.contains_key("immutable_ann"),
+        "mixed immutable layouts should not take ann-only plans"
+    );
 }
 
 #[tokio::test]
@@ -341,6 +380,14 @@ struct DeleteAwarePlannerStorage {
 
 #[derive(Clone)]
 struct ShadowingPlannerStorage {
+    descriptor: CollectionDescriptor,
+    snapshot: Snapshot,
+    stats: CollectionStats,
+    immutable_records: BTreeMap<String, Vec<VisibleRecord>>,
+}
+
+#[derive(Clone)]
+struct MixedImmutableIndexPlannerStorage {
     descriptor: CollectionDescriptor,
     snapshot: Snapshot,
     stats: CollectionStats,
@@ -701,6 +748,117 @@ impl ShadowingPlannerStorage {
     }
 }
 
+impl MixedImmutableIndexPlannerStorage {
+    fn new() -> Self {
+        let descriptor = CollectionDescriptor::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+            Path::new("/tmp/mixed-immutable-planner-storage"),
+        );
+        let snapshot = Snapshot {
+            manifest_generation: 1,
+            visible_seq_no: 2,
+        };
+        let immutable_records = BTreeMap::from([
+            (
+                "segment-exact".to_owned(),
+                vec![visible_record(
+                    "exact-best",
+                    vec![10.0, 0.0],
+                    json!({"kind":"keep","version":1}),
+                )],
+            ),
+            (
+                "segment-ann".to_owned(),
+                vec![visible_record(
+                    "ann-second",
+                    vec![9.0, 0.0],
+                    json!({"kind":"keep","version":2}),
+                )],
+            ),
+        ]);
+        let stats = CollectionStats {
+            collection_id: descriptor.collection_id.clone(),
+            collection_name: descriptor.name.clone(),
+            manifest_generation: snapshot.manifest_generation,
+            visible_seq_no: snapshot.visible_seq_no,
+            mutable_op_count: 0,
+            segment_count: 2,
+            live_record_count: 2,
+            deleted_record_count: 0,
+            maintenance: MaintenanceStatus::default(),
+            query_units: vec![
+                QueryUnitStats {
+                    unit_id: "mutable-delta".to_owned(),
+                    tier: "mutable".to_owned(),
+                    index_kind: "raw".to_owned(),
+                    min_seq_no: 0,
+                    max_seq_no: 0,
+                    put_count: 0,
+                    delete_count: 0,
+                    approx_bytes: 0,
+                    scalar_fields: BTreeMap::new(),
+                    artifact_stats: Vec::new(),
+                    component_bytes: BTreeMap::new(),
+                },
+                QueryUnitStats {
+                    unit_id: "segment-exact".to_owned(),
+                    tier: "immutable".to_owned(),
+                    index_kind: "raw".to_owned(),
+                    min_seq_no: 1,
+                    max_seq_no: 1,
+                    put_count: 1,
+                    delete_count: 0,
+                    approx_bytes: 64,
+                    scalar_fields: scalar_summary(immutable_records["segment-exact"].as_slice()),
+                    artifact_stats: vec![QueryUnitArtifactStats {
+                        kind: "flat_exact".to_owned(),
+                        file_name: "segment-exact.flat.json".to_owned(),
+                        approx_bytes: 64,
+                    }],
+                    component_bytes: BTreeMap::from([("raw_segment".to_owned(), 64)]),
+                },
+                QueryUnitStats {
+                    unit_id: "segment-ann".to_owned(),
+                    tier: "immutable".to_owned(),
+                    index_kind: "hnsw".to_owned(),
+                    min_seq_no: 2,
+                    max_seq_no: 2,
+                    put_count: 1,
+                    delete_count: 0,
+                    approx_bytes: 128,
+                    scalar_fields: scalar_summary(immutable_records["segment-ann"].as_slice()),
+                    artifact_stats: vec![
+                        QueryUnitArtifactStats {
+                            kind: "flat_exact".to_owned(),
+                            file_name: "segment-ann.flat.json".to_owned(),
+                            approx_bytes: 32,
+                        },
+                        QueryUnitArtifactStats {
+                            kind: "hnsw".to_owned(),
+                            file_name: "segment-ann.hnsw.bin".to_owned(),
+                            approx_bytes: 96,
+                        },
+                    ],
+                    component_bytes: BTreeMap::from([
+                        ("raw_segment".to_owned(), 32),
+                        ("ann_graph".to_owned(), 48),
+                        ("ann_vectors".to_owned(), 48),
+                    ]),
+                },
+            ],
+        };
+
+        Self {
+            descriptor,
+            snapshot,
+            stats,
+            immutable_records,
+        }
+    }
+}
+
 #[async_trait]
 impl StorageEngine for PlannerStorage {
     async fn engine_name(&self) -> &'static str {
@@ -973,6 +1131,131 @@ impl StorageEngine for ShadowingPlannerStorage {
         }
 
         Ok(visible)
+    }
+
+    async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+        Err(logpose_types::LogPoseError::Message(
+            "flush is not used by planner tests".to_owned(),
+        ))
+    }
+
+    async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+        Err(logpose_types::LogPoseError::Message(
+            "compact is not used by planner tests".to_owned(),
+        ))
+    }
+
+    async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
+        Ok(self.stats.clone())
+    }
+
+    async fn stats_snapshot(
+        &self,
+        _collection_name: &str,
+        _snapshot: Option<Snapshot>,
+    ) -> logpose_types::Result<CollectionStats> {
+        Ok(self.stats.clone())
+    }
+
+    async fn inspect(
+        &self,
+        _collection_name: &str,
+        _target: InspectTarget,
+    ) -> logpose_types::Result<InspectReport> {
+        Err(logpose_types::LogPoseError::Message(
+            "inspect is not used by planner tests".to_owned(),
+        ))
+    }
+}
+
+#[async_trait]
+impl StorageEngine for MixedImmutableIndexPlannerStorage {
+    async fn engine_name(&self) -> &'static str {
+        "mixed-immutable-planner-test"
+    }
+
+    async fn create_collection(
+        &self,
+        _request: CreateCollectionRequest,
+    ) -> logpose_types::Result<CollectionDescriptor> {
+        Err(logpose_types::LogPoseError::Message(
+            "create_collection is not used by planner tests".to_owned(),
+        ))
+    }
+
+    async fn open_collection(&self, _name: &str) -> logpose_types::Result<CollectionDescriptor> {
+        Ok(self.descriptor.clone())
+    }
+
+    async fn write(
+        &self,
+        _collection_name: &str,
+        _operations: Vec<WriteOperation>,
+    ) -> logpose_types::Result<CommitAck> {
+        Err(logpose_types::LogPoseError::Message(
+            "write is not used by planner tests".to_owned(),
+        ))
+    }
+
+    async fn snapshot(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn scan_exact(
+        &self,
+        _collection_name: &str,
+        _snapshot: Option<Snapshot>,
+    ) -> logpose_types::Result<Vec<VisibleRecord>> {
+        Ok(Vec::new())
+    }
+
+    async fn scan_exact_selected(
+        &self,
+        _collection_name: &str,
+        _snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> logpose_types::Result<Vec<VisibleRecord>> {
+        if include_mutable {
+            return Ok(Vec::new());
+        }
+
+        let mut records = Vec::new();
+        for unit_id in immutable_unit_ids {
+            records.extend(
+                self.immutable_records
+                    .get(&unit_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(records)
+    }
+
+    async fn ann_search_selected(
+        &self,
+        _collection_name: &str,
+        _snapshot: Option<Snapshot>,
+        _immutable_unit_ids: Vec<String>,
+        _request: logpose_types::AnnSearchRequest,
+        _filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
+    ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
+        Err(logpose_types::LogPoseError::Message(
+            "ann_search_selected should not run without full ann coverage".to_owned(),
+        ))
+    }
+
+    async fn latest_visible_selected(
+        &self,
+        _collection_name: &str,
+        _snapshot: Option<Snapshot>,
+        _record_ids: Vec<RecordId>,
+        _include_mutable: bool,
+        _immutable_unit_ids: Vec<String>,
+    ) -> logpose_types::Result<Vec<VisibleRecord>> {
+        Err(logpose_types::LogPoseError::Message(
+            "latest_visible_selected is not used by this planner test".to_owned(),
+        ))
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {

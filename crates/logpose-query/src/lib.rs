@@ -301,7 +301,7 @@ where
         estimated_selectivity,
         request.top_k,
         unit_selection.scanned_put_count,
-        !unit_selection.ann_immutable_unit_ids.is_empty(),
+        unit_selection.has_full_ann_coverage(),
         unit_selection.include_mutable,
     );
     let planning_micros = planning_started.elapsed().as_micros() as u64;
@@ -1294,6 +1294,13 @@ struct UnitSelection {
     units_pruned: usize,
     units_scanned: usize,
     scanned_put_count: usize,
+}
+
+impl UnitSelection {
+    fn has_full_ann_coverage(&self) -> bool {
+        !self.immutable_unit_ids.is_empty()
+            && self.immutable_unit_ids.len() == self.ann_immutable_unit_ids.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
