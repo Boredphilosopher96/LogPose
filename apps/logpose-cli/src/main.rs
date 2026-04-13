@@ -583,6 +583,14 @@ fn read_jsonl_put_batches(
         }
 
         let line_bytes = line.len() + 1;
+        if line_bytes > max_batch_bytes {
+            bail!(
+                "JSONL record on line {} exceeds max_batch_bytes {} ({} bytes)",
+                index + 1,
+                max_batch_bytes,
+                line_bytes
+            );
+        }
         if !current_batch.is_empty() && current_batch_bytes + line_bytes > max_batch_bytes {
             batches.push(current_batch);
             current_batch = Vec::new();
@@ -708,6 +716,26 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 1);
+
+        std::fs::remove_file(&path).expect("temp file should be removed");
+    }
+
+    #[test]
+    fn read_jsonl_put_batches_rejects_oversized_first_record() {
+        let path = std::env::temp_dir().join(format!(
+            "logpose-cli-oversized-batch-test-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"id":"alpha","vector":[1.0],"metadata":{"label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+        )
+        .expect("jsonl should be written");
+
+        let error = read_jsonl_put_batches(&path, 40).expect_err("oversized record should fail");
+
+        assert!(error.to_string().contains("line 1"));
+        assert!(error.to_string().contains("max_batch_bytes"));
 
         std::fs::remove_file(&path).expect("temp file should be removed");
     }
