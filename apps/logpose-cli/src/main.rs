@@ -82,7 +82,7 @@ enum DataCommand {
     Flush(CollectionArgs),
     /// Compact immutable segments into a replacement segment.
     Compact(CollectionArgs),
-    /// Query a collection with an exact vector search.
+    /// Query a collection with planner-controlled exact, ANN, or hybrid vector search.
     Query(QueryArgs),
     /// Show collection-level storage statistics.
     Stats(CollectionArgs),

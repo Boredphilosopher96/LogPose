@@ -482,7 +482,15 @@ fn query_diagnostics_from_proto(diagnostics: proto::QueryDiagnostics) -> Result<
         units_scanned: diagnostics.units_scanned as usize,
         candidates_before_filter: diagnostics.candidates_before_filter as usize,
         candidates_after_filter: diagnostics.candidates_after_filter as usize,
+        candidates_reranked: diagnostics.candidates_reranked as usize,
+        candidates_merged: diagnostics.candidates_merged as usize,
         rerank_count: diagnostics.rerank_count as usize,
+        fallback_reason: diagnostics.fallback_reason,
+        unit_scan_mix: diagnostics
+            .unit_scan_mix
+            .into_iter()
+            .map(|(key, value)| (key, value as usize))
+            .collect(),
         stage_timings: diagnostics
             .stage_timings
             .map(query_stage_timings_from_proto),
@@ -502,14 +510,20 @@ fn query_plan_kind_from_proto(kind: i32) -> Result<QueryPlanKind> {
         proto::QueryPlanKind::TinyPopulationExactFallback => {
             Ok(QueryPlanKind::TinyPopulationExactFallback)
         }
+        proto::QueryPlanKind::VectorFirstAnn => Ok(QueryPlanKind::VectorFirstAnn),
+        proto::QueryPlanKind::CooperativeFilteredAnn => Ok(QueryPlanKind::CooperativeFilteredAnn),
+        proto::QueryPlanKind::HybridExactAnnMerge => Ok(QueryPlanKind::HybridExactAnnMerge),
     }
 }
 
 fn query_stage_timings_from_proto(timings: proto::QueryStageTimings) -> QueryStageTimings {
     QueryStageTimings {
         planning_micros: timings.planning_micros,
-        predicate_micros: timings.predicate_micros,
-        ranking_micros: timings.ranking_micros,
+        prefilter_micros: timings.prefilter_micros,
+        candidate_generation_micros: timings.candidate_generation_micros,
+        postfilter_micros: timings.postfilter_micros,
+        rerank_micros: timings.rerank_micros,
+        merge_micros: timings.merge_micros,
     }
 }
 
@@ -535,7 +549,6 @@ fn query_unit_stats_from_proto(stats: proto::QueryUnitStats) -> Result<QueryUnit
         unit_id: stats.unit_id,
         tier: stats.tier,
         index_kind: stats.index_kind,
-        index_file_name: stats.index_file_name,
         min_seq_no: stats.min_seq_no,
         max_seq_no: stats.max_seq_no,
         put_count: stats.put_count as usize,
@@ -546,6 +559,20 @@ fn query_unit_stats_from_proto(stats: proto::QueryUnitStats) -> Result<QueryUnit
             .into_iter()
             .map(|(field, stats)| scalar_field_stats_from_proto(stats).map(|stats| (field, stats)))
             .collect::<Result<_>>()?,
+        artifact_stats: stats
+            .artifact_stats
+            .into_iter()
+            .map(|artifact| logpose_types::QueryUnitArtifactStats {
+                kind: artifact.kind,
+                file_name: artifact.file_name,
+                approx_bytes: artifact.approx_bytes as usize,
+            })
+            .collect(),
+        component_bytes: stats
+            .component_bytes
+            .into_iter()
+            .map(|(key, value)| (key, value as usize))
+            .collect(),
     })
 }
 
@@ -583,5 +610,77 @@ fn inspect_segment_id(target: &InspectTarget) -> String {
 impl From<LogPoseError> for ClientError {
     fn from(error: LogPoseError) -> Self {
         Self::InvalidResponse(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn query_diagnostics_from_proto_preserves_ann_fields() {
+        let diagnostics = query_diagnostics_from_proto(proto::QueryDiagnostics {
+            chosen_plan: proto::QueryPlanKind::CooperativeFilteredAnn as i32,
+            planner_reason:
+                "filtered ann traversal is cheaper than exact scan for this selectivity".to_owned(),
+            estimated_selectivity: 0.25,
+            units_considered: 2,
+            units_pruned: 1,
+            units_scanned: 1,
+            candidates_before_filter: 17,
+            candidates_after_filter: 13,
+            candidates_reranked: 7,
+            candidates_merged: 5,
+            rerank_count: 1,
+            fallback_reason: Some("fallback".to_owned()),
+            unit_scan_mix: [
+                ("immutable_ann".to_owned(), 1),
+                ("mutable_exact".to_owned(), 2),
+            ]
+            .into_iter()
+            .collect(),
+            stage_timings: Some(proto::QueryStageTimings {
+                planning_micros: 11,
+                prefilter_micros: 22,
+                candidate_generation_micros: 33,
+                postfilter_micros: 44,
+                rerank_micros: 55,
+                merge_micros: 66,
+            }),
+        })
+        .expect("conversion should succeed");
+
+        assert_eq!(
+            diagnostics,
+            QueryDiagnostics {
+                chosen_plan: QueryPlanKind::CooperativeFilteredAnn,
+                planner_reason:
+                    "filtered ann traversal is cheaper than exact scan for this selectivity"
+                        .to_owned(),
+                estimated_selectivity: 0.25,
+                units_considered: 2,
+                units_pruned: 1,
+                units_scanned: 1,
+                candidates_before_filter: 17,
+                candidates_after_filter: 13,
+                candidates_reranked: 7,
+                candidates_merged: 5,
+                rerank_count: 1,
+                fallback_reason: Some("fallback".to_owned()),
+                unit_scan_mix: BTreeMap::from([
+                    ("immutable_ann".to_owned(), 1),
+                    ("mutable_exact".to_owned(), 2),
+                ]),
+                stage_timings: Some(QueryStageTimings {
+                    planning_micros: 11,
+                    prefilter_micros: 22,
+                    candidate_generation_micros: 33,
+                    postfilter_micros: 44,
+                    rerank_micros: 55,
+                    merge_micros: 66,
+                }),
+            }
+        );
     }
 }

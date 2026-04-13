@@ -175,12 +175,18 @@ enum QueryPlanKind {
   QUERY_PLAN_KIND_PREDICATE_FIRST_EXACT = 2;
   QUERY_PLAN_KIND_VECTOR_FIRST_EXACT = 3;
   QUERY_PLAN_KIND_TINY_POPULATION_EXACT_FALLBACK = 4;
+  QUERY_PLAN_KIND_VECTOR_FIRST_ANN = 5;
+  QUERY_PLAN_KIND_COOPERATIVE_FILTERED_ANN = 6;
+  QUERY_PLAN_KIND_HYBRID_EXACT_ANN_MERGE = 7;
 }
 
 message QueryStageTimings {
   uint64 planning_micros = 1;
-  uint64 predicate_micros = 2;
-  uint64 ranking_micros = 3;
+  uint64 prefilter_micros = 2;
+  uint64 candidate_generation_micros = 3;
+  uint64 postfilter_micros = 4;
+  uint64 rerank_micros = 5;
+  uint64 merge_micros = 6;
 }
 
 message QueryDiagnostics {
@@ -192,8 +198,12 @@ message QueryDiagnostics {
   uint64 units_scanned = 6;
   uint64 candidates_before_filter = 7;
   uint64 candidates_after_filter = 8;
-  uint64 rerank_count = 9;
-  QueryStageTimings stage_timings = 10;
+  uint64 candidates_reranked = 9;
+  uint64 candidates_merged = 10;
+  uint64 rerank_count = 11;
+  optional string fallback_reason = 12;
+  map<string, uint64> unit_scan_mix = 13;
+  QueryStageTimings stage_timings = 14;
 }
 
 message QueryCollectionReply {
@@ -264,15 +274,22 @@ message ScalarFieldStats {
   uint64 distinct_count = 6;
 }
 
+message QueryUnitArtifactStats {
+  string kind = 1;
+  string file_name = 2;
+  uint64 approx_bytes = 3;
+}
+
 message QueryUnitStats {
   string unit_id = 1;
   string tier = 2;
   string index_kind = 3;
-  string index_file_name = 4;
-  uint64 min_seq_no = 5;
-  uint64 max_seq_no = 6;
-  uint64 put_count = 7;
-  uint64 delete_count = 8;
-  uint64 approx_bytes = 9;
-  map<string, ScalarFieldStats> scalar_fields = 10;
+  uint64 min_seq_no = 4;
+  uint64 max_seq_no = 5;
+  uint64 put_count = 6;
+  uint64 delete_count = 7;
+  uint64 approx_bytes = 8;
+  map<string, ScalarFieldStats> scalar_fields = 9;
+  repeated QueryUnitArtifactStats artifact_stats = 10;
+  map<string, uint64> component_bytes = 11;
 }

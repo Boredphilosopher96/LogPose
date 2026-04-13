@@ -108,7 +108,7 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/query:
     post:
-      summary: Execute an exact vector query
+      summary: Execute a planner-controlled vector query
       operationId: queryCollection
       parameters:
         - name: name
@@ -124,7 +124,7 @@ paths:
               $ref: "#/components/schemas/QueryCollectionRequest"
       responses:
         "200":
-          description: Ranked exact query results
+          description: Ranked query results with optional planner diagnostics
           content:
             application/json:
               schema:
@@ -393,6 +393,9 @@ components:
         - predicate_first_exact
         - vector_first_exact
         - tiny_population_exact_fallback
+        - vector_first_ann
+        - cooperative_filtered_ann
+        - hybrid_exact_ann_merge
     Predicate:
       oneOf:
         - $ref: "#/components/schemas/AndPredicate"
@@ -481,13 +484,25 @@ components:
           nullable: true
     QueryStageTimings:
       type: object
-      required: [planning_micros, predicate_micros, ranking_micros]
+      required:
+        - planning_micros
+        - prefilter_micros
+        - candidate_generation_micros
+        - postfilter_micros
+        - rerank_micros
+        - merge_micros
       properties:
         planning_micros:
           type: integer
-        predicate_micros:
+        prefilter_micros:
           type: integer
-        ranking_micros:
+        candidate_generation_micros:
+          type: integer
+        postfilter_micros:
+          type: integer
+        rerank_micros:
+          type: integer
+        merge_micros:
           type: integer
     QueryDiagnostics:
       type: object
@@ -500,6 +515,8 @@ components:
         - units_scanned
         - candidates_before_filter
         - candidates_after_filter
+        - candidates_reranked
+        - candidates_merged
         - rerank_count
       properties:
         chosen_plan:
@@ -518,8 +535,20 @@ components:
           type: integer
         candidates_after_filter:
           type: integer
+        candidates_reranked:
+          type: integer
+        candidates_merged:
+          type: integer
         rerank_count:
           type: integer
+        fallback_reason:
+          oneOf:
+            - type: "null"
+            - type: string
+        unit_scan_mix:
+          type: object
+          additionalProperties:
+            type: integer
         stage_timings:
           oneOf:
             - type: "null"
@@ -584,27 +613,36 @@ components:
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/ScalarMetadataValue"
+    QueryUnitArtifactStats:
+      type: object
+      required: [kind, file_name, approx_bytes]
+      properties:
+        kind:
+          type: string
+        file_name:
+          type: string
+        approx_bytes:
+          type: integer
     QueryUnitStats:
       type: object
       required:
         - unit_id
         - tier
         - index_kind
-        - index_file_name
         - min_seq_no
         - max_seq_no
         - put_count
         - delete_count
         - approx_bytes
         - scalar_fields
+        - artifact_stats
+        - component_bytes
       properties:
         unit_id:
           type: string
         tier:
           type: string
         index_kind:
-          type: string
-        index_file_name:
           type: string
         min_seq_no:
           type: integer
@@ -620,6 +658,14 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/ScalarFieldStats"
+        artifact_stats:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryUnitArtifactStats"
+        component_bytes:
+          type: object
+          additionalProperties:
+            type: integer
     CollectionStats:
       type: object
       required:
