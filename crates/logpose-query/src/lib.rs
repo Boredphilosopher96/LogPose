@@ -3,18 +3,20 @@
 #[cfg(test)]
 use async_trait as _;
 #[cfg(test)]
+use criterion as _;
+#[cfg(test)]
 use logpose_catalog as _;
 use logpose_storage::StorageEngine;
 pub use logpose_types::ScalarMetadataValue;
 use logpose_types::{
-    CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId, ScalarFieldStats,
-    Snapshot, VisibleRecord,
+    AnnSearchRequest, CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId,
+    ScalarFieldStats, Snapshot, VisibleRecord,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Number;
 use serde_json::Value;
-use std::{cmp::Ordering, time::Instant};
+use std::{cmp::Ordering, collections::BTreeMap, sync::Arc, time::Instant};
 use thiserror::Error;
 #[cfg(test)]
 use tokio as _;
@@ -120,7 +122,7 @@ pub enum ExplainMode {
     Profile,
 }
 
-/// Planner-selected physical plan for an exact or hybrid-exact query.
+/// Planner-selected physical plan for an exact, ANN, or hybrid query.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryPlanKind {
@@ -132,6 +134,12 @@ pub enum QueryPlanKind {
     VectorFirstExact,
     /// Use a small exact fallback when the predicate is highly selective.
     TinyPopulationExactFallback,
+    /// Use ANN candidate generation over immutable units without exact mutable merge.
+    VectorFirstAnn,
+    /// Use ANN with predicate-aware candidate rejection before final rerank.
+    CooperativeFilteredAnn,
+    /// Merge exact mutable candidates with immutable ANN candidates before rerank.
+    HybridExactAnnMerge,
 }
 
 /// Optional per-stage timings reported for profile mode.
@@ -139,10 +147,16 @@ pub enum QueryPlanKind {
 pub struct QueryStageTimings {
     /// Time spent planning the query.
     pub planning_micros: u64,
-    /// Time spent evaluating predicates.
-    pub predicate_micros: u64,
-    /// Time spent ranking candidate vectors.
-    pub ranking_micros: u64,
+    /// Time spent doing exact prefilter work before candidate generation.
+    pub prefilter_micros: u64,
+    /// Time spent generating ANN or exact candidates.
+    pub candidate_generation_micros: u64,
+    /// Time spent applying postfilters after candidate generation.
+    pub postfilter_micros: u64,
+    /// Time spent reranking exact vectors for final ordering.
+    pub rerank_micros: u64,
+    /// Time spent merging mutable and immutable candidate sets.
+    pub merge_micros: u64,
 }
 
 /// Planner and execution diagnostics surfaced to operators.
@@ -164,8 +178,18 @@ pub struct QueryDiagnostics {
     pub candidates_before_filter: usize,
     /// Candidate count after predicate application.
     pub candidates_after_filter: usize,
+    /// Candidate count entering the final rerank step.
+    pub candidates_reranked: usize,
+    /// Candidate count after mutable plus immutable merge.
+    pub candidates_merged: usize,
     /// Number of rerank passes used by the plan.
     pub rerank_count: usize,
+    /// Optional reason the planner fell back to an exact path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// Count of units scanned by execution role.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unit_scan_mix: BTreeMap<String, usize>,
     /// Optional stage timings when profile mode is requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_timings: Option<QueryStageTimings>,
@@ -277,112 +301,222 @@ where
         estimated_selectivity,
         request.top_k,
         unit_selection.scanned_put_count,
+        !unit_selection.ann_immutable_unit_ids.is_empty(),
+        unit_selection.include_mutable,
     );
     let planning_micros = planning_started.elapsed().as_micros() as u64;
+    let filter_hook = predicate.as_ref().map(|predicate| {
+        let predicate = Arc::new(predicate.clone());
+        Arc::new(move |metadata: &Value| predicate_matches_metadata(metadata, predicate.as_ref()))
+            as Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>
+    });
 
-    let records = storage
-        .scan_exact_selected(
-            &request.collection_name,
-            Some(snapshot.clone()),
-            unit_selection.include_mutable,
-            unit_selection.immutable_unit_ids.clone(),
-        )
-        .await?;
+    let (matches, measurements) = match plan {
+        QueryPlanKind::UnfilteredExactScan
+        | QueryPlanKind::PredicateFirstExact
+        | QueryPlanKind::VectorFirstExact
+        | QueryPlanKind::TinyPopulationExactFallback => {
+            let records = storage
+                .scan_exact_selected(
+                    &request.collection_name,
+                    Some(snapshot.clone()),
+                    unit_selection.include_mutable,
+                    unit_selection.exact_immutable_unit_ids.clone(),
+                )
+                .await?;
+            let candidates_before_filter = records.len();
 
-    let candidates_before_filter = records.len();
-    let (matches, predicate_micros, ranking_micros, candidates_after_filter) = match plan {
-        QueryPlanKind::UnfilteredExactScan => {
-            let ranking_started = Instant::now();
+            match plan {
+                QueryPlanKind::UnfilteredExactScan => {
+                    let ranking_started = Instant::now();
+                    let matches = rank_matches_with(
+                        descriptor.metric,
+                        &request.vector,
+                        records,
+                        request.top_k,
+                        stored_dimension_error,
+                    )?;
+                    (
+                        matches,
+                        DiagnosticMeasurements {
+                            candidates_before_filter,
+                            candidates_after_filter: candidates_before_filter,
+                            candidates_reranked: candidates_before_filter,
+                            candidates_merged: candidates_before_filter,
+                            planning_micros,
+                            candidate_generation_micros: ranking_started.elapsed().as_micros()
+                                as u64,
+                            ..DiagnosticMeasurements::default()
+                        },
+                    )
+                }
+                QueryPlanKind::PredicateFirstExact | QueryPlanKind::TinyPopulationExactFallback => {
+                    let prefilter_started = Instant::now();
+                    let filtered = filter_records_by_predicate(records, predicate.as_ref());
+                    let prefilter_micros = prefilter_started.elapsed().as_micros() as u64;
+                    let candidates_after_filter = filtered.len();
+
+                    let rerank_started = Instant::now();
+                    let matches = rank_matches_with(
+                        descriptor.metric,
+                        &request.vector,
+                        filtered,
+                        request.top_k,
+                        stored_dimension_error,
+                    )?;
+                    (
+                        matches,
+                        DiagnosticMeasurements {
+                            candidates_before_filter,
+                            candidates_after_filter,
+                            candidates_reranked: candidates_after_filter,
+                            candidates_merged: candidates_after_filter,
+                            planning_micros,
+                            prefilter_micros,
+                            rerank_micros: rerank_started.elapsed().as_micros() as u64,
+                            ..DiagnosticMeasurements::default()
+                        },
+                    )
+                }
+                QueryPlanKind::VectorFirstExact => {
+                    let candidate_generation_started = Instant::now();
+                    let ranked = rank_matches_with(
+                        descriptor.metric,
+                        &request.vector,
+                        records,
+                        candidates_before_filter,
+                        stored_dimension_error,
+                    )?;
+                    let candidate_generation_micros =
+                        candidate_generation_started.elapsed().as_micros() as u64;
+
+                    let postfilter_started = Instant::now();
+                    let mut filtered = ranked
+                        .into_iter()
+                        .filter(|candidate| {
+                            predicate.as_ref().is_none_or(|predicate| {
+                                predicate_matches_metadata(&candidate.metadata, predicate)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let postfilter_micros = postfilter_started.elapsed().as_micros() as u64;
+                    let candidates_after_filter = filtered.len();
+                    filtered.truncate(request.top_k);
+                    (
+                        filtered,
+                        DiagnosticMeasurements {
+                            candidates_before_filter,
+                            candidates_after_filter,
+                            candidates_reranked: candidates_before_filter,
+                            candidates_merged: candidates_after_filter,
+                            planning_micros,
+                            candidate_generation_micros,
+                            postfilter_micros,
+                            ..DiagnosticMeasurements::default()
+                        },
+                    )
+                }
+                QueryPlanKind::VectorFirstAnn
+                | QueryPlanKind::CooperativeFilteredAnn
+                | QueryPlanKind::HybridExactAnnMerge => unreachable!("exact branch gated by plan"),
+            }
+        }
+        QueryPlanKind::VectorFirstAnn
+        | QueryPlanKind::CooperativeFilteredAnn
+        | QueryPlanKind::HybridExactAnnMerge => {
+            let request_budget = ann_candidate_budget(request.top_k, estimated_selectivity);
+            let candidate_generation_started = Instant::now();
+            let ann_candidates = storage
+                .ann_search_selected(
+                    &request.collection_name,
+                    Some(snapshot.clone()),
+                    unit_selection.ann_immutable_unit_ids.clone(),
+                    AnnSearchRequest {
+                        vector: request.vector.clone(),
+                        top_k: request.top_k,
+                        candidate_budget: request_budget,
+                    },
+                    filter_hook.clone(),
+                )
+                .await?;
+            let candidate_generation_micros =
+                candidate_generation_started.elapsed().as_micros() as u64;
+
+            let postfilter_started = Instant::now();
+            let ann_records = if ann_candidates.is_empty() {
+                Vec::new()
+            } else {
+                storage
+                    .latest_visible_selected(
+                        &request.collection_name,
+                        Some(snapshot.clone()),
+                        ann_candidates
+                            .iter()
+                            .map(|candidate| candidate.record_id.clone())
+                            .collect(),
+                        true,
+                        unit_selection.exact_immutable_unit_ids.clone(),
+                    )
+                    .await?
+            };
+            let ann_filtered = filter_records_by_predicate(ann_records, predicate.as_ref());
+            let postfilter_micros = postfilter_started.elapsed().as_micros() as u64;
+
+            let mutable_exact = if matches!(plan, QueryPlanKind::HybridExactAnnMerge)
+                && unit_selection.include_mutable
+            {
+                let prefilter_started = Instant::now();
+                let mutable_records = storage
+                    .scan_exact_selected(
+                        &request.collection_name,
+                        Some(snapshot.clone()),
+                        true,
+                        Vec::new(),
+                    )
+                    .await?;
+                let filtered = filter_records_by_predicate(mutable_records, predicate.as_ref());
+                let prefilter_micros = prefilter_started.elapsed().as_micros() as u64;
+                (filtered, prefilter_micros)
+            } else {
+                (Vec::new(), 0)
+            };
+
+            let merge_started = Instant::now();
+            let merged_records = dedupe_latest_records(
+                mutable_exact
+                    .0
+                    .iter()
+                    .cloned()
+                    .chain(ann_filtered.iter().cloned())
+                    .collect(),
+            );
+            let merge_micros = merge_started.elapsed().as_micros() as u64;
+
+            let rerank_started = Instant::now();
             let matches = rank_matches_with(
                 descriptor.metric,
                 &request.vector,
-                records,
+                merged_records.clone(),
                 request.top_k,
-                |record, error| match error {
-                    QueryError::VectorDimensionMismatch { expected, actual } => {
-                        QueryError::StoredVectorDimensionMismatch {
-                            record_id: record.id.clone(),
-                            expected,
-                            actual,
-                        }
-                    }
-                    other => other,
-                },
+                stored_dimension_error,
             )?;
+            let rerank_micros = rerank_started.elapsed().as_micros() as u64;
+            let candidates_after_filter = ann_filtered.len() + mutable_exact.0.len();
             (
                 matches,
-                0,
-                ranking_started.elapsed().as_micros() as u64,
-                candidates_before_filter,
-            )
-        }
-        QueryPlanKind::PredicateFirstExact | QueryPlanKind::TinyPopulationExactFallback => {
-            let predicate_started = Instant::now();
-            let filtered = filter_records_by_predicate(records, predicate.as_ref());
-            let predicate_micros = predicate_started.elapsed().as_micros() as u64;
-            let candidates_after_filter = filtered.len();
-
-            let ranking_started = Instant::now();
-            let matches = rank_matches_with(
-                descriptor.metric,
-                &request.vector,
-                filtered,
-                request.top_k,
-                |record, error| match error {
-                    QueryError::VectorDimensionMismatch { expected, actual } => {
-                        QueryError::StoredVectorDimensionMismatch {
-                            record_id: record.id.clone(),
-                            expected,
-                            actual,
-                        }
-                    }
-                    other => other,
+                DiagnosticMeasurements {
+                    candidates_before_filter: ann_candidates.len() + mutable_exact.0.len(),
+                    candidates_after_filter,
+                    candidates_reranked: merged_records.len(),
+                    candidates_merged: merged_records.len(),
+                    planning_micros,
+                    prefilter_micros: mutable_exact.1,
+                    candidate_generation_micros,
+                    postfilter_micros,
+                    rerank_micros,
+                    merge_micros,
+                    rerank_count: 1,
                 },
-            )?;
-            (
-                matches,
-                predicate_micros,
-                ranking_started.elapsed().as_micros() as u64,
-                candidates_after_filter,
-            )
-        }
-        QueryPlanKind::VectorFirstExact => {
-            let ranking_started = Instant::now();
-            let ranked = rank_matches_with(
-                descriptor.metric,
-                &request.vector,
-                records,
-                candidates_before_filter,
-                |record, error| match error {
-                    QueryError::VectorDimensionMismatch { expected, actual } => {
-                        QueryError::StoredVectorDimensionMismatch {
-                            record_id: record.id.clone(),
-                            expected,
-                            actual,
-                        }
-                    }
-                    other => other,
-                },
-            )?;
-            let ranking_micros = ranking_started.elapsed().as_micros() as u64;
-
-            let predicate_started = Instant::now();
-            let mut filtered = ranked
-                .into_iter()
-                .filter(|candidate| {
-                    predicate.as_ref().is_none_or(|predicate| {
-                        predicate_matches_metadata(&candidate.metadata, predicate)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let predicate_micros = predicate_started.elapsed().as_micros() as u64;
-            let candidates_after_filter = filtered.len();
-            filtered.truncate(request.top_k);
-            (
-                filtered,
-                predicate_micros,
-                ranking_micros,
-                candidates_after_filter,
             )
         }
     };
@@ -391,13 +525,7 @@ where
         plan,
         estimated_selectivity,
         &unit_selection,
-        DiagnosticMeasurements {
-            candidates_before_filter,
-            candidates_after_filter,
-            planning_micros,
-            predicate_micros,
-            ranking_micros,
-        },
+        measurements,
     );
 
     Ok(build_query_response_with_diagnostics(
@@ -407,6 +535,43 @@ where
         matches,
         diagnostics,
     ))
+}
+
+fn ann_candidate_budget(top_k: usize, estimated_selectivity: f32) -> usize {
+    let multiplier = if estimated_selectivity <= 0.2 {
+        10
+    } else if estimated_selectivity <= 0.45 {
+        8
+    } else {
+        6
+    };
+    top_k.max(1).saturating_mul(multiplier).max(16)
+}
+
+fn stored_dimension_error(record: &VisibleRecord, error: QueryError) -> QueryError {
+    match error {
+        QueryError::VectorDimensionMismatch { expected, actual } => {
+            QueryError::StoredVectorDimensionMismatch {
+                record_id: record.id.clone(),
+                expected,
+                actual,
+            }
+        }
+        other => other,
+    }
+}
+
+fn dedupe_latest_records(records: Vec<VisibleRecord>) -> Vec<VisibleRecord> {
+    let mut deduped = BTreeMap::<RecordId, VisibleRecord>::new();
+    for record in records {
+        let should_replace = deduped
+            .get(&record.id)
+            .is_none_or(|current| record.seq_no >= current.seq_no);
+        if should_replace {
+            deduped.insert(record.id.clone(), record);
+        }
+    }
+    deduped.into_values().collect()
 }
 
 /// Filter visible records using top-level metadata equality semantics.
@@ -609,12 +774,21 @@ fn choose_plan(
     estimated_selectivity: f32,
     top_k: usize,
     scanned_put_count: usize,
+    has_ann_units: bool,
+    include_mutable: bool,
 ) -> QueryPlanKind {
     match predicate {
+        None if has_ann_units && include_mutable => QueryPlanKind::HybridExactAnnMerge,
+        None if has_ann_units => QueryPlanKind::VectorFirstAnn,
         None => QueryPlanKind::UnfilteredExactScan,
         Some(_) if (scanned_put_count as f32 * estimated_selectivity).ceil() <= top_k as f32 => {
             QueryPlanKind::TinyPopulationExactFallback
         }
+        Some(_) if has_ann_units && include_mutable => QueryPlanKind::HybridExactAnnMerge,
+        Some(_) if has_ann_units && estimated_selectivity <= 0.45 => {
+            QueryPlanKind::CooperativeFilteredAnn
+        }
+        Some(_) if has_ann_units => QueryPlanKind::VectorFirstAnn,
         Some(_) if estimated_selectivity <= 0.45 => QueryPlanKind::PredicateFirstExact,
         Some(_) => QueryPlanKind::VectorFirstExact,
     }
@@ -657,6 +831,12 @@ fn select_query_units(stats: &CollectionStats, predicate: Option<&Predicate>) ->
     for (index, unit) in immutable_units.into_iter().enumerate() {
         if index < included_immutable_count {
             selection.immutable_unit_ids.push(unit.unit_id.clone());
+            selection
+                .exact_immutable_unit_ids
+                .push(unit.unit_id.clone());
+            if unit.index_kind == "hnsw" {
+                selection.ann_immutable_unit_ids.push(unit.unit_id.clone());
+            }
         } else {
             selection.units_pruned += 1;
         }
@@ -876,12 +1056,19 @@ fn build_diagnostics(
             units_scanned: unit_selection.units_scanned,
             candidates_before_filter: measurements.candidates_before_filter,
             candidates_after_filter: measurements.candidates_after_filter,
-            rerank_count: 0,
+            candidates_reranked: measurements.candidates_reranked,
+            candidates_merged: measurements.candidates_merged,
+            rerank_count: measurements.rerank_count,
+            fallback_reason: fallback_reason(chosen_plan, estimated_selectivity).map(str::to_owned),
+            unit_scan_mix: unit_scan_mix(chosen_plan, unit_selection),
             stage_timings: match request.explain {
                 ExplainMode::Profile => Some(QueryStageTimings {
                     planning_micros: measurements.planning_micros,
-                    predicate_micros: measurements.predicate_micros,
-                    ranking_micros: measurements.ranking_micros,
+                    prefilter_micros: measurements.prefilter_micros,
+                    candidate_generation_micros: measurements.candidate_generation_micros,
+                    postfilter_micros: measurements.postfilter_micros,
+                    rerank_micros: measurements.rerank_micros,
+                    merge_micros: measurements.merge_micros,
                 }),
                 ExplainMode::None | ExplainMode::Plan => None,
             },
@@ -901,8 +1088,73 @@ fn planner_reason(plan: QueryPlanKind, estimated_selectivity: f32) -> &'static s
         QueryPlanKind::TinyPopulationExactFallback => {
             "estimated predicate population is small enough for an exact fallback"
         }
+        QueryPlanKind::VectorFirstAnn => {
+            "immutable hnsw units can generate candidates more cheaply than exact ranking"
+        }
+        QueryPlanKind::CooperativeFilteredAnn => {
+            "filtered ann traversal is cheaper than exact scan for this selectivity"
+        }
+        QueryPlanKind::HybridExactAnnMerge => {
+            "mutable exact candidates and immutable ann candidates must be merged before rerank"
+        }
         QueryPlanKind::PredicateFirstExact => "predicate-first exact scan selected",
     }
+}
+
+fn fallback_reason(plan: QueryPlanKind, estimated_selectivity: f32) -> Option<&'static str> {
+    match plan {
+        QueryPlanKind::TinyPopulationExactFallback => {
+            Some("estimated predicate population is below the requested top-k")
+        }
+        QueryPlanKind::PredicateFirstExact if estimated_selectivity <= 0.45 => {
+            Some("no immutable ann units are available for the selective predicate path")
+        }
+        QueryPlanKind::VectorFirstExact => {
+            Some("no immutable ann units are available for the broad predicate path")
+        }
+        QueryPlanKind::UnfilteredExactScan => Some("no immutable ann units are available"),
+        QueryPlanKind::VectorFirstAnn
+        | QueryPlanKind::CooperativeFilteredAnn
+        | QueryPlanKind::HybridExactAnnMerge
+        | QueryPlanKind::PredicateFirstExact => None,
+    }
+}
+
+fn unit_scan_mix(plan: QueryPlanKind, unit_selection: &UnitSelection) -> BTreeMap<String, usize> {
+    let mut mix = BTreeMap::new();
+    if unit_selection.include_mutable {
+        mix.insert("mutable_exact".to_owned(), 1);
+    }
+    match plan {
+        QueryPlanKind::UnfilteredExactScan
+        | QueryPlanKind::PredicateFirstExact
+        | QueryPlanKind::VectorFirstExact
+        | QueryPlanKind::TinyPopulationExactFallback => {
+            if !unit_selection.exact_immutable_unit_ids.is_empty() {
+                mix.insert(
+                    "immutable_exact".to_owned(),
+                    unit_selection.exact_immutable_unit_ids.len(),
+                );
+            }
+        }
+        QueryPlanKind::VectorFirstAnn | QueryPlanKind::CooperativeFilteredAnn => {
+            if !unit_selection.ann_immutable_unit_ids.is_empty() {
+                mix.insert(
+                    "immutable_ann".to_owned(),
+                    unit_selection.ann_immutable_unit_ids.len(),
+                );
+            }
+        }
+        QueryPlanKind::HybridExactAnnMerge => {
+            if !unit_selection.ann_immutable_unit_ids.is_empty() {
+                mix.insert(
+                    "immutable_ann".to_owned(),
+                    unit_selection.ann_immutable_unit_ids.len(),
+                );
+            }
+        }
+    }
+    mix
 }
 
 fn predicate_may_match_unit(predicate: &Predicate, unit: &QueryUnitStats) -> bool {
@@ -1036,6 +1288,8 @@ fn compare_numbers(left: &serde_json::Number, right: &serde_json::Number) -> Ord
 struct UnitSelection {
     include_mutable: bool,
     immutable_unit_ids: Vec<String>,
+    ann_immutable_unit_ids: Vec<String>,
+    exact_immutable_unit_ids: Vec<String>,
     units_considered: usize,
     units_pruned: usize,
     units_scanned: usize,
@@ -1046,9 +1300,15 @@ struct UnitSelection {
 struct DiagnosticMeasurements {
     candidates_before_filter: usize,
     candidates_after_filter: usize,
+    candidates_reranked: usize,
+    candidates_merged: usize,
     planning_micros: u64,
-    predicate_micros: u64,
-    ranking_micros: u64,
+    prefilter_micros: u64,
+    candidate_generation_micros: u64,
+    postfilter_micros: u64,
+    rerank_micros: u64,
+    merge_micros: u64,
+    rerank_count: usize,
 }
 
 fn ensure_dimensions(query: &[f32], candidate: &[f32]) -> Result<()> {
@@ -1453,6 +1713,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ann_candidate_budget_saturates_without_overflow() {
+        assert_eq!(ann_candidate_budget(usize::MAX, 0.1), usize::MAX);
+    }
+
     #[tokio::test]
     async fn preserves_storage_errors_without_string_flattening() {
         let result = query_exact(
@@ -1820,13 +2085,18 @@ mod tests {
                     unit_id: "mutable-delta".to_owned(),
                     tier: "mutable".to_owned(),
                     index_kind: "raw".to_owned(),
-                    index_file_name: String::new(),
                     min_seq_no: 9,
                     max_seq_no: 9,
                     put_count: 1,
                     delete_count: 0,
                     approx_bytes: 32,
                     scalar_fields: BTreeMap::new(),
+                    artifact_stats: vec![logpose_types::QueryUnitArtifactStats {
+                        kind: "mutable_delta".to_owned(),
+                        file_name: String::new(),
+                        approx_bytes: 32,
+                    }],
+                    component_bytes: BTreeMap::from([("mutable_delta".to_owned(), 32)]),
                 }],
             })
         }
@@ -1949,7 +2219,6 @@ mod tests {
                     unit_id: "mutable-delta".to_owned(),
                     tier: "mutable".to_owned(),
                     index_kind: "raw".to_owned(),
-                    index_file_name: String::new(),
                     min_seq_no: 4,
                     max_seq_no: 6,
                     put_count: 3,
@@ -1969,6 +2238,12 @@ mod tests {
                             ]),
                         },
                     )]),
+                    artifact_stats: vec![logpose_types::QueryUnitArtifactStats {
+                        kind: "mutable_delta".to_owned(),
+                        file_name: String::new(),
+                        approx_bytes: 64,
+                    }],
+                    component_bytes: BTreeMap::from([("mutable_delta".to_owned(), 64)]),
                 }],
             })
         }

@@ -1,6 +1,7 @@
 //! Planner-focused exact query tests.
 
 use async_trait::async_trait;
+use criterion as _;
 use logpose_catalog::CollectionDescriptor;
 use logpose_query::{
     ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
@@ -8,8 +9,9 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine};
 use logpose_types::{
-    CollectionStats, CommitAck, DistanceMetric, MaintenanceStatus, QueryUnitStats, RecordId,
-    ScalarFieldStats, ScalarMetadataValue, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DistanceMetric, MaintenanceStatus, QueryUnitArtifactStats,
+    QueryUnitStats, RecordId, ScalarFieldStats, ScalarMetadataValue, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -60,7 +62,7 @@ async fn planner_prunes_units_and_reports_tiny_population_fallback() {
 }
 
 #[tokio::test]
-async fn planner_uses_vector_first_for_broad_predicates_and_profiles_stages() {
+async fn planner_uses_hybrid_ann_for_broad_predicates_and_profiles_stages() {
     let storage = PlannerStorage::broad();
 
     let response = query_exact(
@@ -83,9 +85,45 @@ async fn planner_uses_vector_first_for_broad_predicates_and_profiles_stages() {
     .expect("query should succeed");
 
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
-    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::VectorFirstExact);
-    assert!(diagnostics.stage_timings.is_some());
-    assert_eq!(diagnostics.rerank_count, 0);
+    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::HybridExactAnnMerge);
+    assert_eq!(diagnostics.rerank_count, 1);
+    let timings = diagnostics
+        .stage_timings
+        .expect("stage timings should exist");
+    assert!(timings.candidate_generation_micros > 0);
+    assert!(timings.rerank_micros > 0);
+    assert!(timings.merge_micros > 0);
+}
+
+#[tokio::test]
+async fn planner_uses_vector_first_ann_for_unfiltered_immutable_queries() {
+    let storage = PlannerStorage::immutable_only();
+
+    let response = query_exact(
+        &storage,
+        QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::Plan,
+        },
+    )
+    .await
+    .expect("query should succeed");
+
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta", "alpha"]
+    );
+    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::VectorFirstAnn);
 }
 
 #[tokio::test]
@@ -355,6 +393,19 @@ impl PlannerStorage {
         )
     }
 
+    fn immutable_only() -> Self {
+        Self::new(
+            Vec::new(),
+            BTreeMap::from([(
+                "segment-ann".to_owned(),
+                vec![
+                    visible_record("alpha", vec![0.9, 0.0], json!({"kind":"keep","score": 1})),
+                    visible_record("beta", vec![1.2, 0.0], json!({"kind":"keep","score": 2})),
+                ],
+            )]),
+        )
+    }
+
     fn new(
         mutable_records: Vec<VisibleRecord>,
         immutable_records: BTreeMap<String, Vec<VisibleRecord>>,
@@ -373,26 +424,47 @@ impl PlannerStorage {
             unit_id: "mutable-delta".to_owned(),
             tier: "mutable".to_owned(),
             index_kind: "raw".to_owned(),
-            index_file_name: String::new(),
             min_seq_no: 1,
             max_seq_no: 1,
             put_count: mutable_records.len(),
             delete_count: 0,
             approx_bytes: 128,
             scalar_fields: scalar_summary(&mutable_records),
+            artifact_stats: vec![QueryUnitArtifactStats {
+                kind: "mutable_delta".to_owned(),
+                file_name: String::new(),
+                approx_bytes: 128,
+            }],
+            component_bytes: BTreeMap::from([("mutable_delta".to_owned(), 128)]),
         }];
         for (index, (unit_id, records)) in immutable_records.iter().enumerate() {
             query_units.push(QueryUnitStats {
                 unit_id: unit_id.clone(),
                 tier: "immutable".to_owned(),
-                index_kind: "flat".to_owned(),
-                index_file_name: format!("{unit_id}.flat.json"),
+                index_kind: "hnsw".to_owned(),
                 min_seq_no: 1,
                 max_seq_no: (index + 1) as u64,
                 put_count: records.len(),
                 delete_count: 0,
                 approx_bytes: 256,
                 scalar_fields: scalar_summary(records),
+                artifact_stats: vec![
+                    QueryUnitArtifactStats {
+                        kind: "flat_exact".to_owned(),
+                        file_name: format!("{unit_id}.flat.json"),
+                        approx_bytes: 64,
+                    },
+                    QueryUnitArtifactStats {
+                        kind: "hnsw".to_owned(),
+                        file_name: format!("{unit_id}.hnsw.bin"),
+                        approx_bytes: 192,
+                    },
+                ],
+                component_bytes: BTreeMap::from([
+                    ("raw_segment".to_owned(), 64),
+                    ("ann_graph".to_owned(), 96),
+                    ("ann_vectors".to_owned(), 96),
+                ]),
             });
         }
         let stats = CollectionStats {
@@ -454,25 +526,46 @@ impl DeleteAwarePlannerStorage {
                     unit_id: "mutable-delta".to_owned(),
                     tier: "mutable".to_owned(),
                     index_kind: "raw".to_owned(),
-                    index_file_name: String::new(),
                     min_seq_no: 2,
                     max_seq_no: 2,
                     put_count: 0,
                     delete_count: 1,
                     approx_bytes: 64,
                     scalar_fields: BTreeMap::new(),
+                    artifact_stats: vec![QueryUnitArtifactStats {
+                        kind: "mutable_delta".to_owned(),
+                        file_name: String::new(),
+                        approx_bytes: 64,
+                    }],
+                    component_bytes: BTreeMap::from([("mutable_delta".to_owned(), 64)]),
                 },
                 QueryUnitStats {
                     unit_id: "segment-keep".to_owned(),
                     tier: "immutable".to_owned(),
-                    index_kind: "flat".to_owned(),
-                    index_file_name: "segment-keep.flat.json".to_owned(),
+                    index_kind: "hnsw".to_owned(),
                     min_seq_no: 1,
                     max_seq_no: 1,
                     put_count: 1,
                     delete_count: 0,
                     approx_bytes: 128,
                     scalar_fields: scalar_summary(immutable_records["segment-keep"].as_slice()),
+                    artifact_stats: vec![
+                        QueryUnitArtifactStats {
+                            kind: "flat_exact".to_owned(),
+                            file_name: "segment-keep.flat.json".to_owned(),
+                            approx_bytes: 32,
+                        },
+                        QueryUnitArtifactStats {
+                            kind: "hnsw".to_owned(),
+                            file_name: "segment-keep.hnsw.bin".to_owned(),
+                            approx_bytes: 96,
+                        },
+                    ],
+                    component_bytes: BTreeMap::from([
+                        ("raw_segment".to_owned(), 32),
+                        ("ann_graph".to_owned(), 48),
+                        ("ann_vectors".to_owned(), 48),
+                    ]),
                 },
             ],
         };
@@ -531,37 +624,70 @@ impl ShadowingPlannerStorage {
                     unit_id: "mutable-delta".to_owned(),
                     tier: "mutable".to_owned(),
                     index_kind: "raw".to_owned(),
-                    index_file_name: String::new(),
                     min_seq_no: 0,
                     max_seq_no: 0,
                     put_count: 0,
                     delete_count: 0,
                     approx_bytes: 0,
                     scalar_fields: BTreeMap::new(),
+                    artifact_stats: Vec::new(),
+                    component_bytes: BTreeMap::new(),
                 },
                 QueryUnitStats {
                     unit_id: "segment-old-keep".to_owned(),
                     tier: "immutable".to_owned(),
-                    index_kind: "flat".to_owned(),
-                    index_file_name: "segment-old-keep.flat.json".to_owned(),
+                    index_kind: "hnsw".to_owned(),
                     min_seq_no: 1,
                     max_seq_no: 1,
                     put_count: 1,
                     delete_count: 0,
                     approx_bytes: 128,
                     scalar_fields: scalar_summary(immutable_records["segment-old-keep"].as_slice()),
+                    artifact_stats: vec![
+                        QueryUnitArtifactStats {
+                            kind: "flat_exact".to_owned(),
+                            file_name: "segment-old-keep.flat.json".to_owned(),
+                            approx_bytes: 32,
+                        },
+                        QueryUnitArtifactStats {
+                            kind: "hnsw".to_owned(),
+                            file_name: "segment-old-keep.hnsw.bin".to_owned(),
+                            approx_bytes: 96,
+                        },
+                    ],
+                    component_bytes: BTreeMap::from([
+                        ("raw_segment".to_owned(), 32),
+                        ("ann_graph".to_owned(), 48),
+                        ("ann_vectors".to_owned(), 48),
+                    ]),
                 },
                 QueryUnitStats {
                     unit_id: "segment-new-drop".to_owned(),
                     tier: "immutable".to_owned(),
-                    index_kind: "flat".to_owned(),
-                    index_file_name: "segment-new-drop.flat.json".to_owned(),
+                    index_kind: "hnsw".to_owned(),
                     min_seq_no: 2,
                     max_seq_no: 2,
                     put_count: 1,
                     delete_count: 0,
                     approx_bytes: 128,
                     scalar_fields: scalar_summary(immutable_records["segment-new-drop"].as_slice()),
+                    artifact_stats: vec![
+                        QueryUnitArtifactStats {
+                            kind: "flat_exact".to_owned(),
+                            file_name: "segment-new-drop.flat.json".to_owned(),
+                            approx_bytes: 32,
+                        },
+                        QueryUnitArtifactStats {
+                            kind: "hnsw".to_owned(),
+                            file_name: "segment-new-drop.hnsw.bin".to_owned(),
+                            approx_bytes: 96,
+                        },
+                    ],
+                    component_bytes: BTreeMap::from([
+                        ("raw_segment".to_owned(), 32),
+                        ("ann_graph".to_owned(), 48),
+                        ("ann_vectors".to_owned(), 48),
+                    ]),
                 },
             ],
         };
