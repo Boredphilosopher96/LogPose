@@ -25,6 +25,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
+    io,
     io::Write,
     path::{Path, PathBuf},
     sync::{
@@ -849,7 +850,8 @@ impl LocalStorageEngine {
 
         let flat_index = build_flat_index(segment_id.clone(), &sidecar_entries);
         let visible_hnsw_entries =
-            visible_hnsw_entries(records, &hnsw_entry_sources, descriptor.dimensions);
+            visible_hnsw_entries(records, &hnsw_entry_sources, descriptor.dimensions)
+                .map_err(|error| io_message("failed to build hnsw sidecar", error))?;
         let hnsw_index = build_hnsw_index(
             segment_id.clone(),
             descriptor.metric,
@@ -1806,7 +1808,7 @@ fn visible_hnsw_entries(
     records: &[WalRecord],
     entry_sources: &[Option<HnswIndexEntrySource>],
     dimensions: usize,
-) -> Vec<HnswIndexEntrySource> {
+) -> io::Result<Vec<HnswIndexEntrySource>> {
     let mut seen = BTreeSet::new();
     let mut visible = Vec::new();
     for (index, record) in records.iter().enumerate().rev() {
@@ -1817,12 +1819,21 @@ fn visible_hnsw_entries(
         let Some(entry) = entry_sources.get(index).and_then(|entry| entry.clone()) else {
             continue;
         };
-        if entry.vector.len() == dimensions {
-            visible.push(entry);
+        if entry.vector.len() != dimensions {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "stored vector '{}' expected {} dimensions but found {}",
+                    entry.record_id,
+                    dimensions,
+                    entry.vector.len()
+                ),
+            ));
         }
+        visible.push(entry);
     }
     visible.reverse();
-    visible
+    Ok(visible)
 }
 
 fn segment_component_bytes(
@@ -2195,6 +2206,89 @@ mod tests {
         let result = std::panic::catch_unwind(|| read_segment_file(&segment_path));
         assert!(result.is_ok(), "truncated segment should not panic");
         assert!(result.expect("result should exist").is_err());
+    }
+
+    #[test]
+    fn visible_hnsw_entries_ignore_shadowed_dimension_mismatches() {
+        let records = vec![
+            WalRecord {
+                seq_no: 1,
+                op: WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![9.0],
+                    metadata: json!({"version":1}),
+                }),
+            },
+            WalRecord {
+                seq_no: 2,
+                op: WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"version":2}),
+                }),
+            },
+        ];
+        let entries = vec![
+            Some(HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![9.0],
+                metadata: json!({"version":1}),
+            }),
+            Some(HnswIndexEntrySource {
+                entry_offset_index: 1,
+                record_id: RecordId::new("alpha"),
+                seq_no: 2,
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":2}),
+            }),
+        ];
+
+        let visible =
+            visible_hnsw_entries(&records, &entries, 2).expect("latest visible record is valid");
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].seq_no, 2);
+        assert_eq!(visible[0].vector, vec![1.0, 0.0]);
+    }
+
+    #[test]
+    fn write_segment_file_rejects_visible_dimension_mismatches() {
+        let root = unique_temp_dir("storage-visible-dimension-mismatch");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+
+        let result = runtime.block_on(async {
+            let engine = LocalStorageEngine::new(&root);
+            let descriptor = engine
+                .create_collection(CreateCollectionRequest {
+                    name: "broken".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Dot,
+                })
+                .await
+                .expect("collection should be created");
+
+            engine.write_segment_file(
+                &descriptor,
+                &[WalRecord {
+                    seq_no: 1,
+                    op: WriteOperation::Put(PutRecord {
+                        id: RecordId::new("alpha"),
+                        vector: vec![1.0],
+                        metadata: json!({"kind":"broken"}),
+                    }),
+                }],
+            )
+        });
+
+        let error = result.expect_err("visible dimension mismatch should fail segment build");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to build hnsw sidecar: stored vector 'alpha' expected 2 dimensions but found 1"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
