@@ -467,7 +467,10 @@ impl LocalStorageEngine {
 
             let descriptor = match self.find_collection_descriptor(&collection_name) {
                 Ok(descriptor) => descriptor,
-                Err(_) => return,
+                Err(_) => {
+                    clear_maintenance_runtime_state(&coordinator_key);
+                    return;
+                }
             };
 
             let status_lock = maintenance_status_lock(&descriptor.root_path);
@@ -1170,6 +1173,13 @@ fn maintenance_coordinator() -> &'static Mutex<BTreeMap<PathBuf, RuntimeMaintena
     COORDINATOR.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn clear_maintenance_runtime_state(path: &Path) {
+    let mut coordinator = maintenance_coordinator()
+        .lock()
+        .expect("maintenance coordinator lock should not be poisoned");
+    coordinator.remove(path);
+}
+
 fn maintenance_operation_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
     static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1749,6 +1759,36 @@ mod tests {
         assert!(
             !sidecar_temp_path.exists(),
             "temporary sidecar file should be cleaned up after failure"
+        );
+    }
+
+    #[test]
+    fn maintenance_worker_clears_coordinator_on_descriptor_lookup_failure() {
+        let root = unique_temp_dir("storage-maintenance-descriptor-failure");
+        let engine = LocalStorageEngine::new(&root);
+        let coordinator_key = root.join("collections").join("missing-collection");
+
+        {
+            let mut coordinator = maintenance_coordinator()
+                .lock()
+                .expect("maintenance coordinator lock should not be poisoned");
+            coordinator.insert(
+                coordinator_key.clone(),
+                RuntimeMaintenanceState {
+                    running: true,
+                    queue: VecDeque::from([MaintenanceOperation::Flush]),
+                },
+            );
+        }
+
+        engine.run_maintenance_worker("missing".to_owned(), coordinator_key.clone());
+
+        let coordinator = maintenance_coordinator()
+            .lock()
+            .expect("maintenance coordinator lock should not be poisoned");
+        assert!(
+            !coordinator.contains_key(&coordinator_key),
+            "descriptor lookup failure should clear runtime coordinator state"
         );
     }
 
