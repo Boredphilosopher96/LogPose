@@ -341,6 +341,17 @@ pub struct MaintenanceStatus {
     pub completed_runs: usize,
 }
 
+/// One physical artifact that backs a queryable unit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryUnitArtifactStats {
+    /// Stable artifact role such as raw segment, flat exact sidecar, or ann graph.
+    pub kind: String,
+    /// Operator-visible file name when the artifact is persisted on disk.
+    pub file_name: String,
+    /// Approximate bytes attributable to the artifact.
+    pub approx_bytes: usize,
+}
+
 /// Planner-visible description of a mutable or immutable queryable unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryUnitStats {
@@ -350,8 +361,6 @@ pub struct QueryUnitStats {
     pub tier: String,
     /// Index family available for the unit.
     pub index_kind: String,
-    /// Sidecar or index file name when one exists.
-    pub index_file_name: String,
     /// Lowest sequence number represented by the unit.
     pub min_seq_no: SeqNo,
     /// Highest sequence number represented by the unit.
@@ -364,6 +373,34 @@ pub struct QueryUnitStats {
     pub approx_bytes: usize,
     /// Planner-visible scalar summaries for top-level metadata fields.
     pub scalar_fields: BTreeMap<String, ScalarFieldStats>,
+    /// Structured physical artifacts that back this unit.
+    pub artifact_stats: Vec<QueryUnitArtifactStats>,
+    /// Component-oriented byte accounting surfaced to planners and operators.
+    pub component_bytes: BTreeMap<String, usize>,
+}
+
+/// Immutable ANN candidate returned before latest-visible resolution and rerank.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnnCandidate {
+    /// Immutable unit that produced this candidate.
+    pub unit_id: String,
+    /// External record identifier.
+    pub record_id: RecordId,
+    /// Sequence number represented by the candidate.
+    pub seq_no: SeqNo,
+    /// Approximate vector score returned by candidate generation.
+    pub value: f32,
+}
+
+/// Planner-provided ANN candidate generation request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AnnSearchRequest {
+    /// Query embedding vector.
+    pub vector: Vec<f32>,
+    /// Final top-k requested by the caller.
+    pub top_k: usize,
+    /// Candidate budget to materialize before rerank.
+    pub candidate_budget: usize,
 }
 
 /// Collection-level storage statistics surfaced to the CLI.

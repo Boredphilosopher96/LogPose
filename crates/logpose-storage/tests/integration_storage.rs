@@ -127,18 +127,40 @@ async fn flush_persists_visible_records_for_reopen() {
     assert_eq!(stats.mutable_op_count, 0);
     assert_eq!(stats.live_record_count, 1);
     assert_eq!(stats.deleted_record_count, 0);
-    assert_eq!(stats.query_units.len(), 2);
     assert!(stats.maintenance.pending.is_empty());
     assert!(stats.maintenance.in_progress.is_none());
     assert_eq!(stats.maintenance.last_error, None);
+    assert!(
+        stats.query_units.iter().any(|unit| unit.tier == "mutable"),
+        "mutable unit should still be reported for planner visibility"
+    );
 
     let immutable = stats
         .query_units
         .iter()
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be reported");
-    assert_eq!(immutable.index_kind, "flat");
-    assert!(immutable.index_file_name.ends_with(".flat.json"));
+    assert_eq!(immutable.index_kind, "hnsw");
+    assert!(
+        immutable
+            .artifact_stats
+            .iter()
+            .any(|artifact| artifact.file_name.ends_with(".flat.json"))
+    );
+    assert!(
+        immutable
+            .artifact_stats
+            .iter()
+            .any(|artifact| artifact.file_name.ends_with(".hnsw.bin"))
+    );
+    assert!(
+        immutable
+            .component_bytes
+            .get("ann_graph")
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
     assert_eq!(immutable.scalar_fields["topic"].present_count, 1);
 }
 
@@ -322,21 +344,25 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
     assert_eq!(
         segment
             .payload
-            .get("index")
+            .get("segment")
             .and_then(Value::as_object)
-            .and_then(|index| index.get("index_kind"))
+            .and_then(|segment| segment.get("index_kind"))
             .and_then(Value::as_str),
-        Some("flat")
+        Some("hnsw")
     );
     assert_eq!(
         segment
             .payload
-            .get("index")
-            .and_then(Value::as_object)
-            .and_then(|index| index.get("vector_norms"))
+            .get("artifacts")
             .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(2)
+            .expect("segment artifacts should be an array")
+            .iter()
+            .filter_map(|artifact| artifact.get("file_name").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        vec![
+            format!("{segment_id}.flat.json"),
+            format!("{segment_id}.hnsw.bin"),
+        ]
     );
     assert_eq!(
         segment
@@ -432,6 +458,174 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     assert!(stats.maintenance.pending.is_empty());
     assert!(stats.maintenance.in_progress.is_none());
     assert_eq!(stats.maintenance.last_error, None);
+}
+
+#[tokio::test]
+async fn ann_queries_surface_corrupted_hnsw_sidecars() {
+    let root = support::unique_temp_dir("storage-hnsw-corruption");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![2.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+            ],
+        )
+        .await
+        .expect("write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let manifest = engine
+        .inspect("documents", InspectTarget::Manifest)
+        .await
+        .expect("manifest inspect should succeed");
+    let segment_id = manifest
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(|segment| segment.get("segment_id"))
+        .and_then(Value::as_str)
+        .expect("segment id should exist");
+    fs::write(
+        descriptor
+            .root_path
+            .join("indexes")
+            .join(format!("{segment_id}.hnsw.bin")),
+        b"LPH1",
+    )
+    .expect("corrupted sidecar should be written");
+
+    let error = logpose_query::query_exact(
+        &engine,
+        logpose_query::QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: logpose_query::ExplainMode::None,
+        },
+    )
+    .await
+    .expect_err("corrupted hnsw sidecar should fail");
+    assert!(
+        error.to_string().contains("failed to read hnsw sidecar"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn ann_search_selected_enforces_a_global_candidate_budget() {
+    let root = support::unique_temp_dir("storage-ann-budget");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    for batch in 0..3 {
+        engine
+            .write(
+                "documents",
+                vec![
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new("shared-hot"),
+                        vector: vec![12.0 - batch as f32, 0.0],
+                        metadata: json!({"kind":"keep"}),
+                    }),
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new(format!("doc-{batch}-unique")),
+                        vector: vec![9.0 - batch as f32, 0.0],
+                        metadata: json!({"kind":"keep"}),
+                    }),
+                ],
+            )
+            .await
+            .expect("write should succeed");
+        engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+    }
+
+    let immutable_units = engine
+        .stats("documents")
+        .await
+        .expect("stats should succeed")
+        .query_units
+        .into_iter()
+        .filter(|unit| unit.tier == "immutable")
+        .map(|unit| unit.unit_id)
+        .collect::<Vec<_>>();
+    let candidates = engine
+        .ann_search_selected(
+            "documents",
+            None,
+            immutable_units,
+            logpose_types::AnnSearchRequest {
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                candidate_budget: 2,
+            },
+            None,
+        )
+        .await
+        .expect("ann search should succeed");
+
+    assert!(candidates.len() <= 2);
+    let record_ids = candidates
+        .iter()
+        .map(|candidate| candidate.record_id.as_str().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(record_ids.len(), candidates.len());
+    assert!(record_ids.contains("shared-hot"));
+    assert!(
+        record_ids
+            .iter()
+            .any(|record_id| record_id.ends_with("-unique")),
+        "expected a unique immutable candidate alongside the hot id, got {record_ids:?}"
+    );
+    let shared_hot = candidates
+        .iter()
+        .find(|candidate| candidate.record_id.as_str() == "shared-hot")
+        .expect("shared hot candidate should be present");
+    assert_eq!(shared_hot.seq_no, 5);
+    assert_eq!(shared_hot.value, 10.0);
+    assert!(
+        candidates
+            .windows(2)
+            .all(|pair| pair[0].value >= pair[1].value),
+        "candidates should be globally trimmed and sorted by score"
+    );
 }
 
 #[tokio::test]
