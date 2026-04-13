@@ -386,6 +386,15 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     }
 
     let version = read_u16(&bytes, &mut cursor)?;
+    if version != HNSW_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported hnsw version {version} in '{}' (expected {HNSW_VERSION})",
+                path.display()
+            ),
+        ));
+    }
     let segment_id = read_string(&bytes, &mut cursor)?;
     let index_kind = match read_u8(&bytes, &mut cursor)? {
         1 => IndexKind::Hnsw,
@@ -473,6 +482,16 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
         nodes,
     };
     validate_hnsw_index(&sidecar)?;
+    if cursor != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected trailing bytes in hnsw sidecar '{}' ({} unread)",
+                path.display(),
+                bytes.len() - cursor
+            ),
+        ));
+    }
     Ok(sidecar)
 }
 
@@ -1446,6 +1465,35 @@ mod tests {
     }
 
     #[test]
+    fn read_hnsw_index_rejects_unsupported_version() {
+        let path = temp_file_path("hnsw-unsupported-version.bin");
+        let mut index = build_hnsw_index(
+            "segment-unsupported-version",
+            DistanceMetric::Dot,
+            HnswBuildParams::default(),
+            &[HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            }],
+        )
+        .expect("index should build");
+        index.version = HNSW_VERSION + 1;
+
+        write_hnsw_index(&path, &index).expect("index should write");
+        let error = read_hnsw_index(&path).expect_err("unsupported version should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("unsupported hnsw version"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn read_hnsw_index_rejects_missing_entry_point_for_non_empty_graph() {
         let path = temp_file_path("hnsw-missing-entry-point.bin");
         let mut index = build_hnsw_index(
@@ -1466,6 +1514,38 @@ mod tests {
         write_hnsw_index(&path, &index).expect("index should write");
         let error = read_hnsw_index(&path).expect_err("missing entry point should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_hnsw_index_rejects_trailing_bytes() {
+        let path = temp_file_path("hnsw-trailing-bytes.bin");
+        let index = build_hnsw_index(
+            "segment-trailing-bytes",
+            DistanceMetric::Dot,
+            HnswBuildParams::default(),
+            &[HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            }],
+        )
+        .expect("index should build");
+
+        write_hnsw_index(&path, &index).expect("index should write");
+        let mut bytes = fs::read(&path).expect("serialized sidecar should read");
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        fs::write(&path, bytes).expect("trailing bytes should write");
+
+        let error = read_hnsw_index(&path).expect_err("trailing bytes should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("unexpected trailing bytes"),
+            "unexpected error: {error}"
+        );
 
         let _ = fs::remove_file(path);
     }
