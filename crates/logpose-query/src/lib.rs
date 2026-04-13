@@ -733,14 +733,17 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
             })
             .unwrap_or(0.0),
         PredicateOperator::Ne => {
-            1.0 - estimate_comparison_selectivity(
-                &PredicateComparison {
-                    field: comparison.field.clone(),
-                    operator: PredicateOperator::Eq,
-                    value: comparison.value.clone(),
-                },
-                unit,
-            )
+            let scalar_present = scalar_present_count(field_stats);
+            if scalar_present == 0 {
+                return 0.0;
+            }
+            let eq_count = comparison
+                .value
+                .as_ref()
+                .and_then(|value| field_stats.value_counts.get(&value.summary_key()))
+                .copied()
+                .unwrap_or_default();
+            scalar_present.saturating_sub(eq_count) as f32 / total
         }
         PredicateOperator::Lt
         | PredicateOperator::Lte
@@ -931,7 +934,7 @@ fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitS
             field_stats
                 .value_counts
                 .get(&value.summary_key())
-                .is_none_or(|count| *count < unit.put_count)
+                .is_none_or(|count| *count < scalar_present_count(field_stats))
         }),
         PredicateOperator::Lt | PredicateOperator::Lte => {
             let Some(value) = comparison.value.as_ref() else {
@@ -995,6 +998,10 @@ fn comparable_value_count(field_stats: &ScalarFieldStats, value: &ScalarMetadata
         .filter(|(summary_key, _)| summary_key.starts_with(prefix))
         .map(|(_, count)| *count)
         .sum()
+}
+
+fn scalar_present_count(field_stats: &ScalarFieldStats) -> usize {
+    field_stats.value_counts.values().sum()
 }
 
 fn compare_ordered_scalars(
