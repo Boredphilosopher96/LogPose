@@ -85,12 +85,15 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 ### Now
 
 - a seeded, replayable state-machine harness at the storage boundary
+- seeded service and transport harnesses that exercise planner-controlled ANN, hybrid merge, and profile diagnostics paths
 - continued explicit regression coverage for storage atomicity and corruption cases
+- deterministic exact-vs-ANN regression suites and recall checks for immutable HNSW units
+- reproducible Criterion benchmarks that pair exact baselines with planner-selected unfiltered ANN, filtered ANN, and tiny exact-fallback queries on fixed corpora
 - clearer separation between inline unit tests and external integration/harness tests
 
 ### Near-Term
 
-- targeted fuzz/property harnesses for WAL, manifests, storage metadata, and CLI surfaces
+- targeted fuzz/property harnesses for WAL, manifests, HNSW sidecars, storage metadata, and CLI surfaces
 - snapshot-style assertions for stable textual and JSON operator output where that increases clarity
 - dedicated CI execution for generative suites so they can evolve independently from general workspace tests
 
@@ -111,6 +114,7 @@ Every new generative, fuzzing, or simulation harness in LogPose should satisfy t
 5. Generators and harness support code must be reusable. Avoid one-off ad hoc random loops.
 6. Keep scenarios bounded so CI runtime remains predictable.
 7. Preserve focused regression tests for bugs and contracts that deserve named coverage even if a generative harness also reaches them.
+8. ANN-capable harnesses must compare approximate paths against an exact oracle or a documented recall envelope.
 
 ## Test Placement Policy
 

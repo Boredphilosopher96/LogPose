@@ -17,5 +17,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+criterion = "0.5"
 logpose-catalog = { path = "../logpose-catalog" }
 tokio.workspace = true
+
+[[bench]]
+name = "phase4_ann"
+harness = false

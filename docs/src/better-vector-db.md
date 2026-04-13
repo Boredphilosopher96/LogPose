@@ -274,7 +274,14 @@ This phase makes the system feel more like a database instead of an offline ANN 
 
 This is where hybrid query quality and predictability improve sharply.
 
-### Phase 4: Research-heavy optimizations
+### Phase 4: Planner-controlled ANN and hybrid execution
+
+- production ANN under planner control instead of index-driven architecture
+- cooperative filtered ANN plus exact fallback for tiny filtered populations
+- operator-facing diagnostics for candidate generation, rerank, merge, and memory accounting
+- deterministic ANN benchmarks plus exact-oracle validation
+
+### Phase 5: Research-heavy optimizations
 
 - disk-native graph layout refinement
 - disaggregated memory support
