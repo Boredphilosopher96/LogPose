@@ -104,6 +104,24 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             .chosen_plan,
         QueryPlanKind::TinyPopulationExactFallback
     );
+    let diagnostics = query
+        .diagnostics
+        .as_ref()
+        .expect("diagnostics should be present");
+    assert!(diagnostics.fallback_reason.is_some());
+    let timings = diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("profile mode should include timings");
+    assert!(timings.planning_micros > 0);
+    assert!(timings.prefilter_micros > 0);
+    assert!(timings.rerank_micros > 0);
+    assert!(diagnostics.candidates_merged >= 1);
+    assert!(diagnostics.candidates_reranked >= 1);
+    assert_eq!(
+        diagnostics.unit_scan_mix.get("mutable_exact").copied(),
+        Some(1)
+    );
 
     let stats = client.stats("documents").await.expect("stats should load");
     assert_eq!(stats.live_record_count, 2);
@@ -112,6 +130,16 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert_eq!(stats.segment_count, 0);
     assert_eq!(stats.maintenance.completed_runs, 0);
     assert_eq!(stats.query_units.len(), 1);
+    assert_eq!(stats.query_units[0].artifact_stats.len(), 1);
+    assert_eq!(stats.query_units[0].artifact_stats[0].kind, "mutable_delta");
+    assert!(
+        stats.query_units[0]
+            .component_bytes
+            .get("mutable_delta")
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
 
     let flush = client
         .flush("documents")
@@ -146,6 +174,77 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert_eq!(stats.maintenance.completed_runs, 0);
     assert!(stats.maintenance.in_progress.is_none());
     assert_eq!(stats.query_units.len(), 2);
+    let immutable = stats
+        .query_units
+        .iter()
+        .find(|unit| unit.tier == "immutable")
+        .expect("immutable unit should be present");
+    assert_eq!(immutable.index_kind, "hnsw");
+    assert!(
+        immutable
+            .artifact_stats
+            .iter()
+            .any(|artifact| artifact.file_name.ends_with(".flat.json"))
+    );
+    assert!(
+        immutable
+            .artifact_stats
+            .iter()
+            .any(|artifact| artifact.file_name.ends_with(".hnsw.bin"))
+    );
+    assert!(
+        immutable
+            .component_bytes
+            .get("ann_graph")
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
+
+    let hybrid_query = client
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::Profile,
+        })
+        .await
+        .expect("hybrid query should succeed");
+    assert_eq!(hybrid_query.matches[0].id.as_str(), "alpha");
+    let hybrid_diagnostics = hybrid_query
+        .diagnostics
+        .as_ref()
+        .expect("hybrid query should include diagnostics");
+    assert_eq!(
+        hybrid_diagnostics.chosen_plan,
+        QueryPlanKind::HybridExactAnnMerge
+    );
+    assert!(hybrid_diagnostics.candidates_merged >= 1);
+    assert!(hybrid_diagnostics.candidates_reranked >= 1);
+    assert_eq!(
+        hybrid_diagnostics
+            .unit_scan_mix
+            .get("immutable_ann")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(
+        hybrid_diagnostics
+            .unit_scan_mix
+            .get("mutable_exact")
+            .copied(),
+        Some(1)
+    );
+    let hybrid_timings = hybrid_diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("hybrid profile should include timings");
+    assert!(hybrid_timings.candidate_generation_micros > 0);
+    assert!(hybrid_timings.merge_micros > 0);
+    assert!(hybrid_timings.rerank_micros > 0);
 
     let inspect = client
         .inspect("documents", InspectTarget::Manifest)
@@ -197,6 +296,114 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .await
         .expect("maintenance inspect should succeed");
     assert_eq!(maintenance.target, "maintenance");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_round_trips_cooperative_filtered_ann() {
+    let temp_root = unique_temp_dir("client-grpc-cooperative");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+    client
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let operations = (0..12)
+        .map(|index| {
+            let kind = if index % 4 == 0 { "keep" } else { "drop" };
+            WriteOperation::Put(PutRecord {
+                id: RecordId::new(format!("doc-{index}")),
+                vector: vec![index as f32 + 1.0, 0.0],
+                metadata: json!({"kind":kind,"version":index}),
+            })
+        })
+        .collect::<Vec<_>>();
+    client
+        .write("documents", operations)
+        .await
+        .expect("write should succeed");
+    client
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let response = client
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: Some(Predicate::Comparison(PredicateComparison {
+                field: "kind".to_owned(),
+                operator: PredicateOperator::Eq,
+                value: Some(ScalarMetadataValue::String("keep".to_owned())),
+            })),
+            explain: ExplainMode::Profile,
+        })
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["doc-8", "doc-4"]
+    );
+    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    assert_eq!(
+        diagnostics.chosen_plan,
+        QueryPlanKind::CooperativeFilteredAnn
+    );
+    assert_eq!(
+        diagnostics.planner_reason,
+        "filtered ann traversal is cheaper than exact scan for this selectivity"
+    );
+    assert!((diagnostics.estimated_selectivity - 0.25).abs() <= f32::EPSILON);
+    assert_eq!(diagnostics.units_considered, 2);
+    assert_eq!(diagnostics.units_pruned, 0);
+    assert_eq!(diagnostics.units_scanned, 1);
+    assert!(diagnostics.candidates_before_filter >= response.returned);
+    assert!(diagnostics.candidates_after_filter >= response.returned);
+    assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
+    assert_eq!(
+        diagnostics.candidates_merged,
+        diagnostics.candidates_reranked
+    );
+    assert!(diagnostics.candidates_merged >= response.returned);
+    assert_eq!(diagnostics.rerank_count, 1);
+    assert_eq!(
+        diagnostics.unit_scan_mix.get("immutable_ann").copied(),
+        Some(1)
+    );
+    assert!(diagnostics.fallback_reason.is_none());
+    let timings = diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("profile mode should include timings");
+    assert!(timings.planning_micros > 0);
+    assert_eq!(timings.prefilter_micros, 0);
+    assert!(timings.candidate_generation_micros > 0);
+    assert!(timings.postfilter_micros > 0);
+    assert!(timings.rerank_micros > 0);
+    assert!(timings.merge_micros > 0);
 
     server.abort();
     let _ = server.await;

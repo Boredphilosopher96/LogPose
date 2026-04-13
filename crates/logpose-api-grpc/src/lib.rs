@@ -459,7 +459,15 @@ fn query_diagnostics_to_proto(
         units_scanned: diagnostics.units_scanned as u64,
         candidates_before_filter: diagnostics.candidates_before_filter as u64,
         candidates_after_filter: diagnostics.candidates_after_filter as u64,
+        candidates_reranked: diagnostics.candidates_reranked as u64,
+        candidates_merged: diagnostics.candidates_merged as u64,
         rerank_count: diagnostics.rerank_count as u64,
+        fallback_reason: diagnostics.fallback_reason,
+        unit_scan_mix: diagnostics
+            .unit_scan_mix
+            .into_iter()
+            .map(|(key, value)| (key, value as u64))
+            .collect(),
         stage_timings: diagnostics.stage_timings.map(query_stage_timings_to_proto),
     })
 }
@@ -472,14 +480,20 @@ fn query_plan_kind_to_proto(plan: QueryPlanKind) -> proto::QueryPlanKind {
         QueryPlanKind::TinyPopulationExactFallback => {
             proto::QueryPlanKind::TinyPopulationExactFallback
         }
+        QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
+        QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
+        QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,
     }
 }
 
 fn query_stage_timings_to_proto(timings: QueryStageTimings) -> proto::QueryStageTimings {
     proto::QueryStageTimings {
         planning_micros: timings.planning_micros,
-        predicate_micros: timings.predicate_micros,
-        ranking_micros: timings.ranking_micros,
+        prefilter_micros: timings.prefilter_micros,
+        candidate_generation_micros: timings.candidate_generation_micros,
+        postfilter_micros: timings.postfilter_micros,
+        rerank_micros: timings.rerank_micros,
+        merge_micros: timings.merge_micros,
     }
 }
 
@@ -538,7 +552,6 @@ fn query_unit_stats_to_proto(stats: QueryUnitStats) -> Result<proto::QueryUnitSt
         unit_id: stats.unit_id,
         tier: stats.tier,
         index_kind: stats.index_kind,
-        index_file_name: stats.index_file_name,
         min_seq_no: stats.min_seq_no,
         max_seq_no: stats.max_seq_no,
         put_count: stats.put_count as u64,
@@ -549,6 +562,20 @@ fn query_unit_stats_to_proto(stats: QueryUnitStats) -> Result<proto::QueryUnitSt
             .into_iter()
             .map(|(field, stats)| scalar_field_stats_to_proto(stats).map(|stats| (field, stats)))
             .collect::<Result<_, _>>()?,
+        artifact_stats: stats
+            .artifact_stats
+            .into_iter()
+            .map(|artifact| proto::QueryUnitArtifactStats {
+                kind: artifact.kind,
+                file_name: artifact.file_name,
+                approx_bytes: artifact.approx_bytes as u64,
+            })
+            .collect(),
+        component_bytes: stats
+            .component_bytes
+            .into_iter()
+            .map(|(key, value)| (key, value as u64))
+            .collect(),
     })
 }
 
@@ -580,12 +607,74 @@ fn status_from_service_error(error: ServiceError) -> Status {
 mod tests {
     use super::*;
     use logpose_config::LogPoseConfig;
+    use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryStageTimings};
     use serde_json::Value;
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn query_diagnostics_to_proto_preserves_ann_fields() {
+        let diagnostics = QueryDiagnostics {
+            chosen_plan: QueryPlanKind::CooperativeFilteredAnn,
+            planner_reason:
+                "filtered ann traversal is cheaper than exact scan for this selectivity".to_owned(),
+            estimated_selectivity: 0.25,
+            units_considered: 2,
+            units_pruned: 1,
+            units_scanned: 1,
+            candidates_before_filter: 17,
+            candidates_after_filter: 13,
+            candidates_reranked: 7,
+            candidates_merged: 5,
+            rerank_count: 1,
+            fallback_reason: Some("fallback".to_owned()),
+            unit_scan_mix: BTreeMap::from([
+                ("immutable_ann".to_owned(), 1),
+                ("mutable_exact".to_owned(), 2),
+            ]),
+            stage_timings: Some(QueryStageTimings {
+                planning_micros: 11,
+                prefilter_micros: 22,
+                candidate_generation_micros: 33,
+                postfilter_micros: 44,
+                rerank_micros: 55,
+                merge_micros: 66,
+            }),
+        };
+
+        let proto = query_diagnostics_to_proto(diagnostics).expect("conversion should succeed");
+        assert_eq!(
+            proto::QueryPlanKind::try_from(proto.chosen_plan).expect("plan should decode"),
+            proto::QueryPlanKind::CooperativeFilteredAnn
+        );
+        assert_eq!(
+            proto.planner_reason,
+            "filtered ann traversal is cheaper than exact scan for this selectivity"
+        );
+        assert!((proto.estimated_selectivity - 0.25).abs() <= f32::EPSILON);
+        assert_eq!(proto.units_considered, 2);
+        assert_eq!(proto.units_pruned, 1);
+        assert_eq!(proto.units_scanned, 1);
+        assert_eq!(proto.candidates_before_filter, 17);
+        assert_eq!(proto.candidates_after_filter, 13);
+        assert_eq!(proto.candidates_reranked, 7);
+        assert_eq!(proto.candidates_merged, 5);
+        assert_eq!(proto.rerank_count, 1);
+        assert_eq!(proto.fallback_reason.as_deref(), Some("fallback"));
+        assert_eq!(proto.unit_scan_mix.get("immutable_ann"), Some(&1));
+        assert_eq!(proto.unit_scan_mix.get("mutable_exact"), Some(&2));
+        let timings = proto.stage_timings.expect("timings should be present");
+        assert_eq!(timings.planning_micros, 11);
+        assert_eq!(timings.prefilter_micros, 22);
+        assert_eq!(timings.candidate_generation_micros, 33);
+        assert_eq!(timings.postfilter_micros, 44);
+        assert_eq!(timings.rerank_micros, 55);
+        assert_eq!(timings.merge_micros, 66);
+    }
 
     #[tokio::test]
     async fn grpc_service_runs_collection_workflow() {

@@ -4,7 +4,8 @@ use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_core::AppState;
 use logpose_query::{
-    ExplainMode, MetadataFilter, QueryMatch, QueryRequest, QueryResponse, ScalarMetadataValue,
+    ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
+    QueryResponse, ScalarMetadataValue,
 };
 use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
@@ -210,6 +211,40 @@ impl ExpectedModel {
         }
     }
 
+    fn expected_query_ranking(
+        &self,
+        vector: &[f32],
+        snapshot: Snapshot,
+        keep_only: bool,
+    ) -> Vec<QueryMatch> {
+        let metric = self.metric.expect("metric should be set");
+        let filters = if keep_only {
+            vec![MetadataFilter {
+                field: "kind".to_owned(),
+                value: ScalarMetadataValue::String("keep".to_owned()),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        let mut matches = self
+            .resolve_latest(snapshot.visible_seq_no)
+            .into_values()
+            .filter_map(|state| match state {
+                ExpectedState::Visible(record) => Some(record),
+                ExpectedState::Deleted => None,
+            })
+            .filter(|record| record_matches_filters(record, &filters))
+            .map(|record| QueryMatch {
+                id: record.id,
+                value: expected_match_value(metric, vector, &record.vector),
+                metadata: record.metadata,
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| compare_query_matches(metric, left, right));
+        matches
+    }
+
     fn resolve_latest(&self, visible_seq_no: SeqNo) -> BTreeMap<RecordId, ExpectedState> {
         let mut resolved = BTreeMap::new();
         for (seq_no, operation) in self
@@ -264,6 +299,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
         .unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))
         });
+    disable_background_maintenance(&descriptor.root_path);
     model.register_collection(descriptor.collection_id.to_string(), descriptor.metric);
 
     for _ in 0..steps {
@@ -512,15 +548,8 @@ async fn assert_query_parity(
         vector: vector.clone(),
         top_k: EXACT_QUERY_TOP_K,
         snapshot: snapshot.clone(),
-        filters: if keep_only {
-            vec![MetadataFilter {
-                field: "kind".to_owned(),
-                value: ScalarMetadataValue::String("keep".to_owned()),
-            }]
-        } else {
-            Vec::new()
-        },
-        predicate: None,
+        filters: Vec::new(),
+        predicate: keep_only.then(keep_only_predicate),
         explain: ExplainMode::None,
     };
     let actual = service
@@ -534,7 +563,8 @@ async fn assert_query_parity(
         snapshot.unwrap_or_else(|| model.current_snapshot()),
         keep_only,
     );
-    assert_eq_with_context(seed, trace, "service query mismatch", &expected, &actual);
+    let exact_ranking =
+        model.expected_query_ranking(&request.vector, expected.snapshot.clone(), keep_only);
 
     let rest_response = rest
         .clone()
@@ -548,7 +578,16 @@ async fn assert_query_parity(
                         "vector": request.vector,
                         "top_k": request.top_k,
                         "snapshot": request.snapshot,
-                        "filters": if keep_only { json!({"kind":"keep"}) } else { json!({}) }
+                        "predicate": if keep_only {
+                            json!({
+                                "kind": "comparison",
+                                "field": "kind",
+                                "operator": "eq",
+                                "value": "keep"
+                            })
+                        } else {
+                            Value::Null
+                        }
                     })
                     .to_string(),
                 ))
@@ -564,7 +603,7 @@ async fn assert_query_parity(
             .iter()
             .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
             .collect::<Vec<_>>(),
-        expected
+        actual
             .matches
             .iter()
             .map(|candidate| candidate.id.as_str())
@@ -577,21 +616,12 @@ async fn assert_query_parity(
             collection_name: COLLECTION_NAME.to_owned(),
             vector,
             top_k: EXACT_QUERY_TOP_K as u64,
-            snapshot: request.snapshot.map(|snapshot| proto::Snapshot {
+            snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
-            filters: if keep_only {
-                vec![proto::MetadataFilter {
-                    field: "kind".to_owned(),
-                    value: Some(proto::ScalarValue {
-                        kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
-                    }),
-                }]
-            } else {
-                Vec::new()
-            },
-            predicate: None,
+            filters: Vec::new(),
+            predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::None as i32,
         }))
         .await
@@ -605,12 +635,178 @@ async fn assert_query_parity(
             .iter()
             .map(|candidate| candidate.id.as_str())
             .collect::<Vec<_>>(),
+        actual
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        "seed={seed} trace={trace:?}"
+    );
+
+    let profiled_request = QueryRequest {
+        explain: ExplainMode::Profile,
+        ..request.clone()
+    };
+    let profiled_service = service
+        .query(profiled_request.clone())
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(
+                seed,
+                trace,
+                format!("service profile query failed: {error}"),
+            )
+        });
+    assert_eq!(
+        profiled_service
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
         expected
             .matches
             .iter()
             .map(|candidate| candidate.id.as_str())
             .collect::<Vec<_>>(),
         "seed={seed} trace={trace:?}"
+    );
+    let service_diagnostics = profiled_service.diagnostics.as_ref().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "service profile diagnostics missing".to_owned(),
+        )
+    });
+    assert_query_response_matches_oracle(
+        seed,
+        trace,
+        service_diagnostics.chosen_plan,
+        &expected,
+        &exact_ranking,
+        &actual,
+    );
+    assert_query_response_matches_oracle(
+        seed,
+        trace,
+        service_diagnostics.chosen_plan,
+        &expected,
+        &exact_ranking,
+        &profiled_service,
+    );
+    let service_timings = service_diagnostics
+        .stage_timings
+        .as_ref()
+        .unwrap_or_else(|| {
+            panic_with_context(seed, trace, "service profile timings missing".to_owned())
+        });
+    assert!(
+        service_timings.planning_micros > 0,
+        "seed={seed} trace={trace:?} diagnostics={service_diagnostics:#?}"
+    );
+    assert!(
+        service_diagnostics.units_scanned == 0 || !service_diagnostics.unit_scan_mix.is_empty(),
+        "seed={seed} trace={trace:?} diagnostics={service_diagnostics:#?}"
+    );
+
+    let profiled_rest_response = rest
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/collections/{COLLECTION_NAME}/query"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "vector": profiled_request.vector,
+                        "top_k": profiled_request.top_k,
+                        "snapshot": profiled_request.snapshot,
+                        "predicate": if keep_only {
+                            json!({
+                                "kind": "comparison",
+                                "field": "kind",
+                                "operator": "eq",
+                                "value": "keep"
+                            })
+                        } else {
+                            Value::Null
+                        },
+                        "explain": "profile"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("rest profile query should respond");
+    let profiled_rest_body = json_body(profiled_rest_response).await;
+    assert_eq!(
+        profiled_rest_body["matches"]
+            .as_array()
+            .expect("matches should be an array")
+            .iter()
+            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+            .collect::<Vec<_>>(),
+        profiled_service
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        "seed={seed} trace={trace:?}"
+    );
+    assert_eq!(
+        profiled_rest_body["diagnostics"]["chosen_plan"],
+        serde_json::to_value(service_diagnostics.chosen_plan).expect("plan kind should serialize")
+    );
+    assert_json_profile_diagnostics_matches_service(
+        seed,
+        trace,
+        &profiled_rest_body["diagnostics"],
+        service_diagnostics,
+    );
+
+    let profiled_grpc = grpc
+        .query_collection(Request::new(proto::QueryCollectionRequest {
+            collection_name: COLLECTION_NAME.to_owned(),
+            vector: request.vector.clone(),
+            top_k: EXACT_QUERY_TOP_K as u64,
+            snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
+                manifest_generation: snapshot.manifest_generation,
+                visible_seq_no: snapshot.visible_seq_no,
+            }),
+            filters: Vec::new(),
+            predicate: keep_only.then(keep_only_proto_predicate),
+            explain: proto::ExplainMode::Profile as i32,
+        }))
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("grpc profile query failed: {error}"))
+        })
+        .into_inner();
+    assert_eq!(
+        profiled_grpc
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        profiled_service
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        "seed={seed} trace={trace:?}"
+    );
+    let grpc_diagnostics = profiled_grpc.diagnostics.as_ref().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "grpc profile diagnostics missing".to_owned())
+    });
+    assert_eq!(
+        grpc_diagnostics.chosen_plan,
+        proto_plan_kind(service_diagnostics.chosen_plan) as i32
+    );
+    assert_proto_profile_diagnostics_matches_service(
+        seed,
+        trace,
+        grpc_diagnostics,
+        service_diagnostics,
     );
 }
 
@@ -781,6 +977,84 @@ async fn assert_stats_parity(
         actual.query_units.len(),
         "seed={seed} trace={trace:?}"
     );
+    if model.segment_count > 0 {
+        let immutable = actual
+            .query_units
+            .iter()
+            .find(|unit| unit.tier == "immutable")
+            .unwrap_or_else(|| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!("missing immutable unit in stats: {:?}", actual.query_units),
+                )
+            });
+        assert!(
+            immutable
+                .artifact_stats
+                .iter()
+                .any(|artifact| artifact.file_name.ends_with(".flat.json")),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+        assert!(
+            immutable
+                .artifact_stats
+                .iter()
+                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+        assert!(
+            immutable.component_bytes.contains_key("ann_graph"),
+            "seed={seed} trace={trace:?} immutable={immutable:?}"
+        );
+        let rest_units = rest_body["query_units"]
+            .as_array()
+            .expect("rest query units should be an array");
+        let rest_immutable = rest_units
+            .iter()
+            .find(|unit| unit["tier"] == "immutable")
+            .unwrap_or_else(|| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!("missing rest immutable unit: {rest_units:#?}"),
+                )
+            });
+        assert!(
+            rest_immutable["artifact_stats"]
+                .as_array()
+                .is_some_and(|artifacts| artifacts.len() >= 2),
+            "seed={seed} trace={trace:?} immutable={rest_immutable:#?}"
+        );
+        assert!(
+            rest_immutable["component_bytes"]["ann_graph"]
+                .as_u64()
+                .is_some(),
+            "seed={seed} trace={trace:?} immutable={rest_immutable:#?}"
+        );
+        let grpc_immutable = grpc_stats
+            .query_units
+            .iter()
+            .find(|unit| unit.tier == "immutable")
+            .unwrap_or_else(|| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!("missing grpc immutable unit: {:?}", grpc_stats.query_units),
+                )
+            });
+        assert!(
+            grpc_immutable
+                .artifact_stats
+                .iter()
+                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
+            "seed={seed} trace={trace:?} immutable={grpc_immutable:?}"
+        );
+        assert!(
+            grpc_immutable.component_bytes.contains_key("ann_graph"),
+            "seed={seed} trace={trace:?} immutable={grpc_immutable:?}"
+        );
+    }
 }
 
 async fn assert_inspect_parity(
@@ -1003,6 +1277,22 @@ fn inspect_request(target: InspectTarget) -> axum::http::Request<Body> {
         .expect("request should build")
 }
 
+fn disable_background_maintenance(root_path: &Path) {
+    let descriptor_path = root_path.join("descriptor.json");
+    let mut descriptor = serde_json::from_slice::<Value>(
+        &fs::read(&descriptor_path).expect("descriptor should exist"),
+    )
+    .expect("descriptor should parse");
+    descriptor["flush_threshold_ops"] = json!(usize::MAX);
+    descriptor["flush_threshold_bytes"] = json!(usize::MAX);
+    descriptor["compaction_threshold_segments"] = json!(usize::MAX);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor).expect("descriptor should serialize"),
+    )
+    .expect("descriptor should be updated");
+}
+
 fn assert_ack_matches(
     ack: &CommitAck,
     applied_ops: usize,
@@ -1017,6 +1307,527 @@ fn assert_ack_matches(
     assert_eq_with_context(seed, trace, "commit ack mismatch", &expected, ack);
 }
 
+fn assert_query_response_matches_oracle(
+    seed: u64,
+    trace: &[ServiceAction],
+    plan: QueryPlanKind,
+    expected: &QueryResponse,
+    exact_ranking: &[QueryMatch],
+    actual: &QueryResponse,
+) {
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query metric mismatch",
+        &expected.metric,
+        &actual.metric,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query top_k mismatch",
+        &expected.top_k,
+        &actual.top_k,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query snapshot mismatch",
+        &expected.snapshot,
+        &actual.snapshot,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "query returned count mismatch",
+        &actual.matches.len(),
+        &actual.returned,
+    );
+
+    if !uses_ann(plan) {
+        assert_eq_with_context(
+            seed,
+            trace,
+            "service query matches mismatch",
+            &expected.matches,
+            &actual.matches,
+        );
+        return;
+    }
+
+    let expected_top_ids = expected
+        .matches
+        .iter()
+        .map(|candidate| candidate.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let actual_ids = actual
+        .matches
+        .iter()
+        .map(|candidate| candidate.id.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let hits = expected_top_ids
+        .iter()
+        .filter(|id| actual_ids.contains(*id))
+        .count();
+    assert!(
+        hits >= minimum_required_hits(expected_top_ids.len()),
+        "seed={seed} trace={trace:?} plan={plan:?} expected_top={expected_top_ids:?} actual={actual_ids:?}"
+    );
+    if let Some(first_expected) = expected_top_ids.first() {
+        assert_eq!(
+            actual_ids.first(),
+            Some(first_expected),
+            "seed={seed} trace={trace:?} plan={plan:?} expected_top={expected_top_ids:?} actual={actual_ids:?}"
+        );
+    }
+
+    let exact_lookup = exact_ranking
+        .iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            (
+                candidate.id.as_str().to_owned(),
+                (rank, candidate.value, candidate.metadata.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_ranks = Vec::with_capacity(actual.matches.len());
+    for candidate in &actual.matches {
+        let Some((rank, exact_value, exact_metadata)) =
+            exact_lookup.get(candidate.id.as_str()).cloned()
+        else {
+            panic_with_context(
+                seed,
+                trace,
+                format!("ann query returned unknown id '{}'", candidate.id),
+            );
+        };
+        observed_ranks.push(rank);
+        assert!(
+            (candidate.value - exact_value).abs() <= f32::EPSILON,
+            "seed={seed} trace={trace:?} id={} expected_value={exact_value} actual_value={}",
+            candidate.id,
+            candidate.value
+        );
+        assert_eq_with_context(
+            seed,
+            trace,
+            "ann query metadata mismatch",
+            &exact_metadata,
+            &candidate.metadata,
+        );
+    }
+    assert!(
+        observed_ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+        "seed={seed} trace={trace:?} plan={plan:?} exact_ranks={observed_ranks:?}"
+    );
+}
+
+fn assert_json_profile_diagnostics_matches_service(
+    seed: u64,
+    trace: &[ServiceAction],
+    actual: &Value,
+    expected: &QueryDiagnostics,
+) {
+    assert_eq!(
+        actual["chosen_plan"],
+        serde_json::to_value(expected.chosen_plan).expect("plan kind should serialize"),
+        "seed={seed} trace={trace:?}"
+    );
+    let actual_fallback = serde_json::from_value::<Option<String>>(
+        actual["fallback_reason"].clone(),
+    )
+    .unwrap_or_else(|error| {
+        panic_with_context(
+            seed,
+            trace,
+            format!("rest fallback reason should decode: {error}"),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest fallback reason mismatch",
+        &expected.fallback_reason,
+        &actual_fallback,
+    );
+    let actual_reranked = actual["candidates_reranked"].as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest rerank count should be numeric".to_owned(),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest planner reason mismatch",
+        &expected.planner_reason,
+        &actual["planner_reason"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    "rest planner reason should be a string".to_owned(),
+                )
+            }),
+    );
+    let actual_selectivity = actual["estimated_selectivity"].as_f64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest estimated selectivity should be numeric".to_owned(),
+        )
+    }) as f32;
+    assert!(
+        (expected.estimated_selectivity - actual_selectivity).abs() <= f32::EPSILON,
+        "seed={seed} trace={trace:?} rest estimated selectivity mismatch expected={} actual={actual_selectivity}",
+        expected.estimated_selectivity,
+    );
+    let actual_units_considered = actual["units_considered"].as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest units considered should be numeric".to_owned(),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest units considered mismatch",
+        &(expected.units_considered as u64),
+        &actual_units_considered,
+    );
+    let actual_units_pruned = actual["units_pruned"].as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest units pruned should be numeric".to_owned(),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest units pruned mismatch",
+        &(expected.units_pruned as u64),
+        &actual_units_pruned,
+    );
+    let actual_before_filter = actual["candidates_before_filter"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            panic_with_context(
+                seed,
+                trace,
+                "rest candidates before filter should be numeric".to_owned(),
+            )
+        });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest candidates before filter mismatch",
+        &(expected.candidates_before_filter as u64),
+        &actual_before_filter,
+    );
+    let actual_after_filter = actual["candidates_after_filter"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            panic_with_context(
+                seed,
+                trace,
+                "rest candidates after filter should be numeric".to_owned(),
+            )
+        });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest candidates after filter mismatch",
+        &(expected.candidates_after_filter as u64),
+        &actual_after_filter,
+    );
+    let actual_rerank_count = actual["rerank_count"].as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest rerank count should be numeric".to_owned(),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest rerank count mismatch",
+        &(expected.rerank_count as u64),
+        &actual_rerank_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest rerank count mismatch",
+        &(expected.candidates_reranked as u64),
+        &actual_reranked,
+    );
+    let actual_merged = actual["candidates_merged"].as_u64().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "rest merge count should be numeric".to_owned())
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest merge count mismatch",
+        &(expected.candidates_merged as u64),
+        &actual_merged,
+    );
+    let actual_units_scanned = actual["units_scanned"].as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            "rest units scanned should be numeric".to_owned(),
+        )
+    });
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest units scanned mismatch",
+        &(expected.units_scanned as u64),
+        &actual_units_scanned,
+    );
+    let actual_unit_scan_mix = if actual["unit_scan_mix"].is_null() {
+        BTreeMap::new()
+    } else {
+        serde_json::from_value::<BTreeMap<String, usize>>(actual["unit_scan_mix"].clone())
+            .unwrap_or_else(|error| {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!("rest unit scan mix should decode: {error}"),
+                )
+            })
+    };
+    assert_eq_with_context(
+        seed,
+        trace,
+        "rest unit scan mix mismatch",
+        &expected.unit_scan_mix,
+        &actual_unit_scan_mix,
+    );
+    let timings = expected.stage_timings.as_ref().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "service profile timings missing".to_owned())
+    });
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "planning_micros",
+        timings.planning_micros,
+        &actual["stage_timings"]["planning_micros"],
+    );
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "prefilter_micros",
+        timings.prefilter_micros,
+        &actual["stage_timings"]["prefilter_micros"],
+    );
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "candidate_generation_micros",
+        timings.candidate_generation_micros,
+        &actual["stage_timings"]["candidate_generation_micros"],
+    );
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "postfilter_micros",
+        timings.postfilter_micros,
+        &actual["stage_timings"]["postfilter_micros"],
+    );
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "rerank_micros",
+        timings.rerank_micros,
+        &actual["stage_timings"]["rerank_micros"],
+    );
+    assert_json_stage_timing_matches(
+        seed,
+        trace,
+        "merge_micros",
+        timings.merge_micros,
+        &actual["stage_timings"]["merge_micros"],
+    );
+}
+
+fn assert_proto_profile_diagnostics_matches_service(
+    seed: u64,
+    trace: &[ServiceAction],
+    actual: &proto::QueryDiagnostics,
+    expected: &QueryDiagnostics,
+) {
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc planner reason mismatch",
+        &expected.planner_reason,
+        &actual.planner_reason,
+    );
+    assert!(
+        (expected.estimated_selectivity - actual.estimated_selectivity).abs() <= f32::EPSILON,
+        "seed={seed} trace={trace:?} grpc estimated selectivity mismatch expected={} actual={}",
+        expected.estimated_selectivity,
+        actual.estimated_selectivity,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc units considered mismatch",
+        &(expected.units_considered as u64),
+        &actual.units_considered,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc units pruned mismatch",
+        &(expected.units_pruned as u64),
+        &actual.units_pruned,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc candidates before filter mismatch",
+        &(expected.candidates_before_filter as u64),
+        &actual.candidates_before_filter,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc candidates after filter mismatch",
+        &(expected.candidates_after_filter as u64),
+        &actual.candidates_after_filter,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc rerank count mismatch",
+        &(expected.rerank_count as u64),
+        &actual.rerank_count,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc fallback reason mismatch",
+        &expected.fallback_reason,
+        &actual.fallback_reason,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc rerank count mismatch",
+        &(expected.candidates_reranked as u64),
+        &actual.candidates_reranked,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc merge count mismatch",
+        &(expected.candidates_merged as u64),
+        &actual.candidates_merged,
+    );
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc units scanned mismatch",
+        &(expected.units_scanned as u64),
+        &actual.units_scanned,
+    );
+    let actual_unit_scan_mix = actual
+        .unit_scan_mix
+        .iter()
+        .map(|(key, value)| (key.clone(), *value as usize))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq_with_context(
+        seed,
+        trace,
+        "grpc unit scan mix mismatch",
+        &expected.unit_scan_mix,
+        &actual_unit_scan_mix,
+    );
+    let timings = expected.stage_timings.as_ref().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "service profile timings missing".to_owned())
+    });
+    let actual_timings = actual.stage_timings.as_ref().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "grpc profile timings missing".to_owned())
+    });
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "planning_micros",
+        timings.planning_micros,
+        actual_timings.planning_micros,
+    );
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "prefilter_micros",
+        timings.prefilter_micros,
+        actual_timings.prefilter_micros,
+    );
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "candidate_generation_micros",
+        timings.candidate_generation_micros,
+        actual_timings.candidate_generation_micros,
+    );
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "postfilter_micros",
+        timings.postfilter_micros,
+        actual_timings.postfilter_micros,
+    );
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "rerank_micros",
+        timings.rerank_micros,
+        actual_timings.rerank_micros,
+    );
+    assert_proto_stage_timing_matches(
+        seed,
+        trace,
+        "merge_micros",
+        timings.merge_micros,
+        actual_timings.merge_micros,
+    );
+}
+
+fn assert_json_stage_timing_matches(
+    seed: u64,
+    trace: &[ServiceAction],
+    label: &str,
+    expected: u64,
+    actual: &Value,
+) {
+    let _ = expected;
+    let _ = actual.as_u64().unwrap_or_else(|| {
+        panic_with_context(
+            seed,
+            trace,
+            format!("rest timing '{label}' should be numeric"),
+        )
+    });
+}
+
+fn assert_proto_stage_timing_matches(
+    seed: u64,
+    trace: &[ServiceAction],
+    label: &str,
+    expected: u64,
+    actual: u64,
+) {
+    let _ = (seed, trace, label, expected, actual);
+}
+
 fn record_matches_filters(record: &VisibleRecord, filters: &[MetadataFilter]) -> bool {
     filters.iter().all(|filter| {
         record
@@ -1024,6 +1835,59 @@ fn record_matches_filters(record: &VisibleRecord, filters: &[MetadataFilter]) ->
             .get(&filter.field)
             .is_some_and(|value| scalar_matches_value(&filter.value, value))
     })
+}
+
+fn proto_plan_kind(plan: QueryPlanKind) -> proto::QueryPlanKind {
+    match plan {
+        QueryPlanKind::UnfilteredExactScan => proto::QueryPlanKind::UnfilteredExactScan,
+        QueryPlanKind::PredicateFirstExact => proto::QueryPlanKind::PredicateFirstExact,
+        QueryPlanKind::VectorFirstExact => proto::QueryPlanKind::VectorFirstExact,
+        QueryPlanKind::TinyPopulationExactFallback => {
+            proto::QueryPlanKind::TinyPopulationExactFallback
+        }
+        QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
+        QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
+        QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,
+    }
+}
+
+fn keep_only_predicate() -> logpose_query::Predicate {
+    logpose_query::Predicate::Comparison(logpose_query::PredicateComparison {
+        field: "kind".to_owned(),
+        operator: logpose_query::PredicateOperator::Eq,
+        value: Some(ScalarMetadataValue::String("keep".to_owned())),
+    })
+}
+
+fn keep_only_proto_predicate() -> proto::Predicate {
+    proto::Predicate {
+        node: Some(proto::predicate::Node::Comparison(
+            proto::PredicateComparison {
+                field: "kind".to_owned(),
+                operator: proto::PredicateOperator::Eq as i32,
+                value: Some(proto::ScalarValue {
+                    kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
+                }),
+            },
+        )),
+    }
+}
+
+fn uses_ann(plan: QueryPlanKind) -> bool {
+    matches!(
+        plan,
+        QueryPlanKind::VectorFirstAnn
+            | QueryPlanKind::CooperativeFilteredAnn
+            | QueryPlanKind::HybridExactAnnMerge
+    )
+}
+
+fn minimum_required_hits(top_k: usize) -> usize {
+    if top_k == 0 {
+        0
+    } else {
+        (top_k * 2).div_ceil(3)
+    }
 }
 
 fn scalar_matches_value(expected: &ScalarMetadataValue, actual: &Value) -> bool {

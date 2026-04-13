@@ -12,8 +12,8 @@ use logpose_catalog as _;
 use logpose_config as _;
 use logpose_core as _;
 use logpose_query::{
-    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator, QueryRequest,
-    ScalarMetadataValue,
+    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind,
+    QueryRequest, ScalarMetadataValue,
 };
 use logpose_service::{LogPoseDataService, ServiceError};
 use logpose_storage::CreateCollectionRequest;
@@ -270,6 +270,12 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .await
         .expect("write should succeed");
 
+    state
+        .service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
     let predicate = Predicate::Comparison(PredicateComparison {
         field: "kind".to_owned(),
         operator: PredicateOperator::Eq,
@@ -352,20 +358,470 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
     assert_eq!(service_response.matches[0].id.as_str(), "gamma");
     assert_eq!(rest_body["matches"][0]["id"], "gamma");
     assert_eq!(grpc_response.matches[0].id, "gamma");
-    assert!(
-        service_response
-            .diagnostics
-            .as_ref()
-            .and_then(|diagnostics| diagnostics.stage_timings.as_ref())
-            .is_some()
+    let service_diagnostics = service_response
+        .diagnostics
+        .as_ref()
+        .expect("service diagnostics should be present");
+    let grpc_diagnostics = grpc_response
+        .diagnostics
+        .as_ref()
+        .expect("grpc diagnostics should be present");
+    assert_eq!(
+        service_diagnostics.chosen_plan,
+        QueryPlanKind::VectorFirstAnn
     );
+    assert_eq!(rest_body["diagnostics"]["chosen_plan"], "vector_first_ann");
+    assert_eq!(
+        proto::QueryPlanKind::try_from(grpc_diagnostics.chosen_plan)
+            .expect("chosen plan should decode"),
+        proto::QueryPlanKind::VectorFirstAnn
+    );
+    assert_eq!(
+        service_diagnostics.candidates_reranked as u64,
+        rest_body["diagnostics"]["candidates_reranked"]
+            .as_u64()
+            .expect("rest rerank count should be numeric")
+    );
+    assert_eq!(
+        service_diagnostics.candidates_merged as u64,
+        rest_body["diagnostics"]["candidates_merged"]
+            .as_u64()
+            .expect("rest merge count should be numeric")
+    );
+    assert_eq!(
+        service_diagnostics.candidates_reranked as u64,
+        grpc_diagnostics.candidates_reranked
+    );
+    assert_eq!(
+        service_diagnostics.candidates_merged as u64,
+        grpc_diagnostics.candidates_merged
+    );
+    assert_eq!(service_diagnostics.fallback_reason, None);
+    assert_eq!(rest_body["diagnostics"]["fallback_reason"], Value::Null);
+    assert_eq!(grpc_diagnostics.fallback_reason, None);
+    assert_eq!(
+        service_diagnostics
+            .unit_scan_mix
+            .get("immutable_ann")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(
+        rest_body["diagnostics"]["unit_scan_mix"]["immutable_ann"],
+        Value::from(1)
+    );
+    assert_eq!(
+        grpc_diagnostics.unit_scan_mix.get("immutable_ann"),
+        Some(&1)
+    );
+    let service_timings = service_diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("service timings should be present");
+    assert!(service_timings.planning_micros > 0);
+    assert!(service_timings.candidate_generation_micros > 0);
+    assert!(service_timings.rerank_micros > 0);
     assert!(rest_body["diagnostics"]["stage_timings"].is_object());
     assert!(
-        grpc_response
-            .diagnostics
-            .as_ref()
-            .and_then(|diagnostics| diagnostics.stage_timings.as_ref())
+        rest_body["diagnostics"]["stage_timings"]["planning_micros"]
+            .as_u64()
             .is_some()
+    );
+    assert!(
+        rest_body["diagnostics"]["stage_timings"]["prefilter_micros"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        rest_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        rest_body["diagnostics"]["stage_timings"]["postfilter_micros"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        rest_body["diagnostics"]["stage_timings"]["rerank_micros"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(
+        rest_body["diagnostics"]["stage_timings"]["merge_micros"]
+            .as_u64()
+            .is_some()
+    );
+    let grpc_timings = grpc_diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("grpc timings should be present");
+    assert!(grpc_timings.planning_micros > 0);
+    assert!(grpc_timings.candidate_generation_micros > 0);
+    assert!(grpc_timings.rerank_micros > 0);
+}
+
+#[tokio::test]
+async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
+    let state = Arc::new(logpose_core::AppState::new(test_config(
+        "service-cooperative-filtered-ann",
+    )));
+    let rest = logpose_api_rest::router(Arc::clone(&state));
+    let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
+
+    state
+        .service
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let operations = (0..12)
+        .map(|index| {
+            let kind = if index % 4 == 0 { "keep" } else { "drop" };
+            WriteOperation::Put(PutRecord {
+                id: RecordId::new(format!("doc-{index}")),
+                vector: vec![index as f32 + 1.0, 0.0],
+                metadata: json!({"kind":kind,"version":index}),
+            })
+        })
+        .collect::<Vec<_>>();
+    state
+        .service
+        .write("documents", operations)
+        .await
+        .expect("write should succeed");
+    state
+        .service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let predicate = Predicate::Comparison(PredicateComparison {
+        field: "kind".to_owned(),
+        operator: PredicateOperator::Eq,
+        value: Some(ScalarMetadataValue::String("keep".to_owned())),
+    });
+
+    let service_response = state
+        .service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: Some(predicate.clone()),
+            explain: ExplainMode::Profile,
+        })
+        .await
+        .expect("service query should succeed");
+    let rest_response = rest
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/collections/documents/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "vector": [1.0, 0.0],
+                        "top_k": 2,
+                        "predicate": {
+                            "kind": "comparison",
+                            "field": "kind",
+                            "operator": "eq",
+                            "value": "keep"
+                        },
+                        "explain": "profile"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("rest query should respond");
+    let rest_body = serde_json::from_slice::<Value>(
+        &rest_response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes(),
+    )
+    .expect("body should be json");
+    let grpc_response = grpc
+        .query_collection(Request::new(proto::QueryCollectionRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: Some(proto::Predicate {
+                node: Some(proto::predicate::Node::Comparison(
+                    proto::PredicateComparison {
+                        field: "kind".to_owned(),
+                        operator: proto::PredicateOperator::Eq as i32,
+                        value: Some(proto::ScalarValue {
+                            kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
+                        }),
+                    },
+                )),
+            }),
+            explain: proto::ExplainMode::Profile as i32,
+        }))
+        .await
+        .expect("grpc query should succeed")
+        .into_inner();
+
+    assert_eq!(
+        service_response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["doc-8", "doc-4"]
+    );
+    assert_eq!(
+        rest_body["matches"]
+            .as_array()
+            .expect("rest matches should be an array")
+            .iter()
+            .map(|candidate| candidate["id"].as_str().expect("id should be string"))
+            .collect::<Vec<_>>(),
+        vec!["doc-8", "doc-4"]
+    );
+    assert_eq!(
+        grpc_response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["doc-8", "doc-4"]
+    );
+    let diagnostics = service_response
+        .diagnostics
+        .as_ref()
+        .expect("service diagnostics should be present");
+    assert_eq!(
+        diagnostics.chosen_plan,
+        QueryPlanKind::CooperativeFilteredAnn
+    );
+    assert_eq!(
+        diagnostics.planner_reason,
+        "filtered ann traversal is cheaper than exact scan for this selectivity"
+    );
+    assert!((diagnostics.estimated_selectivity - 0.25).abs() <= f32::EPSILON);
+    assert_eq!(diagnostics.units_considered, 2);
+    assert_eq!(diagnostics.units_pruned, 0);
+    assert_eq!(diagnostics.units_scanned, 1);
+    assert!(diagnostics.candidates_before_filter >= service_response.returned);
+    assert!(diagnostics.candidates_after_filter >= service_response.returned);
+    assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
+    assert_eq!(
+        diagnostics.candidates_reranked,
+        diagnostics.candidates_merged
+    );
+    assert!(diagnostics.candidates_reranked >= service_response.returned);
+    assert_eq!(diagnostics.rerank_count, 1);
+    assert_eq!(
+        rest_body["diagnostics"]["chosen_plan"],
+        "cooperative_filtered_ann"
+    );
+    assert_eq!(
+        proto::QueryPlanKind::try_from(
+            grpc_response
+                .diagnostics
+                .as_ref()
+                .expect("grpc diagnostics should be present")
+                .chosen_plan
+        )
+        .expect("chosen plan should decode"),
+        proto::QueryPlanKind::CooperativeFilteredAnn
+    );
+    let grpc_diagnostics = grpc_response
+        .diagnostics
+        .as_ref()
+        .expect("grpc diagnostics should be present");
+    assert_eq!(
+        diagnostics.planner_reason,
+        rest_body["diagnostics"]["planner_reason"]
+            .as_str()
+            .expect("rest planner reason should be a string")
+    );
+    assert!(
+        (diagnostics.estimated_selectivity
+            - rest_body["diagnostics"]["estimated_selectivity"]
+                .as_f64()
+                .expect("rest selectivity should be numeric") as f32)
+            .abs()
+            <= f32::EPSILON
+    );
+    assert_eq!(
+        diagnostics.units_considered as u64,
+        rest_body["diagnostics"]["units_considered"]
+            .as_u64()
+            .expect("rest units considered should be numeric")
+    );
+    assert_eq!(
+        diagnostics.units_pruned as u64,
+        rest_body["diagnostics"]["units_pruned"]
+            .as_u64()
+            .expect("rest units pruned should be numeric")
+    );
+    assert_eq!(
+        diagnostics.units_scanned as u64,
+        rest_body["diagnostics"]["units_scanned"]
+            .as_u64()
+            .expect("rest units scanned should be numeric")
+    );
+    assert_eq!(
+        diagnostics.candidates_before_filter as u64,
+        rest_body["diagnostics"]["candidates_before_filter"]
+            .as_u64()
+            .expect("rest candidate count should be numeric")
+    );
+    assert_eq!(
+        diagnostics.candidates_after_filter as u64,
+        rest_body["diagnostics"]["candidates_after_filter"]
+            .as_u64()
+            .expect("rest filtered candidate count should be numeric")
+    );
+    assert_eq!(
+        diagnostics.candidates_reranked as u64,
+        rest_body["diagnostics"]["candidates_reranked"]
+            .as_u64()
+            .expect("rest rerank count should be numeric")
+    );
+    assert_eq!(
+        diagnostics.candidates_merged as u64,
+        rest_body["diagnostics"]["candidates_merged"]
+            .as_u64()
+            .expect("rest merge count should be numeric")
+    );
+    assert_eq!(
+        diagnostics.candidates_reranked as u64,
+        grpc_diagnostics.candidates_reranked
+    );
+    assert_eq!(
+        diagnostics.candidates_merged as u64,
+        grpc_diagnostics.candidates_merged
+    );
+    assert_eq!(
+        diagnostics.rerank_count as u64,
+        grpc_diagnostics.rerank_count
+    );
+    assert_eq!(diagnostics.planner_reason, grpc_diagnostics.planner_reason);
+    assert!(
+        (diagnostics.estimated_selectivity - grpc_diagnostics.estimated_selectivity).abs()
+            <= f32::EPSILON
+    );
+    assert_eq!(
+        diagnostics.units_considered as u64,
+        grpc_diagnostics.units_considered
+    );
+    assert_eq!(
+        diagnostics.units_pruned as u64,
+        grpc_diagnostics.units_pruned
+    );
+    assert_eq!(
+        diagnostics.units_scanned as u64,
+        grpc_diagnostics.units_scanned
+    );
+    assert_eq!(
+        diagnostics.candidates_before_filter as u64,
+        grpc_diagnostics.candidates_before_filter
+    );
+    assert_eq!(
+        diagnostics.candidates_after_filter as u64,
+        grpc_diagnostics.candidates_after_filter
+    );
+    assert_eq!(diagnostics.fallback_reason, None);
+    assert_eq!(rest_body["diagnostics"]["fallback_reason"], Value::Null);
+    assert_eq!(grpc_diagnostics.fallback_reason, None);
+    assert_eq!(
+        diagnostics.unit_scan_mix.get("immutable_ann").copied(),
+        Some(1)
+    );
+    assert_eq!(
+        rest_body["diagnostics"]["unit_scan_mix"]["immutable_ann"],
+        Value::from(1)
+    );
+    assert_eq!(
+        grpc_diagnostics.unit_scan_mix.get("immutable_ann"),
+        Some(&1)
+    );
+    let service_timings = diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("service timings should be present");
+    let rest_timings = &rest_body["diagnostics"]["stage_timings"];
+    assert_eq!(
+        service_timings.planning_micros > 0,
+        rest_timings["planning_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    assert_eq!(
+        service_timings.prefilter_micros > 0,
+        rest_timings["prefilter_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    assert_eq!(
+        service_timings.candidate_generation_micros > 0,
+        rest_timings["candidate_generation_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    assert_eq!(
+        service_timings.postfilter_micros > 0,
+        rest_timings["postfilter_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    assert_eq!(
+        service_timings.rerank_micros > 0,
+        rest_timings["rerank_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    assert_eq!(
+        service_timings.merge_micros > 0,
+        rest_timings["merge_micros"]
+            .as_u64()
+            .is_some_and(|micros| micros > 0)
+    );
+    let grpc_timings = grpc_diagnostics
+        .stage_timings
+        .as_ref()
+        .expect("grpc timings should be present");
+    assert_eq!(
+        service_timings.planning_micros > 0,
+        grpc_timings.planning_micros > 0
+    );
+    assert_eq!(
+        service_timings.prefilter_micros > 0,
+        grpc_timings.prefilter_micros > 0
+    );
+    assert_eq!(
+        service_timings.candidate_generation_micros > 0,
+        grpc_timings.candidate_generation_micros > 0
+    );
+    assert_eq!(
+        service_timings.postfilter_micros > 0,
+        grpc_timings.postfilter_micros > 0
+    );
+    assert_eq!(
+        service_timings.rerank_micros > 0,
+        grpc_timings.rerank_micros > 0
+    );
+    assert_eq!(
+        service_timings.merge_micros > 0,
+        grpc_timings.merge_micros > 0
     );
 }
 

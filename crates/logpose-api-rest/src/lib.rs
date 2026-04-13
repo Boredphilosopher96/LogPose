@@ -239,13 +239,105 @@ mod tests {
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use logpose_config::LogPoseConfig;
+    use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
+    use logpose_types::RecordId;
     use serde_json::{Value, json};
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
     use tower::util::ServiceExt;
+
+    #[test]
+    fn query_response_serializes_ann_diagnostics_fields() {
+        let payload = serde_json::to_value(QueryResponse {
+            metric: DistanceMetric::Dot,
+            top_k: 2,
+            returned: 1,
+            snapshot: Snapshot {
+                manifest_generation: 7,
+                visible_seq_no: 11,
+            },
+            matches: vec![logpose_query::QueryMatch {
+                id: RecordId::new("alpha"),
+                value: 42.0,
+                metadata: json!({"kind":"keep"}),
+            }],
+            diagnostics: Some(QueryDiagnostics {
+                chosen_plan: QueryPlanKind::CooperativeFilteredAnn,
+                planner_reason:
+                    "filtered ann traversal is cheaper than exact scan for this selectivity"
+                        .to_owned(),
+                estimated_selectivity: 0.25,
+                units_considered: 2,
+                units_pruned: 1,
+                units_scanned: 1,
+                candidates_before_filter: 17,
+                candidates_after_filter: 13,
+                candidates_reranked: 7,
+                candidates_merged: 5,
+                rerank_count: 1,
+                fallback_reason: Some("fallback".to_owned()),
+                unit_scan_mix: BTreeMap::from([
+                    ("immutable_ann".to_owned(), 1),
+                    ("mutable_exact".to_owned(), 2),
+                ]),
+                stage_timings: Some(QueryStageTimings {
+                    planning_micros: 11,
+                    prefilter_micros: 22,
+                    candidate_generation_micros: 33,
+                    postfilter_micros: 44,
+                    rerank_micros: 55,
+                    merge_micros: 66,
+                }),
+            }),
+        })
+        .expect("query response should serialize");
+
+        assert_eq!(
+            payload["diagnostics"]["chosen_plan"],
+            "cooperative_filtered_ann"
+        );
+        assert_eq!(
+            payload["diagnostics"]["planner_reason"],
+            "filtered ann traversal is cheaper than exact scan for this selectivity"
+        );
+        assert_eq!(
+            payload["diagnostics"]["estimated_selectivity"],
+            Value::from(0.25)
+        );
+        assert_eq!(payload["diagnostics"]["units_considered"], 2);
+        assert_eq!(payload["diagnostics"]["units_pruned"], 1);
+        assert_eq!(payload["diagnostics"]["units_scanned"], 1);
+        assert_eq!(payload["diagnostics"]["candidates_before_filter"], 17);
+        assert_eq!(payload["diagnostics"]["candidates_after_filter"], 13);
+        assert_eq!(payload["diagnostics"]["candidates_reranked"], 7);
+        assert_eq!(payload["diagnostics"]["candidates_merged"], 5);
+        assert_eq!(payload["diagnostics"]["rerank_count"], 1);
+        assert_eq!(payload["diagnostics"]["fallback_reason"], "fallback");
+        assert_eq!(payload["diagnostics"]["unit_scan_mix"]["immutable_ann"], 1);
+        assert_eq!(payload["diagnostics"]["unit_scan_mix"]["mutable_exact"], 2);
+        assert_eq!(
+            payload["diagnostics"]["stage_timings"]["planning_micros"],
+            11
+        );
+        assert_eq!(
+            payload["diagnostics"]["stage_timings"]["prefilter_micros"],
+            22
+        );
+        assert_eq!(
+            payload["diagnostics"]["stage_timings"]["candidate_generation_micros"],
+            33
+        );
+        assert_eq!(
+            payload["diagnostics"]["stage_timings"]["postfilter_micros"],
+            44
+        );
+        assert_eq!(payload["diagnostics"]["stage_timings"]["rerank_micros"], 55);
+        assert_eq!(payload["diagnostics"]["stage_timings"]["merge_micros"], 66);
+    }
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
@@ -881,10 +973,55 @@ mod tests {
             "predicate_first_exact"
         );
         assert!(
+            query_body["diagnostics"]["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        assert!(
+            query_body["diagnostics"]["candidates_reranked"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(
+            query_body["diagnostics"]["candidates_merged"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(
+            query_body["diagnostics"]["unit_scan_mix"]["mutable_exact"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(
             query_body["diagnostics"]["stage_timings"]["planning_micros"]
                 .as_u64()
                 .is_some(),
             "profile mode should include stage timings"
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["prefilter_micros"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["postfilter_micros"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["rerank_micros"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            query_body["diagnostics"]["stage_timings"]["merge_micros"]
+                .as_u64()
+                .is_some()
         );
     }
 
