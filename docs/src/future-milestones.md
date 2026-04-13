@@ -60,7 +60,7 @@ The phase pages refer to logical components rather than only one specific file o
 | ~~1. Local Database Core~~ | ~~Finish the single-node exact-search database contract~~ | ~~Crisp APIs, explicit visibility rules, operator-ready workflows~~ | ~~Broaden unit, integration, and seeded generative harnesses~~ | ~~[Phase 1](./future-milestones/phase-1-local-database-core.md)~~ |
 | ~~2. Write-Friendly Storage~~ | ~~Move from simple local durability to a real mutable plus immutable storage model~~ | ~~Delta tier, tombstone-aware merge, compaction planning, richer storage stats~~ | ~~Add fuzz/property tests for WAL, manifests, and storage metadata~~ | ~~[Phase 2](./future-milestones/phase-2-write-friendly-storage.md)~~ |
 | ~~3. Query Planning~~ | ~~Move from handcrafted exact query execution to plan-directed retrieval~~ | ~~Planner statistics, explain surfaces, scalar plus vector path selection~~ | ~~Planner oracles, explain snapshots, richer generative query scenarios~~ | ~~[Phase 3](./future-milestones/phase-3-query-planning.md)~~ |
-| 4. ANN and Hybrid Execution | Add ANN as a physical operator family under planner control | Exact and ANN hybrid execution with filtered retrieval strategies | Exact-vs-ANN correctness checks, codec fuzzing, benchmark discipline | [Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md) |
+| ~~4. ANN and Hybrid Execution~~ | ~~Add ANN as a physical operator family under planner control~~ | ~~Exact and ANN hybrid execution with filtered retrieval strategies~~ | ~~Exact-vs-ANN correctness checks, codec fuzzing, benchmark discipline~~ | ~~[Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md)~~ |
 | 5. Distribution and Operations | Grow from single-node engine to service platform | Cluster/runtime boundaries, placement, remote storage, operational control | Deterministic multi-component and fault-oriented harnesses | [Phase 5](./future-milestones/phase-5-distribution-and-operations.md) |
 | 6. Mature Platform | Finish the system and harden the end-state architecture | Planner-led retrieval database with mature operations and disciplined research extensions | Full testing ladder active, including simulation-heavy system validation | [Phase 6](./future-milestones/phase-6-mature-platform.md) |
 
@@ -83,4 +83,4 @@ Use the roadmap in two passes:
 
 If future design work changes the end-state architecture, update [Better Vector DB Architecture](./better-vector-db.md) first, then realign these milestones to match.
 
-**Done marker:** Phases 1, 2, and 3 are complete and the documents on this page now reflect that status.
+**Done marker:** Phases 1, 2, 3, and 4 are complete and the documents on this page now reflect that status.

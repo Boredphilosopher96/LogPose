@@ -1,4 +1,6 @@
-# Phase 4: ANN and Hybrid Execution
+# ~~Phase 4: ANN and Hybrid Execution~~
+
+**Done marker:** Phase 4 is complete.
 
 ## Goal
 
@@ -36,13 +38,17 @@ ANN belongs here as a physical operator family alongside:
 - memory accounting is good enough to explain where vector execution cost lives
 - operator-facing explain output shows how filters, candidate generation, rerank, and merge contributed to query cost
 
+## Status
+
+Phase 4 is done.
+
 ## Testing Direction
 
-This phase should add verification layers that keep ANN honest:
+This phase added verification layers that keep ANN honest:
 
 - exact-vs-ANN comparison tests for correctness envelopes and recall guardrails
 - targeted regression suites for filtered ANN behavior at different selectivity ranges
-- fuzzing and property tests for index codecs, metadata payloads, and candidate-merging logic
+- corruption and property-style tests for index codecs, metadata payloads, and candidate-merging logic
 - benchmark suites that are reproducible enough to detect planner or layout regressions
 - service-level harness scenarios where planner choices move between exact and ANN paths under controlled inputs
 
@@ -50,6 +56,8 @@ The goal is disciplined hybrid retrieval, not just faster demos.
 
 ## What This Unlocks
 
-Once hybrid execution is planner-directed and observable, LogPose is in position to scale the runtime outward.
+Hybrid execution is now planner-directed and observable, with HNSW sidecars published for immutable units, ANN-aware diagnostics exposed through REST, gRPC, client, and CLI surfaces, and deterministic benchmarks living beside the query crate.
+
+That puts LogPose in position to scale the runtime outward.
 
 That makes Phase 5 about service architecture, orchestration, and fault handling rather than still trying to settle the storage and execution contract.
