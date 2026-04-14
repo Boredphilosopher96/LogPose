@@ -823,8 +823,11 @@ dependencies = [
 name = "logpose-core"
 version = "0.1.0"
 dependencies = [
+ "logpose-catalog",
  "logpose-config",
+ "logpose-query",
  "logpose-service",
+ "logpose-storage",
  "logpose-types",
  "serde",
 ]
@@ -871,6 +874,7 @@ dependencies = [
 name = "logpose-service"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "http-body-util",
  "logpose-api-grpc",

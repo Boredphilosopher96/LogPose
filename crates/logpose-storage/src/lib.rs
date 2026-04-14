@@ -14,9 +14,10 @@ use logpose_index::{
     write_flat_index, write_hnsw_index,
 };
 use logpose_types::{
-    AnnCandidate, AnnSearchRequest, CollectionStats, CommitAck, DistanceMetric, LogPoseError,
-    MaintenanceStatus, PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result,
-    ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionStats, CommitAck,
+    DistanceMetric, LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats,
+    QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
 use serde::{Deserialize, Serialize};
@@ -48,8 +49,39 @@ pub trait StorageEngine: Send + Sync {
         request: CreateCollectionRequest,
     ) -> Result<CollectionDescriptor>;
 
+    /// Create a collection and persist its initial placement assignment.
+    async fn create_collection_with_assignment(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+    ) -> Result<CollectionDescriptor> {
+        let _ = request;
+        let _ = assignment;
+        Err(LogPoseError::Message(
+            "persisted collection assignments are not supported by this storage engine".to_owned(),
+        ))
+    }
+
     /// Open an existing collection by name.
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor>;
+
+    /// List every known collection descriptor.
+    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        Err(LogPoseError::Message(
+            "listing collections is not supported by this storage engine".to_owned(),
+        ))
+    }
+
+    /// Load the persisted placement assignment for a collection descriptor.
+    async fn collection_assignment_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        let _ = descriptor;
+        Err(LogPoseError::Message(
+            "persisted collection assignments are not supported by this storage engine".to_owned(),
+        ))
+    }
 
     /// Persist one or more write operations durably.
     async fn write(
@@ -160,6 +192,33 @@ pub trait StorageEngine: Send + Sync {
 
     /// Return collection-level visibility and storage statistics.
     async fn stats(&self, collection_name: &str) -> Result<CollectionStats>;
+
+    /// Return collection-level statistics using a previously loaded descriptor.
+    async fn stats_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let _ = snapshot;
+        self.stats(&descriptor.name).await
+    }
+
+    /// Return persisted maintenance state without reconstructing full collection stats.
+    async fn maintenance_status_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        Ok(self.stats_descriptor(descriptor, None).await?.maintenance)
+    }
+
+    /// Resume persisted maintenance state for a descriptor when the runtime can serve it locally.
+    async fn recover_maintenance_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<()> {
+        let _ = descriptor;
+        Ok(())
+    }
 
     /// Return collection-level statistics for a specific read snapshot.
     async fn stats_snapshot(
@@ -274,6 +333,10 @@ impl LocalStorageEngine {
         descriptor.root_path.join("maintenance.json")
     }
 
+    fn placement_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("placement.json")
+    }
+
     fn current_manifest_pointer(descriptor: &CollectionDescriptor) -> PathBuf {
         descriptor.root_path.join("CURRENT")
     }
@@ -282,12 +345,81 @@ impl LocalStorageEngine {
         descriptor.root_path.join("descriptor.json")
     }
 
+    fn load_collection_assignment(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        let path = Self::placement_file_path(descriptor);
+        if !path.exists() {
+            return Err(LogPoseError::Message(format!(
+                "collection '{}' is missing placement metadata",
+                descriptor.name
+            )));
+        }
+        read_json(&path)
+    }
+
+    fn persist_collection_assignment(
+        &self,
+        descriptor: &CollectionDescriptor,
+        assignment: &CollectionAssignment,
+    ) -> Result<()> {
+        atomic_write(
+            &Self::placement_file_path(descriptor),
+            serde_json::to_vec_pretty(assignment).map_err(json_message)?,
+        )
+    }
+
+    fn create_collection_internal(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: Option<&CollectionAssignment>,
+    ) -> Result<CollectionDescriptor> {
+        fs::create_dir_all(self.collections_root())
+            .map_err(|error| io_message("failed to create collections root", error))?;
+        if self.find_collection_descriptor(&request.name).is_ok() {
+            return Err(LogPoseError::Message(format!(
+                "collection '{}' already exists",
+                request.name
+            )));
+        }
+
+        let descriptor = CollectionDescriptor::new(
+            request.name,
+            request.dimensions,
+            request.metric,
+            self.collections_root(),
+        );
+        descriptor.validate()?;
+        self.create_collection_directories(&descriptor)?;
+        if let Some(assignment) = assignment {
+            self.persist_collection_assignment(&descriptor, assignment)?;
+        }
+        self.publish_manifest(&descriptor, &Manifest::empty(0))?;
+        self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
+        let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
+        wal_writer.truncate()?;
+        atomic_write(
+            &Self::descriptor_path(&descriptor),
+            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
+        )?;
+        Ok(descriptor)
+    }
+
     fn load_collection_state(
         &self,
         collection_name: &str,
         manifest_generation: Option<u64>,
     ) -> Result<CollectionState> {
         let descriptor = self.find_collection_descriptor(collection_name)?;
+        self.load_collection_state_descriptor(descriptor, manifest_generation)
+    }
+
+    fn load_collection_state_descriptor(
+        &self,
+        descriptor: CollectionDescriptor,
+        manifest_generation: Option<u64>,
+    ) -> Result<CollectionState> {
         self.recover_persisted_maintenance(&descriptor)?;
         let manifest = self.load_manifest(&descriptor, manifest_generation)?;
         let delta = replay_dir(descriptor.root_path.join("wal"))?
@@ -339,6 +471,72 @@ impl LocalStorageEngine {
         Err(LogPoseError::Message(format!(
             "collection '{name}' does not exist"
         )))
+    }
+
+    fn list_collection_descriptors(&self) -> Result<Vec<CollectionDescriptor>> {
+        let collections_root = self.collections_root();
+        if !collections_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut descriptors = Vec::new();
+        for entry in fs::read_dir(&collections_root)
+            .map_err(|error| io_message("failed to list collections root", error))?
+        {
+            let entry =
+                entry.map_err(|error| io_message("failed to read collection entry", error))?;
+            let path = entry.path().join("descriptor.json");
+            if !path.exists() {
+                continue;
+            }
+
+            let descriptor = read_json::<CollectionDescriptor>(&path)?;
+            descriptor.validate()?;
+            descriptors.push(descriptor);
+        }
+
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors)
+    }
+
+    fn collection_stats_from_state(
+        &self,
+        state: CollectionState,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let effective_snapshot = resolve_snapshot(&state, snapshot)?;
+        let resolved =
+            resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
+        let mut live_record_count = 0usize;
+        let mut deleted_record_count = 0usize;
+        for value in resolved.values() {
+            match value {
+                ResolvedState::Visible(_) => live_record_count += 1,
+                ResolvedState::Deleted { .. } => deleted_record_count += 1,
+            }
+        }
+        let maintenance = self.load_maintenance_status(&state.descriptor)?;
+        let delta_records = state
+            .delta
+            .iter()
+            .filter(|record| record.seq_no <= effective_snapshot.visible_seq_no)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut query_units = vec![mutable_query_unit(&delta_records)];
+        query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
+
+        Ok(CollectionStats {
+            collection_id: state.descriptor.collection_id.clone(),
+            collection_name: state.descriptor.name.clone(),
+            manifest_generation: effective_snapshot.manifest_generation,
+            visible_seq_no: effective_snapshot.visible_seq_no,
+            mutable_op_count: delta_records.len(),
+            segment_count: state.manifest.segments.len(),
+            live_record_count,
+            deleted_record_count,
+            maintenance,
+            query_units,
+        })
     }
 
     fn load_manifest(
@@ -1006,37 +1204,36 @@ impl StorageEngine for LocalStorageEngine {
         &self,
         request: CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
-        fs::create_dir_all(self.collections_root())
-            .map_err(|error| io_message("failed to create collections root", error))?;
-        if self.find_collection_descriptor(&request.name).is_ok() {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}' already exists",
-                request.name
-            )));
-        }
+        self.create_collection_internal(
+            request,
+            Some(&CollectionAssignment {
+                assigned_node: "local".to_owned(),
+                assigned_role: NodeRole::Data,
+            }),
+        )
+    }
 
-        let descriptor = CollectionDescriptor::new(
-            request.name,
-            request.dimensions,
-            request.metric,
-            self.collections_root(),
-        );
-        self.create_collection_directories(&descriptor)?;
-        atomic_write(
-            &Self::descriptor_path(&descriptor),
-            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-        )?;
-        self.publish_manifest(&descriptor, &Manifest::empty(0))?;
-        self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
-        let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
-        wal_writer.truncate()?;
-        Ok(descriptor)
+    async fn create_collection_with_assignment(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+    ) -> Result<CollectionDescriptor> {
+        self.create_collection_internal(request, Some(&assignment))
     }
 
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        let descriptor = self.find_collection_descriptor(name)?;
-        self.recover_persisted_maintenance(&descriptor)?;
-        Ok(descriptor)
+        self.find_collection_descriptor(name)
+    }
+
+    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.list_collection_descriptors()
+    }
+
+    async fn collection_assignment_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        Ok(self.load_collection_assignment(descriptor)?)
     }
 
     async fn write(
@@ -1239,6 +1436,32 @@ impl StorageEngine for LocalStorageEngine {
         self.stats_snapshot(collection_name, None).await
     }
 
+    async fn stats_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let state = self.load_collection_state_descriptor(
+            descriptor.clone(),
+            snapshot.as_ref().map(|value| value.manifest_generation),
+        )?;
+        self.collection_stats_from_state(state, snapshot)
+    }
+
+    async fn maintenance_status_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        self.load_maintenance_status(descriptor)
+    }
+
+    async fn recover_maintenance_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<()> {
+        self.recover_persisted_maintenance(descriptor)
+    }
+
     async fn stats_snapshot(
         &self,
         collection_name: &str,
@@ -1248,39 +1471,7 @@ impl StorageEngine for LocalStorageEngine {
             collection_name,
             snapshot.as_ref().map(|value| value.manifest_generation),
         )?;
-        let effective_snapshot = resolve_snapshot(&state, snapshot)?;
-        let resolved =
-            resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
-        let mut live_record_count = 0usize;
-        let mut deleted_record_count = 0usize;
-        for value in resolved.values() {
-            match value {
-                ResolvedState::Visible(_) => live_record_count += 1,
-                ResolvedState::Deleted { .. } => deleted_record_count += 1,
-            }
-        }
-        let maintenance = self.load_maintenance_status(&state.descriptor)?;
-        let delta_records = state
-            .delta
-            .iter()
-            .filter(|record| record.seq_no <= effective_snapshot.visible_seq_no)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut query_units = vec![mutable_query_unit(&delta_records)];
-        query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
-
-        Ok(CollectionStats {
-            collection_id: state.descriptor.collection_id.clone(),
-            collection_name: state.descriptor.name.clone(),
-            manifest_generation: effective_snapshot.manifest_generation,
-            visible_seq_no: effective_snapshot.visible_seq_no,
-            mutable_op_count: delta_records.len(),
-            segment_count: state.manifest.segments.len(),
-            live_record_count,
-            deleted_record_count,
-            maintenance,
-            query_units,
-        })
+        self.collection_stats_from_state(state, snapshot)
     }
 
     async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport> {

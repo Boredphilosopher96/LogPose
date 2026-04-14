@@ -174,6 +174,7 @@ fn run_cli_without_assert<const N: usize>(
     args: [&str; N],
 ) -> std::process::Output {
     let config = r#"node_name = "cli-test"
+node_role = "combined"
 rest_host = "127.0.0.1"
 rest_port = 18080
 grpc_host = "127.0.0.1"

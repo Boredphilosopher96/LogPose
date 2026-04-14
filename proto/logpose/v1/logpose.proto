@@ -4,8 +4,10 @@ package logpose.v1;
 
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
+  rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
+  rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
   rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
@@ -22,6 +24,44 @@ message GetMetadataReply {
   string version = 3;
   string git_sha = 4;
   string profile = 5;
+}
+
+message GetRuntimeStatusRequest {}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_COMBINED = 1;
+  NODE_ROLE_CONTROL = 2;
+  NODE_ROLE_DATA = 3;
+}
+
+message MaintenanceBacklogReply {
+  uint64 collections_with_pending = 1;
+  uint64 pending_operations = 2;
+  uint64 collections_in_progress = 3;
+  uint64 collections_with_errors = 4;
+}
+
+message CollectionPlacementReply {
+  string collection_id = 1;
+  string collection_name = 2;
+  string assigned_node = 3;
+  NodeRole assigned_role = 4;
+  string route_kind = 5;
+  string route_reason = 6;
+}
+
+message GetRuntimeStatusReply {
+  GetMetadataReply metadata = 1;
+  NodeRole role = 2;
+  string rest_endpoint = 3;
+  string grpc_endpoint = 4;
+  string storage_engine = 5;
+  bool control_plane_ready = 6;
+  bool data_plane_ready = 7;
+  uint64 collection_count = 8;
+  repeated CollectionPlacementReply collections = 9;
+  MaintenanceBacklogReply maintenance = 10;
 }
 
 message RemoteBlobConfig {
@@ -44,6 +84,10 @@ message CreateCollectionRequest {
 }
 
 message GetCollectionRequest {
+  string collection_name = 1;
+}
+
+message GetCollectionPlacementRequest {
   string collection_name = 1;
 }
 

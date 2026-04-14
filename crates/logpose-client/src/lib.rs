@@ -1,9 +1,10 @@
 //! gRPC-backed client helpers for LogPose operator workflows.
 
 use logpose_api_grpc::proto::{
-    self, CollectionDescriptorReply, CompactCollectionRequest,
+    self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
     CreateCollectionRequest as ProtoCreateCollectionRequest, FlushCollectionRequest,
-    GetCollectionRequest, GetCollectionStatsRequest, GetMetadataRequest, InspectCollectionRequest,
+    GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
+    GetMetadataRequest, GetRuntimeStatusRequest, InspectCollectionRequest, MaintenanceBacklogReply,
     QueryCollectionRequest, ScalarValue, WriteCollectionRequest,
     log_pose_service_client::LogPoseServiceClient,
 };
@@ -19,9 +20,9 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus,
-    NodeMetadata, QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot,
-    WriteOperation,
+    CollectionId, CollectionPlacement, CollectionStats, CommitAck, DistanceMetric, LogPoseError,
+    MaintenanceBacklog, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
+    QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -99,6 +100,17 @@ impl LogPoseClient {
         })
     }
 
+    /// Fetch runtime and maintenance status from the control plane.
+    pub async fn runtime_status(&self) -> Result<NodeRuntimeStatus> {
+        let response = self
+            .inner
+            .clone()
+            .get_runtime_status(Request::new(GetRuntimeStatusRequest {}))
+            .await?
+            .into_inner();
+        runtime_status_from_proto(response)
+    }
+
     /// Create a collection through the shared service contract.
     pub async fn create_collection(
         &self,
@@ -115,6 +127,19 @@ impl LogPoseClient {
             .await?
             .into_inner();
         collection_descriptor_from_proto(response)
+    }
+
+    /// Fetch placement metadata for one collection.
+    pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
+        let response = self
+            .inner
+            .clone()
+            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
+                collection_name: collection_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        collection_placement_from_proto(response)
     }
 
     /// Fetch collection metadata by name.
@@ -295,10 +320,65 @@ fn collection_descriptor_from_proto(
     })
 }
 
+fn runtime_status_from_proto(reply: proto::GetRuntimeStatusReply) -> Result<NodeRuntimeStatus> {
+    let metadata = reply.metadata.ok_or_else(|| {
+        ClientError::InvalidResponse("runtime status missing metadata".to_owned())
+    })?;
+
+    Ok(NodeRuntimeStatus {
+        metadata: NodeMetadata {
+            product: metadata.product,
+            node_name: metadata.node_name,
+            version: metadata.version,
+            git_sha: metadata.git_sha,
+            profile: metadata.profile,
+        },
+        role: node_role_from_proto(reply.role)?,
+        rest_endpoint: reply.rest_endpoint,
+        grpc_endpoint: reply.grpc_endpoint,
+        storage_engine: reply.storage_engine,
+        control_plane_ready: reply.control_plane_ready,
+        data_plane_ready: reply.data_plane_ready,
+        collection_count: reply.collection_count as usize,
+        collections: reply
+            .collections
+            .into_iter()
+            .map(collection_placement_from_proto)
+            .collect::<Result<Vec<_>>>()?,
+        maintenance: maintenance_backlog_from_proto(reply.maintenance.ok_or_else(|| {
+            ClientError::InvalidResponse("runtime status missing maintenance".to_owned())
+        })?),
+    })
+}
+
+fn collection_placement_from_proto(reply: CollectionPlacementReply) -> Result<CollectionPlacement> {
+    Ok(CollectionPlacement {
+        collection_id: parse_collection_id(&reply.collection_id)?,
+        collection_name: reply.collection_name,
+        assigned_node: reply.assigned_node,
+        assigned_role: node_role_from_proto(reply.assigned_role)?,
+        route_kind: reply.route_kind,
+        route_reason: reply.route_reason,
+    })
+}
+
 fn parse_collection_id(value: &str) -> Result<CollectionId> {
     value.parse().map(CollectionId).map_err(|error| {
         ClientError::InvalidResponse(format!("invalid collection id '{value}': {error}"))
     })
+}
+
+fn node_role_from_proto(role: i32) -> Result<NodeRole> {
+    match proto::NodeRole::try_from(role)
+        .map_err(|_| ClientError::InvalidResponse(format!("unknown node role '{role}'")))?
+    {
+        proto::NodeRole::Unspecified => Err(ClientError::InvalidResponse(
+            "node role must be set".to_owned(),
+        )),
+        proto::NodeRole::Combined => Ok(NodeRole::Combined),
+        proto::NodeRole::Control => Ok(NodeRole::Control),
+        proto::NodeRole::Data => Ok(NodeRole::Data),
+    }
 }
 
 fn metric_from_proto(metric: i32) -> Result<DistanceMetric> {
@@ -542,6 +622,15 @@ fn maintenance_status_from_proto(status: proto::MaintenanceStatus) -> Result<Mai
         last_error: status.last_error,
         completed_runs: status.completed_runs as usize,
     })
+}
+
+fn maintenance_backlog_from_proto(maintenance: MaintenanceBacklogReply) -> MaintenanceBacklog {
+    MaintenanceBacklog {
+        collections_with_pending: maintenance.collections_with_pending as usize,
+        pending_operations: maintenance.pending_operations as usize,
+        collections_in_progress: maintenance.collections_in_progress as usize,
+        collections_with_errors: maintenance.collections_with_errors as usize,
+    }
 }
 
 fn query_unit_stats_from_proto(stats: proto::QueryUnitStats) -> Result<QueryUnitStats> {

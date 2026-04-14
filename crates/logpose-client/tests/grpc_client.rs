@@ -1,7 +1,7 @@
 //! Integration tests for the gRPC-backed LogPose client.
 
 use logpose_catalog as _;
-use logpose_client::LogPoseClient;
+use logpose_client::{ClientError, LogPoseClient};
 use logpose_config::LogPoseConfig;
 use logpose_core::AppState;
 use logpose_query::{
@@ -302,6 +302,99 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 }
 
 #[tokio::test]
+async fn grpc_client_reads_runtime_status_and_collection_placement() {
+    let temp_root = unique_temp_dir("client-runtime-status");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+
+    state
+        .control
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+
+    let status = client
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+    assert_eq!(status.role.as_str(), "combined");
+    assert_eq!(status.storage_engine, "local");
+    assert_eq!(status.collection_count, 1);
+    assert_eq!(status.collections[0].collection_name, "documents");
+    assert_eq!(status.collections[0].assigned_role.as_str(), "data");
+
+    let placement = client
+        .collection_placement("documents")
+        .await
+        .expect("placement should load");
+    assert_eq!(placement.collection_name, "documents");
+    assert_eq!(placement.assigned_node, "client-grpc");
+    assert_eq!(placement.assigned_role.as_str(), "data");
+    assert_eq!(placement.route_kind, "local");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_surfaces_data_only_collection_creation_failures() {
+    let temp_root = unique_temp_dir("client-grpc-data-only");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config_with_role(
+        &temp_root,
+        rest_addr,
+        grpc_addr,
+        logpose_types::NodeRole::Data,
+    )));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+
+    let error = client
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect_err("data-only node should reject collection creation");
+
+    assert!(
+        matches!(error, ClientError::Status(_)),
+        "expected status error, got {error:?}"
+    );
+    let ClientError::Status(status) = error else {
+        return;
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("data-only nodes cannot accept control-plane collection lifecycle mutations")
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn grpc_client_round_trips_cooperative_filtered_ann() {
     let temp_root = unique_temp_dir("client-grpc-cooperative");
     let grpc_addr = reserve_local_addr();
@@ -410,8 +503,23 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
 }
 
 fn test_config(root: &Path, rest_addr: SocketAddr, grpc_addr: SocketAddr) -> LogPoseConfig {
+    test_config_with_role(
+        root,
+        rest_addr,
+        grpc_addr,
+        logpose_types::NodeRole::Combined,
+    )
+}
+
+fn test_config_with_role(
+    root: &Path,
+    rest_addr: SocketAddr,
+    grpc_addr: SocketAddr,
+    node_role: logpose_types::NodeRole,
+) -> LogPoseConfig {
     LogPoseConfig {
         node_name: "client-grpc".to_owned(),
+        node_role,
         rest_host: rest_addr.ip().to_string(),
         rest_port: rest_addr.port(),
         grpc_host: grpc_addr.ip().to_string(),

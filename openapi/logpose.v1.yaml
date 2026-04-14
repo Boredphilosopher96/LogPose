@@ -25,6 +25,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MetadataResponse"
+  /v1/runtime/status:
+    get:
+      summary: Get runtime status
+      operationId: getRuntimeStatus
+      responses:
+        "200":
+          description: Control-plane runtime summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeRuntimeStatus"
+        "500":
+          description: Internal runtime-status failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections:
     post:
       summary: Create a collection
@@ -42,6 +59,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CollectionDescriptor"
+        "400":
+          description: Invalid create request or control-plane lifecycle unavailable for the current node role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: Collection already exists
           content:
@@ -71,6 +94,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/placement:
+    get:
+      summary: Get collection placement
+      operationId: getCollectionPlacement
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Collection placement summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionPlacement"
+        "404":
+          description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal placement lookup failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/writes:
     post:
       summary: Write a mixed put/delete batch
@@ -95,7 +147,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/CommitAck"
         "400":
-          description: Invalid write request
+          description: Invalid write request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
             application/json:
               schema:
@@ -130,7 +182,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/QueryResponse"
         "400":
-          description: Invalid query request
+          description: Invalid query request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
             application/json:
               schema:
@@ -158,6 +210,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CollectionStats"
+        "400":
+          description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -181,6 +239,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Snapshot"
+        "400":
+          description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -204,6 +268,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Snapshot"
+        "400":
+          description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -239,7 +309,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/InspectReport"
         "400":
-          description: Invalid inspect request
+          description: Invalid inspect request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
             application/json:
               schema:
@@ -269,6 +339,89 @@ components:
           type: string
         profile:
           type: string
+    NodeRole:
+      type: string
+      enum: [combined, control, data]
+    CollectionPlacement:
+      type: object
+      required:
+        - collection_id
+        - collection_name
+        - assigned_node
+        - assigned_role
+        - route_kind
+        - route_reason
+      properties:
+        collection_id:
+          type: string
+          format: uuid
+        collection_name:
+          type: string
+        assigned_node:
+          type: string
+        assigned_role:
+          $ref: "#/components/schemas/NodeRole"
+        route_kind:
+          type: string
+        route_reason:
+          type: string
+    MaintenanceBacklog:
+      type: object
+      required:
+        - collections_with_pending
+        - pending_operations
+        - collections_in_progress
+        - collections_with_errors
+      properties:
+        collections_with_pending:
+          type: integer
+        pending_operations:
+          type: integer
+        collections_in_progress:
+          type: integer
+        collections_with_errors:
+          type: integer
+    NodeRuntimeStatus:
+      type: object
+      required:
+        - metadata
+        - role
+        - rest_endpoint
+        - grpc_endpoint
+        - storage_engine
+        - control_plane_ready
+        - data_plane_ready
+        - collection_count
+        - collections
+        - maintenance
+      properties:
+        metadata:
+          $ref: "#/components/schemas/MetadataResponse"
+        role:
+          $ref: "#/components/schemas/NodeRole"
+        rest_endpoint:
+          type: string
+          description: Configured REST listener address reported by the runtime.
+        grpc_endpoint:
+          type: string
+          description: Configured gRPC listener address reported by the runtime.
+        storage_engine:
+          type: string
+        control_plane_ready:
+          type: boolean
+          description: Whether control-plane coordination workflows should be considered available on this runtime.
+        data_plane_ready:
+          type: boolean
+          description: Whether data-plane query and mutation workflows are available.
+        collection_count:
+          type: integer
+          description: Number of collections this runtime can currently serve locally.
+        collections:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectionPlacement"
+        maintenance:
+          $ref: "#/components/schemas/MaintenanceBacklog"
     CreateCollectionRequest:
       type: object
       required: [name, dimensions, metric]

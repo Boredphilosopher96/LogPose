@@ -59,6 +59,11 @@ impl CollectionDescriptor {
 
     /// Validate collection-level configuration values.
     pub fn validate(&self) -> logpose_types::Result<()> {
+        if self.dimensions == 0 {
+            return Err(LogPoseError::Message(
+                "dimensions must be greater than 0".to_owned(),
+            ));
+        }
         if self.flush_threshold_ops == 0 {
             return Err(LogPoseError::Message(
                 "flush_threshold_ops must be greater than 0".to_owned(),
@@ -120,6 +125,20 @@ mod tests {
                 .expect_err("compaction threshold of one should fail")
                 .to_string()
                 .contains("compaction_threshold_segments")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_dimensions() {
+        let root = Path::new("/tmp/catalog-validation");
+        let descriptor = CollectionDescriptor::new("events", 0, DistanceMetric::Dot, root);
+
+        assert!(
+            descriptor
+                .validate()
+                .expect_err("zero dimensions should fail")
+                .to_string()
+                .contains("dimensions")
         );
     }
 }
