@@ -10,12 +10,14 @@ workspace = true
 
 [dependencies]
 logpose-catalog = { path = "../logpose-catalog" }
+logpose-config = { path = "../logpose-config" }
 logpose-query = { path = "../logpose-query" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 thiserror.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 axum.workspace = true
 http-body-util = "~0.1"
 logpose-api-grpc = { path = "../logpose-api-grpc" }

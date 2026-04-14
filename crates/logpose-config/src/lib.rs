@@ -1,6 +1,6 @@
 //! Configuration loading for LogPose services and tooling.
 
-use logpose_types::{LogPoseError, Result};
+use logpose_types::{LogPoseError, NodeRole, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -9,6 +9,9 @@ use std::path::PathBuf;
 pub struct LogPoseConfig {
     /// Human-readable deployment name.
     pub node_name: String,
+    /// Declared runtime role for this process.
+    #[serde(default)]
+    pub node_role: NodeRole,
     /// Host address for the REST listener.
     pub rest_host: String,
     /// Port for the REST listener.
@@ -27,6 +30,7 @@ impl Default for LogPoseConfig {
     fn default() -> Self {
         Self {
             node_name: "logpose-node-1".to_owned(),
+            node_role: NodeRole::Combined,
             rest_host: "127.0.0.1".to_owned(),
             rest_port: 8080,
             grpc_host: "127.0.0.1".to_owned(),
@@ -67,6 +71,7 @@ mod tests {
     fn from_toml_str_reads_storage_root() {
         let config = LogPoseConfig::from_toml_str(
             r#"node_name = "edge-a"
+node_role = "data"
 rest_host = "0.0.0.0"
 rest_port = 18080
 grpc_host = "0.0.0.0"
@@ -76,6 +81,23 @@ storage_root = "tmp/logpose-data""#,
         )
         .expect("config should load");
         assert_eq!(config.storage_root, PathBuf::from("tmp/logpose-data"));
+        assert_eq!(config.node_role, NodeRole::Data);
         assert_eq!(config.rest_port, 18080);
+    }
+
+    #[test]
+    fn from_toml_str_defaults_node_role_when_omitted() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data""#,
+        )
+        .expect("config should load");
+
+        assert_eq!(config.node_role, NodeRole::Combined);
     }
 }

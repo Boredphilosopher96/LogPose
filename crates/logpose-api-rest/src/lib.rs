@@ -22,8 +22,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/metadata", get(metadata))
+        .route("/v1/runtime/status", get(runtime_status))
         .route("/v1/collections", post(create_collection))
         .route("/v1/collections/{name}", get(get_collection))
+        .route(
+            "/v1/collections/{name}/placement",
+            get(get_collection_placement),
+        )
         .route("/v1/collections/{name}/writes", post(write_collection))
         .route("/v1/collections/{name}/query", post(query_collection))
         .route("/v1/collections/{name}/stats", get(get_collection_stats))
@@ -59,12 +64,18 @@ async fn metadata(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.metadata())
 }
 
+async fn runtime_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<logpose_types::NodeRuntimeStatus>, ApiError> {
+    Ok(Json(state.control.runtime_status().await?))
+}
+
 async fn create_collection(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateCollectionBody>,
 ) -> Result<(StatusCode, Json<logpose_catalog::CollectionDescriptor>), ApiError> {
     let descriptor = state
-        .service
+        .control
         .create_collection(CreateCollectionRequest {
             name: request.name,
             dimensions: request.dimensions,
@@ -78,7 +89,14 @@ async fn get_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
-    Ok(Json(state.service.get_collection(&name).await?))
+    Ok(Json(state.get_collection(&name).await?))
+}
+
+async fn get_collection_placement(
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    Ok(Json(state.control.collection_placement(&name).await?))
 }
 
 async fn write_collection(
@@ -86,7 +104,7 @@ async fn write_collection(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WriteCollectionBody>,
 ) -> Result<Json<logpose_types::CommitAck>, ApiError> {
-    Ok(Json(state.service.write(&name, request.operations).await?))
+    Ok(Json(state.write(&name, request.operations).await?))
 }
 
 async fn query_collection(
@@ -110,7 +128,6 @@ async fn query_collection(
 
     Ok(Json(
         state
-            .service
             .query(QueryRequest {
                 collection_name: name,
                 vector: request.vector,
@@ -128,21 +145,21 @@ async fn get_collection_stats(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
-    Ok(Json(state.service.stats(&name).await?))
+    Ok(Json(state.stats(&name).await?))
 }
 
 async fn flush_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::Snapshot>, ApiError> {
-    Ok(Json(state.service.flush(&name).await?))
+    Ok(Json(state.flush(&name).await?))
 }
 
 async fn compact_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::Snapshot>, ApiError> {
-    Ok(Json(state.service.compact(&name).await?))
+    Ok(Json(state.compact(&name).await?))
 }
 
 async fn inspect_collection(
@@ -151,7 +168,7 @@ async fn inspect_collection(
     Query(params): Query<InspectCollectionParams>,
 ) -> Result<Json<logpose_storage::InspectReport>, ApiError> {
     let target = inspect_target_from_params(params)?;
-    Ok(Json(state.service.inspect(&name, target).await?))
+    Ok(Json(state.inspect(&name, target).await?))
 }
 
 #[derive(Debug, Serialize)]
@@ -710,6 +727,429 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_status_endpoint_reports_control_plane_summary() {
+        let state = Arc::new(AppState::new(test_config("rest-runtime-status")));
+        state
+            .control
+            .create_collection(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/runtime/status")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["role"], "combined");
+        assert_eq!(body["storage_engine"], "local");
+        assert_eq!(body["collection_count"], 1);
+        assert_eq!(body["collections"][0]["collection_name"], "documents");
+        assert_eq!(body["collections"][0]["assigned_role"], "data");
+        assert_eq!(body["collections"][0]["route_kind"], "local");
+        assert!(
+            body["collections"][0]["route_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("single-node"))
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_endpoint_reports_local_assignment() {
+        let state = Arc::new(AppState::new(test_config("rest-placement")));
+        state
+            .control
+            .create_collection(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/placement")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["collection_name"], "documents");
+        assert_eq!(body["assigned_node"], "rest-placement");
+        assert_eq!(body["assigned_role"], "data");
+        assert_eq!(body["route_kind"], "local");
+    }
+
+    #[tokio::test]
+    async fn data_only_nodes_reject_control_plane_collection_creation() {
+        let app = router(Arc::new(AppState::new(test_config_with_role(
+            "rest-data-only",
+            logpose_types::NodeRole::Data,
+        ))));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(body["error"].as_str().is_some_and(|message| {
+            message.contains(
+                "data-only nodes cannot accept control-plane collection lifecycle mutations",
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn control_only_nodes_reject_control_plane_collection_creation() {
+        let app = router(Arc::new(AppState::new(test_config_with_role(
+            "rest-control-create",
+            logpose_types::NodeRole::Control,
+        ))));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("without a local data plane"))
+        );
+    }
+
+    #[tokio::test]
+    async fn control_only_nodes_reject_data_plane_rest_operations() {
+        let root = unique_temp_dir("rest-control-only");
+        let initial = Arc::new(AppState::new(test_config_with_root(
+            "rest-control-only",
+            logpose_types::NodeRole::Combined,
+            root.clone(),
+        )));
+        initial
+            .control
+            .create_collection(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        drop(initial);
+
+        let state = Arc::new(AppState::new(test_config_with_root(
+            "rest-control-only",
+            logpose_types::NodeRole::Control,
+            root,
+        )));
+        let app = router(state);
+
+        let responses = vec![
+            (
+                "write",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/writes")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "operations": [
+                                        {
+                                            "op": "put",
+                                            "id": "alpha",
+                                            "vector": [1.0, 0.0],
+                                            "metadata": {"kind": "keep"}
+                                        }
+                                    ]
+                                })
+                                .to_string(),
+                            ))
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "query",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/query")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "vector": [1.0, 0.0],
+                                    "top_k": 1
+                                })
+                                .to_string(),
+                            ))
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "stats",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/v1/collections/documents/stats")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "flush",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/flush")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "compact",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/compact")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "inspect",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/v1/collections/documents/inspect?target=manifest")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+        ];
+
+        for (operation, response) in responses {
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{operation} should be rejected on control-only nodes"
+            );
+            let body = json_body(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("data-plane operations")),
+                "{operation} should explain the role mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_remote_assignments_reject_data_plane_rest_operations() {
+        let root = unique_temp_dir("rest-recorded-route");
+        let initial = Arc::new(AppState::new(test_config_with_root(
+            "rest-recorded-node-a",
+            logpose_types::NodeRole::Combined,
+            root.clone(),
+        )));
+        initial
+            .control
+            .create_collection(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        drop(initial);
+
+        let state = Arc::new(AppState::new(test_config_with_root(
+            "rest-recorded-node-b",
+            logpose_types::NodeRole::Combined,
+            root,
+        )));
+        let app = router(state);
+
+        let responses = vec![
+            (
+                "write",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/writes")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "operations": [
+                                        {
+                                            "op": "put",
+                                            "id": "alpha",
+                                            "vector": [1.0, 0.0],
+                                            "metadata": {"kind": "keep"}
+                                        }
+                                    ]
+                                })
+                                .to_string(),
+                            ))
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "query",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/query")
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "vector": [1.0, 0.0],
+                                    "top_k": 1
+                                })
+                                .to_string(),
+                            ))
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "stats",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/v1/collections/documents/stats")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "flush",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/flush")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "compact",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/v1/collections/documents/compact")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+            (
+                "inspect",
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/v1/collections/documents/inspect?target=manifest")
+                            .body(Body::empty())
+                            .expect("request should build"),
+                    )
+                    .await
+                    .expect("router should respond"),
+            ),
+        ];
+
+        for (operation, response) in responses {
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{operation} should be rejected for recorded remote assignments"
+            );
+            let body = json_body(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("not locally served")),
+                "{operation} should explain the recorded placement mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn missing_collection_returns_not_found() {
         let state = Arc::new(AppState::new(test_config("rest-missing")));
         let app = router(state);
@@ -725,6 +1165,56 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn missing_collection_placement_returns_not_found() {
+        let state = Arc::new(AppState::new(test_config("rest-missing-placement")));
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/missing/placement")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_collection_rejects_zero_dimensions() {
+        let app = router(Arc::new(AppState::new(test_config("rest-zero-dimensions"))));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 0,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("dimensions must be greater than 0"))
+        );
     }
 
     #[tokio::test]
@@ -1181,9 +1671,22 @@ mod tests {
     }
 
     fn test_config(label: &str) -> LogPoseConfig {
+        test_config_with_role(label, logpose_types::NodeRole::Combined)
+    }
+
+    fn test_config_with_role(label: &str, node_role: logpose_types::NodeRole) -> LogPoseConfig {
+        test_config_with_root(label, node_role, unique_temp_dir(label))
+    }
+
+    fn test_config_with_root(
+        label: &str,
+        node_role: logpose_types::NodeRole,
+        storage_root: PathBuf,
+    ) -> LogPoseConfig {
         LogPoseConfig {
             node_name: label.to_owned(),
-            storage_root: unique_temp_dir(label),
+            node_role,
+            storage_root,
             ..LogPoseConfig::default()
         }
     }

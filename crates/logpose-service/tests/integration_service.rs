@@ -1,5 +1,6 @@
 //! Integration tests for `LogPoseDataService`.
 
+use async_trait as _;
 use axum as _;
 use axum::body::Body;
 use http_body_util as _;
@@ -46,6 +47,13 @@ async fn service_runs_filtered_query_and_storage_workflow() {
         .await
         .expect("collection should be created");
     assert_eq!(descriptor.name, "documents");
+    let placement: logpose_types::CollectionAssignment = serde_json::from_slice(
+        &fs::read(descriptor.root_path.join("placement.json"))
+            .expect("placement assignment should be written"),
+    )
+    .expect("placement assignment should parse");
+    assert_eq!(placement.assigned_node, "local");
+    assert_eq!(placement.assigned_role, logpose_types::NodeRole::Data);
 
     service
         .write(
@@ -236,7 +244,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
     let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
 
     state
-        .service
+        .control
         .create_collection(CreateCollectionRequest {
             name: "documents".to_owned(),
             dimensions: 2,
@@ -246,7 +254,6 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .expect("collection should be created");
 
     state
-        .service
         .write(
             "documents",
             vec![
@@ -271,7 +278,6 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .expect("write should succeed");
 
     state
-        .service
         .flush("documents")
         .await
         .expect("flush should succeed");
@@ -283,7 +289,6 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
     });
 
     let service_response = state
-        .service
         .query(QueryRequest {
             collection_name: "documents".to_owned(),
             vector: vec![1.0, 0.0],
@@ -470,7 +475,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
     let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
 
     state
-        .service
+        .control
         .create_collection(CreateCollectionRequest {
             name: "documents".to_owned(),
             dimensions: 2,
@@ -490,12 +495,10 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
         })
         .collect::<Vec<_>>();
     state
-        .service
         .write("documents", operations)
         .await
         .expect("write should succeed");
     state
-        .service
         .flush("documents")
         .await
         .expect("flush should succeed");
@@ -507,7 +510,6 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
     });
 
     let service_response = state
-        .service
         .query(QueryRequest {
             collection_name: "documents".to_owned(),
             vector: vec![1.0, 0.0],

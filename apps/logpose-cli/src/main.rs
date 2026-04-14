@@ -15,10 +15,8 @@ use logpose_query::{
     ScalarMetadataValue,
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
-use logpose_types::{
-    DeleteRecord, DistanceMetric, NodeMetadata, PutRecord, RecordId, Snapshot, WriteOperation,
-};
-use serde::{Deserialize, Serialize};
+use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     fs::File,
@@ -64,8 +62,10 @@ enum AdminCommand {
 
 #[derive(Debug, Subcommand)]
 enum DiagnosticsCommand {
-    /// Print service endpoints and bootstrap metadata.
+    /// Print runtime status, endpoints, and control-plane diagnostics.
     Status,
+    /// Explain where a collection is placed.
+    Placement(CollectionArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,14 +177,6 @@ struct JsonlRecord {
     metadata: Value,
 }
 
-#[derive(Debug, Serialize)]
-struct DiagnosticsStatus {
-    #[serde(flatten)]
-    metadata: NodeMetadata,
-    rest_endpoint: String,
-    grpc_endpoint: String,
-}
-
 const CLI_PUT_BATCH_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
@@ -203,15 +195,21 @@ async fn main() -> anyhow::Result<()> {
             command: DiagnosticsCommand::Status,
         } => {
             let client = connect_client(&config).await?;
-            let metadata = client
-                .metadata()
+            let status = client
+                .runtime_status()
                 .await
-                .context("failed to fetch server metadata")?;
-            print_json(&DiagnosticsStatus {
-                metadata,
-                rest_endpoint: rest_endpoint(&config),
-                grpc_endpoint: grpc_endpoint(&config),
-            })?;
+                .context("failed to fetch runtime status")?;
+            print_json(&status)?;
+        }
+        Commands::Diagnostics {
+            command: DiagnosticsCommand::Placement(args),
+        } => {
+            let client = connect_client(&config).await?;
+            let placement = client
+                .collection_placement(&args.collection)
+                .await
+                .context("failed to fetch collection placement")?;
+            print_json(&placement)?;
         }
         Commands::Data {
             command: DataCommand::CreateCollection(args),
@@ -349,17 +347,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect_client(config: &logpose_config::LogPoseConfig) -> anyhow::Result<LogPoseClient> {
-    LogPoseClient::connect(grpc_endpoint(config))
+    let endpoint = grpc_dial_endpoint(config);
+    LogPoseClient::connect(endpoint.clone())
         .await
-        .with_context(|| format!("failed to connect to {}", grpc_endpoint(config)))
+        .with_context(|| format!("failed to connect to {endpoint}"))
 }
 
+#[cfg(test)]
 fn rest_endpoint(config: &logpose_config::LogPoseConfig) -> String {
     endpoint_url(&config.rest_host, config.rest_port)
 }
 
+#[cfg(test)]
+fn rest_dial_endpoint(config: &logpose_config::LogPoseConfig) -> String {
+    dial_endpoint_url(&config.rest_host, config.rest_port)
+}
+
+#[cfg(test)]
 fn grpc_endpoint(config: &logpose_config::LogPoseConfig) -> String {
     endpoint_url(&config.grpc_host, config.grpc_port)
+}
+
+fn grpc_dial_endpoint(config: &logpose_config::LogPoseConfig) -> String {
+    dial_endpoint_url(&config.grpc_host, config.grpc_port)
 }
 
 fn endpoint_url(host: &str, port: u16) -> String {
@@ -369,6 +379,15 @@ fn endpoint_url(host: &str, port: u16) -> String {
     };
 
     format!("http://{authority}:{port}")
+}
+
+fn dial_endpoint_url(host: &str, port: u16) -> String {
+    let dial_host = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        _ => host,
+    };
+    endpoint_url(dial_host, port)
 }
 
 fn inspect_target_from_args(args: &InspectArgs) -> InspectTarget {
@@ -652,6 +671,20 @@ mod tests {
 
         assert_eq!(rest_endpoint(&config), "http://[::1]:18080");
         assert_eq!(grpc_endpoint(&config), "http://[::1]:15051");
+    }
+
+    #[test]
+    fn dial_endpoint_helpers_rewrite_wildcard_bind_addresses() {
+        let config = logpose_config::LogPoseConfig {
+            rest_host: "0.0.0.0".to_owned(),
+            rest_port: 18080,
+            grpc_host: "::".to_owned(),
+            grpc_port: 15051,
+            ..logpose_config::LogPoseConfig::default()
+        };
+
+        assert_eq!(rest_dial_endpoint(&config), "http://127.0.0.1:18080");
+        assert_eq!(grpc_dial_endpoint(&config), "http://[::1]:15051");
     }
 
     #[test]

@@ -29,22 +29,127 @@ fn diagnostics_status_reports_server_metadata_and_endpoints() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let payload: Value = serde_json::from_str(&stdout).expect("status should print json");
 
-    assert_eq!(payload["product"], "LogPose");
-    assert_eq!(payload["node_name"], "cli-diagnostics");
-    assert_eq!(payload["profile"], "debug");
+    assert_eq!(payload["metadata"]["product"], "LogPose");
+    assert_eq!(payload["metadata"]["node_name"], "cli-diagnostics");
+    assert_eq!(payload["metadata"]["profile"], "debug");
+    assert_eq!(payload["role"], "combined");
     assert_eq!(payload["rest_endpoint"], fixture.rest_endpoint());
     assert_eq!(payload["grpc_endpoint"], fixture.grpc_endpoint());
+    assert_eq!(payload["storage_engine"], "local");
     assert!(
-        payload["version"]
+        payload["metadata"]["version"]
             .as_str()
             .is_some_and(|value| !value.is_empty()),
         "version should be non-empty"
     );
     assert!(
-        payload["git_sha"]
+        payload["metadata"]["git_sha"]
             .as_str()
             .is_some_and(|value| !value.is_empty()),
         "git_sha should be non-empty"
+    );
+}
+
+#[test]
+fn diagnostics_placement_reports_local_assignment() {
+    let fixture = TestServerFixture::spawn("cli-placement");
+
+    fixture.run_cli([
+        "data",
+        "create-collection",
+        "--name",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let output = fixture.run_cli(["diagnostics", "placement", "--collection", "documents"]);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let payload: Value = serde_json::from_str(&stdout).expect("placement should print json");
+
+    assert_eq!(payload["collection_name"], "documents");
+    assert_eq!(payload["assigned_node"], "cli-placement");
+    assert_eq!(payload["assigned_role"], "data");
+    assert_eq!(payload["route_kind"], "local");
+}
+
+#[test]
+fn data_only_nodes_reject_collection_creation_over_cli_transport() {
+    let fixture =
+        TestServerFixture::spawn_with_role("cli-data-only", logpose_types::NodeRole::Data);
+
+    let output = fixture.run_cli_expect_failure([
+        "data",
+        "create-collection",
+        "--name",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+
+    assert!(stderr.contains("failed to create collection"));
+    assert!(
+        stderr
+            .contains("data-only nodes cannot accept control-plane collection lifecycle mutations")
+    );
+}
+
+#[test]
+fn control_only_nodes_reject_collection_creation_over_cli_transport() {
+    let fixture =
+        TestServerFixture::spawn_with_role("cli-control-only", logpose_types::NodeRole::Control);
+
+    let output = fixture.run_cli_expect_failure([
+        "data",
+        "create-collection",
+        "--name",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+
+    assert!(stderr.contains("failed to create collection"));
+    assert!(stderr.contains("without a local data plane"));
+}
+
+#[test]
+fn diagnostics_status_preserves_server_reported_wildcard_listener_addresses() {
+    let fixture = TestServerFixture::spawn_with_listener_hosts(
+        "cli-wildcard",
+        logpose_types::NodeRole::Combined,
+        "0.0.0.0",
+        "0.0.0.0",
+    );
+    let output = fixture.run_cli_with_config(
+        ["diagnostics", "status"],
+        render_config_with_hosts(
+            "cli-wildcard",
+            logpose_types::NodeRole::Combined,
+            &fixture.temp_root.join("client-data"),
+            "0.0.0.0",
+            fixture.rest_addr.port(),
+            "0.0.0.0",
+            fixture.grpc_addr.port(),
+        ),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let payload: Value = serde_json::from_str(&stdout).expect("status should print json");
+
+    assert_eq!(
+        payload["rest_endpoint"],
+        format!("http://0.0.0.0:{}", fixture.rest_addr.port())
+    );
+    assert_eq!(
+        payload["grpc_endpoint"],
+        format!("http://0.0.0.0:{}", fixture.grpc_addr.port())
     );
 }
 
@@ -498,6 +603,19 @@ struct TestServerFixture {
 
 impl TestServerFixture {
     fn spawn(node_name: &str) -> Self {
+        Self::spawn_with_role(node_name, logpose_types::NodeRole::Combined)
+    }
+
+    fn spawn_with_role(node_name: &str, node_role: logpose_types::NodeRole) -> Self {
+        Self::spawn_with_listener_hosts(node_name, node_role, "127.0.0.1", "127.0.0.1")
+    }
+
+    fn spawn_with_listener_hosts(
+        node_name: &str,
+        node_role: logpose_types::NodeRole,
+        rest_host: &str,
+        grpc_host: &str,
+    ) -> Self {
         let temp_root = unique_temp_dir(node_name);
         let storage_root = temp_root.join("data");
         let rest_addr = reserve_local_addr();
@@ -505,9 +623,10 @@ impl TestServerFixture {
         let runtime = Runtime::new().expect("runtime should build");
         let state = Arc::new(AppState::new(LogPoseConfig {
             node_name: node_name.to_owned(),
-            rest_host: rest_addr.ip().to_string(),
+            node_role,
+            rest_host: rest_host.to_owned(),
             rest_port: rest_addr.port(),
-            grpc_host: grpc_addr.ip().to_string(),
+            grpc_host: grpc_host.to_owned(),
             grpc_port: grpc_addr.port(),
             log_filter: "info".to_owned(),
             storage_root,
@@ -549,19 +668,7 @@ impl TestServerFixture {
     }
 
     fn run_cli<const N: usize>(&self, args: [&str; N]) -> Output {
-        let config = render_config(
-            "cli-test",
-            &self.temp_root.join("client-data"),
-            self.rest_addr,
-            self.grpc_addr,
-        );
-        let output = Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
-            .current_dir(&self.temp_root)
-            .env("LOGPOSE_CONFIG", config)
-            .args(args)
-            .output()
-            .expect("cli should run");
-
+        let output = self.run_cli_raw(args);
         assert!(
             output.status.success(),
             "command failed with stdout: {}\nstderr: {}",
@@ -569,6 +676,37 @@ impl TestServerFixture {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    fn run_cli_expect_failure<const N: usize>(&self, args: [&str; N]) -> Output {
+        let output = self.run_cli_raw(args);
+        assert!(
+            !output.status.success(),
+            "command unexpectedly succeeded with stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn run_cli_raw<const N: usize>(&self, args: [&str; N]) -> Output {
+        let config = render_config(
+            "cli-test",
+            logpose_types::NodeRole::Combined,
+            &self.temp_root.join("client-data"),
+            self.rest_addr,
+            self.grpc_addr,
+        );
+        self.run_cli_with_config(args, config)
+    }
+
+    fn run_cli_with_config<const N: usize>(&self, args: [&str; N], config: String) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
+            .current_dir(&self.temp_root)
+            .env("LOGPOSE_CONFIG", config)
+            .args(args)
+            .output()
+            .expect("cli should run")
     }
 }
 
@@ -581,22 +719,45 @@ impl Drop for TestServerFixture {
 
 fn render_config(
     node_name: &str,
+    node_role: logpose_types::NodeRole,
     storage_root: &Path,
     rest_addr: SocketAddr,
     grpc_addr: SocketAddr,
 ) -> String {
+    render_config_with_hosts(
+        node_name,
+        node_role,
+        storage_root,
+        &rest_addr.ip().to_string(),
+        rest_addr.port(),
+        &grpc_addr.ip().to_string(),
+        grpc_addr.port(),
+    )
+}
+
+fn render_config_with_hosts(
+    node_name: &str,
+    node_role: logpose_types::NodeRole,
+    storage_root: &Path,
+    rest_host: &str,
+    rest_port: u16,
+    grpc_host: &str,
+    grpc_port: u16,
+) -> String {
     format!(
         r#"node_name = "{node_name}"
+node_role = "{node_role}"
 rest_host = "{rest_host}"
 rest_port = {rest_port}
 grpc_host = "{grpc_host}"
 grpc_port = {grpc_port}
 log_filter = "info"
 storage_root = "{storage_root}""#,
-        rest_host = rest_addr.ip(),
-        rest_port = rest_addr.port(),
-        grpc_host = grpc_addr.ip(),
-        grpc_port = grpc_addr.port(),
+        node_role = node_role.as_str(),
+        rest_host = rest_host,
+        rest_port = rest_port,
+        grpc_host = grpc_host,
+        grpc_port = grpc_port,
         storage_root = storage_root.display(),
     )
 }

@@ -73,6 +73,52 @@ impl NodeMetadata {
     }
 }
 
+/// Declared runtime role for a LogPose node.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRole {
+    /// Serve both control-plane and data-plane workflows.
+    #[default]
+    Combined,
+    /// Serve only control-plane workflows.
+    Control,
+    /// Serve only data-plane workflows.
+    Data,
+}
+
+impl NodeRole {
+    /// Stable string form used in diagnostics and CLI output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Control => "control",
+            Self::Data => "data",
+        }
+    }
+}
+
+impl fmt::Display for NodeRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for NodeRole {
+    type Err = LogPoseError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "combined" => Ok(Self::Combined),
+            "control" => Ok(Self::Control),
+            "data" => Ok(Self::Data),
+            other => Err(LogPoseError::Message(format!(
+                "unsupported node role '{other}'"
+            ))),
+        }
+    }
+}
+
 /// Identifier for a collection or namespace.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ResourceId(pub Uuid);
@@ -426,4 +472,68 @@ pub struct CollectionStats {
     pub maintenance: MaintenanceStatus,
     /// Planner-visible mutable and immutable queryable units.
     pub query_units: Vec<QueryUnitStats>,
+}
+
+/// Persisted node assignment for one collection.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectionAssignment {
+    /// Node recorded to host the collection.
+    pub assigned_node: String,
+    /// Runtime role recorded for the node assignment.
+    pub assigned_role: NodeRole,
+}
+
+/// Operator-visible explanation of where a collection is currently placed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectionPlacement {
+    /// Stable collection identifier.
+    pub collection_id: CollectionId,
+    /// Human-readable collection name.
+    pub collection_name: String,
+    /// Node currently assigned to serve the collection.
+    pub assigned_node: String,
+    /// Runtime role recorded for the current placement assignment.
+    pub assigned_role: NodeRole,
+    /// Routing family selected for this placement.
+    pub route_kind: String,
+    /// Human-readable diagnostic reason for the current route.
+    pub route_reason: String,
+}
+
+/// Aggregated maintenance backlog surfaced through control-plane diagnostics.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceBacklog {
+    /// Number of collections with queued maintenance work.
+    pub collections_with_pending: usize,
+    /// Number of queued maintenance operations across all collections.
+    pub pending_operations: usize,
+    /// Number of collections currently executing maintenance.
+    pub collections_in_progress: usize,
+    /// Number of collections with a recorded maintenance failure.
+    pub collections_with_errors: usize,
+}
+
+/// Operator-facing runtime summary for a node.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeRuntimeStatus {
+    /// Canonical node metadata.
+    pub metadata: NodeMetadata,
+    /// Declared runtime role for the node.
+    pub role: NodeRole,
+    /// Configured REST listener address reported by this runtime.
+    pub rest_endpoint: String,
+    /// Configured gRPC listener address reported by this runtime.
+    pub grpc_endpoint: String,
+    /// Storage engine implementation backing the data plane.
+    pub storage_engine: String,
+    /// Whether control-plane coordination workflows should be considered available.
+    pub control_plane_ready: bool,
+    /// Whether data-plane workflows should be considered available.
+    pub data_plane_ready: bool,
+    /// Number of collections this runtime can currently serve locally.
+    pub collection_count: usize,
+    /// Collection placement summaries sorted by collection name.
+    pub collections: Vec<CollectionPlacement>,
+    /// Aggregated maintenance state across local collections.
+    pub maintenance: MaintenanceBacklog,
 }

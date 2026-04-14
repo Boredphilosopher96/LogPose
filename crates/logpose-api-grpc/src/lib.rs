@@ -8,8 +8,9 @@ use logpose_query::{
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
-    DeleteRecord, DistanceMetric, MaintenanceStatus, PutRecord, QueryUnitStats, RecordId,
-    ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionPlacement, DeleteRecord, DistanceMetric, MaintenanceBacklog, MaintenanceStatus,
+    NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats, RecordId, ScalarFieldStats, Snapshot,
+    WriteOperation,
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
@@ -25,11 +26,13 @@ pub mod proto {
 
 use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
 use proto::{
-    CollectionDescriptorReply, CollectionStatsReply, CommitAckReply, CompactCollectionRequest,
-    CreateCollectionRequest, FlushCollectionRequest, GetCollectionRequest,
-    GetCollectionStatsRequest, GetMetadataReply, GetMetadataRequest, InspectCollectionReply,
-    InspectCollectionRequest, InspectTarget, QueryCollectionReply, QueryCollectionRequest,
-    QueryMatch, RemoteBlobConfig, ScalarValue, SnapshotReply, WriteCollectionRequest,
+    CollectionDescriptorReply, CollectionPlacementReply, CollectionStatsReply, CommitAckReply,
+    CompactCollectionRequest, CreateCollectionRequest, FlushCollectionRequest,
+    GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
+    GetMetadataReply, GetMetadataRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest,
+    InspectCollectionReply, InspectCollectionRequest, InspectTarget, MaintenanceBacklogReply,
+    NodeRole as ProtoNodeRole, QueryCollectionReply, QueryCollectionRequest, QueryMatch,
+    RemoteBlobConfig, ScalarValue, SnapshotReply, WriteCollectionRequest,
 };
 
 /// Serve the gRPC API until shutdown.
@@ -75,14 +78,22 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         _request: Request<GetMetadataRequest>,
     ) -> Result<Response<GetMetadataReply>, Status> {
-        let metadata = self.state.metadata();
-        Ok(Response::new(GetMetadataReply {
-            product: metadata.product,
-            node_name: metadata.node_name,
-            version: metadata.version,
-            git_sha: metadata.git_sha,
-            profile: metadata.profile,
-        }))
+        Ok(Response::new(metadata_reply_from_domain(
+            self.state.metadata(),
+        )))
+    }
+
+    async fn get_runtime_status(
+        &self,
+        _request: Request<GetRuntimeStatusRequest>,
+    ) -> Result<Response<GetRuntimeStatusReply>, Status> {
+        let status = self
+            .state
+            .control
+            .runtime_status()
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(runtime_status_reply_from_domain(status)))
     }
 
     async fn create_collection(
@@ -92,7 +103,7 @@ impl LogPoseService for GrpcLogPoseService {
         let request = request.into_inner();
         let descriptor = self
             .state
-            .service
+            .control
             .create_collection(StorageCreateCollectionRequest {
                 name: request.name,
                 dimensions: request.dimensions as usize,
@@ -103,13 +114,27 @@ impl LogPoseService for GrpcLogPoseService {
         Ok(Response::new(collection_descriptor_reply(descriptor)))
     }
 
+    async fn get_collection_placement(
+        &self,
+        request: Request<GetCollectionPlacementRequest>,
+    ) -> Result<Response<CollectionPlacementReply>, Status> {
+        let placement = self
+            .state
+            .control
+            .collection_placement(&request.into_inner().collection_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(collection_placement_reply_from_domain(
+            placement,
+        )))
+    }
+
     async fn get_collection(
         &self,
         request: Request<GetCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
         let descriptor = self
             .state
-            .service
             .get_collection(&request.into_inner().collection_name)
             .await
             .map_err(status_from_service_error)?;
@@ -128,7 +153,6 @@ impl LogPoseService for GrpcLogPoseService {
             .collect::<Result<Vec<_>, _>>()?;
         let ack = self
             .state
-            .service
             .write(&request.collection_name, operations)
             .await
             .map_err(status_from_service_error)?;
@@ -151,7 +175,6 @@ impl LogPoseService for GrpcLogPoseService {
         let predicate = request.predicate.map(predicate_from_proto).transpose()?;
         let response = self
             .state
-            .service
             .query(QueryRequest {
                 collection_name: request.collection_name,
                 vector: request.vector,
@@ -191,7 +214,6 @@ impl LogPoseService for GrpcLogPoseService {
     ) -> Result<Response<CollectionStatsReply>, Status> {
         let stats = self
             .state
-            .service
             .stats(&request.into_inner().collection_name)
             .await
             .map_err(status_from_service_error)?;
@@ -204,7 +226,6 @@ impl LogPoseService for GrpcLogPoseService {
     ) -> Result<Response<SnapshotReply>, Status> {
         let snapshot = self
             .state
-            .service
             .flush(&request.into_inner().collection_name)
             .await
             .map_err(status_from_service_error)?;
@@ -217,7 +238,6 @@ impl LogPoseService for GrpcLogPoseService {
     ) -> Result<Response<SnapshotReply>, Status> {
         let snapshot = self
             .state
-            .service
             .compact(&request.into_inner().collection_name)
             .await
             .map_err(status_from_service_error)?;
@@ -232,7 +252,6 @@ impl LogPoseService for GrpcLogPoseService {
         let target = inspect_target_from_proto(request.target, request.segment_id)?;
         let report = self
             .state
-            .service
             .inspect(&request.collection_name, target)
             .await
             .map_err(status_from_service_error)?;
@@ -497,6 +516,16 @@ fn query_stage_timings_to_proto(timings: QueryStageTimings) -> proto::QueryStage
     }
 }
 
+fn metadata_reply_from_domain(metadata: logpose_types::NodeMetadata) -> GetMetadataReply {
+    GetMetadataReply {
+        product: metadata.product,
+        node_name: metadata.node_name,
+        version: metadata.version,
+        git_sha: metadata.git_sha,
+        profile: metadata.profile,
+    }
+}
+
 fn collection_descriptor_reply(
     descriptor: logpose_catalog::CollectionDescriptor,
 ) -> CollectionDescriptorReply {
@@ -514,6 +543,47 @@ fn collection_descriptor_reply(
             bucket: remote_blob.bucket,
             prefix: remote_blob.prefix,
         }),
+    }
+}
+
+fn runtime_status_reply_from_domain(status: NodeRuntimeStatus) -> GetRuntimeStatusReply {
+    GetRuntimeStatusReply {
+        metadata: Some(metadata_reply_from_domain(status.metadata)),
+        role: node_role_to_proto(status.role) as i32,
+        rest_endpoint: status.rest_endpoint,
+        grpc_endpoint: status.grpc_endpoint,
+        storage_engine: status.storage_engine,
+        control_plane_ready: status.control_plane_ready,
+        data_plane_ready: status.data_plane_ready,
+        collection_count: status.collection_count as u64,
+        collections: status
+            .collections
+            .into_iter()
+            .map(collection_placement_reply_from_domain)
+            .collect(),
+        maintenance: Some(maintenance_backlog_to_proto(status.maintenance)),
+    }
+}
+
+fn collection_placement_reply_from_domain(
+    placement: CollectionPlacement,
+) -> CollectionPlacementReply {
+    CollectionPlacementReply {
+        collection_id: placement.collection_id.to_string(),
+        collection_name: placement.collection_name,
+        assigned_node: placement.assigned_node,
+        assigned_role: node_role_to_proto(placement.assigned_role) as i32,
+        route_kind: placement.route_kind,
+        route_reason: placement.route_reason,
+    }
+}
+
+fn maintenance_backlog_to_proto(maintenance: MaintenanceBacklog) -> MaintenanceBacklogReply {
+    MaintenanceBacklogReply {
+        collections_with_pending: maintenance.collections_with_pending as u64,
+        pending_operations: maintenance.pending_operations as u64,
+        collections_in_progress: maintenance.collections_in_progress as u64,
+        collections_with_errors: maintenance.collections_with_errors as u64,
     }
 }
 
@@ -544,6 +614,14 @@ fn maintenance_status_to_proto(status: MaintenanceStatus) -> proto::MaintenanceS
         in_progress: status.in_progress,
         last_error: status.last_error,
         completed_runs: status.completed_runs as u64,
+    }
+}
+
+fn node_role_to_proto(role: NodeRole) -> ProtoNodeRole {
+    match role {
+        NodeRole::Combined => ProtoNodeRole::Combined,
+        NodeRole::Control => ProtoNodeRole::Control,
+        NodeRole::Data => ProtoNodeRole::Data,
     }
 }
 
@@ -951,6 +1029,334 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_runtime_status_reports_control_plane_summary() {
+        let state = Arc::new(AppState::new(test_config("grpc-runtime-status")));
+        state
+            .control
+            .create_collection(StorageCreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        let service = GrpcLogPoseService::new(state);
+
+        let status = service
+            .get_runtime_status(Request::new(GetRuntimeStatusRequest {}))
+            .await
+            .expect("runtime status should succeed")
+            .into_inner();
+
+        assert_eq!(status.role, proto::NodeRole::Combined as i32);
+        assert_eq!(status.storage_engine, "local");
+        assert_eq!(status.collection_count, 1);
+        assert_eq!(status.collections.len(), 1);
+        assert_eq!(status.collections[0].collection_name, "documents");
+        assert_eq!(
+            status.collections[0].assigned_role,
+            proto::NodeRole::Data as i32
+        );
+        assert_eq!(status.collections[0].route_kind, "local");
+    }
+
+    #[tokio::test]
+    async fn grpc_collection_placement_reports_local_assignment() {
+        let state = Arc::new(AppState::new(test_config("grpc-placement")));
+        state
+            .control
+            .create_collection(StorageCreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        let service = GrpcLogPoseService::new(state);
+
+        let placement = service
+            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
+                collection_name: "documents".to_owned(),
+            }))
+            .await
+            .expect("placement should succeed")
+            .into_inner();
+
+        assert_eq!(placement.collection_name, "documents");
+        assert_eq!(placement.assigned_node, "grpc-placement");
+        assert_eq!(placement.assigned_role, proto::NodeRole::Data as i32);
+        assert_eq!(placement.route_kind, "local");
+    }
+
+    #[tokio::test]
+    async fn data_only_nodes_reject_control_plane_collection_creation() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
+            "grpc-data-only",
+            NodeRole::Data,
+        ))));
+
+        let error = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect_err("data-only node should reject collection creation");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains(
+            "data-only nodes cannot accept control-plane collection lifecycle mutations"
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_only_nodes_reject_control_plane_collection_creation() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
+            "grpc-control-create",
+            NodeRole::Control,
+        ))));
+
+        let error = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect_err("control-only node should reject collection creation");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("without a local data plane"));
+    }
+
+    #[tokio::test]
+    async fn control_only_nodes_reject_data_plane_grpc_operations() {
+        let root = unique_temp_dir("grpc-control-only");
+        let initial = Arc::new(AppState::new(test_config_with_root(
+            "grpc-control-only",
+            NodeRole::Combined,
+            root.clone(),
+        )));
+        initial
+            .control
+            .create_collection(StorageCreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        drop(initial);
+
+        let state = Arc::new(AppState::new(test_config_with_root(
+            "grpc-control-only",
+            NodeRole::Control,
+            root,
+        )));
+        let service = GrpcLogPoseService::new(state);
+
+        let errors = vec![
+            (
+                "write",
+                service
+                    .write_collection(Request::new(WriteCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        operations: vec![proto::WriteOperation {
+                            operation: Some(proto::write_operation::Operation::Put(
+                                proto::PutRecord {
+                                    id: "alpha".to_owned(),
+                                    vector: vec![1.0, 0.0],
+                                    metadata_json: r#"{"kind":"keep"}"#.to_owned(),
+                                },
+                            )),
+                        }],
+                    }))
+                    .await
+                    .expect_err("control-only node should reject writes"),
+            ),
+            (
+                "query",
+                service
+                    .query_collection(Request::new(QueryCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        vector: vec![1.0, 0.0],
+                        top_k: 1,
+                        snapshot: None,
+                        filters: Vec::new(),
+                        predicate: None,
+                        explain: proto::ExplainMode::None as i32,
+                    }))
+                    .await
+                    .expect_err("control-only node should reject queries"),
+            ),
+            (
+                "stats",
+                service
+                    .get_collection_stats(Request::new(GetCollectionStatsRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("control-only node should reject stats"),
+            ),
+            (
+                "flush",
+                service
+                    .flush_collection(Request::new(FlushCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("control-only node should reject flush"),
+            ),
+            (
+                "compact",
+                service
+                    .compact_collection(Request::new(CompactCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("control-only node should reject compact"),
+            ),
+            (
+                "inspect",
+                service
+                    .inspect_collection(Request::new(InspectCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        target: InspectTarget::Manifest as i32,
+                        segment_id: String::new(),
+                    }))
+                    .await
+                    .expect_err("control-only node should reject inspect"),
+            ),
+        ];
+
+        for (operation, error) in errors {
+            assert_eq!(
+                error.code(),
+                tonic::Code::InvalidArgument,
+                "{operation} should be rejected on control-only nodes"
+            );
+            assert!(
+                error.message().contains("data-plane operations"),
+                "{operation} should explain the role mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_remote_assignments_reject_data_plane_grpc_operations() {
+        let root = unique_temp_dir("grpc-recorded-route");
+        let initial = Arc::new(AppState::new(test_config_with_root(
+            "grpc-recorded-node-a",
+            NodeRole::Combined,
+            root.clone(),
+        )));
+        initial
+            .control
+            .create_collection(StorageCreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            })
+            .await
+            .expect("collection should be created");
+        drop(initial);
+
+        let state = Arc::new(AppState::new(test_config_with_root(
+            "grpc-recorded-node-b",
+            NodeRole::Combined,
+            root,
+        )));
+        let service = GrpcLogPoseService::new(state);
+
+        let errors = vec![
+            (
+                "write",
+                service
+                    .write_collection(Request::new(WriteCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        operations: vec![proto::WriteOperation {
+                            operation: Some(proto::write_operation::Operation::Put(
+                                proto::PutRecord {
+                                    id: "alpha".to_owned(),
+                                    vector: vec![1.0, 0.0],
+                                    metadata_json: r#"{"kind":"keep"}"#.to_owned(),
+                                },
+                            )),
+                        }],
+                    }))
+                    .await
+                    .expect_err("recorded remote writes should be rejected"),
+            ),
+            (
+                "query",
+                service
+                    .query_collection(Request::new(QueryCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        vector: vec![1.0, 0.0],
+                        top_k: 1,
+                        snapshot: None,
+                        filters: Vec::new(),
+                        predicate: None,
+                        explain: proto::ExplainMode::None as i32,
+                    }))
+                    .await
+                    .expect_err("recorded remote queries should be rejected"),
+            ),
+            (
+                "stats",
+                service
+                    .get_collection_stats(Request::new(GetCollectionStatsRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("recorded remote stats should be rejected"),
+            ),
+            (
+                "flush",
+                service
+                    .flush_collection(Request::new(FlushCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("recorded remote flush should be rejected"),
+            ),
+            (
+                "compact",
+                service
+                    .compact_collection(Request::new(CompactCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                    }))
+                    .await
+                    .expect_err("recorded remote compaction should be rejected"),
+            ),
+            (
+                "inspect",
+                service
+                    .inspect_collection(Request::new(InspectCollectionRequest {
+                        collection_name: "documents".to_owned(),
+                        target: InspectTarget::Manifest as i32,
+                        segment_id: String::new(),
+                    }))
+                    .await
+                    .expect_err("recorded remote inspect should be rejected"),
+            ),
+        ];
+
+        for (operation, error) in errors {
+            assert_eq!(
+                error.code(),
+                tonic::Code::InvalidArgument,
+                "{operation} should be rejected for recorded remote assignments"
+            );
+            assert!(
+                error.message().contains("not locally served"),
+                "{operation} should explain the recorded placement mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn grpc_service_maps_missing_collections_to_not_found() {
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-missing"))));
 
@@ -962,6 +1368,44 @@ mod tests {
             .expect_err("missing collection should error");
 
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn grpc_service_maps_missing_collection_placement_to_not_found() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
+            "grpc-missing-placement",
+        ))));
+
+        let error = service
+            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
+                collection_name: "missing".to_owned(),
+            }))
+            .await
+            .expect_err("missing collection placement should error");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn grpc_service_rejects_zero_dimensions_for_collection_creation() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-dimensions"))));
+
+        let error = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 0,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect_err("zero dimensions should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("dimensions must be greater than 0")
+        );
     }
 
     #[tokio::test]
@@ -1253,9 +1697,22 @@ mod tests {
     }
 
     fn test_config(label: &str) -> LogPoseConfig {
+        test_config_with_role(label, NodeRole::Combined)
+    }
+
+    fn test_config_with_role(label: &str, node_role: NodeRole) -> LogPoseConfig {
+        test_config_with_root(label, node_role, unique_temp_dir(label))
+    }
+
+    fn test_config_with_root(
+        label: &str,
+        node_role: NodeRole,
+        storage_root: PathBuf,
+    ) -> LogPoseConfig {
         LogPoseConfig {
             node_name: label.to_owned(),
-            storage_root: unique_temp_dir(label),
+            node_role,
+            storage_root,
             ..LogPoseConfig::default()
         }
     }

@@ -7,7 +7,6 @@ use logpose_query::{
     ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
     QueryResponse, ScalarMetadataValue,
 };
-use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionStats, CommitAck, DeleteRecord, DistanceMetric, MaintenanceStatus, PutRecord,
@@ -281,15 +280,15 @@ pub async fn run_service_scenarios() {
 async fn run_seeded_service_scenario(seed: u64, steps: usize) {
     let root = unique_temp_dir(&format!("service-random-{seed}"));
     let state = Arc::new(AppState::new(test_config(&root)));
-    let service = Arc::clone(&state.service);
     let rest = logpose_api_rest::router(Arc::clone(&state));
-    let grpc = GrpcLogPoseService::new(state);
+    let grpc = GrpcLogPoseService::new(Arc::clone(&state));
     let mut rng = StdRng::seed_from_u64(seed);
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
     let mut snapshots = Vec::new();
 
-    let descriptor = service
+    let descriptor = state
+        .control
         .create_collection(CreateCollectionRequest {
             name: COLLECTION_NAME.to_owned(),
             dimensions: RECORD_DIMENSIONS,
@@ -318,7 +317,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                         })
                     })
                     .collect::<Vec<_>>();
-                let ack = service
+                let ack = state
                     .write(COLLECTION_NAME, operations.clone())
                     .await
                     .unwrap_or_else(|error| {
@@ -331,7 +330,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 let operations = vec![WriteOperation::Delete(DeleteRecord {
                     id: RecordId::new(id),
                 })];
-                let ack = service
+                let ack = state
                     .write(COLLECTION_NAME, operations.clone())
                     .await
                     .unwrap_or_else(|error| {
@@ -341,7 +340,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
             }
             ServiceAction::Snapshot => {
-                let snapshot = service
+                let snapshot = state
                     .snapshot(COLLECTION_NAME)
                     .await
                     .unwrap_or_else(|error| {
@@ -356,7 +355,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 keep_only,
             } => {
                 assert_query_parity(
-                    &service,
+                    &state,
                     &rest,
                     &grpc,
                     &model,
@@ -381,7 +380,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                     )
                 });
                 assert_query_parity(
-                    &service,
+                    &state,
                     &rest,
                     &grpc,
                     &model,
@@ -394,12 +393,9 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 .await;
             }
             ServiceAction::Flush => {
-                let snapshot = service
-                    .flush(COLLECTION_NAME)
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic_with_context(seed, &trace, format!("flush failed: {error}"))
-                    });
+                let snapshot = state.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
+                    panic_with_context(seed, &trace, format!("flush failed: {error}"))
+                });
                 model.record_flush();
                 assert_eq_with_context(
                     seed,
@@ -410,7 +406,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 );
             }
             ServiceAction::Compact => {
-                let snapshot = service
+                let snapshot = state
                     .compact(COLLECTION_NAME)
                     .await
                     .unwrap_or_else(|error| {
@@ -426,11 +422,11 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 );
             }
             ServiceAction::Stats => {
-                assert_stats_parity(&service, &rest, &grpc, &model, seed, &trace).await;
+                assert_stats_parity(&state, &rest, &grpc, &model, seed, &trace).await;
             }
             ServiceAction::InspectManifest => {
                 assert_inspect_parity(
-                    &service,
+                    &state,
                     &rest,
                     &grpc,
                     &model,
@@ -442,7 +438,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
             }
             ServiceAction::InspectWal => {
                 assert_inspect_parity(
-                    &service,
+                    &state,
                     &rest,
                     &grpc,
                     &model,
@@ -453,7 +449,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 .await;
             }
             ServiceAction::InspectSegment => {
-                assert_inspect_segment_parity(&service, &rest, &grpc, &model, seed, &trace).await;
+                assert_inspect_segment_parity(&state, &rest, &grpc, &model, seed, &trace).await;
             }
         }
     }
@@ -532,7 +528,7 @@ fn generate_put_batch(rng: &mut StdRng) -> Vec<TestRecord> {
 
 #[allow(clippy::too_many_arguments)]
 async fn assert_query_parity(
-    service: &LogPoseDataService,
+    state: &AppState,
     rest: &axum::Router,
     grpc: &GrpcLogPoseService,
     model: &ExpectedModel,
@@ -552,12 +548,9 @@ async fn assert_query_parity(
         predicate: keep_only.then(keep_only_predicate),
         explain: ExplainMode::None,
     };
-    let actual = service
-        .query(request.clone())
-        .await
-        .unwrap_or_else(|error| {
-            panic_with_context(seed, trace, format!("service query failed: {error}"))
-        });
+    let actual = state.query(request.clone()).await.unwrap_or_else(|error| {
+        panic_with_context(seed, trace, format!("service query failed: {error}"))
+    });
     let expected = model.expected_query_response(
         &vector,
         snapshot.unwrap_or_else(|| model.current_snapshot()),
@@ -647,7 +640,7 @@ async fn assert_query_parity(
         explain: ExplainMode::Profile,
         ..request.clone()
     };
-    let profiled_service = service
+    let profiled_service = state
         .query(profiled_request.clone())
         .await
         .unwrap_or_else(|error| {
@@ -811,19 +804,16 @@ async fn assert_query_parity(
 }
 
 async fn assert_stats_parity(
-    service: &LogPoseDataService,
+    state: &AppState,
     rest: &axum::Router,
     grpc: &GrpcLogPoseService,
     model: &ExpectedModel,
     seed: u64,
     trace: &[ServiceAction],
 ) {
-    let actual = service
-        .stats(COLLECTION_NAME)
-        .await
-        .unwrap_or_else(|error| {
-            panic_with_context(seed, trace, format!("service stats failed: {error}"))
-        });
+    let actual = state.stats(COLLECTION_NAME).await.unwrap_or_else(|error| {
+        panic_with_context(seed, trace, format!("service stats failed: {error}"))
+    });
     let expected = model.expected_stats();
     assert_eq_with_context(
         seed,
@@ -1058,7 +1048,7 @@ async fn assert_stats_parity(
 }
 
 async fn assert_inspect_parity(
-    service: &LogPoseDataService,
+    state: &AppState,
     rest: &axum::Router,
     grpc: &GrpcLogPoseService,
     model: &ExpectedModel,
@@ -1073,7 +1063,7 @@ async fn assert_inspect_parity(
         InspectTarget::Maintenance => "maintenance",
     };
 
-    let actual = service
+    let actual = state
         .inspect(COLLECTION_NAME, target.clone())
         .await
         .unwrap_or_else(|error| {
@@ -1152,15 +1142,15 @@ async fn assert_inspect_parity(
 }
 
 async fn assert_inspect_segment_parity(
-    service: &LogPoseDataService,
+    state: &AppState,
     rest: &axum::Router,
     grpc: &GrpcLogPoseService,
     model: &ExpectedModel,
     seed: u64,
     trace: &[ServiceAction],
 ) {
-    let manifest = service
-        .inspect_manifest(COLLECTION_NAME)
+    let manifest = state
+        .inspect(COLLECTION_NAME, InspectTarget::Manifest)
         .await
         .unwrap_or_else(|error| {
             panic_with_context(seed, trace, format!("manifest inspect failed: {error}"))
@@ -1181,8 +1171,8 @@ async fn assert_inspect_segment_parity(
         })
         .to_owned();
 
-    let actual = service
-        .inspect_segment(COLLECTION_NAME, segment_id.clone())
+    let actual = state
+        .inspect(COLLECTION_NAME, InspectTarget::Segment(segment_id.clone()))
         .await
         .unwrap_or_else(|error| {
             panic_with_context(

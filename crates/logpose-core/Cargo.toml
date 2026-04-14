@@ -9,7 +9,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+logpose-catalog = { path = "../logpose-catalog" }
 logpose-config = { path = "../logpose-config" }
+logpose-query = { path = "../logpose-query" }
 logpose-service = { path = "../logpose-service" }
+logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
