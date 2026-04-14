@@ -11,9 +11,13 @@ Example:
 
 ```bash
 export LOGPOSE_CONFIG='node_name = "edge-a"
+node_role = "combined"
 rest_host = "0.0.0.0"
 rest_port = 8080
 grpc_host = "0.0.0.0"
 grpc_port = 50051
-log_filter = "info,logpose=debug"'
+log_filter = "info,logpose=debug"
+storage_root = ".logpose-edge-a"'
 ```
+
+When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is provided, the remaining fields should still be present in the TOML payload.

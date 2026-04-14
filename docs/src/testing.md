@@ -86,6 +86,7 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 - a seeded, replayable state-machine harness at the storage boundary
 - seeded service and transport harnesses that exercise planner-controlled ANN, hybrid merge, and profile diagnostics paths
+- deterministic service-boundary simulation scenarios for control-plane/runtime status, placement diagnostics, persistence/recovery behavior, recorded placement, and wrong-plane rejection, with REST and gRPC parity checks focused on the same read-side operator contracts
 - continued explicit regression coverage for storage atomicity and corruption cases
 - deterministic exact-vs-ANN regression suites and recall checks for immutable HNSW units
 - reproducible Criterion benchmarks that pair exact baselines with planner-selected unfiltered ANN, filtered ANN, and tiny exact-fallback queries on fixed corpora
@@ -99,8 +100,8 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 ### Later
 
-- simulation-style harnesses for multi-component workflows
-- restart and recovery orchestration tests
+- broader simulation-style harnesses for multi-component workflows
+- deeper restart and recovery orchestration tests beyond the current control-plane boundary
 - fault-injection around process, disk, transport, and time behavior where LogPose gains those boundaries
 
 ## Non-Negotiable Harness Rules
