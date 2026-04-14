@@ -270,7 +270,7 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
         .expect("placement should load");
 
     assert_eq!(status.role, logpose_types::NodeRole::Control);
-    assert!(status.control_plane_ready);
+    assert!(!status.control_plane_ready);
     assert!(!status.data_plane_ready);
     assert_eq!(status.collection_count, 0);
     assert_eq!(status.collections.len(), 1);

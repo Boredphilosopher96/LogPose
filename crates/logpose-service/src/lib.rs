@@ -344,10 +344,7 @@ impl LogPoseControlService {
             rest_endpoint: http_endpoint(&self.config.rest_host, self.config.rest_port),
             grpc_endpoint: http_endpoint(&self.config.grpc_host, self.config.grpc_port),
             storage_engine: self.data.engine_name().await.to_owned(),
-            control_plane_ready: matches!(
-                self.config.node_role,
-                NodeRole::Combined | NodeRole::Control
-            ),
+            control_plane_ready: matches!(self.config.node_role, NodeRole::Combined),
             data_plane_ready: matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data),
             collection_count: placements
                 .iter()
