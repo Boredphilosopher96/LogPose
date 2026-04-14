@@ -14,10 +14,10 @@ use logpose_index::{
     write_flat_index, write_hnsw_index,
 };
 use logpose_types::{
-    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionStats, CommitAck,
-    DistanceMetric, LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats,
-    QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
+    CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus, NodeRole,
+    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo,
+    Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
 use serde::{Deserialize, Serialize};
@@ -1207,7 +1207,7 @@ impl StorageEngine for LocalStorageEngine {
         self.create_collection_internal(
             request,
             Some(&CollectionAssignment {
-                assigned_node: "local".to_owned(),
+                assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
                 assigned_role: NodeRole::Data,
             }),
         )

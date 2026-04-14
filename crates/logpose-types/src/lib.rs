@@ -10,6 +10,8 @@ use uuid::Uuid;
 pub type Result<T> = std::result::Result<T, LogPoseError>;
 /// Product name surfaced by operator-visible metadata endpoints.
 pub const PRODUCT_NAME: &str = "LogPose";
+/// Reserved placement token for collections created through anonymous local storage paths.
+pub const ANONYMOUS_LOCAL_NODE_NAME: &str = "local";
 
 /// Top-level workspace error.
 #[derive(Debug, Error)]
