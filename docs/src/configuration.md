@@ -21,3 +21,5 @@ storage_root = ".logpose-edge-a"'
 ```
 
 When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is provided, the remaining fields should still be present in the TOML payload.
+
+`node_name` must not be `local`. That token is reserved for anonymous local placement metadata created by raw storage-engine workflows.

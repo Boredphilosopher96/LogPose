@@ -1,6 +1,6 @@
 //! Configuration loading for LogPose services and tooling.
 
-use logpose_types::{LogPoseError, NodeRole, Result};
+use logpose_types::{ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, NodeRole, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -42,17 +42,34 @@ impl Default for LogPoseConfig {
 }
 
 impl LogPoseConfig {
+    /// Validate configuration invariants that must hold before runtime bootstrap.
+    pub fn validate(&self) -> Result<()> {
+        if self.node_name == ANONYMOUS_LOCAL_NODE_NAME {
+            return Err(LogPoseError::Message(format!(
+                "invalid LOGPOSE_CONFIG: node_name '{}' is reserved for anonymous local placement metadata",
+                ANONYMOUS_LOCAL_NODE_NAME
+            )));
+        }
+        Ok(())
+    }
+
     /// Parse configuration from a TOML string.
     pub fn from_toml_str(value: &str) -> Result<Self> {
-        toml::from_str(value)
-            .map_err(|error| LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {error}")))
+        let config: Self = toml::from_str(value)
+            .map_err(|error| LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {error}")))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load configuration from `LOGPOSE_CONFIG` when provided, otherwise use defaults.
     pub fn load() -> Result<Self> {
         match std::env::var("LOGPOSE_CONFIG") {
             Ok(value) if !value.trim().is_empty() => Self::from_toml_str(&value),
-            _ => Ok(Self::default()),
+            _ => {
+                let config = Self::default();
+                config.validate()?;
+                Ok(config)
+            }
         }
     }
 }
@@ -99,5 +116,21 @@ storage_root = "tmp/logpose-data""#,
         .expect("config should load");
 
         assert_eq!(config.node_role, NodeRole::Combined);
+    }
+
+    #[test]
+    fn from_toml_str_rejects_reserved_local_node_name() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "local"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data""#,
+        )
+        .expect_err("reserved anonymous local node name should be rejected");
+
+        assert!(error.to_string().contains("reserved"));
     }
 }

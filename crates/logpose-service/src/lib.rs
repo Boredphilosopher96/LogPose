@@ -29,8 +29,9 @@ use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_types::{
-    BuildInfo, CollectionAssignment, CollectionPlacement, CollectionStats, CommitAck, LogPoseError,
-    MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, Snapshot, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement,
+    CollectionStats, CommitAck, LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeRole,
+    NodeRuntimeStatus, Snapshot, WriteOperation,
 };
 use std::{fmt, net::IpAddr, path::Path, sync::Arc};
 use thiserror::Error;
@@ -363,7 +364,7 @@ impl LogPoseControlService {
         assignment: &CollectionAssignment,
     ) -> CollectionPlacement {
         let assignment_targets_this_runtime = assignment.assigned_node == self.config.node_name
-            || assignment.assigned_node == "local";
+            || assignment.assigned_node == ANONYMOUS_LOCAL_NODE_NAME;
         let serves_local_assignment = assignment_targets_this_runtime
             && match assignment.assigned_role {
                 NodeRole::Combined => self.config.node_role == NodeRole::Combined,
@@ -395,19 +396,21 @@ impl LogPoseControlService {
                 assignment.assigned_role,
                 self.config.node_role,
             ) {
-                (true, _, "local", NodeRole::Combined, NodeRole::Combined) => {
+                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Combined, NodeRole::Combined) => {
                     "anonymous local combined assignment".to_owned()
                 }
-                (true, _, "local", NodeRole::Data, NodeRole::Combined) => {
+                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Combined) => {
                     "anonymous local data-plane assignment".to_owned()
                 }
-                (true, _, "local", NodeRole::Data, NodeRole::Data) => {
+                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Data) => {
                     "anonymous local data-plane assignment".to_owned()
                 }
-                (false, true, "local", assigned_role, NodeRole::Control) => format!(
-                    "anonymous local {assigned_role} assignment is recorded while this process runs as control-only"
-                ),
-                (false, true, "local", assigned_role, current_role) => format!(
+                (false, true, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, NodeRole::Control) => {
+                    format!(
+                        "anonymous local {assigned_role} assignment is recorded while this process runs as control-only"
+                    )
+                }
+                (false, true, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, current_role) => format!(
                     "anonymous local {assigned_role} assignment is recorded while this process runs as {current_role}"
                 ),
                 (true, _, _, NodeRole::Combined, NodeRole::Combined) => {

@@ -31,6 +31,9 @@ impl AppState {
     /// Construct shared state from configuration.
     #[must_use]
     pub fn new(config: LogPoseConfig) -> Self {
+        config
+            .validate()
+            .expect("invalid runtime configuration for AppState");
         let build = BuildInfo::current();
         let data = Arc::new(LogPoseDataService::new(Arc::new(LocalStorageEngine::new(
             &config.storage_root,
@@ -146,5 +149,25 @@ impl AppState {
             "collection '{collection_name}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
             placement.assigned_node, placement.assigned_role, self.config.node_name
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_reserved_anonymous_local_node_name_at_runtime_bootstrap() {
+        let result = std::panic::catch_unwind(|| {
+            AppState::new(LogPoseConfig {
+                node_name: "local".to_owned(),
+                ..LogPoseConfig::default()
+            })
+        });
+
+        assert!(
+            result.is_err(),
+            "reserved anonymous local node name should panic"
+        );
     }
 }
