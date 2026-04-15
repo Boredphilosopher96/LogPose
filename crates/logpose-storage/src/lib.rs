@@ -563,7 +563,7 @@ impl LocalStorageEngine {
         if pending_checkpoint == manifest.checkpoint_seq_no {
             let mut wal_writer = WalWriter::open(Self::active_wal_path(descriptor))?;
             wal_writer.truncate()?;
-            cleanup_file(&marker_path);
+            remove_file_if_exists(&marker_path, "failed to clear pending WAL rotation marker")?;
             return Ok(true);
         }
 
@@ -1346,6 +1346,14 @@ fn publish_segment_artifacts(
 
 fn cleanup_file(path: &Path) {
     let _ = fs::remove_file(path);
+}
+
+fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_message(context, error)),
+    }
 }
 
 #[async_trait]
