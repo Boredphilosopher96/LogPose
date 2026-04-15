@@ -67,6 +67,28 @@ Use epoch-based ownership instead of implicit trust in node names. A node should
 
 Start with one authoritative metadata control domain, not active-active global writes. Multi-cluster should first mean shared authoritative metadata plus remote consumers and replicas. Global multi-writer metadata is a later problem.
 
+## What etcd Gives And What LogPose Must Still Build
+
+etcd is the metadata substrate, not the distributed database itself.
+
+What etcd gives LogPose directly:
+
+- strongly consistent metadata writes
+- watchable metadata revisions for routing and cache invalidation
+- leases for liveness and membership heartbeats
+- compare-and-swap transactions for ownership epochs and promotions
+- building blocks for controller leader election
+
+What LogPose still has to build on top of etcd:
+
+- node membership semantics and health rules
+- controller election policy and fencing for old leaders
+- shard and replica placement policy
+- failover and promotion state machines
+- replica catch-up and repair logic
+- query and write consistency-mode contracts
+- data-plane split-brain prevention and ownership enforcement
+
 ## Consistency Modes To Add
 
 Keep metadata writes strongly consistent by default. Placement, failover, and lifecycle changes should be linearizable.
@@ -96,7 +118,8 @@ The system should document which APIs allow which modes. Consistency should be a
 
 ### 3. Control Loops
 
-- membership registration through leases
+- membership registration through leases plus watch-driven cache updates
+- controller leader election, leader handoff, and fencing
 - placement and rebalance control
 - failover and promotion control
 - repair and catch-up control for lagging replicas
@@ -118,7 +141,7 @@ The system should document which APIs allow which modes. Consistency should be a
 This milestone should extend the current testing ladder upward, not replace it.
 
 - unit-test revision handling, CAS failures, lease expiry, and watch replay logic
-- integration-test real etcd snapshot plus watch catch-up, watch compaction, lease loss, and transactional placement updates
+- integration-test real etcd snapshot plus watch catch-up, watch compaction, lease loss, election handoff, and transactional placement updates
 - add deterministic failover simulations for owner loss during write, flush, and index publication
 - add multi-process tests with several metadata members and multiple LogPose nodes
 - add metadata fault-injection inspired by Milvus' etcd chaos tests
@@ -128,8 +151,10 @@ This milestone should extend the current testing ladder upward, not replace it.
 
 - etcd-backed metadata is authoritative for catalog, placement, and failover-critical state
 - nodes register membership through leases and lose liveness by lease expiry
+- controller leader election and fencing are explicit and tested
 - placement is shard and replica-aware, not just collection-to-node local metadata
 - ownership is epoch-based and prevents double serving
+- failover and promotion behavior are deterministic and operator-visible
 - at least one client-visible consistency contract exists beyond local-node behavior
 - operators can inspect metadata revision, ownership epoch, replica health, and failover reasons
 - deterministic simulation and multi-process tests cover metadata loss, failover, and recovery
