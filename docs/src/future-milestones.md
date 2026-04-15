@@ -26,6 +26,7 @@ What remains is the next layer of system work: turning those local contracts int
 | Full-System Simulation | Move from local and service-boundary harnesses to deterministic system simulation | TigerBeetle-style seeded simulation with virtual time, network and crash faults, replayability, safety checks, and liveness checks | Multi-node simulator campaigns, replayable failures, and healthy-core convergence testing in CI | [Details](./future-milestones/full-system-simulation.md) |
 | Web GUI | Move from CLI plus raw API surfaces to a real operator and developer console | Browser-based runtime, collection, query, inspect, and maintenance workflows | Browser end-to-end coverage plus API contract tests for all UI-backed operations | [Details](./future-milestones/web-gui.md) |
 | Blob Storage Integration | Move immutable artifacts from local-only files to real object storage | MinIO and S3-backed segment and index bundles, remote sync, recovery, and operator-visible durability state | MinIO-backed integration suites, remote failure injection, restart reconciliation, and GC correctness tests | [Details](./future-milestones/blob-storage-integration.md) |
+| Endgoal Convergence and Missing Capabilities | Close the remaining gap between the current milestone set and the `better-vector-db.md` endgoal | Adaptive residency, memory-aware planning, SIMD vector kernels, disk-native serving, and broader filtered-search strategy work are explicitly owned | Memory-sensitive benchmarks, kernel correctness checks, cold-versus-warm plan validation, and broader filtered-search strategy coverage | [Details](./future-milestones/endgoal-convergence-and-missing-capabilities.md) |
 
 ## Cross-Cutting Rules
 
@@ -44,6 +45,7 @@ Some missing work does not need its own chapter yet because it is part of the mi
 - auth, RBAC, and auditability belong inside the Web GUI and multi-cluster/operator stories
 - richer metrics and readiness belong inside the Web GUI and simulation stories
 - deeper fuzz/property work remains part of the testing ladder and should advance alongside new storage and index artifacts
+- adaptive memory management, SIMD kernels, and broader filtered-search strategy work are captured in the endgoal convergence chapter so the roadmap stays aligned with `better-vector-db.md`
 
 ## How To Use This Section
 
