@@ -5,7 +5,7 @@ LogPose exposes two integration surfaces:
 - REST for straightforward HTTP-based control-plane and data-plane operations
 - gRPC for strongly typed, high-performance service integrations over the same core workflows
 
-Current public workflows include:
+## Current Public Workflows
 
 - runtime status with node role, configured listener wiring, collection placement summaries, and maintenance backlog totals for locally servable collections
 - collection placement diagnostics with route kind and human-readable route reason
@@ -18,6 +18,16 @@ Current public workflows include:
 - transport-parity control-plane contracts for runtime status and collection placement alongside the existing data-plane workflows
 
 The REST and gRPC surfaces are expected to describe the same core workflows and to stay aligned with the shared application layer, even when a given transport exposes slightly different ergonomics.
+
+## Current Limits
+
+The public APIs do not yet provide:
+
+- multi-node control-plane coordination or consistency-mode selection
+- collection listing or delete/drop lifecycle endpoints
+- record-browse or scroll-style inspection endpoints
+- browser-ready authentication or RBAC enforcement
+- remote blob-storage configuration for collection creation
 
 Contract sources live in:
 

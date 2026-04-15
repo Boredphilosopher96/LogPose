@@ -1,6 +1,6 @@
 # Future Milestones
 
-This section turns LogPose's architecture direction into a long-term delivery roadmap.
+This section now tracks only the major capabilities that are still missing from LogPose.
 
 It is meant to be used alongside:
 
@@ -8,79 +8,48 @@ It is meant to be used alongside:
 - [Better Vector DB Architecture](./better-vector-db.md) for the target system shape
 - [Testing](./testing.md) for the long-term testing ladder
 
-This roadmap is intentionally two-layered:
+The original phase roadmap is complete. LogPose already has:
 
-- this page stays high-level and explains the whole program arc
-- the phase pages go lower-level and describe what each component should change over time
+- local filesystem durability with WAL, manifests, immutable segments, and maintenance recovery
+- planner-led exact, ANN, and hybrid query execution
+- operator-visible runtime status, placement diagnostics, stats, and inspect surfaces
+- layered integration, randomized, process-boundary, and deterministic service-boundary testing
 
-## Destination
+What remains is the next layer of system work: turning those local contracts into resilient multi-node behavior, broadening the vector operator family, deepening the testing model, and adding the missing product surfaces around storage and operations.
 
-The end-state for LogPose is not "an ANN service with metadata support."
+## Remaining Milestone Map
 
-It is a database-shaped retrieval engine with:
-
-- write-friendly mutable plus immutable storage
-- explicit visibility, freshness, and delete semantics
-- a planner that treats vector search as a first-class physical operator
-- ANN as one operator family inside that planner, not the center of the architecture
-- adaptive memory and observability instead of operator-managed residency by default
-- a testing ladder that grows from unit and integration coverage into generative, fuzzing, and simulation-style system testing
-
-## Starting Point
-
-Today, LogPose already has the beginnings of the local database core:
-
-- a layered Rust workspace with focused crates
-- REST and gRPC service surfaces
-- planner-led exact query with structured predicates and explain/profile diagnostics
-- durable local storage with mutable and immutable units, background maintenance, and recovery behavior
-- shared service orchestration across transports
-- seeded randomized harnesses at storage and service boundaries
-
-This section records how that base was turned into the architecture described in [Better Vector DB Architecture](./better-vector-db.md).
-
-## Component Map
-
-The phase pages refer to logical components rather than only one specific file or crate, but the current code homes are already visible in the workspace:
-
-| Component Area | Current Homes | Long-Term Role |
-| --- | --- | --- |
-| Storage and durability | `crates/logpose-storage`, `crates/logpose-catalog`, `crates/logpose-wal` | Mutable and immutable storage, manifests, compaction, recovery, layout statistics |
-| Query and planning | `crates/logpose-query` and future planner-oriented crates if needed | Exact execution today, then plan selection and hybrid operator orchestration |
-| Indexing | `crates/logpose-index` | ANN and vector indexing families under planner control |
-| Shared application layer | `crates/logpose-service`, `crates/logpose-core` | Request orchestration, validation, error mapping, shared runtime state |
-| Transport and operator surfaces | `crates/logpose-api-rest`, `crates/logpose-api-grpc`, `apps/logpose-cli`, `crates/logpose-client` | Stable external APIs, diagnostics, explain surfaces, admin workflows |
-| Runtime and operations | `apps/logpose-server`, `crates/logpose-config`, `crates/logpose-telemetry`, `crates/logpose-auth` | Service runtime, observability, policy, control-plane behaviors |
-| Testing and CI | crate-level `tests/`, workspace scripts, CI workflows, future harness directories | The full testing ladder from unit checks to simulation-oriented system testing |
-
-## Phase Map
-
-| Phase | Program Shift | Primary Outcome | Testing Shift | Details |
+| Milestone | Program Shift | Primary Outcome | Testing Shift | Details |
 | --- | --- | --- | --- | --- |
-| ~~1. Local Database Core~~ | ~~Finish the single-node exact-search database contract~~ | ~~Crisp APIs, explicit visibility rules, operator-ready workflows~~ | ~~Broaden unit, integration, and seeded generative harnesses~~ | ~~[Phase 1](./future-milestones/phase-1-local-database-core.md)~~ |
-| ~~2. Write-Friendly Storage~~ | ~~Move from simple local durability to a real mutable plus immutable storage model~~ | ~~Delta tier, tombstone-aware merge, compaction planning, richer storage stats~~ | ~~Seeded storage harnesses and corruption-focused recovery coverage establish the next testing layer, with deeper fuzz/property work left for later~~ | ~~[Phase 2](./future-milestones/phase-2-write-friendly-storage.md)~~ |
-| ~~3. Query Planning~~ | ~~Move from handcrafted exact query execution to plan-directed retrieval~~ | ~~Planner statistics, explain surfaces, scalar plus vector path selection~~ | ~~Planner oracles, explain snapshots, richer generative query scenarios~~ | ~~[Phase 3](./future-milestones/phase-3-query-planning.md)~~ |
-| ~~4. ANN and Hybrid Execution~~ | ~~Add ANN as a physical operator family under planner control~~ | ~~Exact and ANN hybrid execution with filtered retrieval strategies~~ | ~~Exact-vs-ANN correctness checks, ANN codec hardening, and benchmark discipline~~ | ~~[Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md)~~ |
-| ~~5. Distribution and Operations~~ | ~~Grow from single-node engine to service platform~~ | ~~Explicit control-plane/data-plane boundaries, placement diagnostics, operational control~~ | ~~Deterministic multi-component, restart, and simulation-oriented harnesses~~ | ~~[Phase 5](./future-milestones/phase-5-distribution-and-operations.md)~~ |
-| ~~6. Mature Platform~~ | ~~Finish the system and harden the end-state architecture~~ | ~~Planner-led retrieval database with mature operations and disciplined research extensions~~ | ~~Testing ladder established across core boundaries, with room to deepen fuzzing and simulation later~~ | ~~[Phase 6](./future-milestones/phase-6-mature-platform.md)~~ |
+| Multi-Cluster Metadata and Consistency | Move from local placement metadata to an authoritative distributed control plane | etcd-backed catalog, shard or replica ownership, failover, resilience, and explicit consistency modes | Multi-process metadata tests, watch and lease recovery, failover simulation, and fault-injection around metadata outages | [Details](./future-milestones/multicluster-metadata-and-consistency.md) |
+| Additional Vector Index Families | Move from one ANN family to planner-selected index families | IVF-based and compression-aware operators alongside HNSW, with better workload fit and richer explain surfaces | Exact-oracle validation, filtered-selectivity regressions, codec corruption tests, and family-specific benchmarks | [Details](./future-milestones/additional-vector-index-families.md) |
+| Full-System Simulation | Move from local and service-boundary harnesses to deterministic system simulation | TigerBeetle-style seeded simulation with virtual time, network and crash faults, replayability, safety checks, and liveness checks | Multi-node simulator campaigns, replayable failures, and healthy-core convergence testing in CI | [Details](./future-milestones/full-system-simulation.md) |
+| Web GUI | Move from CLI plus raw API surfaces to a real operator and developer console | Browser-based runtime, collection, query, inspect, and maintenance workflows | Browser end-to-end coverage plus API contract tests for all UI-backed operations | [Details](./future-milestones/web-gui.md) |
+| Blob Storage Integration | Move immutable artifacts from local-only files to real object storage | MinIO and S3-backed segment and index bundles, remote sync, recovery, and operator-visible durability state | MinIO-backed integration suites, remote failure injection, restart reconciliation, and GC correctness tests | [Details](./future-milestones/blob-storage-integration.md) |
 
 ## Cross-Cutting Rules
 
-The roadmap is phase-based, but a few rules should stay constant across all phases:
+The remaining work should still follow a few fixed rules:
 
-1. Storage and visibility rules come before clever ANN work.
-2. Planner quality comes before large-scale distribution of hybrid query behavior.
-3. Testing evolves with the architecture. Every new subsystem should advance the testing ladder described in [Testing](./testing.md).
-4. Operator ergonomics matter as much as raw query speed. Explainability, diagnostics, and maintenance controls are part of the product.
-5. Later research-heavy optimizations should land only after the storage, planning, and observability contracts are already solid.
+1. Metadata authority must come before real multi-node serving.
+2. New vector indexes must fit the planner model instead of bypassing it.
+3. Object storage and multi-cluster work should share one immutable-artifact contract rather than inventing competing durability paths.
+4. Simulation should deepen before chaos-style experimentation becomes the default systems test.
+5. Operator ergonomics, auth, and observability must grow with the runtime instead of arriving after it.
+
+## Additional Gaps Folded Into These Milestones
+
+Some missing work does not need its own chapter yet because it is part of the milestone set above:
+
+- auth, RBAC, and auditability belong inside the Web GUI and multi-cluster/operator stories
+- richer metrics and readiness belong inside the Web GUI and simulation stories
+- deeper fuzz/property work remains part of the testing ladder and should advance alongside new storage and index artifacts
 
 ## How To Use This Section
 
 Use the roadmap in two passes:
 
 - start on this page to decide where a proposal fits in the overall program
-- then use the matching phase page to understand the intended component changes, testing direction, and exit criteria
+- then use the matching milestone page to understand the intended component changes, research direction, testing strategy, and exit criteria
 
 If future design work changes the end-state architecture, update [Better Vector DB Architecture](./better-vector-db.md) first, then realign these milestones to match.
-
-**Done marker:** Phases 1, 2, 3, 4, 5, and 6 are complete and the documents on this page now reflect that status.

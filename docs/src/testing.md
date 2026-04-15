@@ -4,6 +4,26 @@ LogPose treats testing as part of system architecture, not as a final verificati
 
 Our long-term testing structure is explicitly inspired by TigerBeetle's layered strategy. The goal is not to copy TigerBeetle's exact infrastructure or claim parity with its maturity. The goal is to follow the same discipline: use multiple complementary harnesses, make failures reproducible, and keep production behavior under test whenever practical.
 
+## Current State
+
+LogPose already has a real testing stack, but it is not a full-system simulator yet.
+
+What exists today:
+
+- inline unit tests across storage, WAL, API, and supporting crates
+- crate-level integration and regression suites for storage, service, control-plane behavior, CLI workflows, and query planning
+- seeded randomized harnesses at the storage and service boundaries with replayable seeds and explicit models or oracles
+- deterministic service-boundary simulation scenarios for runtime status, placement, restart, recovery, and wrong-plane rejection
+- process-boundary CLI contract tests with snapshot baselines for operator-visible JSON output
+- exact-versus-ANN regressions, recall checks, and reproducible ANN benchmarks
+
+What does not exist yet:
+
+- a deterministic multi-node event-loop simulator
+- virtual time, simulated network faults, or simulated disk-fault scheduling
+- liveness campaigns that freeze faults outside a healthy core and require convergence
+- broader fuzz and property harnesses for WAL, manifests, sidecars, and operator input surfaces
+
 ## What We Are Basing This On
 
 The testing doctrine for LogPose is based on the public testing approach TigerBeetle has described across its engineering material:
@@ -22,7 +42,7 @@ LogPose organizes testing as a ladder from tight local checks to broader system 
 
 ### 1. Unit Tests
 
-Use unit tests for local pure behavior, validation logic, and private helper behavior that benefits from tight encapsulation.
+Use unit tests for local pure behavior, validation logic, codec rules, and private helper behavior that benefits from tight encapsulation.
 
 - keep these close to the code under test with `#[cfg(test)]`
 - use them for small, direct, non-workflow behavior
@@ -42,7 +62,7 @@ This is the first major TigerBeetle-inspired layer LogPose implemented, and it n
 
 Generative harnesses run seeded, replayable sequences of operations against real LogPose components and compare the observed results to an explicit oracle or model. These are not "random tests" in the loose sense. They are bounded, deterministic scenario generators with correctness checks.
 
-The first generative harness targeted the storage boundary, and the same pattern now also exists at the service boundary:
+The pattern exists today at both the storage boundary and the service boundary:
 
 - generated actions drive `LocalStorageEngine`
 - a model tracks expected logical visibility
@@ -51,7 +71,17 @@ The first generative harness targeted the storage boundary, and the same pattern
 
 This layer is the bridge between ordinary integration tests and future simulation-style system testing.
 
-### 4. Targeted Fuzzing and Property Tests
+### 4. Process-Boundary Operator Tests
+
+Process-boundary tests sit between local harnesses and true full-system simulation.
+
+- use real binaries and real transport boundaries when the operator contract matters
+- keep snapshot-style baselines for CLI output and other rendered operator surfaces
+- preserve transport parity checks for REST and gRPC where the same workflow must stay semantically aligned
+
+This layer already exists in LogPose through CLI server fixtures and snapshot contracts. It should keep growing as operator-facing surfaces become more important.
+
+### 5. Targeted Fuzzing and Property Tests
 
 The next deepening layer after those generative harnesses is subsystem fuzzing and property-style verification.
 
@@ -64,19 +94,20 @@ Near-term candidates include:
 
 These tests should focus on invariants and malformed-input behavior, not only on coverage volume.
 
-### 5. Simulation-Oriented System Testing
+### 6. Full-System Simulation
 
-The long-term target is a simulation-oriented layer for multi-component behavior. This is where LogPose moves closest to the TigerBeetle mindset for deterministic simulation testing.
+The long-term target is a deterministic full-system layer for multi-component and eventually multi-node behavior. This is where LogPose moves closest to the TigerBeetle mindset.
 
 Over time, this layer should cover scenarios such as:
 
 - process restart and recovery sequences
 - background maintenance interacting with foreground reads and writes
-- network or transport faults once distributed/runtime components exist
-- time-sensitive visibility and durability transitions
+- network delay, loss, reordering, duplication, and partition once remote runtime boundaries exist
+- time-sensitive visibility and durability transitions under virtual time
+- crash and restart behavior across multiple nodes
 - cluster or service-level orchestration behavior
 
-We do not need every component to have this layer immediately. We do need every new harness to fit into this structure so the repository evolves consistently toward it.
+The intended shape is a seeded event loop with replayable faults, explicit safety invariants, and later healthy-core liveness checks. The existing deterministic control-plane harness is a precursor to that system, not the finished version.
 
 ## Current Adoption Plan
 
@@ -99,12 +130,14 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 - deeper fuzz/property harnesses for WAL, manifests, HNSW sidecars, storage metadata, and CLI input surfaces
 - broader process-boundary validation beyond the current CLI and service operators
+- deterministic simulator seams for time, transport, and failure injection instead of only filesystem or service-local orchestration
 
 ### Later
 
-- broader simulation-style harnesses for multi-component workflows
-- deeper restart and recovery orchestration tests beyond the current control-plane boundary
-- fault-injection around process, disk, transport, and time behavior where LogPose gains those boundaries
+- a seeded multi-node simulator with virtual time, crash scheduling, and network-fault injection
+- healthy-core liveness campaigns inspired by TigerBeetle's public simulation work
+- deeper restart and recovery orchestration tests across metadata, storage, and remote serving boundaries
+- fault-injection around disk, transport, and background maintenance behavior once those seams are explicit
 
 ## Non-Negotiable Harness Rules
 
@@ -118,6 +151,7 @@ Every new generative, fuzzing, or simulation harness in LogPose should satisfy t
 6. Keep scenarios bounded so CI runtime remains predictable.
 7. Preserve focused regression tests for bugs and contracts that deserve named coverage even if a generative harness also reaches them.
 8. ANN-capable harnesses must compare approximate paths against an exact oracle or a documented recall envelope.
+9. Full-system simulation failures must save enough context to replay the failing seed and fault schedule.
 
 ## Test Placement Policy
 
