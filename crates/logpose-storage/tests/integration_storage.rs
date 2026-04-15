@@ -21,6 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
     let root = support::unique_temp_dir("storage-write-scan");
@@ -567,6 +570,69 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
     assert_eq!(visible[0].metadata["version"], json!(1));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
+    let root = support::unique_temp_dir("storage-pending-rotation-marker-perms");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    fs::write(
+        descriptor.root_path.join("wal").join("active.wal"),
+        b"corrupt checkpointed active wal",
+    )
+    .expect("corrupted active wal should be written");
+    fs::write(
+        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
+        flushed.visible_seq_no.to_string(),
+    )
+    .expect("pending rotation marker should be written");
+
+    let wal_dir = descriptor.root_path.join("wal");
+    let original_mode = fs::metadata(&wal_dir)
+        .expect("wal dir metadata should exist")
+        .permissions()
+        .mode();
+    fs::set_permissions(&wal_dir, fs::Permissions::from_mode(0o555))
+        .expect("wal dir should become read-only");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let result = reopened.stats("documents").await;
+
+    fs::set_permissions(&wal_dir, fs::Permissions::from_mode(original_mode))
+        .expect("wal dir permissions should be restored");
+
+    let error = result.expect_err("recovery should fail when the rotation marker survives");
+    assert!(
+        error.to_string().contains("pending WAL rotation marker"),
+        "unexpected error: {error}"
+    );
 }
 
 #[tokio::test]
