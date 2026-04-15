@@ -1,54 +1,54 @@
-# Phase 6: Mature Platform
+# ~~Phase 6: Mature Platform~~
+
+**Done marker:** Phase 6 is complete.
 
 ## Goal
 
-Finish LogPose as a mature retrieval database: planner-led, storage-principled, operationally transparent, and backed by a full layered testing strategy.
+Finish LogPose's first end-state architecture by hardening recovery, freezing operator-visible contracts, and making the testing ladder real across local, randomized, simulation, and process-boundary workflows.
 
 ## Architectural Shift
 
-This phase is not about changing the system's center again.
+Earlier phases established the main architecture: write-friendly storage, planner-led exact and ANN execution, and explicit control-plane/data-plane runtime boundaries.
 
-It is about completing and hardening the architecture the earlier phases built:
+This final phase made that architecture mature enough to extend instead of still reinterpret:
 
-- database-shaped storage and visibility semantics
-- planner-driven exact and ANN execution
-- adaptive memory and observability
-- service-level operational discipline
+- recovery now distinguishes live WAL state from checkpoint-covered history even in crash-window edge cases
+- operator-visible CLI contracts are locked in with snapshot-style tests instead of ad hoc assertions alone
+- CI gives conventional tests, randomized harnesses, and operator-contract checks dedicated execution lanes without pretending that all compilation work is fully disaggregated
 
-Any later research-heavy optimizations should fit inside that architecture instead of redefining it.
+The result is a repository whose operational and verification surfaces are part of the product boundary, not follow-up work.
 
-## Component Changes
+## Delivered Changes
 
-| Component | Change Needed |
+| Component | Delivered Change |
 | --- | --- |
-| Planner and execution | Refine cost models, filtered ANN strategies, and workload-aware operator selection without abandoning explainability |
-| Storage and layout | Improve tier layouts, compaction policies, and remote storage behavior based on real workload evidence |
-| Indexing and acceleration | Add carefully chosen advanced options such as better filtered ANN methods, disaggregated-memory-aware layouts, or GPU-assisted execution only where they fit the established planner and storage model |
-| Operator surfaces | Mature explain, profile, diagnostics, and safety rails so operators can trust the system in real deployments |
-| Product ergonomics | Harden CLI, API, configuration, and policy workflows so the engine is practical for repeated operation, not only development use |
-| Docs and governance | Keep architecture, roadmap, testing, and operational docs current enough that future contributors can extend the system without re-deriving its intent |
+| Storage recovery | WAL replay is now checkpoint-aware before parsing archived files, and recovery preserves the old `seq_no > checkpoint` rule so stale rolled corruption and crash-window leftovers in `active.wal` do not re-enter the mutable delta |
+| CLI operator contracts | LogPose now keeps snapshot-style baselines for runtime status, placement diagnostics, query explain/profile output, and selected inspect surfaces (`wal`, `manifest`, and `segment`) using normalized but still operator-meaningful JSON contracts |
+| Test support | Shared CLI server fixtures now wait for both REST and gRPC listeners and clean up temporary roots, reducing harness races and temp-dir litter |
+| CI layering | The workspace test job now skips dedicated hardening suites at execution time, while randomized service coverage and CLI operator-contract snapshots run in their own workflows beside the existing randomized storage lane |
+| Docs and roadmap | Testing and milestone docs now describe the delivered hardening work instead of leaving the final phase as an aspirational bucket |
 
-## End-State Characteristics
+## What "Done" Looks Like
 
-By the end of this phase, LogPose should look like:
+- replay and reopen behavior stays correct when checkpointed WAL files are corrupted or when checkpointed frames remain in `active.wal` after a crash window
+- runtime status, placement diagnostics, query diagnostics, and selected inspect surfaces have stable contract tests at the CLI boundary
+- randomized storage, randomized service, simulation-style service tests, and process-boundary CLI workflows all have a clear home in the testing ladder
+- CI failures point to the right class of problem instead of collapsing all verification into one undifferentiated test job
+- future work can focus on extensions and optimizations instead of still repairing the system contract
 
-- a retrieval engine that behaves like a database instead of a bundle of special-case vector features
-- a planner-led system where ANN is powerful but not architecturally privileged
-- a service platform with explicit maintenance, memory, and visibility contracts
-- a repository whose testing strategy scales with system complexity rather than collapsing under it
+Phase 6 is done.
 
 ## Testing Direction
 
-The full testing ladder should be active by this point:
+This phase establishes the full shape of the testing ladder described in [Testing](../testing.md) across the current core boundaries:
 
-- strong unit and regression coverage
-- broad seeded generative harnesses around real subsystems and service boundaries
-- targeted fuzzing and property-style verification for codecs, manifests, protocols, and edge-case state transitions
-- snapshot tests for stable operator-visible output where they improve clarity
-- deterministic simulation-oriented system harnesses for restart, failure, timing, and orchestration behavior
-- binary-level or process-boundary validation where real deployment surfaces need to be exercised directly
+- focused unit and regression coverage remains the local foundation
+- seeded randomized harnesses now exist at both storage and service boundaries
+- snapshot-style assertions protect stable operator-visible CLI JSON contracts for status, placement, query diagnostics, and selected inspect surfaces
+- deterministic simulation-oriented service tests cover restart, placement, wrong-plane rejection, and runtime-boundary behavior
+- process-boundary validation now includes real CLI-to-server contract checks plus a dedicated operator-contract lane in CI
 
-This is the point where LogPose should most closely resemble the testing discipline described in [Testing](../testing.md), including durable replayability and harnesses that remain useful as the system grows.
+Further fuzzing or workload-specific verification can deepen that ladder later, but the categories themselves are now present and integrated into normal development.
 
 ## What Comes After
 
@@ -61,4 +61,4 @@ They should be framed as:
 - deployment-specific runtime improvements
 - product polish and ecosystem work
 
-That distinction matters. It means the architecture is no longer still being invented in public; it is being extended carefully.
+That distinction matters. LogPose is no longer still inventing its core architecture in public; it is extending a hardened one.

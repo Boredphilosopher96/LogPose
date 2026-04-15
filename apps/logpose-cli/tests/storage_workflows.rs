@@ -2,6 +2,7 @@
 
 use anyhow as _;
 use clap as _;
+use insta as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
 use logpose_client as _;
@@ -15,7 +16,7 @@ use serde as _;
 use serde_json as _;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,10 +24,10 @@ use tokio as _;
 
 #[test]
 fn query_rejects_malformed_vector_as_cli_validation() {
-    let temp_root = unique_temp_dir("cli-query-invalid-vector");
+    let temp_root = TempRoot::new("cli-query-invalid-vector");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "query",
@@ -47,10 +48,10 @@ fn query_rejects_malformed_vector_as_cli_validation() {
 
 #[test]
 fn query_requires_complete_snapshot_pair_as_cli_validation() {
-    let temp_root = unique_temp_dir("cli-query-invalid-snapshot");
+    let temp_root = TempRoot::new("cli-query-invalid-snapshot");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "query",
@@ -72,10 +73,10 @@ fn query_requires_complete_snapshot_pair_as_cli_validation() {
 
 #[test]
 fn query_rejects_non_scalar_filter_values_as_cli_validation() {
-    let temp_root = unique_temp_dir("cli-query-invalid-filter");
+    let temp_root = TempRoot::new("cli-query-invalid-filter");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "query",
@@ -97,10 +98,10 @@ fn query_rejects_non_scalar_filter_values_as_cli_validation() {
 
 #[test]
 fn query_rejects_unsupported_where_operators_as_cli_validation() {
-    let temp_root = unique_temp_dir("cli-query-invalid-where");
+    let temp_root = TempRoot::new("cli-query-invalid-where");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "query",
@@ -122,12 +123,12 @@ fn query_rejects_unsupported_where_operators_as_cli_validation() {
 
 #[test]
 fn query_surfaces_local_predicate_json_errors_before_connection_failures() {
-    let temp_root = unique_temp_dir("cli-query-invalid-predicate-json");
-    let predicate_path = temp_root.join("predicate.json");
+    let temp_root = TempRoot::new("cli-query-invalid-predicate-json");
+    let predicate_path = temp_root.path().join("predicate.json");
     fs::write(&predicate_path, "{not-valid-json").expect("predicate json should be written");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "query",
@@ -149,10 +150,10 @@ fn query_surfaces_local_predicate_json_errors_before_connection_failures() {
 
 #[test]
 fn put_surfaces_local_input_errors_before_connection_failures() {
-    let temp_root = unique_temp_dir("cli-put-invalid-input");
+    let temp_root = TempRoot::new("cli-put-invalid-input");
 
     let output = run_cli_without_assert(
-        &temp_root,
+        temp_root.path(),
         [
             "data",
             "put",
@@ -170,7 +171,7 @@ fn put_surfaces_local_input_errors_before_connection_failures() {
 }
 
 fn run_cli_without_assert<const N: usize>(
-    working_dir: &PathBuf,
+    working_dir: &Path,
     args: [&str; N],
 ) -> std::process::Output {
     let config = r#"node_name = "cli-test"
@@ -190,12 +191,28 @@ storage_root = ".logpose-test""#;
         .expect("cli command should run")
 }
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-    fs::create_dir_all(&dir).expect("temp dir should be created");
-    dir
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new(prefix: &str) -> Self {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
+        fs::create_dir_all(&path).expect("temp dir should be created");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }

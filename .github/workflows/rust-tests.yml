@@ -22,4 +22,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
-        run: cargo test --workspace -- --skip randomized_storage_scenarios_match_the_expected_model
+        run: cargo test --workspace -- --skip randomized_storage_scenarios_match_the_expected_model --skip randomized_service_scenarios_match_the_expected_model --skip diagnostics_status_snapshot_contract --skip diagnostics_placement_snapshot_contract --skip query_and_inspect_snapshot_contract

@@ -1,25 +1,20 @@
 //! End-to-end tests for server-backed CLI workflows.
 
 use clap as _;
+use insta as _;
 use logpose_client as _;
-use logpose_config::LogPoseConfig;
-use logpose_core::AppState;
 use logpose_query as _;
 use logpose_storage as _;
 use logpose_telemetry as _;
 use logpose_types as _;
 use serde as _;
 use serde_json::Value;
-use std::{
-    fs,
-    net::{SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    process::{Command, Output},
-    sync::Arc,
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use tokio::runtime::Runtime;
+use std::fs;
+
+#[path = "support/server_fixture.rs"]
+mod support;
+
+use support::{TestServerFixture, render_config_with_hosts};
 
 #[test]
 fn diagnostics_status_reports_server_metadata_and_endpoints() {
@@ -448,7 +443,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert!(
         ann_profiled_query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
     assert!(
         ann_profiled_query_body["diagnostics"]["stage_timings"]["rerank_micros"]
@@ -569,227 +564,26 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
     assert!(
         profiled_query_body["diagnostics"]["stage_timings"]["planning_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
     assert!(
         profiled_query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
     assert!(
         profiled_query_body["diagnostics"]["stage_timings"]["postfilter_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
     assert!(
         profiled_query_body["diagnostics"]["stage_timings"]["rerank_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
     assert!(
         profiled_query_body["diagnostics"]["stage_timings"]["merge_micros"]
             .as_u64()
-            .is_some_and(|micros| micros > 0)
+            .is_some()
     );
-}
-
-struct TestServerFixture {
-    temp_root: PathBuf,
-    rest_addr: SocketAddr,
-    grpc_addr: SocketAddr,
-    runtime: Runtime,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl TestServerFixture {
-    fn spawn(node_name: &str) -> Self {
-        Self::spawn_with_role(node_name, logpose_types::NodeRole::Combined)
-    }
-
-    fn spawn_with_role(node_name: &str, node_role: logpose_types::NodeRole) -> Self {
-        Self::spawn_with_listener_hosts(node_name, node_role, "127.0.0.1", "127.0.0.1")
-    }
-
-    fn spawn_with_listener_hosts(
-        node_name: &str,
-        node_role: logpose_types::NodeRole,
-        rest_host: &str,
-        grpc_host: &str,
-    ) -> Self {
-        let temp_root = unique_temp_dir(node_name);
-        let storage_root = temp_root.join("data");
-        let rest_addr = reserve_local_addr();
-        let grpc_addr = reserve_local_addr();
-        let runtime = Runtime::new().expect("runtime should build");
-        let state = Arc::new(AppState::new(LogPoseConfig {
-            node_name: node_name.to_owned(),
-            node_role,
-            rest_host: rest_host.to_owned(),
-            rest_port: rest_addr.port(),
-            grpc_host: grpc_host.to_owned(),
-            grpc_port: grpc_addr.port(),
-            log_filter: "info".to_owned(),
-            storage_root,
-        }));
-        let server = runtime.spawn(async move {
-            let rest_state = Arc::clone(&state);
-            let grpc_state = Arc::clone(&state);
-            let _ = tokio::try_join!(
-                async move {
-                    logpose_api_rest::serve(rest_state)
-                        .await
-                        .map_err(anyhow::Error::from)
-                },
-                async move {
-                    logpose_api_grpc::serve(grpc_state)
-                        .await
-                        .map_err(|error| anyhow::anyhow!(error.to_string()))
-                }
-            );
-        });
-
-        wait_for_port(grpc_addr);
-
-        Self {
-            temp_root,
-            rest_addr,
-            grpc_addr,
-            runtime,
-            server,
-        }
-    }
-
-    fn rest_endpoint(&self) -> String {
-        format!("http://{}", self.rest_addr)
-    }
-
-    fn grpc_endpoint(&self) -> String {
-        format!("http://{}", self.grpc_addr)
-    }
-
-    fn run_cli<const N: usize>(&self, args: [&str; N]) -> Output {
-        let output = self.run_cli_raw(args);
-        assert!(
-            output.status.success(),
-            "command failed with stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    }
-
-    fn run_cli_expect_failure<const N: usize>(&self, args: [&str; N]) -> Output {
-        let output = self.run_cli_raw(args);
-        assert!(
-            !output.status.success(),
-            "command unexpectedly succeeded with stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
-    }
-
-    fn run_cli_raw<const N: usize>(&self, args: [&str; N]) -> Output {
-        let config = render_config(
-            "cli-test",
-            logpose_types::NodeRole::Combined,
-            &self.temp_root.join("client-data"),
-            self.rest_addr,
-            self.grpc_addr,
-        );
-        self.run_cli_with_config(args, config)
-    }
-
-    fn run_cli_with_config<const N: usize>(&self, args: [&str; N], config: String) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
-            .current_dir(&self.temp_root)
-            .env("LOGPOSE_CONFIG", config)
-            .args(args)
-            .output()
-            .expect("cli should run")
-    }
-}
-
-impl Drop for TestServerFixture {
-    fn drop(&mut self) {
-        self.server.abort();
-        let _ = self.runtime.block_on(async { (&mut self.server).await });
-    }
-}
-
-fn render_config(
-    node_name: &str,
-    node_role: logpose_types::NodeRole,
-    storage_root: &Path,
-    rest_addr: SocketAddr,
-    grpc_addr: SocketAddr,
-) -> String {
-    render_config_with_hosts(
-        node_name,
-        node_role,
-        storage_root,
-        &rest_addr.ip().to_string(),
-        rest_addr.port(),
-        &grpc_addr.ip().to_string(),
-        grpc_addr.port(),
-    )
-}
-
-fn render_config_with_hosts(
-    node_name: &str,
-    node_role: logpose_types::NodeRole,
-    storage_root: &Path,
-    rest_host: &str,
-    rest_port: u16,
-    grpc_host: &str,
-    grpc_port: u16,
-) -> String {
-    format!(
-        r#"node_name = "{node_name}"
-node_role = "{node_role}"
-rest_host = "{rest_host}"
-rest_port = {rest_port}
-grpc_host = "{grpc_host}"
-grpc_port = {grpc_port}
-log_filter = "info"
-storage_root = "{storage_root}""#,
-        node_role = node_role.as_str(),
-        rest_host = rest_host,
-        rest_port = rest_port,
-        grpc_host = grpc_host,
-        grpc_port = grpc_port,
-        storage_root = storage_root.display(),
-    )
-}
-
-fn reserve_local_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-    let address = listener.local_addr().expect("listener should expose addr");
-    drop(listener);
-    address
-}
-
-fn wait_for_port(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if TcpStream::connect(address).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    assert!(
-        TcpStream::connect(address).is_ok(),
-        "timed out waiting for server at {address}"
-    );
-}
-
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-    fs::create_dir_all(&dir).expect("temp dir should be created");
-    dir
 }

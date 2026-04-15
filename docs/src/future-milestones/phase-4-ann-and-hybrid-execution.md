@@ -48,7 +48,7 @@ This phase added verification layers that keep ANN honest:
 
 - exact-vs-ANN comparison tests for correctness envelopes and recall guardrails
 - targeted regression suites for filtered ANN behavior at different selectivity ranges
-- corruption and property-style tests for index codecs, metadata payloads, and candidate-merging logic
+- corruption-focused ANN codec hardening and candidate-merging regressions
 - benchmark suites that are reproducible enough to detect planner or layout regressions
 - service-level harness scenarios where planner choices move between exact and ANN paths under controlled inputs
 

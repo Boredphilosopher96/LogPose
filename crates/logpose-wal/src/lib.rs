@@ -173,6 +173,14 @@ pub fn replay_file(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
 
 /// Replay all WAL files in a directory, processing rolled files before the active file.
 pub fn replay_dir(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
+    replay_dir_after_checkpoint(path, 0)
+}
+
+/// Replay WAL files that may contain records above the current manifest checkpoint.
+pub fn replay_dir_after_checkpoint(
+    path: impl AsRef<Path>,
+    checkpoint_seq_no: SeqNo,
+) -> Result<Vec<WalRecord>> {
     let path = path.as_ref();
     if !path.exists() {
         return Ok(Vec::new());
@@ -183,6 +191,8 @@ pub fn replay_dir(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
         .filter_map(|entry| entry.ok().map(|value| value.path()))
         .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
         .collect::<Vec<_>>();
+
+    entries.retain(|path| wal_may_contain_records_after_checkpoint(path, checkpoint_seq_no));
 
     entries.sort_by_key(|path| wal_sort_key(path));
 
@@ -219,6 +229,23 @@ fn wal_sort_key(path: &Path) -> (u8, String) {
         .unwrap_or_default();
     let priority = u8::from(name == "active.wal");
     (priority, name)
+}
+
+fn wal_may_contain_records_after_checkpoint(path: &Path, checkpoint_seq_no: SeqNo) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return true;
+    };
+
+    if name == "active.wal" {
+        return true;
+    }
+
+    rolled_wal_checkpoint_seq_no(name)
+        .is_none_or(|file_checkpoint| file_checkpoint > checkpoint_seq_no)
+}
+
+fn rolled_wal_checkpoint_seq_no(file_name: &str) -> Option<SeqNo> {
+    file_name.strip_suffix(".wal")?.parse().ok()
 }
 
 fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
@@ -292,6 +319,42 @@ mod tests {
     }
 
     #[test]
+    fn replay_keeps_a_committed_prefix_before_a_partial_tail() {
+        let dir = unique_temp_dir("wal-committed-prefix");
+        let path = dir.join("active.wal");
+
+        let mut writer = WalWriter::open(&path).expect("writer should open");
+        writer
+            .append(
+                1,
+                &WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 2.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+            )
+            .expect("first append should succeed");
+        writer
+            .append(
+                2,
+                &WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![3.0, 4.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+            )
+            .expect("second append should succeed");
+
+        let bytes = fs::read(&path).expect("wal file should exist");
+        fs::write(&path, &bytes[..bytes.len() - 5]).expect("truncate should succeed");
+
+        let replayed = replay_file(&path).expect("replay should succeed");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq_no, 1);
+        assert_eq!(replayed[0].op.id().as_str(), "alpha");
+    }
+
+    #[test]
     fn replay_rejects_corrupt_checksum() {
         let dir = unique_temp_dir("wal-checksum");
         let path = dir.join("active.wal");
@@ -315,6 +378,45 @@ mod tests {
 
         let error = replay_file(&path).expect_err("checksum mismatch should fail");
         assert!(error.to_string().contains("checksum"));
+    }
+
+    #[test]
+    fn replay_dir_after_checkpoint_skips_checkpointed_rolled_logs() {
+        let dir = unique_temp_dir("wal-checkpoint-filter");
+        let active_path = dir.join("active.wal");
+        let rolled_path = dir.join("00000000000000000001.wal");
+
+        let mut writer = WalWriter::open(&active_path).expect("writer should open");
+        writer
+            .append(
+                1,
+                &WriteOperation::Put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+            )
+            .expect("append should succeed");
+        rotate_active(&active_path, &rolled_path).expect("rotation should succeed");
+
+        fs::write(&rolled_path, b"checkpointed garbage").expect("corruption should be written");
+
+        let mut active = WalWriter::open(&active_path).expect("active writer should reopen");
+        active
+            .append(
+                2,
+                &WriteOperation::Put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+            )
+            .expect("second append should succeed");
+
+        let replayed = replay_dir_after_checkpoint(&dir, 1).expect("replay should succeed");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].seq_no, 2);
+        assert_eq!(replayed[0].op.id().as_str(), "beta");
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

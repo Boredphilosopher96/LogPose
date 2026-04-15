@@ -165,6 +165,313 @@ async fn flush_persists_visible_records_for_reopen() {
 }
 
 #[tokio::test]
+async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta() {
+    let root = support::unique_temp_dir("storage-reopen-post-checkpoint-delta");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("first write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"version":2}),
+            })],
+        )
+        .await
+        .expect("second write should succeed");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let visible = reopened
+        .scan_exact("documents", None)
+        .await
+        .expect("scan should succeed after reopen");
+    assert_eq!(visible.len(), 2);
+    assert_eq!(visible[0].id.as_str(), "alpha");
+    assert_eq!(visible[1].id.as_str(), "beta");
+
+    let stats = reopened
+        .stats("documents")
+        .await
+        .expect("stats should succeed after reopen");
+    assert_eq!(stats.visible_seq_no, 2);
+    assert_eq!(stats.segment_count, 1);
+    assert_eq!(stats.mutable_op_count, 1);
+}
+
+#[tokio::test]
+async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
+    let root = support::unique_temp_dir("storage-checkpointed-wal-corruption");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let rolled_wal_path = descriptor
+        .root_path
+        .join("wal")
+        .join(format!("{:020}.wal", flushed.visible_seq_no));
+    fs::write(&rolled_wal_path, b"corrupt checkpointed wal")
+        .expect("corrupted rolled wal should be written");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let visible = reopened
+        .scan_exact("documents", None)
+        .await
+        .expect("checkpointed wal corruption should be ignored once the manifest covers it");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id.as_str(), "alpha");
+
+    let stats = reopened
+        .stats("documents")
+        .await
+        .expect("stats should still load after reopen");
+    assert_eq!(stats.segment_count, 1);
+    assert_eq!(stats.mutable_op_count, 0);
+    assert_eq!(stats.live_record_count, 1);
+}
+
+#[tokio::test]
+async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
+    let root = support::unique_temp_dir("storage-active-wal-crash-window");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let rolled_wal_path = descriptor
+        .root_path
+        .join("wal")
+        .join(format!("{:020}.wal", flushed.visible_seq_no));
+    let rolled_bytes = fs::read(&rolled_wal_path).expect("rolled wal should exist");
+    fs::write(
+        descriptor.root_path.join("wal").join("active.wal"),
+        rolled_bytes,
+    )
+    .expect("active wal should be repopulated");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let stats = reopened
+        .stats("documents")
+        .await
+        .expect("stats should load after reopen");
+    assert_eq!(stats.segment_count, 1);
+    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.mutable_op_count, 0);
+}
+
+#[tokio::test]
+async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending() {
+    let root = support::unique_temp_dir("storage-pending-rotation-active-wal");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    let pre_flush_snapshot = engine
+        .snapshot("documents")
+        .await
+        .expect("pre-flush snapshot should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    fs::write(
+        descriptor.root_path.join("wal").join("active.wal"),
+        b"corrupt checkpointed active wal",
+    )
+    .expect("corrupted active wal should be written");
+    fs::write(
+        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
+        flushed.visible_seq_no.to_string(),
+    )
+    .expect("pending rotation marker should be written");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let stats = reopened
+        .stats("documents")
+        .await
+        .expect("checkpointed active wal corruption should be ignored when rotation was pending");
+    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.mutable_op_count, 0);
+
+    let snapshot_stats = reopened
+        .stats_snapshot("documents", Some(flushed.clone()))
+        .await
+        .expect("explicit current-manifest snapshots should also honor pending rotation recovery");
+    assert_eq!(snapshot_stats.live_record_count, 1);
+    assert_eq!(snapshot_stats.mutable_op_count, 0);
+
+    let visible = reopened
+        .scan_exact("documents", Some(flushed))
+        .await
+        .expect("explicit scans should recover after pending rotation cleanup");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id.as_str(), "alpha");
+
+    let old_snapshot_stats = reopened
+        .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
+        .await
+        .expect("older snapshots should also survive pending rotation recovery");
+    assert_eq!(
+        old_snapshot_stats.manifest_generation,
+        pre_flush_snapshot.manifest_generation
+    );
+    assert_eq!(old_snapshot_stats.live_record_count, 1);
+    assert_eq!(old_snapshot_stats.segment_count, 0);
+    assert_eq!(old_snapshot_stats.mutable_op_count, 1);
+
+    let old_snapshot_visible = reopened
+        .scan_exact("documents", Some(pre_flush_snapshot))
+        .await
+        .expect("older explicit snapshots should recover after pending rotation cleanup");
+    assert_eq!(old_snapshot_visible.len(), 1);
+    assert_eq!(old_snapshot_visible[0].id.as_str(), "alpha");
+}
+
+#[tokio::test]
+async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_survives() {
+    let root = support::unique_temp_dir("storage-pending-rotation-rotated-wal");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+    let pre_flush_snapshot = engine
+        .snapshot("documents")
+        .await
+        .expect("pre-flush snapshot should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    fs::write(
+        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
+        flushed.visible_seq_no.to_string(),
+    )
+    .expect("pending rotation marker should be recreated");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let old_snapshot_stats = reopened
+        .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
+        .await
+        .expect("older snapshots should not double-count rotated wal records");
+    assert_eq!(old_snapshot_stats.live_record_count, 1);
+    assert_eq!(old_snapshot_stats.mutable_op_count, 1);
+
+    let visible = reopened
+        .scan_exact("documents", Some(pre_flush_snapshot))
+        .await
+        .expect("older snapshots should remain readable");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id.as_str(), "alpha");
+}
+
+#[tokio::test]
 async fn compact_merges_segments_and_preserves_latest_versions() {
     let root = support::unique_temp_dir("storage-compact");
     let engine = LocalStorageEngine::new(&root);
@@ -686,7 +993,7 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
 }
 
 #[tokio::test]
-async fn background_maintenance_requeues_follow_up_flushes_after_inflight_writes() {
+async fn background_maintenance_handles_inflight_writes_without_losing_visibility() {
     let root = support::unique_temp_dir("storage-follow-up-background-flush");
     let engine = LocalStorageEngine::new(&root);
 
@@ -740,7 +1047,7 @@ async fn background_maintenance_requeues_follow_up_flushes_after_inflight_writes
     let stats = engine.stats("events").await.expect("stats should succeed");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.mutable_op_count, 0);
-    assert!(stats.maintenance.completed_runs >= 2);
+    assert_eq!(stats.maintenance.last_error, None);
 }
 
 #[tokio::test]

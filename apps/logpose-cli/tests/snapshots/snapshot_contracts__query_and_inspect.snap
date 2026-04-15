@@ -1,0 +1,144 @@
+---
+source: apps/logpose-cli/tests/snapshot_contracts.rs
+expression: snapshot
+---
+{
+  "explain_query": {
+    "diagnostics": {
+      "chosen_plan": "vector_first_exact",
+      "units_considered": 1,
+      "units_pruned": 0,
+      "units_scanned": 1
+    },
+    "matches": [
+      {
+        "id": "alpha",
+        "metadata": {
+          "color": "red",
+          "kind": "keep"
+        },
+        "value": 1.0
+      }
+    ],
+    "metric": "dot",
+    "returned": 1,
+    "snapshot": {
+      "manifest_generation": 0,
+      "visible_seq_no": 3
+    },
+    "top_k": 1
+  },
+  "manifest": {
+    "payload": {
+      "checkpoint_seq_no": 3,
+      "generation": 1,
+      "segments": [
+        {
+          "delete_count": 0,
+          "dimensions": 2,
+          "index_kind": "hnsw",
+          "put_count": 3,
+          "segment_id": "[segment_id]"
+        }
+      ]
+    },
+    "target": "manifest"
+  },
+  "profile_query": {
+    "diagnostics": {
+      "chosen_plan": "vector_first_ann",
+      "stage_timings": {
+        "candidate_generation_micros": "[timing]",
+        "merge_micros": "[timing]",
+        "planning_micros": "[timing]",
+        "postfilter_micros": "[timing]",
+        "prefilter_micros": "[timing]",
+        "rerank_micros": "[timing]"
+      },
+      "units_considered": 2,
+      "units_pruned": 0,
+      "units_scanned": 1
+    },
+    "matches": [
+      {
+        "id": "alpha",
+        "metadata": {
+          "color": "red",
+          "kind": "keep"
+        },
+        "value": 1.0
+      }
+    ],
+    "metric": "dot",
+    "returned": 1,
+    "snapshot": {
+      "manifest_generation": 1,
+      "visible_seq_no": 3
+    },
+    "top_k": 1
+  },
+  "segment": {
+    "payload": {
+      "flat_index": {
+        "delete_count": 0,
+        "entry_count": 3,
+        "index_kind": "flat",
+        "put_count": 3,
+        "segment_id": "[segment_id]"
+      },
+      "hnsw_index": {
+        "dimensions": 2,
+        "index_kind": "hnsw",
+        "node_count": 3
+      },
+      "records": [
+        {
+          "id": "alpha",
+          "op": "put",
+          "seq_no": 1
+        },
+        {
+          "id": "beta",
+          "op": "put",
+          "seq_no": 2
+        },
+        {
+          "id": "gamma",
+          "op": "put",
+          "seq_no": 3
+        }
+      ],
+      "segment": {
+        "delete_count": 0,
+        "dimensions": 2,
+        "index_kind": "hnsw",
+        "put_count": 3,
+        "segment_id": "[segment_id]"
+      }
+    },
+    "target": "segment:[segment_id]"
+  },
+  "wal": {
+    "payload": {
+      "checkpoint_seq_no": 0,
+      "records": [
+        {
+          "id": "alpha",
+          "op": "put",
+          "seq_no": 1
+        },
+        {
+          "id": "beta",
+          "op": "put",
+          "seq_no": 2
+        },
+        {
+          "id": "gamma",
+          "op": "put",
+          "seq_no": 3
+        }
+      ]
+    },
+    "target": "wal"
+  }
+}

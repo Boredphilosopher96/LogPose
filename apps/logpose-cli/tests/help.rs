@@ -2,6 +2,7 @@
 
 use anyhow as _;
 use clap as _;
+use insta as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
 use logpose_client as _;

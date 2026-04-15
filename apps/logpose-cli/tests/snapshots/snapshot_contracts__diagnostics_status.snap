@@ -1,0 +1,27 @@
+---
+source: apps/logpose-cli/tests/snapshot_contracts.rs
+expression: status
+---
+{
+  "collection_count": 0,
+  "collections": [],
+  "control_plane_ready": true,
+  "data_plane_ready": true,
+  "grpc_endpoint": "http://127.0.0.1:[grpc-port]",
+  "maintenance": {
+    "collections_in_progress": 0,
+    "collections_with_errors": 0,
+    "collections_with_pending": 0,
+    "pending_operations": 0
+  },
+  "metadata": {
+    "git_sha": "[git_sha]",
+    "node_name": "cli-snapshot-status",
+    "product": "LogPose",
+    "profile": "debug",
+    "version": "[version]"
+  },
+  "rest_endpoint": "http://127.0.0.1:[rest-port]",
+  "role": "combined",
+  "storage_engine": "local"
+}

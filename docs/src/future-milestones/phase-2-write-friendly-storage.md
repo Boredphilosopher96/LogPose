@@ -42,14 +42,13 @@ Phase 2 is done.
 
 ## Testing Direction
 
-Phase 2 should move the testing ladder upward, not just widen the unit suite:
+Phase 2 moved the testing ladder upward, not just widening the unit suite:
 
-- extend seeded generative harnesses to cover tier transitions, maintenance, reopen, and recovery flows
-- add targeted fuzzing and property-style tests for WAL frames, manifest parsing, segment decoding, and storage metadata loading
-- preserve named regression tests for corruption handling, atomicity, and recovery edge cases
-- keep CI jobs separate for generative suites and new fuzz/property coverage so failures stay attributable
+- seeded generative harnesses now cover tier transitions, maintenance, reopen, and recovery flows at the storage boundary
+- named regression tests cover corruption handling, atomicity, and recovery edge cases that operators can actually hit
+- the repository gained a dedicated randomized storage CI lane so those failures stay attributable
 
-This is the bridge from today's generative harnesses toward future simulation-oriented storage testing.
+Deeper fuzz/property harnesses for WAL frames, manifest parsing, segment decoding, and storage metadata remained later work after the storage model itself was in place.
 
 ## What This Unlocks
 

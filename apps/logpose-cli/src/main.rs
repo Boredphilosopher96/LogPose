@@ -1,6 +1,8 @@
 //! LogPose operator CLI.
 
 #[cfg(test)]
+use insta as _;
+#[cfg(test)]
 use logpose_api_grpc as _;
 #[cfg(test)]
 use logpose_api_rest as _;
