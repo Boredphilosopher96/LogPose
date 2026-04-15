@@ -10,7 +10,7 @@ The goal is not to make a vector engine cosmetically resemble PostgreSQL. The go
 - awkward updates and deletes
 - limited visibility into query planning and system cost
 
-As of April 2026, recent research suggests that the next generation of vector databases should look less like "a distributed ANN service with metadata support" and more like "a storage engine and query planner that happen to include ANN as a first-class operator."
+As of April 11, 2026, recent research suggests that the next generation of vector databases should look less like "a distributed ANN service with metadata support" and more like "a storage engine and query planner that happen to include ANN as a first-class operator."
 
 ## Why Milvus Feels Wrong
 
@@ -243,45 +243,64 @@ It should not promise:
 
 Those promises hide real cost.
 
-## Where LogPose Stands Today
+## A Practical Roadmap
 
-LogPose already implements the first architectural layer from this memo:
+### Phase 1: Better ergonomics and visibility
 
-- local mutable plus immutable storage with WAL, manifests, immutable segments, and maintenance recovery
-- planner-led exact execution plus HNSW-backed ANN and hybrid exact-plus-ANN merge
-- explain and profile diagnostics, collection stats, and inspect surfaces that make planner behavior and storage layout operator-visible
-- an explicit logical control-plane and data-plane split inside one runtime process
+- adaptive caching over segments and index components
+- optional pinning for hot collections
+- clear memory accounting
+- query explain plans for hybrid retrieval
+- explicit freshness and delete semantics
 
-That means this memo is now mostly about what still needs to happen after the foundational phases, not about what the repository is still missing at the very beginning.
+This phase is product and systems engineering heavy, but highly impactful.
 
-## Remaining Milestones For LogPose
+### Phase 2: Write-friendly storage
 
-The biggest remaining steps are now tracked in [Future Milestones](./future-milestones.md):
+- mutable delta tier
+- tombstone-aware query merge
+- background compaction
+- per-level indexing strategy
+- late materialization for rerank payloads
 
-1. [Multi-Cluster Metadata and Consistency](./future-milestones/multicluster-metadata-and-consistency.md)
-   - replace local placement files with an authoritative metadata plane, failover rules, and explicit consistency modes
-2. [Additional Vector Index Families](./future-milestones/additional-vector-index-families.md)
-   - add planner-selected IVF, compression-aware, and later disk-oriented families beyond today's HNSW path
-3. [Full-System Simulation](./future-milestones/full-system-simulation.md)
-   - extend the current deterministic harnesses into TigerBeetle-inspired seeded system simulation with replayable faults and liveness checks
-4. [Web GUI](./future-milestones/web-gui.md)
-   - turn the existing operator-facing contracts into a browser-based runtime, collection, query, and inspect console
-5. [Blob Storage Integration](./future-milestones/blob-storage-integration.md)
-   - move immutable artifacts toward real MinIO or S3-backed durability and recovery instead of local-only files plus metadata stubs
+This phase makes the system feel more like a database instead of an offline ANN service.
 
-Those are product and systems milestones, not just more benchmark tuning.
+### Phase 3: Better hybrid planning
+
+- selectivity-aware planning
+- exact fallback for tiny filtered sets
+- cooperative vector and scalar access path selection
+- planner statistics for segments, filters, and candidate quality
+
+This is where hybrid query quality and predictability improve sharply.
+
+### Phase 4: Planner-controlled ANN and hybrid execution
+
+- production ANN under planner control instead of index-driven architecture
+- cooperative filtered ANN plus exact fallback for tiny filtered populations
+- operator-facing diagnostics for candidate generation, rerank, merge, and memory accounting
+- deterministic ANN benchmarks plus exact-oracle validation
+
+### Phase 5: Research-heavy optimizations
+
+- disk-native graph layout refinement
+- disaggregated memory support
+- more general filtered ANN methods
+- GPU-aware hybrid execution for high-throughput deployments
+
+These are powerful, but they should come after the storage and execution contract is solid.
 
 ## Recommendation for LogPose
 
 If LogPose wants to be better than the current Milvus-style experience, it should focus first on being more principled, not more clever.
 
-The best remaining bets are:
+The best near-term bets are:
 
 1. Treat hybrid planning as a core subsystem.
 2. Design for mutable plus immutable storage from the start.
-3. Add a real metadata authority before pretending distribution is finished.
-4. Make durability and recovery semantics explicit across local and remote storage.
-5. Build observability and deterministic system testing as first-class features.
+3. Make memory behavior largely automatic, with explicit overrides.
+4. Define visibility and freshness precisely.
+5. Build observability for vector and hybrid execution as a first-class feature.
 
 That combination is realistic, differentiated, and aligned with where the research is moving.
 
