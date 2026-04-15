@@ -1,17 +1,29 @@
 # Overview
 
-LogPose is built to deliver fast vector retrieval, durable service behavior, and clean operational ergonomics for modern AI and search platforms.
+LogPose is a Rust retrieval database prototype shaped more like a storage engine plus query planner than a standalone ANN service.
 
-The current platform surface now includes:
+## What It Does Today
 
-- exact vector retrieval over REST and gRPC
-- collection creation plus mixed put/delete writes
-- operator-visible stats, flush, compact, and inspect APIs
-- top-level metadata equality filters for exact queries
+- `logpose-server` exposes REST and gRPC from one shared runtime
+- `logpose-cli` provides operator-facing diagnostics and workflow commands over the same core services
+- collections support create, get, and mixed put/delete batches
+- queries can run exact, HNSW-backed ANN, or hybrid exact-plus-ANN execution with explain and profile diagnostics
+- operators can inspect runtime status, collection placement, stats, maintenance state, WAL, manifests, and segments
 
-The workspace is organized for long-term maintainability:
+## What It Is Today
 
-- focused Rust crates for core subsystems
-- separate server and CLI applications
-- REST and gRPC integration surfaces
-- documentation, security, and quality automation embedded into the repository
+- one local process with role-aware control-plane and data-plane boundaries
+- local filesystem durability with WAL, manifests, immutable segments, and index sidecars
+- immutable HNSW sidecars for ANN, with exact execution still covering mutable state and acting as the correctness oracle
+- layered integration, randomized, process-boundary, and deterministic service-boundary tests
+
+## What Is Not Here Yet
+
+- etcd-backed multi-node or multi-cluster metadata management
+- replica management, failover, or consistency-mode routing
+- vector index families beyond HNSW
+- a TigerBeetle-style full-system simulator
+- a web GUI
+- real MinIO or S3-backed blob storage
+
+Those remaining capabilities are tracked in [Future Milestones](./future-milestones.md).
