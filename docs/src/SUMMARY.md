@@ -9,6 +9,7 @@
   - [Full-System Simulation](./future-milestones/full-system-simulation.md)
   - [Web GUI](./future-milestones/web-gui.md)
   - [Blob Storage Integration](./future-milestones/blob-storage-integration.md)
+  - [Endgoal Convergence and Missing Capabilities](./future-milestones/endgoal-convergence-and-missing-capabilities.md)
 - [Getting Started](./getting-started.md)
 - [Configuration](./configuration.md)
 - [API Overview](./api-overview.md)
