@@ -472,6 +472,104 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
 }
 
 #[tokio::test]
+async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation_recovery() {
+    let root = support::unique_temp_dir("storage-pending-rotation-compaction-history");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest {
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"version":1}),
+            })],
+        )
+        .await
+        .expect("first write should succeed");
+    let old_snapshot = engine
+        .snapshot("documents")
+        .await
+        .expect("old snapshot should be captured before flush");
+    engine
+        .flush("documents")
+        .await
+        .expect("first flush should succeed");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![2.0, 0.0],
+                metadata: json!({"version":2}),
+            })],
+        )
+        .await
+        .expect("second write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("second flush should succeed");
+    engine
+        .compact("documents")
+        .await
+        .expect("compaction should succeed");
+
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"version":3}),
+            })],
+        )
+        .await
+        .expect("third write should succeed");
+    let flushed = engine
+        .flush("documents")
+        .await
+        .expect("third flush should succeed");
+
+    fs::write(
+        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
+        flushed.visible_seq_no.to_string(),
+    )
+    .expect("pending rotation marker should be recreated");
+
+    let reopened = LocalStorageEngine::new(&root);
+    let old_snapshot_stats = reopened
+        .stats_snapshot("documents", Some(old_snapshot.clone()))
+        .await
+        .expect("older snapshot stats should remain readable after compaction");
+    assert_eq!(
+        old_snapshot_stats.manifest_generation,
+        old_snapshot.manifest_generation
+    );
+    assert_eq!(old_snapshot_stats.live_record_count, 1);
+    assert_eq!(old_snapshot_stats.mutable_op_count, 1);
+    assert_eq!(old_snapshot_stats.segment_count, 0);
+
+    let visible = reopened
+        .scan_exact("documents", Some(old_snapshot))
+        .await
+        .expect("older snapshot should preserve the pre-compaction record state");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id.as_str(), "alpha");
+    assert_eq!(visible[0].metadata["version"], json!(1));
+}
+
+#[tokio::test]
 async fn compact_merges_segments_and_preserves_latest_versions() {
     let root = support::unique_temp_dir("storage-compact");
     let engine = LocalStorageEngine::new(&root);

@@ -308,6 +308,13 @@ impl LocalStorageEngine {
         descriptor.root_path.join("wal").join("active.wal")
     }
 
+    fn rolled_wal_path(descriptor: &CollectionDescriptor, checkpoint_seq_no: SeqNo) -> PathBuf {
+        descriptor
+            .root_path
+            .join("wal")
+            .join(format!("{checkpoint_seq_no:020}.wal"))
+    }
+
     fn flat_index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
         descriptor
             .root_path
@@ -460,7 +467,6 @@ impl LocalStorageEngine {
             None
         };
         let mut promoted_delta = Vec::new();
-        let mut replay_checkpoint_seq_no = None;
         let manifest = if let Some(current_manifest) = current_manifest.as_ref() {
             if self.clear_checkpointed_active_wal_if_pending(&descriptor, current_manifest)? {
                 if target_generation == current_generation {
@@ -468,12 +474,17 @@ impl LocalStorageEngine {
                 } else {
                     let target_manifest =
                         self.load_manifest(&descriptor, Some(target_generation))?;
-                    promoted_delta = self.pending_rotation_promoted_delta(
-                        &descriptor,
-                        &target_manifest,
-                        current_manifest,
-                    )?;
-                    replay_checkpoint_seq_no = Some(current_manifest.checkpoint_seq_no);
+                    let previous_manifest = self
+                        .load_manifest(&descriptor, Some(current_generation.saturating_sub(1)))?;
+                    if !Self::rolled_wal_path(&descriptor, current_manifest.checkpoint_seq_no)
+                        .exists()
+                    {
+                        promoted_delta = self.pending_rotation_promoted_delta(
+                            &descriptor,
+                            &previous_manifest,
+                            current_manifest,
+                        )?;
+                    }
                     target_manifest
                 }
             } else {
@@ -484,7 +495,7 @@ impl LocalStorageEngine {
         };
         let delta = replay_dir_after_checkpoint(
             descriptor.root_path.join("wal"),
-            replay_checkpoint_seq_no.unwrap_or(manifest.checkpoint_seq_no),
+            manifest.checkpoint_seq_no,
         )?
         .into_iter()
         .filter(|record| record.seq_no > manifest.checkpoint_seq_no)
@@ -503,10 +514,10 @@ impl LocalStorageEngine {
     fn pending_rotation_promoted_delta(
         &self,
         descriptor: &CollectionDescriptor,
-        target_manifest: &Manifest,
+        previous_manifest: &Manifest,
         current_manifest: &Manifest,
     ) -> Result<Vec<WalRecord>> {
-        let known_segment_ids = target_manifest
+        let known_segment_ids = previous_manifest
             .segments
             .iter()
             .map(|segment| segment.segment_id.as_str())
