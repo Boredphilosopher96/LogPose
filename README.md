@@ -58,7 +58,7 @@ The default bootstrap exposes:
 
 Published documentation is available at:
 
-- https://boredphilosopher96.github.io/LogPose/overview.html
+- [Hosted documentation](https://boredphilosopher96.github.io/LogPose/overview.html)
 
 Build the documentation site locally with:
 
