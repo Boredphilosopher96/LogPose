@@ -56,6 +56,10 @@ The default bootstrap exposes:
 
 ## Documentation
 
+Published documentation is available at:
+
+- https://boredphilosopher96.github.io/LogPose/overview.html
+
 Build the documentation site locally with:
 
 ```bash
