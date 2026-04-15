@@ -21,6 +21,8 @@ logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 prost.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-prost.workspace = true

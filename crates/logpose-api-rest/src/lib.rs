@@ -53,6 +53,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), std::io::Error> {
     ));
 
     let listener = tokio::net::TcpListener::bind(address).await?;
+    serve_with_listener(state, listener).await
+}
+
+/// Serve the REST API over an existing listener.
+pub async fn serve_with_listener(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), std::io::Error> {
     axum::serve(listener, router(state)).await
 }
 

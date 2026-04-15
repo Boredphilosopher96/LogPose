@@ -38,11 +38,11 @@ Use integration tests for filesystem-backed workflows, async behavior, cross-mod
 
 ### 3. Generative Harnesses
 
-This is the first major TigerBeetle-inspired layer we are implementing.
+This is the first major TigerBeetle-inspired layer LogPose implemented, and it now exists at more than one boundary.
 
 Generative harnesses run seeded, replayable sequences of operations against real LogPose components and compare the observed results to an explicit oracle or model. These are not "random tests" in the loose sense. They are bounded, deterministic scenario generators with correctness checks.
 
-For the first Phase 2 slice, the initial harness targets the storage boundary:
+The first generative harness targeted the storage boundary, and the same pattern now also exists at the service boundary:
 
 - generated actions drive `LocalStorageEngine`
 - a model tracks expected logical visibility
@@ -53,7 +53,7 @@ This layer is the bridge between ordinary integration tests and future simulatio
 
 ### 4. Targeted Fuzzing and Property Tests
 
-The next layer after the first storage harness is subsystem fuzzing and property-style verification.
+The next deepening layer after those generative harnesses is subsystem fuzzing and property-style verification.
 
 Near-term candidates include:
 
@@ -88,15 +88,17 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 - seeded service and transport harnesses that exercise planner-controlled ANN, hybrid merge, and profile diagnostics paths
 - deterministic service-boundary simulation scenarios for control-plane/runtime status, placement diagnostics, persistence/recovery behavior, recorded placement, and wrong-plane rejection, with REST and gRPC parity checks focused on the same read-side operator contracts
 - continued explicit regression coverage for storage atomicity and corruption cases
+- checkpoint-aware recovery regressions for stale rolled WAL corruption and crash-window leftovers that would otherwise re-enter the mutable delta after reopen
 - deterministic exact-vs-ANN regression suites and recall checks for immutable HNSW units
 - reproducible Criterion benchmarks that pair exact baselines with planner-selected unfiltered ANN, filtered ANN, and tiny exact-fallback queries on fixed corpora
+- snapshot-style CLI contract tests for runtime status, placement diagnostics, query explain/profile output, and selected inspect surfaces (`wal`, `manifest`, and `segment`)
+- dedicated CI execution for randomized storage, randomized service, and CLI operator-contract suites so runtime failures stay attributable even though workspace compilation is still shared
 - clearer separation between inline unit tests and external integration/harness tests
 
 ### Near-Term
 
-- targeted fuzz/property harnesses for WAL, manifests, HNSW sidecars, storage metadata, and CLI surfaces
-- snapshot-style assertions for stable textual and JSON operator output where that increases clarity
-- dedicated CI execution for generative suites so they can evolve independently from general workspace tests
+- deeper fuzz/property harnesses for WAL, manifests, HNSW sidecars, storage metadata, and CLI input surfaces
+- broader process-boundary validation beyond the current CLI and service operators
 
 ### Later
 

@@ -14,6 +14,7 @@ use logpose_types::{
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_health::server::health_reporter;
 use tracing::info;
@@ -42,6 +43,16 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         state.config.grpc_port,
     ));
 
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    serve_with_listener(state, listener).await
+}
+
+/// Serve the gRPC API over an existing listener.
+pub async fn serve_with_listener(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let address = listener.local_addr()?;
     let (health_reporter, health_service) = health_reporter();
     health_reporter
         .set_serving::<LogPoseServiceServer<GrpcLogPoseService>>()
@@ -52,7 +63,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     Server::builder()
         .add_service(health_service)
         .add_service(LogPoseServiceServer::new(GrpcLogPoseService::new(state)))
-        .serve(address)
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
 
     Ok(())

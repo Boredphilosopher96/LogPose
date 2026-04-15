@@ -37,7 +37,7 @@ Today, LogPose already has the beginnings of the local database core:
 - shared service orchestration across transports
 - seeded randomized harnesses at storage and service boundaries
 
-The remaining roadmap is about turning that base into the architecture described in [Better Vector DB Architecture](./better-vector-db.md).
+This section records how that base was turned into the architecture described in [Better Vector DB Architecture](./better-vector-db.md).
 
 ## Component Map
 
@@ -58,11 +58,11 @@ The phase pages refer to logical components rather than only one specific file o
 | Phase | Program Shift | Primary Outcome | Testing Shift | Details |
 | --- | --- | --- | --- | --- |
 | ~~1. Local Database Core~~ | ~~Finish the single-node exact-search database contract~~ | ~~Crisp APIs, explicit visibility rules, operator-ready workflows~~ | ~~Broaden unit, integration, and seeded generative harnesses~~ | ~~[Phase 1](./future-milestones/phase-1-local-database-core.md)~~ |
-| ~~2. Write-Friendly Storage~~ | ~~Move from simple local durability to a real mutable plus immutable storage model~~ | ~~Delta tier, tombstone-aware merge, compaction planning, richer storage stats~~ | ~~Add fuzz/property tests for WAL, manifests, and storage metadata~~ | ~~[Phase 2](./future-milestones/phase-2-write-friendly-storage.md)~~ |
+| ~~2. Write-Friendly Storage~~ | ~~Move from simple local durability to a real mutable plus immutable storage model~~ | ~~Delta tier, tombstone-aware merge, compaction planning, richer storage stats~~ | ~~Seeded storage harnesses and corruption-focused recovery coverage establish the next testing layer, with deeper fuzz/property work left for later~~ | ~~[Phase 2](./future-milestones/phase-2-write-friendly-storage.md)~~ |
 | ~~3. Query Planning~~ | ~~Move from handcrafted exact query execution to plan-directed retrieval~~ | ~~Planner statistics, explain surfaces, scalar plus vector path selection~~ | ~~Planner oracles, explain snapshots, richer generative query scenarios~~ | ~~[Phase 3](./future-milestones/phase-3-query-planning.md)~~ |
-| ~~4. ANN and Hybrid Execution~~ | ~~Add ANN as a physical operator family under planner control~~ | ~~Exact and ANN hybrid execution with filtered retrieval strategies~~ | ~~Exact-vs-ANN correctness checks, codec fuzzing, benchmark discipline~~ | ~~[Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md)~~ |
+| ~~4. ANN and Hybrid Execution~~ | ~~Add ANN as a physical operator family under planner control~~ | ~~Exact and ANN hybrid execution with filtered retrieval strategies~~ | ~~Exact-vs-ANN correctness checks, ANN codec hardening, and benchmark discipline~~ | ~~[Phase 4](./future-milestones/phase-4-ann-and-hybrid-execution.md)~~ |
 | ~~5. Distribution and Operations~~ | ~~Grow from single-node engine to service platform~~ | ~~Explicit control-plane/data-plane boundaries, placement diagnostics, operational control~~ | ~~Deterministic multi-component, restart, and simulation-oriented harnesses~~ | ~~[Phase 5](./future-milestones/phase-5-distribution-and-operations.md)~~ |
-| 6. Mature Platform | Finish the system and harden the end-state architecture | Planner-led retrieval database with mature operations and disciplined research extensions | Full testing ladder active, including simulation-heavy system validation | [Phase 6](./future-milestones/phase-6-mature-platform.md) |
+| ~~6. Mature Platform~~ | ~~Finish the system and harden the end-state architecture~~ | ~~Planner-led retrieval database with mature operations and disciplined research extensions~~ | ~~Testing ladder established across core boundaries, with room to deepen fuzzing and simulation later~~ | ~~[Phase 6](./future-milestones/phase-6-mature-platform.md)~~ |
 
 ## Cross-Cutting Rules
 
@@ -83,4 +83,4 @@ Use the roadmap in two passes:
 
 If future design work changes the end-state architecture, update [Better Vector DB Architecture](./better-vector-db.md) first, then realign these milestones to match.
 
-**Done marker:** Phases 1, 2, 3, 4, and 5 are complete and the documents on this page now reflect that status.
+**Done marker:** Phases 1, 2, 3, 4, 5, and 6 are complete and the documents on this page now reflect that status.

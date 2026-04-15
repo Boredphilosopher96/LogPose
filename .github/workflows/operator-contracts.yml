@@ -1,0 +1,25 @@
+---
+name: Operator Contracts
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  operator-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run CLI snapshot contracts
+        run: cargo test -p logpose-cli --test snapshot_contracts

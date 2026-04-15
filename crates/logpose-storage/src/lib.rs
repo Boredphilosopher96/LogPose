@@ -19,7 +19,7 @@ use logpose_types::{
     PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo,
     Snapshot, VisibleRecord, WriteOperation,
 };
-use logpose_wal::{WalRecord, WalWriter, replay_dir, rotate_active};
+use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -341,6 +341,10 @@ impl LocalStorageEngine {
         descriptor.root_path.join("CURRENT")
     }
 
+    fn pending_rotation_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("wal").join("PENDING_ROTATION")
+    }
+
     fn descriptor_path(descriptor: &CollectionDescriptor) -> PathBuf {
         descriptor.root_path.join("descriptor.json")
     }
@@ -420,18 +424,139 @@ impl LocalStorageEngine {
         descriptor: CollectionDescriptor,
         manifest_generation: Option<u64>,
     ) -> Result<CollectionState> {
+        self.load_collection_state_descriptor_inner(descriptor, manifest_generation, false)
+    }
+
+    fn load_collection_state_descriptor_with_wal_lock(
+        &self,
+        descriptor: CollectionDescriptor,
+        manifest_generation: Option<u64>,
+    ) -> Result<CollectionState> {
+        self.load_collection_state_descriptor_inner(descriptor, manifest_generation, true)
+    }
+
+    fn load_collection_state_descriptor_inner(
+        &self,
+        descriptor: CollectionDescriptor,
+        manifest_generation: Option<u64>,
+        wal_lock_already_held: bool,
+    ) -> Result<CollectionState> {
         self.recover_persisted_maintenance(&descriptor)?;
-        let manifest = self.load_manifest(&descriptor, manifest_generation)?;
-        let delta = replay_dir(descriptor.root_path.join("wal"))?
-            .into_iter()
-            .filter(|record| record.seq_no > manifest.checkpoint_seq_no)
-            .collect::<Vec<_>>();
+        let current_generation = self.read_current_generation(&descriptor)?;
+        let target_generation = manifest_generation.unwrap_or(current_generation);
+        let has_pending_rotation = Self::pending_rotation_file_path(&descriptor).exists();
+        let wal_lock = if has_pending_rotation && !wal_lock_already_held {
+            Some(wal_rotation_lock(&descriptor.root_path))
+        } else {
+            None
+        };
+        let _wal_guard = wal_lock.as_ref().map(|lock| {
+            lock.lock()
+                .expect("wal rotation lock should not be poisoned")
+        });
+        let current_manifest = if has_pending_rotation {
+            Some(self.load_manifest(&descriptor, Some(current_generation))?)
+        } else {
+            None
+        };
+        let mut promoted_delta = Vec::new();
+        let mut replay_checkpoint_seq_no = None;
+        let manifest = if let Some(current_manifest) = current_manifest.as_ref() {
+            if self.clear_checkpointed_active_wal_if_pending(&descriptor, current_manifest)? {
+                if target_generation == current_generation {
+                    current_manifest.clone()
+                } else {
+                    let target_manifest =
+                        self.load_manifest(&descriptor, Some(target_generation))?;
+                    promoted_delta = self.pending_rotation_promoted_delta(
+                        &descriptor,
+                        &target_manifest,
+                        current_manifest,
+                    )?;
+                    replay_checkpoint_seq_no = Some(current_manifest.checkpoint_seq_no);
+                    target_manifest
+                }
+            } else {
+                self.load_manifest(&descriptor, Some(target_generation))?
+            }
+        } else {
+            self.load_manifest(&descriptor, Some(target_generation))?
+        };
+        let delta = replay_dir_after_checkpoint(
+            descriptor.root_path.join("wal"),
+            replay_checkpoint_seq_no.unwrap_or(manifest.checkpoint_seq_no),
+        )?
+        .into_iter()
+        .filter(|record| record.seq_no > manifest.checkpoint_seq_no)
+        .chain(promoted_delta)
+        .collect::<Vec<_>>();
+        let mut delta = delta;
+        delta.sort_by_key(|record| record.seq_no);
 
         Ok(CollectionState {
             descriptor,
             manifest,
             delta,
         })
+    }
+
+    fn pending_rotation_promoted_delta(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target_manifest: &Manifest,
+        current_manifest: &Manifest,
+    ) -> Result<Vec<WalRecord>> {
+        let known_segment_ids = target_manifest
+            .segments
+            .iter()
+            .map(|segment| segment.segment_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut promoted = Vec::new();
+
+        for segment in &current_manifest.segments {
+            if known_segment_ids.contains(segment.segment_id.as_str()) {
+                continue;
+            }
+
+            promoted.extend(read_segment_file(
+                &descriptor
+                    .root_path
+                    .join("segments")
+                    .join(&segment.file_name),
+            )?);
+        }
+
+        Ok(promoted)
+    }
+
+    fn clear_checkpointed_active_wal_if_pending(
+        &self,
+        descriptor: &CollectionDescriptor,
+        manifest: &Manifest,
+    ) -> Result<bool> {
+        let marker_path = Self::pending_rotation_file_path(descriptor);
+        if !marker_path.exists() {
+            return Ok(false);
+        }
+
+        let pending_checkpoint = fs::read_to_string(&marker_path)
+            .map_err(|error| io_message("failed to read pending WAL rotation marker", error))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                LogPoseError::Message(format!(
+                    "failed to parse pending WAL rotation marker: {error}"
+                ))
+            })?;
+
+        if pending_checkpoint == manifest.checkpoint_seq_no {
+            let mut wal_writer = WalWriter::open(Self::active_wal_path(descriptor))?;
+            wal_writer.truncate()?;
+            cleanup_file(&marker_path);
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     fn create_collection_directories(&self, descriptor: &CollectionDescriptor) -> Result<()> {
@@ -811,14 +936,27 @@ impl LocalStorageEngine {
         operation: MaintenanceOperation,
     ) -> Result<Snapshot> {
         let descriptor = self.find_collection_descriptor(collection_name)?;
-        let operation_lock = maintenance_operation_lock(&descriptor.root_path);
-        let _guard = operation_lock
-            .lock()
-            .expect("maintenance operation lock should not be poisoned");
-        let state = self.load_collection_state(collection_name, None)?;
+        let manifest_lock = maintenance_operation_lock(&descriptor.root_path);
         match operation {
-            MaintenanceOperation::Flush => self.flush_state(state),
-            MaintenanceOperation::Compact => self.compact_state(state),
+            MaintenanceOperation::Flush => {
+                let _manifest_guard = manifest_lock
+                    .lock()
+                    .expect("maintenance operation lock should not be poisoned");
+                let wal_lock = wal_rotation_lock(&descriptor.root_path);
+                let _wal_guard = wal_lock
+                    .lock()
+                    .expect("wal rotation lock should not be poisoned");
+                let state =
+                    self.load_collection_state_descriptor_with_wal_lock(descriptor, None)?;
+                self.flush_state(state)
+            }
+            MaintenanceOperation::Compact => {
+                let _manifest_guard = manifest_lock
+                    .lock()
+                    .expect("maintenance operation lock should not be poisoned");
+                let state = self.load_collection_state_descriptor(descriptor, None)?;
+                self.compact_state(state)
+            }
         }
     }
 
@@ -845,6 +983,10 @@ impl LocalStorageEngine {
             checkpoint_seq_no,
             segments,
         };
+        atomic_write(
+            &Self::pending_rotation_file_path(&state.descriptor),
+            checkpoint_seq_no.to_string().into_bytes(),
+        )?;
         self.publish_manifest(&state.descriptor, &next_manifest)?;
 
         let rolled_path = state
@@ -853,6 +995,7 @@ impl LocalStorageEngine {
             .join("wal")
             .join(format!("{checkpoint_seq_no:020}.wal"));
         rotate_active(Self::active_wal_path(&state.descriptor), rolled_path)?;
+        cleanup_file(&Self::pending_rotation_file_path(&state.descriptor));
 
         Ok(Snapshot {
             manifest_generation: next_manifest.generation,
@@ -1247,7 +1390,12 @@ impl StorageEngine for LocalStorageEngine {
             ));
         }
 
-        let state = self.load_collection_state(collection_name, None)?;
+        let descriptor = self.find_collection_descriptor(collection_name)?;
+        let wal_lock = wal_rotation_lock(&descriptor.root_path);
+        let _guard = wal_lock
+            .lock()
+            .expect("wal rotation lock should not be poisoned");
+        let state = self.load_collection_state_descriptor_with_wal_lock(descriptor, None)?;
         let existing_max = state.visible_seq_no();
         let mut seen_ids = BTreeMap::<RecordId, ()>::new();
         for operation in &operations {
@@ -1673,6 +1821,21 @@ fn maintenance_operation_lock(path: &Path) -> Arc<Mutex<()>> {
     let mut locks = maintenance_operation_locks()
         .lock()
         .expect("maintenance operation lock map should not be poisoned");
+    locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn wal_rotation_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn wal_rotation_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = wal_rotation_locks()
+        .lock()
+        .expect("wal rotation lock map should not be poisoned");
     locks
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
