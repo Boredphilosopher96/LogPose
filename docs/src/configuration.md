@@ -23,3 +23,28 @@ storage_root = ".logpose-edge-a"'
 When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is provided, the remaining fields should still be present in the TOML payload.
 
 `node_name` must not be `local`. That token is reserved for anonymous local placement metadata created by raw storage-engine workflows.
+
+## Authentication
+
+Set `auth_token` to require bearer-token authentication on all API endpoints
+(except health checks):
+
+```bash
+export LOGPOSE_CONFIG='node_name = "edge-a"
+node_role = "combined"
+rest_host = "0.0.0.0"
+rest_port = 8080
+grpc_host = "0.0.0.0"
+grpc_port = 50051
+log_filter = "info,logpose=debug"
+storage_root = ".logpose-edge-a"
+auth_token = "my-secret-token"'
+```
+
+When `auth_token` is present, every REST and gRPC request (except `/health` and
+the gRPC health service) must include an `Authorization: Bearer <token>` header
+matching the configured value. Requests without a valid token receive a `401
+Unauthorized` response.
+
+When `auth_token` is omitted (the default), APIs operate in unauthenticated
+mode. An empty string is rejected at startup as a misconfiguration.

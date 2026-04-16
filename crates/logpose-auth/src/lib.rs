@@ -1,5 +1,7 @@
 //! Authentication and authorization foundations.
 
+use subtle::ConstantTimeEq;
+
 /// Access model scaffold used to grow operator and service permissions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AccessTier {
@@ -24,7 +26,9 @@ pub fn validate_bearer_token(
     let token = header_value
         .strip_prefix("Bearer ")
         .ok_or("Authorization header must use Bearer scheme")?;
-    if token == expected_token {
+    if token.len() == expected_token.len()
+        && bool::from(token.as_bytes().ct_eq(expected_token.as_bytes()))
+    {
         Ok(())
     } else {
         Err("invalid bearer token")

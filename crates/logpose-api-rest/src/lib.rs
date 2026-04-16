@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -62,7 +62,12 @@ async fn require_auth(
             .get("authorization")
             .and_then(|value| value.to_str().ok());
         if let Err(message) = logpose_auth::validate_bearer_token(auth_header, expected_token) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": message }))).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(json!({ "error": message })),
+            )
+                .into_response();
         }
     }
     next.run(request).await
@@ -1873,6 +1878,98 @@ mod tests {
         assert!(body["error"].as_str().is_some_and(|message| {
             message.contains("write operation record id must not be empty")
         }));
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_token() {
+        let mut config = test_config("rest-auth-missing");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error field")
+                .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_wrong_token() {
+        let mut config = test_config("rest-auth-wrong");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_correct_token() {
+        let mut config = test_config("rest-auth-correct");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .header("authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_bypasses_auth() {
+        let mut config = test_config("rest-auth-health");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn json_body(response: axum::response::Response) -> Value {

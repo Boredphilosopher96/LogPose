@@ -58,6 +58,11 @@ impl LogPoseConfig {
                 ANONYMOUS_LOCAL_NODE_NAME
             )));
         }
+        if self.auth_token.as_deref().is_some_and(|t| t.is_empty()) {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: auth_token must not be an empty string".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -124,6 +129,23 @@ storage_root = "tmp/logpose-data""#,
         .expect("config should load");
 
         assert_eq!(config.node_role, NodeRole::Combined);
+    }
+
+    #[test]
+    fn from_toml_str_rejects_empty_auth_token() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+auth_token = """#,
+        )
+        .expect_err("empty auth_token should be rejected");
+
+        assert!(error.to_string().contains("auth_token"));
     }
 
     #[test]

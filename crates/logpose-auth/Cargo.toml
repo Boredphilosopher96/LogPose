@@ -9,4 +9,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+subtle = "2.6.1"
 
