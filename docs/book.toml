@@ -7,5 +7,9 @@ title = "LogPose Documentation"
 [build]
 build-dir = "../book"
 
+[preprocessor.toc]
+command = "mdbook-toc"
+renderer = ["html"]
+
 [output.html]
 site-url = "/LogPose/"
