@@ -1729,6 +1729,107 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
+    #[tokio::test]
+    async fn grpc_query_rejects_zero_top_k() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-top-k"))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        let error = service
+            .query_collection(Request::new(QueryCollectionRequest {
+                collection_name: "documents".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 0,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: None,
+                explain: proto::ExplainMode::None as i32,
+            }))
+            .await
+            .expect_err("zero top_k should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("top_k must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn grpc_write_rejects_empty_put_record_id() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-put-id"))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        let error = service
+            .write_collection(Request::new(WriteCollectionRequest {
+                collection_name: "documents".to_owned(),
+                operations: vec![proto::WriteOperation {
+                    operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                        id: String::new(),
+                        vector: vec![1.0, 0.0],
+                        metadata_json: "{}".to_owned(),
+                    })),
+                }],
+            }))
+            .await
+            .expect_err("empty put record id should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("put operation record id must not be empty")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_write_rejects_empty_delete_record_id() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-delete-id"))));
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+            }))
+            .await
+            .expect("create should succeed");
+
+        let error = service
+            .write_collection(Request::new(WriteCollectionRequest {
+                collection_name: "documents".to_owned(),
+                operations: vec![proto::WriteOperation {
+                    operation: Some(proto::write_operation::Operation::Delete(
+                        proto::DeleteRecord { id: String::new() },
+                    )),
+                }],
+            }))
+            .await
+            .expect_err("empty delete record id should error");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("delete operation record id must not be empty")
+        );
+    }
+
     fn test_config(label: &str) -> LogPoseConfig {
         test_config_with_role(label, NodeRole::Combined)
     }

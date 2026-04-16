@@ -1681,6 +1681,171 @@ mod tests {
         assert_eq!(query.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn query_rejects_zero_top_k() {
+        let state = Arc::new(AppState::new(test_config("rest-zero-top-k")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let query = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 0
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(query).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("top_k must be greater than 0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_empty_put_record_id() {
+        let state = Arc::new(AppState::new(test_config("rest-empty-put-id")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "put",
+                                    "id": "",
+                                    "vector": [1.0, 0.0],
+                                    "metadata": {}
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(write).await;
+        assert!(body["error"].as_str().is_some_and(|message| {
+            message.contains("write operation record id must not be empty")
+        }));
+    }
+
+    #[tokio::test]
+    async fn write_rejects_empty_delete_record_id() {
+        let state = Arc::new(AppState::new(test_config("rest-empty-delete-id")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "delete",
+                                    "id": ""
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(write).await;
+        assert!(body["error"].as_str().is_some_and(|message| {
+            message.contains("write operation record id must not be empty")
+        }));
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = response
             .into_body()
