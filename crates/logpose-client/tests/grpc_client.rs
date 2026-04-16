@@ -526,6 +526,7 @@ fn test_config_with_role(
         grpc_port: grpc_addr.port(),
         log_filter: "info".to_owned(),
         storage_root: root.join("data"),
+        auth_token: None,
     }
 }
 

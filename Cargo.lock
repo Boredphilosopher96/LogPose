@@ -1142,6 +1142,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "logpose-api-grpc"
 version = "0.1.0"
 dependencies = [
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",
@@ -1168,6 +1169,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http-body-util",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",

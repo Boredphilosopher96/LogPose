@@ -10,6 +10,8 @@ pub const DEFAULT_FLUSH_THRESHOLD_OPS: usize = 10_000;
 pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of immutable segments before compaction is recommended.
 pub const DEFAULT_COMPACTION_THRESHOLD_SEGMENTS: usize = 4;
+/// Maximum allowed length for a collection name in bytes.
+pub const MAX_COLLECTION_NAME_LENGTH: usize = 256;
 
 /// Logical collection metadata scaffold.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -59,6 +61,31 @@ impl CollectionDescriptor {
 
     /// Validate collection-level configuration values.
     pub fn validate(&self) -> logpose_types::Result<()> {
+        if self.name.is_empty() {
+            return Err(LogPoseError::Message(
+                "collection name must not be empty".to_owned(),
+            ));
+        }
+        if self.name.len() > MAX_COLLECTION_NAME_LENGTH {
+            return Err(LogPoseError::Message(format!(
+                "collection name exceeds maximum length of {MAX_COLLECTION_NAME_LENGTH} bytes"
+            )));
+        }
+        if self.name.contains('/') || self.name.contains('\\') {
+            return Err(LogPoseError::Message(
+                "collection name must not contain path separators".to_owned(),
+            ));
+        }
+        if self.name == "." || self.name == ".." || self.name.contains("..") {
+            return Err(LogPoseError::Message(
+                "collection name must not contain path traversal sequences".to_owned(),
+            ));
+        }
+        if self.name.chars().any(|c| c.is_control()) {
+            return Err(LogPoseError::Message(
+                "collection name must not contain control characters".to_owned(),
+            ));
+        }
         if self.dimensions == 0 {
             return Err(LogPoseError::Message(
                 "dimensions must be greater than 0".to_owned(),

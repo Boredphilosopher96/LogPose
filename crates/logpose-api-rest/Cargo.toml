@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 axum.workspace = true
+logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-core = { path = "../logpose-core" }
 logpose-query = { path = "../logpose-query" }

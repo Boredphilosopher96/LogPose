@@ -2,8 +2,9 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,10 +18,12 @@ use serde_json::{Map, Value, json};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 
+/// Maximum request body size in bytes (16 MiB).
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Create the versioned REST router.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let authenticated = Router::new()
         .route("/v1/metadata", get(metadata))
         .route("/v1/runtime/status", get(runtime_status))
         .route("/v1/collections", post(create_collection))
@@ -35,8 +38,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/collections/{name}/flush", post(flush_collection))
         .route("/v1/collections/{name}/compact", post(compact_collection))
         .route("/v1/collections/{name}/inspect", get(inspect_collection))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(authenticated)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+}
+
+/// Middleware that enforces bearer-token authentication when an `auth_token` is
+/// configured.  The `/health` endpoint is excluded because it lives outside the
+/// authenticated route group.
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref expected_token) = state.config.auth_token {
+        let auth_header = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if let Err(message) = logpose_auth::validate_bearer_token(auth_header, expected_token) {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": message }))).into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Serve the REST API until shutdown.

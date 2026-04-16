@@ -24,6 +24,13 @@ pub struct LogPoseConfig {
     pub log_filter: String,
     /// Root directory for local storage-engine state.
     pub storage_root: PathBuf,
+    /// Optional bearer token required for API authentication.
+    ///
+    /// When set, all API requests (except health checks) must include an
+    /// `Authorization: Bearer <token>` header matching this value.  When
+    /// absent the APIs operate in unauthenticated mode.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for LogPoseConfig {
@@ -37,6 +44,7 @@ impl Default for LogPoseConfig {
             grpc_port: 50051,
             log_filter: "info,logpose=debug".to_owned(),
             storage_root: PathBuf::from(".logpose"),
+            auth_token: None,
         }
     }
 }

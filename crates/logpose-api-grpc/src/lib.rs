@@ -60,9 +60,23 @@ pub async fn serve_with_listener(
 
     info!(%address, "starting gRPC listener");
 
+    let auth_token = state.config.auth_token.clone();
     Server::builder()
         .add_service(health_service)
-        .add_service(LogPoseServiceServer::new(GrpcLogPoseService::new(state)))
+        .add_service(LogPoseServiceServer::with_interceptor(
+            GrpcLogPoseService::new(state),
+            move |request: Request<()>| -> Result<Request<()>, Status> {
+                if let Some(ref token) = auth_token {
+                    let auth_value = request
+                        .metadata()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok());
+                    logpose_auth::validate_bearer_token(auth_value, token)
+                        .map_err(Status::unauthenticated)?;
+                }
+                Ok(request)
+            },
+        ))
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
 
