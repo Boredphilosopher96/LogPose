@@ -3,10 +3,10 @@
 LogPose exposes two integration surfaces that share the same core application
 layer:
 
-| Transport | Default Endpoint       | Use Case                                      |
-|-----------|------------------------|-----------------------------------------------|
-| REST      | `http://127.0.0.1:8080`| HTTP-based control-plane and data-plane ops    |
-| gRPC      | `127.0.0.1:50051`      | Strongly typed, high-performance integrations  |
+| Transport | Default Endpoint        | Use Case                                     |
+|-----------|-------------------------|----------------------------------------------|
+| REST      | `http://127.0.0.1:8080` | HTTP-based control-plane and data-plane ops  |
+| gRPC      | `127.0.0.1:50051`       | Strongly typed, high-performance integrations|
 
 Both transports cover the same workflows and stay aligned with the shared
 application layer, even when a given transport exposes slightly different
@@ -158,11 +158,11 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 
 **Request body**:
 
-| Field        | Type     | Required | Description                           |
-|--------------|----------|----------|---------------------------------------|
-| `name`       | string   | yes      | Unique collection name                |
-| `dimensions` | integer  | yes      | Vector dimensionality (>= 1)         |
-| `metric`     | string   | yes      | Distance metric: `cosine`, `dot`, `l2`|
+| Field        | Type     | Required | Description                            |
+|--------------|----------|----------|----------------------------------------|
+| `name`       | string   | yes      | Unique collection name                 |
+| `dimensions` | integer  | yes      | Vector dimensionality (>= 1)           |
+| `metric`     | string   | yes      | Distance metric: `cosine`, `dot`, `l2` |
 
 **Response** (`201`):
 
@@ -304,7 +304,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | Field       | Type     | Required | Description                                              |
 |-------------|----------|----------|----------------------------------------------------------|
 | `vector`    | float[]  | yes      | Query vector                                             |
-| `top_k`     | integer  | yes      | Maximum results to return (>= 1)                        |
+| `top_k`     | integer  | yes      | Maximum results to return (>= 1)                         |
 | `snapshot`  | object   | no       | Pin query to a specific snapshot                         |
 | `filters`   | object   | no       | Legacy AND-only equality filters over scalar metadata    |
 | `predicate` | object   | no       | Structured predicate tree (see below)                    |
@@ -562,11 +562,11 @@ service LogPoseService {
 
 ## Distance Metrics
 
-| Metric   | Description                          | REST value | Proto enum              |
-|----------|--------------------------------------|------------|-------------------------|
-| Cosine   | Cosine similarity (1 - cosine dist)  | `cosine`   | `DISTANCE_METRIC_COSINE`|
-| Dot      | Dot-product similarity               | `dot`      | `DISTANCE_METRIC_DOT`   |
-| L2       | Euclidean (L2) distance              | `l2`       | `DISTANCE_METRIC_L2`    |
+| Metric | Description                          | REST value | Proto enum                 |
+|--------|--------------------------------------|------------|----------------------------|
+| Cosine | Cosine similarity (1 - cosine dist)  | `cosine`   | `DISTANCE_METRIC_COSINE`   |
+| Dot    | Dot-product similarity               | `dot`      | `DISTANCE_METRIC_DOT`      |
+| L2     | Euclidean (L2) distance              | `l2`       | `DISTANCE_METRIC_L2`       |
 
 ## Contract Sources
 
