@@ -112,6 +112,13 @@ async fn write_collection(
     State(state): State<Arc<AppState>>,
     Json(request): Json<WriteCollectionBody>,
 ) -> Result<Json<logpose_types::CommitAck>, ApiError> {
+    for operation in &request.operations {
+        if operation.id().as_str().is_empty() {
+            return Err(ApiError(ServiceError::InvalidArgument(
+                "write operation record id must not be empty".to_owned(),
+            )));
+        }
+    }
     Ok(Json(state.write(&name, request.operations).await?))
 }
 
@@ -120,6 +127,12 @@ async fn query_collection(
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryCollectionBody>,
 ) -> Result<Json<logpose_query::QueryResponse>, ApiError> {
+    if request.top_k == 0 {
+        return Err(ApiError(ServiceError::InvalidArgument(
+            "top_k must be greater than 0".to_owned(),
+        )));
+    }
+
     let filters = request
         .filters
         .into_iter()
