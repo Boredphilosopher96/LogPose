@@ -178,6 +178,9 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<QueryCollectionRequest>,
     ) -> Result<Response<QueryCollectionReply>, Status> {
         let request = request.into_inner();
+        if request.top_k == 0 {
+            return Err(Status::invalid_argument("top_k must be greater than 0"));
+        }
         let filters = request
             .filters
             .into_iter()
@@ -205,13 +208,20 @@ impl LogPoseService for GrpcLogPoseService {
             matches: response
                 .matches
                 .into_iter()
-                .map(|candidate| QueryMatch {
-                    id: candidate.id.to_string(),
-                    value: candidate.value,
-                    metadata_json: serde_json::to_string(&candidate.metadata)
-                        .expect("query match metadata should serialize"),
+                .map(|candidate| {
+                    let metadata_json =
+                        serde_json::to_string(&candidate.metadata).map_err(|error| {
+                            Status::internal(format!(
+                                "failed to serialize query match metadata: {error}"
+                            ))
+                        })?;
+                    Ok(QueryMatch {
+                        id: candidate.id.to_string(),
+                        value: candidate.value,
+                        metadata_json,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, Status>>()?,
             diagnostics: response
                 .diagnostics
                 .map(query_diagnostics_to_proto)
@@ -266,10 +276,12 @@ impl LogPoseService for GrpcLogPoseService {
             .inspect(&request.collection_name, target)
             .await
             .map_err(status_from_service_error)?;
+        let payload_json = serde_json::to_string(&report.payload).map_err(|error| {
+            Status::internal(format!("failed to serialize inspect payload: {error}"))
+        })?;
         Ok(Response::new(InspectCollectionReply {
             target: report.target,
-            payload_json: serde_json::to_string(&report.payload)
-                .expect("inspect payload should serialize"),
+            payload_json,
         }))
     }
 }
@@ -296,6 +308,11 @@ fn proto_metric(metric: DistanceMetric) -> proto::DistanceMetric {
 fn write_operation_from_proto(operation: proto::WriteOperation) -> Result<WriteOperation, Status> {
     match operation.operation {
         Some(proto::write_operation::Operation::Put(put)) => {
+            if put.id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "put operation record id must not be empty",
+                ));
+            }
             let metadata = serde_json::from_str::<Value>(&put.metadata_json).map_err(|error| {
                 Status::invalid_argument(format!("invalid metadata_json: {error}"))
             })?;
@@ -306,6 +323,11 @@ fn write_operation_from_proto(operation: proto::WriteOperation) -> Result<WriteO
             }))
         }
         Some(proto::write_operation::Operation::Delete(delete)) => {
+            if delete.id.is_empty() {
+                return Err(Status::invalid_argument(
+                    "delete operation record id must not be empty",
+                ));
+            }
             Ok(WriteOperation::Delete(DeleteRecord {
                 id: RecordId::new(delete.id),
             }))
