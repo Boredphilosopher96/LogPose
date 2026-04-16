@@ -486,7 +486,9 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("duplicate record id")
         || message.contains("must include at least one operation")
         || message.contains("must not be empty")
+        || message.contains("must not contain")
         || message.contains("must be greater than 0")
+        || message.contains("exceeds maximum length")
         || message.contains("invalid snapshot")
         || is_dimension_validation_error(&message)
     {
