@@ -1140,11 +1140,13 @@ impl InteractiveApp {
                     // is mid-flight can leave partial writes (e.g. a batched
                     // record put that has only flushed some batches). Instead
                     // we mark the request and honor it once the action
-                    // finishes in `apply_tui_event`.
+                    // finishes in `apply_tui_event`, which sets `should_exit`
+                    // after the `ActionComplete` event is received. Returning
+                    // `false` here keeps the main TUI loop alive so the
+                    // spawned tokio task can run to completion.
                     self.exit_after_running = true;
                     self.status_message =
                         "Quit queued. Waiting for the running action to finish...".to_owned();
-                    return Ok(true);
                 }
                 Ok(false)
             }
