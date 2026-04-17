@@ -158,16 +158,21 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
 
 fn render_config(config: &LogPoseConfig) -> String {
     format!(
-        "Configuration\nNode name: {}\nRole: {}\nREST: {}:{}\ngRPC: {}:{}\nStorage root: {}\nLog filter: {}",
+        "Configuration\nNode name: {}\nRole: {}\nREST: {}\ngRPC: {}\nStorage root: {}\nLog filter: {}",
         config.node_name,
         config.node_role.as_str(),
-        config.rest_host,
-        config.rest_port,
-        config.grpc_host,
-        config.grpc_port,
+        format_host_port(&config.rest_host, config.rest_port),
+        format_host_port(&config.grpc_host, config.grpc_port),
         config.storage_root.display(),
         config.log_filter
     )
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
+        Ok(std::net::IpAddr::V4(_)) | Err(_) => format!("{host}:{port}"),
+    }
 }
 
 fn render_stats(stats: &CollectionStats) -> String {
