@@ -11,6 +11,7 @@ paths:
     get:
       summary: Health probe
       operationId: health
+      security: []
       responses:
         "200":
           description: Healthy
@@ -25,6 +26,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MetadataResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/runtime/status:
     get:
       summary: Get runtime status
@@ -36,6 +43,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeRuntimeStatus"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal runtime-status failure
           content:
@@ -65,6 +78,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: Collection already exists
           content:
@@ -88,6 +107,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CollectionDescriptor"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -113,6 +138,12 @@ paths:
                 $ref: "#/components/schemas/CollectionPlacement"
         "404":
           description: Collection not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -152,6 +183,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -187,6 +224,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -212,6 +255,12 @@ paths:
                 $ref: "#/components/schemas/CollectionStats"
         "400":
           description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -245,6 +294,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -270,6 +325,12 @@ paths:
                 $ref: "#/components/schemas/Snapshot"
         "400":
           description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
           content:
             application/json:
               schema:
@@ -314,13 +375,29 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection or segment not found
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+security:
+  - BearerAuth: []
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        Optional bearer-token authentication. When `auth_token` is configured,
+        all endpoints except `/health` require an `Authorization: Bearer <token>`
+        header. When `auth_token` is omitted, authentication is disabled.
   schemas:
     DistanceMetric:
       type: string

@@ -2,8 +2,9 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,10 +18,12 @@ use serde_json::{Map, Value, json};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 
+/// Maximum request body size in bytes (16 MiB).
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Create the versioned REST router.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let authenticated = Router::new()
         .route("/v1/metadata", get(metadata))
         .route("/v1/runtime/status", get(runtime_status))
         .route("/v1/collections", post(create_collection))
@@ -35,8 +38,39 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/collections/{name}/flush", post(flush_collection))
         .route("/v1/collections/{name}/compact", post(compact_collection))
         .route("/v1/collections/{name}/inspect", get(inspect_collection))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(authenticated)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+}
+
+/// Middleware that enforces bearer-token authentication when an `auth_token` is
+/// configured.  The `/health` endpoint is excluded because it lives outside the
+/// authenticated route group.
+async fn require_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref expected_token) = state.config.auth_token {
+        let auth_header = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if let Err(message) = logpose_auth::validate_bearer_token(auth_header, expected_token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Serve the REST API until shutdown.
@@ -1844,6 +1878,98 @@ mod tests {
         assert!(body["error"].as_str().is_some_and(|message| {
             message.contains("write operation record id must not be empty")
         }));
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_token() {
+        let mut config = test_config("rest-auth-missing");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+        let body = json_body(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error field")
+                .contains("missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_wrong_token() {
+        let mut config = test_config("rest-auth-wrong");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_accepts_correct_token() {
+        let mut config = test_config("rest-auth-correct");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/metadata")
+                    .header("authorization", "Bearer test-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_bypasses_auth() {
+        let mut config = test_config("rest-auth-health");
+        config.auth_token = Some("test-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        let app = router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn json_body(response: axum::response::Response) -> Value {

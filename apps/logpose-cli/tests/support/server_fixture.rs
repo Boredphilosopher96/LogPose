@@ -60,6 +60,7 @@ impl TestServerFixture {
                 grpc_port: grpc_addr.port(),
                 log_filter: "info".to_owned(),
                 storage_root: storage_root.clone(),
+                auth_token: None,
             }));
             let mut server = runtime.spawn(async move {
                 let rest_listener = tokio::net::TcpListener::from_std(rest_listener)
