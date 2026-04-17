@@ -2,9 +2,12 @@
 
 use anyhow as _;
 use clap as _;
+use crossterm as _;
 use insta as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
+use logpose_catalog as _;
+use logpose_cli as _;
 use logpose_client as _;
 use logpose_config as _;
 use logpose_core as _;
@@ -12,6 +15,7 @@ use logpose_query as _;
 use logpose_storage as _;
 use logpose_telemetry as _;
 use logpose_types as _;
+use ratatui as _;
 use serde as _;
 use serde_json as _;
 use std::{
@@ -21,6 +25,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio as _;
+use walkdir as _;
+
+#[path = "support/server_fixture.rs"]
+mod support;
+
+use support::TestServerFixture;
 
 #[test]
 fn query_rejects_malformed_vector_as_cli_validation() {
@@ -28,16 +38,7 @@ fn query_rejects_malformed_vector_as_cli_validation() {
 
     let output = run_cli_without_assert(
         temp_root.path(),
-        [
-            "data",
-            "query",
-            "--collection",
-            "colors",
-            "--top-k",
-            "1",
-            "--vector",
-            "1.0,wat",
-        ],
+        ["query", "colors", "--top-k", "1", "--vector", "1.0,wat"],
     );
 
     assert!(!output.status.success(), "command should fail validation");
@@ -53,9 +54,7 @@ fn query_requires_complete_snapshot_pair_as_cli_validation() {
     let output = run_cli_without_assert(
         temp_root.path(),
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
@@ -78,9 +77,7 @@ fn query_rejects_non_scalar_filter_values_as_cli_validation() {
     let output = run_cli_without_assert(
         temp_root.path(),
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
@@ -103,9 +100,7 @@ fn query_rejects_unsupported_where_operators_as_cli_validation() {
     let output = run_cli_without_assert(
         temp_root.path(),
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
@@ -130,9 +125,7 @@ fn query_surfaces_local_predicate_json_errors_before_connection_failures() {
     let output = run_cli_without_assert(
         temp_root.path(),
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
@@ -154,20 +147,108 @@ fn put_surfaces_local_input_errors_before_connection_failures() {
 
     let output = run_cli_without_assert(
         temp_root.path(),
-        [
-            "data",
-            "put",
-            "--collection",
-            "colors",
-            "--input",
-            "missing.jsonl",
-        ],
+        ["record", "put", "colors", "--input", "missing.jsonl"],
     );
 
     assert!(!output.status.success(), "command should fail validation");
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("failed to open JSONL input"));
     assert!(stderr.contains("missing.jsonl"));
+}
+
+#[test]
+fn interactive_collection_create_supports_fuzzy_workflow_search_and_defaults() {
+    let fixture = TestServerFixture::spawn("cli-interactive-create");
+
+    let output = fixture.run_cli_with_stdin(["--json", "interactive"], "create\n\ncolors\n2\n\n\n");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        output.status.success(),
+        "interactive create failed with stdout: {stdout}\nstderr: {stderr}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout).expect("interactive create should print valid json");
+
+    assert!(stderr.contains("Workflow search"));
+    assert!(stderr.contains("Select option"));
+    assert!(stderr.contains("Collection name"));
+    assert!(stderr.contains("Embedding dimensions"));
+    assert!(stderr.contains("Distance metric search"));
+    assert!(stderr.contains("Collection created"));
+    assert_eq!(payload["name"], "colors");
+    assert_eq!(payload["metric"], "dot");
+}
+
+#[test]
+fn interactive_create_shortcut_skips_workflow_picker_and_prefills_known_values() {
+    let fixture = TestServerFixture::spawn("cli-interactive-create-shortcut");
+
+    let output = fixture.run_cli_with_stdin(
+        [
+            "--json",
+            "interactive",
+            "--create",
+            "--name",
+            "colors",
+            "--dimensions",
+            "2",
+        ],
+        "\n\n",
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        output.status.success(),
+        "interactive create shortcut failed with stdout: {stdout}\nstderr: {stderr}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout).expect("interactive create shortcut should print valid json");
+
+    assert!(!stderr.contains("Workflow search"));
+    assert!(!stderr.contains("Collection name"));
+    assert!(!stderr.contains("Embedding dimensions"));
+    assert!(stderr.contains("Distance metric"));
+    assert_eq!(payload["name"], "colors");
+    assert_eq!(payload["metric"], "dot");
+}
+
+#[test]
+fn interactive_record_put_supports_fuzzy_file_picker() {
+    let fixture = TestServerFixture::spawn("cli-interactive-put");
+    fixture.run_cli([
+        "collection",
+        "create",
+        "colors",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let input_path = fixture.temp_root.join("records.jsonl");
+    fs::write(
+        &input_path,
+        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"color":"red"}}"#,
+    )
+    .expect("jsonl input should be written");
+
+    let output = fixture.run_cli_with_stdin(["--json", "interactive"], "put\n\n\n\nrecords\n\n");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        output.status.success(),
+        "interactive put failed with stdout: {stdout}\nstderr: {stderr}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&stdout).expect("interactive put should print valid json");
+
+    assert!(stderr.contains("Workflow search"));
+    assert!(stderr.contains("Choose A Collection"));
+    assert!(stderr.contains("File search"));
+    assert!(stderr.contains("records.jsonl"));
+    assert!(stderr.contains("Write completed"));
+    assert_eq!(payload["applied_ops"], 1);
 }
 
 fn run_cli_without_assert<const N: usize>(

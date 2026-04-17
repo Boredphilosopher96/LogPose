@@ -1,15 +1,20 @@
 //! Snapshot-style operator contract tests for the CLI.
 
 use clap as _;
+use crossterm as _;
 use insta::assert_json_snapshot;
+use logpose_catalog as _;
+use logpose_cli as _;
 use logpose_client as _;
 use logpose_query as _;
 use logpose_storage as _;
 use logpose_telemetry as _;
 use logpose_types as _;
+use ratatui as _;
 use serde as _;
 use serde_json::{Map, Value, json};
 use std::fs;
+use walkdir as _;
 
 #[path = "support/server_fixture.rs"]
 mod support;
@@ -20,7 +25,7 @@ use support::TestServerFixture;
 fn diagnostics_status_snapshot_contract() {
     let fixture = TestServerFixture::spawn("cli-snapshot-status");
 
-    let status = normalize_status(cli_json(&fixture, ["diagnostics", "status"]));
+    let status = normalize_status(cli_json(&fixture, ["status"]));
 
     assert_json_snapshot!("diagnostics_status", status);
 }
@@ -30,9 +35,8 @@ fn diagnostics_placement_snapshot_contract() {
     let fixture = TestServerFixture::spawn("cli-snapshot-placement");
 
     fixture.run_cli([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "documents",
         "--dimensions",
         "2",
@@ -40,10 +44,8 @@ fn diagnostics_placement_snapshot_contract() {
         "dot",
     ]);
 
-    let placement = normalize_placement(cli_json(
-        &fixture,
-        ["diagnostics", "placement", "--collection", "documents"],
-    ));
+    let placement =
+        normalize_placement(cli_json(&fixture, ["collection", "placement", "documents"]));
 
     assert_json_snapshot!("diagnostics_placement", placement);
 }
@@ -61,9 +63,8 @@ fn query_and_inspect_snapshot_contract() {
     .expect("jsonl input should be written");
 
     fixture.run_cli([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "colors",
         "--dimensions",
         "2",
@@ -71,9 +72,8 @@ fn query_and_inspect_snapshot_contract() {
         "dot",
     ]);
     fixture.run_cli([
-        "data",
+        "record",
         "put",
-        "--collection",
         "colors",
         "--input",
         input_path.to_str().expect("input path should be utf8"),
@@ -82,60 +82,45 @@ fn query_and_inspect_snapshot_contract() {
     let explain = normalize_query(cli_json(
         &fixture,
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
             "--where",
             "kind:eq:keep",
             "--explain",
+            "plan",
             "--vector",
             "1.0,0.0",
         ],
     ));
-    let wal = cli_json(
-        &fixture,
-        ["data", "inspect", "--collection", "colors", "--wal"],
-    );
+    let wal = cli_json(&fixture, ["inspect", "wal", "colors"]);
 
-    fixture.run_cli(["data", "flush", "--collection", "colors"]);
+    fixture.run_cli(["collection", "flush", "colors"]);
 
     let profile = normalize_query(cli_json(
         &fixture,
         [
-            "data",
             "query",
-            "--collection",
             "colors",
             "--top-k",
             "1",
             "--where",
             "kind:eq:keep",
-            "--profile",
+            "--explain",
+            "profile",
             "--vector",
             "1.0,0.0",
         ],
     ));
-    let manifest = cli_json(
-        &fixture,
-        ["data", "inspect", "--collection", "colors", "--manifest"],
-    );
+    let manifest = cli_json(&fixture, ["inspect", "manifest", "colors"]);
     let segment_id = manifest["payload"]["segments"][0]["segment_id"]
         .as_str()
         .expect("segment id should exist")
         .to_owned();
     let segment = cli_json(
         &fixture,
-        [
-            "data",
-            "inspect",
-            "--collection",
-            "colors",
-            "--segment",
-            segment_id.as_str(),
-        ],
+        ["inspect", "segment", "colors", segment_id.as_str()],
     );
 
     let snapshot = json!({
@@ -150,7 +135,7 @@ fn query_and_inspect_snapshot_contract() {
 }
 
 fn cli_json<const N: usize>(fixture: &TestServerFixture, args: [&str; N]) -> Value {
-    let output = fixture.run_cli(args);
+    let output = fixture.run_cli_json(&args);
     serde_json::from_slice(&output.stdout).expect("cli should print valid json")
 }
 
