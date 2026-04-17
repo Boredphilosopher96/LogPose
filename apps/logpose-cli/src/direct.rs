@@ -24,24 +24,27 @@ pub struct TerminalUi {
     color_enabled: bool,
     spinner_enabled: bool,
     stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
     stderr_is_terminal: bool,
 }
 
 impl TerminalUi {
     pub fn detect() -> Self {
         let stdin_is_terminal = io::stdin().is_terminal();
+        let stdout_is_terminal = io::stdout().is_terminal();
         let stderr_is_terminal = io::stderr().is_terminal();
         let no_color = std::env::var_os("NO_COLOR").is_some();
         Self {
             color_enabled: stderr_is_terminal && !no_color,
             spinner_enabled: stderr_is_terminal,
             stdin_is_terminal,
+            stdout_is_terminal,
             stderr_is_terminal,
         }
     }
 
     pub fn supports_fullscreen(&self) -> bool {
-        self.stdin_is_terminal && self.stderr_is_terminal
+        self.stdin_is_terminal && self.stdout_is_terminal && self.stderr_is_terminal
     }
 
     pub fn error_report(&self, error: &anyhow::Error) {
@@ -269,10 +272,20 @@ impl SpinnerSession {
     }
 
     fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl Drop for SpinnerSession {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

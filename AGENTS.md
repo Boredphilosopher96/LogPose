@@ -9,7 +9,7 @@ LogPose is a Rust workspace. Application entrypoints live in `apps/logpose-serve
 Use the workspace root for all commands.
 
 - `cargo run -p logpose-server` starts the server on the default REST and gRPC ports.
-- `cargo run -p logpose-cli -- diagnostics status` runs a basic CLI diagnostic.
+- `cargo run -p logpose-cli -- status` runs a basic CLI diagnostic.
 - `cargo fmt --all --check` enforces formatting.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` treats lint warnings as errors.
 - `cargo test --workspace` runs unit, integration, and workspace smoke tests.

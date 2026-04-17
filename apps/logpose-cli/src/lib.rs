@@ -1,7 +1,6 @@
 //! LogPose operator CLI.
 #![allow(missing_docs)]
 
-use anyhow as _;
 use clap as _;
 use crossterm as _;
 #[cfg(test)]
@@ -32,6 +31,7 @@ pub mod feedback;
 pub mod interactive;
 pub mod render;
 
+use anyhow::Context;
 use clap::Parser;
 use std::process::ExitCode;
 
@@ -55,7 +55,7 @@ pub async fn main_entry() -> ExitCode {
 
 async fn run(ui: &TerminalUi) -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = logpose_config::LogPoseConfig::load().map_err(anyhow::Error::from)?;
+    let config = logpose_config::LogPoseConfig::load().context("failed to load configuration")?;
     logpose_telemetry::init(&config.log_filter);
 
     match cli.into_request() {

@@ -113,8 +113,12 @@ fn run_scripted(
     session: &SessionContext,
 ) -> anyhow::Result<Action> {
     ui.section("Interactive Mode");
-    ui.info("Using the scripted fallback because stdin or stderr is not attached to a terminal.");
-    ui.info("The full-screen dashboard is available when both stdin and stderr are terminals.");
+    ui.info(
+        "Using the scripted fallback because stdin, stdout, or stderr is not attached to a terminal.",
+    );
+    ui.info(
+        "The full-screen dashboard is available when stdin, stdout, and stderr are all terminals.",
+    );
     if let Some(warning) = &session.warning {
         ui.warn(warning);
     }
@@ -483,8 +487,7 @@ async fn run_tui(
     args: InteractiveArgs,
     session: SessionContext,
 ) -> anyhow::Result<()> {
-    let mut terminal = setup_terminal()?;
-    let _guard = TerminalGuard;
+    let (mut terminal, _guard) = setup_terminal()?;
     let cwd = std::env::current_dir().context("failed to determine current working directory")?;
     let (tx, mut rx) = unbounded_channel();
     let mut app = InteractiveApp::new(args, cwd, output_mode, session)?;
@@ -517,20 +520,24 @@ async fn run_tui(
     Ok(())
 }
 
-fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn setup_terminal() -> anyhow::Result<(Terminal<CrosstermBackend<io::Stdout>>, TerminalGuard)> {
     enable_raw_mode().context("failed to enable raw mode")?;
+    // Install the cleanup guard immediately after enabling raw mode so any
+    // subsequent initialization failure restores the terminal on unwind.
+    let guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("failed to initialize terminal")
+    let terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+    Ok((terminal, guard))
 }
 
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
     }
 }
 
@@ -983,11 +990,7 @@ impl FormState {
             if value.is_empty() {
                 return Ok(None);
             }
-            Ok(Some(resolve_path_or_first_suggestion(
-                &self.file_suggestions,
-                cwd,
-                value,
-            )))
+            Ok(Some(resolve_user_path(cwd, value)))
         };
 
         match self.workflow {
@@ -2940,16 +2943,20 @@ fn parse_optional_predicates(value: &str) -> anyhow::Result<Vec<Predicate>> {
     }
 }
 
-fn resolve_path_or_first_suggestion(paths: &[PathBuf], cwd: &Path, value: &str) -> PathBuf {
+/// Resolves a user-entered path while preserving the typed value.
+///
+/// Relative paths are joined to the current working directory so that
+/// downstream consumers see an unambiguous location, but the file component
+/// is never replaced with a fuzzy match. This ensures a typo like
+/// `records.jonl` fails with a clear "file not found" rather than silently
+/// ingesting a different existing file.
+fn resolve_user_path(cwd: &Path, value: &str) -> PathBuf {
     let direct = PathBuf::from(value);
-    if direct.is_absolute() || direct.exists() {
-        return direct;
+    if direct.is_absolute() {
+        direct
+    } else {
+        cwd.join(direct)
     }
-    rank_path_choices(paths, cwd, value)
-        .into_iter()
-        .next()
-        .map(|choice| choice.path)
-        .unwrap_or_else(|| cwd.join(value))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, rect: Rect) -> Rect {
