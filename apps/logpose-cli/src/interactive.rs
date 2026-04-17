@@ -2,9 +2,9 @@ use crate::{
     action::{
         Action, CollectionCreateAction, ExplainArg, MetricArg, QueryAction, RecordDeleteAction,
         RecordPutAction, WorkflowDefinition, WorkflowKind, collect_picker_files, explain_choices,
-        format_command, metric_choices, parse_filter_list, parse_query_vector, parse_where_list,
-        picker_choice, rank_path_choices, rank_picker_choices, workflow_choices,
-        workflow_definitions,
+        format_command, format_filter, format_predicate, metric_choices, parse_filter_list,
+        parse_query_vector, parse_where_list, picker_choice, rank_path_choices,
+        rank_picker_choices, workflow_choices, workflow_definitions,
     },
     cli::{InteractiveArgs, OutputMode},
     direct::{DirectReporter, TerminalUi},
@@ -1072,6 +1072,11 @@ struct InteractiveApp {
     cwd: PathBuf,
     status_message: String,
     should_exit: bool,
+    // Set when the user asks to quit while an action is still in flight.
+    // The TUI event loop honors this after the in-flight action completes so
+    // that background mutations (e.g. batched record writes) are not killed
+    // mid-flight, which would otherwise leave silent partial writes.
+    exit_after_running: bool,
 }
 
 impl InteractiveApp {
@@ -1106,6 +1111,7 @@ impl InteractiveApp {
             output_mode,
             cwd,
             should_exit: false,
+            exit_after_running: false,
         };
         if let Some(workflow) = args.selected_workflow() {
             app.dashboard.concern = concern_for_workflow(workflow);
@@ -1130,7 +1136,14 @@ impl InteractiveApp {
             Screen::Confirm => self.handle_confirm_key(key, tx, config).await,
             Screen::Running => {
                 if matches!(key.code, KeyCode::Char('q')) {
-                    self.should_exit = true;
+                    // Defer the exit: killing the process while a tokio task
+                    // is mid-flight can leave partial writes (e.g. a batched
+                    // record put that has only flushed some batches). Instead
+                    // we mark the request and honor it once the action
+                    // finishes in `apply_tui_event`.
+                    self.exit_after_running = true;
+                    self.status_message =
+                        "Quit queued. Waiting for the running action to finish...".to_owned();
                     return Ok(true);
                 }
                 Ok(false)
@@ -1491,6 +1504,9 @@ impl InteractiveApp {
                         self.running = None;
                         self.screen = Screen::Form;
                     }
+                }
+                if self.exit_after_running {
+                    self.should_exit = true;
                 }
             }
         }
@@ -2872,41 +2888,19 @@ fn vector_to_value(vector: &crate::action::QueryVector) -> String {
 }
 
 fn filter_to_value(filter: &crate::action::QueryFilter) -> String {
-    format_command(&Action::Query(QueryAction {
-        collection: "tmp".to_owned(),
-        top_k: 1,
-        vector: crate::action::QueryVector(vec![1.0]),
-        filters: vec![filter.clone()],
-        where_clauses: Vec::new(),
-        predicate_json: None,
-        explain: None,
-        snapshot_manifest_generation: None,
-        snapshot_visible_seq_no: None,
-    }))
-    .split("--filter ")
-    .nth(1)
-    .unwrap_or_default()
-    .trim_matches('\'')
-    .to_owned()
+    // Build the literal directly from the typed filter instead of
+    // round-tripping through shell-escaped command text, because that
+    // round-trip corrupts values that contain apostrophes (e.g. `O'Brien`
+    // becomes `O'"'"'Brien`) and would silently change query semantics when
+    // the form is pre-filled.
+    format_filter(filter)
 }
 
 fn predicate_to_value(predicate: &Predicate) -> String {
-    command_preview(&Action::Query(QueryAction {
-        collection: "tmp".to_owned(),
-        top_k: 1,
-        vector: crate::action::QueryVector(vec![1.0]),
-        filters: Vec::new(),
-        where_clauses: vec![predicate.clone()],
-        predicate_json: None,
-        explain: None,
-        snapshot_manifest_generation: None,
-        snapshot_visible_seq_no: None,
-    }))
-    .split("--where ")
-    .nth(1)
-    .unwrap_or_default()
-    .trim_matches('\'')
-    .to_owned()
+    // Same reasoning as `filter_to_value`: format the predicate literal
+    // directly so apostrophes and other shell-significant characters
+    // survive round-tripping into the TUI form.
+    format_predicate(predicate)
 }
 
 fn parse_metric(value: &str) -> anyhow::Result<MetricArg> {
@@ -3276,6 +3270,7 @@ mod tests {
             cwd: PathBuf::from("."),
             status_message: String::new(),
             should_exit: false,
+            exit_after_running: false,
         };
 
         let filtered = app.filtered_workflows();
@@ -3350,6 +3345,7 @@ mod tests {
             cwd: PathBuf::from("."),
             status_message: String::new(),
             should_exit: false,
+            exit_after_running: false,
         };
 
         let should_break = app
@@ -3435,6 +3431,7 @@ mod tests {
             cwd: PathBuf::from("."),
             status_message: String::new(),
             should_exit: false,
+            exit_after_running: false,
         };
 
         let should_break = app.handle_result_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -3494,6 +3491,7 @@ mod tests {
             cwd: PathBuf::from("."),
             status_message: String::new(),
             should_exit: false,
+            exit_after_running: false,
         };
 
         app.prepare_follow_up_form();
