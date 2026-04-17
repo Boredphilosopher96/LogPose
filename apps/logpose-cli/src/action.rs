@@ -880,7 +880,7 @@ fn format_vector(vector: &QueryVector) -> String {
         .join(",")
 }
 
-fn format_filter(filter: &QueryFilter) -> String {
+pub fn format_filter(filter: &QueryFilter) -> String {
     format!(
         "{}={}",
         filter.field,
@@ -888,7 +888,7 @@ fn format_filter(filter: &QueryFilter) -> String {
     )
 }
 
-fn format_predicate(predicate: &Predicate) -> String {
+pub fn format_predicate(predicate: &Predicate) -> String {
     match predicate {
         Predicate::Comparison(PredicateComparison {
             field,
