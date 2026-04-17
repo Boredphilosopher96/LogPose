@@ -19,7 +19,7 @@ logpose-query = { path = "../../crates/logpose-query" }
 logpose-storage = { path = "../../crates/logpose-storage" }
 logpose-telemetry = { path = "../../crates/logpose-telemetry" }
 logpose-types = { path = "../../crates/logpose-types" }
-ratatui = "~0.29"
+ratatui = { version = "~0.30", default-features = false, features = ["crossterm_0_29", "underline-color"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
