@@ -1,15 +1,20 @@
 //! End-to-end tests for server-backed CLI workflows.
 
 use clap as _;
+use crossterm as _;
 use insta as _;
+use logpose_catalog as _;
+use logpose_cli as _;
 use logpose_client as _;
 use logpose_query as _;
 use logpose_storage as _;
 use logpose_telemetry as _;
 use logpose_types as _;
+use ratatui as _;
 use serde as _;
 use serde_json::Value;
 use std::fs;
+use walkdir as _;
 
 #[path = "support/server_fixture.rs"]
 mod support;
@@ -17,10 +22,25 @@ mod support;
 use support::{TestServerFixture, render_config_with_hosts};
 
 #[test]
-fn diagnostics_status_reports_server_metadata_and_endpoints() {
+fn diagnostics_status_defaults_to_human_summary() {
+    let fixture = TestServerFixture::spawn("cli-diagnostics-human");
+
+    let output = fixture.run_cli(["status"]);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+
+    assert!(stdout.contains("Runtime Status"));
+    assert!(stdout.contains("Node: cli-diagnostics-human"));
+    assert!(stdout.contains("Role: combined"));
+    assert!(stdout.contains(&fixture.rest_endpoint()));
+    assert!(stdout.contains(&fixture.grpc_endpoint()));
+    assert!(!stdout.trim_start().starts_with('{'));
+}
+
+#[test]
+fn diagnostics_status_reports_server_metadata_and_endpoints_as_json() {
     let fixture = TestServerFixture::spawn("cli-diagnostics");
 
-    let output = fixture.run_cli(["diagnostics", "status"]);
+    let output = fixture.run_cli_json(&["status"]);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let payload: Value = serde_json::from_str(&stdout).expect("status should print json");
 
@@ -50,9 +70,8 @@ fn diagnostics_placement_reports_local_assignment() {
     let fixture = TestServerFixture::spawn("cli-placement");
 
     fixture.run_cli([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "documents",
         "--dimensions",
         "2",
@@ -60,7 +79,7 @@ fn diagnostics_placement_reports_local_assignment() {
         "dot",
     ]);
 
-    let output = fixture.run_cli(["diagnostics", "placement", "--collection", "documents"]);
+    let output = fixture.run_cli_json(&["collection", "placement", "documents"]);
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let payload: Value = serde_json::from_str(&stdout).expect("placement should print json");
 
@@ -76,9 +95,8 @@ fn data_only_nodes_reject_collection_creation_over_cli_transport() {
         TestServerFixture::spawn_with_role("cli-data-only", logpose_types::NodeRole::Data);
 
     let output = fixture.run_cli_expect_failure([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "documents",
         "--dimensions",
         "2",
@@ -100,9 +118,8 @@ fn control_only_nodes_reject_collection_creation_over_cli_transport() {
         TestServerFixture::spawn_with_role("cli-control-only", logpose_types::NodeRole::Control);
 
     let output = fixture.run_cli_expect_failure([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "documents",
         "--dimensions",
         "2",
@@ -124,7 +141,7 @@ fn diagnostics_status_preserves_server_reported_wildcard_listener_addresses() {
         "0.0.0.0",
     );
     let output = fixture.run_cli_with_config(
-        ["diagnostics", "status"],
+        ["--json", "status"],
         render_config_with_hosts(
             "cli-wildcard",
             logpose_types::NodeRole::Combined,
@@ -161,9 +178,8 @@ fn data_commands_run_against_the_server_over_grpc() {
     .expect("jsonl input should be written");
 
     let create = fixture.run_cli([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "colors",
         "--dimensions",
         "2",
@@ -171,11 +187,10 @@ fn data_commands_run_against_the_server_over_grpc() {
         "dot",
     ]);
     let create_stdout = String::from_utf8(create.stdout).expect("stdout should be utf8");
-    let create_body: Value =
-        serde_json::from_str(&create_stdout).expect("create output should be valid json");
-    assert_eq!(create_body["name"], "colors");
+    assert!(create_stdout.contains("Collection created"));
+    assert!(create_stdout.contains("colors"));
 
-    let get = fixture.run_cli(["data", "get-collection", "--collection", "colors"]);
+    let get = fixture.run_cli_json(&["collection", "show", "colors"]);
     let get_stdout = String::from_utf8(get.stdout).expect("stdout should be utf8");
     let get_body: Value =
         serde_json::from_str(&get_stdout).expect("collection output should be valid json");
@@ -183,18 +198,15 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert_eq!(get_body["metric"], "dot");
 
     fixture.run_cli([
-        "data",
+        "record",
         "put",
-        "--collection",
         "colors",
         "--input",
         input_path.to_str().expect("input path should be utf8"),
     ]);
 
-    let query = fixture.run_cli([
-        "data",
+    let query = fixture.run_cli_json(&[
         "query",
-        "--collection",
         "colors",
         "--top-k",
         "3",
@@ -213,16 +225,15 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert_eq!(matches[0]["id"], "alpha");
     assert_eq!(matches[1]["id"], "gamma");
 
-    let profiled_query = fixture.run_cli([
-        "data",
+    let profiled_query = fixture.run_cli_json(&[
         "query",
-        "--collection",
         "colors",
         "--top-k",
         "1",
         "--where",
         "kind:eq:keep",
-        "--profile",
+        "--explain",
+        "profile",
         "--vector",
         "1.0,0.0",
     ]);
@@ -283,7 +294,7 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some()
     );
 
-    let stats = fixture.run_cli(["data", "stats", "--collection", "colors"]);
+    let stats = fixture.run_cli_json(&["collection", "stats", "colors"]);
     let stats_stdout = String::from_utf8(stats.stdout).expect("stdout should be utf8");
     let stats_body: Value =
         serde_json::from_str(&stats_stdout).expect("stats output should be valid json");
@@ -317,7 +328,7 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some_and(|bytes| bytes > 0)
     );
 
-    let wal = fixture.run_cli(["data", "inspect", "--collection", "colors", "--wal"]);
+    let wal = fixture.run_cli_json(&["inspect", "wal", "colors"]);
     let wal_stdout = String::from_utf8(wal.stdout).expect("stdout should be utf8");
     let wal_body: Value =
         serde_json::from_str(&wal_stdout).expect("wal output should be valid json");
@@ -330,20 +341,19 @@ fn data_commands_run_against_the_server_over_grpc() {
         3
     );
 
-    let maintenance =
-        fixture.run_cli(["data", "inspect", "--collection", "colors", "--maintenance"]);
+    let maintenance = fixture.run_cli_json(&["inspect", "maintenance", "colors"]);
     let maintenance_stdout = String::from_utf8(maintenance.stdout).expect("stdout should be utf8");
     let maintenance_body: Value =
         serde_json::from_str(&maintenance_stdout).expect("maintenance output should be valid json");
     assert_eq!(maintenance_body["target"], "maintenance");
 
-    let flush = fixture.run_cli(["data", "flush", "--collection", "colors"]);
+    let flush = fixture.run_cli_json(&["collection", "flush", "colors"]);
     let flush_stdout = String::from_utf8(flush.stdout).expect("stdout should be utf8");
     let flush_body: Value =
         serde_json::from_str(&flush_stdout).expect("flush output should be valid json");
     assert!(flush_body["manifest_generation"].as_u64().is_some());
 
-    let immutable_stats = fixture.run_cli(["data", "stats", "--collection", "colors"]);
+    let immutable_stats = fixture.run_cli_json(&["collection", "stats", "colors"]);
     let immutable_stats_stdout =
         String::from_utf8(immutable_stats.stdout).expect("stdout should be utf8");
     let immutable_stats_body: Value =
@@ -365,7 +375,7 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some()
     );
 
-    let manifest = fixture.run_cli(["data", "inspect", "--collection", "colors", "--manifest"]);
+    let manifest = fixture.run_cli_json(&["inspect", "manifest", "colors"]);
     let manifest_stdout = String::from_utf8(manifest.stdout).expect("stdout should be utf8");
     let manifest_body: Value =
         serde_json::from_str(&manifest_stdout).expect("manifest output should be valid json");
@@ -375,14 +385,7 @@ fn data_commands_run_against_the_server_over_grpc() {
         .expect("segment id should be a string")
         .to_owned();
 
-    let segment = fixture.run_cli([
-        "data",
-        "inspect",
-        "--collection",
-        "colors",
-        "--segment",
-        &segment_id,
-    ]);
+    let segment = fixture.run_cli_json(&["inspect", "segment", "colors", &segment_id]);
     let segment_stdout = String::from_utf8(segment.stdout).expect("stdout should be utf8");
     let segment_body: Value =
         serde_json::from_str(&segment_stdout).expect("segment output should be valid json");
@@ -413,16 +416,15 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some_and(|count| count >= 3)
     );
 
-    let ann_profiled_query = fixture.run_cli([
-        "data",
+    let ann_profiled_query = fixture.run_cli_json(&[
         "query",
-        "--collection",
         "colors",
         "--top-k",
         "1",
         "--where",
         "kind:eq:keep",
-        "--profile",
+        "--explain",
+        "profile",
         "--vector",
         "1.0,0.0",
     ]);
@@ -451,7 +453,7 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some()
     );
 
-    let compact = fixture.run_cli(["data", "compact", "--collection", "colors"]);
+    let compact = fixture.run_cli_json(&["collection", "compact", "colors"]);
     let compact_stdout = String::from_utf8(compact.stdout).expect("stdout should be utf8");
     let compact_body: Value =
         serde_json::from_str(&compact_stdout).expect("compact output should be valid json");
@@ -475,9 +477,8 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
     fs::write(&input_path, records).expect("jsonl input should be written");
 
     fixture.run_cli([
-        "data",
-        "create-collection",
-        "--name",
+        "collection",
+        "create",
         "documents",
         "--dimensions",
         "2",
@@ -485,25 +486,23 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
         "dot",
     ]);
     fixture.run_cli([
-        "data",
+        "record",
         "put",
-        "--collection",
         "documents",
         "--input",
         input_path.to_str().expect("input path should be utf8"),
     ]);
-    fixture.run_cli(["data", "flush", "--collection", "documents"]);
+    fixture.run_cli(["collection", "flush", "documents"]);
 
-    let profiled_query = fixture.run_cli([
-        "data",
+    let profiled_query = fixture.run_cli_json(&[
         "query",
-        "--collection",
         "documents",
         "--top-k",
         "2",
         "--where",
         "kind:eq:keep",
-        "--profile",
+        "--explain",
+        "profile",
         "--vector",
         "1.0,0.0",
     ]);

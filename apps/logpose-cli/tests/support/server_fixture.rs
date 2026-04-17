@@ -6,7 +6,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::{Arc, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -134,6 +134,24 @@ impl TestServerFixture {
         output
     }
 
+    pub fn run_cli_args(&self, args: &[&str]) -> Output {
+        let output = self.run_cli_raw_args(args);
+        assert!(
+            output.status.success(),
+            "command failed with stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    pub fn run_cli_json(&self, args: &[&str]) -> Output {
+        let mut prefixed = Vec::with_capacity(args.len() + 1);
+        prefixed.push("--json");
+        prefixed.extend_from_slice(args);
+        self.run_cli_args(&prefixed)
+    }
+
     pub fn run_cli_expect_failure<const N: usize>(&self, args: [&str; N]) -> Output {
         let output = self.run_cli_raw(args);
         assert!(
@@ -143,6 +161,17 @@ impl TestServerFixture {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    pub fn run_cli_with_stdin<const N: usize>(&self, args: [&str; N], input: &str) -> Output {
+        let config = render_config(
+            "cli-test",
+            logpose_types::NodeRole::Combined,
+            &self.temp_root.join("client-data"),
+            self.rest_addr,
+            self.grpc_addr,
+        );
+        self.run_cli_with_config_and_stdin(args, config, input)
     }
 
     pub fn run_cli_raw<const N: usize>(&self, args: [&str; N]) -> Output {
@@ -156,6 +185,17 @@ impl TestServerFixture {
         self.run_cli_with_config(args, config)
     }
 
+    pub fn run_cli_raw_args(&self, args: &[&str]) -> Output {
+        let config = render_config(
+            "cli-test",
+            logpose_types::NodeRole::Combined,
+            &self.temp_root.join("client-data"),
+            self.rest_addr,
+            self.grpc_addr,
+        );
+        self.run_cli_with_config_args(args, config)
+    }
+
     pub fn run_cli_with_config<const N: usize>(&self, args: [&str; N], config: String) -> Output {
         Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
             .current_dir(&self.temp_root)
@@ -163,6 +203,39 @@ impl TestServerFixture {
             .args(args)
             .output()
             .expect("cli should run")
+    }
+
+    pub fn run_cli_with_config_args(&self, args: &[&str], config: String) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
+            .current_dir(&self.temp_root)
+            .env("LOGPOSE_CONFIG", config)
+            .args(args)
+            .output()
+            .expect("cli should run")
+    }
+
+    pub fn run_cli_with_config_and_stdin<const N: usize>(
+        &self,
+        args: [&str; N],
+        config: String,
+        input: &str,
+    ) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
+            .current_dir(&self.temp_root)
+            .env("LOGPOSE_CONFIG", config)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cli should spawn");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin pipe should exist")
+            .write_all(input.as_bytes())
+            .expect("stdin should be written");
+        child.wait_with_output().expect("cli should finish")
     }
 }
 
