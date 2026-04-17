@@ -1,6 +1,6 @@
 //! Configuration loading for LogPose services and tooling.
 
-use logpose_storage_etcd::MetadataConfig;
+use logpose_storage_etcd::{MetadataBackend, MetadataConfig};
 use logpose_types::{ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, NodeRole, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -54,6 +54,12 @@ impl LogPoseConfig {
                 "invalid LOGPOSE_CONFIG: node_name '{}' is reserved for anonymous local placement metadata",
                 ANONYMOUS_LOCAL_NODE_NAME
             )));
+        }
+        if self.metadata.backend == MetadataBackend::Etcd && self.metadata.etcd.endpoints.is_empty()
+        {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -161,6 +167,28 @@ storage_root = "tmp/logpose-data""#,
         .expect("config should load");
 
         assert_eq!(config.node_role, NodeRole::Combined);
+    }
+
+    #[test]
+    fn from_toml_str_rejects_etcd_backend_with_empty_endpoints() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = []"#,
+        )
+        .expect_err("etcd backend with empty endpoints should be rejected");
+
+        assert!(error.to_string().contains("metadata.etcd.endpoints"));
     }
 
     #[test]

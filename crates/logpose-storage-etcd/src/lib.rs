@@ -496,19 +496,24 @@ impl EtcdCoordinationClient {
             .await
             .map_err(etcd_message)?;
         let lease_id = lease.id();
-        client_ref
+        match client_ref
             .put(
                 membership_key.clone(),
                 encoded,
                 Some(PutOptions::new().with_lease(lease_id)),
             )
             .await
-            .map_err(etcd_message)?;
-        Ok(MembershipLease {
-            node_id: node_id.to_owned(),
-            lease_id,
-            key: membership_key,
-        })
+        {
+            Ok(_) => Ok(MembershipLease {
+                node_id: node_id.to_owned(),
+                lease_id,
+                key: membership_key,
+            }),
+            Err(error) => {
+                let _ = client_ref.lease_revoke(lease_id).await;
+                Err(etcd_message(error))
+            }
+        }
     }
 
     /// Keep one lease alive by issuing a keep-alive signal.
@@ -555,8 +560,15 @@ impl EtcdCoordinationClient {
                 encoded,
                 Some(PutOptions::new().with_lease(lease_id)),
             )]);
-        let response = client_ref.txn(txn).await.map_err(etcd_message)?;
+        let response = match client_ref.txn(txn).await {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = client_ref.lease_revoke(lease_id).await;
+                return Err(etcd_message(error));
+            }
+        };
         if !response.succeeded() {
+            let _ = client_ref.lease_revoke(lease_id).await;
             return Ok(None);
         }
         Ok(Some(LeadershipLease {
@@ -657,7 +669,8 @@ impl EtcdCoordinationClient {
                 CompareOp::Equal,
                 current.mod_revision,
             )])
-            .and_then([TxnOp::put(key.clone(), encoded, None)]);
+            .and_then([TxnOp::put(key.clone(), encoded, None)])
+            .or_else([TxnOp::get(key.clone(), None)]);
         let mut client = self.store.client().await?;
         let client_ref = client
             .as_mut()
@@ -666,14 +679,15 @@ impl EtcdCoordinationClient {
         if !response.succeeded() {
             return Ok(PromotionResult::Conflict);
         }
-        let Some(applied) = self
-            .shard_owner(&current.collection_name, &current.shard_id)
-            .await?
-        else {
+        let get_response = client_ref.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = get_response.kvs().first() else {
             return Err(LogPoseError::Message(
                 "shard owner should exist after successful promotion".to_owned(),
             ));
         };
+        let mut applied: ShardOwnership =
+            serde_json::from_slice(kv.value()).map_err(json_message)?;
+        applied.mod_revision = kv.mod_revision();
         Ok(PromotionResult::Applied(applied))
     }
 
