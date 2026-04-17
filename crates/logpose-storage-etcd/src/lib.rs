@@ -1,0 +1,635 @@
+//! Etcd-backed metadata overlay for collection placement assignments.
+
+use async_trait::async_trait;
+use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, Txn, TxnOp};
+use logpose_catalog::CollectionDescriptor;
+use logpose_storage::{
+    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
+};
+use logpose_types::{
+    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionStats, CommitAck, LogPoseError,
+    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{fmt, path::Path, sync::Arc, time::Duration};
+
+/// Runtime metadata mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataBackend {
+    /// Use local placement files as metadata authority.
+    #[default]
+    Local,
+    /// Use etcd as metadata authority and keep local placement files as fallback.
+    Etcd,
+}
+
+impl fmt::Display for MetadataBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => formatter.write_str("local"),
+            Self::Etcd => formatter.write_str("etcd"),
+        }
+    }
+}
+
+/// Configuration for etcd-backed metadata authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EtcdMetadataConfig {
+    /// Etcd endpoints, for example `http://127.0.0.1:2379`.
+    pub endpoints: Vec<String>,
+    /// Key prefix for LogPose metadata state.
+    #[serde(default = "default_prefix")]
+    pub key_prefix: String,
+    /// Request timeout in milliseconds.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Node membership lease TTL in seconds.
+    #[serde(default = "default_membership_ttl_secs")]
+    pub membership_ttl_secs: i64,
+    /// Controller leadership lease TTL in seconds.
+    #[serde(default = "default_leadership_ttl_secs")]
+    pub leadership_ttl_secs: i64,
+    /// Cluster namespace for metadata coordination keys.
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
+}
+
+impl Default for EtcdMetadataConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key_prefix: "/logpose/metadata".to_owned(),
+            timeout_ms: default_timeout_ms(),
+            membership_ttl_secs: default_membership_ttl_secs(),
+            leadership_ttl_secs: default_leadership_ttl_secs(),
+            cluster_name: default_cluster_name(),
+        }
+    }
+}
+
+/// Top-level metadata configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct MetadataConfig {
+    /// Selected metadata backend.
+    #[serde(default)]
+    pub backend: MetadataBackend,
+    /// Etcd-specific settings.
+    #[serde(default)]
+    pub etcd: EtcdMetadataConfig,
+}
+
+fn default_prefix() -> String {
+    "/logpose/metadata".to_owned()
+}
+
+const fn default_timeout_ms() -> u64 {
+    1_500
+}
+
+const fn default_membership_ttl_secs() -> i64 {
+    15
+}
+
+const fn default_leadership_ttl_secs() -> i64 {
+    10
+}
+
+fn default_cluster_name() -> String {
+    "default".to_owned()
+}
+
+/// Storage engine wrapper that uses etcd for assignment metadata.
+#[derive(Clone)]
+pub struct EtcdBackedStorageEngine {
+    local: Arc<LocalStorageEngine>,
+    etcd: EtcdPlacementStore,
+}
+
+impl EtcdBackedStorageEngine {
+    /// Construct the wrapper over a local storage root.
+    pub fn new(root: impl AsRef<Path>, config: EtcdMetadataConfig) -> Result<Self> {
+        let etcd = EtcdPlacementStore::new(config)?;
+        Ok(Self {
+            local: Arc::new(LocalStorageEngine::new(root)),
+            etcd,
+        })
+    }
+}
+
+#[async_trait]
+impl StorageEngine for EtcdBackedStorageEngine {
+    async fn engine_name(&self) -> &'static str {
+        "local+etcd-metadata"
+    }
+
+    async fn create_collection(
+        &self,
+        request: CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        self.local.create_collection(request).await
+    }
+
+    async fn create_collection_with_assignment(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+    ) -> Result<CollectionDescriptor> {
+        self.etcd
+            .put_assignment_if_absent(&request.name, &assignment)
+            .await?;
+        match self
+            .local
+            .create_collection_with_assignment(request.clone(), assignment)
+            .await
+        {
+            Ok(descriptor) => Ok(descriptor),
+            Err(error) => {
+                let _ = self.etcd.delete_assignment(&request.name).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
+        self.local.open_collection(name).await
+    }
+
+    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.local.list_collections().await
+    }
+
+    async fn collection_assignment_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        if let Some(assignment) = self.etcd.get_assignment(&descriptor.name).await? {
+            return Ok(assignment);
+        }
+        self.local
+            .collection_assignment_descriptor(descriptor)
+            .await
+    }
+
+    async fn write(
+        &self,
+        collection_name: &str,
+        operations: Vec<WriteOperation>,
+    ) -> Result<CommitAck> {
+        self.local.write(collection_name, operations).await
+    }
+
+    async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
+        self.local.snapshot(collection_name).await
+    }
+
+    async fn scan_exact(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Vec<VisibleRecord>> {
+        self.local.scan_exact(collection_name, snapshot).await
+    }
+
+    async fn scan_exact_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        self.local
+            .scan_exact_selected(
+                collection_name,
+                snapshot,
+                include_mutable,
+                immutable_unit_ids,
+            )
+            .await
+    }
+
+    async fn ann_search_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        immutable_unit_ids: Vec<String>,
+        request: AnnSearchRequest,
+        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
+    ) -> Result<Vec<AnnCandidate>> {
+        self.local
+            .ann_search_selected(
+                collection_name,
+                snapshot,
+                immutable_unit_ids,
+                request,
+                filter,
+            )
+            .await
+    }
+
+    async fn latest_visible_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        record_ids: Vec<RecordId>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        self.local
+            .latest_visible_selected(
+                collection_name,
+                snapshot,
+                record_ids,
+                include_mutable,
+                immutable_unit_ids,
+            )
+            .await
+    }
+
+    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        self.local.flush(collection_name).await
+    }
+
+    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        self.local.compact(collection_name).await
+    }
+
+    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
+        self.local.stats(collection_name).await
+    }
+
+    async fn stats_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        self.local.stats_descriptor(descriptor, snapshot).await
+    }
+
+    async fn maintenance_status_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        self.local.maintenance_status_descriptor(descriptor).await
+    }
+
+    async fn recover_maintenance_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<()> {
+        self.local.recover_maintenance_descriptor(descriptor).await
+    }
+
+    async fn stats_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        self.local.stats_snapshot(collection_name, snapshot).await
+    }
+
+    async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport> {
+        self.local.inspect(collection_name, target).await
+    }
+}
+
+#[derive(Clone)]
+struct EtcdPlacementStore {
+    client: Arc<tokio::sync::Mutex<Option<Client>>>,
+    endpoints: Vec<String>,
+    timeout_ms: u64,
+    key_prefix: String,
+}
+
+impl EtcdPlacementStore {
+    fn new(config: EtcdMetadataConfig) -> Result<Self> {
+        if config.endpoints.is_empty() {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.endpoints must not be empty".to_owned(),
+            ));
+        }
+        Ok(Self {
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+            endpoints: config.endpoints,
+            timeout_ms: config.timeout_ms,
+            key_prefix: config.key_prefix.trim_end_matches('/').to_owned(),
+        })
+    }
+
+    async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Client>>> {
+        let mut guard = self.client.lock().await;
+        if guard.is_none() {
+            let options = etcd_client::ConnectOptions::default()
+                .with_keep_alive(Duration::from_secs(5), Duration::from_secs(2))
+                .with_timeout(Duration::from_millis(self.timeout_ms));
+            let client = Client::connect(self.endpoints.clone(), Some(options))
+                .await
+                .map_err(etcd_message)?;
+            *guard = Some(client);
+        }
+        Ok(guard)
+    }
+
+    fn assignment_key(&self, collection_name: &str) -> String {
+        format!(
+            "{}/collections/{collection_name}/assignment",
+            self.key_prefix
+        )
+    }
+
+    async fn put_assignment_if_absent(
+        &self,
+        collection_name: &str,
+        assignment: &CollectionAssignment,
+    ) -> Result<()> {
+        let key = self.assignment_key(collection_name);
+        let value = serde_json::to_string(assignment).map_err(json_message)?;
+        let txn = Txn::new()
+            .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
+            .and_then([TxnOp::put(key.clone(), value, Some(PutOptions::new()))]);
+        let mut client = self.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref.txn(txn).await.map_err(etcd_message)?;
+        if response.succeeded() {
+            Ok(())
+        } else {
+            Err(LogPoseError::Message(format!(
+                "collection '{collection_name}' already has metadata assignment in etcd"
+            )))
+        }
+    }
+
+    async fn get_assignment(&self, collection_name: &str) -> Result<Option<CollectionAssignment>> {
+        let key = self.assignment_key(collection_name);
+        let mut client = self.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let assignment = serde_json::from_slice(kv.value()).map_err(json_message)?;
+        Ok(Some(assignment))
+    }
+
+    async fn delete_assignment(&self, collection_name: &str) -> Result<()> {
+        let mut client = self.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        client_ref
+            .delete(
+                self.assignment_key(collection_name),
+                Some(DeleteOptions::new()),
+            )
+            .await
+            .map_err(etcd_message)?;
+        Ok(())
+    }
+}
+
+fn json_message(error: serde_json::Error) -> LogPoseError {
+    LogPoseError::Message(format!("failed to encode metadata payload: {error}"))
+}
+
+fn etcd_message(error: etcd_client::Error) -> LogPoseError {
+    LogPoseError::Message(format!("etcd metadata operation failed: {error}"))
+}
+
+/// Lease-backed membership record registered in etcd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MembershipLease {
+    /// Node identifier registered in metadata.
+    pub node_id: String,
+    /// Etcd lease identifier backing this membership.
+    pub lease_id: i64,
+    /// Etcd key containing the membership payload.
+    pub key: String,
+}
+
+/// Controller leadership claim record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LeadershipLease {
+    /// Current leader node identifier.
+    pub node_id: String,
+    /// Etcd lease identifier backing the leadership claim.
+    pub lease_id: i64,
+    /// Etcd key containing the leadership payload.
+    pub key: String,
+}
+
+/// Membership payload persisted in etcd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MembershipRecord {
+    /// Node identifier registered in metadata.
+    pub node_id: String,
+    /// Node state marker used by control loops.
+    pub state: String,
+}
+
+/// Leadership payload persisted in etcd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LeadershipRecord {
+    /// Current leader node identifier.
+    pub node_id: String,
+}
+
+/// Distributed coordination helper over etcd leases and CAS primitives.
+#[derive(Clone)]
+pub struct EtcdCoordinationClient {
+    store: EtcdPlacementStore,
+    config: EtcdMetadataConfig,
+}
+
+impl EtcdCoordinationClient {
+    /// Build a coordination helper from etcd metadata config.
+    pub fn new(config: EtcdMetadataConfig) -> Result<Self> {
+        let store = EtcdPlacementStore::new(config.clone())?;
+        Ok(Self { store, config })
+    }
+
+    /// Register node membership with an etcd lease.
+    pub async fn register_membership(&self, node_id: &str) -> Result<MembershipLease> {
+        let membership_key = format!(
+            "{}/clusters/{}/members/{node_id}",
+            self.store.key_prefix, self.config.cluster_name
+        );
+        let payload = serde_json::json!({
+            "node_id": node_id,
+            "state": "ready",
+        });
+        let encoded = serde_json::to_string(&payload).map_err(json_message)?;
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let lease = client_ref
+            .lease_grant(self.config.membership_ttl_secs, None)
+            .await
+            .map_err(etcd_message)?;
+        let lease_id = lease.id();
+        client_ref
+            .put(
+                membership_key.clone(),
+                encoded,
+                Some(PutOptions::new().with_lease(lease_id)),
+            )
+            .await
+            .map_err(etcd_message)?;
+        Ok(MembershipLease {
+            node_id: node_id.to_owned(),
+            lease_id,
+            key: membership_key,
+        })
+    }
+
+    /// Keep one lease alive by issuing a keep-alive signal.
+    pub async fn keep_alive(&self, lease_id: i64) -> Result<()> {
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let (mut keeper, _stream) = client_ref
+            .lease_keep_alive(lease_id)
+            .await
+            .map_err(etcd_message)?;
+        keeper.keep_alive().await.map_err(etcd_message)?;
+        Ok(())
+    }
+
+    /// Try to acquire controller leadership using lease-backed CAS.
+    pub async fn try_acquire_leadership(&self, node_id: &str) -> Result<Option<LeadershipLease>> {
+        let leadership_key = format!(
+            "{}/clusters/{}/controllers/leader",
+            self.store.key_prefix, self.config.cluster_name
+        );
+        let payload = serde_json::json!({
+            "node_id": node_id,
+        });
+        let encoded = serde_json::to_string(&payload).map_err(json_message)?;
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let lease = client_ref
+            .lease_grant(self.config.leadership_ttl_secs, None)
+            .await
+            .map_err(etcd_message)?;
+        let lease_id = lease.id();
+        let txn = Txn::new()
+            .when([Compare::version(
+                leadership_key.clone(),
+                CompareOp::Equal,
+                0,
+            )])
+            .and_then([TxnOp::put(
+                leadership_key.clone(),
+                encoded,
+                Some(PutOptions::new().with_lease(lease_id)),
+            )]);
+        let response = client_ref.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Ok(None);
+        }
+        Ok(Some(LeadershipLease {
+            node_id: node_id.to_owned(),
+            lease_id,
+            key: leadership_key,
+        }))
+    }
+
+    /// Return all currently visible membership records under the configured cluster.
+    pub async fn list_membership(&self) -> Result<Vec<MembershipRecord>> {
+        let membership_prefix = format!(
+            "{}/clusters/{}/members/",
+            self.store.key_prefix, self.config.cluster_name
+        );
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref
+            .get(
+                membership_prefix,
+                Some(
+                    GetOptions::new()
+                        .with_prefix()
+                        .with_sort(etcd_client::SortTarget::Key, etcd_client::SortOrder::Ascend),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        response
+            .kvs()
+            .iter()
+            .map(|kv| serde_json::from_slice(kv.value()).map_err(json_message))
+            .collect()
+    }
+
+    /// Return the current controller leader when one exists.
+    pub async fn current_leader(&self) -> Result<Option<LeadershipRecord>> {
+        let leadership_key = format!(
+            "{}/clusters/{}/controllers/leader",
+            self.store.key_prefix, self.config.cluster_name
+        );
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref
+            .get(leadership_key, None)
+            .await
+            .map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice(kv.value()).map_err(json_message)?;
+        Ok(Some(record))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_etcd_metadata_config_includes_coordination_settings() {
+        let config = EtcdMetadataConfig::default();
+        assert_eq!(config.membership_ttl_secs, 15);
+        assert_eq!(config.leadership_ttl_secs, 10);
+        assert_eq!(config.cluster_name, "default");
+    }
+
+    #[test]
+    fn metadata_backend_display_strings_are_stable() {
+        assert_eq!(MetadataBackend::Local.to_string(), "local");
+        assert_eq!(MetadataBackend::Etcd.to_string(), "etcd");
+    }
+
+    #[test]
+    fn membership_record_round_trip_json() {
+        let payload = MembershipRecord {
+            node_id: "node-a".to_owned(),
+            state: "ready".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: MembershipRecord =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn leadership_record_round_trip_json() {
+        let payload = LeadershipRecord {
+            node_id: "leader-a".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let decoded: LeadershipRecord =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        assert_eq!(decoded, payload);
+    }
+}

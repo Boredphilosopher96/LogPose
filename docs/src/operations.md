@@ -37,10 +37,25 @@ Operator-facing query diagnostics now include ANN-aware plan kinds, candidate ge
 
 Operationally, LogPose is still earlier than a distributed database:
 
-- there is no metadata quorum, cluster membership service, or replica controller
+- etcd-backed collection-assignment metadata can now be enabled, but metadata quorum, membership leases, and replica controllers are not complete
 - health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
 - authentication and authorization are scaffolds, not full operator policy enforcement
 - tracing is initialized, but a metrics endpoint and richer telemetry surfaces do not exist yet
 - remote blob synchronization to MinIO or S3 is not implemented yet
 
 Testing and CI are intentionally layered. The repository-level doctrine for generative harnesses, future simulation work, and concern-based CI decomposition lives in [Testing](./testing.md).
+
+To enable etcd-backed assignment metadata:
+
+```toml
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379"]
+key_prefix = "/logpose/metadata"
+timeout_ms = 1500
+membership_ttl_secs = 15
+leadership_ttl_secs = 10
+cluster_name = "default"
+```

@@ -6,6 +6,7 @@ use logpose_service::{
     LogPoseControlService, LogPoseDataService, Result as ServiceResult, ServiceError,
 };
 use logpose_storage::{InspectReport, InspectTarget, LocalStorageEngine};
+use logpose_storage_etcd::{EtcdBackedStorageEngine, MetadataBackend};
 use logpose_types::{
     BuildInfo, CollectionStats, CommitAck, NodeMetadata, NodeRole, Snapshot, WriteOperation,
 };
@@ -35,9 +36,14 @@ impl AppState {
             .validate()
             .expect("invalid runtime configuration for AppState");
         let build = BuildInfo::current();
-        let data = Arc::new(LogPoseDataService::new(Arc::new(LocalStorageEngine::new(
-            &config.storage_root,
-        ))));
+        let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
+            MetadataBackend::Local => Arc::new(LocalStorageEngine::new(&config.storage_root)),
+            MetadataBackend::Etcd => Arc::new(
+                EtcdBackedStorageEngine::new(&config.storage_root, config.metadata.etcd.clone())
+                    .expect("invalid etcd metadata configuration"),
+            ),
+        };
+        let data = Arc::new(LogPoseDataService::new(storage));
         let control = Arc::new(LogPoseControlService::new(
             Arc::clone(&data),
             config.clone(),

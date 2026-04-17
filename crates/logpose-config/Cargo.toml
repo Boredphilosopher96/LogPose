@@ -10,5 +10,6 @@ workspace = true
 
 [dependencies]
 logpose-types = { path = "../logpose-types" }
+logpose-storage-etcd = { path = "../logpose-storage-etcd" }
 serde.workspace = true
 toml.workspace = true
