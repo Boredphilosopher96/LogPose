@@ -3323,6 +3323,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_quit_is_deferred_until_the_action_completes() {
+        let mut app = InteractiveApp {
+            screen: Screen::Running,
+            home: HomeState {
+                search: String::new(),
+                selected: 0,
+            },
+            dashboard: DashboardState {
+                concern: ConcernKind::Data,
+                search: String::new(),
+                selected: 0,
+            },
+            concerns: concern_definitions(),
+            definitions: workflow_definitions(),
+            form: None,
+            confirm: None,
+            picker: None,
+            running: Some(RunningState {
+                message: "Running".to_owned(),
+                action: Action::Status,
+                frame: 0,
+            }),
+            result: None,
+            session: test_session(),
+            output_mode: OutputMode::Human,
+            cwd: PathBuf::from("."),
+            status_message: String::new(),
+            should_exit: false,
+            exit_after_running: false,
+        };
+
+        let should_break = app
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &logpose_config::LogPoseConfig::default(),
+                unbounded_channel().0,
+            )
+            .await
+            .expect("running key should succeed");
+
+        assert!(
+            !should_break,
+            "quit on Running screen must keep the TUI loop alive so the in-flight action can finish"
+        );
+        assert!(
+            !app.should_exit,
+            "quit on Running screen must not set should_exit before the action completes"
+        );
+        assert!(
+            app.exit_after_running,
+            "quit on Running screen must queue the exit for after the action completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_quit_exits_the_app_after_the_action_completes() {
+        let mut app = InteractiveApp {
+            screen: Screen::Running,
+            home: HomeState {
+                search: String::new(),
+                selected: 0,
+            },
+            dashboard: DashboardState {
+                concern: ConcernKind::Data,
+                search: String::new(),
+                selected: 0,
+            },
+            concerns: concern_definitions(),
+            definitions: workflow_definitions(),
+            form: None,
+            confirm: None,
+            picker: None,
+            running: Some(RunningState {
+                message: "Running".to_owned(),
+                action: Action::Status,
+                frame: 0,
+            }),
+            result: None,
+            session: test_session(),
+            output_mode: OutputMode::Human,
+            cwd: PathBuf::from("."),
+            status_message: String::new(),
+            should_exit: false,
+            exit_after_running: true,
+        };
+
+        app.apply_tui_event(TuiEvent::ActionComplete {
+            action: Action::Status,
+            result: Box::new(Err(anyhow::anyhow!("boom"))),
+            session: Box::new(test_session()),
+        });
+
+        assert!(
+            app.should_exit,
+            "ActionComplete should honor the queued quit once the action finishes"
+        );
+    }
+
+    #[tokio::test]
     async fn dashboard_escape_does_not_exit_the_session() {
         let mut app = InteractiveApp {
             screen: Screen::Dashboard,
