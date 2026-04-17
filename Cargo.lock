@@ -1353,7 +1353,6 @@ dependencies = [
 name = "logpose-config"
 version = "0.1.0"
 dependencies = [
- "logpose-storage-etcd",
  "logpose-types",
  "serde",
  "toml",

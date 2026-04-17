@@ -476,6 +476,97 @@ pub struct CollectionStats {
     pub query_units: Vec<QueryUnitStats>,
 }
 
+/// Runtime metadata backend selection for the control-plane authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataBackend {
+    /// Use local placement files as metadata authority.
+    #[default]
+    Local,
+    /// Use etcd as metadata authority and keep local placement files as fallback.
+    Etcd,
+}
+
+impl fmt::Display for MetadataBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => formatter.write_str("local"),
+            Self::Etcd => formatter.write_str("etcd"),
+        }
+    }
+}
+
+/// Configuration for etcd-backed metadata authority.
+///
+/// These fields configure the etcd client used by the control plane when
+/// [`MetadataBackend::Etcd`] is selected. The struct lives in `logpose-types`
+/// (not `logpose-storage-etcd`) so crates that only need to parse
+/// configuration do not have to pull in the etcd-client implementation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EtcdMetadataConfig {
+    /// Etcd endpoints, for example `http://127.0.0.1:2379`.
+    pub endpoints: Vec<String>,
+    /// Key prefix for LogPose metadata state.
+    #[serde(default = "default_etcd_key_prefix")]
+    pub key_prefix: String,
+    /// Request timeout in milliseconds.
+    #[serde(default = "default_etcd_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Node membership lease TTL in seconds.
+    #[serde(default = "default_etcd_membership_ttl_secs")]
+    pub membership_ttl_secs: i64,
+    /// Controller leadership lease TTL in seconds.
+    #[serde(default = "default_etcd_leadership_ttl_secs")]
+    pub leadership_ttl_secs: i64,
+    /// Cluster namespace for metadata coordination keys.
+    #[serde(default = "default_etcd_cluster_name")]
+    pub cluster_name: String,
+}
+
+impl Default for EtcdMetadataConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key_prefix: default_etcd_key_prefix(),
+            timeout_ms: default_etcd_timeout_ms(),
+            membership_ttl_secs: default_etcd_membership_ttl_secs(),
+            leadership_ttl_secs: default_etcd_leadership_ttl_secs(),
+            cluster_name: default_etcd_cluster_name(),
+        }
+    }
+}
+
+/// Top-level metadata configuration exposed through `LogPoseConfig`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct MetadataConfig {
+    /// Selected metadata backend.
+    #[serde(default)]
+    pub backend: MetadataBackend,
+    /// Etcd-specific settings.
+    #[serde(default)]
+    pub etcd: EtcdMetadataConfig,
+}
+
+fn default_etcd_key_prefix() -> String {
+    "/logpose/metadata".to_owned()
+}
+
+const fn default_etcd_timeout_ms() -> u64 {
+    1_500
+}
+
+const fn default_etcd_membership_ttl_secs() -> i64 {
+    15
+}
+
+const fn default_etcd_leadership_ttl_secs() -> i64 {
+    10
+}
+
+fn default_etcd_cluster_name() -> String {
+    "default".to_owned()
+}
+
 /// Persisted node assignment for one collection.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionAssignment {

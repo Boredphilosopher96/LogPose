@@ -6,9 +6,10 @@ use logpose_service::{
     LogPoseControlService, LogPoseDataService, Result as ServiceResult, ServiceError,
 };
 use logpose_storage::{InspectReport, InspectTarget, LocalStorageEngine};
-use logpose_storage_etcd::{EtcdBackedStorageEngine, MetadataBackend};
+use logpose_storage_etcd::EtcdBackedStorageEngine;
 use logpose_types::{
-    BuildInfo, CollectionStats, CommitAck, NodeMetadata, NodeRole, Snapshot, WriteOperation,
+    BuildInfo, CollectionStats, CommitAck, MetadataBackend, NodeMetadata, NodeRole, Snapshot,
+    WriteOperation,
 };
 use serde::Serialize;
 use std::sync::Arc;

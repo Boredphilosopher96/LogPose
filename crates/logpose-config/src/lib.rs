@@ -1,7 +1,8 @@
 //! Configuration loading for LogPose services and tooling.
 
-use logpose_storage_etcd::{MetadataBackend, MetadataConfig};
-use logpose_types::{ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, NodeRole, Result};
+use logpose_types::{
+    ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, MetadataBackend, MetadataConfig, NodeRole, Result,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
