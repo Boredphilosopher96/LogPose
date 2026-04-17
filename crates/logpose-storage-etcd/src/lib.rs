@@ -1,104 +1,26 @@
 //! Etcd-backed metadata overlay for collection placement assignments.
 
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, Txn, TxnOp};
+use etcd_client::{
+    Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, ResponseHeader, Txn, TxnOp,
+};
 use logpose_catalog::CollectionDescriptor;
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_types::{
-    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionStats, CommitAck, LogPoseError,
-    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionStats, CommitAck,
+    EtcdMetadataConfig, LogPoseError, MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fmt, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
-/// Runtime metadata mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MetadataBackend {
-    /// Use local placement files as metadata authority.
-    #[default]
-    Local,
-    /// Use etcd as metadata authority and keep local placement files as fallback.
-    Etcd,
-}
-
-impl fmt::Display for MetadataBackend {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Local => formatter.write_str("local"),
-            Self::Etcd => formatter.write_str("etcd"),
-        }
-    }
-}
-
-/// Configuration for etcd-backed metadata authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EtcdMetadataConfig {
-    /// Etcd endpoints, for example `http://127.0.0.1:2379`.
-    pub endpoints: Vec<String>,
-    /// Key prefix for LogPose metadata state.
-    #[serde(default = "default_prefix")]
-    pub key_prefix: String,
-    /// Request timeout in milliseconds.
-    #[serde(default = "default_timeout_ms")]
-    pub timeout_ms: u64,
-    /// Node membership lease TTL in seconds.
-    #[serde(default = "default_membership_ttl_secs")]
-    pub membership_ttl_secs: i64,
-    /// Controller leadership lease TTL in seconds.
-    #[serde(default = "default_leadership_ttl_secs")]
-    pub leadership_ttl_secs: i64,
-    /// Cluster namespace for metadata coordination keys.
-    #[serde(default = "default_cluster_name")]
-    pub cluster_name: String,
-}
-
-impl Default for EtcdMetadataConfig {
-    fn default() -> Self {
-        Self {
-            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-            key_prefix: "/logpose/metadata".to_owned(),
-            timeout_ms: default_timeout_ms(),
-            membership_ttl_secs: default_membership_ttl_secs(),
-            leadership_ttl_secs: default_leadership_ttl_secs(),
-            cluster_name: default_cluster_name(),
-        }
-    }
-}
-
-/// Top-level metadata configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
-pub struct MetadataConfig {
-    /// Selected metadata backend.
-    #[serde(default)]
-    pub backend: MetadataBackend,
-    /// Etcd-specific settings.
-    #[serde(default)]
-    pub etcd: EtcdMetadataConfig,
-}
-
-fn default_prefix() -> String {
-    "/logpose/metadata".to_owned()
-}
-
-const fn default_timeout_ms() -> u64 {
-    1_500
-}
-
-const fn default_membership_ttl_secs() -> i64 {
-    15
-}
-
-const fn default_leadership_ttl_secs() -> i64 {
-    10
-}
-
-fn default_cluster_name() -> String {
-    "default".to_owned()
-}
+// The metadata configuration types (`MetadataBackend`, `EtcdMetadataConfig`,
+// and `MetadataConfig`) live in `logpose-types` so that crates like
+// `logpose-config` can depend only on the foundational types crate without
+// pulling in the etcd client implementation.
 
 /// Storage engine wrapper that uses etcd for assignment metadata.
 #[derive(Clone)]
@@ -649,13 +571,21 @@ impl EtcdCoordinationClient {
     }
 
     /// Promote or move shard ownership using revision-based CAS fencing.
+    ///
+    /// On a successful CAS, the returned [`ShardOwnership`] observes *our own
+    /// write* strictly: the payload is the exact candidate we issued and
+    /// `mod_revision` is taken from the committing transaction's header
+    /// revision, which is the cluster revision at which the put applied.
+    /// This avoids the race window a follow-up `get` would expose, where a
+    /// later writer could advance the key's `mod_revision` between the CAS
+    /// and the read-back.
     pub async fn promote_shard_owner(
         &self,
         current: &ShardOwnership,
         new_owner_node_id: &str,
     ) -> Result<PromotionResult> {
         let key = self.shard_owner_key(&current.collection_name, &current.shard_id);
-        let candidate = ShardOwnership {
+        let mut candidate = ShardOwnership {
             collection_name: current.collection_name.clone(),
             shard_id: current.shard_id.clone(),
             owner_node_id: new_owner_node_id.to_owned(),
@@ -669,8 +599,7 @@ impl EtcdCoordinationClient {
                 CompareOp::Equal,
                 current.mod_revision,
             )])
-            .and_then([TxnOp::put(key.clone(), encoded, None)])
-            .or_else([TxnOp::get(key.clone(), None)]);
+            .and_then([TxnOp::put(key.clone(), encoded, None)]);
         let mut client = self.store.client().await?;
         let client_ref = client
             .as_mut()
@@ -679,16 +608,16 @@ impl EtcdCoordinationClient {
         if !response.succeeded() {
             return Ok(PromotionResult::Conflict);
         }
-        let get_response = client_ref.get(key, None).await.map_err(etcd_message)?;
-        let Some(kv) = get_response.kvs().first() else {
-            return Err(LogPoseError::Message(
-                "shard owner should exist after successful promotion".to_owned(),
-            ));
-        };
-        let mut applied: ShardOwnership =
-            serde_json::from_slice(kv.value()).map_err(json_message)?;
-        applied.mod_revision = kv.mod_revision();
-        Ok(PromotionResult::Applied(applied))
+        let revision = response
+            .header()
+            .map(ResponseHeader::revision)
+            .ok_or_else(|| {
+                LogPoseError::Message(
+                    "etcd txn response missing header revision after successful put".to_owned(),
+                )
+            })?;
+        candidate.mod_revision = revision;
+        Ok(PromotionResult::Applied(candidate))
     }
 
     fn shard_owner_key(&self, collection_name: &str, shard_id: &str) -> String {
@@ -702,20 +631,6 @@ impl EtcdCoordinationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_etcd_metadata_config_includes_coordination_settings() {
-        let config = EtcdMetadataConfig::default();
-        assert_eq!(config.membership_ttl_secs, 15);
-        assert_eq!(config.leadership_ttl_secs, 10);
-        assert_eq!(config.cluster_name, "default");
-    }
-
-    #[test]
-    fn metadata_backend_display_strings_are_stable() {
-        assert_eq!(MetadataBackend::Local.to_string(), "local");
-        assert_eq!(MetadataBackend::Etcd.to_string(), "etcd");
-    }
 
     #[test]
     fn membership_record_round_trip_json() {
