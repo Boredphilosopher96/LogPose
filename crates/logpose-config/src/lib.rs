@@ -1,5 +1,6 @@
 //! Configuration loading for LogPose services and tooling.
 
+use logpose_storage_etcd::MetadataConfig;
 use logpose_types::{ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, NodeRole, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,6 +25,9 @@ pub struct LogPoseConfig {
     pub log_filter: String,
     /// Root directory for local storage-engine state.
     pub storage_root: PathBuf,
+    /// Metadata control-plane backend and settings.
+    #[serde(default)]
+    pub metadata: MetadataConfig,
 }
 
 impl Default for LogPoseConfig {
@@ -37,6 +41,7 @@ impl Default for LogPoseConfig {
             grpc_port: 50051,
             log_filter: "info,logpose=debug".to_owned(),
             storage_root: PathBuf::from(".logpose"),
+            metadata: MetadataConfig::default(),
         }
     }
 }
@@ -100,6 +105,46 @@ storage_root = "tmp/logpose-data""#,
         assert_eq!(config.storage_root, PathBuf::from("tmp/logpose-data"));
         assert_eq!(config.node_role, NodeRole::Data);
         assert_eq!(config.rest_port, 18080);
+        assert_eq!(config.metadata.backend.to_string(), "local");
+    }
+
+    #[test]
+    fn from_toml_str_reads_etcd_metadata_backend() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379", "http://127.0.0.1:22379"]
+key_prefix = "/logpose/prod"
+timeout_ms = 900
+membership_ttl_secs = 25
+leadership_ttl_secs = 12
+cluster_name = "prod-cluster""#,
+        )
+        .expect("config should load");
+
+        assert_eq!(config.metadata.backend.to_string(), "etcd");
+        assert_eq!(
+            config.metadata.etcd.endpoints,
+            vec![
+                "http://127.0.0.1:2379".to_owned(),
+                "http://127.0.0.1:22379".to_owned()
+            ]
+        );
+        assert_eq!(config.metadata.etcd.key_prefix, "/logpose/prod");
+        assert_eq!(config.metadata.etcd.timeout_ms, 900);
+        assert_eq!(config.metadata.etcd.membership_ttl_secs, 25);
+        assert_eq!(config.metadata.etcd.leadership_ttl_secs, 12);
+        assert_eq!(config.metadata.etcd.cluster_name, "prod-cluster");
     }
 
     #[test]

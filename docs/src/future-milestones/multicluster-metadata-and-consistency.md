@@ -104,6 +104,17 @@ The system should document which APIs allow which modes. Consistency should be a
 
 ## Main Work Streams
 
+## Implementation Checkpoint (April 17, 2026)
+
+The repository now includes a first production-oriented metadata backend switch with an etcd option:
+
+- `metadata.backend = "etcd"` enables etcd-backed authoritative collection assignment metadata
+- assignment writes use create-if-absent transactions to prevent split ownership on create
+- read paths prefer etcd assignments and fall back to local placement files only when keys are absent
+- local placement files are still written for recovery/bootstrap diagnostics while etcd is authoritative
+
+This is intentionally a foundation milestone and not full distributed control-plane completion. Remaining work from the streams below still applies (leases, elections, shard/replica control loops, epoch-gated serving, and multi-node failover simulations).
+
 ### 1. Metadata Model
 
 - add first-class shard, replica, and epoch types

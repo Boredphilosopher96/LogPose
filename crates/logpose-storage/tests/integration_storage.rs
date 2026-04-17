@@ -621,6 +621,13 @@ async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
         .mode();
     fs::set_permissions(&wal_dir, fs::Permissions::from_mode(0o555))
         .expect("wal dir should become read-only");
+    let probe_path = wal_dir.join("permission_probe");
+    if fs::write(&probe_path, b"probe").is_ok() {
+        let _ = fs::remove_file(&probe_path);
+        fs::set_permissions(&wal_dir, fs::Permissions::from_mode(original_mode))
+            .expect("wal dir permissions should be restored");
+        return;
+    }
 
     let reopened = LocalStorageEngine::new(&root);
     let result = reopened.stats("documents").await;

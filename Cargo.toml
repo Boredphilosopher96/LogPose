@@ -13,6 +13,7 @@ members = [
     "crates/logpose-query",
     "crates/logpose-service",
     "crates/logpose-storage",
+    "crates/logpose-storage-etcd",
     "crates/logpose-telemetry",
     "crates/logpose-types",
     "crates/logpose-wal",
