@@ -1140,11 +1140,15 @@ impl InteractiveApp {
                     // is mid-flight can leave partial writes (e.g. a batched
                     // record put that has only flushed some batches). Instead
                     // we mark the request and honor it once the action
-                    // finishes in `apply_tui_event`.
+                    // finishes in `apply_tui_event`. We must return `Ok(false)`
+                    // here, because returning `Ok(true)` breaks the `run_tui`
+                    // event loop immediately, which would drop the spawned
+                    // tokio task from `launch_action` and reintroduce the
+                    // partial-write race this branch is meant to prevent.
                     self.exit_after_running = true;
                     self.status_message =
                         "Quit queued. Waiting for the running action to finish...".to_owned();
-                    return Ok(true);
+                    return Ok(false);
                 }
                 Ok(false)
             }
