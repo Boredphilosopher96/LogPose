@@ -438,6 +438,30 @@ pub struct LeadershipRecord {
     pub node_id: String,
 }
 
+/// Shard ownership record used for epoch-based write fencing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardOwnership {
+    /// Collection name owning the shard.
+    pub collection_name: String,
+    /// Shard identifier string.
+    pub shard_id: String,
+    /// Current owner node identifier.
+    pub owner_node_id: String,
+    /// Monotonic ownership epoch.
+    pub epoch: u64,
+    /// Etcd mod revision observed when the record was read.
+    pub mod_revision: i64,
+}
+
+/// Result of a promotion or ownership move transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PromotionResult {
+    /// Ownership update transaction committed.
+    Applied(ShardOwnership),
+    /// Ownership update conflicted with a newer revision.
+    Conflict,
+}
+
 /// Distributed coordination helper over etcd leases and CAS primitives.
 #[derive(Clone)]
 pub struct EtcdCoordinationClient {
@@ -590,6 +614,75 @@ impl EtcdCoordinationClient {
         let record = serde_json::from_slice(kv.value()).map_err(json_message)?;
         Ok(Some(record))
     }
+
+    /// Read the current owner for one shard with mod revision for CAS updates.
+    pub async fn shard_owner(
+        &self,
+        collection_name: &str,
+        shard_id: &str,
+    ) -> Result<Option<ShardOwnership>> {
+        let key = self.shard_owner_key(collection_name, shard_id);
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let mut ownership: ShardOwnership =
+            serde_json::from_slice(kv.value()).map_err(json_message)?;
+        ownership.mod_revision = kv.mod_revision();
+        Ok(Some(ownership))
+    }
+
+    /// Promote or move shard ownership using revision-based CAS fencing.
+    pub async fn promote_shard_owner(
+        &self,
+        current: &ShardOwnership,
+        new_owner_node_id: &str,
+    ) -> Result<PromotionResult> {
+        let key = self.shard_owner_key(&current.collection_name, &current.shard_id);
+        let candidate = ShardOwnership {
+            collection_name: current.collection_name.clone(),
+            shard_id: current.shard_id.clone(),
+            owner_node_id: new_owner_node_id.to_owned(),
+            epoch: current.epoch.saturating_add(1),
+            mod_revision: 0,
+        };
+        let encoded = serde_json::to_string(&candidate).map_err(json_message)?;
+        let txn = Txn::new()
+            .when([Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                current.mod_revision,
+            )])
+            .and_then([TxnOp::put(key.clone(), encoded, None)]);
+        let mut client = self.store.client().await?;
+        let client_ref = client
+            .as_mut()
+            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))?;
+        let response = client_ref.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Ok(PromotionResult::Conflict);
+        }
+        let Some(applied) = self
+            .shard_owner(&current.collection_name, &current.shard_id)
+            .await?
+        else {
+            return Err(LogPoseError::Message(
+                "shard owner should exist after successful promotion".to_owned(),
+            ));
+        };
+        Ok(PromotionResult::Applied(applied))
+    }
+
+    fn shard_owner_key(&self, collection_name: &str, shard_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/collections/{collection_name}/shards/{shard_id}/owner",
+            self.store.key_prefix, self.config.cluster_name
+        )
+    }
 }
 
 #[cfg(test)]
@@ -616,10 +709,14 @@ mod tests {
             node_id: "node-a".to_owned(),
             state: "ready".to_owned(),
         };
-        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
-        let decoded: MembershipRecord =
-            serde_json::from_slice(&encoded).expect("payload should decode");
-        assert_eq!(decoded, payload);
+        let encoded = serde_json::to_vec(&payload);
+        assert!(encoded.is_ok(), "payload should encode");
+        let decoded: serde_json::Result<MembershipRecord> =
+            serde_json::from_slice(encoded.as_deref().unwrap_or_default());
+        assert!(decoded.is_ok(), "payload should decode");
+        if let Ok(decoded) = decoded {
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[test]
@@ -627,9 +724,32 @@ mod tests {
         let payload = LeadershipRecord {
             node_id: "leader-a".to_owned(),
         };
-        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
-        let decoded: LeadershipRecord =
-            serde_json::from_slice(&encoded).expect("payload should decode");
-        assert_eq!(decoded, payload);
+        let encoded = serde_json::to_vec(&payload);
+        assert!(encoded.is_ok(), "payload should encode");
+        let decoded: serde_json::Result<LeadershipRecord> =
+            serde_json::from_slice(encoded.as_deref().unwrap_or_default());
+        assert!(decoded.is_ok(), "payload should decode");
+        if let Ok(decoded) = decoded {
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[test]
+    fn shard_ownership_round_trip_json() {
+        let payload = ShardOwnership {
+            collection_name: "documents".to_owned(),
+            shard_id: "shard-0".to_owned(),
+            owner_node_id: "node-a".to_owned(),
+            epoch: 4,
+            mod_revision: 11,
+        };
+        let encoded = serde_json::to_vec(&payload);
+        assert!(encoded.is_ok(), "payload should encode");
+        let decoded: serde_json::Result<ShardOwnership> =
+            serde_json::from_slice(encoded.as_deref().unwrap_or_default());
+        assert!(decoded.is_ok(), "payload should decode");
+        if let Ok(decoded) = decoded {
+            assert_eq!(decoded, payload);
+        }
     }
 }
