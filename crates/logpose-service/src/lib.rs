@@ -29,7 +29,7 @@ use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement,
+    ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeRole,
     NodeRuntimeStatus, Snapshot, WriteOperation,
 };
@@ -112,10 +112,7 @@ impl LogPoseDataService {
         &self,
         collection_name: &str,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        self.storage
-            .open_collection(collection_name)
-            .await
-            .map_err(Into::into)
+        self.resolved_collection_descriptor(collection_name).await
     }
 
     /// List all known collections.
@@ -145,8 +142,9 @@ impl LogPoseDataService {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .write(collection_name, operations)
+            .write(&descriptor.lookup_name(), operations)
             .await
             .map_err(Into::into)
     }
@@ -160,18 +158,17 @@ impl LogPoseDataService {
 
     /// Capture the current read snapshot.
     pub async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .snapshot(collection_name)
+            .snapshot(&descriptor.lookup_name())
             .await
             .map_err(Into::into)
     }
 
     /// Return collection-level stats.
     pub async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        self.storage
-            .stats(collection_name)
-            .await
-            .map_err(Into::into)
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.stats_descriptor(&descriptor, None).await
     }
 
     /// Return collection-level stats using a previously loaded descriptor.
@@ -180,10 +177,14 @@ impl LogPoseDataService {
         descriptor: &logpose_catalog::CollectionDescriptor,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
-        self.storage
+        let mut stats = self
+            .storage
             .stats_descriptor(descriptor, snapshot)
             .await
-            .map_err(Into::into)
+            .map_err(ServiceError::from)?;
+        stats.tenant_name = descriptor.tenant_name.clone();
+        stats.database_name = descriptor.database_name.clone();
+        Ok(stats)
     }
 
     /// Load persisted maintenance state without reconstructing full stats.
@@ -210,16 +211,18 @@ impl LogPoseDataService {
 
     /// Flush the mutable delta to a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .flush(collection_name)
+            .flush(&descriptor.lookup_name())
             .await
             .map_err(Into::into)
     }
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .compact(collection_name)
+            .compact(&descriptor.lookup_name())
             .await
             .map_err(Into::into)
     }
@@ -230,8 +233,9 @@ impl LogPoseDataService {
         collection_name: &str,
         target: InspectTarget,
     ) -> Result<InspectReport> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .inspect(collection_name, target)
+            .inspect(&descriptor.lookup_name(), target)
             .await
             .map_err(Into::into)
     }
@@ -254,6 +258,22 @@ impl LogPoseDataService {
     ) -> Result<InspectReport> {
         self.inspect(collection_name, InspectTarget::Segment(segment_id))
             .await
+    }
+
+    async fn resolved_collection_descriptor(
+        &self,
+        collection_name: &str,
+    ) -> Result<logpose_catalog::CollectionDescriptor> {
+        let reference = parse_collection_reference(collection_name).map_err(ServiceError::from)?;
+        let descriptor = self
+            .storage
+            .open_collection(collection_name)
+            .await
+            .map_err(|error| qualify_collection_error(error, collection_name))
+            .map_err(ServiceError::from)?;
+        ensure_collection_reference_matches_descriptor(&reference, &descriptor, collection_name)
+            .map_err(ServiceError::from)?;
+        Ok(descriptor)
     }
 }
 
@@ -321,7 +341,18 @@ impl LogPoseControlService {
             }
             placements.push(placement);
         }
-        placements.sort_by(|left, right| left.collection_name.cmp(&right.collection_name));
+        placements.sort_by(|left, right| {
+            (
+                &left.tenant_name,
+                &left.database_name,
+                &left.collection_name,
+            )
+                .cmp(&(
+                    &right.tenant_name,
+                    &right.database_name,
+                    &right.collection_name,
+                ))
+        });
 
         let mut maintenance = MaintenanceBacklog::default();
         for descriptor in local_descriptors {
@@ -382,6 +413,8 @@ impl LogPoseControlService {
         };
         CollectionPlacement {
             collection_id: descriptor.collection_id.clone(),
+            tenant_name: descriptor.tenant_name.clone(),
+            database_name: descriptor.database_name.clone(),
             collection_name: descriptor.name.clone(),
             assigned_node: assignment.assigned_node.clone(),
             assigned_role: assignment.assigned_role,
@@ -509,6 +542,52 @@ fn http_endpoint(host: &str, port: u16) -> String {
         _ => host.to_owned(),
     };
     format!("http://{authority}:{port}")
+}
+
+fn parse_collection_reference(collection_name: &str) -> logpose_types::Result<CollectionRef> {
+    let reference = match collection_name
+        .trim()
+        .split('/')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [collection_name] => CollectionRef::new_default(*collection_name),
+        [tenant_name, database_name, collection_name] => {
+            CollectionRef::new(*tenant_name, *database_name, *collection_name)
+        }
+        _ => {
+            return Err(LogPoseError::Message(format!(
+                "unsupported collection reference '{collection_name}': expected 'collection' or 'tenant/database/collection'"
+            )));
+        }
+    };
+    reference.validate()?;
+    Ok(reference)
+}
+
+fn ensure_collection_reference_matches_descriptor(
+    reference: &CollectionRef,
+    descriptor: &logpose_catalog::CollectionDescriptor,
+    original_name: &str,
+) -> logpose_types::Result<()> {
+    if reference.tenant_name != descriptor.tenant_name
+        || reference.database_name != descriptor.database_name
+        || reference.collection_name != descriptor.name
+    {
+        return Err(LogPoseError::Message(format!(
+            "collection '{original_name}' does not exist"
+        )));
+    }
+    Ok(())
+}
+
+fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPoseError {
+    match error {
+        LogPoseError::Message(message) if message.contains("does not exist") => {
+            LogPoseError::Message(format!("collection '{collection_name}' does not exist"))
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -659,6 +738,8 @@ mod tests {
 
         let descriptor = service
             .create_collection(CreateCollectionRequest {
+                tenant_name: "default".to_owned(),
+                database_name: "default".to_owned(),
                 name: "documents".to_owned(),
                 dimensions: 2,
                 metric: DistanceMetric::Dot,

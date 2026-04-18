@@ -45,7 +45,11 @@ pub async fn execute_action<R: Reporter>(
                 ProgressHandle::start(reporter.clone(), "Fetching collection metadata...");
             let client = connect_client(config).await?;
             let descriptor = client
-                .get_collection(collection)
+                .get_collection_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                )
                 .await
                 .context("failed to fetch collection")?;
             progress.finish_success("Collection metadata ready");
@@ -55,7 +59,11 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Fetching collection stats...");
             let client = connect_client(config).await?;
             let stats = client
-                .stats(collection)
+                .stats_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                )
                 .await
                 .context("failed to read collection stats")?;
             progress.finish_success("Collection stats ready");
@@ -66,7 +74,11 @@ pub async fn execute_action<R: Reporter>(
                 ProgressHandle::start(reporter.clone(), "Fetching collection placement...");
             let client = connect_client(config).await?;
             let placement = client
-                .collection_placement(collection)
+                .collection_placement_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                )
                 .await
                 .context("failed to fetch collection placement")?;
             progress.finish_success("Collection placement ready");
@@ -76,7 +88,11 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Flushing collection...");
             let client = connect_client(config).await?;
             let snapshot = client
-                .flush(collection)
+                .flush_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                )
                 .await
                 .context("failed to flush collection")?;
             progress.finish_success("Flush completed");
@@ -86,7 +102,11 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Compacting collection...");
             let client = connect_client(config).await?;
             let snapshot = client
-                .compact(collection)
+                .compact_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                )
                 .await
                 .context("failed to compact collection")?;
             progress.finish_success("Compaction completed");
@@ -101,24 +121,38 @@ pub async fn execute_action<R: Reporter>(
             let mut applied_ops = 0;
             for operations in batches {
                 let ack = client
-                    .write(&action.collection, operations)
+                    .write_in_namespace(
+                        &action.collection.tenant_name,
+                        &action.collection.database_name,
+                        &action.collection.collection_name,
+                        operations,
+                    )
                     .await
                     .context("failed to write records")?;
                 last_seq_no = ack.last_seq_no;
                 applied_ops += ack.applied_ops;
             }
             progress.finish_success("Write completed");
-            Ok(ActionOutput::RecordsWritten(logpose_types::CommitAck {
-                last_seq_no,
-                applied_ops,
-            }))
+            Ok(ActionOutput::RecordsWritten(
+                logpose_client::ScopedCollectionResponse {
+                    tenant_name: action.collection.tenant_name.clone(),
+                    database_name: action.collection.database_name.clone(),
+                    collection_name: action.collection.collection_name.clone(),
+                    response: logpose_types::CommitAck {
+                        last_seq_no,
+                        applied_ops,
+                    },
+                },
+            ))
         }
         Action::RecordDelete(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Deleting record...");
             let client = connect_client(config).await?;
             let ack = client
-                .write(
-                    &action.collection,
+                .write_in_namespace(
+                    &action.collection.tenant_name,
+                    &action.collection.database_name,
+                    &action.collection.collection_name,
                     vec![WriteOperation::Delete(DeleteRecord {
                         id: RecordId::new(action.id.clone()),
                     })],
@@ -133,7 +167,11 @@ pub async fn execute_action<R: Reporter>(
             let request = query_request_from_action(action)?;
             let client = connect_client(config).await?;
             let response = client
-                .query(request)
+                .query_in_namespace(
+                    &action.collection.tenant_name,
+                    &action.collection.database_name,
+                    request,
+                )
                 .await
                 .context("failed to query collection")?;
             progress.finish_success("Query completed");
@@ -144,7 +182,12 @@ pub async fn execute_action<R: Reporter>(
                 ProgressHandle::start(reporter.clone(), "Inspecting collection storage...");
             let client = connect_client(config).await?;
             let report = client
-                .inspect(collection, target.clone())
+                .inspect_in_namespace(
+                    &collection.tenant_name,
+                    &collection.database_name,
+                    &collection.collection_name,
+                    target.clone(),
+                )
                 .await
                 .context("failed to inspect collection")?;
             progress.finish_success("Inspection ready");

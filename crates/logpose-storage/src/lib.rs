@@ -7,17 +7,17 @@ use rand as _;
 
 use async_trait::async_trait;
 use crc32fast::hash;
-use logpose_catalog::CollectionDescriptor;
+use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor, TenantDescriptor};
 use logpose_index::{
     FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
     HnswIndexSidecar, build_flat_index, build_hnsw_index, read_flat_index, read_hnsw_index,
     write_flat_index, write_hnsw_index,
 };
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
-    CollectionStats, CommitAck, DistanceMetric, LogPoseError, MaintenanceStatus, NodeRole,
-    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo,
-    Snapshot, VisibleRecord, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
+    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric,
+    LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
+    RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
 use serde::{Deserialize, Serialize};
@@ -200,7 +200,7 @@ pub trait StorageEngine: Send + Sync {
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
         let _ = snapshot;
-        self.stats(&descriptor.name).await
+        self.stats(&descriptor.lookup_name()).await
     }
 
     /// Return persisted maintenance state without reconstructing full collection stats.
@@ -237,12 +237,81 @@ pub trait StorageEngine: Send + Sync {
 /// Request payload for creating a collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateCollectionRequest {
+    /// Tenant containing the collection. Blank values default to `default`.
+    pub tenant_name: String,
+    /// Database containing the collection. Blank values default to `default`.
+    pub database_name: String,
     /// Human-readable collection name.
     pub name: String,
     /// Fixed embedding dimensionality.
     pub dimensions: usize,
     /// Distance metric reserved for future query layers.
     pub metric: DistanceMetric,
+}
+
+impl CreateCollectionRequest {
+    /// Create a collection request in the default tenant/database namespace.
+    #[must_use]
+    pub fn new(name: impl Into<String>, dimensions: usize, metric: DistanceMetric) -> Self {
+        Self::in_namespace(
+            DEFAULT_TENANT_NAME,
+            DEFAULT_DATABASE_NAME,
+            name,
+            dimensions,
+            metric,
+        )
+    }
+
+    /// Create a collection request in an explicit tenant/database namespace.
+    #[must_use]
+    pub fn in_namespace(
+        tenant_name: impl Into<String>,
+        database_name: impl Into<String>,
+        name: impl Into<String>,
+        dimensions: usize,
+        metric: DistanceMetric,
+    ) -> Self {
+        Self {
+            tenant_name: tenant_name.into(),
+            database_name: database_name.into(),
+            name: name.into(),
+            dimensions,
+            metric,
+        }
+    }
+
+    /// Return the canonical tenant/database/collection reference for this request.
+    #[must_use]
+    pub fn collection_ref(&self) -> CollectionRef {
+        let request = self.clone().with_defaults();
+        CollectionRef::new(request.tenant_name, request.database_name, request.name)
+    }
+
+    /// Return the canonical tenant/database/collection lookup key for this request.
+    #[must_use]
+    pub fn lookup_name(&self) -> String {
+        self.collection_ref().lookup_name()
+    }
+
+    fn with_defaults(self) -> Self {
+        let tenant_name = if self.tenant_name.trim().is_empty() {
+            DEFAULT_TENANT_NAME.to_owned()
+        } else {
+            self.tenant_name
+        };
+        let database_name = if self.database_name.trim().is_empty() {
+            DEFAULT_DATABASE_NAME.to_owned()
+        } else {
+            self.database_name
+        };
+        Self {
+            tenant_name,
+            database_name,
+            name: self.name,
+            dimensions: self.dimensions,
+            metric: self.metric,
+        }
+    }
 }
 
 /// Target to inspect from the local storage layout.
@@ -302,6 +371,26 @@ impl LocalStorageEngine {
 
     fn collections_root(&self) -> PathBuf {
         self.root.join("collections")
+    }
+
+    fn tenants_root(&self) -> PathBuf {
+        self.root.join("tenants")
+    }
+
+    fn tenant_descriptor_path(&self, tenant_name: &str) -> PathBuf {
+        self.tenants_root()
+            .join(tenant_name)
+            .join("descriptor.json")
+    }
+
+    fn databases_root(&self, tenant_name: &str) -> PathBuf {
+        self.tenants_root().join(tenant_name).join("databases")
+    }
+
+    fn database_descriptor_path(&self, tenant_name: &str, database_name: &str) -> PathBuf {
+        self.databases_root(tenant_name)
+            .join(database_name)
+            .join("descriptor.json")
     }
 
     fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
@@ -386,22 +475,32 @@ impl LocalStorageEngine {
         request: CreateCollectionRequest,
         assignment: Option<&CollectionAssignment>,
     ) -> Result<CollectionDescriptor> {
+        let request = request.with_defaults();
         fs::create_dir_all(self.collections_root())
             .map_err(|error| io_message("failed to create collections root", error))?;
-        if self.find_collection_descriptor(&request.name).is_ok() {
+        let collection = CollectionRef::new(
+            request.tenant_name.clone(),
+            request.database_name.clone(),
+            request.name.clone(),
+        );
+        if self.find_collection_descriptor_ref(&collection).is_ok() {
             return Err(LogPoseError::Message(format!(
-                "collection '{}' already exists",
-                request.name
+                "collection '{}/{}/{}' already exists",
+                collection.tenant_name, collection.database_name, collection.collection_name
             )));
         }
 
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::new_in_namespace(
+            request.tenant_name,
+            request.database_name,
             request.name,
             request.dimensions,
             request.metric,
             self.collections_root(),
         );
         descriptor.validate()?;
+        self.ensure_tenant_descriptor(&descriptor.tenant_name)?;
+        self.ensure_database_descriptor(&descriptor.tenant_name, &descriptor.database_name)?;
         self.create_collection_directories(&descriptor)?;
         if let Some(assignment) = assignment {
             self.persist_collection_assignment(&descriptor, assignment)?;
@@ -415,6 +514,83 @@ impl LocalStorageEngine {
             serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
         )?;
         Ok(descriptor)
+    }
+
+    fn ensure_tenant_descriptor(&self, tenant_name: &str) -> Result<()> {
+        if tenant_name.trim().is_empty() {
+            return Err(LogPoseError::Message(
+                "tenant name must not be empty".to_owned(),
+            ));
+        }
+        let path = self.tenant_descriptor_path(tenant_name);
+        if path.exists() {
+            let descriptor = read_json::<TenantDescriptor>(&path)?;
+            descriptor.validate()?;
+            return Ok(());
+        }
+
+        let descriptor = TenantDescriptor::new(tenant_name);
+        descriptor.validate()?;
+        let parent = path.parent().ok_or_else(|| {
+            LogPoseError::Message(format!(
+                "tenant descriptor path for '{tenant_name}' is missing a parent directory"
+            ))
+        })?;
+        fs::create_dir_all(parent)
+            .map_err(|error| io_message("failed to create tenants root", error))?;
+        atomic_write(
+            &path,
+            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_database_descriptor(&self, tenant_name: &str, database_name: &str) -> Result<()> {
+        if tenant_name.trim().is_empty() {
+            return Err(LogPoseError::Message(
+                "tenant name must not be empty".to_owned(),
+            ));
+        }
+        if database_name.trim().is_empty() {
+            return Err(LogPoseError::Message(
+                "database name must not be empty".to_owned(),
+            ));
+        }
+        let path = self.database_descriptor_path(tenant_name, database_name);
+        if path.exists() {
+            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+            descriptor.validate()?;
+            return Ok(());
+        }
+
+        let descriptor = if database_name == DEFAULT_DATABASE_NAME {
+            DatabaseDescriptor::new_in_tenant(tenant_name, DEFAULT_DATABASE_NAME)
+        } else {
+            DatabaseDescriptor::new_in_tenant(tenant_name, database_name)
+        };
+        descriptor.validate()?;
+        let parent = path.parent().ok_or_else(|| {
+            LogPoseError::Message(format!(
+                "database descriptor path for '{tenant_name}/{database_name}' is missing a parent directory"
+            ))
+        })?;
+        fs::create_dir_all(parent)
+            .map_err(|error| io_message("failed to create databases root", error))?;
+        atomic_write(
+            &path,
+            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
+        )?;
+        Ok(())
+    }
+
+    /// Open a collection descriptor using an explicit tenant/database namespace.
+    pub async fn open_collection_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        name: &str,
+    ) -> Result<CollectionDescriptor> {
+        self.find_collection_descriptor_ref(&CollectionRef::new(tenant_name, database_name, name))
     }
 
     fn load_collection_state(
@@ -580,10 +756,18 @@ impl LocalStorageEngine {
     }
 
     fn find_collection_descriptor(&self, name: &str) -> Result<CollectionDescriptor> {
+        self.find_collection_descriptor_ref(&Self::collection_ref_from_lookup(name))
+    }
+
+    fn find_collection_descriptor_ref(
+        &self,
+        collection: &CollectionRef,
+    ) -> Result<CollectionDescriptor> {
         let collections_root = self.collections_root();
         if !collections_root.exists() {
             return Err(LogPoseError::Message(format!(
-                "collection '{name}' does not exist"
+                "collection '{}/{}/{}' does not exist",
+                collection.tenant_name, collection.database_name, collection.collection_name
             )));
         }
 
@@ -598,14 +782,18 @@ impl LocalStorageEngine {
             }
 
             let descriptor = read_json::<CollectionDescriptor>(&path)?;
-            if descriptor.name == name {
+            if descriptor.tenant_name == collection.tenant_name
+                && descriptor.database_name == collection.database_name
+                && descriptor.name == collection.collection_name
+            {
                 descriptor.validate()?;
                 return Ok(descriptor);
             }
         }
 
         Err(LogPoseError::Message(format!(
-            "collection '{name}' does not exist"
+            "collection '{}/{}/{}' does not exist",
+            collection.tenant_name, collection.database_name, collection.collection_name
         )))
     }
 
@@ -631,8 +819,23 @@ impl LocalStorageEngine {
             descriptors.push(descriptor);
         }
 
-        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        descriptors.sort_by(|left, right| {
+            (&left.tenant_name, &left.database_name, &left.name).cmp(&(
+                &right.tenant_name,
+                &right.database_name,
+                &right.name,
+            ))
+        });
         Ok(descriptors)
+    }
+
+    fn collection_ref_from_lookup(name: &str) -> CollectionRef {
+        let parts = name.split('/').collect::<Vec<_>>();
+        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+            CollectionRef::new(parts[0], parts[1], parts[2])
+        } else {
+            CollectionRef::new_default(name)
+        }
     }
 
     fn collection_stats_from_state(
@@ -663,6 +866,8 @@ impl LocalStorageEngine {
 
         Ok(CollectionStats {
             collection_id: state.descriptor.collection_id.clone(),
+            tenant_name: state.descriptor.tenant_name.clone(),
+            database_name: state.descriptor.database_name.clone(),
             collection_name: state.descriptor.name.clone(),
             manifest_generation: effective_snapshot.manifest_generation,
             visible_seq_no: effective_snapshot.visible_seq_no,
@@ -815,7 +1020,7 @@ impl LocalStorageEngine {
 
         if should_spawn {
             let engine = self.clone();
-            let collection_name = descriptor.name.clone();
+            let collection_name = descriptor.lookup_name();
             thread::spawn(move || engine.run_maintenance_worker(collection_name, key));
         }
         Ok(())
@@ -2542,11 +2747,11 @@ mod tests {
         let segment_path = runtime.block_on(async {
             let engine = LocalStorageEngine::new(&root);
             let descriptor = engine
-                .create_collection(CreateCollectionRequest {
-                    name: "broken".to_owned(),
-                    dimensions: 2,
-                    metric: DistanceMetric::Cosine,
-                })
+                .create_collection(CreateCollectionRequest::new(
+                    "broken",
+                    2,
+                    DistanceMetric::Cosine,
+                ))
                 .await
                 .expect("collection should be created");
 
@@ -2634,11 +2839,11 @@ mod tests {
         let result = runtime.block_on(async {
             let engine = LocalStorageEngine::new(&root);
             let descriptor = engine
-                .create_collection(CreateCollectionRequest {
-                    name: "broken".to_owned(),
-                    dimensions: 2,
-                    metric: DistanceMetric::Dot,
-                })
+                .create_collection(CreateCollectionRequest::new(
+                    "broken",
+                    2,
+                    DistanceMetric::Dot,
+                ))
                 .await
                 .expect("collection should be created");
 

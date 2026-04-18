@@ -20,11 +20,13 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionPlacement, CollectionStats, CommitAck, DistanceMetric, LogPoseError,
-    MaintenanceBacklog, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
-    QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
+    DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog,
+    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
+    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use thiserror::Error;
 #[cfg(test)]
 use tokio as _;
@@ -42,6 +44,39 @@ impl Default for ClientConfig {
         Self {
             grpc_endpoint: "http://127.0.0.1:50051".to_owned(),
         }
+    }
+}
+
+/// Namespace-aware response wrapper for operations whose payload omits collection identity.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScopedCollectionResponse<T> {
+    /// Tenant containing the collection.
+    pub tenant_name: String,
+    /// Database containing the collection.
+    pub database_name: String,
+    /// Collection name inside the database.
+    pub collection_name: String,
+    /// Operation payload.
+    pub response: T,
+}
+
+impl<T> ScopedCollectionResponse<T> {
+    /// Recover the collection reference attached to this response.
+    #[must_use]
+    pub fn collection(&self) -> CollectionRef {
+        CollectionRef::new(
+            self.tenant_name.clone(),
+            self.database_name.clone(),
+            self.collection_name.clone(),
+        )
+    }
+}
+
+impl<T> Deref for ScopedCollectionResponse<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
     }
 }
 
@@ -123,6 +158,8 @@ impl LogPoseClient {
                 name: request.name,
                 dimensions: request.dimensions as u64,
                 metric: proto_metric(request.metric) as i32,
+                tenant_name: request.tenant_name,
+                database_name: request.database_name,
             }))
             .await?
             .into_inner();
@@ -131,11 +168,28 @@ impl LogPoseClient {
 
     /// Fetch placement metadata for one collection.
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
+        self.collection_placement_in_namespace(
+            DEFAULT_TENANT_NAME,
+            DEFAULT_DATABASE_NAME,
+            collection_name,
+        )
+        .await
+    }
+
+    /// Fetch placement metadata for one collection in an explicit namespace.
+    pub async fn collection_placement_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<CollectionPlacement> {
         let response = self
             .inner
             .clone()
             .get_collection_placement(Request::new(GetCollectionPlacementRequest {
                 collection_name: collection_name.to_owned(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
@@ -144,11 +198,28 @@ impl LogPoseClient {
 
     /// Fetch collection metadata by name.
     pub async fn get_collection(&self, collection_name: &str) -> Result<CollectionDescriptor> {
+        self.get_collection_in_namespace(
+            DEFAULT_TENANT_NAME,
+            DEFAULT_DATABASE_NAME,
+            collection_name,
+        )
+        .await
+    }
+
+    /// Fetch collection metadata by namespace-qualified identity.
+    pub async fn get_collection_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<CollectionDescriptor> {
         let response = self
             .inner
             .clone()
             .get_collection(Request::new(GetCollectionRequest {
                 collection_name: collection_name.to_owned(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
@@ -161,6 +232,25 @@ impl LogPoseClient {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
+        Ok(self
+            .write_in_namespace(
+                DEFAULT_TENANT_NAME,
+                DEFAULT_DATABASE_NAME,
+                collection_name,
+                operations,
+            )
+            .await?
+            .response)
+    }
+
+    /// Persist a write batch durably in an explicit namespace.
+    pub async fn write_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+        operations: Vec<WriteOperation>,
+    ) -> Result<ScopedCollectionResponse<CommitAck>> {
         let response = self
             .inner
             .clone()
@@ -170,22 +260,50 @@ impl LogPoseClient {
                     .into_iter()
                     .map(write_operation_to_proto)
                     .collect::<Vec<_>>(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
-        Ok(CommitAck {
-            last_seq_no: response.last_seq_no,
-            applied_ops: response.applied_ops as usize,
-        })
+        Ok(scoped_collection_response(
+            response.tenant_name,
+            response.database_name,
+            response.collection_name,
+            tenant_name,
+            database_name,
+            collection_name,
+            CommitAck {
+                last_seq_no: response.last_seq_no,
+                applied_ops: response.applied_ops as usize,
+            },
+        ))
     }
 
     /// Execute an exact query through the shared service contract.
     pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse> {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(&request.collection_name);
+        let mut request = request;
+        request.collection_name = collection_name;
+        Ok(self
+            .query_in_namespace(&tenant_name, &database_name, request)
+            .await?
+            .response)
+    }
+
+    /// Execute an exact query through the shared service contract in an explicit namespace.
+    pub async fn query_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        request: QueryRequest,
+    ) -> Result<ScopedCollectionResponse<QueryResponse>> {
+        let collection_name = request.collection_name.clone();
         let response = self
             .inner
             .clone()
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: request.collection_name,
+                collection_name: collection_name.clone(),
                 vector: request.vector,
                 top_k: request.top_k as u64,
                 snapshot: request.snapshot.map(snapshot_to_proto),
@@ -196,41 +314,66 @@ impl LogPoseClient {
                     .collect::<Result<Vec<_>>>()?,
                 predicate: request.predicate.map(predicate_to_proto).transpose()?,
                 explain: explain_mode_to_proto(request.explain) as i32,
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
 
-        Ok(QueryResponse {
-            metric: metric_from_proto(response.metric)?,
-            top_k: response.top_k as usize,
-            returned: response.returned as usize,
-            snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
-                ClientError::InvalidResponse("query response missing snapshot".to_owned())
-            })?,
-            matches: response
-                .matches
-                .into_iter()
-                .map(query_match_from_proto)
-                .collect::<Result<Vec<_>>>()?,
-            diagnostics: response
-                .diagnostics
-                .map(query_diagnostics_from_proto)
-                .transpose()?,
-        })
+        Ok(scoped_collection_response(
+            response.tenant_name,
+            response.database_name,
+            response.collection_name,
+            tenant_name,
+            database_name,
+            &collection_name,
+            QueryResponse {
+                metric: metric_from_proto(response.metric)?,
+                top_k: response.top_k as usize,
+                returned: response.returned as usize,
+                snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
+                    ClientError::InvalidResponse("query response missing snapshot".to_owned())
+                })?,
+                matches: response
+                    .matches
+                    .into_iter()
+                    .map(query_match_from_proto)
+                    .collect::<Result<Vec<_>>>()?,
+                diagnostics: response
+                    .diagnostics
+                    .map(query_diagnostics_from_proto)
+                    .transpose()?,
+            },
+        ))
     }
 
     /// Fetch collection-level statistics.
     pub async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
+        self.stats_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+            .await
+    }
+
+    /// Fetch collection-level statistics in an explicit namespace.
+    pub async fn stats_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<CollectionStats> {
         let response = self
             .inner
             .clone()
             .get_collection_stats(Request::new(GetCollectionStatsRequest {
                 collection_name: collection_name.to_owned(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         Ok(CollectionStats {
             collection_id: parse_collection_id(&response.collection_id)?,
+            tenant_name: response.tenant_name,
+            database_name: response.database_name,
             collection_name: response.collection_name,
             manifest_generation: response.manifest_generation,
             visible_seq_no: response.visible_seq_no,
@@ -253,28 +396,76 @@ impl LogPoseClient {
 
     /// Flush the mutable delta into a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        Ok(self
+            .flush_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+            .await?
+            .response)
+    }
+
+    /// Flush the mutable delta into a new segment in an explicit namespace.
+    pub async fn flush_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
             .inner
             .clone()
             .flush_collection(Request::new(FlushCollectionRequest {
                 collection_name: collection_name.to_owned(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
-        Ok(snapshot_reply_from_proto(response))
+        let snapshot = snapshot_reply_from_proto(response.clone());
+        Ok(scoped_collection_response(
+            response.tenant_name,
+            response.database_name,
+            response.collection_name,
+            tenant_name,
+            database_name,
+            collection_name,
+            snapshot,
+        ))
     }
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        Ok(self
+            .compact_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+            .await?
+            .response)
+    }
+
+    /// Compact immutable segments in an explicit namespace.
+    pub async fn compact_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+    ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
             .inner
             .clone()
             .compact_collection(Request::new(CompactCollectionRequest {
                 collection_name: collection_name.to_owned(),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
-        Ok(snapshot_reply_from_proto(response))
+        let snapshot = snapshot_reply_from_proto(response.clone());
+        Ok(scoped_collection_response(
+            response.tenant_name,
+            response.database_name,
+            response.collection_name,
+            tenant_name,
+            database_name,
+            collection_name,
+            snapshot,
+        ))
     }
 
     /// Inspect operator-visible storage state.
@@ -283,6 +474,25 @@ impl LogPoseClient {
         collection_name: &str,
         target: InspectTarget,
     ) -> Result<InspectReport> {
+        Ok(self
+            .inspect_in_namespace(
+                DEFAULT_TENANT_NAME,
+                DEFAULT_DATABASE_NAME,
+                collection_name,
+                target,
+            )
+            .await?
+            .response)
+    }
+
+    /// Inspect operator-visible storage state in an explicit namespace.
+    pub async fn inspect_in_namespace(
+        &self,
+        tenant_name: &str,
+        database_name: &str,
+        collection_name: &str,
+        target: InspectTarget,
+    ) -> Result<ScopedCollectionResponse<InspectReport>> {
         let response = self
             .inner
             .clone()
@@ -290,13 +500,23 @@ impl LogPoseClient {
                 collection_name: collection_name.to_owned(),
                 target: inspect_target_to_proto(&target) as i32,
                 segment_id: inspect_segment_id(&target),
+                tenant_name: tenant_name.to_owned(),
+                database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
-        Ok(InspectReport {
-            target: response.target,
-            payload: serde_json::from_str(&response.payload_json)?,
-        })
+        Ok(scoped_collection_response(
+            response.tenant_name,
+            response.database_name,
+            response.collection_name,
+            tenant_name,
+            database_name,
+            collection_name,
+            InspectReport {
+                target: response.target,
+                payload: serde_json::from_str(&response.payload_json)?,
+            },
+        ))
     }
 }
 
@@ -305,6 +525,8 @@ fn collection_descriptor_from_proto(
 ) -> Result<CollectionDescriptor> {
     Ok(CollectionDescriptor {
         collection_id: parse_collection_id(&reply.collection_id)?,
+        tenant_name: reply.tenant_name,
+        database_name: reply.database_name,
         name: reply.name,
         dimensions: reply.dimensions as usize,
         metric: metric_from_proto(reply.metric)?,
@@ -354,6 +576,8 @@ fn runtime_status_from_proto(reply: proto::GetRuntimeStatusReply) -> Result<Node
 fn collection_placement_from_proto(reply: CollectionPlacementReply) -> Result<CollectionPlacement> {
     Ok(CollectionPlacement {
         collection_id: parse_collection_id(&reply.collection_id)?,
+        tenant_name: reply.tenant_name,
+        database_name: reply.database_name,
         collection_name: reply.collection_name,
         assigned_node: reply.assigned_node,
         assigned_role: node_role_from_proto(reply.assigned_role)?,
@@ -366,6 +590,52 @@ fn parse_collection_id(value: &str) -> Result<CollectionId> {
     value.parse().map(CollectionId).map_err(|error| {
         ClientError::InvalidResponse(format!("invalid collection id '{value}': {error}"))
     })
+}
+
+fn split_collection_lookup_key(value: &str) -> (String, String, String) {
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+        (
+            parts[0].to_owned(),
+            parts[1].to_owned(),
+            parts[2].to_owned(),
+        )
+    } else {
+        (
+            DEFAULT_TENANT_NAME.to_owned(),
+            DEFAULT_DATABASE_NAME.to_owned(),
+            value.to_owned(),
+        )
+    }
+}
+
+fn scoped_collection_response<T>(
+    tenant_name: String,
+    database_name: String,
+    collection_name: String,
+    fallback_tenant: &str,
+    fallback_database: &str,
+    fallback_collection: &str,
+    response: T,
+) -> ScopedCollectionResponse<T> {
+    ScopedCollectionResponse {
+        tenant_name: if tenant_name.trim().is_empty() {
+            fallback_tenant.to_owned()
+        } else {
+            tenant_name
+        },
+        database_name: if database_name.trim().is_empty() {
+            fallback_database.to_owned()
+        } else {
+            database_name
+        },
+        collection_name: if collection_name.trim().is_empty() {
+            fallback_collection.to_owned()
+        } else {
+            collection_name
+        },
+        response,
+    }
 }
 
 fn node_role_from_proto(role: i32) -> Result<NodeRole> {
@@ -706,6 +976,37 @@ impl From<LogPoseError> for ClientError {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn split_collection_lookup_key_parses_explicit_namespace() {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key("acme/analytics/documents");
+
+        assert_eq!(tenant_name, "acme");
+        assert_eq!(database_name, "analytics");
+        assert_eq!(collection_name, "documents");
+    }
+
+    #[test]
+    fn scoped_collection_response_falls_back_to_requested_namespace() {
+        let response = scoped_collection_response(
+            String::new(),
+            String::new(),
+            String::new(),
+            "acme",
+            "analytics",
+            "documents",
+            CommitAck {
+                last_seq_no: 7,
+                applied_ops: 2,
+            },
+        );
+
+        assert_eq!(response.tenant_name, "acme");
+        assert_eq!(response.database_name, "analytics");
+        assert_eq!(response.collection_name, "documents");
+        assert_eq!(response.last_seq_no, 7);
+    }
 
     #[test]
     fn query_diagnostics_from_proto_preserves_ann_fields() {

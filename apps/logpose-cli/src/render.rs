@@ -2,6 +2,7 @@ use crate::action::{Action, format_command, metric_name};
 use crate::cli::OutputMode;
 use anyhow::Context;
 use logpose_catalog::CollectionDescriptor;
+use logpose_client::ScopedCollectionResponse;
 use logpose_config::LogPoseConfig;
 use logpose_query::QueryResponse;
 use logpose_storage::InspectReport;
@@ -15,12 +16,12 @@ pub enum ActionOutput {
     CollectionShown(CollectionDescriptor),
     CollectionStats(CollectionStats),
     CollectionPlacement(CollectionPlacement),
-    CollectionFlushed(Snapshot),
-    CollectionCompacted(Snapshot),
-    RecordsWritten(CommitAck),
-    RecordDeleted(CommitAck),
-    Query(QueryResponse),
-    Inspect(InspectReport),
+    CollectionFlushed(ScopedCollectionResponse<Snapshot>),
+    CollectionCompacted(ScopedCollectionResponse<Snapshot>),
+    RecordsWritten(ScopedCollectionResponse<CommitAck>),
+    RecordDeleted(ScopedCollectionResponse<CommitAck>),
+    Query(ScopedCollectionResponse<QueryResponse>),
+    Inspect(ScopedCollectionResponse<InspectReport>),
 }
 
 impl ActionOutput {
@@ -39,39 +40,68 @@ impl ActionOutput {
             ActionOutput::Status(status) => render_status(status),
             ActionOutput::Config(config) => render_config(config),
             ActionOutput::CollectionCreated(descriptor) => format!(
-                "Collection created\nName: {}\nDimensions: {}\nMetric: {}",
-                descriptor.name,
+                "Collection created\nCollection: {}\nDimensions: {}\nMetric: {}",
+                collection_identity(
+                    &descriptor.tenant_name,
+                    &descriptor.database_name,
+                    &descriptor.name,
+                ),
                 descriptor.dimensions,
                 metric_name(descriptor.metric)
             ),
             ActionOutput::CollectionShown(descriptor) => format!(
-                "Collection\nName: {}\nDimensions: {}\nMetric: {}",
-                descriptor.name,
+                "Collection\nCollection: {}\nDimensions: {}\nMetric: {}",
+                collection_identity(
+                    &descriptor.tenant_name,
+                    &descriptor.database_name,
+                    &descriptor.name,
+                ),
                 descriptor.dimensions,
                 metric_name(descriptor.metric)
             ),
             ActionOutput::CollectionStats(stats) => render_stats(stats),
             ActionOutput::CollectionPlacement(placement) => render_placement(placement),
             ActionOutput::CollectionFlushed(snapshot) => format!(
-                "Collection flushed\nManifest generation: {}\nVisible sequence number: {}",
-                snapshot.manifest_generation, snapshot.visible_seq_no
+                "Collection flushed\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}",
+                collection_identity(
+                    &snapshot.tenant_name,
+                    &snapshot.database_name,
+                    &snapshot.collection_name
+                ),
+                snapshot.manifest_generation,
+                snapshot.visible_seq_no
             ),
             ActionOutput::CollectionCompacted(snapshot) => format!(
-                "Collection compacted\nManifest generation: {}\nVisible sequence number: {}",
-                snapshot.manifest_generation, snapshot.visible_seq_no
+                "Collection compacted\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}",
+                collection_identity(
+                    &snapshot.tenant_name,
+                    &snapshot.database_name,
+                    &snapshot.collection_name
+                ),
+                snapshot.manifest_generation,
+                snapshot.visible_seq_no
             ),
             ActionOutput::RecordsWritten(ack) => format!(
-                "Write completed\nApplied operations: {}\nLast sequence number: {}",
-                ack.applied_ops, ack.last_seq_no
+                "Write completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
+                collection_identity(&ack.tenant_name, &ack.database_name, &ack.collection_name),
+                ack.applied_ops,
+                ack.last_seq_no
             ),
             ActionOutput::RecordDeleted(ack) => format!(
-                "Delete completed\nApplied operations: {}\nLast sequence number: {}",
-                ack.applied_ops, ack.last_seq_no
+                "Delete completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
+                collection_identity(&ack.tenant_name, &ack.database_name, &ack.collection_name),
+                ack.applied_ops,
+                ack.last_seq_no
             ),
             ActionOutput::Query(response) => render_query(response)?,
             ActionOutput::Inspect(report) => format!(
-                "Inspection: {}\n{}",
+                "Inspection: {}\nCollection: {}\n{}",
                 report.target,
+                collection_identity(
+                    &report.tenant_name,
+                    &report.database_name,
+                    &report.collection_name
+                ),
                 serde_json::to_string_pretty(&report.payload)
                     .context("failed to serialize inspect payload")?
             ),
@@ -148,7 +178,13 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
         for placement in status.collections.iter().take(5) {
             lines.push(format!(
                 "  - {} -> {} ({})",
-                placement.collection_name, placement.assigned_node, placement.route_kind
+                collection_identity(
+                    &placement.tenant_name,
+                    &placement.database_name,
+                    &placement.collection_name,
+                ),
+                placement.assigned_node,
+                placement.route_kind
             ));
         }
     }
@@ -178,7 +214,11 @@ fn format_host_port(host: &str, port: u16) -> String {
 fn render_stats(stats: &CollectionStats) -> String {
     format!(
         "Collection Statistics\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}\nLive records: {}\nDeleted records: {}\nMutable operations: {}\nSegments: {}\nPending maintenance: {}",
-        stats.collection_name,
+        collection_identity(
+            &stats.tenant_name,
+            &stats.database_name,
+            &stats.collection_name
+        ),
         stats.manifest_generation,
         stats.visible_seq_no,
         stats.live_record_count,
@@ -192,7 +232,11 @@ fn render_stats(stats: &CollectionStats) -> String {
 fn render_placement(placement: &CollectionPlacement) -> String {
     format!(
         "Collection Placement\nCollection: {}\nAssigned node: {}\nAssigned role: {}\nRoute kind: {}\nReason: {}",
-        placement.collection_name,
+        collection_identity(
+            &placement.tenant_name,
+            &placement.database_name,
+            &placement.collection_name,
+        ),
         placement.assigned_node,
         placement.assigned_role.as_str(),
         placement.route_kind,
@@ -200,9 +244,17 @@ fn render_placement(placement: &CollectionPlacement) -> String {
     )
 }
 
-fn render_query(response: &QueryResponse) -> anyhow::Result<String> {
+fn render_query(response: &ScopedCollectionResponse<QueryResponse>) -> anyhow::Result<String> {
     let mut lines = vec![
         "Query Results".to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(
+                &response.tenant_name,
+                &response.database_name,
+                &response.collection_name,
+            )
+        ),
         format!("Metric: {}", metric_name(response.metric)),
         format!("Returned: {}/{}", response.returned, response.top_k),
         format!(
@@ -246,4 +298,53 @@ fn pretty_json<T: Serialize>(value: &T) -> anyhow::Result<String> {
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+fn collection_identity(tenant_name: &str, database_name: &str, collection_name: &str) -> String {
+    format!("{tenant_name}/{database_name}/{collection_name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn collection_descriptors_render_fully_qualified_identity() {
+        let output = ActionOutput::CollectionShown(CollectionDescriptor {
+            collection_id: logpose_types::CollectionId::default(),
+            tenant_name: "acme".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: logpose_types::DistanceMetric::Dot,
+            root_path: PathBuf::from("/tmp/documents"),
+            remote_blob: None,
+            flush_threshold_ops: 10,
+            flush_threshold_bytes: 20,
+            compaction_threshold_segments: 3,
+        })
+        .human_text()
+        .expect("descriptor should render");
+
+        assert!(output.contains("acme/analytics/documents"));
+    }
+
+    #[test]
+    fn scoped_write_results_render_fully_qualified_identity() {
+        let output = ActionOutput::RecordsWritten(ScopedCollectionResponse {
+            tenant_name: "acme".to_owned(),
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            response: CommitAck {
+                last_seq_no: 7,
+                applied_ops: 2,
+            },
+        })
+        .human_text()
+        .expect("write result should render");
+
+        assert!(output.contains("acme/analytics/documents"));
+        assert!(output.contains("Applied operations: 2"));
+    }
 }

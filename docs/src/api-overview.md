@@ -22,7 +22,9 @@ ergonomics.
 
 The public API surface does not currently enforce authentication or RBAC.
 All endpoints are open once the server is reachable. Browser-ready auth
-and role-based access control are tracked as future work.
+and role-based access control are tracked as future work. The runtime now
+persists collections inside a default database catalog entry, but database-
+scoped policy enforcement is not implemented yet.
 
 ## Base URL and Versioning
 
@@ -168,6 +170,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 
 ```json
 {
+  "database_name": "default",
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "embeddings",
   "dimensions": 768,

@@ -38,6 +38,7 @@ Operator-facing query diagnostics now include ANN-aware plan kinds, candidate ge
 Operationally, LogPose is still earlier than a distributed database:
 
 - etcd-backed collection-assignment metadata can now be enabled, but metadata quorum, membership leases, and replica controllers are not complete
+- collections now live under a persisted default database descriptor, but database-scoped auth, ACLs, and multi-tenant routing are not implemented yet
 - health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
 - authentication and authorization are scaffolds, not full operator policy enforcement
 - tracing is initialized, but a metrics endpoint and richer telemetry surfaces do not exist yet
@@ -45,7 +46,7 @@ Operationally, LogPose is still earlier than a distributed database:
 
 Testing and CI are intentionally layered. The repository-level doctrine for generative harnesses, future simulation work, and concern-based CI decomposition lives in [Testing](./testing.md).
 
-To enable etcd-backed assignment metadata:
+To enable etcd-backed assignment metadata, set explicit endpoints:
 
 ```toml
 [metadata]

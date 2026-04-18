@@ -45,19 +45,23 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert!(!metadata.git_sha.is_empty(), "git sha should be non-empty");
 
     let descriptor = client
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
+    assert_eq!(descriptor.tenant_name, "default");
+    assert_eq!(descriptor.database_name, "default");
     assert_eq!(descriptor.name, "documents");
 
     let read_back = client
         .get_collection("documents")
         .await
         .expect("collection should load");
+    assert_eq!(read_back.tenant_name, "default");
+    assert_eq!(read_back.database_name, "default");
     assert_eq!(read_back.collection_id, descriptor.collection_id);
 
     client
@@ -124,6 +128,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let stats = client.stats("documents").await.expect("stats should load");
+    assert_eq!(stats.tenant_name, "default");
+    assert_eq!(stats.database_name, "default");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.deleted_record_count, 0);
     assert_eq!(stats.mutable_op_count, 2);
@@ -310,11 +316,11 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -332,6 +338,8 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
     assert_eq!(status.role.as_str(), "combined");
     assert_eq!(status.storage_engine, "local");
     assert_eq!(status.collection_count, 1);
+    assert_eq!(status.collections[0].tenant_name, "default");
+    assert_eq!(status.collections[0].database_name, "default");
     assert_eq!(status.collections[0].collection_name, "documents");
     assert_eq!(status.collections[0].assigned_role.as_str(), "data");
 
@@ -339,6 +347,8 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
         .collection_placement("documents")
         .await
         .expect("placement should load");
+    assert_eq!(placement.tenant_name, "default");
+    assert_eq!(placement.database_name, "default");
     assert_eq!(placement.collection_name, "documents");
     assert_eq!(placement.assigned_node, "client-grpc");
     assert_eq!(placement.assigned_role.as_str(), "data");
@@ -368,11 +378,11 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
         .expect("client should connect");
 
     let error = client
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect_err("data-only node should reject collection creation");
 
@@ -408,11 +418,11 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
         .await
         .expect("client should connect");
     client
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 

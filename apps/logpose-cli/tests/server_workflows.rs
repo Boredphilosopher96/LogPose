@@ -21,6 +21,14 @@ mod support;
 
 use support::{TestServerFixture, render_config_with_hosts};
 
+fn query_response_body(payload: &Value) -> &Value {
+    payload.get("response").unwrap_or(payload)
+}
+
+fn scoped_response_body(payload: &Value) -> &Value {
+    payload.get("response").unwrap_or(payload)
+}
+
 #[test]
 fn diagnostics_status_defaults_to_human_summary() {
     let fixture = TestServerFixture::spawn("cli-diagnostics-human");
@@ -218,7 +226,8 @@ fn data_commands_run_against_the_server_over_grpc() {
     let query_stdout = String::from_utf8(query.stdout).expect("stdout should be utf8");
     let query_body: Value =
         serde_json::from_str(&query_stdout).expect("query output should be valid json");
-    let matches = query_body["matches"]
+    let query_response = query_response_body(&query_body);
+    let matches = query_response["matches"]
         .as_array()
         .expect("matches should be an array");
     assert_eq!(matches.len(), 2);
@@ -241,55 +250,56 @@ fn data_commands_run_against_the_server_over_grpc() {
         String::from_utf8(profiled_query.stdout).expect("stdout should be utf8");
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
-    assert_eq!(profiled_query_body["matches"][0]["id"], "alpha");
-    assert!(profiled_query_body["diagnostics"].is_object());
-    assert!(profiled_query_body["diagnostics"]["stage_timings"].is_object());
+    let profiled_query_response = query_response_body(&profiled_query_body);
+    assert_eq!(profiled_query_response["matches"][0]["id"], "alpha");
+    assert!(profiled_query_response["diagnostics"].is_object());
+    assert!(profiled_query_response["diagnostics"]["stage_timings"].is_object());
     assert_eq!(
-        profiled_query_body["diagnostics"]["chosen_plan"],
+        profiled_query_response["diagnostics"]["chosen_plan"],
         "vector_first_exact"
     );
     assert!(
-        profiled_query_body["diagnostics"]["candidates_reranked"]
+        profiled_query_response["diagnostics"]["candidates_reranked"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
     assert!(
-        profiled_query_body["diagnostics"]["candidates_merged"]
+        profiled_query_response["diagnostics"]["candidates_merged"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
     assert!(
-        profiled_query_body["diagnostics"]["unit_scan_mix"]["mutable_exact"]
+        profiled_query_response["diagnostics"]["unit_scan_mix"]["mutable_exact"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["planning_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["planning_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["prefilter_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["prefilter_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["candidate_generation_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["postfilter_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["postfilter_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["rerank_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["rerank_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["merge_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["merge_micros"]
             .as_u64()
             .is_some()
     );
@@ -332,9 +342,10 @@ fn data_commands_run_against_the_server_over_grpc() {
     let wal_stdout = String::from_utf8(wal.stdout).expect("stdout should be utf8");
     let wal_body: Value =
         serde_json::from_str(&wal_stdout).expect("wal output should be valid json");
-    assert_eq!(wal_body["target"], "wal");
+    let wal_response = scoped_response_body(&wal_body);
+    assert_eq!(wal_response["target"], "wal");
     assert_eq!(
-        wal_body["payload"]["records"]
+        wal_response["payload"]["records"]
             .as_array()
             .expect("wal records should be an array")
             .len(),
@@ -345,13 +356,15 @@ fn data_commands_run_against_the_server_over_grpc() {
     let maintenance_stdout = String::from_utf8(maintenance.stdout).expect("stdout should be utf8");
     let maintenance_body: Value =
         serde_json::from_str(&maintenance_stdout).expect("maintenance output should be valid json");
-    assert_eq!(maintenance_body["target"], "maintenance");
+    let maintenance_response = scoped_response_body(&maintenance_body);
+    assert_eq!(maintenance_response["target"], "maintenance");
 
     let flush = fixture.run_cli_json(&["collection", "flush", "colors"]);
     let flush_stdout = String::from_utf8(flush.stdout).expect("stdout should be utf8");
     let flush_body: Value =
         serde_json::from_str(&flush_stdout).expect("flush output should be valid json");
-    assert!(flush_body["manifest_generation"].as_u64().is_some());
+    let flush_response = scoped_response_body(&flush_body);
+    assert!(flush_response["manifest_generation"].as_u64().is_some());
 
     let immutable_stats = fixture.run_cli_json(&["collection", "stats", "colors"]);
     let immutable_stats_stdout =
@@ -379,8 +392,9 @@ fn data_commands_run_against_the_server_over_grpc() {
     let manifest_stdout = String::from_utf8(manifest.stdout).expect("stdout should be utf8");
     let manifest_body: Value =
         serde_json::from_str(&manifest_stdout).expect("manifest output should be valid json");
-    assert_eq!(manifest_body["target"], "manifest");
-    let segment_id = manifest_body["payload"]["segments"][0]["segment_id"]
+    let manifest_response = scoped_response_body(&manifest_body);
+    assert_eq!(manifest_response["target"], "manifest");
+    let segment_id = manifest_response["payload"]["segments"][0]["segment_id"]
         .as_str()
         .expect("segment id should be a string")
         .to_owned();
@@ -389,29 +403,30 @@ fn data_commands_run_against_the_server_over_grpc() {
     let segment_stdout = String::from_utf8(segment.stdout).expect("stdout should be utf8");
     let segment_body: Value =
         serde_json::from_str(&segment_stdout).expect("segment output should be valid json");
+    let segment_response = scoped_response_body(&segment_body);
     assert_eq!(
-        segment_body["target"]
+        segment_response["target"]
             .as_str()
             .expect("segment target should be a string"),
         format!("segment:{segment_id}")
     );
     assert_eq!(
-        segment_body["payload"]["records"]
+        segment_response["payload"]["records"]
             .as_array()
             .expect("segment records should be an array")
             .len(),
         3
     );
-    assert_eq!(segment_body["payload"]["segment"]["index_kind"], "hnsw");
+    assert_eq!(segment_response["payload"]["segment"]["index_kind"], "hnsw");
     assert_eq!(
-        segment_body["payload"]["artifacts"]
+        segment_response["payload"]["artifacts"]
             .as_array()
             .expect("segment artifacts should be an array")
             .len(),
         2
     );
     assert!(
-        segment_body["payload"]["hnsw_index"]["node_count"]
+        segment_response["payload"]["hnsw_index"]["node_count"]
             .as_u64()
             .is_some_and(|count| count >= 3)
     );
@@ -432,23 +447,24 @@ fn data_commands_run_against_the_server_over_grpc() {
         String::from_utf8(ann_profiled_query.stdout).expect("stdout should be utf8");
     let ann_profiled_query_body: Value = serde_json::from_str(&ann_profiled_query_stdout)
         .expect("query output should be valid json");
-    assert_eq!(ann_profiled_query_body["matches"][0]["id"], "alpha");
+    let ann_query_response = query_response_body(&ann_profiled_query_body);
+    assert_eq!(ann_query_response["matches"][0]["id"], "alpha");
     assert_eq!(
-        ann_profiled_query_body["diagnostics"]["chosen_plan"],
+        ann_query_response["diagnostics"]["chosen_plan"],
         "vector_first_ann"
     );
     assert!(
-        ann_profiled_query_body["diagnostics"]["unit_scan_mix"]["immutable_ann"]
+        ann_query_response["diagnostics"]["unit_scan_mix"]["immutable_ann"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
     assert!(
-        ann_profiled_query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
+        ann_query_response["diagnostics"]["stage_timings"]["candidate_generation_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        ann_profiled_query_body["diagnostics"]["stage_timings"]["rerank_micros"]
+        ann_query_response["diagnostics"]["stage_timings"]["rerank_micros"]
             .as_u64()
             .is_some()
     );
@@ -457,7 +473,8 @@ fn data_commands_run_against_the_server_over_grpc() {
     let compact_stdout = String::from_utf8(compact.stdout).expect("stdout should be utf8");
     let compact_body: Value =
         serde_json::from_str(&compact_stdout).expect("compact output should be valid json");
-    assert!(compact_body["manifest_generation"].as_u64().is_some());
+    let compact_response = scoped_response_body(&compact_body);
+    assert!(compact_response["manifest_generation"].as_u64().is_some());
 }
 
 #[test]
@@ -510,78 +527,83 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
         String::from_utf8(profiled_query.stdout).expect("stdout should be utf8");
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
-    assert_eq!(profiled_query_body["matches"][0]["id"], "doc-8");
-    assert_eq!(profiled_query_body["matches"][1]["id"], "doc-4");
+    let profiled_query_response = query_response_body(&profiled_query_body);
+    assert_eq!(profiled_query_response["matches"][0]["id"], "doc-8");
+    assert_eq!(profiled_query_response["matches"][1]["id"], "doc-4");
     assert_eq!(
-        profiled_query_body["diagnostics"]["chosen_plan"],
+        profiled_query_response["diagnostics"]["chosen_plan"],
         "cooperative_filtered_ann"
     );
     assert_eq!(
-        profiled_query_body["diagnostics"]["planner_reason"],
+        profiled_query_response["diagnostics"]["planner_reason"],
         "filtered ann traversal is cheaper than exact scan for this selectivity"
     );
     assert_eq!(
-        profiled_query_body["diagnostics"]["estimated_selectivity"],
+        profiled_query_response["diagnostics"]["estimated_selectivity"],
         Value::from(0.25)
     );
-    assert_eq!(profiled_query_body["diagnostics"]["units_considered"], 2);
-    assert_eq!(profiled_query_body["diagnostics"]["units_pruned"], 0);
-    assert_eq!(profiled_query_body["diagnostics"]["units_scanned"], 1);
-    let candidates_before_filter = profiled_query_body["diagnostics"]["candidates_before_filter"]
-        .as_u64()
-        .expect("candidates before filter should be numeric");
-    let candidates_after_filter = profiled_query_body["diagnostics"]["candidates_after_filter"]
+    assert_eq!(
+        profiled_query_response["diagnostics"]["units_considered"],
+        2
+    );
+    assert_eq!(profiled_query_response["diagnostics"]["units_pruned"], 0);
+    assert_eq!(profiled_query_response["diagnostics"]["units_scanned"], 1);
+    let candidates_before_filter =
+        profiled_query_response["diagnostics"]["candidates_before_filter"]
+            .as_u64()
+            .expect("candidates before filter should be numeric");
+    let candidates_after_filter = profiled_query_response["diagnostics"]["candidates_after_filter"]
         .as_u64()
         .expect("candidates after filter should be numeric");
     assert!(candidates_before_filter >= 2);
     assert!(candidates_after_filter >= 2);
     assert!(candidates_after_filter <= candidates_before_filter);
     assert_eq!(
-        profiled_query_body["diagnostics"]["fallback_reason"],
+        profiled_query_response["diagnostics"]["fallback_reason"],
         Value::Null
     );
-    assert_eq!(profiled_query_body["diagnostics"]["rerank_count"], 1);
+    assert_eq!(profiled_query_response["diagnostics"]["rerank_count"], 1);
     assert!(
-        profiled_query_body["diagnostics"]["candidates_reranked"]
+        profiled_query_response["diagnostics"]["candidates_reranked"]
             .as_u64()
             .is_some_and(|count| count == candidates_after_filter)
     );
     assert!(
-        profiled_query_body["diagnostics"]["candidates_merged"]
+        profiled_query_response["diagnostics"]["candidates_merged"]
             .as_u64()
             .is_some_and(|count| count == candidates_after_filter)
     );
     assert!(
-        profiled_query_body["diagnostics"]["unit_scan_mix"]["immutable_ann"]
+        profiled_query_response["diagnostics"]["unit_scan_mix"]["immutable_ann"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
     assert_eq!(
-        profiled_query_body["diagnostics"]["stage_timings"]["prefilter_micros"],
+        profiled_query_response["diagnostics"]["stage_timings"]["prefilter_micros"],
         Value::from(0)
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["planning_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["planning_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["candidate_generation_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["postfilter_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["postfilter_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["rerank_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["rerank_micros"]
             .as_u64()
             .is_some()
     );
     assert!(
-        profiled_query_body["diagnostics"]["stage_timings"]["merge_micros"]
+        profiled_query_response["diagnostics"]["stage_timings"]["merge_micros"]
             .as_u64()
             .is_some()
     );

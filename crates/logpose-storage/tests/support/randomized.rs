@@ -3,8 +3,9 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    CollectionId, CollectionStats, CommitAck, DeleteRecord, DistanceMetric, PutRecord, RecordId,
-    SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    CollectionId, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME,
+    DeleteRecord, DistanceMetric, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -138,6 +139,8 @@ impl ExpectedModel {
                 .collection_id
                 .clone()
                 .expect("collection id should be registered"),
+            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
+            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
             manifest_generation: self.manifest_generation,
             visible_seq_no: self.next_seq_no,
@@ -211,11 +214,11 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
 
     trace.push(StorageAction::CreateCollection);
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: COLLECTION_NAME.to_owned(),
-            dimensions: RECORD_DIMENSIONS,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            COLLECTION_NAME,
+            RECORD_DIMENSIONS,
+            DistanceMetric::Cosine,
+        ))
         .await
         .unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))

@@ -11,7 +11,10 @@ use logpose_core::AppState;
 use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, ScalarMetadataValue};
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
-use logpose_types::{DistanceMetric, Snapshot, WriteOperation};
+use logpose_types::{
+    CollectionRef, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric, Snapshot,
+    WriteOperation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{net::SocketAddr, sync::Arc};
@@ -85,6 +88,8 @@ async fn create_collection(
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: request.tenant_name,
+            database_name: request.database_name,
             name: request.name,
             dimensions: request.dimensions,
             metric: request.metric,
@@ -95,23 +100,36 @@ async fn create_collection(
 
 async fn get_collection(
     Path(name): Path<String>,
+    Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
-    Ok(Json(state.get_collection(&name).await?))
+    let collection = namespace.collection(name);
+    Ok(Json(
+        state
+            .get_collection(&collection_lookup_key(&collection))
+            .await?,
+    ))
 }
 
 async fn get_collection_placement(
     Path(name): Path<String>,
+    Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
-    Ok(Json(state.control.collection_placement(&name).await?))
+    let collection = namespace.collection(name);
+    Ok(Json(
+        state
+            .control
+            .collection_placement(&collection_lookup_key(&collection))
+            .await?,
+    ))
 }
 
 async fn write_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(request): Json<WriteCollectionBody>,
-) -> Result<Json<logpose_types::CommitAck>, ApiError> {
+) -> Result<Json<CollectionScopedResponse<logpose_types::CommitAck>>, ApiError> {
     for operation in &request.operations {
         if operation.id().as_str().is_empty() {
             return Err(ApiError(ServiceError::InvalidArgument(
@@ -119,20 +137,25 @@ async fn write_collection(
             )));
         }
     }
-    Ok(Json(state.write(&name, request.operations).await?))
+    let collection = request.collection(name);
+    let ack = state
+        .write(&collection_lookup_key(&collection), request.operations)
+        .await?;
+    Ok(Json(CollectionScopedResponse::new(collection, ack)))
 }
 
 async fn query_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryCollectionBody>,
-) -> Result<Json<logpose_query::QueryResponse>, ApiError> {
+) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
     if request.top_k == 0 {
         return Err(ApiError(ServiceError::InvalidArgument(
             "top_k must be greater than 0".to_owned(),
         )));
     }
 
+    let collection = request.collection(name);
     let filters = request
         .filters
         .into_iter()
@@ -147,49 +170,63 @@ async fn query_collection(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Json(
-        state
-            .query(QueryRequest {
-                collection_name: name,
-                vector: request.vector,
-                top_k: request.top_k,
-                snapshot: request.snapshot,
-                filters,
-                predicate: request.predicate,
-                explain: request.explain,
-            })
-            .await?,
-    ))
+    let response = state
+        .query(QueryRequest {
+            collection_name: collection_lookup_key(&collection),
+            vector: request.vector,
+            top_k: request.top_k,
+            snapshot: request.snapshot,
+            filters,
+            predicate: request.predicate,
+            explain: request.explain,
+        })
+        .await?;
+
+    Ok(Json(CollectionScopedResponse::new(collection, response)))
 }
 
 async fn get_collection_stats(
     Path(name): Path<String>,
+    Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
-    Ok(Json(state.stats(&name).await?))
+    let collection = namespace.collection(name);
+    Ok(Json(
+        state.stats(&collection_lookup_key(&collection)).await?,
+    ))
 }
 
 async fn flush_collection(
     Path(name): Path<String>,
+    Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<logpose_types::Snapshot>, ApiError> {
-    Ok(Json(state.flush(&name).await?))
+) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+    let collection = namespace.collection(name);
+    let snapshot = state.flush(&collection_lookup_key(&collection)).await?;
+    Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
 }
 
 async fn compact_collection(
     Path(name): Path<String>,
+    Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<logpose_types::Snapshot>, ApiError> {
-    Ok(Json(state.compact(&name).await?))
+) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+    let collection = namespace.collection(name);
+    let snapshot = state.compact(&collection_lookup_key(&collection)).await?;
+    Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
 }
 
 async fn inspect_collection(
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<InspectCollectionParams>,
-) -> Result<Json<logpose_storage::InspectReport>, ApiError> {
-    let target = inspect_target_from_params(params)?;
-    Ok(Json(state.inspect(&name, target).await?))
+) -> Result<Json<CollectionScopedResponse<logpose_storage::InspectReport>>, ApiError> {
+    let (target, namespace) = inspect_target_from_params(params)?;
+    let collection = namespace.collection(name);
+    let report = state
+        .inspect(&collection_lookup_key(&collection), target)
+        .await?;
+    Ok(Json(CollectionScopedResponse::new(collection, report)))
 }
 
 #[derive(Debug, Serialize)]
@@ -199,18 +236,62 @@ struct HealthResponse {
 
 #[derive(Debug, Deserialize)]
 struct CreateCollectionBody {
+    #[serde(default = "default_tenant_name")]
+    tenant_name: String,
+    #[serde(default = "default_database_name")]
+    database_name: String,
     name: String,
     dimensions: usize,
     metric: DistanceMetric,
 }
 
 #[derive(Debug, Deserialize)]
+struct NamespaceQuery {
+    #[serde(
+        default = "default_tenant_name",
+        alias = "tenant_name",
+        rename = "tenant"
+    )]
+    tenant: String,
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
+    database: String,
+}
+
+impl NamespaceQuery {
+    fn collection(&self, name: impl Into<String>) -> CollectionRef {
+        CollectionRef::new(self.tenant.clone(), self.database.clone(), name.into())
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct WriteCollectionBody {
+    #[serde(default = "default_tenant_name")]
+    tenant_name: String,
+    #[serde(default = "default_database_name")]
+    database_name: String,
     operations: Vec<WriteOperation>,
+}
+
+impl WriteCollectionBody {
+    fn collection(&self, name: impl Into<String>) -> CollectionRef {
+        CollectionRef::new(
+            self.tenant_name.clone(),
+            self.database_name.clone(),
+            name.into(),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct QueryCollectionBody {
+    #[serde(default = "default_tenant_name")]
+    tenant_name: String,
+    #[serde(default = "default_database_name")]
+    database_name: String,
     vector: Vec<f32>,
     top_k: usize,
     #[serde(default)]
@@ -223,10 +304,52 @@ struct QueryCollectionBody {
     explain: ExplainMode,
 }
 
+impl QueryCollectionBody {
+    fn collection(&self, name: impl Into<String>) -> CollectionRef {
+        CollectionRef::new(
+            self.tenant_name.clone(),
+            self.database_name.clone(),
+            name.into(),
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct InspectCollectionParams {
+    #[serde(
+        default = "default_tenant_name",
+        alias = "tenant_name",
+        rename = "tenant"
+    )]
+    tenant: String,
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
+    database: String,
     target: Option<String>,
     segment_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionScopedResponse<T> {
+    tenant_name: String,
+    database_name: String,
+    collection_name: String,
+    #[serde(flatten)]
+    response: T,
+}
+
+impl<T> CollectionScopedResponse<T> {
+    fn new(collection: CollectionRef, response: T) -> Self {
+        Self {
+            tenant_name: collection.tenant_name,
+            database_name: collection.database_name,
+            collection_name: collection.collection_name,
+            response,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,8 +373,14 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn inspect_target_from_params(params: InspectCollectionParams) -> Result<InspectTarget, ApiError> {
-    match params.target.as_deref().unwrap_or("manifest") {
+fn inspect_target_from_params(
+    params: InspectCollectionParams,
+) -> Result<(InspectTarget, NamespaceQuery), ApiError> {
+    let namespace = NamespaceQuery {
+        tenant: params.tenant,
+        database: params.database,
+    };
+    let target = match params.target.as_deref().unwrap_or("manifest") {
         "manifest" => Ok(InspectTarget::Manifest),
         "wal" => Ok(InspectTarget::Wal),
         "segment" => params
@@ -267,7 +396,23 @@ fn inspect_target_from_params(params: InspectCollectionParams) -> Result<Inspect
         other => Err(ApiError(ServiceError::InvalidArgument(format!(
             "unsupported inspect target '{other}'"
         )))),
-    }
+    }?;
+    Ok((target, namespace))
+}
+
+fn default_tenant_name() -> String {
+    DEFAULT_TENANT_NAME.to_owned()
+}
+
+fn default_database_name() -> String {
+    DEFAULT_DATABASE_NAME.to_owned()
+}
+
+fn collection_lookup_key(collection: &CollectionRef) -> String {
+    format!(
+        "{}/{}/{}",
+        collection.tenant_name, collection.database_name, collection.collection_name
+    )
 }
 
 #[cfg(test)]
@@ -419,6 +564,9 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(create.status(), StatusCode::CREATED);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["tenant_name"], "default");
+        assert_eq!(create_body["database_name"], "default");
 
         let write = app
             .clone()
@@ -457,6 +605,10 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(write.status(), StatusCode::OK);
+        let write_body = json_body(write).await;
+        assert_eq!(write_body["tenant_name"], "default");
+        assert_eq!(write_body["database_name"], "default");
+        assert_eq!(write_body["collection_name"], "documents");
 
         let query = app
             .clone()
@@ -479,6 +631,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(query.status(), StatusCode::OK);
         let query_body = json_body(query).await;
+        assert_eq!(query_body["tenant_name"], "default");
+        assert_eq!(query_body["database_name"], "default");
+        assert_eq!(query_body["collection_name"], "documents");
         assert_eq!(
             query_body["matches"]
                 .as_array()
@@ -501,6 +656,8 @@ mod tests {
             .expect("router should respond");
         assert_eq!(stats.status(), StatusCode::OK);
         let stats_body = json_body(stats).await;
+        assert_eq!(stats_body["tenant_name"], "default");
+        assert_eq!(stats_body["database_name"], "default");
         assert_eq!(stats_body["live_record_count"], 3);
         assert_eq!(stats_body["deleted_record_count"], 0);
         assert_eq!(stats_body["mutable_op_count"], 3);
@@ -518,6 +675,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(wal.status(), StatusCode::OK);
         let wal_body = json_body(wal).await;
+        assert_eq!(wal_body["tenant_name"], "default");
+        assert_eq!(wal_body["database_name"], "default");
+        assert_eq!(wal_body["collection_name"], "documents");
         assert_eq!(wal_body["target"], "wal");
         assert_eq!(
             wal_body["payload"]["records"]
@@ -539,6 +699,10 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(flush.status(), StatusCode::OK);
+        let flush_body = json_body(flush).await;
+        assert_eq!(flush_body["tenant_name"], "default");
+        assert_eq!(flush_body["database_name"], "default");
+        assert_eq!(flush_body["collection_name"], "documents");
 
         let compact = app
             .clone()
@@ -552,6 +716,10 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(compact.status(), StatusCode::OK);
+        let compact_body = json_body(compact).await;
+        assert_eq!(compact_body["tenant_name"], "default");
+        assert_eq!(compact_body["database_name"], "default");
+        assert_eq!(compact_body["collection_name"], "documents");
 
         let inspect = app
             .clone()
@@ -565,6 +733,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(inspect.status(), StatusCode::OK);
         let inspect_body = json_body(inspect).await;
+        assert_eq!(inspect_body["tenant_name"], "default");
+        assert_eq!(inspect_body["database_name"], "default");
+        assert_eq!(inspect_body["collection_name"], "documents");
         assert_eq!(inspect_body["target"], "manifest");
         let segment_id = inspect_body["payload"]["segments"][0]["segment_id"]
             .as_str()
@@ -752,11 +923,11 @@ mod tests {
         let state = Arc::new(AppState::new(test_config("rest-runtime-status")));
         state
             .control
-            .create_collection(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         let app = router(state);
@@ -791,11 +962,11 @@ mod tests {
         let state = Arc::new(AppState::new(test_config("rest-placement")));
         state
             .control
-            .create_collection(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         let app = router(state);
@@ -812,10 +983,61 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
+        assert_eq!(body["tenant_name"], "default");
+        assert_eq!(body["database_name"], "default");
         assert_eq!(body["collection_name"], "documents");
         assert_eq!(body["assigned_node"], "rest-placement");
         assert_eq!(body["assigned_role"], "data");
         assert_eq!(body["route_kind"], "local");
+    }
+
+    #[tokio::test]
+    async fn rest_round_trips_explicit_namespace_requests() {
+        let state = Arc::new(AppState::new(test_config("rest-namespace-reject")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant_name": "acme",
+                            "database_name": "analytics",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["tenant_name"], "acme");
+        assert_eq!(create_body["database_name"], "analytics");
+
+        let get = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents?tenant=acme&database=analytics")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(get.status(), StatusCode::OK);
+        let get_body = json_body(get).await;
+        assert_eq!(get_body["tenant_name"], "acme");
+        assert_eq!(get_body["database_name"], "analytics");
+        assert_eq!(get_body["name"], "documents");
     }
 
     #[tokio::test]
@@ -898,11 +1120,11 @@ mod tests {
         )));
         initial
             .control
-            .create_collection(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         drop(initial);
@@ -1039,11 +1261,11 @@ mod tests {
         )));
         initial
             .control
-            .create_collection(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         drop(initial);
