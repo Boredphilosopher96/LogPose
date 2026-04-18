@@ -3409,6 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn running_quit_is_deferred_until_the_action_completes() {
         let mut app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Running,
             home: HomeState {
                 search: String::new(),
@@ -3464,6 +3465,7 @@ mod tests {
     #[tokio::test]
     async fn queued_quit_exits_the_app_after_the_action_completes() {
         let mut app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Running,
             home: HomeState {
                 search: String::new(),
