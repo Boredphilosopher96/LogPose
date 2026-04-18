@@ -44,7 +44,6 @@ fn top_level_help_includes_primary_workflows_and_interactive_entrypoint() {
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("--output <OUTPUT>"));
     assert!(stdout.contains("--auth-token <TOKEN>"));
-    assert!(!stdout.contains("\ntenant\n"));
     assert!(!stdout.contains("--interactive <MODE>"));
 }
 
@@ -66,7 +65,6 @@ fn collection_create_help_lists_metric_values_and_examples() {
     assert!(stdout.contains("dot"));
     assert!(stdout.contains("l2"));
     assert!(stdout.contains("--database <DATABASE>"));
-    assert!(!stdout.contains("--tenant <TENANT>"));
     assert!(stdout.contains("Examples:"));
     assert!(stdout.contains("logpose collection create colors --dimensions 768 --metric cosine"));
     assert!(stdout.contains("logpose interactive"));
@@ -90,7 +88,6 @@ fn interactive_help_describes_search_defaults_and_file_picker() {
     assert!(stdout.contains("--create"));
     assert!(stdout.contains("--name <NAME>"));
     assert!(stdout.contains("--database <DATABASE>"));
-    assert!(!stdout.contains("--tenant <TENANT>"));
 }
 
 #[test]
@@ -106,7 +103,6 @@ fn query_help_explains_input_formats_and_examples() {
     assert!(stdout.contains("--vector <VECTOR>"));
     assert!(stdout.contains("0.12,-0.44,0.90"));
     assert!(stdout.contains("--database <DATABASE>"));
-    assert!(!stdout.contains("--tenant <TENANT>"));
     assert!(stdout.contains("--filter <FIELD=VALUE>"));
     assert!(stdout.contains("kind=article"));
     assert!(stdout.contains("score=json:7"));

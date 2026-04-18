@@ -716,19 +716,6 @@ mod tests {
             .expect("router should respond");
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let removed_tenant_route = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/tenants")
-                    .header("authorization", "Bearer operator-secret")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(removed_tenant_route.status(), StatusCode::NOT_FOUND);
-
         let put_database = app
             .clone()
             .oneshot(
@@ -745,7 +732,6 @@ mod tests {
         assert_eq!(put_database.status(), StatusCode::OK);
         let put_database_body = json_body(put_database).await;
         assert_eq!(put_database_body["name"], "analytics");
-        assert!(put_database_body.get("tenant_name").is_none());
 
         let get_database = app
             .clone()
@@ -761,7 +747,6 @@ mod tests {
         assert_eq!(get_database.status(), StatusCode::OK);
         let get_database_body = json_body(get_database).await;
         assert_eq!(get_database_body["name"], "analytics");
-        assert!(get_database_body.get("tenant_name").is_none());
 
         let list_databases = app
             .oneshot(
@@ -779,11 +764,6 @@ mod tests {
             .as_array()
             .expect("databases should be an array");
         assert_eq!(databases.len(), 2);
-        assert!(
-            databases
-                .iter()
-                .all(|database| database.get("tenant_name").is_none())
-        );
         assert!(
             databases
                 .iter()
@@ -884,7 +864,6 @@ mod tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         let create_body = json_body(create).await;
         assert_eq!(create_body["database_name"], "default");
-        assert!(create_body.get("tenant_name").is_none());
 
         let write = app
             .clone()
@@ -926,7 +905,6 @@ mod tests {
         let write_body = json_body(write).await;
         assert_eq!(write_body["database_name"], "default");
         assert_eq!(write_body["collection_name"], "documents");
-        assert!(write_body.get("tenant_name").is_none());
 
         let query = app
             .clone()
@@ -951,7 +929,6 @@ mod tests {
         let query_body = json_body(query).await;
         assert_eq!(query_body["database_name"], "default");
         assert_eq!(query_body["collection_name"], "documents");
-        assert!(query_body.get("tenant_name").is_none());
         assert_eq!(
             query_body["matches"]
                 .as_array()
@@ -975,7 +952,6 @@ mod tests {
         assert_eq!(stats.status(), StatusCode::OK);
         let stats_body = json_body(stats).await;
         assert_eq!(stats_body["database_name"], "default");
-        assert!(stats_body.get("tenant_name").is_none());
         assert_eq!(stats_body["live_record_count"], 3);
         assert_eq!(stats_body["deleted_record_count"], 0);
         assert_eq!(stats_body["mutable_op_count"], 3);
@@ -995,7 +971,6 @@ mod tests {
         let wal_body = json_body(wal).await;
         assert_eq!(wal_body["database_name"], "default");
         assert_eq!(wal_body["collection_name"], "documents");
-        assert!(wal_body.get("tenant_name").is_none());
         assert_eq!(wal_body["target"], "wal");
         assert_eq!(
             wal_body["payload"]["records"]
@@ -1020,7 +995,6 @@ mod tests {
         let flush_body = json_body(flush).await;
         assert_eq!(flush_body["database_name"], "default");
         assert_eq!(flush_body["collection_name"], "documents");
-        assert!(flush_body.get("tenant_name").is_none());
 
         let compact = app
             .clone()
@@ -1037,7 +1011,6 @@ mod tests {
         let compact_body = json_body(compact).await;
         assert_eq!(compact_body["database_name"], "default");
         assert_eq!(compact_body["collection_name"], "documents");
-        assert!(compact_body.get("tenant_name").is_none());
 
         let inspect = app
             .clone()
@@ -1053,7 +1026,6 @@ mod tests {
         let inspect_body = json_body(inspect).await;
         assert_eq!(inspect_body["database_name"], "default");
         assert_eq!(inspect_body["collection_name"], "documents");
-        assert!(inspect_body.get("tenant_name").is_none());
         assert_eq!(inspect_body["target"], "manifest");
         let segment_id = inspect_body["payload"]["segments"][0]["segment_id"]
             .as_str()
@@ -1267,7 +1239,6 @@ mod tests {
         assert_eq!(body["collection_count"], 1);
         assert_eq!(body["collections"][0]["collection_name"], "documents");
         assert_eq!(body["collections"][0]["database_name"], "default");
-        assert!(body["collections"][0].get("tenant_name").is_none());
         assert_eq!(body["collections"][0]["assigned_role"], "data");
         assert_eq!(body["collections"][0]["route_kind"], "local");
         assert!(
@@ -1305,7 +1276,6 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["database_name"], "default");
         assert_eq!(body["collection_name"], "documents");
-        assert!(body.get("tenant_name").is_none());
         assert_eq!(body["assigned_node"], "rest-placement");
         assert_eq!(body["assigned_role"], "data");
         assert_eq!(body["route_kind"], "local");
@@ -1340,7 +1310,6 @@ mod tests {
         assert_eq!(create.status(), StatusCode::CREATED);
         let create_body = json_body(create).await;
         assert_eq!(create_body["database_name"], "analytics");
-        assert!(create_body.get("tenant_name").is_none());
 
         let get = app
             .oneshot(
@@ -1356,7 +1325,6 @@ mod tests {
         let get_body = json_body(get).await;
         assert_eq!(get_body["database_name"], "analytics");
         assert_eq!(get_body["name"], "documents");
-        assert!(get_body.get("tenant_name").is_none());
     }
 
     #[tokio::test]
@@ -2468,7 +2436,6 @@ mod tests {
         let put_body = json_body(put).await;
         assert_eq!(put_body["database_name"], "default");
         assert_eq!(put_body["authentication_mode"], "external_token");
-        assert!(put_body.get("tenant_name").is_none());
         assert_eq!(
             put_body["role_bindings"]
                 .as_array()

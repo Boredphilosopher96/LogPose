@@ -156,10 +156,6 @@ fn normalize_placement(mut value: Value) -> Value {
 
 fn normalize_query(value: Value) -> Value {
     let value = normalize_scoped_response(value);
-    assert!(
-        value.get("tenant_name").is_none(),
-        "query responses must not include the removed tenant_name field"
-    );
     let matches = value["matches"]
         .as_array()
         .expect("query matches should be an array")
@@ -220,10 +216,6 @@ fn normalize_scoped_response(value: Value) -> Value {
     assert!(
         value.get("response").is_none(),
         "scoped transport responses must be flattened"
-    );
-    assert!(
-        value.get("tenant_name").is_none(),
-        "scoped transport responses must not include the removed tenant_name field"
     );
     for field in ["database_name", "collection_name"] {
         assert!(

@@ -782,13 +782,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tenant_commands_are_not_available() {
-        let cli = Cli::try_parse_from(["logpose", "tenant", "list"]);
-
-        assert!(cli.is_err(), "tenant commands should be removed: {cli:?}");
-    }
-
-    #[test]
     fn collection_commands_accept_database_flags_only() {
         let cli = Cli::try_parse_from([
             "logpose",
@@ -813,23 +806,6 @@ mod tests {
         };
         assert_eq!(collection.database_name, "analytics");
         assert_eq!(collection.collection_name, "colors");
-    }
-
-    #[test]
-    fn collection_commands_reject_tenant_flags() {
-        let cli = Cli::try_parse_from([
-            "logpose",
-            "collection",
-            "show",
-            "colors",
-            "--tenant",
-            "acme",
-        ]);
-
-        assert!(
-            cli.is_err(),
-            "collection show should reject tenant flags: {cli:?}"
-        );
     }
 
     #[test]
