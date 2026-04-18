@@ -235,7 +235,8 @@ impl CollectionRef {
 }
 
 fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> {
-    if value.trim().is_empty() {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
         return Err(LogPoseError::Message(format!(
             "{field_name} must not be empty"
         )));
@@ -243,6 +244,11 @@ fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> 
     if value.contains('/') {
         return Err(LogPoseError::Message(format!(
             "{field_name} must not contain '/'"
+        )));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(LogPoseError::Message(format!(
+            "{field_name} must not be a relative path component"
         )));
     }
     Ok(())
@@ -787,6 +793,19 @@ mod tests {
 
         assert!(error.to_string().contains("collection_name"));
         assert!(error.to_string().contains("/"));
+    }
+
+    #[test]
+    fn collection_ref_rejects_relative_path_components() {
+        let database_error = CollectionRef::new("..", "docs")
+            .validate()
+            .expect_err("relative database names should fail");
+        assert!(database_error.to_string().contains("relative path"));
+
+        let collection_error = CollectionRef::new("analytics", ".")
+            .validate()
+            .expect_err("relative collection names should fail");
+        assert!(collection_error.to_string().contains("relative path"));
     }
 }
 

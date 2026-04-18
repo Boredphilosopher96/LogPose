@@ -1624,6 +1624,15 @@ fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
 
 impl CatalogStore for LocalStorageEngine {
     fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        let mut descriptor = descriptor;
+        descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
+        match self.get_database(&descriptor.name) {
+            Ok(existing) => {
+                descriptor.database_id = existing.database_id;
+            }
+            Err(error) if error.to_string().contains("does not exist") => {}
+            Err(error) => return Err(error),
+        }
         descriptor.validate()?;
         atomic_write(
             &self.database_descriptor_path(&descriptor.name),
@@ -2896,6 +2905,7 @@ fn json_message(error: serde_json::Error) -> LogPoseError {
 }
 
 fn validate_principal_name(value: &str) -> Result<()> {
+    let trimmed = value.trim();
     if value.trim().is_empty() {
         return Err(LogPoseError::Message(
             "principal name must not be empty".to_owned(),
@@ -2906,16 +2916,27 @@ fn validate_principal_name(value: &str) -> Result<()> {
             "principal name must not contain '/'".to_owned(),
         ));
     }
+    if matches!(trimmed, "." | "..") {
+        return Err(LogPoseError::Message(
+            "principal name must not be a relative path component".to_owned(),
+        ));
+    }
     Ok(())
 }
 
 fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
     if value.trim().is_empty() {
         return Err(LogPoseError::Message(format!("{label} must not be empty")));
     }
     if value.contains('/') {
         return Err(LogPoseError::Message(format!(
             "{label} must not contain '/'"
+        )));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(LogPoseError::Message(format!(
+            "{label} must not be a relative path component"
         )));
     }
     Ok(())
@@ -2946,6 +2967,17 @@ mod tests {
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].name, DEFAULT_DATABASE_NAME);
         assert!(databases[0].is_default);
+    }
+
+    #[test]
+    fn catalog_validation_rejects_relative_path_components() {
+        let principal_error =
+            validate_principal_name("..").expect_err("relative principal names should fail");
+        assert!(principal_error.to_string().contains("relative path"));
+
+        let database_error = validate_namespace_segment("database name", "..")
+            .expect_err("relative database names should fail");
+        assert!(database_error.to_string().contains("relative path"));
     }
 
     #[test]

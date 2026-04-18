@@ -10,10 +10,10 @@ use logpose_service::{
     LogPoseControlService, LogPoseDataService, Result as ServiceResult, ServiceError,
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
-use logpose_storage_etcd::EtcdBackedStorageEngine;
+use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
-    BuildInfo, CollectionRef, CollectionStats, CommitAck, MetadataBackend, NodeMetadata, NodeRole,
-    Snapshot, WriteOperation,
+    BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, MetadataBackend,
+    NodeMetadata, NodeRole, Snapshot, WriteOperation,
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -50,7 +50,7 @@ enum DatabasePermission {
 }
 
 /// Top-level state shared by transport layers and tools.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AppState {
     /// Effective runtime configuration.
     pub config: LogPoseConfig,
@@ -62,6 +62,15 @@ pub struct AppState {
     /// Shared application data-plane service used internally by app-state helpers.
     #[serde(skip_serializing)]
     data: Arc<LogPoseDataService>,
+    /// Shared database and policy metadata surface used by authenticated APIs.
+    #[serde(skip_serializing)]
+    shared_catalog: SharedCatalog,
+}
+
+#[derive(Clone)]
+enum SharedCatalog {
+    Local,
+    Etcd(EtcdCatalogStore),
 }
 
 impl AppState {
@@ -81,6 +90,13 @@ impl AppState {
         };
         let data = Arc::new(LogPoseDataService::new(storage));
         let catalog = logpose_service::local_catalog_store(&config.storage_root);
+        let shared_catalog = match config.metadata.backend {
+            MetadataBackend::Local => SharedCatalog::Local,
+            MetadataBackend::Etcd => SharedCatalog::Etcd(
+                EtcdCatalogStore::new(config.metadata.etcd.clone())
+                    .expect("invalid etcd metadata configuration for shared catalog"),
+            ),
+        };
         let control = Arc::new(LogPoseControlService::new(
             Arc::clone(&data),
             catalog,
@@ -95,6 +111,7 @@ impl AppState {
             data,
             config,
             build,
+            shared_catalog,
         }
     }
 
@@ -111,7 +128,7 @@ impl AppState {
         descriptor: DatabaseDescriptor,
     ) -> ServiceResult<DatabaseDescriptor> {
         self.require_operator(auth).await?;
-        self.control.put_database(descriptor).await
+        self.put_database_shared(descriptor).await
     }
 
     /// Read one database descriptor after enforcing operator access.
@@ -121,7 +138,7 @@ impl AppState {
         database_name: &str,
     ) -> ServiceResult<DatabaseDescriptor> {
         self.require_operator(auth).await?;
-        self.control.database(database_name).await
+        self.database_shared(database_name).await
     }
 
     /// List database descriptors after enforcing operator access.
@@ -130,7 +147,7 @@ impl AppState {
         auth: &RequestAuth,
     ) -> ServiceResult<Vec<DatabaseDescriptor>> {
         self.require_operator(auth).await?;
-        self.control.databases().await
+        self.databases_shared().await
     }
 
     /// Return runtime status after enforcing operator access when auth is enabled.
@@ -154,6 +171,9 @@ impl AppState {
             DatabasePermission::ReadWrite,
         )
         .await?;
+        self.require_control_plane_collection_mutation()?;
+        self.ensure_shared_database_descriptor(&request.database_name)
+            .await?;
         self.control.create_collection(request).await
     }
 
@@ -165,7 +185,7 @@ impl AppState {
     ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
         self.require_database_owner_permission(auth, &policy.database_name)
             .await?;
-        self.control.set_database_access_policy(policy).await
+        self.put_database_access_policy_shared(policy).await
     }
 
     /// Read one database-scoped access policy after enforcing owner access.
@@ -176,7 +196,7 @@ impl AppState {
     ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
         self.require_database_owner_permission(auth, database_name)
             .await?;
-        self.control.database_access_policy(database_name).await
+        self.database_access_policy_shared(database_name).await
     }
 
     /// Return collection placement after enforcing operator access when auth is enabled.
@@ -419,7 +439,7 @@ impl AppState {
         permission: DatabasePermission,
         allow_unauthenticated_if_disabled: bool,
     ) -> ServiceResult<()> {
-        let policy = match self.control.database_access_policy(database_name).await {
+        let policy = match self.database_access_policy_shared(database_name).await {
             Ok(policy) => Some(policy),
             Err(ServiceError::NotFound(_)) => None,
             Err(error) => return Err(error),
@@ -481,11 +501,11 @@ impl AppState {
             .auth
             .bootstrap_tokens
             .iter()
-            .find(|entry| entry.token == token)
+            .find(|entry| constant_time_eq(&entry.token, token))
             .map(|entry| entry.principal.clone())
             .ok_or_else(|| ServiceError::Unauthenticated("invalid bearer token".to_owned()))?;
 
-        match self.control.principal(&bootstrap_principal.name).await {
+        match self.principal_shared(&bootstrap_principal.name).await {
             Ok(principal) => Ok(Some(principal)),
             Err(ServiceError::NotFound(_)) => Ok(Some(bootstrap_principal)),
             Err(error) => Err(error),
@@ -500,6 +520,29 @@ impl AppState {
                 "node '{}' is running as '{}' and cannot accept data-plane operations",
                 self.config.node_name, self.config.node_role
             )))
+        }
+    }
+
+    fn require_control_plane_database_mutation(&self) -> ServiceResult<()> {
+        match self.config.node_role {
+            NodeRole::Data => Err(ServiceError::InvalidArgument(
+                "data-only nodes cannot accept control-plane database mutations".to_owned(),
+            )),
+            NodeRole::Control | NodeRole::Combined => Ok(()),
+        }
+    }
+
+    fn require_control_plane_collection_mutation(&self) -> ServiceResult<()> {
+        match self.config.node_role {
+            NodeRole::Data => Err(ServiceError::InvalidArgument(
+                "data-only nodes cannot accept control-plane collection lifecycle mutations"
+                    .to_owned(),
+            )),
+            NodeRole::Control => Err(ServiceError::InvalidArgument(
+                "control-only nodes cannot accept control-plane collection lifecycle mutations without a local data plane"
+                    .to_owned(),
+            )),
+            NodeRole::Combined => Ok(()),
         }
     }
 
@@ -523,10 +566,109 @@ impl AppState {
             self.config.node_name
         )))
     }
+
+    async fn put_database_shared(
+        &self,
+        descriptor: DatabaseDescriptor,
+    ) -> ServiceResult<DatabaseDescriptor> {
+        self.require_control_plane_database_mutation()?;
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.put_database(descriptor).await,
+            SharedCatalog::Etcd(catalog) => {
+                catalog.put_database(descriptor).await.map_err(Into::into)
+            }
+        }
+    }
+
+    async fn database_shared(&self, database_name: &str) -> ServiceResult<DatabaseDescriptor> {
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.database(database_name).await,
+            SharedCatalog::Etcd(catalog) => catalog
+                .get_database(database_name)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn databases_shared(&self) -> ServiceResult<Vec<DatabaseDescriptor>> {
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.databases().await,
+            SharedCatalog::Etcd(catalog) => catalog.list_databases().await.map_err(Into::into),
+        }
+    }
+
+    async fn put_database_access_policy_shared(
+        &self,
+        policy: logpose_auth::DatabaseAccessPolicy,
+    ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
+        self.require_control_plane_database_mutation()?;
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.set_database_access_policy(policy).await,
+            SharedCatalog::Etcd(catalog) => catalog
+                .put_database_access_policy(policy)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn database_access_policy_shared(
+        &self,
+        database_name: &str,
+    ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.database_access_policy(database_name).await,
+            SharedCatalog::Etcd(catalog) => catalog
+                .get_database_access_policy(database_name)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn principal_shared(&self, principal_name: &str) -> ServiceResult<Principal> {
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.principal(principal_name).await,
+            SharedCatalog::Etcd(catalog) => catalog
+                .get_principal(principal_name)
+                .await
+                .map_err(Into::into),
+        }
+    }
+
+    async fn ensure_shared_database_descriptor(&self, database_name: &str) -> ServiceResult<()> {
+        let database_name = if database_name.trim().is_empty() {
+            DEFAULT_DATABASE_NAME
+        } else {
+            database_name
+        };
+        if matches!(&self.shared_catalog, SharedCatalog::Local) {
+            return Ok(());
+        }
+        match self.database_shared(database_name).await {
+            Ok(_) => Ok(()),
+            Err(ServiceError::NotFound(_)) => self
+                .put_database_shared(DatabaseDescriptor::new(database_name))
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {
     format!("{}/{}", placement.database_name, placement.collection_name)
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 fn parse_collection_reference(collection_name: &str) -> ServiceResult<CollectionRef> {
@@ -610,6 +752,13 @@ mod tests {
                 .contains("expected 'collection' or 'database/collection'"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_expected_string_equality() {
+        assert!(constant_time_eq("reader-token", "reader-token"));
+        assert!(!constant_time_eq("reader-token", "reader-token-x"));
+        assert!(!constant_time_eq("reader-token", "writer-token"));
     }
 
     #[tokio::test]
@@ -734,6 +883,46 @@ mod tests {
             )
             .await
             .expect_err("observer-tier persisted principal should not retain operator access");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not allowed to perform operator actions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_principal_overrides_survive_local_restart() {
+        let config = auth_test_config(
+            "core-auth-persisted-principal-restart",
+            vec![BootstrapTokenConfig {
+                token: "operator-token".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            }],
+        );
+        let state = AppState::new(config.clone());
+        local_catalog_store(&state.config.storage_root)
+            .put_principal(Principal::new_with_access_tier(
+                "ops-admin",
+                PrincipalKind::User,
+                AccessTier::Observer,
+            ))
+            .expect("persisted principal should be updated before restart");
+        drop(state);
+
+        let restarted = AppState::new(config);
+        let error = restarted
+            .put_database_with_auth(
+                &RequestAuth::bearer_token("operator-token"),
+                DatabaseDescriptor::new("analytics"),
+            )
+            .await
+            .expect_err("restarted runtime should preserve the persisted observer tier");
 
         assert!(
             error

@@ -2508,8 +2508,7 @@ mod tests {
         assert_eq!(data_error.status(), StatusCode::BAD_REQUEST);
         let data_error_body = json_body(data_error).await;
         assert!(data_error_body["error"].as_str().is_some_and(|message| {
-            message
-                .contains("data-only nodes cannot accept control-plane database policy mutations")
+            message.contains("data-only nodes cannot accept control-plane database mutations")
         }));
     }
 

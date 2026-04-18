@@ -328,7 +328,7 @@ async fn grpc_client_round_trips_database_policy_over_grpc() {
 
     let policy = DatabaseAccessPolicy {
         database_name: "default".to_owned(),
-        authentication_mode: AuthenticationMode::Password,
+        authentication_mode: AuthenticationMode::ExternalToken,
         role_bindings: vec![
             DatabaseRoleBinding {
                 database_name: "default".to_owned(),

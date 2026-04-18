@@ -73,10 +73,7 @@ impl Principal {
 
     /// Validate principal shape.
     pub fn validate(&self) -> Result<(), String> {
-        if self.name.trim().is_empty() {
-            return Err("principal name must not be empty".to_owned());
-        }
-        Ok(())
+        validate_identifier("principal name", &self.name)
     }
 }
 
@@ -106,12 +103,8 @@ pub struct DatabaseRoleBinding {
 impl DatabaseRoleBinding {
     /// Validate binding shape.
     pub fn validate(&self) -> Result<(), String> {
-        if self.database_name.trim().is_empty() {
-            return Err("database_name must not be empty".to_owned());
-        }
-        if self.principal_name.trim().is_empty() {
-            return Err("principal_name must not be empty".to_owned());
-        }
+        validate_identifier("database_name", &self.database_name)?;
+        validate_identifier("principal_name", &self.principal_name)?;
         Ok(())
     }
 }
@@ -140,8 +133,15 @@ impl DatabaseAccessPolicy {
 
     /// Validate the policy contents.
     pub fn validate(&self) -> Result<(), String> {
-        if self.database_name.trim().is_empty() {
-            return Err("database_name must not be empty".to_owned());
+        validate_identifier("database_name", &self.database_name)?;
+        match self.authentication_mode {
+            AuthenticationMode::Disabled | AuthenticationMode::ExternalToken => {}
+            AuthenticationMode::Password | AuthenticationMode::MutualTls => {
+                return Err(format!(
+                    "authentication_mode '{}' is not supported",
+                    authentication_mode_name(self.authentication_mode.clone())
+                ));
+            }
         }
         for binding in &self.role_bindings {
             binding.validate()?;
@@ -155,6 +155,29 @@ impl DatabaseAccessPolicy {
 
 fn default_access_tier() -> AccessTier {
     AccessTier::Service
+}
+
+fn validate_identifier(label: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.contains('/') {
+        return Err(format!("{label} must not contain '/'"));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(format!("{label} must not be a relative path component"));
+    }
+    Ok(())
+}
+
+fn authentication_mode_name(mode: AuthenticationMode) -> &'static str {
+    match mode {
+        AuthenticationMode::Disabled => "disabled",
+        AuthenticationMode::Password => "password",
+        AuthenticationMode::MutualTls => "mutual_tls",
+        AuthenticationMode::ExternalToken => "external_token",
+    }
 }
 
 #[cfg(test)]
@@ -185,14 +208,14 @@ mod tests {
 
     #[test]
     fn database_policy_is_database_scoped() {
-        let policy = DatabaseAccessPolicy::new("analytics", AuthenticationMode::Password);
+        let policy = DatabaseAccessPolicy::new("analytics", AuthenticationMode::ExternalToken);
 
         assert_eq!(policy.database_name, "analytics");
         assert_eq!(
             serde_json::to_value(&policy).expect("policy should serialize"),
             serde_json::json!({
                 "database_name": "analytics",
-                "authentication_mode": "password",
+                "authentication_mode": "external_token",
                 "role_bindings": [],
             })
         );
@@ -202,7 +225,7 @@ mod tests {
     fn database_policy_validates_nested_bindings() {
         let error = DatabaseAccessPolicy {
             database_name: "default".to_owned(),
-            authentication_mode: AuthenticationMode::Password,
+            authentication_mode: AuthenticationMode::ExternalToken,
             role_bindings: vec![DatabaseRoleBinding {
                 database_name: "default".to_owned(),
                 principal_name: String::new(),
@@ -230,5 +253,27 @@ mod tests {
         .expect_err("cross-database bindings should fail");
 
         assert!(error.contains("database_name"));
+    }
+
+    #[test]
+    fn database_policy_rejects_reserved_namespace_separator() {
+        let error = DatabaseAccessPolicy::new("analytics/v2", AuthenticationMode::ExternalToken)
+            .validate()
+            .expect_err("slash-containing database names should fail");
+
+        assert!(error.contains("database_name"));
+    }
+
+    #[test]
+    fn database_policy_rejects_unsupported_authentication_modes() {
+        let password_error = DatabaseAccessPolicy::new("analytics", AuthenticationMode::Password)
+            .validate()
+            .expect_err("password authentication mode should fail until implemented");
+        assert!(password_error.contains("authentication_mode"));
+
+        let mtls_error = DatabaseAccessPolicy::new("analytics", AuthenticationMode::MutualTls)
+            .validate()
+            .expect_err("mutual tls authentication mode should fail until implemented");
+        assert!(mtls_error.contains("authentication_mode"));
     }
 }

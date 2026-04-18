@@ -5,14 +5,15 @@ use etcd_client::{
     Client, Compare, CompareOp, DeleteOptions, GetOptions, LeaseKeepAliveStream, LeaseKeeper,
     PutOptions, ResponseHeader, Txn, TxnOp,
 };
-use logpose_catalog::CollectionDescriptor;
+use logpose_auth::{DatabaseAccessPolicy, Principal};
+use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_types::{
     AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
-    CommitAck, EtcdMetadataConfig, LogPoseError, MaintenanceStatus, RecordId, Result, Snapshot,
-    VisibleRecord, WriteOperation,
+    CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LogPoseError, MaintenanceStatus,
+    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +28,12 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 #[derive(Clone)]
 pub struct EtcdBackedStorageEngine {
     local: Arc<LocalStorageEngine>,
+    etcd: EtcdPlacementStore,
+}
+
+/// Shared etcd-backed catalog metadata for database descriptors and policies.
+#[derive(Clone)]
+pub struct EtcdCatalogStore {
     etcd: EtcdPlacementStore,
 }
 
@@ -78,6 +85,197 @@ impl EtcdBackedStorageEngine {
             }
             Ok(_) | Err(_) => Ok(descriptor),
         }
+    }
+}
+
+impl EtcdCatalogStore {
+    /// Construct one shared catalog metadata store over the configured etcd cluster.
+    pub fn new(config: EtcdMetadataConfig) -> Result<Self> {
+        Ok(Self {
+            etcd: EtcdPlacementStore::new(config)?,
+        })
+    }
+
+    /// Create or replace one database descriptor in shared metadata.
+    pub async fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        let mut descriptor = descriptor;
+        descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
+        match self.get_database(&descriptor.name).await {
+            Ok(existing) => {
+                descriptor.database_id = existing.database_id;
+            }
+            Err(error) if error.to_string().contains("does not exist") => {}
+            Err(error) => return Err(error),
+        }
+        descriptor.validate()?;
+        let key = self.etcd.database_descriptor_key(&descriptor.name);
+        let value = serde_json::to_string(&descriptor).map_err(json_encode_message)?;
+        let mut client = self.etcd.client().await?;
+        client
+            .put(key, value, Some(PutOptions::new()))
+            .await
+            .map_err(etcd_message)?;
+        Ok(descriptor)
+    }
+
+    /// Read one shared database descriptor.
+    pub async fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        validate_database_name(database_name)?;
+        self.ensure_default_database_descriptor().await?;
+        let key = self.etcd.database_descriptor_key(database_name);
+        let mut client = self.etcd.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Err(LogPoseError::Message(format!(
+                "database '{database_name}' does not exist"
+            )));
+        };
+        let descriptor: DatabaseDescriptor =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    /// List all shared database descriptors.
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        self.ensure_default_database_descriptor().await?;
+        let mut client = self.etcd.client().await?;
+        let response = client
+            .get(
+                self.etcd.databases_prefix(),
+                Some(
+                    GetOptions::new()
+                        .with_prefix()
+                        .with_sort(etcd_client::SortTarget::Key, etcd_client::SortOrder::Ascend),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        let mut descriptors = Vec::new();
+        for kv in response.kvs() {
+            let key = std::str::from_utf8(kv.key()).map_err(|error| {
+                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+            })?;
+            if !key.ends_with("/descriptor") {
+                continue;
+            }
+            let descriptor: DatabaseDescriptor =
+                serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+            descriptor.validate()?;
+            descriptors.push(descriptor);
+        }
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors)
+    }
+
+    /// Create or replace one shared principal descriptor.
+    pub async fn put_principal(&self, principal: Principal) -> Result<Principal> {
+        principal.validate().map_err(string_message)?;
+        let key = self.etcd.principal_descriptor_key(&principal.name);
+        let value = serde_json::to_string(&principal).map_err(json_encode_message)?;
+        let mut client = self.etcd.client().await?;
+        client
+            .put(key, value, Some(PutOptions::new()))
+            .await
+            .map_err(etcd_message)?;
+        Ok(principal)
+    }
+
+    /// Read one shared principal descriptor.
+    pub async fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+        validate_principal_name(principal_name)?;
+        let key = self.etcd.principal_descriptor_key(principal_name);
+        let mut client = self.etcd.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Err(LogPoseError::Message(format!(
+                "principal '{principal_name}' does not exist"
+            )));
+        };
+        let principal: Principal =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        principal.validate().map_err(string_message)?;
+        Ok(principal)
+    }
+
+    /// List all shared principal descriptors.
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        let mut client = self.etcd.client().await?;
+        let response = client
+            .get(
+                self.etcd.principals_prefix(),
+                Some(
+                    GetOptions::new()
+                        .with_prefix()
+                        .with_sort(etcd_client::SortTarget::Key, etcd_client::SortOrder::Ascend),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        let mut principals = Vec::new();
+        for kv in response.kvs() {
+            let key = std::str::from_utf8(kv.key()).map_err(|error| {
+                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+            })?;
+            if !key.ends_with("/descriptor") {
+                continue;
+            }
+            let principal: Principal =
+                serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+            principal.validate().map_err(string_message)?;
+            principals.push(principal);
+        }
+        principals.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(principals)
+    }
+
+    /// Create or replace one shared database access policy.
+    pub async fn put_database_access_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> Result<DatabaseAccessPolicy> {
+        policy.validate().map_err(string_message)?;
+        self.get_database(&policy.database_name).await?;
+        let key = self.etcd.database_policy_key(&policy.database_name);
+        let value = serde_json::to_string(&policy).map_err(json_encode_message)?;
+        let mut client = self.etcd.client().await?;
+        client
+            .put(key, value, Some(PutOptions::new()))
+            .await
+            .map_err(etcd_message)?;
+        Ok(policy)
+    }
+
+    /// Read one shared database access policy.
+    pub async fn get_database_access_policy(
+        &self,
+        database_name: &str,
+    ) -> Result<DatabaseAccessPolicy> {
+        validate_database_name(database_name)?;
+        let key = self.etcd.database_policy_key(database_name);
+        let mut client = self.etcd.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Err(LogPoseError::Message(format!(
+                "database access policy '{database_name}' does not exist"
+            )));
+        };
+        let policy: DatabaseAccessPolicy =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        policy.validate().map_err(string_message)?;
+        Ok(policy)
+    }
+
+    async fn ensure_default_database_descriptor(&self) -> Result<()> {
+        let descriptor = DatabaseDescriptor::new(DEFAULT_DATABASE_NAME);
+        let key = self.etcd.database_descriptor_key(DEFAULT_DATABASE_NAME);
+        let value = serde_json::to_string(&descriptor).map_err(json_encode_message)?;
+        let txn = Txn::new()
+            .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
+            .and_then([TxnOp::put(key, value, Some(PutOptions::new()))]);
+        let mut client = self.etcd.client().await?;
+        client.txn(txn).await.map_err(etcd_message)?;
+        Ok(())
     }
 }
 
@@ -398,6 +596,20 @@ impl EtcdPlacementStore {
         )
     }
 
+    fn databases_prefix(&self) -> String {
+        format!(
+            "{}/clusters/{}/databases/",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn principals_prefix(&self) -> String {
+        format!(
+            "{}/clusters/{}/principals/",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
     fn assignment_key(&self, collection_name: &str) -> String {
         let collection_name = canonical_collection_lookup_name(collection_name);
         format!(
@@ -410,6 +622,27 @@ impl EtcdPlacementStore {
         let collection_name = canonical_collection_lookup_name(collection_name);
         format!(
             "{}/clusters/{}/collections/{collection_name}/descriptor",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn database_descriptor_key(&self, database_name: &str) -> String {
+        format!(
+            "{}/clusters/{}/databases/{database_name}/descriptor",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn database_policy_key(&self, database_name: &str) -> String {
+        format!(
+            "{}/clusters/{}/databases/{database_name}/policy",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn principal_descriptor_key(&self, principal_name: &str) -> String {
+        format!(
+            "{}/clusters/{}/principals/{principal_name}/descriptor",
             self.key_prefix, self.cluster_name
         )
     }
@@ -615,6 +848,20 @@ fn json_decode_message(error: serde_json::Error) -> LogPoseError {
 
 fn etcd_message(error: etcd_client::Error) -> LogPoseError {
     LogPoseError::Message(format!("etcd metadata operation failed: {error}"))
+}
+
+fn string_message(error: String) -> LogPoseError {
+    LogPoseError::Message(error)
+}
+
+fn validate_database_name(value: &str) -> Result<()> {
+    DatabaseDescriptor::new(value).validate()
+}
+
+fn validate_principal_name(value: &str) -> Result<()> {
+    Principal::new(value, logpose_auth::PrincipalKind::Service)
+        .validate()
+        .map_err(string_message)
 }
 
 fn assignment_conflict(error: &LogPoseError) -> bool {

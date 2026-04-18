@@ -1475,6 +1475,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "etcd-client",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-storage",
  "logpose-types",

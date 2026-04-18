@@ -111,7 +111,7 @@ impl ActionOutput {
     pub fn json_text(&self) -> anyhow::Result<String> {
         match self {
             ActionOutput::Status(status) => pretty_json(status),
-            ActionOutput::Config(config) => pretty_json(config),
+            ActionOutput::Config(config) => pretty_json(&redacted_config_json(config)?),
             ActionOutput::DatabaseShown(descriptor) | ActionOutput::DatabaseUpdated(descriptor) => {
                 pretty_json(descriptor)
             }
@@ -209,6 +209,25 @@ fn render_config(config: &LogPoseConfig) -> String {
         config.storage_root.display(),
         config.log_filter
     )
+}
+
+fn redacted_config_json(config: &LogPoseConfig) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(config).context("failed to serialize configuration")?;
+    let Some(tokens) = value
+        .pointer_mut("/auth/bootstrap_tokens")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(value);
+    };
+    for token in tokens {
+        if let Some(object) = token.as_object_mut() {
+            object.insert(
+                "token".to_owned(),
+                serde_json::Value::String("<redacted>".to_owned()),
+            );
+        }
+    }
+    Ok(value)
 }
 
 fn render_database_policy(title: &str, policy: &DatabaseAccessPolicy) -> String {
@@ -368,6 +387,8 @@ fn collection_identity(database_name: &str, collection_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logpose_auth::{AccessTier, Principal, PrincipalKind};
+    use logpose_config::{AuthConfig, BootstrapTokenConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -428,5 +449,27 @@ mod tests {
 
         assert!(output.contains("Collection: documents"));
         assert!(!output.contains("default/default/documents"));
+    }
+
+    #[test]
+    fn config_json_redacts_bootstrap_tokens() {
+        let output = ActionOutput::Config(LogPoseConfig {
+            auth: AuthConfig {
+                bootstrap_tokens: vec![BootstrapTokenConfig {
+                    token: "super-secret".to_owned(),
+                    principal: Principal::new_with_access_tier(
+                        "ops-admin",
+                        PrincipalKind::User,
+                        AccessTier::Operator,
+                    ),
+                }],
+            },
+            ..LogPoseConfig::default()
+        })
+        .json_text()
+        .expect("config json should render");
+
+        assert!(output.contains("\"token\": \"<redacted>\""));
+        assert!(!output.contains("super-secret"));
     }
 }

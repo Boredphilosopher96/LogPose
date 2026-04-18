@@ -47,6 +47,7 @@ pub struct AuthConfig {
 impl AuthConfig {
     fn validate(&self) -> Result<()> {
         let mut seen_tokens = BTreeSet::new();
+        let mut seen_principals = BTreeSet::new();
         for (index, token) in self.bootstrap_tokens.iter().enumerate() {
             token.validate().map_err(|message| {
                 LogPoseError::Message(format!(
@@ -54,10 +55,16 @@ impl AuthConfig {
                 ))
             })?;
             if !seen_tokens.insert(token.token.clone()) {
-                return Err(LogPoseError::Message(format!(
-                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate token values ('{}')",
-                    token.token
-                )));
+                return Err(LogPoseError::Message(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate token values"
+                        .to_owned(),
+                ));
+            }
+            if !seen_principals.insert(token.principal.name.clone()) {
+                return Err(LogPoseError::Message(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate principal names"
+                        .to_owned(),
+                ));
             }
         }
         Ok(())
@@ -75,8 +82,12 @@ pub struct BootstrapTokenConfig {
 
 impl BootstrapTokenConfig {
     fn validate(&self) -> std::result::Result<(), String> {
-        if self.token.trim().is_empty() {
+        let trimmed = self.token.trim();
+        if trimmed.is_empty() {
             return Err("token must not be empty".to_owned());
+        }
+        if trimmed != self.token {
+            return Err("token must not include leading or trailing whitespace".to_owned());
         }
         self.principal.validate()?;
         Ok(())
@@ -407,5 +418,75 @@ access_tier = "operator""#,
         .expect_err("duplicate bootstrap tokens should fail");
 
         assert!(error.to_string().contains("auth.bootstrap_tokens"));
+        assert!(
+            !error.to_string().contains("duplicate-secret"),
+            "duplicate token validation must not echo the secret token"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_duplicate_bootstrap_principal_names() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[auth]
+
+[[auth.bootstrap_tokens]]
+token = "one-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "shared-principal"
+kind = "user"
+access_tier = "operator"
+
+[[auth.bootstrap_tokens]]
+token = "two-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "shared-principal"
+kind = "user"
+access_tier = "observer""#,
+        )
+        .expect_err("duplicate bootstrap principal names should fail");
+
+        assert!(
+            error.to_string().contains("duplicate principal names"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_bootstrap_tokens_with_surrounding_whitespace() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[auth]
+
+[[auth.bootstrap_tokens]]
+token = " secret "
+
+[auth.bootstrap_tokens.principal]
+name = "ops-admin"
+kind = "user"
+access_tier = "operator""#,
+        )
+        .expect_err("tokens with surrounding whitespace should fail");
+
+        assert!(
+            error.to_string().contains("leading or trailing whitespace"),
+            "unexpected error: {error}"
+        );
     }
 }
