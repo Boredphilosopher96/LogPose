@@ -47,6 +47,17 @@ message MaintenanceBacklogReply {
   uint64 collections_with_errors = 4;
 }
 
+message CoordinationStatusReply {
+  string cluster_name = 1;
+  bool membership_registered = 2;
+  optional int64 membership_lease_id = 3;
+  repeated string registered_members = 4;
+  optional string leader_node = 5;
+  bool is_local_leader = 6;
+  optional int64 leadership_lease_id = 7;
+  optional string last_error = 8;
+}
+
 message CollectionPlacementReply {
   string collection_id = 1;
   string collection_name = 2;
@@ -68,6 +79,7 @@ message GetRuntimeStatusReply {
   uint64 collection_count = 8;
   repeated CollectionPlacementReply collections = 9;
   MaintenanceBacklogReply maintenance = 10;
+  optional CoordinationStatusReply coordination = 11;
 }
 
 message DatabaseDescriptorReply {

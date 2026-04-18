@@ -3623,6 +3623,7 @@ mod tests {
                     data_plane_ready: true,
                     collection_count: 0,
                     collections: Vec::new(),
+                    coordination: None,
                     maintenance: logpose_types::MaintenanceBacklog::default(),
                 }),
                 tab: ResultTab::Summary,

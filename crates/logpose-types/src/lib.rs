@@ -838,6 +838,27 @@ pub struct CollectionPlacement {
     pub route_reason: String,
 }
 
+/// Operator-facing summary of the node's distributed coordination state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CoordinationStatus {
+    /// Cluster namespace used for etcd coordination keys.
+    pub cluster_name: String,
+    /// Whether this runtime currently holds a live membership lease.
+    pub membership_registered: bool,
+    /// Current etcd lease backing node membership when one is active.
+    pub membership_lease_id: Option<i64>,
+    /// Visible member node identifiers in the cluster.
+    pub registered_members: Vec<String>,
+    /// Current controller leader node identifier when one is visible.
+    pub leader_node: Option<String>,
+    /// Whether this runtime currently holds the controller leadership claim.
+    pub is_local_leader: bool,
+    /// Current etcd lease backing the local leadership claim when one is active.
+    pub leadership_lease_id: Option<i64>,
+    /// Last coordination-loop error observed by this runtime.
+    pub last_error: Option<String>,
+}
+
 /// Aggregated maintenance backlog surfaced through control-plane diagnostics.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceBacklog {
@@ -872,6 +893,8 @@ pub struct NodeRuntimeStatus {
     pub collection_count: usize,
     /// Collection placement summaries sorted by collection name.
     pub collections: Vec<CollectionPlacement>,
+    /// Distributed coordination state when an authoritative metadata backend is active.
+    pub coordination: Option<CoordinationStatus>,
     /// Aggregated maintenance state across local collections.
     pub maintenance: MaintenanceBacklog,
 }

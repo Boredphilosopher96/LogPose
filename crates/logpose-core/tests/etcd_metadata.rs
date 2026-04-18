@@ -11,10 +11,10 @@ use logpose_core::{AppState, RequestAuth};
 use logpose_query as _;
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest;
-use logpose_storage_etcd::EtcdCatalogStore;
+use logpose_storage_etcd::{EtcdCatalogStore, EtcdCoordinationClient};
 use logpose_types::{
-    DistanceMetric, EtcdMetadataConfig, MetadataBackend, MetadataConfig, PutRecord, RecordId,
-    WriteOperation,
+    DistanceMetric, EtcdMetadataConfig, MetadataBackend, MetadataConfig, NodeRole, PutRecord,
+    RecordId, WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -22,8 +22,9 @@ use std::{
     fs,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::time::{Instant, sleep};
 
 #[tokio::test]
 async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
@@ -105,7 +106,7 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(placement.collection_id, descriptor.collection_id);
     assert_eq!(placement.assigned_node, "node-a");
     assert_eq!(placement.route_kind, "recorded");
-    assert!(runtime.control_plane_ready);
+    assert!(!runtime.control_plane_ready);
     assert!(runtime.data_plane_ready);
     assert_eq!(runtime.collections.len(), 1);
     assert_eq!(runtime.collections[0].collection_name, "documents");
@@ -411,6 +412,263 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
+#[tokio::test]
+async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("runtime-status-coordination");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-runtime-status";
+
+    let mut combined_config = test_config(
+        "coordinator-a",
+        unique_temp_dir("etcd-runtime-status-coordinator"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    combined_config.node_role = NodeRole::Combined;
+    let combined = Arc::new(AppState::new(combined_config));
+
+    let mut data_config = test_config(
+        "data-b",
+        unique_temp_dir("etcd-runtime-status-data"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    data_config.node_role = NodeRole::Data;
+    let data = Arc::new(AppState::new(data_config));
+
+    let combined_status = wait_for_runtime_status(&combined, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("coordinator-a")
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "coordinator-a")
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "data-b")
+        })
+    })
+    .await;
+    let data_status = wait_for_runtime_status(&data, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("coordinator-a")
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "coordinator-a")
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "data-b")
+        })
+    })
+    .await;
+
+    assert!(combined_status.control_plane_ready);
+    assert!(combined_status.data_plane_ready);
+    assert!(data_status.data_plane_ready);
+    assert!(!data_status.control_plane_ready);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_membership_leases_expire_after_state_drop() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("membership-expiry-after-drop");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-membership-expiry";
+
+    let mut config = test_config(
+        "coordinator-a",
+        unique_temp_dir("etcd-membership-expiry"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    config.node_role = NodeRole::Combined;
+    config.metadata.etcd.membership_ttl_secs = 2;
+    config.metadata.etcd.leadership_ttl_secs = 2;
+    let state = Arc::new(AppState::new(config.clone()));
+
+    wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered && coordination.is_local_leader
+        })
+    })
+    .await;
+
+    drop(state);
+
+    let coordination = EtcdCoordinationClient::new(config.metadata.etcd.clone())
+        .expect("coordination client should build");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let members = coordination
+            .list_membership()
+            .await
+            .expect("membership list should stay readable");
+        let leader = coordination
+            .current_leader()
+            .await
+            .expect("leader lookup should stay readable");
+        if members.is_empty() && leader.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for membership and leadership lease expiry after state drop: members={members:?} leader={leader:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_follower_nodes_reject_control_plane_mutations() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("follower-control-plane-gate");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-leader-gate";
+    let bootstrap_tokens = vec![BootstrapTokenConfig {
+        token: "operator-token".to_owned(),
+        principal: Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Operator,
+        ),
+    }];
+
+    let mut leader_config = test_config_with_auth(
+        "leader-a",
+        unique_temp_dir("etcd-leader-gate-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens.clone(),
+    );
+    leader_config.node_role = NodeRole::Combined;
+    let leader = Arc::new(AppState::new(leader_config));
+    wait_for_runtime_status(&leader, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+
+    let mut follower_config = test_config_with_auth(
+        "follower-b",
+        unique_temp_dir("etcd-leader-gate-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    let follower = Arc::new(AppState::new(follower_config));
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("leader-a")
+        })
+    })
+    .await;
+    let follower_status = follower
+        .control
+        .runtime_status()
+        .await
+        .expect("follower runtime status should load");
+
+    let collection_error = follower
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect_err("follower should reject direct control-plane collection mutations");
+    let database_error = follower
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("analytics"),
+        )
+        .await
+        .expect_err("follower should reject shared database mutations");
+
+    assert!(matches!(
+        collection_error,
+        ServiceError::InvalidArgument(message)
+            if message.contains("not the active control-plane leader")
+    ));
+    assert!(!follower_status.control_plane_ready);
+    assert!(follower_status.data_plane_ready);
+    assert!(matches!(
+        database_error,
+        ServiceError::InvalidArgument(message)
+            if message.contains("not the active control-plane leader")
+    ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachable() {
+    let root = unique_temp_dir("etcd-runtime-status-error");
+    let mut config = LogPoseConfig {
+        node_name: "unreachable-node".to_owned(),
+        storage_root: root,
+        metadata: MetadataConfig {
+            backend: MetadataBackend::Etcd,
+            etcd: EtcdMetadataConfig {
+                endpoints: vec!["http://127.0.0.1:1".to_owned()],
+                key_prefix: unique_etcd_prefix("runtime-status-error"),
+                timeout_ms: 50,
+                membership_ttl_secs: 2,
+                leadership_ttl_secs: 2,
+                cluster_name: "core-etcd-runtime-status-error".to_owned(),
+            },
+        },
+        ..LogPoseConfig::default()
+    };
+    config.node_role = NodeRole::Combined;
+    let state = Arc::new(AppState::new(config));
+
+    let status = wait_for_runtime_status(&state, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.last_error.is_some())
+    })
+    .await;
+    let coordination = status
+        .coordination
+        .expect("coordination state should be present for etcd backend");
+
+    assert!(!status.control_plane_ready);
+    assert!(!status.data_plane_ready);
+    assert!(!coordination.membership_registered);
+    assert!(coordination.registered_members.is_empty());
+    assert!(coordination.leader_node.is_none());
+    assert!(
+        coordination
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("etcd metadata operation failed"))
+    );
+}
+
 fn test_config(
     node_name: &str,
     storage_root: PathBuf,
@@ -462,6 +720,28 @@ fn test_etcd_endpoints() -> Vec<String> {
         })
         .filter(|endpoints| !endpoints.is_empty())
         .unwrap_or_else(|| vec!["http://127.0.0.1:2379".to_owned()])
+}
+
+async fn wait_for_runtime_status(
+    state: &AppState,
+    ready: impl Fn(&logpose_types::NodeRuntimeStatus) -> bool,
+) -> logpose_types::NodeRuntimeStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = state
+            .control
+            .runtime_status()
+            .await
+            .expect("runtime status should be readable");
+        if ready(&status) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for coordination-ready runtime status: {status:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn cleanup_prefix(endpoints: &[String], key_prefix: &str) {

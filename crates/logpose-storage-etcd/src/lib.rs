@@ -1056,6 +1056,14 @@ impl EtcdCoordinationClient {
         Ok(())
     }
 
+    /// Revoke one lease and remove any local keep-alive session.
+    pub async fn revoke_lease(&self, lease_id: i64) -> Result<()> {
+        self.lease_sessions.lock().await.remove(&lease_id);
+        let mut client = self.store.client().await?;
+        client.lease_revoke(lease_id).await.map_err(etcd_message)?;
+        Ok(())
+    }
+
     /// Try to acquire controller leadership using lease-backed CAS.
     pub async fn try_acquire_leadership(&self, node_id: &str) -> Result<Option<LeadershipLease>> {
         let leadership_key = format!(

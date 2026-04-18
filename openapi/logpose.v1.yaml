@@ -824,6 +824,38 @@ components:
           type: integer
         collections_with_errors:
           type: integer
+    CoordinationStatus:
+      type: object
+      required:
+        - cluster_name
+        - membership_registered
+        - registered_members
+        - is_local_leader
+      properties:
+        cluster_name:
+          type: string
+        membership_registered:
+          type: boolean
+        membership_lease_id:
+          type: integer
+          format: int64
+          nullable: true
+        registered_members:
+          type: array
+          items:
+            type: string
+        leader_node:
+          type: string
+          nullable: true
+        is_local_leader:
+          type: boolean
+        leadership_lease_id:
+          type: integer
+          format: int64
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
     NodeRuntimeStatus:
       type: object
       required:
@@ -863,6 +895,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CollectionPlacement"
+        coordination:
+          allOf:
+            - $ref: "#/components/schemas/CoordinationStatus"
+          nullable: true
         maintenance:
           $ref: "#/components/schemas/MaintenanceBacklog"
     CreateCollectionRequest:

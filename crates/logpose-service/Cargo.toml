@@ -14,8 +14,10 @@ logpose-catalog = { path = "../logpose-catalog" }
 logpose-config = { path = "../logpose-config" }
 logpose-query = { path = "../logpose-query" }
 logpose-storage = { path = "../logpose-storage" }
+logpose-storage-etcd = { path = "../logpose-storage-etcd" }
 logpose-types = { path = "../logpose-types" }
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -2,12 +2,12 @@
 
 use logpose_api_grpc::proto::{
     self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
-    CreateCollectionRequest as ProtoCreateCollectionRequest, FlushCollectionRequest,
-    GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
-    GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataRequest, GetRuntimeStatusRequest,
-    InspectCollectionRequest, ListDatabasesRequest, MaintenanceBacklogReply,
-    PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest, ScalarValue,
-    WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
+    CoordinationStatusReply, CreateCollectionRequest as ProtoCreateCollectionRequest,
+    FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
+    GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataRequest,
+    GetRuntimeStatusRequest, InspectCollectionRequest, ListDatabasesRequest,
+    MaintenanceBacklogReply, PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest,
+    ScalarValue, WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
 };
 use logpose_auth::{AuthenticationMode, DatabaseRole};
 pub use logpose_auth::{DatabaseAccessPolicy, DatabaseRoleBinding};
@@ -24,9 +24,9 @@ use logpose_query::{
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
     CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
-    DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog, MaintenanceStatus,
-    NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId, RemoteBlobConfig,
-    ScalarFieldStats, Snapshot, WriteOperation,
+    CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog,
+    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
+    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -733,9 +733,26 @@ fn runtime_status_from_proto(reply: proto::GetRuntimeStatusReply) -> Result<Node
             .into_iter()
             .map(collection_placement_from_proto)
             .collect::<Result<Vec<_>>>()?,
+        coordination: reply
+            .coordination
+            .map(coordination_status_from_proto)
+            .transpose()?,
         maintenance: maintenance_backlog_from_proto(reply.maintenance.ok_or_else(|| {
             ClientError::InvalidResponse("runtime status missing maintenance".to_owned())
         })?),
+    })
+}
+
+fn coordination_status_from_proto(reply: CoordinationStatusReply) -> Result<CoordinationStatus> {
+    Ok(CoordinationStatus {
+        cluster_name: reply.cluster_name,
+        membership_registered: reply.membership_registered,
+        membership_lease_id: reply.membership_lease_id,
+        registered_members: reply.registered_members,
+        leader_node: reply.leader_node,
+        is_local_leader: reply.is_local_leader,
+        leadership_lease_id: reply.leadership_lease_id,
+        last_error: reply.last_error,
     })
 }
 
@@ -1282,5 +1299,57 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn runtime_status_from_proto_reads_coordination_fields() {
+        let status = runtime_status_from_proto(proto::GetRuntimeStatusReply {
+            metadata: Some(proto::GetMetadataReply {
+                product: "LogPose".to_owned(),
+                node_name: "client-node".to_owned(),
+                version: "test".to_owned(),
+                git_sha: "sha".to_owned(),
+                profile: "debug".to_owned(),
+            }),
+            role: proto::NodeRole::Combined as i32,
+            rest_endpoint: "http://127.0.0.1:8080".to_owned(),
+            grpc_endpoint: "http://127.0.0.1:50051".to_owned(),
+            storage_engine: "local+etcd-metadata".to_owned(),
+            control_plane_ready: true,
+            data_plane_ready: true,
+            collection_count: 0,
+            collections: Vec::new(),
+            coordination: Some(proto::CoordinationStatusReply {
+                cluster_name: "prod-cluster".to_owned(),
+                membership_registered: true,
+                membership_lease_id: Some(17),
+                registered_members: vec!["client-node".to_owned(), "client-peer".to_owned()],
+                leader_node: Some("client-node".to_owned()),
+                is_local_leader: true,
+                leadership_lease_id: Some(23),
+                last_error: Some("warn".to_owned()),
+            }),
+            maintenance: Some(proto::MaintenanceBacklogReply {
+                collections_with_pending: 0,
+                pending_operations: 0,
+                collections_in_progress: 0,
+                collections_with_errors: 0,
+            }),
+        })
+        .expect("runtime status should decode");
+
+        let coordination = status
+            .coordination
+            .expect("coordination should be populated");
+        assert_eq!(coordination.cluster_name, "prod-cluster");
+        assert_eq!(coordination.membership_lease_id, Some(17));
+        assert_eq!(coordination.leadership_lease_id, Some(23));
+        assert_eq!(coordination.leader_node.as_deref(), Some("client-node"));
+        assert_eq!(
+            coordination.registered_members,
+            vec!["client-node".to_owned(), "client-peer".to_owned()]
+        );
+        assert!(coordination.is_local_leader);
+        assert_eq!(coordination.last_error.as_deref(), Some("warn"));
     }
 }

@@ -184,6 +184,45 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
         ),
     ];
 
+    if let Some(coordination) = &status.coordination {
+        lines.push(format!("Cluster: {}", coordination.cluster_name));
+        lines.push(format!(
+            "Membership Registered: {}",
+            yes_no(coordination.membership_registered)
+        ));
+        if let Some(lease_id) = coordination.membership_lease_id {
+            lines.push(format!("Membership Lease: {lease_id}"));
+        }
+        lines.push(format!(
+            "Leader: {}",
+            coordination
+                .leader_node
+                .as_deref()
+                .map(|leader| {
+                    if coordination.is_local_leader {
+                        format!("{leader} (local leader)")
+                    } else {
+                        leader.to_owned()
+                    }
+                })
+                .unwrap_or_else(|| "none".to_owned())
+        ));
+        if let Some(lease_id) = coordination.leadership_lease_id {
+            lines.push(format!("Leadership Lease: {lease_id}"));
+        }
+        lines.push(format!(
+            "Members: {}",
+            if coordination.registered_members.is_empty() {
+                "none".to_owned()
+            } else {
+                coordination.registered_members.join(", ")
+            }
+        ));
+        if let Some(error) = &coordination.last_error {
+            lines.push(format!("Coordination Error: {error}"));
+        }
+    }
+
     if !status.collections.is_empty() {
         lines.push("Placements:".to_owned());
         for placement in status.collections.iter().take(5) {
@@ -471,5 +510,46 @@ mod tests {
 
         assert!(output.contains("\"token\": \"<redacted>\""));
         assert!(!output.contains("super-secret"));
+    }
+
+    #[test]
+    fn status_render_includes_coordination_summary_when_present() {
+        let output = ActionOutput::Status(NodeRuntimeStatus {
+            metadata: logpose_types::NodeMetadata {
+                product: "LogPose".to_owned(),
+                node_name: "node-a".to_owned(),
+                version: "test".to_owned(),
+                git_sha: "sha".to_owned(),
+                profile: "debug".to_owned(),
+            },
+            role: logpose_types::NodeRole::Combined,
+            rest_endpoint: "http://127.0.0.1:8080".to_owned(),
+            grpc_endpoint: "http://127.0.0.1:50051".to_owned(),
+            storage_engine: "local+etcd-metadata".to_owned(),
+            control_plane_ready: true,
+            data_plane_ready: true,
+            collection_count: 0,
+            collections: Vec::new(),
+            coordination: Some(logpose_types::CoordinationStatus {
+                cluster_name: "prod-cluster".to_owned(),
+                membership_registered: true,
+                membership_lease_id: Some(17),
+                registered_members: vec!["node-a".to_owned(), "node-b".to_owned()],
+                leader_node: Some("node-a".to_owned()),
+                is_local_leader: true,
+                leadership_lease_id: Some(23),
+                last_error: None,
+            }),
+            maintenance: logpose_types::MaintenanceBacklog::default(),
+        })
+        .human_text()
+        .expect("status should render");
+
+        assert!(output.contains("Cluster: prod-cluster"));
+        assert!(output.contains("Membership Registered: yes"));
+        assert!(output.contains("Membership Lease: 17"));
+        assert!(output.contains("Leader: node-a (local leader)"));
+        assert!(output.contains("Leadership Lease: 23"));
+        assert!(output.contains("Members: node-a, node-b"));
     }
 }

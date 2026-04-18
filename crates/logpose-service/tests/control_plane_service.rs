@@ -16,6 +16,7 @@ use logpose_service as _;
 use logpose_storage::{
     CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine as _,
 };
+use logpose_storage_etcd as _;
 use logpose_types::{
     CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
 };
