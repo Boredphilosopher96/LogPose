@@ -201,6 +201,35 @@ impl CollectionRef {
         Self::new(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
     }
 
+    /// Resolve a user-facing lookup key into a collection reference.
+    #[must_use]
+    pub fn from_lookup_key(value: &str) -> Self {
+        let parts = value.split('/').collect::<Vec<_>>();
+        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+            Self::new(parts[0], parts[1], parts[2])
+        } else {
+            Self::new_default(value)
+        }
+    }
+
+    /// Parse a strict collection reference accepted by service/query APIs.
+    pub fn parse_reference(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        let reference = match trimmed.split('/').collect::<Vec<_>>().as_slice() {
+            [collection_name] => Self::new_default(*collection_name),
+            [tenant_name, database_name, collection_name] => {
+                Self::new(*tenant_name, *database_name, *collection_name)
+            }
+            _ => {
+                return Err(LogPoseError::Message(format!(
+                    "unsupported collection reference '{value}': expected 'collection' or 'tenant/database/collection'"
+                )));
+            }
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
     /// Build the canonical tenant/database/collection lookup key.
     #[must_use]
     pub fn lookup_name(&self) -> String {
@@ -733,6 +762,38 @@ fn default_database_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_ref_from_lookup_key_uses_default_namespace_for_bare_names() {
+        let reference = CollectionRef::from_lookup_key("documents");
+
+        assert_eq!(reference, CollectionRef::new_default("documents"));
+    }
+
+    #[test]
+    fn collection_ref_parse_reference_accepts_bare_and_qualified_names() {
+        assert_eq!(
+            CollectionRef::parse_reference("documents").expect("bare collection should parse"),
+            CollectionRef::new_default("documents")
+        );
+        assert_eq!(
+            CollectionRef::parse_reference("acme/analytics/documents")
+                .expect("qualified collection should parse"),
+            CollectionRef::new("acme", "analytics", "documents")
+        );
+    }
+
+    #[test]
+    fn collection_ref_parse_reference_rejects_invalid_component_count() {
+        let error = CollectionRef::parse_reference("analytics/documents")
+            .expect_err("two-part references should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported collection reference")
+        );
+    }
 
     #[test]
     fn collection_ref_rejects_reserved_namespace_separator() {

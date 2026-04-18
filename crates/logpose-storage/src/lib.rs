@@ -894,12 +894,7 @@ impl LocalStorageEngine {
     }
 
     fn collection_ref_from_lookup(name: &str) -> CollectionRef {
-        let parts = name.split('/').collect::<Vec<_>>();
-        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-            CollectionRef::new(parts[0], parts[1], parts[2])
-        } else {
-            CollectionRef::new_default(name)
-        }
+        CollectionRef::from_lookup_key(name)
     }
 
     fn collection_stats_from_state(

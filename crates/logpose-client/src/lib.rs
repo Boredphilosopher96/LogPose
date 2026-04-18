@@ -20,10 +20,9 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
-    DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog,
-    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
-    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck, DistanceMetric,
+    LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
+    QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -590,20 +589,12 @@ fn parse_collection_id(value: &str) -> Result<CollectionId> {
 }
 
 fn split_collection_lookup_key(value: &str) -> (String, String, String) {
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-        (
-            parts[0].to_owned(),
-            parts[1].to_owned(),
-            parts[2].to_owned(),
-        )
-    } else {
-        (
-            DEFAULT_TENANT_NAME.to_owned(),
-            DEFAULT_DATABASE_NAME.to_owned(),
-            value.to_owned(),
-        )
-    }
+    let reference = CollectionRef::from_lookup_key(value);
+    (
+        reference.tenant_name,
+        reference.database_name,
+        reference.collection_name,
+    )
 }
 
 fn scoped_collection_response<T>(

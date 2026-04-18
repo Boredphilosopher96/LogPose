@@ -247,17 +247,9 @@ struct CreateCollectionBody {
 
 #[derive(Debug, Deserialize)]
 struct NamespaceQuery {
-    #[serde(
-        default = "default_tenant_name",
-        alias = "tenant_name",
-        rename = "tenant"
-    )]
+    #[serde(default = "default_tenant_name", alias = "tenant_name")]
     tenant: String,
-    #[serde(
-        default = "default_database_name",
-        alias = "database_name",
-        rename = "database"
-    )]
+    #[serde(default = "default_database_name", alias = "database_name")]
     database: String,
 }
 
@@ -328,17 +320,9 @@ fn default_namespace_if_blank(value: String, default: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 struct InspectCollectionParams {
-    #[serde(
-        default = "default_tenant_name",
-        alias = "tenant_name",
-        rename = "tenant"
-    )]
+    #[serde(default = "default_tenant_name", alias = "tenant_name")]
     tenant: String,
-    #[serde(
-        default = "default_database_name",
-        alias = "database_name",
-        rename = "database"
-    )]
+    #[serde(default = "default_database_name", alias = "database_name")]
     database: String,
     target: Option<String>,
     segment_id: Option<String>,
