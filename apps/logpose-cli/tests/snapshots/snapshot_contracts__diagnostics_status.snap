@@ -1,11 +1,13 @@
 ---
 source: apps/logpose-cli/tests/snapshot_contracts.rs
+assertion_line: 31
 expression: status
 ---
 {
   "collection_count": 0,
   "collections": [],
   "control_plane_ready": true,
+  "coordination": null,
   "data_plane_ready": true,
   "grpc_endpoint": "http://127.0.0.1:[grpc-port]",
   "maintenance": {

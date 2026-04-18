@@ -34,13 +34,26 @@ use logpose_query::{QueryError, QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
+use logpose_storage_etcd::{EtcdCoordinationClient, LeadershipLease};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
-    CollectionStats, CommitAck, LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeRole,
-    NodeRuntimeStatus, Snapshot, WriteOperation,
+    CollectionStats, CommitAck, CoordinationStatus, LogPoseError, MaintenanceBacklog,
+    MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus, Snapshot, WriteOperation,
 };
-use std::{fmt, net::IpAddr, path::Path, sync::Arc};
+use std::{
+    fmt,
+    net::IpAddr,
+    path::Path,
+    sync::{
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use thiserror::Error;
+use tokio::{
+    runtime::Handle,
+    time::{Duration, Instant, interval, sleep},
+};
 
 /// Service-local result type.
 pub type Result<T> = std::result::Result<T, ServiceError>;
@@ -66,6 +79,209 @@ pub enum ServiceError {
     /// The system failed while processing the request.
     #[error("{0}")]
     Internal(String),
+}
+
+#[derive(Clone)]
+enum CoordinationRuntime {
+    Local,
+    Etcd(Arc<EtcdRuntime>),
+}
+
+#[derive(Debug)]
+struct EtcdRuntime {
+    snapshot: Arc<RwLock<CoordinationStatus>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for EtcdRuntime {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+impl CoordinationRuntime {
+    fn new(config: &LogPoseConfig) -> Self {
+        if config.metadata.backend != MetadataBackend::Etcd {
+            return Self::Local;
+        }
+
+        let snapshot = Arc::new(RwLock::new(CoordinationStatus {
+            cluster_name: config.metadata.etcd.cluster_name.clone(),
+            membership_registered: false,
+            membership_lease_id: None,
+            registered_members: Vec::new(),
+            leader_node: None,
+            is_local_leader: false,
+            leadership_lease_id: None,
+            last_error: None,
+        }));
+        let runtime = Arc::new(EtcdRuntime {
+            snapshot: Arc::clone(&snapshot),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        });
+        let client = EtcdCoordinationClient::new(config.metadata.etcd.clone())
+            .expect("invalid etcd coordination configuration");
+        let node_name = config.node_name.clone();
+        let node_role = config.node_role;
+        let tick = coordination_tick(&config.metadata.etcd);
+        let shutdown = Arc::clone(&runtime.shutdown);
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    run_coordination_loop(client, snapshot, shutdown, node_name, node_role, tick)
+                        .await;
+                });
+            }
+            Err(error) => {
+                coordination_write(&snapshot).last_error = Some(format!(
+                    "etcd coordination loop did not start because no tokio runtime was available: {error}"
+                ));
+            }
+        }
+        Self::Etcd(runtime)
+    }
+
+    async fn snapshot(&self) -> Option<CoordinationStatus> {
+        match self {
+            Self::Local => None,
+            Self::Etcd(runtime) => Some(coordination_read(&runtime.snapshot).clone()),
+        }
+    }
+}
+
+fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
+    let ttl_secs = config
+        .membership_ttl_secs
+        .min(config.leadership_ttl_secs)
+        .max(1) as u64;
+    Duration::from_secs((ttl_secs / 3).max(1))
+}
+
+async fn run_coordination_loop(
+    client: EtcdCoordinationClient,
+    snapshot: Arc<RwLock<CoordinationStatus>>,
+    shutdown: Arc<AtomicBool>,
+    node_name: String,
+    node_role: NodeRole,
+    tick: Duration,
+) {
+    let mut membership_lease_id = None;
+    let mut leadership_lease: Option<LeadershipLease> = None;
+    let mut ticker = interval(tick);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        ticker.tick().await;
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        if let Some(lease_id) = membership_lease_id
+            && let Err(error) = client.keep_alive(lease_id).await
+        {
+            membership_lease_id = None;
+            leadership_lease = None;
+            record_coordination_error(&snapshot, error.to_string()).await;
+        }
+
+        if membership_lease_id.is_none() {
+            match client.register_membership(&node_name).await {
+                Ok(lease) => {
+                    membership_lease_id = Some(lease.lease_id);
+                    clear_coordination_error(&snapshot).await;
+                }
+                Err(error) => {
+                    record_coordination_error(&snapshot, error.to_string()).await;
+                    continue;
+                }
+            }
+        }
+
+        if let Some(lease) = &leadership_lease
+            && let Err(error) = client.keep_alive(lease.lease_id).await
+        {
+            leadership_lease = None;
+            record_coordination_error(&snapshot, error.to_string()).await;
+        }
+
+        if leadership_lease.is_none() && matches!(node_role, NodeRole::Combined | NodeRole::Control)
+        {
+            match client.try_acquire_leadership(&node_name).await {
+                Ok(lease) => {
+                    leadership_lease = lease;
+                    clear_coordination_error(&snapshot).await;
+                }
+                Err(error) => record_coordination_error(&snapshot, error.to_string()).await,
+            }
+        }
+
+        let members = client.list_membership().await;
+        let leader = client.current_leader().await;
+        let mut current = coordination_write(&snapshot);
+        current.membership_registered = membership_lease_id.is_some();
+        current.membership_lease_id = membership_lease_id;
+        if let Ok(member_records) = &members {
+            current.registered_members = member_records
+                .iter()
+                .map(|member| member.node_id.clone())
+                .collect();
+            current.registered_members.sort();
+        }
+        if let Ok(leader_record) = &leader {
+            current.leader_node = leader_record.as_ref().map(|record| record.node_id.clone());
+        }
+        current.is_local_leader = current.leader_node.as_deref() == Some(node_name.as_str())
+            && leadership_lease.is_some();
+        current.leadership_lease_id = leadership_lease.as_ref().map(|lease| lease.lease_id);
+        current.last_error = match (members, leader) {
+            (Err(members_error), Err(leader_error)) => {
+                Some(format!("{members_error}; {leader_error}"))
+            }
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Some(error.to_string()),
+            (Ok(_), Ok(_)) => None,
+        };
+    }
+
+    if let Some(lease) = leadership_lease.take() {
+        let _ = client.revoke_lease(lease.lease_id).await;
+    }
+    if let Some(lease_id) = membership_lease_id.take() {
+        let _ = client.revoke_lease(lease_id).await;
+    }
+}
+
+async fn record_coordination_error(snapshot: &RwLock<CoordinationStatus>, error: String) {
+    let mut current = coordination_write(snapshot);
+    current.last_error = Some(error);
+    current.membership_registered = false;
+    current.membership_lease_id = None;
+    current.registered_members.clear();
+    current.leader_node = None;
+    current.is_local_leader = false;
+    current.leadership_lease_id = None;
+}
+
+async fn clear_coordination_error(snapshot: &RwLock<CoordinationStatus>) {
+    coordination_write(snapshot).last_error = None;
+}
+
+fn coordination_read(
+    snapshot: &RwLock<CoordinationStatus>,
+) -> RwLockReadGuard<'_, CoordinationStatus> {
+    match snapshot.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn coordination_write(
+    snapshot: &RwLock<CoordinationStatus>,
+) -> RwLockWriteGuard<'_, CoordinationStatus> {
+    match snapshot.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Shared application orchestration over the current storage and query layers.
@@ -322,6 +538,7 @@ pub struct LogPoseControlService {
     catalog: Arc<dyn CatalogStore>,
     config: LogPoseConfig,
     build: BuildInfo,
+    coordination: CoordinationRuntime,
 }
 
 impl fmt::Debug for LogPoseControlService {
@@ -332,6 +549,13 @@ impl fmt::Debug for LogPoseControlService {
             .field("catalog_store", &"<dyn CatalogStore>")
             .field("node_name", &self.config.node_name)
             .field("node_role", &self.config.node_role)
+            .field(
+                "coordination_backend",
+                &match &self.coordination {
+                    CoordinationRuntime::Local => "local",
+                    CoordinationRuntime::Etcd(_) => "etcd",
+                },
+            )
             .finish()
     }
 }
@@ -345,11 +569,13 @@ impl LogPoseControlService {
         config: LogPoseConfig,
         build: BuildInfo,
     ) -> Self {
+        let coordination = CoordinationRuntime::new(&config);
         Self {
             data,
             catalog,
             config,
             build,
+            coordination,
         }
     }
 
@@ -373,6 +599,7 @@ impl LogPoseControlService {
             }
             NodeRole::Combined => {}
         }
+        self.require_local_control_plane_leader().await?;
         self.data
             .create_collection_with_assignment(request, self.initial_assignment())
             .await
@@ -392,6 +619,7 @@ impl LogPoseControlService {
             }
             NodeRole::Control | NodeRole::Combined => {}
         }
+        self.require_local_control_plane_leader().await?;
         self.catalog
             .put_database_access_policy(policy)
             .map_err(Into::into)
@@ -407,6 +635,7 @@ impl LogPoseControlService {
             }
             NodeRole::Control | NodeRole::Combined => {}
         }
+        self.require_local_control_plane_leader().await?;
         self.catalog.put_database(descriptor).map_err(Into::into)
     }
 
@@ -451,6 +680,7 @@ impl LogPoseControlService {
     /// Return aggregated runtime and maintenance status for the local node.
     pub async fn runtime_status(&self) -> Result<NodeRuntimeStatus> {
         let metadata_ready = self.data.metadata_status().await.is_ok();
+        let coordination = self.coordination.snapshot().await;
         let descriptors = if metadata_ready {
             self.data.list_collections().await?
         } else {
@@ -491,6 +721,18 @@ impl LogPoseControlService {
             }
         }
 
+        let control_coordination_ready = coordination.as_ref().is_none_or(|status| {
+            status.membership_registered
+                && status.last_error.is_none()
+                && (!matches!(
+                    self.config.node_role,
+                    NodeRole::Combined | NodeRole::Control
+                ) || status.is_local_leader)
+        });
+        let data_coordination_ready = coordination
+            .as_ref()
+            .is_none_or(|status| status.membership_registered && status.last_error.is_none());
+
         Ok(NodeRuntimeStatus {
             metadata: logpose_types::NodeMetadata::new(self.config.node_name.clone(), &self.build),
             role: self.config.node_role,
@@ -501,14 +743,17 @@ impl LogPoseControlService {
                 && matches!(
                     self.config.node_role,
                     NodeRole::Combined | NodeRole::Control
-                ),
+                )
+                && control_coordination_ready,
             data_plane_ready: metadata_ready
-                && matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data),
+                && matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data)
+                && data_coordination_ready,
             collection_count: placements
                 .iter()
                 .filter(|placement| placement.route_kind == "local")
                 .count(),
             collections: placements,
+            coordination,
             maintenance,
         })
     }
@@ -527,6 +772,11 @@ impl LogPoseControlService {
             }
         }
         Ok(())
+    }
+
+    /// Return the current distributed coordination status when one exists.
+    pub async fn coordination_status(&self) -> Option<CoordinationStatus> {
+        self.coordination.snapshot().await
     }
 
     fn local_placement(
@@ -657,6 +907,35 @@ impl LogPoseControlService {
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
         self.data.collection_assignment_descriptor(descriptor).await
+    }
+
+    /// Require this runtime to hold the active etcd-backed control-plane leadership.
+    pub async fn require_local_control_plane_leader(&self) -> Result<()> {
+        if !matches!(
+            self.config.node_role,
+            NodeRole::Combined | NodeRole::Control
+        ) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let Some(coordination) = self.coordination.snapshot().await else {
+                return Ok(());
+            };
+            if coordination.is_local_leader {
+                return Ok(());
+            }
+            if coordination.leader_node.is_some() || Instant::now() >= deadline {
+                let leader = coordination
+                    .leader_node
+                    .unwrap_or_else(|| "none".to_owned());
+                return Err(ServiceError::InvalidArgument(format!(
+                    "node '{}' is not the active control-plane leader; current leader is '{}'",
+                    self.config.node_name, leader
+                )));
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
     }
 }
 

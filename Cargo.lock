@@ -1440,6 +1440,7 @@ dependencies = [
  "logpose-core",
  "logpose-query",
  "logpose-storage",
+ "logpose-storage-etcd",
  "logpose-types",
  "rand 0.10.1",
  "serde",

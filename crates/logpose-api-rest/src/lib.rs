@@ -1241,11 +1241,55 @@ mod tests {
         assert_eq!(body["collections"][0]["database_name"], "default");
         assert_eq!(body["collections"][0]["assigned_role"], "data");
         assert_eq!(body["collections"][0]["route_kind"], "local");
+        assert!(body["coordination"].is_null());
         assert!(
             body["collections"][0]["route_reason"]
                 .as_str()
                 .is_some_and(|reason| reason.contains("single-node"))
         );
+    }
+
+    #[test]
+    fn runtime_status_serializes_coordination_fields_when_present() {
+        let payload = serde_json::to_value(logpose_types::NodeRuntimeStatus {
+            metadata: logpose_types::NodeMetadata {
+                product: "LogPose".to_owned(),
+                node_name: "rest-node".to_owned(),
+                version: "test".to_owned(),
+                git_sha: "sha".to_owned(),
+                profile: "debug".to_owned(),
+            },
+            role: logpose_types::NodeRole::Combined,
+            rest_endpoint: "http://127.0.0.1:8080".to_owned(),
+            grpc_endpoint: "http://127.0.0.1:50051".to_owned(),
+            storage_engine: "local+etcd-metadata".to_owned(),
+            control_plane_ready: true,
+            data_plane_ready: true,
+            collection_count: 0,
+            collections: Vec::new(),
+            coordination: Some(logpose_types::CoordinationStatus {
+                cluster_name: "prod-cluster".to_owned(),
+                membership_registered: true,
+                membership_lease_id: Some(17),
+                registered_members: vec!["rest-node".to_owned(), "rest-peer".to_owned()],
+                leader_node: Some("rest-node".to_owned()),
+                is_local_leader: true,
+                leadership_lease_id: Some(23),
+                last_error: Some("warn".to_owned()),
+            }),
+            maintenance: logpose_types::MaintenanceBacklog::default(),
+        })
+        .expect("runtime status should serialize");
+
+        assert_eq!(payload["coordination"]["cluster_name"], "prod-cluster");
+        assert_eq!(payload["coordination"]["membership_lease_id"], 17);
+        assert_eq!(payload["coordination"]["leadership_lease_id"], 23);
+        assert_eq!(payload["coordination"]["leader_node"], "rest-node");
+        assert_eq!(
+            payload["coordination"]["registered_members"],
+            serde_json::json!(["rest-node", "rest-peer"])
+        );
+        assert_eq!(payload["coordination"]["last_error"], "warn");
     }
 
     #[tokio::test]

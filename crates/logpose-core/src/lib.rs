@@ -572,6 +572,7 @@ impl AppState {
         descriptor: DatabaseDescriptor,
     ) -> ServiceResult<DatabaseDescriptor> {
         self.require_control_plane_database_mutation()?;
+        self.control.require_local_control_plane_leader().await?;
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.put_database(descriptor).await,
             SharedCatalog::Etcd(catalog) => {
@@ -602,6 +603,7 @@ impl AppState {
         policy: logpose_auth::DatabaseAccessPolicy,
     ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
         self.require_control_plane_database_mutation()?;
+        self.control.require_local_control_plane_leader().await?;
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.set_database_access_policy(policy).await,
             SharedCatalog::Etcd(catalog) => catalog

@@ -19,6 +19,7 @@ use logpose_query::{
 };
 use logpose_service::{LogPoseDataService, ServiceError};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
+use logpose_storage_etcd as _;
 use logpose_types::{DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
 use rand as _;
 use serde as _;
