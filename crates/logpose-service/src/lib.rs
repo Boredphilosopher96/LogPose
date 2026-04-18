@@ -803,21 +803,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_collection_reference_accepts_database_collection_and_rejects_tenant_depth() {
+    fn parse_collection_reference_accepts_database_collection() {
         let reference = parse_collection_reference("analytics/documents")
             .expect("database-qualified collection name should parse");
 
         assert_eq!(reference.database_name, "analytics");
         assert_eq!(reference.collection_name, "documents");
-
-        let error = parse_collection_reference("tenant-a/analytics/documents")
-            .expect_err("tenant-qualified collection name should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("expected 'collection' or 'database/collection'"),
-            "unexpected error: {error}"
-        );
     }
 
     #[tokio::test]

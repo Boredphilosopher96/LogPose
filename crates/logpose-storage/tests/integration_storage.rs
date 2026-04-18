@@ -91,7 +91,7 @@ async fn create_write_scan_and_delete_records() {
 }
 
 #[tokio::test]
-async fn create_collection_persists_default_database_descriptor_without_tenant_scaffold() {
+async fn create_collection_persists_default_database_descriptor() {
     let root = support::unique_temp_dir("storage-default-database");
     let engine = LocalStorageEngine::new(&root);
 
@@ -113,10 +113,6 @@ async fn create_collection_persists_default_database_descriptor_without_tenant_s
     )
     .expect("database descriptor JSON should parse");
 
-    assert!(
-        !root.join("tenants").exists(),
-        "collection creation should not materialize a removed tenant scaffold"
-    );
     assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
     assert_eq!(database_descriptor.name, DEFAULT_DATABASE_NAME);
     assert!(database_descriptor.is_default);

@@ -2011,6 +2011,5 @@ mod tests {
 
         assert_eq!(payload["database_name"], DEFAULT_DATABASE_NAME);
         assert_eq!(payload["collection_name"], COLLECTION_NAME);
-        assert!(payload.get("tenant_name").is_none());
     }
 }

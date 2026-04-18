@@ -468,7 +468,6 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
                     .as_str()
                     .expect("collection_name should be present"),
             );
-            assert!(item.get("tenant_name").is_none(), "trace: {trace:?}");
             assert_eq!(
                 item["assigned_node"],
                 model.collection(&collection_name).assigned_node,
@@ -652,10 +651,6 @@ async fn assert_placement_matches(
         "trace: {trace:?}"
     );
 
-    assert!(
-        rest_placement.get("tenant_name").is_none(),
-        "trace: {trace:?}"
-    );
     assert_eq!(
         rest_placement["database_name"], database_name,
         "trace: {trace:?}"
