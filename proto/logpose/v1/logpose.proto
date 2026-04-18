@@ -5,6 +5,9 @@ package logpose.v1;
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
   rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
+  rpc PutDatabase(PutDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc GetDatabase(GetDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
@@ -14,6 +17,8 @@ service LogPoseService {
   rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
   rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
   rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
+  rpc PutDatabasePolicy(PutDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
+  rpc GetDatabasePolicy(GetDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
 }
 
 message GetMetadataRequest {}
@@ -49,8 +54,7 @@ message CollectionPlacementReply {
   NodeRole assigned_role = 4;
   string route_kind = 5;
   string route_reason = 6;
-  string tenant_name = 7;
-  string database_name = 8;
+  string database_name = 7;
 }
 
 message GetRuntimeStatusReply {
@@ -64,6 +68,26 @@ message GetRuntimeStatusReply {
   uint64 collection_count = 8;
   repeated CollectionPlacementReply collections = 9;
   MaintenanceBacklogReply maintenance = 10;
+}
+
+message DatabaseDescriptorReply {
+  string database_id = 1;
+  string name = 2;
+  bool is_default = 3;
+}
+
+message PutDatabaseRequest {
+  DatabaseDescriptorReply descriptor = 1;
+}
+
+message GetDatabaseRequest {
+  string database_name = 1;
+}
+
+message ListDatabasesRequest {}
+
+message ListDatabasesReply {
+  repeated DatabaseDescriptorReply databases = 1;
 }
 
 message RemoteBlobConfig {
@@ -83,20 +107,17 @@ message CreateCollectionRequest {
   string name = 1;
   uint64 dimensions = 2;
   DistanceMetric metric = 3;
-  string tenant_name = 4;
-  string database_name = 5;
+  string database_name = 4;
 }
 
 message GetCollectionRequest {
   string collection_name = 1;
-  string tenant_name = 2;
-  string database_name = 3;
+  string database_name = 2;
 }
 
 message GetCollectionPlacementRequest {
   string collection_name = 1;
-  string tenant_name = 2;
-  string database_name = 3;
+  string database_name = 2;
 }
 
 message CollectionDescriptorReply {
@@ -110,7 +131,41 @@ message CollectionDescriptorReply {
   uint64 compaction_threshold_segments = 8;
   RemoteBlobConfig remote_blob = 9;
   string database_name = 10;
-  string tenant_name = 11;
+}
+
+enum AuthenticationMode {
+  AUTHENTICATION_MODE_UNSPECIFIED = 0;
+  AUTHENTICATION_MODE_DISABLED = 1;
+  AUTHENTICATION_MODE_PASSWORD = 2;
+  AUTHENTICATION_MODE_MUTUAL_TLS = 3;
+  AUTHENTICATION_MODE_EXTERNAL_TOKEN = 4;
+}
+
+enum DatabaseRole {
+  DATABASE_ROLE_UNSPECIFIED = 0;
+  DATABASE_ROLE_OWNER = 1;
+  DATABASE_ROLE_READ_WRITE = 2;
+  DATABASE_ROLE_READ_ONLY = 3;
+}
+
+message DatabaseRoleBindingReply {
+  string database_name = 1;
+  string principal_name = 2;
+  DatabaseRole role = 3;
+}
+
+message DatabaseAccessPolicyReply {
+  string database_name = 1;
+  AuthenticationMode authentication_mode = 2;
+  repeated DatabaseRoleBindingReply role_bindings = 3;
+}
+
+message PutDatabasePolicyRequest {
+  DatabaseAccessPolicyReply policy = 1;
+}
+
+message GetDatabasePolicyRequest {
+  string database_name = 1;
 }
 
 message PutRecord {
@@ -133,16 +188,14 @@ message WriteOperation {
 message WriteCollectionRequest {
   string collection_name = 1;
   repeated WriteOperation operations = 2;
-  string tenant_name = 3;
-  string database_name = 4;
+  string database_name = 3;
 }
 
 message CommitAckReply {
   uint64 last_seq_no = 1;
   uint64 applied_ops = 2;
-  string tenant_name = 3;
-  string database_name = 4;
-  string collection_name = 5;
+  string database_name = 3;
+  string collection_name = 4;
 }
 
 message Snapshot {
@@ -153,9 +206,8 @@ message Snapshot {
 message SnapshotReply {
   uint64 manifest_generation = 1;
   uint64 visible_seq_no = 2;
-  string tenant_name = 3;
-  string database_name = 4;
-  string collection_name = 5;
+  string database_name = 3;
+  string collection_name = 4;
 }
 
 message ScalarValue {
@@ -223,8 +275,7 @@ message QueryCollectionRequest {
   repeated MetadataFilter filters = 5;
   Predicate predicate = 6;
   ExplainMode explain = 7;
-  string tenant_name = 8;
-  string database_name = 9;
+  string database_name = 8;
 }
 
 message QueryMatch {
@@ -277,15 +328,13 @@ message QueryCollectionReply {
   Snapshot snapshot = 4;
   repeated QueryMatch matches = 5;
   QueryDiagnostics diagnostics = 6;
-  string tenant_name = 7;
-  string database_name = 8;
-  string collection_name = 9;
+  string database_name = 7;
+  string collection_name = 8;
 }
 
 message GetCollectionStatsRequest {
   string collection_name = 1;
-  string tenant_name = 2;
-  string database_name = 3;
+  string database_name = 2;
 }
 
 message CollectionStatsReply {
@@ -299,20 +348,17 @@ message CollectionStatsReply {
   uint64 deleted_record_count = 8;
   MaintenanceStatus maintenance = 9;
   repeated QueryUnitStats query_units = 10;
-  string tenant_name = 11;
-  string database_name = 12;
+  string database_name = 11;
 }
 
 message FlushCollectionRequest {
   string collection_name = 1;
-  string tenant_name = 2;
-  string database_name = 3;
+  string database_name = 2;
 }
 
 message CompactCollectionRequest {
   string collection_name = 1;
-  string tenant_name = 2;
-  string database_name = 3;
+  string database_name = 2;
 }
 
 enum InspectTarget {
@@ -326,16 +372,14 @@ message InspectCollectionRequest {
   string collection_name = 1;
   InspectTarget target = 2;
   string segment_id = 3;
-  string tenant_name = 4;
-  string database_name = 5;
+  string database_name = 4;
 }
 
 message InspectCollectionReply {
   string target = 1;
   string payload_json = 2;
-  string tenant_name = 3;
-  string database_name = 4;
-  string collection_name = 5;
+  string database_name = 3;
+  string collection_name = 4;
 }
 
 message MaintenanceStatus {

@@ -266,7 +266,6 @@ pub enum QueryError {
 pub type Result<T> = std::result::Result<T, QueryError>;
 
 struct ResolvedCollectionDescriptor {
-    tenant_name: String,
     database_name: String,
     collection_name: String,
     dimensions: usize,
@@ -275,12 +274,7 @@ struct ResolvedCollectionDescriptor {
 
 impl ResolvedCollectionDescriptor {
     fn lookup_name(&self) -> String {
-        CollectionRef::new(
-            self.tenant_name.clone(),
-            self.database_name.clone(),
-            self.collection_name.clone(),
-        )
-        .lookup_name()
+        CollectionRef::new(self.database_name.clone(), self.collection_name.clone()).lookup_name()
     }
 }
 
@@ -564,7 +558,6 @@ where
         .await
         .map_err(|error| qualify_collection_error(error, collection_name))?;
     let resolved = ResolvedCollectionDescriptor {
-        tenant_name: descriptor.tenant_name,
         database_name: descriptor.database_name,
         collection_name: descriptor.name,
         dimensions: descriptor.dimensions,
@@ -575,7 +568,22 @@ where
 }
 
 fn parse_collection_reference(collection_name: &str) -> Result<CollectionRef> {
-    CollectionRef::parse_reference(collection_name).map_err(QueryError::Storage)
+    let reference = match collection_name
+        .trim()
+        .split('/')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [collection_name] => CollectionRef::new_default(*collection_name),
+        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
+        _ => {
+            return Err(QueryError::Storage(LogPoseError::Message(format!(
+                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
+            ))));
+        }
+    };
+    reference.validate().map_err(QueryError::Storage)?;
+    Ok(reference)
 }
 
 fn ensure_collection_reference_matches_descriptor(
@@ -583,8 +591,7 @@ fn ensure_collection_reference_matches_descriptor(
     descriptor: &ResolvedCollectionDescriptor,
     original_name: &str,
 ) -> Result<()> {
-    if reference.tenant_name != descriptor.tenant_name
-        || reference.database_name != descriptor.database_name
+    if reference.database_name != descriptor.database_name
         || reference.collection_name != descriptor.collection_name
     {
         return Err(QueryError::Storage(LogPoseError::Message(format!(
@@ -1479,6 +1486,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_collection_reference_accepts_database_collection_and_rejects_tenant_depth() {
+        let reference = parse_collection_reference("analytics/documents")
+            .expect("database-qualified collection name should parse");
+
+        assert_eq!(reference.database_name, "analytics");
+        assert_eq!(reference.collection_name, "documents");
+
+        let error = parse_collection_reference("tenant-a/analytics/documents")
+            .expect_err("tenant-qualified collection name should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("expected 'collection' or 'database/collection'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn computes_raw_metric_values_for_supported_metrics() {
         let query = vec![1.0, 2.0];
         let candidate = vec![3.0, 4.0];
@@ -2086,7 +2111,7 @@ mod tests {
         let result = query_exact(
             &storage,
             QueryRequest {
-                collection_name: "default/analytics/profiles".to_owned(),
+                collection_name: "analytics/profiles".to_owned(),
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
@@ -2107,10 +2132,10 @@ mod tests {
                 .expect("seen names should be readable")
                 .as_slice(),
             &[
-                "default/analytics/profiles",
-                "default/analytics/profiles",
-                "default/analytics/profiles",
-                "default/analytics/profiles",
+                "analytics/profiles",
+                "analytics/profiles",
+                "analytics/profiles",
+                "analytics/profiles",
             ]
         );
     }
@@ -2123,9 +2148,9 @@ mod tests {
 
     impl QualifiedReferenceStorage {
         fn record_name(&self, collection_name: &str) -> logpose_types::Result<()> {
-            if collection_name != "default/analytics/profiles" {
+            if collection_name != "analytics/profiles" {
                 return Err(LogPoseError::Message(format!(
-                    "expected qualified collection name 'default/analytics/profiles', got '{collection_name}'"
+                    "expected qualified collection name 'analytics/profiles', got '{collection_name}'"
                 )));
             }
             self.seen_names
@@ -2209,7 +2234,6 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .collection_id,
-                tenant_name: "default".to_owned(),
                 database_name: "analytics".to_owned(),
                 collection_name: "profiles".to_owned(),
                 manifest_generation: 5,
@@ -2328,7 +2352,6 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .collection_id,
-                tenant_name: "default".to_owned(),
                 database_name: "default".to_owned(),
                 collection_name: "broken".to_owned(),
                 manifest_generation: 4,
@@ -2464,7 +2487,6 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .collection_id,
-                tenant_name: "default".to_owned(),
                 database_name: "default".to_owned(),
                 collection_name: "filtered".to_owned(),
                 manifest_generation: 3,

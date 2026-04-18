@@ -13,6 +13,7 @@ workspace = true
 ignored = ["prost", "tonic-prost", "prost-build", "protoc-bin-vendored", "tonic-prost-build"]
 
 [dependencies]
+logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-core = { path = "../logpose-core" }
 logpose-query = { path = "../logpose-query" }

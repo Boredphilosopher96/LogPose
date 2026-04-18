@@ -9,5 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+logpose-auth = { path = "../logpose-auth" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

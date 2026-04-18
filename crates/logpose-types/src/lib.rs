@@ -12,8 +12,6 @@ pub type Result<T> = std::result::Result<T, LogPoseError>;
 pub const PRODUCT_NAME: &str = "LogPose";
 /// Reserved placement token for collections created through anonymous local storage paths.
 pub const ANONYMOUS_LOCAL_NODE_NAME: &str = "local";
-/// Built-in tenant name used until callers provision explicit tenants.
-pub const DEFAULT_TENANT_NAME: &str = "default";
 /// Built-in database name used until callers provision explicit databases.
 pub const DEFAULT_DATABASE_NAME: &str = "default";
 
@@ -135,22 +133,6 @@ impl Default for ResourceId {
     }
 }
 
-/// Identifier for a logical tenant.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct TenantId(pub Uuid);
-
-impl Default for TenantId {
-    fn default() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl fmt::Display for TenantId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
-    }
-}
-
 /// Identifier for a logical database.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct DatabaseId(pub Uuid);
@@ -167,12 +149,54 @@ impl fmt::Display for DatabaseId {
     }
 }
 
-/// Qualified reference to one collection inside a tenant and database namespace.
+impl std::str::FromStr for DatabaseId {
+    type Err = LogPoseError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        uuid::Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|error| LogPoseError::Message(error.to_string()))
+    }
+}
+
+/// Qualified reference to one database inside the cluster.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct DatabaseRef {
+    /// Database name.
+    pub database_name: String,
+}
+
+impl DatabaseRef {
+    /// Build one database reference.
+    #[must_use]
+    pub fn new(database_name: impl Into<String>) -> Self {
+        Self {
+            database_name: database_name.into(),
+        }
+    }
+
+    /// Build one reference.
+    #[must_use]
+    pub fn new_default(database_name: impl Into<String>) -> Self {
+        Self::new(database_name)
+    }
+
+    /// Build the canonical database lookup key.
+    #[must_use]
+    pub fn lookup_name(&self) -> String {
+        self.database_name.clone()
+    }
+
+    /// Validate that namespace fields are populated.
+    pub fn validate(&self) -> Result<()> {
+        validate_collection_ref_segment("database_name", &self.database_name)?;
+        Ok(())
+    }
+}
+
+/// Qualified reference to one collection inside a database namespace.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CollectionRef {
-    /// Tenant containing the database.
-    #[serde(default = "default_tenant_name")]
-    pub tenant_name: String,
     /// Database containing the collection.
     #[serde(default = "default_database_name")]
     pub database_name: String,
@@ -183,13 +207,8 @@ pub struct CollectionRef {
 impl CollectionRef {
     /// Build one qualified collection reference.
     #[must_use]
-    pub fn new(
-        tenant_name: impl Into<String>,
-        database_name: impl Into<String>,
-        collection_name: impl Into<String>,
-    ) -> Self {
+    pub fn new(database_name: impl Into<String>, collection_name: impl Into<String>) -> Self {
         Self {
-            tenant_name: tenant_name.into(),
             database_name: database_name.into(),
             collection_name: collection_name.into(),
         }
@@ -198,50 +217,17 @@ impl CollectionRef {
     /// Build one reference inside the bootstrap default namespace.
     #[must_use]
     pub fn new_default(collection_name: impl Into<String>) -> Self {
-        Self::new(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+        Self::new(DEFAULT_DATABASE_NAME, collection_name)
     }
 
-    /// Resolve a user-facing lookup key into a collection reference.
-    #[must_use]
-    pub fn from_lookup_key(value: &str) -> Self {
-        let parts = value.split('/').collect::<Vec<_>>();
-        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-            Self::new(parts[0], parts[1], parts[2])
-        } else {
-            Self::new_default(value)
-        }
-    }
-
-    /// Parse a strict collection reference accepted by service/query APIs.
-    pub fn parse_reference(value: &str) -> Result<Self> {
-        let trimmed = value.trim();
-        let reference = match trimmed.split('/').collect::<Vec<_>>().as_slice() {
-            [collection_name] => Self::new_default(*collection_name),
-            [tenant_name, database_name, collection_name] => {
-                Self::new(*tenant_name, *database_name, *collection_name)
-            }
-            _ => {
-                return Err(LogPoseError::Message(format!(
-                    "unsupported collection reference '{value}': expected 'collection' or 'tenant/database/collection'"
-                )));
-            }
-        };
-        reference.validate()?;
-        Ok(reference)
-    }
-
-    /// Build the canonical tenant/database/collection lookup key.
+    /// Build the canonical database/collection lookup key.
     #[must_use]
     pub fn lookup_name(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.tenant_name, self.database_name, self.collection_name
-        )
+        format!("{}/{}", self.database_name, self.collection_name)
     }
 
     /// Validate that namespace fields are populated.
     pub fn validate(&self) -> Result<()> {
-        validate_collection_ref_segment("tenant_name", &self.tenant_name)?;
         validate_collection_ref_segment("database_name", &self.database_name)?;
         validate_collection_ref_segment("collection_name", &self.collection_name)?;
         Ok(())
@@ -587,9 +573,6 @@ pub struct AnnSearchRequest {
 pub struct CollectionStats {
     /// Collection identifier.
     pub collection_id: CollectionId,
-    /// Tenant containing the collection.
-    #[serde(default = "default_tenant_name")]
-    pub tenant_name: String,
     /// Database containing the collection.
     #[serde(default = "default_database_name")]
     pub database_name: String,
@@ -751,10 +734,6 @@ fn default_etcd_cluster_name() -> String {
     "default".to_owned()
 }
 
-fn default_tenant_name() -> String {
-    DEFAULT_TENANT_NAME.to_owned()
-}
-
 fn default_database_name() -> String {
     DEFAULT_DATABASE_NAME.to_owned()
 }
@@ -764,40 +743,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collection_ref_from_lookup_key_uses_default_namespace_for_bare_names() {
-        let reference = CollectionRef::from_lookup_key("documents");
+    fn database_ref_is_database_only() {
+        let reference = DatabaseRef::new("analytics");
 
-        assert_eq!(reference, CollectionRef::new_default("documents"));
-    }
-
-    #[test]
-    fn collection_ref_parse_reference_accepts_bare_and_qualified_names() {
+        assert_eq!(reference.lookup_name(), "analytics");
         assert_eq!(
-            CollectionRef::parse_reference("documents").expect("bare collection should parse"),
-            CollectionRef::new_default("documents")
-        );
-        assert_eq!(
-            CollectionRef::parse_reference("acme/analytics/documents")
-                .expect("qualified collection should parse"),
-            CollectionRef::new("acme", "analytics", "documents")
+            serde_json::to_value(&reference).expect("database ref should serialize"),
+            serde_json::json!({
+                "database_name": "analytics",
+            })
         );
     }
 
     #[test]
-    fn collection_ref_parse_reference_rejects_invalid_component_count() {
-        let error = CollectionRef::parse_reference("analytics/documents")
-            .expect_err("two-part references should be rejected");
+    fn database_ref_rejects_reserved_namespace_separator() {
+        let error = DatabaseRef::new("analytics/v2")
+            .validate()
+            .expect_err("slash-containing database names should fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported collection reference")
+        assert!(error.to_string().contains("database_name"));
+        assert!(error.to_string().contains("/"));
+    }
+
+    #[test]
+    fn collection_ref_is_database_and_collection_only() {
+        let reference = CollectionRef::new("analytics", "docs");
+
+        assert_eq!(reference.lookup_name(), "analytics/docs");
+        assert_eq!(
+            serde_json::to_value(&reference).expect("collection ref should serialize"),
+            serde_json::json!({
+                "database_name": "analytics",
+                "collection_name": "docs",
+            })
         );
     }
 
     #[test]
     fn collection_ref_rejects_reserved_namespace_separator() {
-        let error = CollectionRef::new("tenant-a", "analytics", "docs/v2")
+        let error = CollectionRef::new("analytics", "docs/v2")
             .validate()
             .expect_err("slash-containing collection names should fail");
 
@@ -820,9 +804,6 @@ pub struct CollectionAssignment {
 pub struct CollectionPlacement {
     /// Stable collection identifier.
     pub collection_id: CollectionId,
-    /// Tenant containing the collection.
-    #[serde(default = "default_tenant_name")]
-    pub tenant_name: String,
     /// Database containing the collection.
     #[serde(default = "default_database_name")]
     pub database_name: String,

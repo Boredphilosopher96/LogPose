@@ -1,11 +1,11 @@
 use crate::action::{
-    Action, CollectionCreateAction, ExplainArg, MetricArg, QueryAction, QueryFilter, QueryVector,
-    RecordDeleteAction, RecordPutAction, WorkflowKind, parse_query_filter, parse_query_vector,
-    parse_query_where,
+    Action, CollectionCreateAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg,
+    MetricArg, QueryAction, QueryFilter, QueryVector, RecordDeleteAction, RecordPutAction,
+    WorkflowKind, parse_query_filter, parse_query_vector, parse_query_where,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use logpose_storage::InspectTarget;
-use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME};
+use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,10 +32,12 @@ impl From<OutputModeArg> for OutputMode {
 pub enum CommandRequest {
     Direct {
         action: Action,
+        auth_token: Option<String>,
         output: OutputMode,
     },
     Interactive {
         args: InteractiveArgs,
+        auth_token: Option<String>,
         output: OutputMode,
     },
 }
@@ -64,6 +66,14 @@ pub struct Cli {
         help = "Direct command output format."
     )]
     pub output: Option<OutputModeArg>,
+    #[arg(
+        long,
+        global = true,
+        env = "LOGPOSE_AUTH_TOKEN",
+        value_name = "TOKEN",
+        help = "Bearer token sent to authenticated server endpoints. Can also be set with LOGPOSE_AUTH_TOKEN."
+    )]
+    pub auth_token: Option<String>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -79,17 +89,47 @@ impl Cli {
 
     pub fn into_request(self) -> CommandRequest {
         let output = self.output_mode();
+        let auth_token = self.auth_token;
         match self.command {
             Commands::Status => CommandRequest::Direct {
                 action: Action::Status,
+                auth_token: auth_token.clone(),
                 output,
             },
             Commands::Config(args) => match args.command {
                 ConfigCommand::Show => CommandRequest::Direct {
                     action: Action::ConfigShow,
+                    auth_token: auth_token.clone(),
                     output,
                 },
             },
+            Commands::Database(args) => {
+                let action = match args.command {
+                    DatabaseCommand::List(_) => Action::DatabaseList,
+                    DatabaseCommand::Show(args) => Action::DatabaseShow {
+                        database_name: args.database_name,
+                    },
+                    DatabaseCommand::Put(args) => Action::DatabasePut(DatabasePutAction {
+                        database_name: args.database_name,
+                    }),
+                    DatabaseCommand::Policy(args) => match args.command {
+                        DatabasePolicyCommand::Show(args) => Action::DatabasePolicyShow {
+                            database_name: args.database,
+                        },
+                        DatabasePolicyCommand::Set(args) => {
+                            Action::DatabasePolicySet(DatabasePolicySetAction {
+                                database_name: args.database,
+                                input: args.input,
+                            })
+                        }
+                    },
+                };
+                CommandRequest::Direct {
+                    action,
+                    auth_token: auth_token.clone(),
+                    output,
+                }
+            }
             Commands::Collection(args) => {
                 let action = match args.command {
                     CollectionCommand::Create(args) => {
@@ -113,7 +153,11 @@ impl Cli {
                         Action::CollectionCompact(args.collection_ref())
                     }
                 };
-                CommandRequest::Direct { action, output }
+                CommandRequest::Direct {
+                    action,
+                    auth_token: auth_token.clone(),
+                    output,
+                }
             }
             Commands::Record(args) => {
                 let action = match args.command {
@@ -126,7 +170,11 @@ impl Cli {
                         id: args.id,
                     }),
                 };
-                CommandRequest::Direct { action, output }
+                CommandRequest::Direct {
+                    action,
+                    auth_token: auth_token.clone(),
+                    output,
+                }
             }
             Commands::Query(args) => CommandRequest::Direct {
                 action: Action::Query(QueryAction {
@@ -140,6 +188,7 @@ impl Cli {
                     snapshot_manifest_generation: args.snapshot_manifest_generation,
                     snapshot_visible_seq_no: args.snapshot_visible_seq_no,
                 }),
+                auth_token: auth_token.clone(),
                 output,
             },
             Commands::Inspect(args) => {
@@ -161,22 +210,23 @@ impl Cli {
                         target: InspectTarget::Segment(args.segment_id),
                     },
                 };
-                CommandRequest::Direct { action, output }
+                CommandRequest::Direct {
+                    action,
+                    auth_token: auth_token.clone(),
+                    output,
+                }
             }
-            Commands::Interactive(args) => CommandRequest::Interactive { args, output },
+            Commands::Interactive(args) => CommandRequest::Interactive {
+                args,
+                auth_token,
+                output,
+            },
         }
     }
 }
 
 #[derive(Debug, Args, Clone)]
 pub struct NamespaceArgs {
-    #[arg(
-        long,
-        default_value = DEFAULT_TENANT_NAME,
-        value_name = "TENANT",
-        help = "Tenant containing the collection. Defaults to default."
-    )]
-    pub tenant: String,
     #[arg(
         long,
         default_value = DEFAULT_DATABASE_NAME,
@@ -189,7 +239,6 @@ pub struct NamespaceArgs {
 impl Default for NamespaceArgs {
     fn default() -> Self {
         Self {
-            tenant: DEFAULT_TENANT_NAME.to_owned(),
             database: DEFAULT_DATABASE_NAME.to_owned(),
         }
     }
@@ -199,10 +248,10 @@ impl NamespaceArgs {
     pub fn collection_ref(&self, collection_name: impl Into<String>) -> CollectionRef {
         let collection_name = collection_name.into();
         let parts = collection_name.split('/').collect::<Vec<_>>();
-        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-            CollectionRef::new(parts[0], parts[1], parts[2])
+        if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+            CollectionRef::new(parts[0], parts[1])
         } else {
-            CollectionRef::new(self.tenant.clone(), self.database.clone(), collection_name)
+            CollectionRef::new(self.database.clone(), collection_name)
         }
     }
 }
@@ -213,6 +262,8 @@ pub enum Commands {
     Status,
     /// Inspect the effective node configuration.
     Config(ConfigGroup),
+    /// Create, inspect, and list databases or manage database policies.
+    Database(DatabaseGroup),
     /// Create, inspect, place, and maintain collections.
     Collection(CollectionGroup),
     /// Ingest and delete records.
@@ -389,6 +440,93 @@ pub struct ConfigGroup {
 pub enum ConfigCommand {
     /// Show the effective node configuration.
     Show,
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+pub struct DatabaseGroup {
+    #[command(subcommand)]
+    pub command: DatabaseCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DatabaseCommand {
+    /// List database descriptors.
+    List(DatabaseListArgs),
+    /// Show one database descriptor.
+    Show(DatabaseNameArg),
+    /// Create or replace one database descriptor.
+    Put(DatabaseNameArg),
+    /// Show or replace one database access policy.
+    Policy(DatabasePolicyGroup),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "List database descriptors.",
+    after_long_help = "Examples:\n  logpose database list\n  logpose --json database list"
+)]
+pub struct DatabaseListArgs {}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Show or create one database descriptor.",
+    after_long_help = "Examples:\n  logpose database show analytics\n  logpose database put analytics\n  logpose --json database show analytics"
+)]
+pub struct DatabaseNameArg {
+    #[arg(value_name = "DATABASE", help = "Database name. Example: analytics")]
+    pub database_name: String,
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+pub struct DatabasePolicyGroup {
+    #[command(subcommand)]
+    pub command: DatabasePolicyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DatabasePolicyCommand {
+    /// Show one database access policy.
+    Show(DatabasePolicyShowArgs),
+    /// Create or replace one database access policy from JSON.
+    Set(DatabasePolicySetArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Show one database access policy for the selected database namespace.",
+    after_long_help = "Examples:\n  logpose database policy show\n  logpose database policy show --database analytics\n  logpose --json database policy show --database analytics"
+)]
+pub struct DatabasePolicyShowArgs {
+    #[arg(
+        long,
+        default_value = DEFAULT_DATABASE_NAME,
+        value_name = "DATABASE",
+        help = "Database to inspect. Defaults to default."
+    )]
+    pub database: String,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Create or replace one database access policy from a JSON document.",
+    after_long_help = "Examples:\n  logpose database policy set --input policy.json\n  logpose database policy set --database analytics --input policy.json\n  logpose --json database policy set --input policy.json"
+)]
+pub struct DatabasePolicySetArgs {
+    #[arg(
+        long,
+        default_value = DEFAULT_DATABASE_NAME,
+        value_name = "DATABASE",
+        help = "Database to update. Defaults to default."
+    )]
+    pub database: String,
+    #[arg(
+        long,
+        value_name = "JSON_PATH",
+        help = "Path to the database policy JSON document. Example: policy.json"
+    )]
+    pub input: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -644,21 +782,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collection_commands_accept_namespace_flags() {
+    fn tenant_commands_are_not_available() {
+        let cli = Cli::try_parse_from(["logpose", "tenant", "list"]);
+
+        assert!(cli.is_err(), "tenant commands should be removed: {cli:?}");
+    }
+
+    #[test]
+    fn collection_commands_accept_database_flags_only() {
         let cli = Cli::try_parse_from([
             "logpose",
             "collection",
             "show",
             "colors",
-            "--tenant",
-            "acme",
             "--database",
             "analytics",
         ]);
 
         assert!(
             cli.is_ok(),
-            "collection show should accept tenant/database flags: {cli:?}"
+            "collection show should accept database flags: {cli:?}"
         );
 
         let request = cli.expect("cli should parse").into_request();
@@ -668,19 +811,33 @@ mod tests {
         let Action::CollectionShow(collection) = action else {
             unreachable!("expected collection show action");
         };
-        assert_eq!(collection.tenant_name, "acme");
         assert_eq!(collection.database_name, "analytics");
         assert_eq!(collection.collection_name, "colors");
     }
 
     #[test]
-    fn query_commands_accept_namespace_flags() {
+    fn collection_commands_reject_tenant_flags() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "collection",
+            "show",
+            "colors",
+            "--tenant",
+            "acme",
+        ]);
+
+        assert!(
+            cli.is_err(),
+            "collection show should reject tenant flags: {cli:?}"
+        );
+    }
+
+    #[test]
+    fn query_commands_accept_database_flags_only() {
         let cli = Cli::try_parse_from([
             "logpose",
             "query",
             "colors",
-            "--tenant",
-            "acme",
             "--database",
             "analytics",
             "--vector",
@@ -689,10 +846,7 @@ mod tests {
             "1",
         ]);
 
-        assert!(
-            cli.is_ok(),
-            "query should accept tenant/database flags: {cli:?}"
-        );
+        assert!(cli.is_ok(), "query should accept database flags: {cli:?}");
 
         let request = cli.expect("cli should parse").into_request();
         let CommandRequest::Direct { action, .. } = request else {
@@ -701,15 +855,13 @@ mod tests {
         let Action::Query(query) = action else {
             unreachable!("expected query action");
         };
-        assert_eq!(query.collection.tenant_name, "acme");
         assert_eq!(query.collection.database_name, "analytics");
         assert_eq!(query.collection.collection_name, "colors");
     }
 
     #[test]
     fn collection_commands_accept_fully_qualified_lookup_keys() {
-        let cli =
-            Cli::try_parse_from(["logpose", "collection", "show", "tenant-a/analytics/colors"]);
+        let cli = Cli::try_parse_from(["logpose", "collection", "show", "analytics/colors"]);
 
         assert!(
             cli.is_ok(),
@@ -723,7 +875,6 @@ mod tests {
         let Action::CollectionShow(collection) = action else {
             unreachable!("expected collection show action");
         };
-        assert_eq!(collection.tenant_name, "tenant-a");
         assert_eq!(collection.database_name, "analytics");
         assert_eq!(collection.collection_name, "colors");
     }
@@ -733,7 +884,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "logpose",
             "query",
-            "tenant-a/analytics/colors",
+            "analytics/colors",
             "--vector",
             "1.0,0.0",
             "--top-k",
@@ -749,7 +900,6 @@ mod tests {
         let Action::Query(query) = action else {
             unreachable!("expected query action");
         };
-        assert_eq!(query.collection.tenant_name, "tenant-a");
         assert_eq!(query.collection.database_name, "analytics");
         assert_eq!(query.collection.collection_name, "colors");
     }
@@ -764,9 +914,72 @@ mod tests {
         let Action::CollectionShow(collection) = action else {
             unreachable!("expected collection show action");
         };
-        assert_eq!(collection.tenant_name, DEFAULT_TENANT_NAME);
         assert_eq!(collection.database_name, DEFAULT_DATABASE_NAME);
         assert_eq!(collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn database_policy_commands_accept_database_flags_only() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "database",
+            "policy",
+            "show",
+            "--database",
+            "analytics",
+        ]);
+
+        assert!(
+            cli.is_ok(),
+            "database policy show should accept database flags: {cli:?}"
+        );
+
+        let request = cli.expect("cli should parse").into_request();
+        let CommandRequest::Direct { action, .. } = request else {
+            unreachable!("expected direct request");
+        };
+        let Action::DatabasePolicyShow { database_name } = action else {
+            unreachable!("expected database policy show action");
+        };
+        assert_eq!(database_name, "analytics");
+    }
+
+    #[test]
+    fn database_policy_set_defaults_namespace_to_default_values() {
+        let cli = Cli::parse_from([
+            "logpose",
+            "database",
+            "policy",
+            "set",
+            "--input",
+            "policy.json",
+        ]);
+        let request = cli.into_request();
+        let CommandRequest::Direct { action, .. } = request else {
+            unreachable!("expected direct request");
+        };
+        let Action::DatabasePolicySet(action) = action else {
+            unreachable!("expected database policy set action");
+        };
+        assert_eq!(action.database_name, DEFAULT_DATABASE_NAME);
+        assert_eq!(action.input, PathBuf::from("policy.json"));
+    }
+
+    #[test]
+    fn global_auth_token_flows_into_direct_requests() {
+        let cli = Cli::parse_from(["logpose", "--auth-token", "secret-token", "status"]);
+        let request = cli.into_request();
+        let CommandRequest::Direct {
+            action,
+            auth_token,
+            output,
+        } = request
+        else {
+            unreachable!("expected direct request");
+        };
+        assert!(matches!(action, Action::Status));
+        assert_eq!(auth_token.as_deref(), Some("secret-token"));
+        assert_eq!(output, OutputMode::Human);
     }
 
     #[test]
@@ -787,8 +1000,14 @@ mod tests {
             matches!(request, CommandRequest::Interactive { .. }),
             "expected interactive request"
         );
-        if let CommandRequest::Interactive { args, output } = request {
+        if let CommandRequest::Interactive {
+            args,
+            auth_token,
+            output,
+        } = request
+        {
             assert_eq!(output, OutputMode::Json);
+            assert!(auth_token.is_none());
             assert_eq!(
                 args.selected_workflow(),
                 Some(WorkflowKind::CollectionCreate)

@@ -1,6 +1,7 @@
 //! gRPC API surface for LogPose.
 
-use logpose_core::AppState;
+use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
+use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
     ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator,
     QueryDiagnostics, QueryPlanKind, QueryRequest, QueryStageTimings, ScalarMetadataValue,
@@ -8,9 +9,9 @@ use logpose_query::{
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
-    CollectionPlacement, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord, DistanceMetric,
-    MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats,
-    RecordId, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionPlacement, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, MaintenanceBacklog,
+    MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats, RecordId,
+    ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
@@ -28,12 +29,15 @@ pub mod proto {
 use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
 use proto::{
     CollectionDescriptorReply, CollectionPlacementReply, CollectionStatsReply, CommitAckReply,
-    CompactCollectionRequest, CreateCollectionRequest, FlushCollectionRequest,
+    CompactCollectionRequest, CreateCollectionRequest, DatabaseAccessPolicyReply,
+    DatabaseDescriptorReply, DatabaseRoleBindingReply, FlushCollectionRequest,
     GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
-    GetMetadataReply, GetMetadataRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest,
-    InspectCollectionReply, InspectCollectionRequest, InspectTarget, MaintenanceBacklogReply,
-    NodeRole as ProtoNodeRole, QueryCollectionReply, QueryCollectionRequest, QueryMatch,
-    RemoteBlobConfig, ScalarValue, SnapshotReply, WriteCollectionRequest,
+    GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataReply, GetMetadataRequest,
+    GetRuntimeStatusReply, GetRuntimeStatusRequest, InspectCollectionReply,
+    InspectCollectionRequest, InspectTarget, ListDatabasesReply, ListDatabasesRequest,
+    MaintenanceBacklogReply, NodeRole as ProtoNodeRole, PutDatabasePolicyRequest,
+    PutDatabaseRequest, QueryCollectionReply, QueryCollectionRequest, QueryMatch, RemoteBlobConfig,
+    ScalarValue, SnapshotReply, WriteCollectionRequest,
 };
 
 /// Serve the gRPC API until shutdown.
@@ -96,34 +100,84 @@ impl LogPoseService for GrpcLogPoseService {
 
     async fn get_runtime_status(
         &self,
-        _request: Request<GetRuntimeStatusRequest>,
+        request: Request<GetRuntimeStatusRequest>,
     ) -> Result<Response<GetRuntimeStatusReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let status = self
             .state
-            .control
-            .runtime_status()
+            .runtime_status_with_auth(&auth)
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(runtime_status_reply_from_domain(status)))
+    }
+
+    async fn put_database(
+        &self,
+        request: Request<PutDatabaseRequest>,
+    ) -> Result<Response<DatabaseDescriptorReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let descriptor = request
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("database descriptor payload is required"))?;
+        let stored = self
+            .state
+            .put_database_with_auth(&auth, database_descriptor_from_proto(descriptor)?)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(database_descriptor_to_proto(stored)))
+    }
+
+    async fn get_database(
+        &self,
+        request: Request<GetDatabaseRequest>,
+    ) -> Result<Response<DatabaseDescriptorReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let database_name = normalize_database_name(&request.database_name);
+        let descriptor = self
+            .state
+            .database_with_auth(&auth, &database_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(database_descriptor_to_proto(descriptor)))
+    }
+
+    async fn list_databases(
+        &self,
+        request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let descriptors = self
+            .state
+            .databases_with_auth(&auth)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(ListDatabasesReply {
+            databases: descriptors
+                .into_iter()
+                .map(database_descriptor_to_proto)
+                .collect(),
+        }))
     }
 
     async fn create_collection(
         &self,
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
         let descriptor = self
             .state
-            .control
-            .create_collection(StorageCreateCollectionRequest {
-                tenant_name,
-                database_name,
-                name: request.name,
-                dimensions: request.dimensions as usize,
-                metric: metric_from_proto(request.metric)?,
-            })
+            .create_collection_with_auth(
+                &auth,
+                StorageCreateCollectionRequest::in_database(
+                    normalize_database_name(&request.database_name),
+                    request.name,
+                    request.dimensions as usize,
+                    metric_from_proto(request.metric)?,
+                ),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_descriptor_reply(descriptor)))
@@ -133,15 +187,14 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionPlacementRequest>,
     ) -> Result<Response<CollectionPlacementReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let placement = self
             .state
-            .control
-            .collection_placement(&collection_lookup_key(
-                &request.tenant_name,
-                &request.database_name,
-                &request.collection_name,
-            ))
+            .collection_placement_with_auth(
+                &auth,
+                &collection_lookup_key(&request.database_name, &request.collection_name),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_placement_reply_from_domain(
@@ -153,14 +206,14 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let descriptor = self
             .state
-            .get_collection(&collection_lookup_key(
-                &request.tenant_name,
-                &request.database_name,
-                &request.collection_name,
-            ))
+            .get_collection_with_auth(
+                &auth,
+                &collection_lookup_key(&request.database_name, &request.collection_name),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_descriptor_reply(descriptor)))
@@ -170,9 +223,9 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<WriteCollectionRequest>,
     ) -> Result<Response<CommitAckReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
+        let database_name = normalize_database_name(&request.database_name);
         let operations = request
             .operations
             .into_iter()
@@ -180,8 +233,9 @@ impl LogPoseService for GrpcLogPoseService {
             .collect::<Result<Vec<_>, _>>()?;
         let ack = self
             .state
-            .write(
-                &collection_lookup_key(&tenant_name, &database_name, &request.collection_name),
+            .write_with_auth(
+                &auth,
+                &collection_lookup_key(&database_name, &request.collection_name),
                 operations,
             )
             .await
@@ -189,7 +243,6 @@ impl LogPoseService for GrpcLogPoseService {
         Ok(Response::new(CommitAckReply {
             last_seq_no: ack.last_seq_no,
             applied_ops: ack.applied_ops as u64,
-            tenant_name,
             database_name,
             collection_name: request.collection_name,
         }))
@@ -199,9 +252,9 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<QueryCollectionRequest>,
     ) -> Result<Response<QueryCollectionReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
+        let database_name = normalize_database_name(&request.database_name);
         if request.top_k == 0 {
             return Err(Status::invalid_argument("top_k must be greater than 0"));
         }
@@ -213,19 +266,21 @@ impl LogPoseService for GrpcLogPoseService {
         let predicate = request.predicate.map(predicate_from_proto).transpose()?;
         let response = self
             .state
-            .query(QueryRequest {
-                collection_name: collection_lookup_key(
-                    &tenant_name,
-                    &database_name,
-                    &request.collection_name,
-                ),
-                vector: request.vector,
-                top_k: request.top_k as usize,
-                snapshot: request.snapshot.map(snapshot_from_proto),
-                filters,
-                predicate,
-                explain: explain_mode_from_proto(request.explain)?,
-            })
+            .query_with_auth(
+                &auth,
+                QueryRequest {
+                    collection_name: collection_lookup_key(
+                        &database_name,
+                        &request.collection_name,
+                    ),
+                    vector: request.vector,
+                    top_k: request.top_k as usize,
+                    snapshot: request.snapshot.map(snapshot_from_proto),
+                    filters,
+                    predicate,
+                    explain: explain_mode_from_proto(request.explain)?,
+                },
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(QueryCollectionReply {
@@ -254,7 +309,6 @@ impl LogPoseService for GrpcLogPoseService {
                 .diagnostics
                 .map(query_diagnostics_to_proto)
                 .transpose()?,
-            tenant_name,
             database_name,
             collection_name: request.collection_name,
         }))
@@ -264,14 +318,14 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionStatsRequest>,
     ) -> Result<Response<CollectionStatsReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let stats = self
             .state
-            .stats(&collection_lookup_key(
-                &request.tenant_name,
-                &request.database_name,
-                &request.collection_name,
-            ))
+            .stats_with_auth(
+                &auth,
+                &collection_lookup_key(&request.database_name, &request.collection_name),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_stats_reply_from_domain(stats)?))
@@ -281,21 +335,19 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<FlushCollectionRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
+        let database_name = normalize_database_name(&request.database_name);
         let snapshot = self
             .state
-            .flush(&collection_lookup_key(
-                &tenant_name,
-                &database_name,
-                &request.collection_name,
-            ))
+            .flush_with_auth(
+                &auth,
+                &collection_lookup_key(&database_name, &request.collection_name),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(snapshot_reply_from_domain(
             snapshot,
-            tenant_name,
             database_name,
             request.collection_name,
         )))
@@ -305,21 +357,19 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<CompactCollectionRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
+        let database_name = normalize_database_name(&request.database_name);
         let snapshot = self
             .state
-            .compact(&collection_lookup_key(
-                &tenant_name,
-                &database_name,
-                &request.collection_name,
-            ))
+            .compact_with_auth(
+                &auth,
+                &collection_lookup_key(&database_name, &request.collection_name),
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(snapshot_reply_from_domain(
             snapshot,
-            tenant_name,
             database_name,
             request.collection_name,
         )))
@@ -329,14 +379,15 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<InspectCollectionRequest>,
     ) -> Result<Response<InspectCollectionReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let (tenant_name, database_name) =
-            normalize_namespace(&request.tenant_name, &request.database_name);
+        let database_name = normalize_database_name(&request.database_name);
         let target = inspect_target_from_proto(request.target, request.segment_id)?;
         let report = self
             .state
-            .inspect(
-                &collection_lookup_key(&tenant_name, &database_name, &request.collection_name),
+            .inspect_with_auth(
+                &auth,
+                &collection_lookup_key(&database_name, &request.collection_name),
                 target,
             )
             .await
@@ -347,10 +398,42 @@ impl LogPoseService for GrpcLogPoseService {
         Ok(Response::new(InspectCollectionReply {
             target: report.target,
             payload_json,
-            tenant_name,
             database_name,
             collection_name: request.collection_name,
         }))
+    }
+
+    async fn put_database_policy(
+        &self,
+        request: Request<PutDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let policy = request
+            .policy
+            .ok_or_else(|| Status::invalid_argument("database policy payload is required"))?;
+        let policy = database_access_policy_from_proto(policy)?;
+        let stored = self
+            .state
+            .set_database_access_policy_with_auth(&auth, policy)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(database_access_policy_to_proto(stored)))
+    }
+
+    async fn get_database_policy(
+        &self,
+        request: Request<GetDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let database_name = normalize_database_name(&request.database_name);
+        let policy = self
+            .state
+            .database_access_policy_with_auth(&auth, &database_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(database_access_policy_to_proto(policy)))
     }
 }
 
@@ -562,14 +645,12 @@ fn snapshot_message_from_domain(snapshot: Snapshot) -> proto::Snapshot {
 
 fn snapshot_reply_from_domain(
     snapshot: Snapshot,
-    tenant_name: String,
     database_name: String,
     collection_name: String,
 ) -> SnapshotReply {
     SnapshotReply {
         manifest_generation: snapshot.manifest_generation,
         visible_seq_no: snapshot.visible_seq_no,
-        tenant_name,
         database_name,
         collection_name,
     }
@@ -635,6 +716,30 @@ fn metadata_reply_from_domain(metadata: logpose_types::NodeMetadata) -> GetMetad
     }
 }
 
+fn database_descriptor_to_proto(
+    descriptor: logpose_catalog::DatabaseDescriptor,
+) -> DatabaseDescriptorReply {
+    DatabaseDescriptorReply {
+        database_id: descriptor.database_id.to_string(),
+        name: descriptor.name,
+        is_default: descriptor.is_default,
+    }
+}
+
+fn database_descriptor_from_proto(
+    descriptor: DatabaseDescriptorReply,
+) -> Result<logpose_catalog::DatabaseDescriptor, Status> {
+    Ok(logpose_catalog::DatabaseDescriptor {
+        database_id: descriptor.database_id.parse().map_err(
+            |error: logpose_types::LogPoseError| {
+                Status::invalid_argument(format!("invalid database_id: {error}"))
+            },
+        )?,
+        name: descriptor.name,
+        is_default: descriptor.is_default,
+    })
+}
+
 fn collection_descriptor_reply(
     descriptor: logpose_catalog::CollectionDescriptor,
 ) -> CollectionDescriptorReply {
@@ -653,7 +758,6 @@ fn collection_descriptor_reply(
             prefix: remote_blob.prefix,
         }),
         database_name: descriptor.database_name,
-        tenant_name: descriptor.tenant_name,
     }
 }
 
@@ -686,7 +790,6 @@ fn collection_placement_reply_from_domain(
         assigned_role: node_role_to_proto(placement.assigned_role) as i32,
         route_kind: placement.route_kind,
         route_reason: placement.route_reason,
-        tenant_name: placement.tenant_name,
         database_name: placement.database_name,
     }
 }
@@ -718,28 +821,68 @@ fn collection_stats_reply_from_domain(
             .into_iter()
             .map(query_unit_stats_to_proto)
             .collect::<Result<Vec<_>, _>>()?,
-        tenant_name: stats.tenant_name,
         database_name: stats.database_name,
     })
 }
 
-fn normalize_namespace(tenant_name: &str, database_name: &str) -> (String, String) {
-    let tenant_name = if tenant_name.trim().is_empty() {
-        DEFAULT_TENANT_NAME.to_owned()
-    } else {
-        tenant_name.to_owned()
-    };
-    let database_name = if database_name.trim().is_empty() {
+fn database_access_policy_to_proto(policy: DatabaseAccessPolicy) -> DatabaseAccessPolicyReply {
+    DatabaseAccessPolicyReply {
+        database_name: policy.database_name,
+        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
+        role_bindings: policy
+            .role_bindings
+            .into_iter()
+            .map(database_role_binding_to_proto)
+            .collect(),
+    }
+}
+
+fn database_access_policy_from_proto(
+    policy: DatabaseAccessPolicyReply,
+) -> Result<DatabaseAccessPolicy, Status> {
+    Ok(DatabaseAccessPolicy {
+        database_name: normalize_database_name(&policy.database_name),
+        authentication_mode: authentication_mode_from_proto(policy.authentication_mode)?,
+        role_bindings: policy
+            .role_bindings
+            .into_iter()
+            .map(database_role_binding_from_proto)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn database_role_binding_to_proto(binding: DatabaseRoleBinding) -> DatabaseRoleBindingReply {
+    DatabaseRoleBindingReply {
+        database_name: binding.database_name,
+        principal_name: binding.principal_name,
+        role: database_role_to_proto(binding.role) as i32,
+    }
+}
+
+fn database_role_binding_from_proto(
+    binding: DatabaseRoleBindingReply,
+) -> Result<DatabaseRoleBinding, Status> {
+    Ok(DatabaseRoleBinding {
+        database_name: normalize_database_name(&binding.database_name),
+        principal_name: binding.principal_name,
+        role: database_role_from_proto(binding.role)?,
+    })
+}
+
+fn normalize_database_name(database_name: &str) -> String {
+    if database_name.trim().is_empty() {
         DEFAULT_DATABASE_NAME.to_owned()
     } else {
         database_name.to_owned()
-    };
-    (tenant_name, database_name)
+    }
 }
 
-fn collection_lookup_key(tenant_name: &str, database_name: &str, collection_name: &str) -> String {
-    let (tenant_name, database_name) = normalize_namespace(tenant_name, database_name);
-    format!("{tenant_name}/{database_name}/{collection_name}")
+fn collection_lookup_key(database_name: &str, collection_name: &str) -> String {
+    format!(
+        "{}/{}",
+        normalize_database_name(database_name),
+        collection_name
+    )
 }
 
 fn maintenance_status_to_proto(status: MaintenanceStatus) -> proto::MaintenanceStatus {
@@ -756,6 +899,50 @@ fn node_role_to_proto(role: NodeRole) -> ProtoNodeRole {
         NodeRole::Combined => ProtoNodeRole::Combined,
         NodeRole::Control => ProtoNodeRole::Control,
         NodeRole::Data => ProtoNodeRole::Data,
+    }
+}
+
+fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
+    match mode {
+        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
+        AuthenticationMode::Password => proto::AuthenticationMode::Password,
+        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
+        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
+    }
+}
+
+fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, Status> {
+    match proto::AuthenticationMode::try_from(mode).map_err(|_| {
+        Status::invalid_argument(format!("unsupported authentication mode '{mode}'"))
+    })? {
+        proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
+        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
+        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
+        proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
+        proto::AuthenticationMode::Unspecified => {
+            Err(Status::invalid_argument("authentication mode is required"))
+        }
+    }
+}
+
+fn database_role_to_proto(role: DatabaseRole) -> proto::DatabaseRole {
+    match role {
+        DatabaseRole::Owner => proto::DatabaseRole::Owner,
+        DatabaseRole::ReadWrite => proto::DatabaseRole::ReadWrite,
+        DatabaseRole::ReadOnly => proto::DatabaseRole::ReadOnly,
+    }
+}
+
+fn database_role_from_proto(role: i32) -> Result<DatabaseRole, Status> {
+    match proto::DatabaseRole::try_from(role)
+        .map_err(|_| Status::invalid_argument(format!("unsupported database role '{role}'")))?
+    {
+        proto::DatabaseRole::Owner => Ok(DatabaseRole::Owner),
+        proto::DatabaseRole::ReadWrite => Ok(DatabaseRole::ReadWrite),
+        proto::DatabaseRole::ReadOnly => Ok(DatabaseRole::ReadOnly),
+        proto::DatabaseRole::Unspecified => {
+            Err(Status::invalid_argument("database role is required"))
+        }
     }
 }
 
@@ -806,11 +993,32 @@ fn scalar_field_stats_to_proto(stats: ScalarFieldStats) -> Result<proto::ScalarF
     })
 }
 
+fn request_auth_from_metadata<T>(request: &Request<T>) -> Result<RequestAuth, Status> {
+    let value = match request.metadata().get("authorization") {
+        Some(value) => value,
+        None => return Ok(RequestAuth::default()),
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| Status::unauthenticated("authorization metadata must be valid ASCII"))?;
+    let (scheme, token) = value.split_once(' ').ok_or_else(|| {
+        Status::unauthenticated("authorization metadata must use the Bearer scheme")
+    })?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+        return Err(Status::unauthenticated(
+            "authorization metadata must use the Bearer scheme",
+        ));
+    }
+    Ok(RequestAuth::bearer_token(token.trim()))
+}
+
 fn status_from_service_error(error: ServiceError) -> Status {
     match error {
         ServiceError::AlreadyExists(message) => Status::already_exists(message),
         ServiceError::NotFound(message) => Status::not_found(message),
         ServiceError::InvalidArgument(message) => Status::invalid_argument(message),
+        ServiceError::Unauthenticated(message) => Status::unauthenticated(message),
+        ServiceError::PermissionDenied(message) => Status::permission_denied(message),
         ServiceError::Internal(message) => Status::internal(message),
     }
 }
@@ -818,7 +1026,11 @@ fn status_from_service_error(error: ServiceError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use logpose_config::LogPoseConfig;
+    use logpose_auth::{
+        AccessTier, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding, Principal,
+        PrincipalKind,
+    };
+    use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryStageTimings};
     use serde_json::Value;
     use std::{
@@ -827,6 +1039,7 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tonic::metadata::MetadataValue;
 
     #[test]
     fn query_diagnostics_to_proto_preserves_ann_fields() {
@@ -1147,6 +1360,178 @@ mod tests {
         assert!(!metadata.version.is_empty());
         assert!(!metadata.git_sha.is_empty());
         assert_eq!(metadata.profile, "debug");
+    }
+
+    #[tokio::test]
+    async fn grpc_runtime_status_requires_bearer_token_when_auth_is_configured() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(auth_test_config(
+            "grpc-auth-runtime",
+        ))));
+
+        let unauthorized = service
+            .get_runtime_status(Request::new(GetRuntimeStatusRequest {}))
+            .await
+            .expect_err("missing token should be rejected");
+        assert_eq!(unauthorized.code(), tonic::Code::Unauthenticated);
+
+        let authorized = service
+            .get_runtime_status(authorized_request(
+                GetRuntimeStatusRequest {},
+                "operator-secret",
+            ))
+            .await
+            .expect("operator token should be accepted")
+            .into_inner();
+        assert_eq!(
+            authorized
+                .metadata
+                .expect("metadata should be present")
+                .node_name,
+            "grpc-auth-runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_database_rpcs_round_trip_with_operator_auth() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(auth_test_config(
+            "grpc-namespace-auth",
+        ))));
+
+        let unauthorized = service
+            .list_databases(Request::new(ListDatabasesRequest {}))
+            .await
+            .expect_err("missing token should be rejected");
+        assert_eq!(unauthorized.code(), tonic::Code::Unauthenticated);
+
+        let put_database = service
+            .put_database(authorized_request(
+                put_database_request("analytics"),
+                "operator-secret",
+            ))
+            .await
+            .expect("operator token should create database")
+            .into_inner();
+        assert_eq!(put_database.name, "analytics");
+
+        let get_database = service
+            .get_database(authorized_request(
+                get_database_request("analytics"),
+                "operator-secret",
+            ))
+            .await
+            .expect("operator token should read database")
+            .into_inner();
+        assert_eq!(get_database.name, "analytics");
+
+        let databases = service
+            .list_databases(authorized_request(
+                list_databases_request(),
+                "operator-secret",
+            ))
+            .await
+            .expect("operator token should list databases")
+            .into_inner();
+        assert_eq!(databases.databases.len(), 2);
+        assert!(
+            databases
+                .databases
+                .iter()
+                .any(|database| database.name == "default" && database.is_default),
+            "default database should be bootstrapped lazily"
+        );
+        assert!(
+            databases
+                .databases
+                .iter()
+                .any(|database| database.name == "analytics" && !database.is_default),
+            "created database should still be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_database_policy_rpcs_round_trip_and_map_service_errors() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-policy"))));
+
+        let put = service
+            .put_database_policy(Request::new(put_database_policy_request("default")))
+            .await
+            .expect("put policy should succeed")
+            .into_inner();
+        assert_eq!(put.database_name, "default");
+        assert_eq!(
+            put.authentication_mode,
+            proto::AuthenticationMode::ExternalToken as i32
+        );
+        assert_eq!(put.role_bindings.len(), 2);
+
+        let get = service
+            .get_database_policy(Request::new(get_database_policy_request("default")))
+            .await
+            .expect("get policy should succeed")
+            .into_inner();
+        assert_eq!(get, put);
+
+        let data_only = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
+            "grpc-policy-data-only",
+            NodeRole::Data,
+        ))));
+        let error = data_only
+            .put_database_policy(Request::new(put_database_policy_request("default")))
+            .await
+            .expect_err("data-only node should reject policy mutation");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .contains("data-only nodes cannot accept control-plane database policy mutations")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_read_only_principals_can_read_but_not_write_when_auth_is_configured() {
+        let state = Arc::new(AppState::new(auth_test_config("grpc-auth-readonly")));
+        state
+            .control
+            .set_database_access_policy(read_only_policy("default", "reader"))
+            .await
+            .expect("database policy should persist");
+        state
+            .control
+            .create_collection(storage_create_collection_request(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let service = GrpcLogPoseService::new(state);
+
+        service
+            .get_collection_stats(authorized_request(
+                get_collection_stats_request("documents"),
+                "reader-secret",
+            ))
+            .await
+            .expect("read-only principal should read stats");
+
+        let error = service
+            .write_collection(authorized_request(
+                write_collection_request(
+                    "documents",
+                    vec![proto::WriteOperation {
+                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                            id: "alpha".to_owned(),
+                            vector: vec![1.0, 0.0],
+                            metadata_json: "{}".to_owned(),
+                        })),
+                    }],
+                ),
+                "reader-secret",
+            ))
+            .await
+            .expect_err("read-only principal should not write");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -1867,11 +2252,8 @@ mod tests {
         );
     }
 
-    fn default_namespace() -> (String, String) {
-        (
-            DEFAULT_TENANT_NAME.to_owned(),
-            DEFAULT_DATABASE_NAME.to_owned(),
-        )
+    fn default_database_name() -> String {
+        DEFAULT_DATABASE_NAME.to_owned()
     }
 
     fn create_collection_request(
@@ -1879,13 +2261,11 @@ mod tests {
         dimensions: u64,
         metric: proto::DistanceMetric,
     ) -> CreateCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         CreateCollectionRequest {
             name: name.to_owned(),
             dimensions,
             metric: metric as i32,
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
@@ -1894,31 +2274,25 @@ mod tests {
         dimensions: usize,
         metric: DistanceMetric,
     ) -> StorageCreateCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
-        StorageCreateCollectionRequest {
-            tenant_name,
-            database_name,
-            name: name.to_owned(),
+        StorageCreateCollectionRequest::in_database(
+            default_database_name(),
+            name.to_owned(),
             dimensions,
             metric,
-        }
+        )
     }
 
     fn get_collection_request(collection_name: &str) -> GetCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         GetCollectionRequest {
             collection_name: collection_name.to_owned(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
     fn get_collection_placement_request(collection_name: &str) -> GetCollectionPlacementRequest {
-        let (tenant_name, database_name) = default_namespace();
         GetCollectionPlacementRequest {
             collection_name: collection_name.to_owned(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
@@ -1926,12 +2300,10 @@ mod tests {
         collection_name: &str,
         operations: Vec<proto::WriteOperation>,
     ) -> WriteCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         WriteCollectionRequest {
             collection_name: collection_name.to_owned(),
             operations,
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
@@ -1940,7 +2312,6 @@ mod tests {
         vector: Vec<f32>,
         top_k: u64,
     ) -> QueryCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         QueryCollectionRequest {
             collection_name: collection_name.to_owned(),
             vector,
@@ -1949,35 +2320,28 @@ mod tests {
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
     fn get_collection_stats_request(collection_name: &str) -> GetCollectionStatsRequest {
-        let (tenant_name, database_name) = default_namespace();
         GetCollectionStatsRequest {
             collection_name: collection_name.to_owned(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
     fn flush_collection_request(collection_name: &str) -> FlushCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         FlushCollectionRequest {
             collection_name: collection_name.to_owned(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
     fn compact_collection_request(collection_name: &str) -> CompactCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         CompactCollectionRequest {
             collection_name: collection_name.to_owned(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
     }
 
@@ -1986,14 +2350,61 @@ mod tests {
         target: proto::InspectTarget,
         segment_id: impl Into<String>,
     ) -> InspectCollectionRequest {
-        let (tenant_name, database_name) = default_namespace();
         InspectCollectionRequest {
             collection_name: collection_name.to_owned(),
             target: target as i32,
             segment_id: segment_id.into(),
-            tenant_name,
-            database_name,
+            database_name: default_database_name(),
         }
+    }
+
+    fn put_database_policy_request(database_name: &str) -> proto::PutDatabasePolicyRequest {
+        proto::PutDatabasePolicyRequest {
+            policy: Some(proto::DatabaseAccessPolicyReply {
+                database_name: database_name.to_owned(),
+                authentication_mode: proto::AuthenticationMode::ExternalToken as i32,
+                role_bindings: vec![
+                    proto::DatabaseRoleBindingReply {
+                        database_name: database_name.to_owned(),
+                        principal_name: "ops-admin".to_owned(),
+                        role: proto::DatabaseRole::Owner as i32,
+                    },
+                    proto::DatabaseRoleBindingReply {
+                        database_name: database_name.to_owned(),
+                        principal_name: "reader-service".to_owned(),
+                        role: proto::DatabaseRole::ReadOnly as i32,
+                    },
+                ],
+            }),
+        }
+    }
+
+    fn get_database_policy_request(database_name: &str) -> proto::GetDatabasePolicyRequest {
+        proto::GetDatabasePolicyRequest {
+            database_name: database_name.to_owned(),
+        }
+    }
+
+    fn put_database_request(database_name: &str) -> proto::PutDatabaseRequest {
+        proto::PutDatabaseRequest {
+            descriptor: Some(proto::DatabaseDescriptorReply {
+                database_id: logpose_catalog::DatabaseDescriptor::new(database_name)
+                    .database_id
+                    .to_string(),
+                name: database_name.to_owned(),
+                is_default: database_name == DEFAULT_DATABASE_NAME,
+            }),
+        }
+    }
+
+    fn get_database_request(database_name: &str) -> proto::GetDatabaseRequest {
+        proto::GetDatabaseRequest {
+            database_name: database_name.to_owned(),
+        }
+    }
+
+    fn list_databases_request() -> proto::ListDatabasesRequest {
+        proto::ListDatabasesRequest {}
     }
 
     fn test_config(label: &str) -> LogPoseConfig {
@@ -2015,6 +2426,51 @@ mod tests {
             storage_root,
             ..LogPoseConfig::default()
         }
+    }
+
+    fn auth_test_config(label: &str) -> LogPoseConfig {
+        let mut config = test_config(label);
+        config.auth.bootstrap_tokens = vec![
+            BootstrapTokenConfig {
+                token: "operator-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            },
+            BootstrapTokenConfig {
+                token: "reader-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "reader",
+                    PrincipalKind::User,
+                    AccessTier::Service,
+                ),
+            },
+        ];
+        config
+    }
+
+    fn read_only_policy(database_name: &str, principal_name: &str) -> DatabaseAccessPolicy {
+        DatabaseAccessPolicy {
+            database_name: database_name.to_owned(),
+            authentication_mode: AuthenticationMode::ExternalToken,
+            role_bindings: vec![DatabaseRoleBinding {
+                database_name: database_name.to_owned(),
+                principal_name: principal_name.to_owned(),
+                role: DatabaseRole::ReadOnly,
+            }],
+        }
+    }
+
+    fn authorized_request<T>(message: T, token: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}"))
+                .expect("authorization metadata should be valid"),
+        );
+        request
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

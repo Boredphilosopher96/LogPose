@@ -624,7 +624,12 @@ fn assignment_conflict(error: &LogPoseError) -> bool {
 }
 
 fn canonical_collection_lookup_name(collection_name: &str) -> String {
-    CollectionRef::from_lookup_key(collection_name).lookup_name()
+    let parts = collection_name.split('/').collect::<Vec<_>>();
+    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        CollectionRef::new_default(collection_name).lookup_name()
+    }
 }
 
 fn matching_assignment_without_local_state(
@@ -1047,8 +1052,35 @@ mod tests {
         .expect("store should build");
 
         assert_eq!(
-            store.assignment_key("tenant-a/analytics/documents"),
-            "/logpose/metadata/clusters/prod-cluster/collections/tenant-a/analytics/documents/assignment"
+            store.assignment_key("analytics/documents"),
+            "/logpose/metadata/clusters/prod-cluster/collections/analytics/documents/assignment"
+        );
+    }
+
+    #[test]
+    fn assignment_keys_do_not_collide_across_clusters() {
+        let prod = EtcdPlacementStore::new(EtcdMetadataConfig {
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key_prefix: "/logpose/metadata".to_owned(),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+            cluster_name: "prod-cluster".to_owned(),
+        })
+        .expect("prod store should build");
+        let staging = EtcdPlacementStore::new(EtcdMetadataConfig {
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key_prefix: "/logpose/metadata".to_owned(),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+            cluster_name: "staging-cluster".to_owned(),
+        })
+        .expect("staging store should build");
+
+        assert_ne!(
+            prod.assignment_key("analytics/documents"),
+            staging.assignment_key("analytics/documents")
         );
     }
 
@@ -1061,8 +1093,8 @@ mod tests {
         .expect("store should build");
 
         assert_eq!(
-            store.descriptor_key("tenant-a/analytics/documents"),
-            "/logpose/metadata/clusters/prod-cluster/collections/tenant-a/analytics/documents/descriptor"
+            store.descriptor_key("analytics/documents"),
+            "/logpose/metadata/clusters/prod-cluster/collections/analytics/documents/descriptor"
         );
     }
 
@@ -1075,11 +1107,8 @@ mod tests {
         .expect("coordination client should build");
 
         assert_eq!(
-            client.shard_owner_key(
-                &CollectionRef::new("tenant-a", "analytics", "documents"),
-                "0"
-            ),
-            "/logpose/metadata/clusters/prod-cluster/collections/tenant-a/analytics/documents/shards/0/owner"
+            client.shard_owner_key(&CollectionRef::new("analytics", "documents"), "0"),
+            "/logpose/metadata/clusters/prod-cluster/collections/analytics/documents/shards/0/owner"
         );
     }
 
@@ -1131,7 +1160,7 @@ mod tests {
     #[test]
     fn shard_ownership_round_trip_json() {
         let payload = ShardOwnership {
-            collection: CollectionRef::new("tenant-a", "analytics", "documents"),
+            collection: CollectionRef::new("analytics", "documents"),
             shard_id: "shard-0".to_owned(),
             owner_node_id: "node-a".to_owned(),
             epoch: 4,
@@ -1156,7 +1185,7 @@ mod tests {
     #[test]
     fn shard_ownership_does_not_persist_mod_revision() {
         let payload = ShardOwnership {
-            collection: CollectionRef::new("tenant-a", "analytics", "documents"),
+            collection: CollectionRef::new("analytics", "documents"),
             shard_id: "shard-0".to_owned(),
             owner_node_id: "node-a".to_owned(),
             epoch: 4,
@@ -1170,10 +1199,6 @@ mod tests {
             "mod_revision should not be persisted in etcd payloads"
         );
         assert_eq!(
-            encoded.get("tenant_name"),
-            Some(&serde_json::json!("tenant-a"))
-        );
-        assert_eq!(
             encoded.get("database_name"),
             Some(&serde_json::json!("analytics"))
         );
@@ -1185,8 +1210,7 @@ mod tests {
 
     #[test]
     fn stored_collection_descriptors_strip_runtime_paths_and_track_readiness() {
-        let descriptor = CollectionDescriptor::new_in_namespace(
-            "tenant-a",
+        let descriptor = CollectionDescriptor::new_in_database(
             "analytics",
             "documents",
             2,
@@ -1261,11 +1285,51 @@ mod tests {
 
     #[test]
     fn stale_assignment_requires_manual_reconciliation_error_is_explicit() {
-        let error =
-            stale_assignment_requires_manual_reconciliation_error("tenant-a/analytics/documents");
+        let error = stale_assignment_requires_manual_reconciliation_error("analytics/documents");
 
         assert!(error.to_string().contains("manual reconciliation"));
-        assert!(error.to_string().contains("tenant-a/analytics/documents"));
+        assert!(error.to_string().contains("analytics/documents"));
+    }
+
+    #[test]
+    fn rollback_failure_error_includes_assignment_key_and_manual_reconciliation_hint() {
+        let _store = EtcdPlacementStore::new(EtcdMetadataConfig {
+            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            key_prefix: "/logpose/metadata".to_owned(),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+            cluster_name: "prod-cluster".to_owned(),
+        })
+        .expect("store should build");
+        let error = rollback_failure_error(
+            "analytics/documents",
+            "local collection bootstrap failed",
+            LogPoseError::Message("etcd metadata operation failed: permission denied".to_owned()),
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("local collection bootstrap failed"),
+            "create failure should remain visible: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("etcd metadata operation failed: permission denied"),
+            "rollback failure should remain visible: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("rollback of authoritative etcd metadata"),
+            "rollback failure should mention authoritative metadata rollback: {error}"
+        );
+        assert!(
+            error.to_string().contains("analytics/documents"),
+            "rollback failure should preserve the collection identity: {error}"
+        );
     }
 
     #[tokio::test]

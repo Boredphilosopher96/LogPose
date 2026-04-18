@@ -20,11 +20,28 @@ ergonomics.
 
 ## Authentication
 
-The public API surface does not currently enforce authentication or RBAC.
-All endpoints are open once the server is reachable. Browser-ready auth
-and role-based access control are tracked as future work. The runtime now
-persists collections inside a default database catalog entry, but database-
-scoped policy enforcement is not implemented yet.
+LogPose now supports bootstrap bearer-token authentication and database-scoped
+authorization.
+
+- Configure accepted bootstrap tokens under `auth.bootstrap_tokens` in `LOGPOSE_CONFIG`.
+- Send `Authorization: Bearer <token>` on REST requests.
+- Send `authorization: Bearer <token>` gRPC metadata on gRPC requests.
+- `/health` remains open. Operator-only endpoints such as runtime status and
+  database management require an operator-tier principal.
+- Database-scoped policies gate collection reads, writes, flushes, compactions,
+  and policy changes.
+
+Example bootstrap config:
+
+```toml
+[[auth.bootstrap_tokens]]
+token = "operator-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "ops-admin"
+kind = "user"
+access_tier = "operator"
+```
 
 ## Base URL and Versioning
 
@@ -56,7 +73,7 @@ Snapshot references are used across writes, queries, flushes, and compactions:
 ```
 
 Collection-scoped write/query/flush/compact/inspect responses flatten
-`tenant_name`, `database_name`, and `collection_name` into the top-level JSON
+`database_name` and `collection_name` into the top-level JSON
 payload so operators can tell which namespace produced the response without
 reconstructing it from the request path.
 
@@ -116,7 +133,8 @@ Returns a control-plane summary including node role, listener endpoints,
 collection placements, and maintenance backlog.
 
 ```bash
-curl http://127.0.0.1:8080/v1/runtime/status
+curl http://127.0.0.1:8080/v1/runtime/status \
+  -H "Authorization: Bearer operator-secret"
 ```
 
 **Response** (`200`):
@@ -134,7 +152,6 @@ curl http://127.0.0.1:8080/v1/runtime/status
   "collections": [
     {
       "collection_id": "550e8400-e29b-41d4-a716-446655440000",
-      "tenant_name": "default",
       "database_name": "default",
       "collection_name": "embeddings",
       "assigned_node": "node-alpha",
@@ -158,17 +175,33 @@ gRPC equivalent:
 rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
 ```
 
+### Database Management
+
+Operator principals can provision database descriptors explicitly instead of
+relying on collection or policy side effects. Operator UX is database-scoped:
+collections live under `database/collection` namespaces, and the default
+database is used when no database is selected.
+
+```bash
+curl -X PUT http://127.0.0.1:8080/v1/databases/analytics \
+  -H "Authorization: Bearer operator-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"database_id":"550e8400-e29b-41d4-a716-446655440001","name":"analytics","is_default":false}'
+```
+
 ### Create Collection
 
 Creates a new vector collection. Control-plane lifecycle changes are only
 accepted on nodes with the `combined` role. Request and response bodies are
-namespace-aware: omit `tenant_name` / `database_name` to use the bootstrap
-`default/default` namespace, or set them explicitly for non-default scopes.
+namespace-aware: omit `database_name` to use the bootstrap `default`
+database, or set it explicitly for non-default scopes.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections \
+  -H "Authorization: Bearer operator-secret" \
   -H "Content-Type: application/json" \
   -d '{
+    "database_name": "analytics",
     "name": "embeddings",
     "dimensions": 768,
     "metric": "cosine"
@@ -177,19 +210,17 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 
 **Request body**:
 
-| Field           | Type    | Required | Description                              |
-|-----------------|---------|----------|------------------------------------------|
-| `tenant_name`   | string  | no       | Tenant namespace; defaults to `default`  |
-| `database_name` | string  | no       | Database namespace; defaults to `default`|
-| `name`          | string  | yes      | Unique collection name                   |
-| `dimensions`    | integer | yes      | Vector dimensionality (>= 1)             |
-| `metric`        | string  | yes      | Distance metric: `cosine`, `dot`, `l2`   |
+| Field           | Type    | Required | Description                                              |
+|-----------------|---------|----------|----------------------------------------------------------|
+| `database_name` | string  | no       | Target database; defaults to `default` when omitted      |
+| `name`          | string  | yes      | Unique collection name inside the selected database      |
+| `dimensions`    | integer | yes      | Vector dimensionality (>= 1)                             |
+| `metric`        | string  | yes      | Distance metric: `cosine`, `dot`, `l2`                   |
 
 **Response** (`201`):
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "embeddings",
@@ -215,10 +246,19 @@ gRPC equivalent:
 rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
 ```
 
+Collection routes target the `default` database unless you select another one.
+For non-default collections:
+
+- use `?database=analytics` on read-style routes such as `GET /v1/collections/{name}`,
+  `.../placement`, `.../stats`, `.../flush`, `.../compact`, and `.../inspect`
+- include `"database_name": "analytics"` in write/query request bodies
+- include `Authorization: Bearer <token>` on collection control-plane requests, and on
+  data-plane requests whenever auth is enabled
+
 ### Get Collection
 
-Retrieves metadata for an existing collection by name. Use `tenant` /
-`database` query parameters for non-default namespaces.
+Retrieves metadata for an existing collection by name. Use the `database`
+query parameter for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings
@@ -232,8 +272,8 @@ curl http://127.0.0.1:8080/v1/collections/embeddings
 
 ### Get Collection Placement
 
-Returns placement routing information for a collection. Use `tenant` /
-`database` query parameters for non-default namespaces.
+Returns placement routing information for a collection. Use the `database`
+query parameter for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/placement
@@ -244,7 +284,6 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/placement
 ```json
 {
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "assigned_node": "node-alpha",
@@ -265,8 +304,7 @@ rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPla
 Submits a mixed batch of `put` and `delete` operations to a collection.
 Data-plane calls are rejected when the runtime cannot serve the collection
 locally.
-For non-default namespaces, include `tenant_name` and `database_name` in the
-request body.
+For non-default namespaces, include `database_name` in the request body.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
@@ -297,7 +335,6 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "last_seq_no": 1023,
@@ -321,8 +358,7 @@ rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
 
 Executes a planner-controlled vector query with optional metadata filtering
 and explain diagnostics.
-For non-default namespaces, include `tenant_name` and `database_name` in the
-request body.
+For non-default namespaces, include `database_name` in the request body.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
@@ -336,22 +372,20 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 
 **Request body**:
 
-| Field             | Type    | Required | Description                                           |
-|-------------------|---------|----------|-------------------------------------------------------|
-| `tenant_name`     | string  | no       | Tenant namespace; defaults to `default`               |
-| `database_name`   | string  | no       | Database namespace; defaults to `default`             |
-| `vector`          | float[] | yes      | Query vector                                          |
-| `top_k`           | integer | yes      | Maximum results to return (>= 1)                      |
-| `snapshot`        | object  | no       | Pin query to a specific snapshot                      |
-| `filters`         | object  | no       | Legacy AND-only equality filters over scalar metadata |
-| `predicate`       | object  | no       | Structured predicate tree (see below)                 |
-| `explain`         | string  | no       | `"none"`, `"plan"`, or `"profile"`                    |
+| Field           | Type    | Required | Description                                           |
+|-----------------|---------|----------|-------------------------------------------------------|
+| `database_name` | string  | no       | Database namespace; defaults to `default`             |
+| `vector`        | float[] | yes      | Query vector                                          |
+| `top_k`         | integer | yes      | Maximum results to return (>= 1)                      |
+| `snapshot`      | object  | no       | Pin query to a specific snapshot                      |
+| `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata |
+| `predicate`     | object  | no       | Structured predicate tree (see below)                 |
+| `explain`       | string  | no       | `"none"`, `"plan"`, or `"profile"`                    |
 
 **Response** (`200`):
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "metric": "cosine",
@@ -442,7 +476,7 @@ filter selectivity:
 ### Collection Stats
 
 Returns storage statistics, maintenance state, and per-query-unit breakdowns.
-Use `tenant` / `database` query parameters for non-default namespaces.
+Use the `database` query parameter for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -452,7 +486,6 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "collection_name": "embeddings",
@@ -501,7 +534,7 @@ rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply)
 ### Flush Collection
 
 Flushes the mutable delta into a new immutable segment.
-Use `tenant` / `database` query parameters for non-default namespaces.
+Use the `database` query parameter for non-default namespaces.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/flush
@@ -511,7 +544,6 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/flush
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "manifest_generation": 5,
@@ -529,7 +561,7 @@ rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
 
 Merges immutable segments to reduce segment count and reclaim space from
 tombstoned deletes.
-Use `tenant` / `database` query parameters for non-default namespaces.
+Use the `database` query parameter for non-default namespaces.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/compact
@@ -539,7 +571,6 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/compact
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "manifest_generation": 6,
@@ -556,7 +587,7 @@ rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
 ### Inspect Collection
 
 Returns low-level storage inspection reports for debugging and diagnostics.
-Use `tenant` / `database` query parameters for non-default namespaces.
+Use the `database` query parameter for non-default namespaces.
 
 ```bash
 # Inspect manifest
@@ -581,7 +612,6 @@ curl "http://127.0.0.1:8080/v1/collections/embeddings/inspect?target=maintenance
 
 ```json
 {
-  "tenant_name": "default",
   "database_name": "default",
   "collection_name": "embeddings",
   "target": "manifest",

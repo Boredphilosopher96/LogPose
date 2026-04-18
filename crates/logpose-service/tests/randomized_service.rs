@@ -1,8 +1,10 @@
 //! Seeded randomized service and transport parity tests.
 
 use async_trait as _;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_service as _;
+use serde as _;
 use thiserror as _;
 
 #[path = "support/randomized.rs"]

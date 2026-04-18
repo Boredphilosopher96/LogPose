@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-config = { path = "../logpose-config" }
 logpose-query = { path = "../logpose-query" }
@@ -25,6 +26,7 @@ logpose-api-rest = { path = "../logpose-api-rest" }
 logpose-config = { path = "../logpose-config" }
 logpose-core = { path = "../logpose-core" }
 rand = "~0.10"
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true

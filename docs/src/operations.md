@@ -14,9 +14,11 @@ Operational workflows are centered around:
 Use the server as the source of truth for service behavior, and treat the CLI as the preferred operator entrypoint for configuration inspection, query diagnostics, and maintenance. The CLI now has two explicit modes:
 
 - `logpose-cli interactive` for a guided dashboard with concern-based navigation, searchable workflow pickers, persistent result tabs, clipboard-friendly views, and a shortcut bar that stays visible while you work
-- direct commands such as `status`, `config`, `collection`, `record`, `query`, and `inspect` for fast operator and scripting workflows
+- direct commands such as `status`, `config`, `database`, `collection`, `record`, `query`, and `inspect` for fast operator and scripting workflows
 
 Direct commands default to concise human-readable summaries. Use `--json` or `--output json` when you need the exact machine-readable contract. REST and gRPC should remain transport-parity views over the same shared workflows, with no semantic drift between them.
+
+Namespace handling is now database-first. `database list/show/put` sit at the top level, and collection, record, query, and inspect flows default to the `default` database unless you pass `--database <name>`. Human-facing collection labels use `database/collection` outside the default database and collapse to just `collection` inside it.
 
 In interactive mode, the flow is intentionally layered: start from a broad concern area, narrow to a workflow, then fill a guided form with fuzzy-searchable selectors where appropriate. Results stay open instead of ending the session, which makes it practical to copy output, compare summary and json views, or jump straight back into repeat operations such as adding multiple files to the same collection.
 
@@ -38,9 +40,9 @@ Operator-facing query diagnostics now include ANN-aware plan kinds, candidate ge
 Operationally, LogPose is still earlier than a distributed database:
 
 - etcd-backed collection-assignment metadata can now be enabled, but metadata quorum, membership leases, and replica controllers are not complete
-- collections now live under a persisted default database descriptor, but database-scoped auth, ACLs, and multi-tenant routing are not implemented yet
-- `/health` remains a lightweight liveness probe; runtime-status readiness bits are still an early local signal rather than a full distributed readiness contract
-- authentication and authorization are scaffolds, not full operator policy enforcement
+- bootstrap bearer authentication, operator-gated database admin, and database-scoped read/write/owner policies now exist, but principal lifecycle and richer policy listing/delete workflows are not complete
+- health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
+- database descriptors are now explicit control-plane objects, but etcd-backed catalog replication and distributed namespace controllers are not implemented yet
 - tracing is initialized, but a metrics endpoint and richer telemetry surfaces do not exist yet
 - remote blob synchronization to MinIO or S3 is not implemented yet
 

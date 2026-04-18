@@ -2,6 +2,7 @@ use axum::body::Body;
 use http_body_util::BodyExt;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
+use logpose_auth as _;
 use logpose_core::AppState;
 use logpose_query::{
     ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
@@ -9,11 +10,11 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord,
-    DistanceMetric, MaintenanceStatus, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation,
+    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
+    MaintenanceStatus, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
+use serde as _;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -156,7 +157,6 @@ impl ExpectedModel {
                     .parse()
                     .expect("collection id should be valid uuid"),
             ),
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
             manifest_generation: self.manifest_generation,
@@ -619,7 +619,6 @@ async fn assert_query_parity(
             filters: Vec::new(),
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::None as i32,
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
         }))
         .await
@@ -774,7 +773,6 @@ async fn assert_query_parity(
             filters: Vec::new(),
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::Profile as i32,
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
         }))
         .await
@@ -935,7 +933,6 @@ async fn assert_stats_parity(
     let grpc_stats = grpc
         .get_collection_stats(Request::new(proto::GetCollectionStatsRequest {
             collection_name: COLLECTION_NAME.to_owned(),
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
         }))
         .await
@@ -1120,7 +1117,6 @@ async fn assert_inspect_parity(
                     String::new()
                 }
             },
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
         }))
         .await
@@ -1237,7 +1233,6 @@ async fn assert_inspect_segment_parity(
             collection_name: COLLECTION_NAME.to_owned(),
             target: proto::InspectTarget::Segment as i32,
             segment_id: segment_id.clone(),
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
         }))
         .await
@@ -1997,4 +1992,25 @@ fn assert_eq_with_context<T>(
 #[allow(clippy::panic)]
 fn panic_with_context(seed: u64, trace: &[ServiceAction], message: String) -> ! {
     panic!("seed={seed}\ntrace={trace:#?}\n{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_stats_are_database_scoped() {
+        let mut model = ExpectedModel::new();
+        model.register_collection(
+            "00000000-0000-0000-0000-000000000001".to_owned(),
+            DistanceMetric::Cosine,
+        );
+
+        let payload = serde_json::to_value(model.expected_stats())
+            .expect("collection stats should serialize");
+
+        assert_eq!(payload["database_name"], DEFAULT_DATABASE_NAME);
+        assert_eq!(payload["collection_name"], COLLECTION_NAME);
+        assert!(payload.get("tenant_name").is_none());
+    }
 }

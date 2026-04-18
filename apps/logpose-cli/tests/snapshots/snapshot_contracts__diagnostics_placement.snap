@@ -9,6 +9,5 @@ expression: placement
   "collection_name": "documents",
   "database_name": "default",
   "route_kind": "local",
-  "route_reason": "single-node combined runtime exposes a local data-plane assignment",
-  "tenant_name": "default"
+  "route_reason": "single-node combined runtime exposes a local data-plane assignment"
 }

@@ -1,5 +1,6 @@
+use logpose_auth::{AccessTier, Principal, PrincipalKind};
 use logpose_client::LogPoseClient;
-use logpose_config::LogPoseConfig;
+use logpose_config::{AuthConfig, BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
 use std::{
     fs,
@@ -16,6 +17,8 @@ pub struct TestServerFixture {
     pub temp_root: PathBuf,
     pub rest_addr: SocketAddr,
     pub grpc_addr: SocketAddr,
+    #[allow(dead_code)]
+    pub auth_token: Option<String>,
     runtime: Runtime,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -28,8 +31,28 @@ impl TestServerFixture {
         Self::spawn_with_role(node_name, logpose_types::NodeRole::Combined)
     }
 
+    pub fn spawn_with_auth(node_name: &str) -> Self {
+        Self::spawn_with_role_and_auth(node_name, logpose_types::NodeRole::Combined)
+    }
+
     pub fn spawn_with_role(node_name: &str, node_role: logpose_types::NodeRole) -> Self {
-        Self::spawn_with_listener_hosts(node_name, node_role, "127.0.0.1", "127.0.0.1")
+        Self::spawn_with_listener_hosts_and_auth(
+            node_name,
+            node_role,
+            "127.0.0.1",
+            "127.0.0.1",
+            AuthConfig::default(),
+        )
+    }
+
+    pub fn spawn_with_role_and_auth(node_name: &str, node_role: logpose_types::NodeRole) -> Self {
+        Self::spawn_with_listener_hosts_and_auth(
+            node_name,
+            node_role,
+            "127.0.0.1",
+            "127.0.0.1",
+            default_auth_config(),
+        )
     }
 
     pub fn spawn_with_listener_hosts(
@@ -38,8 +61,28 @@ impl TestServerFixture {
         rest_host: &str,
         grpc_host: &str,
     ) -> Self {
+        Self::spawn_with_listener_hosts_and_auth(
+            node_name,
+            node_role,
+            rest_host,
+            grpc_host,
+            AuthConfig::default(),
+        )
+    }
+
+    fn spawn_with_listener_hosts_and_auth(
+        node_name: &str,
+        node_role: logpose_types::NodeRole,
+        rest_host: &str,
+        grpc_host: &str,
+        auth: AuthConfig,
+    ) -> Self {
         let temp_root = unique_temp_dir(node_name);
         let storage_root = temp_root.join("data");
+        let readiness_auth_token = auth
+            .bootstrap_tokens
+            .first()
+            .map(|token| token.token.clone());
         for attempt in 0..STARTUP_ATTEMPTS {
             let rest_listener = bind_listener(rest_host);
             let grpc_listener = bind_listener(grpc_host);
@@ -61,6 +104,7 @@ impl TestServerFixture {
                 log_filter: "info".to_owned(),
                 storage_root: storage_root.clone(),
                 metadata: Default::default(),
+                auth: auth.clone(),
             }));
             let mut server = runtime.spawn(async move {
                 let rest_listener = tokio::net::TcpListener::from_std(rest_listener)
@@ -88,12 +132,19 @@ impl TestServerFixture {
                 Ok(())
             });
 
-            match wait_for_server(&runtime, &mut server, &ready_rx, &[rest_addr, grpc_addr]) {
+            match wait_for_server(
+                &runtime,
+                &mut server,
+                &ready_rx,
+                &[rest_addr, grpc_addr],
+                readiness_auth_token.as_deref(),
+            ) {
                 Ok(()) => {
                     return Self {
                         temp_root,
                         rest_addr,
                         grpc_addr,
+                        auth_token: readiness_auth_token.clone(),
                         runtime,
                         server,
                     };
@@ -306,6 +357,7 @@ fn wait_for_server(
     server: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
     ready_rx: &mpsc::Receiver<&'static str>,
     addresses: &[SocketAddr],
+    grpc_auth_token: Option<&str>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let rest_address = addresses[0];
@@ -323,7 +375,7 @@ fn wait_for_server(
         if rest_ready
             && grpc_ready
             && rest_endpoint_ready(rest_address)
-            && grpc_endpoint_ready(runtime, grpc_address)
+            && grpc_endpoint_ready(runtime, grpc_address, grpc_auth_token)
         {
             return Ok(());
         }
@@ -384,13 +436,14 @@ fn rest_endpoint_ready(address: SocketAddr) -> bool {
     response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
 }
 
-fn grpc_endpoint_ready(runtime: &Runtime, address: SocketAddr) -> bool {
+fn grpc_endpoint_ready(runtime: &Runtime, address: SocketAddr, auth_token: Option<&str>) -> bool {
     let dial_address = dial_address(address);
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_millis(200), async {
-            let client = LogPoseClient::connect(format!("http://{dial_address}"))
-                .await
-                .map_err(|error| error.to_string())?;
+            let client =
+                LogPoseClient::connect_with_auth(format!("http://{dial_address}"), auth_token)
+                    .await
+                    .map_err(|error| error.to_string())?;
             client
                 .runtime_status()
                 .await
@@ -400,6 +453,29 @@ fn grpc_endpoint_ready(runtime: &Runtime, address: SocketAddr) -> bool {
         .await
         .is_ok_and(|result| result.is_ok())
     })
+}
+
+fn default_auth_config() -> AuthConfig {
+    AuthConfig {
+        bootstrap_tokens: vec![
+            BootstrapTokenConfig {
+                token: "operator-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            },
+            BootstrapTokenConfig {
+                token: "reader-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "reader",
+                    PrincipalKind::User,
+                    AccessTier::Service,
+                ),
+            },
+        ],
+    }
 }
 
 fn dial_address(address: SocketAddr) -> SocketAddr {

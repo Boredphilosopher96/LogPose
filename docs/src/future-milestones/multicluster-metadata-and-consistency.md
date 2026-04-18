@@ -42,7 +42,7 @@ Use etcd as the authoritative metadata plane for small transactional state, not 
 
 Store persistent metadata there:
 
-- database descriptors and tenant-scoped policy objects
+- database descriptors and database-scoped policy objects
 - collection specifications
 - shard and replica assignments
 - ownership epochs

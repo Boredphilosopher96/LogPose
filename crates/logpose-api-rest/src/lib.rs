@@ -3,17 +3,18 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use logpose_core::AppState;
+use logpose_auth::DatabaseAccessPolicy;
+use logpose_catalog::DatabaseDescriptor;
+use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, ScalarMetadataValue};
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric, Snapshot,
-    WriteOperation,
+    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -26,7 +27,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/metadata", get(metadata))
         .route("/v1/runtime/status", get(runtime_status))
+        .route("/v1/databases", get(list_databases))
+        .route("/v1/databases/{name}", get(get_database).put(put_database))
         .route("/v1/collections", post(create_collection))
+        .route(
+            "/v1/databases/{name}/policy",
+            get(get_database_policy).put(put_database_policy),
+        )
         .route("/v1/collections/{name}", get(get_collection))
         .route(
             "/v1/collections/{name}/placement",
@@ -76,60 +83,124 @@ async fn metadata(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn runtime_status(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::NodeRuntimeStatus>, ApiError> {
-    Ok(Json(state.control.runtime_status().await?))
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.runtime_status_with_auth(&auth).await?))
+}
+
+async fn put_database(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(descriptor): Json<DatabaseDescriptor>,
+) -> Result<Json<DatabaseDescriptor>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    validate_database_scope(&descriptor, &name)?;
+    Ok(Json(state.put_database_with_auth(&auth, descriptor).await?))
+}
+
+async fn get_database(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DatabaseDescriptor>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.database_with_auth(&auth, &name).await?))
+}
+
+async fn list_databases(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DatabaseDescriptor>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.databases_with_auth(&auth).await?))
 }
 
 async fn create_collection(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateCollectionBody>,
 ) -> Result<(StatusCode, Json<logpose_catalog::CollectionDescriptor>), ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let descriptor = state
-        .control
-        .create_collection(CreateCollectionRequest {
-            tenant_name: default_namespace_if_blank(request.tenant_name, DEFAULT_TENANT_NAME),
-            database_name: default_namespace_if_blank(request.database_name, DEFAULT_DATABASE_NAME),
-            name: request.name,
-            dimensions: request.dimensions,
-            metric: request.metric,
-        })
+        .create_collection_with_auth(
+            &auth,
+            CreateCollectionRequest::in_database(
+                default_database_if_blank(request.database_name),
+                request.name,
+                request.dimensions,
+                request.metric,
+            ),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(descriptor)))
 }
 
+async fn put_database_policy(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(policy): Json<DatabaseAccessPolicy>,
+) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    validate_policy_scope(&policy, &name)?;
+    Ok(Json(
+        state
+            .set_database_access_policy_with_auth(&auth, policy)
+            .await?,
+    ))
+}
+
+async fn get_database_policy(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(
+        state.database_access_policy_with_auth(&auth, &name).await?,
+    ))
+}
+
 async fn get_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let collection = namespace.collection(name);
     Ok(Json(
         state
-            .get_collection(&collection_lookup_key(&collection))
+            .get_collection_with_auth(&auth, &collection_lookup_key(&collection))
             .await?,
     ))
 }
 
 async fn get_collection_placement(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let collection = namespace.collection(name);
     Ok(Json(
         state
-            .control
-            .collection_placement(&collection_lookup_key(&collection))
+            .collection_placement_with_auth(&auth, &collection_lookup_key(&collection))
             .await?,
     ))
 }
 
 async fn write_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(request): Json<WriteCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::CommitAck>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     for operation in &request.operations {
         if operation.id().as_str().is_empty() {
             return Err(ApiError(ServiceError::InvalidArgument(
@@ -139,16 +210,22 @@ async fn write_collection(
     }
     let collection = request.collection(name);
     let ack = state
-        .write(&collection_lookup_key(&collection), request.operations)
+        .write_with_auth(
+            &auth,
+            &collection_lookup_key(&collection),
+            request.operations,
+        )
         .await?;
     Ok(Json(CollectionScopedResponse::new(collection, ack)))
 }
 
 async fn query_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     if request.top_k == 0 {
         return Err(ApiError(ServiceError::InvalidArgument(
             "top_k must be greater than 0".to_owned(),
@@ -171,60 +248,77 @@ async fn query_collection(
         .collect::<Result<Vec<_>, _>>()?;
 
     let response = state
-        .query(QueryRequest {
-            collection_name: collection_lookup_key(&collection),
-            vector: request.vector,
-            top_k: request.top_k,
-            snapshot: request.snapshot,
-            filters,
-            predicate: request.predicate,
-            explain: request.explain,
-        })
+        .query_with_auth(
+            &auth,
+            QueryRequest {
+                collection_name: collection_lookup_key(&collection),
+                vector: request.vector,
+                top_k: request.top_k,
+                snapshot: request.snapshot,
+                filters,
+                predicate: request.predicate,
+                explain: request.explain,
+            },
+        )
         .await?;
 
     Ok(Json(CollectionScopedResponse::new(collection, response)))
 }
 
 async fn get_collection_stats(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let collection = namespace.collection(name);
     Ok(Json(
-        state.stats(&collection_lookup_key(&collection)).await?,
+        state
+            .stats_with_auth(&auth, &collection_lookup_key(&collection))
+            .await?,
     ))
 }
 
 async fn flush_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let collection = namespace.collection(name);
-    let snapshot = state.flush(&collection_lookup_key(&collection)).await?;
+    let snapshot = state
+        .flush_with_auth(&auth, &collection_lookup_key(&collection))
+        .await?;
     Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
 }
 
 async fn compact_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     Query(namespace): Query<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let collection = namespace.collection(name);
-    let snapshot = state.compact(&collection_lookup_key(&collection)).await?;
+    let snapshot = state
+        .compact_with_auth(&auth, &collection_lookup_key(&collection))
+        .await?;
     Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
 }
 
 async fn inspect_collection(
+    headers: HeaderMap,
     Path(name): Path<String>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<InspectCollectionParams>,
 ) -> Result<Json<CollectionScopedResponse<logpose_storage::InspectReport>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     let (target, namespace) = inspect_target_from_params(params)?;
     let collection = namespace.collection(name);
     let report = state
-        .inspect(&collection_lookup_key(&collection), target)
+        .inspect_with_auth(&auth, &collection_lookup_key(&collection), target)
         .await?;
     Ok(Json(CollectionScopedResponse::new(collection, report)))
 }
@@ -236,8 +330,6 @@ struct HealthResponse {
 
 #[derive(Debug, Deserialize)]
 struct CreateCollectionBody {
-    #[serde(default = "default_tenant_name")]
-    tenant_name: String,
     #[serde(default = "default_database_name")]
     database_name: String,
     name: String,
@@ -247,26 +339,51 @@ struct CreateCollectionBody {
 
 #[derive(Debug, Deserialize)]
 struct NamespaceQuery {
-    #[serde(default = "default_tenant_name", alias = "tenant_name")]
-    tenant: String,
-    #[serde(default = "default_database_name", alias = "database_name")]
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
     database: String,
 }
 
 impl NamespaceQuery {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
         CollectionRef::new(
-            default_namespace_if_blank(self.tenant.clone(), DEFAULT_TENANT_NAME),
-            default_namespace_if_blank(self.database.clone(), DEFAULT_DATABASE_NAME),
+            default_database_if_blank(self.database.clone()),
             name.into(),
         )
     }
 }
 
+fn validate_policy_scope(
+    policy: &DatabaseAccessPolicy,
+    database_name: &str,
+) -> Result<(), ApiError> {
+    if policy.database_name != database_name {
+        return Err(ApiError(ServiceError::InvalidArgument(format!(
+            "database policy database_name '{}' does not match request database '{}'",
+            policy.database_name, database_name
+        ))));
+    }
+    Ok(())
+}
+
+fn validate_database_scope(
+    descriptor: &DatabaseDescriptor,
+    database_name: &str,
+) -> Result<(), ApiError> {
+    if descriptor.name != database_name {
+        return Err(ApiError(ServiceError::InvalidArgument(format!(
+            "database descriptor name '{}' does not match request database '{}'",
+            descriptor.name, database_name
+        ))));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct WriteCollectionBody {
-    #[serde(default = "default_tenant_name")]
-    tenant_name: String,
     #[serde(default = "default_database_name")]
     database_name: String,
     operations: Vec<WriteOperation>,
@@ -275,8 +392,7 @@ struct WriteCollectionBody {
 impl WriteCollectionBody {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
         CollectionRef::new(
-            default_namespace_if_blank(self.tenant_name.clone(), DEFAULT_TENANT_NAME),
-            default_namespace_if_blank(self.database_name.clone(), DEFAULT_DATABASE_NAME),
+            default_database_if_blank(self.database_name.clone()),
             name.into(),
         )
     }
@@ -284,8 +400,6 @@ impl WriteCollectionBody {
 
 #[derive(Debug, Deserialize)]
 struct QueryCollectionBody {
-    #[serde(default = "default_tenant_name")]
-    tenant_name: String,
     #[serde(default = "default_database_name")]
     database_name: String,
     vector: Vec<f32>,
@@ -303,26 +417,19 @@ struct QueryCollectionBody {
 impl QueryCollectionBody {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
         CollectionRef::new(
-            default_namespace_if_blank(self.tenant_name.clone(), DEFAULT_TENANT_NAME),
-            default_namespace_if_blank(self.database_name.clone(), DEFAULT_DATABASE_NAME),
+            default_database_if_blank(self.database_name.clone()),
             name.into(),
         )
     }
 }
 
-fn default_namespace_if_blank(value: String, default: &str) -> String {
-    if value.trim().is_empty() {
-        default.to_owned()
-    } else {
-        value
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct InspectCollectionParams {
-    #[serde(default = "default_tenant_name", alias = "tenant_name")]
-    tenant: String,
-    #[serde(default = "default_database_name", alias = "database_name")]
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
     database: String,
     target: Option<String>,
     segment_id: Option<String>,
@@ -330,7 +437,6 @@ struct InspectCollectionParams {
 
 #[derive(Debug, Serialize)]
 struct CollectionScopedResponse<T> {
-    tenant_name: String,
     database_name: String,
     collection_name: String,
     #[serde(flatten)]
@@ -340,7 +446,6 @@ struct CollectionScopedResponse<T> {
 impl<T> CollectionScopedResponse<T> {
     fn new(collection: CollectionRef, response: T) -> Self {
         Self {
-            tenant_name: collection.tenant_name,
             database_name: collection.database_name,
             collection_name: collection.collection_name,
             response,
@@ -363,18 +468,42 @@ impl IntoResponse for ApiError {
             ServiceError::AlreadyExists(message) => (StatusCode::CONFLICT, message),
             ServiceError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ServiceError::InvalidArgument(message) => (StatusCode::BAD_REQUEST, message),
+            ServiceError::Unauthenticated(message) => (StatusCode::UNAUTHORIZED, message),
+            ServiceError::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
             ServiceError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
 }
 
+fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiError> {
+    let value = match headers.get(AUTHORIZATION) {
+        Some(value) => value,
+        None => return Ok(RequestAuth::default()),
+    };
+    let value = value.to_str().map_err(|_| {
+        ApiError(ServiceError::Unauthenticated(
+            "authorization header must be valid ASCII".to_owned(),
+        ))
+    })?;
+    let (scheme, token) = value.split_once(' ').ok_or_else(|| {
+        ApiError(ServiceError::Unauthenticated(
+            "authorization header must use the Bearer scheme".to_owned(),
+        ))
+    })?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+        return Err(ApiError(ServiceError::Unauthenticated(
+            "authorization header must use the Bearer scheme".to_owned(),
+        )));
+    }
+    Ok(RequestAuth::bearer_token(token.trim()))
+}
+
 fn inspect_target_from_params(
     params: InspectCollectionParams,
 ) -> Result<(InspectTarget, NamespaceQuery), ApiError> {
     let namespace = NamespaceQuery {
-        tenant: params.tenant,
-        database: params.database,
+        database: default_database_if_blank(params.database),
     };
     let target = match params.target.as_deref().unwrap_or("manifest") {
         "manifest" => Ok(InspectTarget::Manifest),
@@ -396,19 +525,20 @@ fn inspect_target_from_params(
     Ok((target, namespace))
 }
 
-fn default_tenant_name() -> String {
-    DEFAULT_TENANT_NAME.to_owned()
-}
-
 fn default_database_name() -> String {
     DEFAULT_DATABASE_NAME.to_owned()
 }
 
+fn default_database_if_blank(value: String) -> String {
+    if value.trim().is_empty() {
+        DEFAULT_DATABASE_NAME.to_owned()
+    } else {
+        value
+    }
+}
+
 fn collection_lookup_key(collection: &CollectionRef) -> String {
-    format!(
-        "{}/{}/{}",
-        collection.tenant_name, collection.database_name, collection.collection_name
-    )
+    collection.lookup_name()
 }
 
 #[cfg(test)]
@@ -417,7 +547,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::StatusCode;
     use http_body_util::BodyExt;
-    use logpose_config::LogPoseConfig;
+    use logpose_auth::{
+        AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+        Principal, PrincipalKind,
+    };
+    use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
     use logpose_types::RecordId;
     use serde_json::{Value, json};
@@ -536,6 +670,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_status_requires_bearer_token_when_auth_is_configured() {
+        let state = Arc::new(AppState::new(auth_test_config("rest-auth-runtime")));
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/runtime/status")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/runtime/status")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn database_endpoints_round_trip_with_operator_auth() {
+        let state = Arc::new(AppState::new(auth_test_config("rest-namespace-auth")));
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/databases")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let removed_tenant_route = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/tenants")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(removed_tenant_route.status(), StatusCode::NOT_FOUND);
+
+        let put_database = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v1/databases/analytics")
+                    .header("authorization", "Bearer operator-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(database_body("analytics").to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(put_database.status(), StatusCode::OK);
+        let put_database_body = json_body(put_database).await;
+        assert_eq!(put_database_body["name"], "analytics");
+        assert!(put_database_body.get("tenant_name").is_none());
+
+        let get_database = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/databases/analytics")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(get_database.status(), StatusCode::OK);
+        let get_database_body = json_body(get_database).await;
+        assert_eq!(get_database_body["name"], "analytics");
+        assert!(get_database_body.get("tenant_name").is_none());
+
+        let list_databases = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/databases")
+                    .header("authorization", "Bearer operator-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(list_databases.status(), StatusCode::OK);
+        let databases_body = json_body(list_databases).await;
+        let databases = databases_body
+            .as_array()
+            .expect("databases should be an array");
+        assert_eq!(databases.len(), 2);
+        assert!(
+            databases
+                .iter()
+                .all(|database| database.get("tenant_name").is_none())
+        );
+        assert!(
+            databases
+                .iter()
+                .any(|database| database["name"] == "default"),
+            "default database should be lazily bootstrapped"
+        );
+        assert!(
+            databases
+                .iter()
+                .any(|database| database["name"] == "analytics"),
+            "created database should be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_principals_can_read_but_not_write_when_auth_is_configured() {
+        let state = Arc::new(AppState::new(auth_test_config("rest-auth-readonly")));
+        state
+            .control
+            .set_database_access_policy(read_only_policy("default", "reader"))
+            .await
+            .expect("database policy should persist");
+        state
+            .control
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+
+        let stats = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats")
+                    .header("authorization", "Bearer reader-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(stats.status(), StatusCode::OK);
+
+        let write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("authorization", "Bearer reader-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {
+                                    "op": "put",
+                                    "id": "alpha",
+                                    "vector": [1.0, 0.0],
+                                    "metadata": {}
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn data_endpoints_run_the_collection_workflow() {
         let state = Arc::new(AppState::new(test_config("rest-workflow")));
         let app = router(state);
@@ -561,8 +883,8 @@ mod tests {
             .expect("router should respond");
         assert_eq!(create.status(), StatusCode::CREATED);
         let create_body = json_body(create).await;
-        assert_eq!(create_body["tenant_name"], "default");
         assert_eq!(create_body["database_name"], "default");
+        assert!(create_body.get("tenant_name").is_none());
 
         let write = app
             .clone()
@@ -602,9 +924,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(write.status(), StatusCode::OK);
         let write_body = json_body(write).await;
-        assert_eq!(write_body["tenant_name"], "default");
         assert_eq!(write_body["database_name"], "default");
         assert_eq!(write_body["collection_name"], "documents");
+        assert!(write_body.get("tenant_name").is_none());
 
         let query = app
             .clone()
@@ -627,9 +949,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(query.status(), StatusCode::OK);
         let query_body = json_body(query).await;
-        assert_eq!(query_body["tenant_name"], "default");
         assert_eq!(query_body["database_name"], "default");
         assert_eq!(query_body["collection_name"], "documents");
+        assert!(query_body.get("tenant_name").is_none());
         assert_eq!(
             query_body["matches"]
                 .as_array()
@@ -652,8 +974,8 @@ mod tests {
             .expect("router should respond");
         assert_eq!(stats.status(), StatusCode::OK);
         let stats_body = json_body(stats).await;
-        assert_eq!(stats_body["tenant_name"], "default");
         assert_eq!(stats_body["database_name"], "default");
+        assert!(stats_body.get("tenant_name").is_none());
         assert_eq!(stats_body["live_record_count"], 3);
         assert_eq!(stats_body["deleted_record_count"], 0);
         assert_eq!(stats_body["mutable_op_count"], 3);
@@ -671,9 +993,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(wal.status(), StatusCode::OK);
         let wal_body = json_body(wal).await;
-        assert_eq!(wal_body["tenant_name"], "default");
         assert_eq!(wal_body["database_name"], "default");
         assert_eq!(wal_body["collection_name"], "documents");
+        assert!(wal_body.get("tenant_name").is_none());
         assert_eq!(wal_body["target"], "wal");
         assert_eq!(
             wal_body["payload"]["records"]
@@ -696,9 +1018,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(flush.status(), StatusCode::OK);
         let flush_body = json_body(flush).await;
-        assert_eq!(flush_body["tenant_name"], "default");
         assert_eq!(flush_body["database_name"], "default");
         assert_eq!(flush_body["collection_name"], "documents");
+        assert!(flush_body.get("tenant_name").is_none());
 
         let compact = app
             .clone()
@@ -713,9 +1035,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(compact.status(), StatusCode::OK);
         let compact_body = json_body(compact).await;
-        assert_eq!(compact_body["tenant_name"], "default");
         assert_eq!(compact_body["database_name"], "default");
         assert_eq!(compact_body["collection_name"], "documents");
+        assert!(compact_body.get("tenant_name").is_none());
 
         let inspect = app
             .clone()
@@ -729,9 +1051,9 @@ mod tests {
             .expect("router should respond");
         assert_eq!(inspect.status(), StatusCode::OK);
         let inspect_body = json_body(inspect).await;
-        assert_eq!(inspect_body["tenant_name"], "default");
         assert_eq!(inspect_body["database_name"], "default");
         assert_eq!(inspect_body["collection_name"], "documents");
+        assert!(inspect_body.get("tenant_name").is_none());
         assert_eq!(inspect_body["target"], "manifest");
         let segment_id = inspect_body["payload"]["segments"][0]["segment_id"]
             .as_str()
@@ -944,6 +1266,8 @@ mod tests {
         assert_eq!(body["storage_engine"], "local");
         assert_eq!(body["collection_count"], 1);
         assert_eq!(body["collections"][0]["collection_name"], "documents");
+        assert_eq!(body["collections"][0]["database_name"], "default");
+        assert!(body["collections"][0].get("tenant_name").is_none());
         assert_eq!(body["collections"][0]["assigned_role"], "data");
         assert_eq!(body["collections"][0]["route_kind"], "local");
         assert!(
@@ -979,16 +1303,16 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
-        assert_eq!(body["tenant_name"], "default");
         assert_eq!(body["database_name"], "default");
         assert_eq!(body["collection_name"], "documents");
+        assert!(body.get("tenant_name").is_none());
         assert_eq!(body["assigned_node"], "rest-placement");
         assert_eq!(body["assigned_role"], "data");
         assert_eq!(body["route_kind"], "local");
     }
 
     #[tokio::test]
-    async fn rest_round_trips_explicit_namespace_requests() {
+    async fn rest_round_trips_explicit_database_requests() {
         let state = Arc::new(AppState::new(test_config("rest-namespace-reject")));
         let app = router(state);
 
@@ -1001,7 +1325,6 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "tenant_name": "acme",
                             "database_name": "analytics",
                             "name": "documents",
                             "dimensions": 2,
@@ -1016,13 +1339,13 @@ mod tests {
 
         assert_eq!(create.status(), StatusCode::CREATED);
         let create_body = json_body(create).await;
-        assert_eq!(create_body["tenant_name"], "acme");
         assert_eq!(create_body["database_name"], "analytics");
+        assert!(create_body.get("tenant_name").is_none());
 
         let get = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/v1/collections/documents?tenant=acme&database=analytics")
+                    .uri("/v1/collections/documents?database=analytics")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1031,9 +1354,9 @@ mod tests {
 
         assert_eq!(get.status(), StatusCode::OK);
         let get_body = json_body(get).await;
-        assert_eq!(get_body["tenant_name"], "acme");
         assert_eq!(get_body["database_name"], "analytics");
         assert_eq!(get_body["name"], "documents");
+        assert!(get_body.get("tenant_name").is_none());
     }
 
     #[tokio::test]
@@ -1050,7 +1373,6 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "tenant_name": "",
                             "database_name": "   ",
                             "name": "documents",
                             "dimensions": 2,
@@ -1065,13 +1387,13 @@ mod tests {
 
         assert_eq!(create.status(), StatusCode::CREATED);
         let create_body = json_body(create).await;
-        assert_eq!(create_body["tenant_name"], "default");
         assert_eq!(create_body["database_name"], "default");
 
         let get = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/v1/collections/documents?tenant=&database=")
+                    .uri("/v1/collections/documents?database=")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1080,9 +1402,23 @@ mod tests {
 
         assert_eq!(get.status(), StatusCode::OK);
         let get_body = json_body(get).await;
-        assert_eq!(get_body["tenant_name"], "default");
         assert_eq!(get_body["database_name"], "default");
         assert_eq!(get_body["name"], "documents");
+
+        let inspect = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/inspect?database=")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(inspect.status(), StatusCode::OK);
+        let inspect_body = json_body(inspect).await;
+        assert_eq!(inspect_body["database_name"], "default");
+        assert_eq!(inspect_body["collection_name"], "documents");
     }
 
     #[tokio::test]
@@ -2113,6 +2449,70 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn rest_database_policy_endpoints_round_trip_json_and_role_errors() {
+        let combined = router(Arc::new(AppState::new(test_config("rest-policy-combined"))));
+        let put = combined
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v1/databases/default/policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(policy_body("default").to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(put.status(), StatusCode::OK);
+        let put_body = json_body(put).await;
+        assert_eq!(put_body["database_name"], "default");
+        assert_eq!(put_body["authentication_mode"], "external_token");
+        assert!(put_body.get("tenant_name").is_none());
+        assert_eq!(
+            put_body["role_bindings"]
+                .as_array()
+                .expect("bindings should be an array")
+                .len(),
+            2
+        );
+
+        let get = combined
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/databases/default/policy")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(get.status(), StatusCode::OK);
+        let get_body = json_body(get).await;
+        assert_eq!(get_body, policy_body("default"));
+
+        let data_only = router(Arc::new(AppState::new(test_config_with_role(
+            "rest-policy-data-only",
+            logpose_types::NodeRole::Data,
+        ))));
+        let data_error = data_only
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/v1/databases/default/policy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(policy_body("default").to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(data_error.status(), StatusCode::BAD_REQUEST);
+        let data_error_body = json_body(data_error).await;
+        assert!(data_error_body["error"].as_str().is_some_and(|message| {
+            message
+                .contains("data-only nodes cannot accept control-plane database policy mutations")
+        }));
+    }
+
     async fn json_body(response: axum::response::Response) -> Value {
         let bytes = response
             .into_body()
@@ -2142,6 +2542,65 @@ mod tests {
             storage_root,
             ..LogPoseConfig::default()
         }
+    }
+
+    fn auth_test_config(label: &str) -> LogPoseConfig {
+        let mut config = test_config(label);
+        config.auth.bootstrap_tokens = vec![
+            BootstrapTokenConfig {
+                token: "operator-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            },
+            BootstrapTokenConfig {
+                token: "reader-secret".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "reader",
+                    PrincipalKind::User,
+                    AccessTier::Service,
+                ),
+            },
+        ];
+        config
+    }
+
+    fn database_body(database_name: &str) -> Value {
+        let descriptor = DatabaseDescriptor::new(database_name);
+        serde_json::to_value(descriptor).expect("database descriptor should serialize")
+    }
+
+    fn read_only_policy(database_name: &str, principal_name: &str) -> DatabaseAccessPolicy {
+        DatabaseAccessPolicy {
+            database_name: database_name.to_owned(),
+            authentication_mode: AuthenticationMode::ExternalToken,
+            role_bindings: vec![DatabaseRoleBinding {
+                database_name: database_name.to_owned(),
+                principal_name: principal_name.to_owned(),
+                role: DatabaseRole::ReadOnly,
+            }],
+        }
+    }
+
+    fn policy_body(database_name: &str) -> Value {
+        json!({
+            "database_name": database_name,
+            "authentication_mode": "external_token",
+            "role_bindings": [
+                {
+                    "database_name": database_name,
+                    "principal_name": "ops-admin",
+                    "role": "owner"
+                },
+                {
+                    "database_name": database_name,
+                    "principal_name": "reader-service",
+                    "role": "read_only"
+                }
+            ]
+        })
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

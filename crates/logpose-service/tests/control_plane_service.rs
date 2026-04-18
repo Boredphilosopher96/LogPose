@@ -5,6 +5,10 @@ use axum as _;
 use http_body_util as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
+use logpose_auth::{
+    AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+    Principal, PrincipalKind,
+};
 use logpose_catalog as _;
 use logpose_core::AppState;
 use logpose_query::{ExplainMode, QueryRequest};
@@ -16,6 +20,7 @@ use logpose_types::{
     CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
 };
 use rand as _;
+use serde as _;
 use std::{
     fs,
     path::PathBuf,
@@ -35,7 +40,6 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -110,7 +114,6 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
     state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -121,7 +124,6 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
     state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "events".to_owned(),
             dimensions: 2,
@@ -173,7 +175,6 @@ async fn control_plane_reports_non_default_database_collection_identity() {
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -193,12 +194,10 @@ async fn control_plane_reports_non_default_database_collection_identity() {
         .await
         .expect_err("bare placement lookup should be rejected for non-default databases");
 
-    assert_eq!(descriptor.tenant_name, "default");
     assert_eq!(descriptor.database_name, "analytics");
     assert_eq!(descriptor.name, "documents");
     assert_eq!(status.collection_count, 1);
     assert_eq!(status.collections.len(), 1);
-    assert_eq!(status.collections[0].tenant_name, "default");
     assert_eq!(status.collections[0].database_name, "analytics");
     assert_eq!(status.collections[0].collection_name, "documents");
     assert_eq!(status.collections[0].route_kind, "local");
@@ -209,13 +208,12 @@ async fn control_plane_reports_non_default_database_collection_identity() {
 }
 
 #[tokio::test]
-async fn control_plane_distinguishes_duplicate_collection_names_across_namespaces() {
+async fn control_plane_distinguishes_duplicate_collection_names_across_databases() {
     let state = Arc::new(AppState::new(test_config("control-namespace-collision")));
 
     let default_descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -223,17 +221,16 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_namespace
         })
         .await
         .expect("default namespace collection should be created");
-    let tenant_descriptor = state
+    let analytics_descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "tenant-a".to_owned(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
         })
         .await
-        .expect("tenant namespace collection should be created");
+        .expect("database namespace collection should be created");
 
     state
         .write(
@@ -248,15 +245,15 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_namespace
         .expect("default namespace write should succeed");
     state
         .write(
-            "tenant-a/analytics/documents",
+            "analytics/documents",
             vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("tenant-alpha"),
+                id: RecordId::new("analytics-alpha"),
                 vector: vec![0.0, 1.0],
-                metadata: serde_json::json!({"namespace":"tenant-a"}),
+                metadata: serde_json::json!({"namespace":"analytics"}),
             })],
         )
         .await
-        .expect("tenant namespace write should succeed");
+        .expect("database namespace write should succeed");
 
     let status = state
         .control
@@ -268,52 +265,44 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_namespace
         .collection_placement("documents")
         .await
         .expect("default placement should load");
-    let tenant_placement = state
+    let analytics_placement = state
         .control
-        .collection_placement("tenant-a/analytics/documents")
+        .collection_placement("analytics/documents")
         .await
-        .expect("tenant placement should load");
+        .expect("database placement should load");
     let default_stats = state
         .stats("documents")
         .await
         .expect("default stats should load");
-    let tenant_stats = state
-        .stats("tenant-a/analytics/documents")
+    let analytics_stats = state
+        .stats("analytics/documents")
         .await
-        .expect("tenant stats should load");
+        .expect("database stats should load");
 
     assert_eq!(status.collection_count, 2);
     assert_eq!(status.collections.len(), 2);
     assert!(status.collections.iter().any(|placement| {
-        placement.tenant_name == "default"
-            && placement.database_name == "default"
-            && placement.collection_name == "documents"
+        placement.database_name == "default" && placement.collection_name == "documents"
     }));
     assert!(status.collections.iter().any(|placement| {
-        placement.tenant_name == "tenant-a"
-            && placement.database_name == "analytics"
-            && placement.collection_name == "documents"
+        placement.database_name == "analytics" && placement.collection_name == "documents"
     }));
 
     assert_eq!(
         default_placement.collection_id,
         default_descriptor.collection_id
     );
-    assert_eq!(default_placement.tenant_name, "default");
     assert_eq!(default_placement.database_name, "default");
     assert_eq!(
-        tenant_placement.collection_id,
-        tenant_descriptor.collection_id
+        analytics_placement.collection_id,
+        analytics_descriptor.collection_id
     );
-    assert_eq!(tenant_placement.tenant_name, "tenant-a");
-    assert_eq!(tenant_placement.database_name, "analytics");
+    assert_eq!(analytics_placement.database_name, "analytics");
 
-    assert_eq!(default_stats.tenant_name, "default");
     assert_eq!(default_stats.database_name, "default");
     assert_eq!(default_stats.live_record_count, 1);
-    assert_eq!(tenant_stats.tenant_name, "tenant-a");
-    assert_eq!(tenant_stats.database_name, "analytics");
-    assert_eq!(tenant_stats.live_record_count, 1);
+    assert_eq!(analytics_stats.database_name, "analytics");
+    assert_eq!(analytics_stats.live_record_count, 1);
 }
 
 #[tokio::test]
@@ -326,7 +315,6 @@ async fn data_only_nodes_reject_control_plane_collection_creation() {
     let error = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -374,7 +362,6 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
     let error = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -409,7 +396,6 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
     initial
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -461,7 +447,6 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
     initial
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -531,7 +516,6 @@ async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
     let descriptor = initial
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -601,7 +585,6 @@ async fn combined_runtime_status_reads_persisted_maintenance_without_resuming_it
     let descriptor = initial
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -671,7 +654,6 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
     initial
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -783,7 +765,6 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
     let engine = LocalStorageEngine::new(&root);
     engine
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -828,7 +809,6 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
     engine
         .create_collection_with_assignment(
             CreateCollectionRequest {
-                tenant_name: "default".to_owned(),
                 database_name: "default".to_owned(),
                 name: "documents".to_owned(),
                 dimensions: 2,
@@ -895,7 +875,6 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -934,7 +913,6 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
     let default_descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -942,17 +920,16 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
         })
         .await
         .expect("default namespace collection should be created");
-    let tenant_descriptor = state
+    let analytics_descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "tenant-a".to_owned(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
         })
         .await
-        .expect("tenant namespace collection should be created");
+        .expect("database namespace collection should be created");
 
     fs::write(
         default_descriptor.root_path.join("maintenance.json"),
@@ -966,16 +943,16 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
     )
     .expect("default maintenance file should be written");
     fs::write(
-        tenant_descriptor.root_path.join("maintenance.json"),
+        analytics_descriptor.root_path.join("maintenance.json"),
         serde_json::to_vec_pretty(&MaintenanceStatus {
             pending: vec!["compact".to_owned()],
             in_progress: None,
             last_error: Some("disk full".to_owned()),
             completed_runs: 0,
         })
-        .expect("tenant maintenance json should serialize"),
+        .expect("database maintenance json should serialize"),
     )
-    .expect("tenant maintenance file should be written");
+    .expect("database maintenance file should be written");
 
     let status = state
         .control
@@ -988,6 +965,125 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
     assert_eq!(status.maintenance.pending_operations, 2);
     assert_eq!(status.maintenance.collections_in_progress, 0);
     assert_eq!(status.maintenance.collections_with_errors, 1);
+}
+
+#[tokio::test]
+async fn control_plane_round_trips_default_database_access_policy_after_restart() {
+    let root = unique_temp_dir("control-policy-restart");
+    let initial = Arc::new(AppState::new(test_config_with_root(
+        "control-policy-restart",
+        logpose_types::NodeRole::Combined,
+        root.clone(),
+    )));
+    let policy = sample_policy("default");
+
+    initial
+        .control
+        .set_database_access_policy(policy.clone())
+        .await
+        .expect("policy should be written");
+
+    let before_restart = initial
+        .control
+        .database_access_policy("default")
+        .await
+        .expect("policy should load");
+    drop(initial);
+
+    let restarted = Arc::new(AppState::new(test_config_with_root(
+        "control-policy-restart",
+        logpose_types::NodeRole::Combined,
+        root,
+    )));
+    let after_restart = restarted
+        .control
+        .database_access_policy("default")
+        .await
+        .expect("policy should survive restart");
+
+    assert_eq!(before_restart, policy);
+    assert_eq!(after_restart, policy);
+}
+
+#[tokio::test]
+async fn control_plane_reads_database_access_policies_by_database_name() {
+    let state = Arc::new(AppState::new(test_config("control-policy-namespace")));
+    let default_policy = sample_policy("default");
+    let analytics_policy = sample_policy("analytics");
+
+    state
+        .control
+        .set_database_access_policy(default_policy.clone())
+        .await
+        .expect("default policy should be written");
+    state
+        .control
+        .set_database_access_policy(analytics_policy.clone())
+        .await
+        .expect("analytics policy should be written");
+
+    let read_default = state
+        .control
+        .database_access_policy("default")
+        .await
+        .expect("default policy should load");
+    let read_analytics = state
+        .control
+        .database_access_policy("analytics")
+        .await
+        .expect("analytics policy should load by database name");
+
+    assert_eq!(read_default, default_policy);
+    assert_eq!(read_analytics, analytics_policy);
+    assert_ne!(read_default, read_analytics);
+}
+
+#[tokio::test]
+async fn data_only_nodes_reject_database_policy_mutation_while_control_only_nodes_accept_it() {
+    let policy = sample_policy("default");
+    let data_state = Arc::new(AppState::new(test_config_with_role(
+        "control-policy-data-only",
+        logpose_types::NodeRole::Data,
+    )));
+
+    let data_error = data_state
+        .control
+        .set_database_access_policy(policy.clone())
+        .await
+        .expect_err("data-only node should reject policy mutation");
+
+    assert!(
+        data_error
+            .to_string()
+            .contains("data-only nodes cannot accept control-plane database policy mutations"),
+        "unexpected error: {data_error}"
+    );
+
+    let root = unique_temp_dir("control-policy-control-only");
+    let combined = Arc::new(AppState::new(test_config_with_root(
+        "control-policy-control-only",
+        logpose_types::NodeRole::Combined,
+        root.clone(),
+    )));
+    combined
+        .control
+        .set_database_access_policy(policy.clone())
+        .await
+        .expect("combined node should seed policy");
+    drop(combined);
+
+    let control_state = Arc::new(AppState::new(test_config_with_root(
+        "control-policy-control-only",
+        logpose_types::NodeRole::Control,
+        root,
+    )));
+    let read_policy = control_state
+        .control
+        .database_access_policy("default")
+        .await
+        .expect("control-only node should read policy");
+
+    assert_eq!(read_policy, policy);
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -1021,5 +1117,34 @@ fn test_config_with_root(
         node_role,
         storage_root,
         ..logpose_config::LogPoseConfig::default()
+    }
+}
+
+fn sample_policy(database_name: &str) -> DatabaseAccessPolicy {
+    DatabaseAccessPolicy {
+        database_name: database_name.to_owned(),
+        authentication_mode: AuthenticationMode::ExternalToken,
+        role_bindings: vec![
+            DatabaseRoleBinding {
+                database_name: database_name.to_owned(),
+                principal_name: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                )
+                .name,
+                role: DatabaseRole::Owner,
+            },
+            DatabaseRoleBinding {
+                database_name: database_name.to_owned(),
+                principal_name: Principal::new_with_access_tier(
+                    "reader-service",
+                    PrincipalKind::Service,
+                    AccessTier::Service,
+                )
+                .name,
+                role: DatabaseRole::ReadOnly,
+            },
+        ],
     }
 }

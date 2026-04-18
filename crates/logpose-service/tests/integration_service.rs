@@ -9,6 +9,7 @@ use logpose_api_grpc as _;
 use logpose_api_grpc::proto;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_rest as _;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_config as _;
 use logpose_core as _;
@@ -20,6 +21,7 @@ use logpose_service::{LogPoseDataService, ServiceError};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
 use rand as _;
+use serde as _;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -40,7 +42,6 @@ async fn service_runs_filtered_query_and_storage_workflow() {
 
     let descriptor = service
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -143,7 +144,6 @@ async fn service_rejects_impossible_snapshots() {
 
     service
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -193,7 +193,6 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
 
     service
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -242,7 +241,7 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
 }
 
 #[tokio::test]
-async fn app_state_accepts_default_namespace_qualified_collection_references() {
+async fn app_state_accepts_database_qualified_collection_references() {
     let state = Arc::new(logpose_core::AppState::new(test_config(
         "service-qualified-default-namespace",
     )));
@@ -250,7 +249,6 @@ async fn app_state_accepts_default_namespace_qualified_collection_references() {
     state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -261,7 +259,7 @@ async fn app_state_accepts_default_namespace_qualified_collection_references() {
 
     state
         .write(
-            "default/default/documents",
+            "default/documents",
             vec![WriteOperation::Put(PutRecord {
                 id: RecordId::new("alpha"),
                 vector: vec![1.0, 0.0],
@@ -273,24 +271,24 @@ async fn app_state_accepts_default_namespace_qualified_collection_references() {
 
     let placement = state
         .control
-        .collection_placement("default/default/documents")
+        .collection_placement("default/documents")
         .await
         .expect("qualified placement lookup should succeed");
     let snapshot = state
-        .snapshot("default/default/documents")
+        .snapshot("default/documents")
         .await
         .expect("qualified snapshot should succeed");
     let stats = state
-        .stats("default/default/documents")
+        .stats("default/documents")
         .await
         .expect("qualified stats should succeed");
     let inspect = state
-        .inspect("default/default/documents", InspectTarget::Manifest)
+        .inspect("default/documents", InspectTarget::Manifest)
         .await
         .expect("qualified inspect should succeed");
     let query = state
         .query(QueryRequest {
-            collection_name: "default/default/documents".to_owned(),
+            collection_name: "default/documents".to_owned(),
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
@@ -302,11 +300,9 @@ async fn app_state_accepts_default_namespace_qualified_collection_references() {
         .expect("qualified query should succeed");
 
     assert_eq!(placement.collection_name, "documents");
-    assert_eq!(placement.tenant_name, "default");
     assert_eq!(placement.database_name, "default");
     assert_eq!(placement.route_kind, "local");
     assert_eq!(snapshot.visible_seq_no, 1);
-    assert_eq!(stats.tenant_name, "default");
     assert_eq!(stats.database_name, "default");
     assert_eq!(stats.collection_name, "documents");
     assert_eq!(stats.live_record_count, 1);
@@ -326,7 +322,6 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
     state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -437,7 +432,6 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
                 )),
             }),
             explain: proto::ExplainMode::Profile as i32,
-            tenant_name: String::new(),
             database_name: String::new(),
         }))
         .await
@@ -561,7 +555,6 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
     state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -660,7 +653,6 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
                 )),
             }),
             explain: proto::ExplainMode::Profile as i32,
-            tenant_name: String::new(),
             database_name: String::new(),
         }))
         .await
@@ -922,7 +914,6 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
 
     service
         .create_collection(CreateCollectionRequest {
-            tenant_name: "default".to_owned(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,

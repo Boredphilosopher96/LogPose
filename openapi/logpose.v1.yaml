@@ -46,6 +46,106 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/databases:
+    get:
+      summary: List databases
+      operationId: listDatabases
+      responses:
+        "200":
+          description: Database descriptors
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatabaseDescriptor"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/databases/{name}:
+    get:
+      summary: Get a database descriptor
+      operationId: getDatabase
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Database descriptor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseDescriptor"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Database not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: Create or replace a database descriptor
+      operationId: putDatabase
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatabaseDescriptor"
+      responses:
+        "200":
+          description: Database descriptor written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseDescriptor"
+        "400":
+          description: Invalid database descriptor or path/body mismatch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections:
     post:
       summary: Create a collection
@@ -75,6 +175,75 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/databases/{name}/policy:
+    get:
+      summary: Get a database access policy
+      operationId: getDatabasePolicy
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Database access policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseAccessPolicy"
+        "404":
+          description: Database access policy not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal database policy lookup failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      summary: Create or replace a database access policy
+      operationId: putDatabasePolicy
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatabaseAccessPolicy"
+      responses:
+        "200":
+          description: Database access policy written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseAccessPolicy"
+        "400":
+          description: Invalid policy request or control-plane database policy mutations unavailable for the current node role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Database not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal database policy persistence failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}:
     get:
       summary: Get collection metadata
@@ -85,12 +254,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -126,12 +289,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -243,12 +400,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -284,12 +435,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -325,12 +470,6 @@ paths:
           required: true
           schema:
             type: string
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -372,12 +511,6 @@ paths:
           schema:
             type: string
             enum: [manifest, wal, segment, maintenance]
-        - name: tenant
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
         - name: database
           in: query
           required: false
@@ -437,11 +570,44 @@ components:
     NodeRole:
       type: string
       enum: [combined, control, data]
+    AuthenticationMode:
+      type: string
+      enum: [disabled, password, mutual_tls, external_token]
+    DatabaseRole:
+      type: string
+      enum: [owner, read_write, read_only]
+    DatabaseRoleBinding:
+      type: object
+      required:
+        - database_name
+        - principal_name
+        - role
+      properties:
+        database_name:
+          type: string
+        principal_name:
+          type: string
+        role:
+          $ref: "#/components/schemas/DatabaseRole"
+    DatabaseAccessPolicy:
+      type: object
+      required:
+        - database_name
+        - authentication_mode
+        - role_bindings
+      properties:
+        database_name:
+          type: string
+        authentication_mode:
+          $ref: "#/components/schemas/AuthenticationMode"
+        role_bindings:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseRoleBinding"
     CollectionPlacement:
       type: object
       required:
         - collection_id
-        - tenant_name
         - database_name
         - collection_name
         - assigned_node
@@ -452,8 +618,6 @@ components:
         collection_id:
           type: string
           format: uuid
-        tenant_name:
-          type: string
         database_name:
           type: string
         collection_name:
@@ -527,9 +691,6 @@ components:
       type: object
       required: [name, dimensions, metric]
       properties:
-        tenant_name:
-          type: string
-          default: default
         database_name:
           type: string
           default: default
@@ -544,7 +705,6 @@ components:
       type: object
       required:
         - collection_id
-        - tenant_name
         - database_name
         - name
         - dimensions
@@ -558,8 +718,6 @@ components:
         collection_id:
           type: string
           format: uuid
-        tenant_name:
-          type: string
         database_name:
           type: string
         name:
@@ -588,6 +746,20 @@ components:
           type: integer
         compaction_threshold_segments:
           type: integer
+    DatabaseDescriptor:
+      type: object
+      required:
+        - database_id
+        - name
+        - is_default
+      properties:
+        database_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        is_default:
+          type: boolean
     PutOperation:
       type: object
       required: [op, id, vector, metadata]
@@ -620,9 +792,6 @@ components:
       type: object
       required: [operations]
       properties:
-        tenant_name:
-          type: string
-          default: default
         database_name:
           type: string
           default: default
@@ -722,9 +891,6 @@ components:
       type: object
       required: [vector, top_k]
       properties:
-        tenant_name:
-          type: string
-          default: default
         database_name:
           type: string
           default: default
@@ -853,10 +1019,8 @@ components:
             - $ref: "#/components/schemas/QueryDiagnostics"
     CollectionContext:
       type: object
-      required: [tenant_name, database_name, collection_name]
+      required: [database_name, collection_name]
       properties:
-        tenant_name:
-          type: string
         database_name:
           type: string
         collection_name:
@@ -962,7 +1126,6 @@ components:
       type: object
       required:
         - collection_id
-        - tenant_name
         - database_name
         - collection_name
         - manifest_generation
@@ -977,8 +1140,6 @@ components:
         collection_id:
           type: string
           format: uuid
-        tenant_name:
-          type: string
         database_name:
           type: string
         collection_name:

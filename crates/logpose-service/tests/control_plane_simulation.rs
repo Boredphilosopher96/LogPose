@@ -1,10 +1,12 @@
 //! Deterministic control-plane/data-plane simulation scenarios.
 
 use async_trait as _;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_query as _;
 use logpose_service as _;
 use rand as _;
+use serde as _;
 use thiserror as _;
 
 #[path = "support/control_plane_simulation.rs"]
