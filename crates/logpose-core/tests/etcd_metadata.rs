@@ -1,14 +1,17 @@
 //! End-to-end etcd metadata integration coverage for `AppState`.
 
 use etcd_client::{Client, DeleteOptions};
-use logpose_auth as _;
+use logpose_auth::{
+    AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+    Principal, PrincipalKind,
+};
 use logpose_catalog as _;
-use logpose_config::LogPoseConfig;
-use logpose_core::AppState;
+use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
+use logpose_core::{AppState, RequestAuth};
 use logpose_query as _;
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest;
-use logpose_storage_etcd as _;
+use logpose_storage_etcd::EtcdCatalogStore;
 use logpose_types::{
     DistanceMetric, EtcdMetadataConfig, MetadataBackend, MetadataConfig, PutRecord, RecordId,
     WriteOperation,
@@ -116,6 +119,298 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
+#[tokio::test]
+async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("shared-database-policies");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let root_a = unique_temp_dir("etcd-policy-node-a");
+    let root_b = unique_temp_dir("etcd-policy-node-b");
+    let cluster_name = "core-etcd-auth-metadata";
+    let bootstrap_tokens = vec![
+        BootstrapTokenConfig {
+            token: "operator-token".to_owned(),
+            principal: Principal::new_with_access_tier(
+                "ops-admin",
+                PrincipalKind::User,
+                AccessTier::Operator,
+            ),
+        },
+        BootstrapTokenConfig {
+            token: "reader-token".to_owned(),
+            principal: Principal::new_with_access_tier(
+                "reader-service",
+                PrincipalKind::Service,
+                AccessTier::Service,
+            ),
+        },
+    ];
+
+    let state_a = Arc::new(AppState::new(test_config_with_auth(
+        "policy-node-a",
+        root_a,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens.clone(),
+    )));
+    state_a
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("analytics"),
+        )
+        .await
+        .expect("database descriptor should persist through shared metadata");
+    state_a
+        .set_database_access_policy_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            DatabaseAccessPolicy {
+                database_name: "analytics".to_owned(),
+                authentication_mode: AuthenticationMode::ExternalToken,
+                role_bindings: vec![DatabaseRoleBinding {
+                    database_name: "analytics".to_owned(),
+                    principal_name: "reader-service".to_owned(),
+                    role: DatabaseRole::ReadOnly,
+                }],
+            },
+        )
+        .await
+        .expect("database policy should persist through shared metadata");
+    state_a
+        .create_collection_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            CreateCollectionRequest::in_database("analytics", "documents", 2, DistanceMetric::Dot),
+        )
+        .await
+        .expect("collection should be created through shared metadata");
+
+    let state_b = Arc::new(AppState::new(test_config_with_auth(
+        "policy-node-b",
+        root_b,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    )));
+    let descriptor = state_b
+        .get_collection_with_auth(
+            &RequestAuth::bearer_token("reader-token"),
+            "analytics/documents",
+        )
+        .await
+        .expect("reader token should resolve shared database policy on another node");
+    let policy = state_b
+        .database_access_policy_with_auth(&RequestAuth::bearer_token("operator-token"), "analytics")
+        .await
+        .expect("operator should read the shared database policy on another node");
+
+    assert_eq!(descriptor.database_name, "analytics");
+    assert_eq!(descriptor.name, "documents");
+    assert_eq!(policy.database_name, "analytics");
+    assert_eq!(policy.role_bindings.len(), 1);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("shared-principal-overrides");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let root_a = unique_temp_dir("etcd-principal-node-a");
+    let root_b = unique_temp_dir("etcd-principal-node-b");
+    let cluster_name = "core-etcd-shared-principals";
+    let bootstrap_tokens = vec![BootstrapTokenConfig {
+        token: "operator-token".to_owned(),
+        principal: Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Operator,
+        ),
+    }];
+    let config_a = test_config_with_auth(
+        "principal-node-a",
+        root_a,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens.clone(),
+    );
+    let config_b = test_config_with_auth(
+        "principal-node-b",
+        root_b,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    );
+    let shared_catalog = EtcdCatalogStore::new(config_a.metadata.etcd.clone())
+        .expect("etcd catalog store should be constructed");
+
+    let _state_a = Arc::new(AppState::new(config_a));
+    let state_b = Arc::new(AppState::new(config_b));
+    shared_catalog
+        .put_principal(Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Observer,
+        ))
+        .await
+        .expect("shared principal override should persist through etcd");
+
+    let error = state_b
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("analytics"),
+        )
+        .await
+        .expect_err("shared persisted principal should override bootstrap operator tier");
+
+    assert!(matches!(
+        error,
+        ServiceError::PermissionDenied(message)
+            if message.contains("not allowed to perform operator actions")
+    ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_collection_creation_seeds_shared_database_metadata() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("shared-database-seeding");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let root_a = unique_temp_dir("etcd-seeded-database-node-a");
+    let root_b = unique_temp_dir("etcd-seeded-database-node-b");
+    let cluster_name = "core-etcd-shared-database-seeding";
+    let bootstrap_tokens = vec![BootstrapTokenConfig {
+        token: "operator-token".to_owned(),
+        principal: Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Operator,
+        ),
+    }];
+
+    let state_a = Arc::new(AppState::new(test_config_with_auth(
+        "seed-node-a",
+        root_a,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens.clone(),
+    )));
+    state_a
+        .create_collection_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            CreateCollectionRequest::in_database("analytics", "documents", 2, DistanceMetric::Dot),
+        )
+        .await
+        .expect("collection creation should seed shared database metadata");
+
+    let state_b = Arc::new(AppState::new(test_config_with_auth(
+        "seed-node-b",
+        root_b,
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    )));
+    let database = state_b
+        .database_with_auth(&RequestAuth::bearer_token("operator-token"), "analytics")
+        .await
+        .expect("shared database metadata should be readable from another node");
+    let databases = state_b
+        .databases_with_auth(&RequestAuth::bearer_token("operator-token"))
+        .await
+        .expect("shared database list should include seeded namespaces");
+
+    assert_eq!(database.name, "analytics");
+    assert!(
+        databases
+            .iter()
+            .any(|descriptor| descriptor.name == "analytics")
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_data_only_nodes_reject_catalog_mutations() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("data-node-catalog-mutations");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-data-node-mutations";
+    let bootstrap_tokens = vec![BootstrapTokenConfig {
+        token: "operator-token".to_owned(),
+        principal: Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Operator,
+        ),
+    }];
+    let mut combined_config = test_config_with_auth(
+        "combined-node",
+        unique_temp_dir("etcd-combined-catalog-node"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens.clone(),
+    );
+    combined_config.node_role = logpose_types::NodeRole::Combined;
+    let combined = Arc::new(AppState::new(combined_config));
+    combined
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("analytics"),
+        )
+        .await
+        .expect("combined node should seed the shared database");
+
+    let mut data_config = test_config_with_auth(
+        "data-node",
+        unique_temp_dir("etcd-data-catalog-node"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    );
+    data_config.node_role = logpose_types::NodeRole::Data;
+    let data_node = Arc::new(AppState::new(data_config));
+
+    let database_error = data_node
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("events"),
+        )
+        .await
+        .expect_err("data-only nodes must reject shared database mutations");
+    let policy_error = data_node
+        .set_database_access_policy_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            DatabaseAccessPolicy {
+                database_name: "analytics".to_owned(),
+                authentication_mode: AuthenticationMode::ExternalToken,
+                role_bindings: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("data-only nodes must reject shared policy mutations");
+
+    assert!(matches!(
+        database_error,
+        ServiceError::InvalidArgument(message)
+            if message.contains("data-only nodes cannot accept control-plane database mutations")
+    ));
+    assert!(matches!(
+        policy_error,
+        ServiceError::InvalidArgument(message)
+            if message.contains("data-only nodes cannot accept control-plane database mutations")
+    ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
 fn test_config(
     node_name: &str,
     storage_root: PathBuf,
@@ -139,6 +434,19 @@ fn test_config(
         },
         ..LogPoseConfig::default()
     }
+}
+
+fn test_config_with_auth(
+    node_name: &str,
+    storage_root: PathBuf,
+    endpoints: &[String],
+    key_prefix: &str,
+    cluster_name: &str,
+    bootstrap_tokens: Vec<BootstrapTokenConfig>,
+) -> LogPoseConfig {
+    let mut config = test_config(node_name, storage_root, endpoints, key_prefix, cluster_name);
+    config.auth.bootstrap_tokens = bootstrap_tokens;
+    config
 }
 
 fn test_etcd_endpoints() -> Vec<String> {

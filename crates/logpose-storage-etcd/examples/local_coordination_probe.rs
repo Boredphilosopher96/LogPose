@@ -2,6 +2,7 @@
 
 use async_trait as _;
 use etcd_client::Client;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult, ShardOwnership};

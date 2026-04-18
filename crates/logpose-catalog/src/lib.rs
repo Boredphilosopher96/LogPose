@@ -42,6 +42,13 @@ impl DatabaseDescriptor {
     /// Validate database-level configuration.
     pub fn validate(&self) -> logpose_types::Result<()> {
         validate_namespace_segment("database name", &self.name)?;
+        let expected_is_default = self.name == DEFAULT_DATABASE_NAME;
+        if self.is_default != expected_is_default {
+            return Err(LogPoseError::Message(format!(
+                "database descriptor is_default must be {expected_is_default} for database '{}'",
+                self.name
+            )));
+        }
         Ok(())
     }
 
@@ -198,12 +205,18 @@ fn default_database_name() -> String {
 }
 
 fn validate_namespace_segment(label: &str, value: &str) -> logpose_types::Result<()> {
+    let trimmed = value.trim();
     if value.trim().is_empty() {
         return Err(LogPoseError::Message(format!("{label} must not be empty")));
     }
     if value.contains('/') {
         return Err(LogPoseError::Message(format!(
             "{label} must not contain '/'"
+        )));
+    }
+    if matches!(trimmed, "." | "..") {
+        return Err(LogPoseError::Message(format!(
+            "{label} must not be a relative path component"
         )));
     }
     Ok(())
@@ -274,6 +287,19 @@ mod tests {
     }
 
     #[test]
+    fn database_descriptor_rejects_inconsistent_default_flag() {
+        let error = DatabaseDescriptor {
+            database_id: DatabaseId::default(),
+            name: "analytics".to_owned(),
+            is_default: true,
+        }
+        .validate()
+        .expect_err("non-default databases must not be flagged as default");
+
+        assert!(error.to_string().contains("is_default"));
+    }
+
+    #[test]
     fn collection_descriptor_defaults_to_default_database() {
         let descriptor = CollectionDescriptor::new(
             "events",
@@ -317,6 +343,25 @@ mod tests {
         .validate()
         .expect_err("slash-containing collection name should fail");
         assert!(collection_error.to_string().contains("collection_name"));
+    }
+
+    #[test]
+    fn namespace_descriptors_reject_relative_path_components() {
+        let database_error = DatabaseDescriptor::new("..")
+            .validate()
+            .expect_err("relative database names should fail");
+        assert!(database_error.to_string().contains("relative path"));
+
+        let collection_error = CollectionDescriptor::new_in_database(
+            ".",
+            "events",
+            2,
+            DistanceMetric::Dot,
+            Path::new("/tmp/catalog-validation"),
+        )
+        .validate()
+        .expect_err("relative database path components should fail");
+        assert!(collection_error.to_string().contains("relative path"));
     }
 
     #[test]

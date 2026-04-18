@@ -516,9 +516,15 @@ impl LogPoseControlService {
     /// Persist configured bootstrap principals into the catalog store.
     pub fn sync_bootstrap_principals(&self) -> Result<()> {
         for token in &self.config.auth.bootstrap_tokens {
-            self.catalog
-                .put_principal(token.principal.clone())
-                .map_err(ServiceError::from)?;
+            match self.catalog.get_principal(&token.principal.name) {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("does not exist") => {
+                    self.catalog
+                        .put_principal(token.principal.clone())
+                        .map_err(ServiceError::from)?;
+                }
+                Err(error) => return Err(ServiceError::from(error)),
+            }
         }
         Ok(())
     }
@@ -684,7 +690,11 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("must include at least one operation")
         || message.contains("must not be empty")
         || message.contains("must not contain '/'")
+        || message.contains("must not be a relative path component")
         || message.contains("must be greater than 0")
+        || message.contains("role binding database_name must match policy database_name")
+        || message.contains("authentication_mode")
+        || message.contains("is_default")
         || message.contains("invalid snapshot")
         || message.contains("manual reconciliation is required")
         || message.contains("reconciliation is required")

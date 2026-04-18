@@ -140,7 +140,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
     let policy = engine
         .put_database_access_policy(DatabaseAccessPolicy {
             database_name: "analytics".to_owned(),
-            authentication_mode: AuthenticationMode::Password,
+            authentication_mode: AuthenticationMode::ExternalToken,
             role_bindings: vec![DatabaseRoleBinding {
                 database_name: "analytics".to_owned(),
                 principal_name: "reader".to_owned(),
@@ -247,7 +247,7 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
     let owner_policy = engine
         .put_database_access_policy(DatabaseAccessPolicy {
             database_name: "analytics".to_owned(),
-            authentication_mode: AuthenticationMode::Password,
+            authentication_mode: AuthenticationMode::ExternalToken,
             role_bindings: vec![DatabaseRoleBinding {
                 database_name: "analytics".to_owned(),
                 principal_name: "owner-reader".to_owned(),
@@ -281,6 +281,22 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
         database
     );
     assert_ne!(owner_policy, read_only_policy);
+}
+
+#[test]
+fn put_database_preserves_stable_database_identity_on_replace() {
+    let root = support::unique_temp_dir("storage-database-idempotence");
+    let engine = LocalStorageEngine::new(&root);
+
+    let first = engine
+        .put_database(DatabaseDescriptor::new("analytics"))
+        .expect("first database descriptor should persist");
+    let replacement = engine
+        .put_database(DatabaseDescriptor::new("analytics"))
+        .expect("replacing a database descriptor should preserve its identity");
+
+    assert_eq!(replacement.name, "analytics");
+    assert_eq!(replacement.database_id, first.database_id);
 }
 
 #[tokio::test]

@@ -133,7 +133,7 @@ fn database_policy_commands_round_trip_over_grpc() {
         &policy_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "database_name": "default",
-            "authentication_mode": AuthenticationMode::Password,
+            "authentication_mode": AuthenticationMode::ExternalToken,
             "role_bindings": [
                 {
                     "database_name": "default",
@@ -161,7 +161,7 @@ fn database_policy_commands_round_trip_over_grpc() {
     let set_stdout = String::from_utf8(set.stdout).expect("stdout should be utf8");
     assert!(set_stdout.contains("Database policy updated"));
     assert!(set_stdout.contains("Database: default"));
-    assert!(set_stdout.contains("password"));
+    assert!(set_stdout.contains("external_token"));
     assert!(set_stdout.contains("writer"));
     assert!(set_stdout.contains("read_write"));
 
@@ -171,7 +171,7 @@ fn database_policy_commands_round_trip_over_grpc() {
         serde_json::from_str(&show_stdout).expect("policy output should be valid json");
 
     assert_eq!(show_body["database_name"], "default");
-    assert_eq!(show_body["authentication_mode"], "password");
+    assert_eq!(show_body["authentication_mode"], "external_token");
     assert_eq!(show_body["role_bindings"][0]["principal_name"], "writer");
     assert_eq!(show_body["role_bindings"][0]["role"], "read_write");
     assert_eq!(show_body["role_bindings"][1]["principal_name"], "reader");

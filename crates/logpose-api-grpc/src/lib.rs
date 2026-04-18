@@ -1484,7 +1484,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("data-only nodes cannot accept control-plane database policy mutations")
+                .contains("data-only nodes cannot accept control-plane database mutations")
         );
     }
 

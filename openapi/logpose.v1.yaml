@@ -33,6 +33,8 @@ paths:
     get:
       summary: Get runtime status
       operationId: getRuntimeStatus
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Control-plane runtime summary
@@ -40,6 +42,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeRuntimeStatus"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal runtime-status failure
           content:
@@ -50,6 +64,8 @@ paths:
     get:
       summary: List databases
       operationId: listDatabases
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Database descriptors
@@ -75,6 +91,8 @@ paths:
     get:
       summary: Get a database descriptor
       operationId: getDatabase
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -109,6 +127,8 @@ paths:
     put:
       summary: Create or replace a database descriptor
       operationId: putDatabase
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -150,6 +170,8 @@ paths:
     post:
       summary: Create a collection
       operationId: createCollection
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -175,10 +197,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database write permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/databases/{name}/policy:
     get:
       summary: Get a database access policy
       operationId: getDatabasePolicy
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -198,6 +234,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database owner permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal database policy lookup failure
           content:
@@ -207,6 +255,8 @@ paths:
     put:
       summary: Create or replace a database access policy
       operationId: putDatabasePolicy
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -238,6 +288,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database owner permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal database policy persistence failure
           content:
@@ -248,6 +310,8 @@ paths:
     get:
       summary: Get collection metadata
       operationId: getCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -279,10 +343,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database read permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/placement:
     get:
       summary: Get collection placement
       operationId: getCollectionPlacement
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -314,6 +392,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal placement lookup failure
           content:
@@ -324,6 +414,8 @@ paths:
     post:
       summary: Write a mixed put/delete batch
       operationId: writeCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -355,10 +447,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database write permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/query:
     post:
       summary: Execute a planner-controlled vector query
       operationId: queryCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -390,10 +496,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database read permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/stats:
     get:
       summary: Get collection stats
       operationId: getCollectionStats
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -425,10 +545,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database read permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/flush:
     post:
       summary: Flush the mutable delta into a new segment
       operationId: flushCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -460,10 +594,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database write permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/compact:
     post:
       summary: Compact immutable segments
       operationId: compactCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -495,10 +643,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database write permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/inspect:
     get:
       summary: Inspect collection storage state
       operationId: inspectCollection
+      security:
+        - bearerAuth: []
       parameters:
         - name: name
           in: path
@@ -541,7 +703,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Database read permission required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
   schemas:
     HealthResponse:
       type: object
@@ -572,7 +750,7 @@ components:
       enum: [combined, control, data]
     AuthenticationMode:
       type: string
-      enum: [disabled, password, mutual_tls, external_token]
+      enum: [disabled, external_token]
     DatabaseRole:
       type: string
       enum: [owner, read_write, read_only]
