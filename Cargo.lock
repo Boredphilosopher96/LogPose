@@ -1362,6 +1362,7 @@ dependencies = [
 name = "logpose-core"
 version = "0.1.0"
 dependencies = [
+ "etcd-client",
  "logpose-catalog",
  "logpose-config",
  "logpose-query",
@@ -1370,6 +1371,8 @@ dependencies = [
  "logpose-storage-etcd",
  "logpose-types",
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

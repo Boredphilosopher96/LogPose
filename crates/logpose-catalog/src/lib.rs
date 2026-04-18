@@ -194,6 +194,29 @@ impl CollectionDescriptor {
         self.collection_ref().lookup_name()
     }
 
+    /// Return a copy of the descriptor without any node-local filesystem path.
+    #[must_use]
+    pub fn without_root_path(&self) -> Self {
+        let mut descriptor = self.clone();
+        descriptor.root_path = PathBuf::new();
+        descriptor
+    }
+
+    /// Return whether two descriptors refer to the same serveable collection identity.
+    #[must_use]
+    pub fn matches_serving_identity(&self, other: &Self) -> bool {
+        self.collection_id == other.collection_id
+            && self.tenant_name == other.tenant_name
+            && self.database_name == other.database_name
+            && self.name == other.name
+            && self.dimensions == other.dimensions
+            && self.metric == other.metric
+            && self.remote_blob == other.remote_blob
+            && self.flush_threshold_ops == other.flush_threshold_ops
+            && self.flush_threshold_bytes == other.flush_threshold_bytes
+            && self.compaction_threshold_segments == other.compaction_threshold_segments
+    }
+
     /// Validate collection-level configuration values.
     pub fn validate(&self) -> logpose_types::Result<()> {
         self.collection_ref().validate()?;
@@ -354,5 +377,15 @@ mod tests {
                 .to_string()
                 .contains("dimensions")
         );
+    }
+
+    #[test]
+    fn serving_identity_ignores_runtime_root_path() {
+        let root = Path::new("/tmp/catalog-validation");
+        let descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        let stripped = descriptor.without_root_path();
+
+        assert!(descriptor.matches_serving_identity(&stripped));
+        assert_eq!(stripped.root_path, PathBuf::new());
     }
 }

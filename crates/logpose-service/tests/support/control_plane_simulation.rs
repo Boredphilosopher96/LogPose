@@ -131,7 +131,7 @@ impl ExpectedModel {
     }
 
     fn control_plane_ready(&self) -> bool {
-        self.current_role == NodeRole::Combined
+        matches!(self.current_role, NodeRole::Combined | NodeRole::Control)
     }
 
     fn data_plane_ready(&self) -> bool {

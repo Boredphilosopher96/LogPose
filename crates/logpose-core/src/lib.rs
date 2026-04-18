@@ -1,5 +1,7 @@
 //! Shared service lifecycle types.
 
+#[cfg(test)]
+use etcd_client as _;
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
 use logpose_service::{
@@ -12,7 +14,11 @@ use logpose_types::{
     WriteOperation,
 };
 use serde::Serialize;
+#[cfg(test)]
+use serde_json as _;
 use std::sync::Arc;
+#[cfg(test)]
+use tokio as _;
 
 /// Top-level state shared by transport layers and tools.
 #[derive(Clone, Debug, Serialize)]

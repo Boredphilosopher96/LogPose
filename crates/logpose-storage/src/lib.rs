@@ -43,6 +43,11 @@ pub trait StorageEngine: Send + Sync {
     /// Return a short identifier for the engine implementation.
     async fn engine_name(&self) -> &'static str;
 
+    /// Verify that the engine's metadata authority is currently reachable.
+    async fn metadata_status(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Create a new collection rooted under the engine storage path.
     async fn create_collection(
         &self,
@@ -64,6 +69,27 @@ pub trait StorageEngine: Send + Sync {
 
     /// Open an existing collection by name.
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor>;
+
+    /// Return whether the collection's local on-disk state exists on this node.
+    async fn has_local_collection(&self, name: &str) -> Result<bool> {
+        match self.open_collection(name).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.to_string().contains("does not exist") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return whether the local on-disk descriptor matches the authoritative descriptor.
+    async fn local_collection_matches_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<bool> {
+        if !self.has_local_collection(&descriptor.lookup_name()).await? {
+            return Ok(false);
+        }
+        let local_descriptor = self.open_collection(&descriptor.lookup_name()).await?;
+        Ok(local_descriptor.matches_serving_identity(descriptor))
+    }
 
     /// List every known collection descriptor.
     async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
@@ -445,6 +471,81 @@ impl LocalStorageEngine {
         descriptor.root_path.join("descriptor.json")
     }
 
+    /// Build the descriptor that would be persisted for one collection request.
+    pub fn plan_collection_descriptor(
+        &self,
+        request: &CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        let request = request.clone().with_defaults();
+        let collection = CollectionRef::new(
+            request.tenant_name.clone(),
+            request.database_name.clone(),
+            request.name.clone(),
+        );
+        if self.find_collection_descriptor_ref(&collection).is_ok() {
+            return Err(LogPoseError::Message(format!(
+                "collection '{}/{}/{}' already exists",
+                collection.tenant_name, collection.database_name, collection.collection_name
+            )));
+        }
+
+        let descriptor = CollectionDescriptor::new_in_namespace(
+            request.tenant_name,
+            request.database_name,
+            request.name,
+            request.dimensions,
+            request.metric,
+            self.collections_root(),
+        );
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    /// Persist a collection using a previously planned descriptor.
+    pub fn create_collection_from_descriptor(
+        &self,
+        descriptor: CollectionDescriptor,
+        assignment: Option<&CollectionAssignment>,
+    ) -> Result<CollectionDescriptor> {
+        fs::create_dir_all(self.collections_root())
+            .map_err(|error| io_message("failed to create collections root", error))?;
+        if self
+            .find_collection_descriptor_ref(&descriptor.collection_ref())
+            .is_ok()
+        {
+            return Err(LogPoseError::Message(format!(
+                "collection '{}/{}/{}' already exists",
+                descriptor.tenant_name, descriptor.database_name, descriptor.name
+            )));
+        }
+
+        descriptor.validate()?;
+        let result = (|| -> Result<()> {
+            self.ensure_tenant_descriptor(&descriptor.tenant_name)?;
+            self.ensure_database_descriptor(&descriptor.tenant_name, &descriptor.database_name)?;
+            self.create_collection_directories(&descriptor)?;
+            if let Some(assignment) = assignment {
+                self.persist_collection_assignment(&descriptor, assignment)?;
+            }
+            self.publish_manifest(&descriptor, &Manifest::empty(0))?;
+            self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
+            let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
+            wal_writer.truncate()?;
+            atomic_write(
+                &Self::descriptor_path(&descriptor),
+                serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(descriptor),
+            Err(error) => {
+                cleanup_dir(&descriptor.root_path);
+                Err(error)
+            }
+        }
+    }
+
     fn load_collection_assignment(
         &self,
         descriptor: &CollectionDescriptor,
@@ -475,45 +576,8 @@ impl LocalStorageEngine {
         request: CreateCollectionRequest,
         assignment: Option<&CollectionAssignment>,
     ) -> Result<CollectionDescriptor> {
-        let request = request.with_defaults();
-        fs::create_dir_all(self.collections_root())
-            .map_err(|error| io_message("failed to create collections root", error))?;
-        let collection = CollectionRef::new(
-            request.tenant_name.clone(),
-            request.database_name.clone(),
-            request.name.clone(),
-        );
-        if self.find_collection_descriptor_ref(&collection).is_ok() {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}/{}/{}' already exists",
-                collection.tenant_name, collection.database_name, collection.collection_name
-            )));
-        }
-
-        let descriptor = CollectionDescriptor::new_in_namespace(
-            request.tenant_name,
-            request.database_name,
-            request.name,
-            request.dimensions,
-            request.metric,
-            self.collections_root(),
-        );
-        descriptor.validate()?;
-        self.ensure_tenant_descriptor(&descriptor.tenant_name)?;
-        self.ensure_database_descriptor(&descriptor.tenant_name, &descriptor.database_name)?;
-        self.create_collection_directories(&descriptor)?;
-        if let Some(assignment) = assignment {
-            self.persist_collection_assignment(&descriptor, assignment)?;
-        }
-        self.publish_manifest(&descriptor, &Manifest::empty(0))?;
-        self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
-        let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
-        wal_writer.truncate()?;
-        atomic_write(
-            &Self::descriptor_path(&descriptor),
-            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-        )?;
-        Ok(descriptor)
+        let descriptor = self.plan_collection_descriptor(&request)?;
+        self.create_collection_from_descriptor(descriptor, assignment)
     }
 
     fn ensure_tenant_descriptor(&self, tenant_name: &str) -> Result<()> {
@@ -1553,6 +1617,10 @@ fn cleanup_file(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+fn cleanup_dir(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
 fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1590,6 +1658,21 @@ impl StorageEngine for LocalStorageEngine {
 
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
         self.find_collection_descriptor(name)
+    }
+
+    async fn has_local_collection(&self, name: &str) -> Result<bool> {
+        Ok(self.find_collection_descriptor(name).is_ok())
+    }
+
+    async fn local_collection_matches_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<bool> {
+        match self.find_collection_descriptor(&descriptor.lookup_name()) {
+            Ok(local_descriptor) => Ok(local_descriptor.matches_serving_identity(descriptor)),
+            Err(error) if error.to_string().contains("does not exist") => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {

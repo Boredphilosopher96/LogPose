@@ -1,6 +1,6 @@
 # Getting Started
 
-Install Rust `1.94.1` and run:
+Install Rust `1.94.1`, ensure `protoc` / `protobuf-compiler` is available on `PATH`, start a local etcd endpoint on `http://127.0.0.1:2379` for the full test suite, and run:
 
 ```bash
 cargo metadata --format-version 1 > /dev/null

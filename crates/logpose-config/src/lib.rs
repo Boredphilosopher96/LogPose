@@ -56,11 +56,12 @@ impl LogPoseConfig {
                 ANONYMOUS_LOCAL_NODE_NAME
             )));
         }
-        if self.metadata.backend == MetadataBackend::Etcd && self.metadata.etcd.endpoints.is_empty()
-        {
-            return Err(LogPoseError::Message(
-                "invalid LOGPOSE_CONFIG: metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'".to_owned(),
-            ));
+        if self.metadata.backend == MetadataBackend::Etcd {
+            self.metadata.etcd.validate().map_err(|error| match error {
+                LogPoseError::Message(message) => {
+                    LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {message}"))
+                }
+            })?;
         }
         Ok(())
     }
@@ -190,6 +191,58 @@ endpoints = []"#,
         .expect_err("etcd backend with empty endpoints should be rejected");
 
         assert!(error.to_string().contains("metadata.etcd.endpoints"));
+    }
+
+    #[test]
+    fn from_toml_str_rejects_blank_etcd_cluster_name() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379"]
+cluster_name = "   ""#,
+        )
+        .expect_err("blank cluster name should be rejected");
+
+        assert!(error.to_string().contains("metadata.etcd.cluster_name"));
+    }
+
+    #[test]
+    fn from_toml_str_rejects_zero_etcd_timeout_and_ttls() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379"]
+timeout_ms = 0
+membership_ttl_secs = 0
+leadership_ttl_secs = 0"#,
+        )
+        .expect_err("zero timeout and ttls should be rejected");
+
+        assert!(
+            error.to_string().contains("timeout_ms")
+                || error.to_string().contains("membership_ttl_secs")
+                || error.to_string().contains("leadership_ttl_secs")
+        );
     }
 
     #[test]

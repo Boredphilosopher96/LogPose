@@ -55,6 +55,11 @@ Snapshot references are used across writes, queries, flushes, and compactions:
 }
 ```
 
+Collection-scoped write/query/flush/compact/inspect responses flatten
+`tenant_name`, `database_name`, and `collection_name` into the top-level JSON
+payload so operators can tell which namespace produced the response without
+reconstructing it from the request path.
+
 ## Endpoints
 
 ### Health Check
@@ -70,6 +75,14 @@ curl http://127.0.0.1:8080/health
 | Method   | `GET`            |
 | Path     | `/health`        |
 | Success  | `200 OK`         |
+
+**Response** (`200`):
+
+```json
+{
+  "status": "ok"
+}
+```
 
 ### Node Metadata
 
@@ -110,22 +123,24 @@ curl http://127.0.0.1:8080/v1/runtime/status
 
 ```json
 {
-  "metadata": { "product": "logpose", "node_name": "node-alpha", "version": "0.1.0", "git_sha": "abc1234", "profile": "release" },
+  "metadata": { "product": "LogPose", "node_name": "node-alpha", "version": "0.1.0", "git_sha": "abc1234", "profile": "release" },
   "role": "combined",
-  "rest_endpoint": "127.0.0.1:8080",
-  "grpc_endpoint": "127.0.0.1:50051",
+  "rest_endpoint": "http://127.0.0.1:8080",
+  "grpc_endpoint": "http://127.0.0.1:50051",
   "storage_engine": "local",
   "control_plane_ready": true,
   "data_plane_ready": true,
-  "collection_count": 2,
+  "collection_count": 1,
   "collections": [
     {
       "collection_id": "550e8400-e29b-41d4-a716-446655440000",
+      "tenant_name": "default",
+      "database_name": "default",
       "collection_name": "embeddings",
       "assigned_node": "node-alpha",
-      "assigned_role": "combined",
+      "assigned_role": "data",
       "route_kind": "local",
-      "route_reason": "single-node placement"
+      "route_reason": "assigned data-plane collection is stored locally on this runtime"
     }
   ],
   "maintenance": {
@@ -146,7 +161,9 @@ rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
 ### Create Collection
 
 Creates a new vector collection. Control-plane lifecycle changes are only
-accepted on nodes with the `combined` role.
+accepted on nodes with the `combined` role. Request and response bodies are
+namespace-aware: omit `tenant_name` / `database_name` to use the bootstrap
+`default/default` namespace, or set them explicitly for non-default scopes.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections \
@@ -160,16 +177,19 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 
 **Request body**:
 
-| Field        | Type     | Required | Description                            |
-|--------------|----------|----------|----------------------------------------|
-| `name`       | string   | yes      | Unique collection name                 |
-| `dimensions` | integer  | yes      | Vector dimensionality (>= 1)           |
-| `metric`     | string   | yes      | Distance metric: `cosine`, `dot`, `l2` |
+| Field           | Type    | Required | Description                              |
+|-----------------|---------|----------|------------------------------------------|
+| `tenant_name`   | string  | no       | Tenant namespace; defaults to `default`  |
+| `database_name` | string  | no       | Database namespace; defaults to `default`|
+| `name`          | string  | yes      | Unique collection name                   |
+| `dimensions`    | integer | yes      | Vector dimensionality (>= 1)             |
+| `metric`        | string  | yes      | Distance metric: `cosine`, `dot`, `l2`   |
 
 **Response** (`201`):
 
 ```json
 {
+  "tenant_name": "default",
   "database_name": "default",
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "name": "embeddings",
@@ -197,20 +217,23 @@ rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply
 
 ### Get Collection
 
-Retrieves metadata for an existing collection by name.
+Retrieves metadata for an existing collection by name. Use `tenant` /
+`database` query parameters for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings
 ```
 
-| Status | Meaning              |
-|--------|----------------------|
-| `200`  | Collection descriptor|
-| `404`  | Collection not found |
+| Status | Meaning                            |
+|--------|------------------------------------|
+| `200`  | Collection descriptor              |
+| `400`  | Reconciliation or namespace error  |
+| `404`  | Collection not found               |
 
 ### Get Collection Placement
 
-Returns placement routing information for a collection.
+Returns placement routing information for a collection. Use `tenant` /
+`database` query parameters for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/placement
@@ -221,11 +244,13 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/placement
 ```json
 {
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant_name": "default",
+  "database_name": "default",
   "collection_name": "embeddings",
   "assigned_node": "node-alpha",
-  "assigned_role": "combined",
+  "assigned_role": "data",
   "route_kind": "local",
-  "route_reason": "single-node placement"
+  "route_reason": "assigned data-plane collection is stored locally on this runtime"
 }
 ```
 
@@ -240,6 +265,8 @@ rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPla
 Submits a mixed batch of `put` and `delete` operations to a collection.
 Data-plane calls are rejected when the runtime cannot serve the collection
 locally.
+For non-default namespaces, include `tenant_name` and `database_name` in the
+request body.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
@@ -270,6 +297,9 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
+  "collection_name": "embeddings",
   "last_seq_no": 1023,
   "applied_ops": 3
 }
@@ -291,6 +321,8 @@ rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
 
 Executes a planner-controlled vector query with optional metadata filtering
 and explain diagnostics.
+For non-default namespaces, include `tenant_name` and `database_name` in the
+request body.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
@@ -304,19 +336,24 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 
 **Request body**:
 
-| Field       | Type     | Required | Description                                              |
-|-------------|----------|----------|----------------------------------------------------------|
-| `vector`    | float[]  | yes      | Query vector                                             |
-| `top_k`     | integer  | yes      | Maximum results to return (>= 1)                         |
-| `snapshot`  | object   | no       | Pin query to a specific snapshot                         |
-| `filters`   | object   | no       | Legacy AND-only equality filters over scalar metadata    |
-| `predicate` | object   | no       | Structured predicate tree (see below)                    |
-| `explain`   | string   | no       | `"none"`, `"plan"`, or `"profile"`                       |
+| Field             | Type    | Required | Description                                           |
+|-------------------|---------|----------|-------------------------------------------------------|
+| `tenant_name`     | string  | no       | Tenant namespace; defaults to `default`               |
+| `database_name`   | string  | no       | Database namespace; defaults to `default`             |
+| `vector`          | float[] | yes      | Query vector                                          |
+| `top_k`           | integer | yes      | Maximum results to return (>= 1)                      |
+| `snapshot`        | object  | no       | Pin query to a specific snapshot                      |
+| `filters`         | object  | no       | Legacy AND-only equality filters over scalar metadata |
+| `predicate`       | object  | no       | Structured predicate tree (see below)                 |
+| `explain`         | string  | no       | `"none"`, `"plan"`, or `"profile"`                    |
 
 **Response** (`200`):
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
+  "collection_name": "embeddings",
   "metric": "cosine",
   "top_k": 5,
   "returned": 2,
@@ -405,6 +442,7 @@ filter selectivity:
 ### Collection Stats
 
 Returns storage statistics, maintenance state, and per-query-unit breakdowns.
+Use `tenant` / `database` query parameters for non-default namespaces.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -414,6 +452,8 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "collection_name": "embeddings",
   "manifest_generation": 4,
@@ -461,6 +501,7 @@ rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply)
 ### Flush Collection
 
 Flushes the mutable delta into a new immutable segment.
+Use `tenant` / `database` query parameters for non-default namespaces.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/flush
@@ -470,6 +511,9 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/flush
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
+  "collection_name": "embeddings",
   "manifest_generation": 5,
   "visible_seq_no": 1023
 }
@@ -485,6 +529,7 @@ rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
 
 Merges immutable segments to reduce segment count and reclaim space from
 tombstoned deletes.
+Use `tenant` / `database` query parameters for non-default namespaces.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/compact
@@ -494,6 +539,9 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/compact
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
+  "collection_name": "embeddings",
   "manifest_generation": 6,
   "visible_seq_no": 1023
 }
@@ -508,6 +556,7 @@ rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
 ### Inspect Collection
 
 Returns low-level storage inspection reports for debugging and diagnostics.
+Use `tenant` / `database` query parameters for non-default namespaces.
 
 ```bash
 # Inspect manifest
@@ -532,6 +581,9 @@ curl "http://127.0.0.1:8080/v1/collections/embeddings/inspect?target=maintenance
 
 ```json
 {
+  "tenant_name": "default",
+  "database_name": "default",
+  "collection_name": "embeddings",
   "target": "manifest",
   "payload": { "...": "target-specific JSON" }
 }

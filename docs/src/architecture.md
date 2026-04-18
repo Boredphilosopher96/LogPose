@@ -31,7 +31,7 @@ LogPose is still a local filesystem engine.
 
 - mutable writes land in WAL-backed local state under `storage_root`
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
-- a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
+- a default database descriptor is now persisted under `storage_root/tenants/default/databases/default/descriptor.json`
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units

@@ -11,3 +11,6 @@ Before opening a pull request, run:
 ```bash
 scripts/check.sh
 ```
+
+The full workspace verification flow now expects etcd to be reachable at
+`http://127.0.0.1:2379` unless you override `LOGPOSE_TEST_ETCD_ENDPOINTS`.

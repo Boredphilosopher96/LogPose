@@ -9,6 +9,20 @@ on:
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.18
+        env:
+          ETCD_NAME: default
+          ETCD_INITIAL_CLUSTER: default=http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER_TOKEN: logpose-ci
+          ETCD_INITIAL_CLUSTER_STATE: new
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
+        ports:
+          - 2379:2379
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -23,6 +37,17 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Wait for etcd readiness
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:2379/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "etcd did not become ready at http://127.0.0.1:2379" >&2
+          exit 1
 
       - name: Run workspace tests
         run: cargo test --workspace -- --skip randomized_storage_scenarios_match_the_expected_model --skip randomized_service_scenarios_match_the_expected_model --skip diagnostics_status_snapshot_contract --skip diagnostics_placement_snapshot_contract --skip query_and_inspect_snapshot_contract

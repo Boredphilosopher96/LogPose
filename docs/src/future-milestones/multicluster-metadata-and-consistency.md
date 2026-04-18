@@ -110,9 +110,9 @@ The system should document which APIs allow which modes. Consistency should be a
 The repository now includes a first production-oriented metadata backend switch with an etcd option:
 
 - `metadata.backend = "etcd"` enables etcd-backed authoritative collection assignment metadata
-- assignment writes use create-if-absent transactions to prevent split ownership on create
-- read paths prefer etcd assignments and fall back to local placement files only when keys are absent
-- local placement files are still written for recovery/bootstrap diagnostics while etcd is authoritative
+- collection create writes use create-if-absent transactions for both the authoritative assignment and descriptor metadata
+- read paths fail closed if authoritative etcd metadata is unavailable instead of falling back to stale local placement files
+- local placement files are still written for recovery/bootstrap diagnostics, but they are no longer consulted as an authority once the etcd backend is selected
 
 This is intentionally a foundation milestone and not full distributed control-plane completion. Remaining work from the streams below still applies (leases, elections, shard/replica control loops, epoch-gated serving, and multi-node failover simulations).
 

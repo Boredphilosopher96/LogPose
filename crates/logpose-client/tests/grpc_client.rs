@@ -52,12 +52,13 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         ))
         .await
         .expect("collection should be created");
+    let qualified = descriptor.lookup_name();
     assert_eq!(descriptor.tenant_name, "default");
     assert_eq!(descriptor.database_name, "default");
     assert_eq!(descriptor.name, "documents");
 
     let read_back = client
-        .get_collection("documents")
+        .get_collection(&qualified)
         .await
         .expect("collection should load");
     assert_eq!(read_back.tenant_name, "default");
@@ -66,7 +67,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 
     client
         .write(
-            "documents",
+            &qualified,
             vec![
                 WriteOperation::Put(PutRecord {
                     id: RecordId::new("alpha"),
@@ -85,7 +86,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 
     let query = client
         .query(QueryRequest {
-            collection_name: "documents".to_owned(),
+            collection_name: qualified.clone(),
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
@@ -127,7 +128,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         Some(1)
     );
 
-    let stats = client.stats("documents").await.expect("stats should load");
+    let stats = client.stats(&qualified).await.expect("stats should load");
     assert_eq!(stats.tenant_name, "default");
     assert_eq!(stats.database_name, "default");
     assert_eq!(stats.live_record_count, 2);
@@ -148,14 +149,14 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let flush = client
-        .flush("documents")
+        .flush(&qualified)
         .await
         .expect("flush should succeed");
     assert!(flush.manifest_generation >= 1);
 
     client
         .write(
-            "documents",
+            &qualified,
             vec![WriteOperation::Delete(DeleteRecord {
                 id: RecordId::new("beta"),
             })],
@@ -164,15 +165,12 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .expect("delete should succeed");
 
     let compact = client
-        .compact("documents")
+        .compact(&qualified)
         .await
         .expect("compact should succeed");
     assert!(compact.manifest_generation >= flush.manifest_generation);
 
-    let stats = client
-        .stats("documents")
-        .await
-        .expect("stats should reload");
+    let stats = client.stats(&qualified).await.expect("stats should reload");
     assert_eq!(stats.live_record_count, 1);
     assert_eq!(stats.deleted_record_count, 1);
     assert_eq!(stats.mutable_op_count, 1);
@@ -209,7 +207,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 
     let hybrid_query = client
         .query(QueryRequest {
-            collection_name: "documents".to_owned(),
+            collection_name: qualified.clone(),
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
@@ -253,7 +251,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert!(hybrid_timings.rerank_micros > 0);
 
     let inspect = client
-        .inspect("documents", InspectTarget::Manifest)
+        .inspect(&qualified, InspectTarget::Manifest)
         .await
         .expect("inspect should succeed");
     assert_eq!(inspect.target, "manifest");
@@ -269,7 +267,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .to_owned();
 
     let wal = client
-        .inspect("documents", InspectTarget::Wal)
+        .inspect(&qualified, InspectTarget::Wal)
         .await
         .expect("wal inspect should succeed");
     assert_eq!(wal.target, "wal");
@@ -283,7 +281,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let segment = client
-        .inspect("documents", InspectTarget::Segment(segment_id.clone()))
+        .inspect(&qualified, InspectTarget::Segment(segment_id.clone()))
         .await
         .expect("segment inspect should succeed");
     assert_eq!(segment.target, format!("segment:{segment_id}"));
@@ -298,7 +296,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let maintenance = client
-        .inspect("documents", InspectTarget::Maintenance)
+        .inspect(&qualified, InspectTarget::Maintenance)
         .await
         .expect("maintenance inspect should succeed");
     assert_eq!(maintenance.target, "maintenance");
@@ -344,7 +342,7 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
     assert_eq!(status.collections[0].assigned_role.as_str(), "data");
 
     let placement = client
-        .collection_placement("documents")
+        .collection_placement("default/default/documents")
         .await
         .expect("placement should load");
     assert_eq!(placement.tenant_name, "default");
@@ -437,17 +435,17 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
         })
         .collect::<Vec<_>>();
     client
-        .write("documents", operations)
+        .write("default/default/documents", operations)
         .await
         .expect("write should succeed");
     client
-        .flush("documents")
+        .flush("default/default/documents")
         .await
         .expect("flush should succeed");
 
     let response = client
         .query(QueryRequest {
-            collection_name: "documents".to_owned(),
+            collection_name: "default/default/documents".to_owned(),
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
