@@ -136,6 +136,30 @@ impl LogPoseDataService {
         self.storage.engine_name().await
     }
 
+    /// Verify whether the backing metadata authority is currently reachable.
+    pub async fn metadata_status(&self) -> Result<()> {
+        self.storage.metadata_status().await.map_err(Into::into)
+    }
+
+    /// Return whether the collection's local on-disk state exists on this node.
+    pub async fn has_local_collection(&self, collection_name: &str) -> Result<bool> {
+        self.storage
+            .has_local_collection(collection_name)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Return whether the local on-disk descriptor matches the authoritative descriptor.
+    pub async fn local_collection_matches_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<bool> {
+        self.storage
+            .local_collection_matches_descriptor(descriptor)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Persist a write batch.
     pub async fn write(
         &self,
@@ -325,17 +349,31 @@ impl LogPoseControlService {
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
         let descriptor = self.data.get_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
-        Ok(self.local_placement(&descriptor, &assignment))
+        let local_collection_available = self
+            .data
+            .local_collection_matches_descriptor(&descriptor)
+            .await?;
+        Ok(self.local_placement(&descriptor, &assignment, local_collection_available))
     }
 
     /// Return aggregated runtime and maintenance status for the local node.
     pub async fn runtime_status(&self) -> Result<NodeRuntimeStatus> {
-        let descriptors = self.data.list_collections().await?;
+        let metadata_ready = self.data.metadata_status().await.is_ok();
+        let descriptors = if metadata_ready {
+            self.data.list_collections().await?
+        } else {
+            Vec::new()
+        };
         let mut placements = Vec::with_capacity(descriptors.len());
         let mut local_descriptors = Vec::new();
         for descriptor in &descriptors {
             let assignment = self.assignment_for_descriptor(descriptor).await?;
-            let placement = self.local_placement(descriptor, &assignment);
+            let local_collection_available = self
+                .data
+                .local_collection_matches_descriptor(descriptor)
+                .await?;
+            let placement =
+                self.local_placement(descriptor, &assignment, local_collection_available);
             if placement.route_kind == "local" {
                 local_descriptors.push(descriptor);
             }
@@ -375,8 +413,13 @@ impl LogPoseControlService {
             rest_endpoint: http_endpoint(&self.config.rest_host, self.config.rest_port),
             grpc_endpoint: http_endpoint(&self.config.grpc_host, self.config.grpc_port),
             storage_engine: self.data.engine_name().await.to_owned(),
-            control_plane_ready: matches!(self.config.node_role, NodeRole::Combined),
-            data_plane_ready: matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data),
+            control_plane_ready: metadata_ready
+                && matches!(
+                    self.config.node_role,
+                    NodeRole::Combined | NodeRole::Control
+                ),
+            data_plane_ready: metadata_ready
+                && matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data),
             collection_count: placements
                 .iter()
                 .filter(|placement| placement.route_kind == "local")
@@ -390,10 +433,12 @@ impl LogPoseControlService {
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
         assignment: &CollectionAssignment,
+        local_collection_available: bool,
     ) -> CollectionPlacement {
         let assignment_targets_this_runtime = assignment.assigned_node == self.config.node_name
             || assignment.assigned_node == ANONYMOUS_LOCAL_NODE_NAME;
         let serves_local_assignment = assignment_targets_this_runtime
+            && local_collection_available
             && match assignment.assigned_role {
                 NodeRole::Combined => self.config.node_role == NodeRole::Combined,
                 NodeRole::Control => {
@@ -422,52 +467,78 @@ impl LogPoseControlService {
             route_reason: match (
                 serves_local_assignment,
                 assignment_targets_this_runtime,
+                local_collection_available,
                 assignment.assigned_node.as_str(),
                 assignment.assigned_role,
                 self.config.node_role,
             ) {
-                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Combined, NodeRole::Combined) => {
-                    "anonymous local combined assignment".to_owned()
-                }
-                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Combined) => {
+                (
+                    true,
+                    _,
+                    true,
+                    ANONYMOUS_LOCAL_NODE_NAME,
+                    NodeRole::Combined,
+                    NodeRole::Combined,
+                ) => "anonymous local combined assignment".to_owned(),
+                (true, _, true, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Combined) => {
                     "anonymous local data-plane assignment".to_owned()
                 }
-                (true, _, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Data) => {
+                (true, _, true, ANONYMOUS_LOCAL_NODE_NAME, NodeRole::Data, NodeRole::Data) => {
                     "anonymous local data-plane assignment".to_owned()
                 }
-                (false, true, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, NodeRole::Control) => {
+                (false, true, false, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, _) => format!(
+                    "anonymous local {assigned_role} assignment targets this runtime but local collection state is absent"
+                ),
+                (
+                    false,
+                    true,
+                    true,
+                    ANONYMOUS_LOCAL_NODE_NAME,
+                    assigned_role,
+                    NodeRole::Control,
+                ) => {
                     format!(
                         "anonymous local {assigned_role} assignment is recorded while this process runs as control-only"
                     )
                 }
-                (false, true, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, current_role) => format!(
-                    "anonymous local {assigned_role} assignment is recorded while this process runs as {current_role}"
-                ),
-                (true, _, _, NodeRole::Combined, NodeRole::Combined) => {
+                (false, true, true, ANONYMOUS_LOCAL_NODE_NAME, assigned_role, current_role) => {
+                    format!(
+                        "anonymous local {assigned_role} assignment is recorded while this process runs as {current_role}"
+                    )
+                }
+                (true, _, true, _, NodeRole::Combined, NodeRole::Combined) => {
                     "single-node combined runtime keeps control-plane and data-plane colocated"
                         .to_owned()
                 }
-                (true, _, _, NodeRole::Data, NodeRole::Combined) => {
+                (true, _, true, _, NodeRole::Data, NodeRole::Combined) => {
                     "single-node combined runtime exposes a local data-plane assignment".to_owned()
                 }
-                (true, _, _, NodeRole::Data, NodeRole::Data) => {
+                (true, _, true, _, NodeRole::Data, NodeRole::Data) => {
                     "local data-plane assignment".to_owned()
                 }
-                (false, true, _, assigned_role, NodeRole::Control) => format!(
+                (false, true, false, _, assigned_role, _) => format!(
+                    "persisted local {assigned_role} assignment targets this runtime but local collection state is absent"
+                ),
+                (false, true, true, _, assigned_role, NodeRole::Control) => format!(
                     "persisted local {assigned_role} assignment is recorded while this process runs as control-only"
                 ),
-                (false, true, _, assigned_role, current_role) => format!(
+                (false, true, true, _, assigned_role, current_role) => format!(
                     "persisted local {assigned_role} assignment is recorded while this process runs as {current_role}"
                 ),
-                (true, _, _, assigned_role, current_role) if assigned_role != current_role => {
+                (true, _, true, _, assigned_role, current_role)
+                    if assigned_role != current_role =>
+                {
                     format!(
                         "persisted local {assigned_role} assignment is being inspected from a {current_role} runtime"
                     )
                 }
-                (true, _, _, assigned_role, _) => {
+                (true, _, true, _, assigned_role, _) => {
                     format!("persisted local {assigned_role} assignment")
                 }
-                (false, false, _, assigned_role, _) => format!(
+                (true, _, false, _, assigned_role, _) => format!(
+                    "persisted local {assigned_role} assignment cannot be served because local collection state is absent"
+                ),
+                (false, false, _, _, assigned_role, _) => format!(
                     "persisted placement targets node '{}' with role '{}'",
                     assignment.assigned_node, assigned_role
                 ),
@@ -519,8 +590,11 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("duplicate record id")
         || message.contains("must include at least one operation")
         || message.contains("must not be empty")
+        || message.contains("must not contain '/'")
         || message.contains("must be greater than 0")
         || message.contains("invalid snapshot")
+        || message.contains("manual reconciliation is required")
+        || message.contains("reconciliation is required")
         || is_dimension_validation_error(&message)
     {
         ServiceError::InvalidArgument(message)
@@ -616,6 +690,15 @@ mod tests {
         assert!(
             matches!(error, ServiceError::Internal(message) if message.contains("checksum mismatch"))
         );
+    }
+
+    #[test]
+    fn classifies_reconciliation_failures_as_invalid_argument() {
+        let error = ServiceError::from(LogPoseError::Message(
+            "collection 'default/default/documents' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it".to_owned(),
+        ));
+
+        assert!(matches!(error, ServiceError::InvalidArgument(_)));
     }
 
     #[tokio::test]
@@ -750,5 +833,138 @@ mod tests {
         assert_eq!(descriptor.name, "documents");
         assert_eq!(descriptor.dimensions, 2);
         assert_eq!(descriptor.metric, DistanceMetric::Dot);
+    }
+
+    #[tokio::test]
+    async fn runtime_status_surfaces_metadata_unready_without_failing() {
+        #[derive(Debug)]
+        struct MetadataUnavailableStorageEngine;
+
+        #[async_trait]
+        impl StorageEngine for MetadataUnavailableStorageEngine {
+            async fn engine_name(&self) -> &'static str {
+                "metadata-unavailable"
+            }
+
+            async fn metadata_status(&self) -> logpose_types::Result<()> {
+                Err(LogPoseError::Message(
+                    "etcd metadata operation failed: connection refused".to_owned(),
+                ))
+            }
+
+            async fn create_collection(
+                &self,
+                _request: CreateCollectionRequest,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                Err(LogPoseError::Message("unsupported".to_owned()))
+            }
+
+            async fn open_collection(
+                &self,
+                name: &str,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{name}' does not exist"
+                )))
+            }
+
+            async fn list_collections(
+                &self,
+            ) -> logpose_types::Result<Vec<logpose_catalog::CollectionDescriptor>> {
+                Err(LogPoseError::Message(
+                    "list_collections should not run when metadata is unavailable".to_owned(),
+                ))
+            }
+
+            async fn write(
+                &self,
+                collection_name: &str,
+                _operations: Vec<WriteOperation>,
+            ) -> logpose_types::Result<CommitAck> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn scan_exact(
+                &self,
+                collection_name: &str,
+                _snapshot: Option<Snapshot>,
+            ) -> logpose_types::Result<Vec<VisibleRecord>> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn ann_search_selected(
+                &self,
+                collection_name: &str,
+                _snapshot: Option<Snapshot>,
+                _immutable_unit_ids: Vec<String>,
+                _request: AnnSearchRequest,
+                _filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
+            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
+                Err(LogPoseError::Message(format!(
+                    "collection '{collection_name}' does not exist"
+                )))
+            }
+
+            async fn inspect(
+                &self,
+                collection_name: &str,
+                target: InspectTarget,
+            ) -> logpose_types::Result<InspectReport> {
+                let _ = collection_name;
+                Ok(InspectReport {
+                    target: match target {
+                        InspectTarget::Manifest => "manifest".to_owned(),
+                        InspectTarget::Wal => "wal".to_owned(),
+                        InspectTarget::Maintenance => "maintenance".to_owned(),
+                        InspectTarget::Segment(segment_id) => format!("segment:{segment_id}"),
+                    },
+                    payload: json!({}),
+                })
+            }
+        }
+
+        let data = Arc::new(LogPoseDataService::new(Arc::new(
+            MetadataUnavailableStorageEngine,
+        )));
+        let control =
+            LogPoseControlService::new(data, LogPoseConfig::default(), BuildInfo::current());
+
+        let status = control
+            .runtime_status()
+            .await
+            .expect("runtime status should still surface readiness state");
+
+        assert!(!status.control_plane_ready);
+        assert!(!status.data_plane_ready);
+        assert_eq!(status.collection_count, 0);
+        assert!(status.collections.is_empty());
     }
 }

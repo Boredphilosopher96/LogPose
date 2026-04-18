@@ -14,6 +14,10 @@ paths:
       responses:
         "200":
           description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
   /v1/metadata:
     get:
       summary: Cluster metadata
@@ -100,6 +104,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CollectionDescriptor"
+        "400":
+          description: Invalid namespace selection or reconciliation is required before the collection can be served
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -135,6 +145,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CollectionPlacement"
+        "400":
+          description: Invalid namespace selection or reconciliation is required before placement can be resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Collection not found
           content:
@@ -394,6 +410,13 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
 components:
   schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
     DistanceMetric:
       type: string
       enum: [cosine, dot, l2]

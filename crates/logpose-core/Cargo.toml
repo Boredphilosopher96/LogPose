@@ -17,3 +17,8 @@ logpose-storage = { path = "../logpose-storage" }
 logpose-storage-etcd = { path = "../logpose-storage-etcd" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
+
+[dev-dependencies]
+etcd-client = "0.14"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

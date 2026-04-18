@@ -22,11 +22,19 @@ mod support;
 use support::{TestServerFixture, render_config_with_hosts};
 
 fn query_response_body(payload: &Value) -> &Value {
-    payload.get("response").unwrap_or(payload)
+    assert!(
+        payload.get("response").is_none(),
+        "CLI query JSON should be flattened instead of wrapped in a response envelope"
+    );
+    payload
 }
 
 fn scoped_response_body(payload: &Value) -> &Value {
-    payload.get("response").unwrap_or(payload)
+    assert!(
+        payload.get("response").is_none(),
+        "CLI scoped JSON should be flattened instead of wrapped in a response envelope"
+    );
+    payload
 }
 
 #[test]

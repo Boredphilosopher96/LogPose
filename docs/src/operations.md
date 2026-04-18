@@ -7,13 +7,13 @@ LogPose is currently operated as one `logpose-server` process configured through
 Operational workflows are centered around:
 
 - the `logpose-server` runtime
-- the `logpose` CLI as a server-first wrapper around the same control-plane and data-plane workflows
+- the `logpose-cli` CLI as a server-first wrapper around the same control-plane and data-plane workflows
 - structured logging and tracing
 - repeatable CI/CD quality gates
 
 Use the server as the source of truth for service behavior, and treat the CLI as the preferred operator entrypoint for configuration inspection, query diagnostics, and maintenance. The CLI now has two explicit modes:
 
-- `logpose interactive` for a guided dashboard with concern-based navigation, searchable workflow pickers, persistent result tabs, clipboard-friendly views, and a shortcut bar that stays visible while you work
+- `logpose-cli interactive` for a guided dashboard with concern-based navigation, searchable workflow pickers, persistent result tabs, clipboard-friendly views, and a shortcut bar that stays visible while you work
 - direct commands such as `status`, `config`, `collection`, `record`, `query`, and `inspect` for fast operator and scripting workflows
 
 Direct commands default to concise human-readable summaries. Use `--json` or `--output json` when you need the exact machine-readable contract. REST and gRPC should remain transport-parity views over the same shared workflows, with no semantic drift between them.
@@ -39,7 +39,7 @@ Operationally, LogPose is still earlier than a distributed database:
 
 - etcd-backed collection-assignment metadata can now be enabled, but metadata quorum, membership leases, and replica controllers are not complete
 - collections now live under a persisted default database descriptor, but database-scoped auth, ACLs, and multi-tenant routing are not implemented yet
-- health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
+- `/health` remains a lightweight liveness probe; runtime-status readiness bits are still an early local signal rather than a full distributed readiness contract
 - authentication and authorization are scaffolds, not full operator policy enforcement
 - tracing is initialized, but a metrics endpoint and richer telemetry surfaces do not exist yet
 - remote blob synchronization to MinIO or S3 is not implemented yet
@@ -60,3 +60,10 @@ membership_ttl_secs = 15
 leadership_ttl_secs = 10
 cluster_name = "default"
 ```
+
+With `metadata.backend = "etcd"`, LogPose now treats etcd as the authoritative
+source for collection descriptors and assignments. Collections created before
+the etcd metadata path is enabled are not auto-backfilled from local
+`placement.json` files; migrate them by recreating them through the control
+plane or by explicitly backfilling metadata before flipping an existing storage
+root to the etcd backend.

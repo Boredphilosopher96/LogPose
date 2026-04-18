@@ -88,8 +88,8 @@ async fn create_collection(
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
-            tenant_name: request.tenant_name,
-            database_name: request.database_name,
+            tenant_name: default_namespace_if_blank(request.tenant_name, DEFAULT_TENANT_NAME),
+            database_name: default_namespace_if_blank(request.database_name, DEFAULT_DATABASE_NAME),
             name: request.name,
             dimensions: request.dimensions,
             metric: request.metric,
@@ -263,7 +263,11 @@ struct NamespaceQuery {
 
 impl NamespaceQuery {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
-        CollectionRef::new(self.tenant.clone(), self.database.clone(), name.into())
+        CollectionRef::new(
+            default_namespace_if_blank(self.tenant.clone(), DEFAULT_TENANT_NAME),
+            default_namespace_if_blank(self.database.clone(), DEFAULT_DATABASE_NAME),
+            name.into(),
+        )
     }
 }
 
@@ -279,8 +283,8 @@ struct WriteCollectionBody {
 impl WriteCollectionBody {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
         CollectionRef::new(
-            self.tenant_name.clone(),
-            self.database_name.clone(),
+            default_namespace_if_blank(self.tenant_name.clone(), DEFAULT_TENANT_NAME),
+            default_namespace_if_blank(self.database_name.clone(), DEFAULT_DATABASE_NAME),
             name.into(),
         )
     }
@@ -307,10 +311,18 @@ struct QueryCollectionBody {
 impl QueryCollectionBody {
     fn collection(&self, name: impl Into<String>) -> CollectionRef {
         CollectionRef::new(
-            self.tenant_name.clone(),
-            self.database_name.clone(),
+            default_namespace_if_blank(self.tenant_name.clone(), DEFAULT_TENANT_NAME),
+            default_namespace_if_blank(self.database_name.clone(), DEFAULT_DATABASE_NAME),
             name.into(),
         )
+    }
+}
+
+fn default_namespace_if_blank(value: String, default: &str) -> String {
+    if value.trim().is_empty() {
+        default.to_owned()
+    } else {
+        value
     }
 }
 
@@ -1037,6 +1049,55 @@ mod tests {
         let get_body = json_body(get).await;
         assert_eq!(get_body["tenant_name"], "acme");
         assert_eq!(get_body["database_name"], "analytics");
+        assert_eq!(get_body["name"], "documents");
+    }
+
+    #[tokio::test]
+    async fn rest_treats_blank_namespace_fields_as_default_namespace() {
+        let state = Arc::new(AppState::new(test_config("rest-blank-namespace")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant_name": "",
+                            "database_name": "   ",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["tenant_name"], "default");
+        assert_eq!(create_body["database_name"], "default");
+
+        let get = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents?tenant=&database=")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(get.status(), StatusCode::OK);
+        let get_body = json_body(get).await;
+        assert_eq!(get_body["tenant_name"], "default");
+        assert_eq!(get_body["database_name"], "default");
         assert_eq!(get_body["name"], "documents");
     }
 

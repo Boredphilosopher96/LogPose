@@ -197,11 +197,13 @@ impl Default for NamespaceArgs {
 
 impl NamespaceArgs {
     pub fn collection_ref(&self, collection_name: impl Into<String>) -> CollectionRef {
-        CollectionRef::new(
-            self.tenant.clone(),
-            self.database.clone(),
-            collection_name.into(),
-        )
+        let collection_name = collection_name.into();
+        let parts = collection_name.split('/').collect::<Vec<_>>();
+        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+            CollectionRef::new(parts[0], parts[1], parts[2])
+        } else {
+            CollectionRef::new(self.tenant.clone(), self.database.clone(), collection_name)
+        }
     }
 }
 
@@ -700,6 +702,54 @@ mod tests {
             unreachable!("expected query action");
         };
         assert_eq!(query.collection.tenant_name, "acme");
+        assert_eq!(query.collection.database_name, "analytics");
+        assert_eq!(query.collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn collection_commands_accept_fully_qualified_lookup_keys() {
+        let cli =
+            Cli::try_parse_from(["logpose", "collection", "show", "tenant-a/analytics/colors"]);
+
+        assert!(
+            cli.is_ok(),
+            "qualified collection show should parse: {cli:?}"
+        );
+
+        let request = cli.expect("cli should parse").into_request();
+        let CommandRequest::Direct { action, .. } = request else {
+            unreachable!("expected direct request");
+        };
+        let Action::CollectionShow(collection) = action else {
+            unreachable!("expected collection show action");
+        };
+        assert_eq!(collection.tenant_name, "tenant-a");
+        assert_eq!(collection.database_name, "analytics");
+        assert_eq!(collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn query_commands_accept_fully_qualified_lookup_keys() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "query",
+            "tenant-a/analytics/colors",
+            "--vector",
+            "1.0,0.0",
+            "--top-k",
+            "1",
+        ]);
+
+        assert!(cli.is_ok(), "qualified query should parse: {cli:?}");
+
+        let request = cli.expect("cli should parse").into_request();
+        let CommandRequest::Direct { action, .. } = request else {
+            unreachable!("expected direct request");
+        };
+        let Action::Query(query) = action else {
+            unreachable!("expected query action");
+        };
+        assert_eq!(query.collection.tenant_name, "tenant-a");
         assert_eq!(query.collection.database_name, "analytics");
         assert_eq!(query.collection.collection_name, "colors");
     }

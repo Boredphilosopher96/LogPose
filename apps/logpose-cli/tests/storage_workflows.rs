@@ -248,7 +248,7 @@ fn interactive_record_put_supports_fuzzy_file_picker() {
     assert!(stderr.contains("File search"));
     assert!(stderr.contains("records.jsonl"));
     assert!(stderr.contains("Write completed"));
-    assert_eq!(payload["response"]["applied_ops"], 1);
+    assert_eq!(payload["applied_ops"], 1);
 }
 
 fn run_cli_without_assert<const N: usize>(

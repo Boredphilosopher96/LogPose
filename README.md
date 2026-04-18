@@ -27,6 +27,8 @@ LogPose is a high-performance, reliable vector database built for low-latency re
 
 - Rust `1.94.1` via `rustup`
 - Cargo `1.94.1`
+- `protoc` / `protobuf-compiler` on `PATH` for gRPC code generation
+- a reachable etcd endpoint at `http://127.0.0.1:2379` for the full workspace test suite and `scripts/check.sh`
 
 ### Bootstrap
 
@@ -40,7 +42,7 @@ cargo test --workspace
 ### Run The CLI
 
 ```bash
-cargo run -p logpose-cli -- diagnostics status
+cargo run -p logpose-cli -- status
 ```
 
 ### Run The Server

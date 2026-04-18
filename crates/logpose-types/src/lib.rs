@@ -644,6 +644,53 @@ impl Default for EtcdMetadataConfig {
     }
 }
 
+impl EtcdMetadataConfig {
+    /// Validate etcd-specific configuration invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.endpoints.is_empty() {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'"
+                    .to_owned(),
+            ));
+        }
+        if self
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.endpoints must not contain blank values".to_owned(),
+            ));
+        }
+        if self.key_prefix.trim().is_empty() {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.key_prefix must not be blank".to_owned(),
+            ));
+        }
+        if self.cluster_name.trim().is_empty() {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.cluster_name must not be blank".to_owned(),
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.timeout_ms must be greater than 0".to_owned(),
+            ));
+        }
+        if self.membership_ttl_secs <= 0 {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.membership_ttl_secs must be greater than 0".to_owned(),
+            ));
+        }
+        if self.leadership_ttl_secs <= 0 {
+            return Err(LogPoseError::Message(
+                "metadata.etcd.leadership_ttl_secs must be greater than 0".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Top-level metadata configuration exposed through `LogPoseConfig`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct MetadataConfig {

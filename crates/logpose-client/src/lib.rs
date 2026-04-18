@@ -57,6 +57,7 @@ pub struct ScopedCollectionResponse<T> {
     /// Collection name inside the database.
     pub collection_name: String,
     /// Operation payload.
+    #[serde(flatten)]
     pub response: T,
 }
 
@@ -168,12 +169,10 @@ impl LogPoseClient {
 
     /// Fetch placement metadata for one collection.
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
-        self.collection_placement_in_namespace(
-            DEFAULT_TENANT_NAME,
-            DEFAULT_DATABASE_NAME,
-            collection_name,
-        )
-        .await
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
+        self.collection_placement_in_namespace(&tenant_name, &database_name, &collection_name)
+            .await
     }
 
     /// Fetch placement metadata for one collection in an explicit namespace.
@@ -198,12 +197,10 @@ impl LogPoseClient {
 
     /// Fetch collection metadata by name.
     pub async fn get_collection(&self, collection_name: &str) -> Result<CollectionDescriptor> {
-        self.get_collection_in_namespace(
-            DEFAULT_TENANT_NAME,
-            DEFAULT_DATABASE_NAME,
-            collection_name,
-        )
-        .await
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
+        self.get_collection_in_namespace(&tenant_name, &database_name, &collection_name)
+            .await
     }
 
     /// Fetch collection metadata by namespace-qualified identity.
@@ -232,13 +229,10 @@ impl LogPoseClient {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
         Ok(self
-            .write_in_namespace(
-                DEFAULT_TENANT_NAME,
-                DEFAULT_DATABASE_NAME,
-                collection_name,
-                operations,
-            )
+            .write_in_namespace(&tenant_name, &database_name, &collection_name, operations)
             .await?
             .response)
     }
@@ -349,7 +343,9 @@ impl LogPoseClient {
 
     /// Fetch collection-level statistics.
     pub async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        self.stats_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
+        self.stats_in_namespace(&tenant_name, &database_name, &collection_name)
             .await
     }
 
@@ -396,8 +392,10 @@ impl LogPoseClient {
 
     /// Flush the mutable delta into a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
         Ok(self
-            .flush_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+            .flush_in_namespace(&tenant_name, &database_name, &collection_name)
             .await?
             .response)
     }
@@ -433,8 +431,10 @@ impl LogPoseClient {
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
         Ok(self
-            .compact_in_namespace(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+            .compact_in_namespace(&tenant_name, &database_name, &collection_name)
             .await?
             .response)
     }
@@ -474,13 +474,10 @@ impl LogPoseClient {
         collection_name: &str,
         target: InspectTarget,
     ) -> Result<InspectReport> {
+        let (tenant_name, database_name, collection_name) =
+            split_collection_lookup_key(collection_name);
         Ok(self
-            .inspect_in_namespace(
-                DEFAULT_TENANT_NAME,
-                DEFAULT_DATABASE_NAME,
-                collection_name,
-                target,
-            )
+            .inspect_in_namespace(&tenant_name, &database_name, &collection_name, target)
             .await?
             .response)
     }
@@ -1006,6 +1003,30 @@ mod tests {
         assert_eq!(response.database_name, "analytics");
         assert_eq!(response.collection_name, "documents");
         assert_eq!(response.last_seq_no, 7);
+    }
+
+    #[test]
+    fn scoped_collection_response_serializes_flattened_payload() {
+        let response = scoped_collection_response(
+            "acme".to_owned(),
+            "analytics".to_owned(),
+            "documents".to_owned(),
+            "acme",
+            "analytics",
+            "documents",
+            CommitAck {
+                last_seq_no: 7,
+                applied_ops: 2,
+            },
+        );
+
+        let json = serde_json::to_value(response).expect("response should serialize");
+        assert_eq!(json["tenant_name"], "acme");
+        assert_eq!(json["database_name"], "analytics");
+        assert_eq!(json["collection_name"], "documents");
+        assert_eq!(json["last_seq_no"], 7);
+        assert_eq!(json["applied_ops"], 2);
+        assert!(json.get("response").is_none());
     }
 
     #[test]
