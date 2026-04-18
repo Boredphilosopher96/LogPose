@@ -81,6 +81,18 @@ paths:
           required: true
           schema:
             type: string
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
       responses:
         "200":
           description: Collection descriptor
@@ -104,6 +116,18 @@ paths:
           required: true
           schema:
             type: string
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
       responses:
         "200":
           description: Collection placement summary
@@ -145,7 +169,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CommitAck"
+                $ref: "#/components/schemas/CollectionCommitAck"
         "400":
           description: Invalid write request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
@@ -180,7 +204,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryResponse"
+                $ref: "#/components/schemas/CollectionQueryResponse"
         "400":
           description: Invalid query request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
@@ -203,6 +227,18 @@ paths:
           required: true
           schema:
             type: string
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
       responses:
         "200":
           description: Collection stats
@@ -232,13 +268,25 @@ paths:
           required: true
           schema:
             type: string
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
       responses:
         "200":
           description: Flush snapshot
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Snapshot"
+                $ref: "#/components/schemas/CollectionSnapshot"
         "400":
           description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
@@ -261,13 +309,25 @@ paths:
           required: true
           schema:
             type: string
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
       responses:
         "200":
           description: Compaction snapshot
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Snapshot"
+                $ref: "#/components/schemas/CollectionSnapshot"
         "400":
           description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
@@ -296,6 +356,18 @@ paths:
           schema:
             type: string
             enum: [manifest, wal, segment, maintenance]
+        - name: tenant
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+        - name: database
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
         - name: segment_id
           in: query
           required: false
@@ -307,7 +379,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/InspectReport"
+                $ref: "#/components/schemas/CollectionInspectReport"
         "400":
           description: Invalid inspect request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
           content:
@@ -346,6 +418,8 @@ components:
       type: object
       required:
         - collection_id
+        - tenant_name
+        - database_name
         - collection_name
         - assigned_node
         - assigned_role
@@ -355,6 +429,10 @@ components:
         collection_id:
           type: string
           format: uuid
+        tenant_name:
+          type: string
+        database_name:
+          type: string
         collection_name:
           type: string
         assigned_node:
@@ -426,6 +504,12 @@ components:
       type: object
       required: [name, dimensions, metric]
       properties:
+        tenant_name:
+          type: string
+          default: default
+        database_name:
+          type: string
+          default: default
         name:
           type: string
         dimensions:
@@ -437,6 +521,8 @@ components:
       type: object
       required:
         - collection_id
+        - tenant_name
+        - database_name
         - name
         - dimensions
         - metric
@@ -449,6 +535,10 @@ components:
         collection_id:
           type: string
           format: uuid
+        tenant_name:
+          type: string
+        database_name:
+          type: string
         name:
           type: string
         dimensions:
@@ -507,6 +597,12 @@ components:
       type: object
       required: [operations]
       properties:
+        tenant_name:
+          type: string
+          default: default
+        database_name:
+          type: string
+          default: default
         operations:
           type: array
           items:
@@ -603,6 +699,12 @@ components:
       type: object
       required: [vector, top_k]
       properties:
+        tenant_name:
+          type: string
+          default: default
+        database_name:
+          type: string
+          default: default
         vector:
           type: array
           items:
@@ -726,6 +828,20 @@ components:
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/QueryDiagnostics"
+    CollectionContext:
+      type: object
+      required: [tenant_name, database_name, collection_name]
+      properties:
+        tenant_name:
+          type: string
+        database_name:
+          type: string
+        collection_name:
+          type: string
+    CollectionQueryResponse:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/QueryResponse"
     MaintenanceStatus:
       type: object
       required: [pending, completed_runs]
@@ -823,6 +939,8 @@ components:
       type: object
       required:
         - collection_id
+        - tenant_name
+        - database_name
         - collection_name
         - manifest_generation
         - visible_seq_no
@@ -836,6 +954,10 @@ components:
         collection_id:
           type: string
           format: uuid
+        tenant_name:
+          type: string
+        database_name:
+          type: string
         collection_name:
           type: string
         manifest_generation:
@@ -864,6 +986,18 @@ components:
           type: string
         payload:
           nullable: true
+    CollectionCommitAck:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/CommitAck"
+    CollectionSnapshot:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/Snapshot"
+    CollectionInspectReport:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/InspectReport"
     ErrorResponse:
       type: object
       required: [error]

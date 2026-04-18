@@ -1,12 +1,13 @@
 use crate::{
     action::{
         Action, CollectionCreateAction, ExplainArg, MetricArg, QueryAction, RecordDeleteAction,
-        RecordPutAction, WorkflowDefinition, WorkflowKind, collect_picker_files, explain_choices,
+        RecordPutAction, WorkflowDefinition, WorkflowKind, collect_picker_files,
+        collection_lookup_name, collection_ref_from_lookup_or_namespace, explain_choices,
         format_command, format_filter, format_predicate, metric_choices, parse_filter_list,
         parse_query_vector, parse_where_list, picker_choice, rank_path_choices,
         rank_picker_choices, workflow_choices, workflow_definitions,
     },
-    cli::{InteractiveArgs, OutputMode},
+    cli::{InteractiveArgs, NamespaceArgs, OutputMode},
     direct::{DirectReporter, TerminalUi},
     execute::{connect_client, execute_action},
     feedback::{ProgressEvent, Reporter},
@@ -21,6 +22,7 @@ use crossterm::{
 use logpose_config::LogPoseConfig;
 use logpose_query::Predicate;
 use logpose_storage::InspectTarget;
+use logpose_types::CollectionRef;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -69,9 +71,14 @@ async fn load_session_context(config: &LogPoseConfig) -> SessionContext {
                     .collections
                     .into_iter()
                     .map(|placement| {
-                        picker_choice(
-                            placement.collection_name.clone(),
+                        let collection_name = collection_lookup_name(
+                            &placement.tenant_name,
+                            &placement.database_name,
                             &placement.collection_name,
+                        );
+                        picker_choice(
+                            collection_name.clone(),
+                            &collection_name,
                             &format!(
                                 "{} on {} ({})",
                                 placement.route_kind,
@@ -171,41 +178,54 @@ fn action_from_scripted_prompts(
                 )?,
             };
             Ok(Action::CollectionCreate(CollectionCreateAction {
-                name,
+                collection: collection_ref_for_namespace(&args.namespace, &name),
                 dimensions,
                 metric: metric.into(),
             }))
         }
-        WorkflowKind::CollectionShow => Ok(Action::CollectionShow(required_collection_string(
-            ui,
-            args.collection.clone(),
-            session,
-            Some("colors"),
-        )?)),
-        WorkflowKind::CollectionStats => Ok(Action::CollectionStats(required_collection_string(
-            ui,
-            args.collection.clone(),
-            session,
-            Some("colors"),
-        )?)),
-        WorkflowKind::CollectionPlacement => Ok(Action::CollectionPlacement(
-            required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
-        )),
+        WorkflowKind::CollectionShow => Ok(Action::CollectionShow(collection_ref_for_namespace(
+            &args.namespace,
+            &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+        ))),
+        WorkflowKind::CollectionStats => Ok(Action::CollectionStats(collection_ref_for_namespace(
+            &args.namespace,
+            &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+        ))),
+        WorkflowKind::CollectionPlacement => {
+            Ok(Action::CollectionPlacement(collection_ref_for_namespace(
+                &args.namespace,
+                &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+            )))
+        }
         WorkflowKind::CollectionFlush => {
             let collection =
                 required_collection_string(ui, args.collection.clone(), session, Some("colors"))?;
-            if !ui.confirm(&format!("Flush collection '{collection}' now?"), false)? {
+            let collection_ref = collection_ref_for_namespace(&args.namespace, &collection);
+            if !ui.confirm(
+                &format!(
+                    "Flush collection '{}' now?",
+                    collection_label(&collection_ref)
+                ),
+                false,
+            )? {
                 bail!("operation cancelled");
             }
-            Ok(Action::CollectionFlush(collection))
+            Ok(Action::CollectionFlush(collection_ref))
         }
         WorkflowKind::CollectionCompact => {
             let collection =
                 required_collection_string(ui, args.collection.clone(), session, Some("colors"))?;
-            if !ui.confirm(&format!("Compact collection '{collection}' now?"), false)? {
+            let collection_ref = collection_ref_for_namespace(&args.namespace, &collection);
+            if !ui.confirm(
+                &format!(
+                    "Compact collection '{}' now?",
+                    collection_label(&collection_ref)
+                ),
+                false,
+            )? {
                 bail!("operation cancelled");
             }
-            Ok(Action::CollectionCompact(collection))
+            Ok(Action::CollectionCompact(collection_ref))
         }
         WorkflowKind::RecordPut => {
             let collection =
@@ -215,19 +235,29 @@ fn action_from_scripted_prompts(
             } else {
                 choose_file_path_scripted(ui)?
             };
-            Ok(Action::RecordPut(RecordPutAction { collection, input }))
+            Ok(Action::RecordPut(RecordPutAction {
+                collection: collection_ref_for_namespace(&args.namespace, &collection),
+                input,
+            }))
         }
         WorkflowKind::RecordDelete => {
             let collection =
                 required_collection_string(ui, args.collection.clone(), session, Some("colors"))?;
+            let collection_ref = collection_ref_for_namespace(&args.namespace, &collection);
             let id = required_string(ui, "Record id", args.id.clone(), Some("alpha"))?;
             if !ui.confirm(
-                &format!("Delete record '{id}' from collection '{collection}' now?"),
+                &format!(
+                    "Delete record '{id}' from collection '{}' now?",
+                    collection_label(&collection_ref)
+                ),
                 false,
             )? {
                 bail!("operation cancelled");
             }
-            Ok(Action::RecordDelete(RecordDeleteAction { collection, id }))
+            Ok(Action::RecordDelete(RecordDeleteAction {
+                collection: collection_ref,
+                id,
+            }))
         }
         WorkflowKind::Query => {
             let collection =
@@ -282,7 +312,7 @@ fn action_from_scripted_prompts(
                 .prompt_optional_string("Predicate JSON path (optional)", Some("predicate.json"))?
                 .map(PathBuf::from));
             Ok(Action::Query(QueryAction {
-                collection,
+                collection: collection_ref_for_namespace(&args.namespace, &collection),
                 top_k,
                 vector,
                 filters,
@@ -294,39 +324,31 @@ fn action_from_scripted_prompts(
             }))
         }
         WorkflowKind::InspectManifest => Ok(Action::Inspect {
-            collection: required_collection_string(
-                ui,
-                args.collection.clone(),
-                session,
-                Some("colors"),
-            )?,
+            collection: collection_ref_for_namespace(
+                &args.namespace,
+                &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+            ),
             target: InspectTarget::Manifest,
         }),
         WorkflowKind::InspectWal => Ok(Action::Inspect {
-            collection: required_collection_string(
-                ui,
-                args.collection.clone(),
-                session,
-                Some("colors"),
-            )?,
+            collection: collection_ref_for_namespace(
+                &args.namespace,
+                &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+            ),
             target: InspectTarget::Wal,
         }),
         WorkflowKind::InspectMaintenance => Ok(Action::Inspect {
-            collection: required_collection_string(
-                ui,
-                args.collection.clone(),
-                session,
-                Some("colors"),
-            )?,
+            collection: collection_ref_for_namespace(
+                &args.namespace,
+                &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+            ),
             target: InspectTarget::Maintenance,
         }),
         WorkflowKind::InspectSegment => Ok(Action::Inspect {
-            collection: required_collection_string(
-                ui,
-                args.collection.clone(),
-                session,
-                Some("colors"),
-            )?,
+            collection: collection_ref_for_namespace(
+                &args.namespace,
+                &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
+            ),
             target: InspectTarget::Segment(required_string(
                 ui,
                 "Segment id",
@@ -393,6 +415,18 @@ fn required_collection_string(
         default_search,
         &session.collections,
         default_index,
+    )
+}
+
+fn collection_ref_for_namespace(namespace: &NamespaceArgs, value: &str) -> CollectionRef {
+    collection_ref_from_lookup_or_namespace(value, &namespace.tenant, &namespace.database)
+}
+
+fn collection_label(collection: &CollectionRef) -> String {
+    collection_lookup_name(
+        &collection.tenant_name,
+        &collection.database_name,
+        &collection.collection_name,
     )
 }
 
@@ -664,6 +698,7 @@ struct FormField {
 
 struct FormState {
     workflow: WorkflowKind,
+    namespace: NamespaceArgs,
     title: String,
     description: String,
     fields: Vec<FormField>,
@@ -869,6 +904,7 @@ impl FormState {
         };
         Ok(Self {
             workflow,
+            namespace: args.namespace.clone(),
             title,
             description,
             fields,
@@ -985,6 +1021,12 @@ impl FormState {
             }
             Ok(value.to_owned())
         };
+        let required_collection = |key: &str| -> anyhow::Result<CollectionRef> {
+            Ok(collection_ref_for_namespace(
+                &self.namespace,
+                &required(key)?,
+            ))
+        };
         let optional_path = |key: &str| -> anyhow::Result<Option<PathBuf>> {
             let value = field(key)?.trim();
             if value.is_empty() {
@@ -995,34 +1037,41 @@ impl FormState {
 
         match self.workflow {
             WorkflowKind::CollectionCreate => {
+                let name = required("name")?;
                 Ok(Action::CollectionCreate(CollectionCreateAction {
-                    name: required("name")?,
+                    collection: collection_ref_for_namespace(&self.namespace, &name),
                     dimensions: required("dimensions")?
                         .parse::<usize>()
                         .context("dimensions must be a positive integer")?,
                     metric: parse_metric(field("metric")?)?.into(),
                 }))
             }
-            WorkflowKind::CollectionShow => Ok(Action::CollectionShow(required("collection")?)),
-            WorkflowKind::CollectionStats => Ok(Action::CollectionStats(required("collection")?)),
-            WorkflowKind::CollectionPlacement => {
-                Ok(Action::CollectionPlacement(required("collection")?))
+            WorkflowKind::CollectionShow => {
+                Ok(Action::CollectionShow(required_collection("collection")?))
             }
-            WorkflowKind::CollectionFlush => Ok(Action::CollectionFlush(required("collection")?)),
-            WorkflowKind::CollectionCompact => {
-                Ok(Action::CollectionCompact(required("collection")?))
+            WorkflowKind::CollectionStats => {
+                Ok(Action::CollectionStats(required_collection("collection")?))
             }
+            WorkflowKind::CollectionPlacement => Ok(Action::CollectionPlacement(
+                required_collection("collection")?,
+            )),
+            WorkflowKind::CollectionFlush => {
+                Ok(Action::CollectionFlush(required_collection("collection")?))
+            }
+            WorkflowKind::CollectionCompact => Ok(Action::CollectionCompact(required_collection(
+                "collection",
+            )?)),
             WorkflowKind::RecordPut => Ok(Action::RecordPut(RecordPutAction {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 input: optional_path("input")?
                     .ok_or_else(|| anyhow::anyhow!("input is required"))?,
             })),
             WorkflowKind::RecordDelete => Ok(Action::RecordDelete(RecordDeleteAction {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 id: required("id")?,
             })),
             WorkflowKind::Query => Ok(Action::Query(QueryAction {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 top_k: required("top_k")?
                     .parse::<usize>()
                     .context("top_k must be a positive integer")?,
@@ -1035,19 +1084,19 @@ impl FormState {
                 snapshot_visible_seq_no: None,
             })),
             WorkflowKind::InspectManifest => Ok(Action::Inspect {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 target: InspectTarget::Manifest,
             }),
             WorkflowKind::InspectWal => Ok(Action::Inspect {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 target: InspectTarget::Wal,
             }),
             WorkflowKind::InspectMaintenance => Ok(Action::Inspect {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 target: InspectTarget::Maintenance,
             }),
             WorkflowKind::InspectSegment => Ok(Action::Inspect {
-                collection: required("collection")?,
+                collection: required_collection("collection")?,
                 target: InspectTarget::Segment(required("segment_id")?),
             }),
             WorkflowKind::Status => Ok(Action::Status),
@@ -1057,6 +1106,7 @@ impl FormState {
 }
 
 struct InteractiveApp {
+    namespace: NamespaceArgs,
     screen: Screen,
     home: HomeState,
     dashboard: DashboardState,
@@ -1087,6 +1137,7 @@ impl InteractiveApp {
         session: SessionContext,
     ) -> anyhow::Result<Self> {
         let mut app = Self {
+            namespace: args.namespace.clone(),
             screen: Screen::Home,
             home: HomeState {
                 search: String::new(),
@@ -1254,6 +1305,7 @@ impl InteractiveApp {
             KeyCode::Enter => {
                 let workflow = self.selected_workflow()?;
                 let args = InteractiveArgs {
+                    namespace: self.namespace.clone(),
                     workflow: None,
                     create: false,
                     collection: self.session.last_collection.clone(),
@@ -1547,19 +1599,19 @@ impl InteractiveApp {
 
     fn remember_collection(&mut self, action: &Action) {
         let collection = match action {
-            Action::CollectionCreate(action) => Some(action.name.as_str()),
+            Action::CollectionCreate(action) => Some(collection_label(&action.collection)),
             Action::CollectionShow(collection)
             | Action::CollectionStats(collection)
             | Action::CollectionPlacement(collection)
             | Action::CollectionFlush(collection)
-            | Action::CollectionCompact(collection) => Some(collection.as_str()),
-            Action::RecordPut(action) => Some(action.collection.as_str()),
-            Action::RecordDelete(action) => Some(action.collection.as_str()),
-            Action::Query(action) => Some(action.collection.as_str()),
-            Action::Inspect { collection, .. } => Some(collection.as_str()),
+            | Action::CollectionCompact(collection) => Some(collection_label(collection)),
+            Action::RecordPut(action) => Some(collection_label(&action.collection)),
+            Action::RecordDelete(action) => Some(collection_label(&action.collection)),
+            Action::Query(action) => Some(collection_label(&action.collection)),
+            Action::Inspect { collection, .. } => Some(collection_label(collection)),
             Action::Status | Action::ConfigShow => None,
         };
-        self.session.last_collection = collection.map(ToOwned::to_owned);
+        self.session.last_collection = collection;
     }
 
     fn return_from_result(&mut self) {
@@ -2743,15 +2795,18 @@ fn workflow_description(workflow: WorkflowKind) -> &'static str {
 
 fn confirmation_prompt(action: &Action) -> Option<String> {
     match action {
-        Action::CollectionFlush(collection) => {
-            Some(format!("Flush collection '{collection}' now?"))
-        }
-        Action::CollectionCompact(collection) => {
-            Some(format!("Compact collection '{collection}' now?"))
-        }
+        Action::CollectionFlush(collection) => Some(format!(
+            "Flush collection '{}' now?",
+            collection_label(collection)
+        )),
+        Action::CollectionCompact(collection) => Some(format!(
+            "Compact collection '{}' now?",
+            collection_label(collection)
+        )),
         Action::RecordDelete(action) => Some(format!(
             "Delete record '{}' from collection '{}' now?",
-            action.id, action.collection
+            action.id,
+            collection_label(&action.collection)
         )),
         _ => None,
     }
@@ -3227,6 +3282,7 @@ mod tests {
 
     fn empty_args() -> InteractiveArgs {
         InteractiveArgs {
+            namespace: NamespaceArgs::default(),
             workflow: None,
             create: false,
             collection: None,
@@ -3248,6 +3304,7 @@ mod tests {
     #[test]
     fn dashboard_filter_prefers_matching_workflow_labels() {
         let app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Dashboard,
             home: HomeState {
                 search: String::new(),
@@ -3311,9 +3368,36 @@ mod tests {
     }
 
     #[test]
+    fn query_form_applies_interactive_namespace_to_bare_collection_names() {
+        let args = InteractiveArgs {
+            namespace: NamespaceArgs {
+                tenant: "acme".to_owned(),
+                database: "analytics".to_owned(),
+            },
+            collection: Some("colors".to_owned()),
+            top_k: Some(1),
+            vector: Some(crate::action::QueryVector(vec![1.0, 0.0])),
+            ..empty_args()
+        };
+        let form =
+            FormState::from_workflow(WorkflowKind::Query, &args, Path::new("."), &test_session())
+                .expect("query form should build");
+
+        let action = form
+            .build_action(Path::new("."))
+            .expect("action should build");
+        let Action::Query(action) = action else {
+            unreachable!("expected query action");
+        };
+        assert_eq!(action.collection.tenant_name, "acme");
+        assert_eq!(action.collection.database_name, "analytics");
+        assert_eq!(action.collection.collection_name, "colors");
+    }
+
+    #[test]
     fn destructive_actions_require_confirmation_prompt() {
         let action = Action::RecordDelete(RecordDeleteAction {
-            collection: "colors".to_owned(),
+            collection: NamespaceArgs::default().collection_ref("colors"),
             id: "alpha".to_owned(),
         });
         let prompt = confirmation_prompt(&action).expect("delete prompt should exist");
@@ -3323,6 +3407,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_escape_does_not_exit_the_session() {
         let mut app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Dashboard,
             home: HomeState {
                 search: String::new(),
@@ -3364,6 +3449,7 @@ mod tests {
     #[test]
     fn result_back_returns_to_the_form_when_one_exists() {
         let mut app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Result,
             home: HomeState {
                 search: String::new(),
@@ -3380,6 +3466,7 @@ mod tests {
                 FormState::from_workflow(
                     WorkflowKind::RecordPut,
                     &InteractiveArgs {
+                        namespace: NamespaceArgs::default(),
                         workflow: None,
                         create: false,
                         collection: Some("colors".to_owned()),
@@ -3459,6 +3546,7 @@ mod tests {
             .expect("input field")
             .value = "records.jsonl".to_owned();
         let mut app = InteractiveApp {
+            namespace: NamespaceArgs::default(),
             screen: Screen::Result,
             home: HomeState {
                 search: String::new(),
@@ -3477,12 +3565,17 @@ mod tests {
             running: None,
             result: Some(ResultState {
                 action: Action::RecordPut(RecordPutAction {
-                    collection: "colors".to_owned(),
+                    collection: NamespaceArgs::default().collection_ref("colors"),
                     input: PathBuf::from("records.jsonl"),
                 }),
-                output: ActionOutput::RecordsWritten(logpose_types::CommitAck {
-                    applied_ops: 1,
-                    last_seq_no: 7,
+                output: ActionOutput::RecordsWritten(logpose_client::ScopedCollectionResponse {
+                    tenant_name: "default".to_owned(),
+                    database_name: "default".to_owned(),
+                    collection_name: "colors".to_owned(),
+                    response: logpose_types::CommitAck {
+                        applied_ops: 1,
+                        last_seq_no: 7,
+                    },
                 }),
                 tab: ResultTab::Summary,
             }),

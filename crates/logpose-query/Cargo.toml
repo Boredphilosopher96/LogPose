@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+logpose-catalog = { path = "../logpose-catalog" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
@@ -18,7 +19,6 @@ thiserror.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 criterion = "0.5"
-logpose-catalog = { path = "../logpose-catalog" }
 tokio.workspace = true
 
 [[bench]]

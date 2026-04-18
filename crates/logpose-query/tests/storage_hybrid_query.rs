@@ -24,11 +24,11 @@ async fn uses_vector_first_ann_after_flush_and_reranks_exact_vectors() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -108,11 +108,11 @@ async fn uses_cooperative_filtered_ann_for_selective_immutable_predicates() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -190,11 +190,11 @@ async fn hybrid_query_prefers_latest_mutable_version_over_stale_immutable_candid
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "profiles".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "profiles",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -274,11 +274,11 @@ async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 

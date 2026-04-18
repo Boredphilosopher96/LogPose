@@ -35,6 +35,8 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -108,6 +110,8 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
     state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Cosine,
@@ -117,6 +121,8 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
     state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "events".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -161,6 +167,156 @@ async fn control_plane_rejects_missing_collection_placement_requests() {
 }
 
 #[tokio::test]
+async fn control_plane_reports_non_default_database_collection_identity() {
+    let state = Arc::new(AppState::new(test_config("control-qualified-database")));
+
+    let descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let status = state
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+    let bare_error = state
+        .control
+        .collection_placement("documents")
+        .await
+        .expect_err("bare placement lookup should be rejected for non-default databases");
+
+    assert_eq!(descriptor.tenant_name, "default");
+    assert_eq!(descriptor.database_name, "analytics");
+    assert_eq!(descriptor.name, "documents");
+    assert_eq!(status.collection_count, 1);
+    assert_eq!(status.collections.len(), 1);
+    assert_eq!(status.collections[0].tenant_name, "default");
+    assert_eq!(status.collections[0].database_name, "analytics");
+    assert_eq!(status.collections[0].collection_name, "documents");
+    assert_eq!(status.collections[0].route_kind, "local");
+    assert!(
+        bare_error.to_string().contains("does not exist"),
+        "unexpected error: {bare_error}"
+    );
+}
+
+#[tokio::test]
+async fn control_plane_distinguishes_duplicate_collection_names_across_namespaces() {
+    let state = Arc::new(AppState::new(test_config("control-namespace-collision")));
+
+    let default_descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("default namespace collection should be created");
+    let tenant_descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest {
+            tenant_name: "tenant-a".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("tenant namespace collection should be created");
+
+    state
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("default-alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: serde_json::json!({"namespace":"default"}),
+            })],
+        )
+        .await
+        .expect("default namespace write should succeed");
+    state
+        .write(
+            "tenant-a/analytics/documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("tenant-alpha"),
+                vector: vec![0.0, 1.0],
+                metadata: serde_json::json!({"namespace":"tenant-a"}),
+            })],
+        )
+        .await
+        .expect("tenant namespace write should succeed");
+
+    let status = state
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+    let default_placement = state
+        .control
+        .collection_placement("documents")
+        .await
+        .expect("default placement should load");
+    let tenant_placement = state
+        .control
+        .collection_placement("tenant-a/analytics/documents")
+        .await
+        .expect("tenant placement should load");
+    let default_stats = state
+        .stats("documents")
+        .await
+        .expect("default stats should load");
+    let tenant_stats = state
+        .stats("tenant-a/analytics/documents")
+        .await
+        .expect("tenant stats should load");
+
+    assert_eq!(status.collection_count, 2);
+    assert_eq!(status.collections.len(), 2);
+    assert!(status.collections.iter().any(|placement| {
+        placement.tenant_name == "default"
+            && placement.database_name == "default"
+            && placement.collection_name == "documents"
+    }));
+    assert!(status.collections.iter().any(|placement| {
+        placement.tenant_name == "tenant-a"
+            && placement.database_name == "analytics"
+            && placement.collection_name == "documents"
+    }));
+
+    assert_eq!(
+        default_placement.collection_id,
+        default_descriptor.collection_id
+    );
+    assert_eq!(default_placement.tenant_name, "default");
+    assert_eq!(default_placement.database_name, "default");
+    assert_eq!(
+        tenant_placement.collection_id,
+        tenant_descriptor.collection_id
+    );
+    assert_eq!(tenant_placement.tenant_name, "tenant-a");
+    assert_eq!(tenant_placement.database_name, "analytics");
+
+    assert_eq!(default_stats.tenant_name, "default");
+    assert_eq!(default_stats.database_name, "default");
+    assert_eq!(default_stats.live_record_count, 1);
+    assert_eq!(tenant_stats.tenant_name, "tenant-a");
+    assert_eq!(tenant_stats.database_name, "analytics");
+    assert_eq!(tenant_stats.live_record_count, 1);
+}
+
+#[tokio::test]
 async fn data_only_nodes_reject_control_plane_collection_creation() {
     let state = Arc::new(AppState::new(test_config_with_role(
         "control-data-only",
@@ -170,6 +326,8 @@ async fn data_only_nodes_reject_control_plane_collection_creation() {
     let error = state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -216,6 +374,8 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
     let error = state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -249,6 +409,8 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
     initial
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -299,6 +461,8 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
     initial
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -367,6 +531,8 @@ async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
     let descriptor = initial
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -435,6 +601,8 @@ async fn combined_runtime_status_reads_persisted_maintenance_without_resuming_it
     let descriptor = initial
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -503,6 +671,8 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
     initial
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -613,6 +783,8 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
     let engine = LocalStorageEngine::new(&root);
     engine
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -656,6 +828,8 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
     engine
         .create_collection_with_assignment(
             CreateCollectionRequest {
+                tenant_name: "default".to_owned(),
+                database_name: "default".to_owned(),
                 name: "documents".to_owned(),
                 dimensions: 2,
                 metric: DistanceMetric::Dot,
@@ -721,6 +895,8 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
@@ -747,6 +923,68 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
         .expect("runtime status should load");
 
     assert_eq!(status.maintenance.collections_with_pending, 1);
+    assert_eq!(status.maintenance.pending_operations, 2);
+    assert_eq!(status.maintenance.collections_in_progress, 0);
+    assert_eq!(status.maintenance.collections_with_errors, 1);
+}
+
+#[tokio::test]
+async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs() {
+    let state = Arc::new(AppState::new(test_config("control-maintenance-namespace")));
+    let default_descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest {
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("default namespace collection should be created");
+    let tenant_descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest {
+            tenant_name: "tenant-a".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("tenant namespace collection should be created");
+
+    fs::write(
+        default_descriptor.root_path.join("maintenance.json"),
+        serde_json::to_vec_pretty(&MaintenanceStatus {
+            pending: vec!["flush".to_owned()],
+            in_progress: None,
+            last_error: None,
+            completed_runs: 0,
+        })
+        .expect("default maintenance json should serialize"),
+    )
+    .expect("default maintenance file should be written");
+    fs::write(
+        tenant_descriptor.root_path.join("maintenance.json"),
+        serde_json::to_vec_pretty(&MaintenanceStatus {
+            pending: vec!["compact".to_owned()],
+            in_progress: None,
+            last_error: Some("disk full".to_owned()),
+            completed_runs: 0,
+        })
+        .expect("tenant maintenance json should serialize"),
+    )
+    .expect("tenant maintenance file should be written");
+
+    let status = state
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+
+    assert_eq!(status.collection_count, 2);
+    assert_eq!(status.maintenance.collections_with_pending, 2);
     assert_eq!(status.maintenance.pending_operations, 2);
     assert_eq!(status.maintenance.collections_in_progress, 0);
     assert_eq!(status.maintenance.collections_with_errors, 1);

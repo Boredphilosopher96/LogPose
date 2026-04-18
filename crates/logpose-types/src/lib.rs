@@ -12,6 +12,10 @@ pub type Result<T> = std::result::Result<T, LogPoseError>;
 pub const PRODUCT_NAME: &str = "LogPose";
 /// Reserved placement token for collections created through anonymous local storage paths.
 pub const ANONYMOUS_LOCAL_NODE_NAME: &str = "local";
+/// Built-in tenant name used until callers provision explicit tenants.
+pub const DEFAULT_TENANT_NAME: &str = "default";
+/// Built-in database name used until callers provision explicit databases.
+pub const DEFAULT_DATABASE_NAME: &str = "default";
 
 /// Top-level workspace error.
 #[derive(Debug, Error)]
@@ -129,6 +133,104 @@ impl Default for ResourceId {
     fn default() -> Self {
         Self(Uuid::new_v4())
     }
+}
+
+/// Identifier for a logical tenant.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct TenantId(pub Uuid);
+
+impl Default for TenantId {
+    fn default() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for TenantId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Identifier for a logical database.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct DatabaseId(pub Uuid);
+
+impl Default for DatabaseId {
+    fn default() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for DatabaseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+/// Qualified reference to one collection inside a tenant and database namespace.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct CollectionRef {
+    /// Tenant containing the database.
+    #[serde(default = "default_tenant_name")]
+    pub tenant_name: String,
+    /// Database containing the collection.
+    #[serde(default = "default_database_name")]
+    pub database_name: String,
+    /// Collection name inside the database.
+    pub collection_name: String,
+}
+
+impl CollectionRef {
+    /// Build one qualified collection reference.
+    #[must_use]
+    pub fn new(
+        tenant_name: impl Into<String>,
+        database_name: impl Into<String>,
+        collection_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant_name: tenant_name.into(),
+            database_name: database_name.into(),
+            collection_name: collection_name.into(),
+        }
+    }
+
+    /// Build one reference inside the bootstrap default namespace.
+    #[must_use]
+    pub fn new_default(collection_name: impl Into<String>) -> Self {
+        Self::new(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
+    }
+
+    /// Build the canonical tenant/database/collection lookup key.
+    #[must_use]
+    pub fn lookup_name(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.tenant_name, self.database_name, self.collection_name
+        )
+    }
+
+    /// Validate that namespace fields are populated.
+    pub fn validate(&self) -> Result<()> {
+        validate_collection_ref_segment("tenant_name", &self.tenant_name)?;
+        validate_collection_ref_segment("database_name", &self.database_name)?;
+        validate_collection_ref_segment("collection_name", &self.collection_name)?;
+        Ok(())
+    }
+}
+
+fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(LogPoseError::Message(format!(
+            "{field_name} must not be empty"
+        )));
+    }
+    if value.contains('/') {
+        return Err(LogPoseError::Message(format!(
+            "{field_name} must not contain '/'"
+        )));
+    }
+    Ok(())
 }
 
 /// Monotonic sequence number assigned to durable write operations.
@@ -456,6 +558,12 @@ pub struct AnnSearchRequest {
 pub struct CollectionStats {
     /// Collection identifier.
     pub collection_id: CollectionId,
+    /// Tenant containing the collection.
+    #[serde(default = "default_tenant_name")]
+    pub tenant_name: String,
+    /// Database containing the collection.
+    #[serde(default = "default_database_name")]
+    pub database_name: String,
     /// Human-readable collection name.
     pub collection_name: String,
     /// Current manifest generation.
@@ -526,7 +634,7 @@ pub struct EtcdMetadataConfig {
 impl Default for EtcdMetadataConfig {
     fn default() -> Self {
         Self {
-            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            endpoints: Vec::new(),
             key_prefix: default_etcd_key_prefix(),
             timeout_ms: default_etcd_timeout_ms(),
             membership_ttl_secs: default_etcd_membership_ttl_secs(),
@@ -567,6 +675,29 @@ fn default_etcd_cluster_name() -> String {
     "default".to_owned()
 }
 
+fn default_tenant_name() -> String {
+    DEFAULT_TENANT_NAME.to_owned()
+}
+
+fn default_database_name() -> String {
+    DEFAULT_DATABASE_NAME.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_ref_rejects_reserved_namespace_separator() {
+        let error = CollectionRef::new("tenant-a", "analytics", "docs/v2")
+            .validate()
+            .expect_err("slash-containing collection names should fail");
+
+        assert!(error.to_string().contains("collection_name"));
+        assert!(error.to_string().contains("/"));
+    }
+}
+
 /// Persisted node assignment for one collection.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionAssignment {
@@ -581,6 +712,12 @@ pub struct CollectionAssignment {
 pub struct CollectionPlacement {
     /// Stable collection identifier.
     pub collection_id: CollectionId,
+    /// Tenant containing the collection.
+    #[serde(default = "default_tenant_name")]
+    pub tenant_name: String,
+    /// Database containing the collection.
+    #[serde(default = "default_database_name")]
+    pub database_name: String,
     /// Human-readable collection name.
     pub collection_name: String,
     /// Node currently assigned to serve the collection.

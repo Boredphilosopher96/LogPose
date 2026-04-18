@@ -58,8 +58,9 @@ impl ExpectedModel {
     }
 
     fn register_collection(&mut self, collection_name: &str) {
+        let collection_name = canonical_collection_name(collection_name);
         self.collections
-            .entry(collection_name.to_owned())
+            .entry(collection_name.clone())
             .or_insert_with(|| ExpectedCollection {
                 assigned_node: self.node_name.clone(),
                 assigned_role: NodeRole::Data,
@@ -85,9 +86,10 @@ impl ExpectedModel {
         collection_name: &str,
         records: usize,
     ) -> Vec<WriteOperation> {
+        let collection_name = canonical_collection_name(collection_name);
         let collection = self
             .collections
-            .get_mut(collection_name)
+            .get_mut(&collection_name)
             .expect("collection should be registered before writes");
         let start_index = collection.next_record_index;
         collection.next_record_index += records;
@@ -108,9 +110,10 @@ impl ExpectedModel {
     }
 
     fn record_flush(&mut self, collection_name: &str) {
+        let collection_name = canonical_collection_name(collection_name);
         let collection = self
             .collections
-            .get_mut(collection_name)
+            .get_mut(&collection_name)
             .expect("collection should be registered before flush");
         if collection.mutable_op_count > 0 {
             collection.segment_count += 1;
@@ -123,7 +126,8 @@ impl ExpectedModel {
     }
 
     fn contains_collection(&self, collection_name: &str) -> bool {
-        self.collections.contains_key(collection_name)
+        self.collections
+            .contains_key(&canonical_collection_name(collection_name))
     }
 
     fn control_plane_ready(&self) -> bool {
@@ -188,7 +192,7 @@ impl ExpectedModel {
 
     fn collection(&self, collection_name: &str) -> &ExpectedCollection {
         self.collections
-            .get(collection_name)
+            .get(&canonical_collection_name(collection_name))
             .expect("collection should be tracked by the simulation model")
     }
 
@@ -258,11 +262,15 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
         match step {
             Step::ReadStatus => assert_status_matches(&harness, &model, &trace).await,
             Step::CreateCollection(collection_name) => {
+                let (tenant_name, database_name, bare_collection_name) =
+                    request_namespace_parts(collection_name);
                 harness
                     .state
                     .control
                     .create_collection(CreateCollectionRequest {
-                        name: collection_name.to_owned(),
+                        tenant_name,
+                        database_name,
+                        name: bare_collection_name,
                         dimensions: 2,
                         metric: DistanceMetric::Dot,
                     })
@@ -353,7 +361,13 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
     let actual_collections = service_status
         .collections
         .iter()
-        .map(|placement| placement.collection_name.clone())
+        .map(|placement| {
+            runtime_collection_identity(
+                &placement.tenant_name,
+                &placement.database_name,
+                &placement.collection_name,
+            )
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -436,7 +450,13 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| item["collection_name"].as_str().map(str::to_owned))
+                    .filter_map(|item| {
+                        Some(runtime_collection_identity(
+                            item["tenant_name"].as_str()?,
+                            item["database_name"].as_str()?,
+                            item["collection_name"].as_str()?,
+                        ))
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
@@ -445,27 +465,35 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
     );
     if let Some(items) = rest_status["collections"].as_array() {
         for item in items {
-            let collection_name = item["collection_name"]
-                .as_str()
-                .expect("collection_name should be present");
+            let collection_name = runtime_collection_identity(
+                item["tenant_name"]
+                    .as_str()
+                    .expect("tenant_name should be present"),
+                item["database_name"]
+                    .as_str()
+                    .expect("database_name should be present"),
+                item["collection_name"]
+                    .as_str()
+                    .expect("collection_name should be present"),
+            );
             assert_eq!(
                 item["assigned_node"],
-                model.collection(collection_name).assigned_node,
+                model.collection(&collection_name).assigned_node,
                 "trace: {trace:?}"
             );
             assert_eq!(
                 item["assigned_role"],
-                model.collection(collection_name).assigned_role.as_str(),
+                model.collection(&collection_name).assigned_role.as_str(),
                 "trace: {trace:?}"
             );
             assert_eq!(
                 item["route_kind"],
-                model.expected_route_kind(collection_name),
+                model.expected_route_kind(&collection_name),
                 "trace: {trace:?}"
             );
             assert!(
                 item["route_reason"].as_str().is_some_and(|reason| {
-                    reason.contains(model.expected_route_reason_fragment(collection_name))
+                    reason.contains(model.expected_route_reason_fragment(&collection_name))
                 }),
                 "trace: {trace:?}"
             );
@@ -516,31 +544,42 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
         grpc_status
             .collections
             .iter()
-            .map(|placement| placement.collection_name.clone())
+            .map(|placement| {
+                runtime_collection_identity(
+                    &placement.tenant_name,
+                    &placement.database_name,
+                    &placement.collection_name,
+                )
+            })
             .collect::<Vec<_>>(),
         expected_collections,
         "trace: {trace:?}"
     );
     for placement in &grpc_status.collections {
+        let collection_name = runtime_collection_identity(
+            &placement.tenant_name,
+            &placement.database_name,
+            &placement.collection_name,
+        );
         assert_eq!(
             placement.assigned_node,
-            model.collection(&placement.collection_name).assigned_node,
+            model.collection(&collection_name).assigned_node,
             "trace: {trace:?}"
         );
         assert_eq!(
             placement.assigned_role,
-            proto_node_role(model.collection(&placement.collection_name).assigned_role) as i32,
+            proto_node_role(model.collection(&collection_name).assigned_role) as i32,
             "trace: {trace:?}"
         );
         assert_eq!(
             placement.route_kind,
-            model.expected_route_kind(&placement.collection_name),
+            model.expected_route_kind(&collection_name),
             "trace: {trace:?}"
         );
         assert!(
             placement
                 .route_reason
-                .contains(model.expected_route_reason_fragment(&placement.collection_name)),
+                .contains(model.expected_route_reason_fragment(&collection_name)),
             "trace: {trace:?}"
         );
     }
@@ -580,10 +619,14 @@ async fn assert_placement_matches(
     let rest_placement = rest_collection_placement(harness, collection_name)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let grpc_placement = harness
         .grpc
         .get_collection_placement(Request::new(proto::GetCollectionPlacementRequest {
-            collection_name: collection_name.to_owned(),
+            collection_name: bare_collection_name.clone(),
+            tenant_name: tenant_name.clone(),
+            database_name: database_name.clone(),
         }))
         .await
         .unwrap_or_else(|error| {
@@ -596,7 +639,15 @@ async fn assert_placement_matches(
         "placement requested for unknown collection with trace: {trace:?}"
     );
     assert_eq!(
-        service_placement.collection_name, collection_name,
+        service_placement.tenant_name, tenant_name,
+        "trace: {trace:?}"
+    );
+    assert_eq!(
+        service_placement.database_name, database_name,
+        "trace: {trace:?}"
+    );
+    assert_eq!(
+        service_placement.collection_name, bare_collection_name,
         "trace: {trace:?}"
     );
     assert_eq!(
@@ -622,7 +673,15 @@ async fn assert_placement_matches(
     );
 
     assert_eq!(
-        rest_placement["collection_name"], collection_name,
+        rest_placement["tenant_name"], tenant_name,
+        "trace: {trace:?}"
+    );
+    assert_eq!(
+        rest_placement["database_name"], database_name,
+        "trace: {trace:?}"
+    );
+    assert_eq!(
+        rest_placement["collection_name"], bare_collection_name,
         "trace: {trace:?}"
     );
     assert_eq!(
@@ -649,8 +708,13 @@ async fn assert_placement_matches(
         "trace: {trace:?}"
     );
 
+    assert_eq!(grpc_placement.tenant_name, tenant_name, "trace: {trace:?}");
     assert_eq!(
-        grpc_placement.collection_name, collection_name,
+        grpc_placement.database_name, database_name,
+        "trace: {trace:?}"
+    );
+    assert_eq!(
+        grpc_placement.collection_name, bare_collection_name,
         "trace: {trace:?}"
     );
     assert_eq!(
@@ -697,10 +761,14 @@ async fn assert_data_matches(
     let rest_stats = rest_collection_stats(harness, collection_name)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let grpc_stats = harness
         .grpc
         .get_collection_stats(Request::new(proto::GetCollectionStatsRequest {
-            collection_name: collection_name.to_owned(),
+            collection_name: bare_collection_name,
+            tenant_name,
+            database_name,
         }))
         .await
         .unwrap_or_else(|error| panic_with_context(trace, format!("grpc stats failed: {error}")))
@@ -777,16 +845,20 @@ async fn assert_data_matches(
     let rest_query = rest_collection_query(harness, collection_name, expected_record_count)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let grpc_query = harness
         .grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
-            collection_name: collection_name.to_owned(),
+            collection_name: bare_collection_name,
             vector: vec![1.0, 0.0],
             top_k: expected_record_count as u64,
             snapshot: None,
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
+            tenant_name,
+            database_name,
         }))
         .await
         .unwrap_or_else(|error| panic_with_context(trace, format!("grpc query failed: {error}")))
@@ -846,12 +918,19 @@ async fn rest_collection_placement(
     harness: &Harness,
     collection_name: &str,
 ) -> Result<Value, String> {
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let response = harness
         .rest
         .clone()
         .oneshot(
             axum::http::Request::builder()
-                .uri(format!("/v1/collections/{collection_name}/placement"))
+                .uri(format!(
+                    "/v1/collections/{}/placement?tenant={}&database={}",
+                    encode_collection_path_segment(&bare_collection_name),
+                    encode_collection_query_value(&tenant_name),
+                    encode_collection_query_value(&database_name)
+                ))
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -867,12 +946,19 @@ async fn rest_collection_placement(
 }
 
 async fn rest_collection_stats(harness: &Harness, collection_name: &str) -> Result<Value, String> {
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let response = harness
         .rest
         .clone()
         .oneshot(
             axum::http::Request::builder()
-                .uri(format!("/v1/collections/{collection_name}/stats"))
+                .uri(format!(
+                    "/v1/collections/{}/stats?tenant={}&database={}",
+                    encode_collection_path_segment(&bare_collection_name),
+                    encode_collection_query_value(&tenant_name),
+                    encode_collection_query_value(&database_name)
+                ))
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -892,16 +978,23 @@ async fn rest_collection_query(
     collection_name: &str,
     top_k: usize,
 ) -> Result<Value, String> {
+    let (tenant_name, database_name, bare_collection_name) =
+        request_namespace_parts(collection_name);
     let response = harness
         .rest
         .clone()
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/v1/collections/{collection_name}/query"))
+                .uri(format!(
+                    "/v1/collections/{}/query",
+                    encode_collection_path_segment(&bare_collection_name)
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
+                        "tenant_name": tenant_name,
+                        "database_name": database_name,
                         "vector": [1.0, 0.0],
                         "top_k": top_k
                     })
@@ -940,40 +1033,40 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
                 Step::ReadStatus,
                 Step::CreateCollection("documents"),
                 Step::ReadStatus,
-                Step::ReadPlacement("documents"),
-                Step::WriteBatch("documents", 3),
-                Step::ReadData("documents"),
-                Step::Flush("documents"),
-                Step::ReadData("documents"),
+                Step::ReadPlacement("default/default/documents"),
+                Step::WriteBatch("default/default/documents", 3),
+                Step::ReadData("default/default/documents"),
+                Step::Flush("default/default/documents"),
+                Step::ReadData("default/default/documents"),
                 Step::ReadStatus,
                 Step::Restart,
                 Step::ReadStatus,
-                Step::ReadPlacement("documents"),
-                Step::ReadData("documents"),
+                Step::ReadPlacement("default/default/documents"),
+                Step::ReadData("default/default/documents"),
             ],
         ),
         (
             "phase5-control-only-recorded-route",
             vec![
                 Step::CreateCollection("documents"),
-                Step::WriteBatch("documents", 1),
+                Step::WriteBatch("default/default/documents", 1),
                 Step::ReadStatus,
                 Step::RestartAs(NodeRole::Control),
                 Step::ReadStatus,
-                Step::ReadPlacement("documents"),
-                Step::ExpectWriteRejected("documents"),
+                Step::ReadPlacement("default/default/documents"),
+                Step::ExpectWriteRejected("default/default/documents"),
             ],
         ),
         (
             "phase5-node-name-recorded-route",
             vec![
                 Step::CreateCollection("documents"),
-                Step::WriteBatch("documents", 1),
+                Step::WriteBatch("default/default/documents", 1),
                 Step::ReadStatus,
                 Step::RestartAsNamed("phase5-node-name-recorded-route-moved", NodeRole::Combined),
                 Step::ReadStatus,
-                Step::ReadPlacement("documents"),
-                Step::ExpectWriteRejected("documents"),
+                Step::ReadPlacement("default/default/documents"),
+                Step::ExpectWriteRejected("default/default/documents"),
             ],
         ),
         (
@@ -981,21 +1074,84 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
             vec![
                 Step::CreateCollection("events"),
                 Step::CreateCollection("metrics"),
-                Step::WriteBatch("events", 2),
-                Step::WriteBatch("metrics", 1),
-                Step::ReadData("events"),
-                Step::ReadData("metrics"),
+                Step::WriteBatch("default/default/events", 2),
+                Step::WriteBatch("default/default/metrics", 1),
+                Step::ReadData("default/default/events"),
+                Step::ReadData("default/default/metrics"),
                 Step::ReadStatus,
-                Step::ReadPlacement("metrics"),
+                Step::ReadPlacement("default/default/metrics"),
                 Step::Restart,
                 Step::ReadStatus,
-                Step::ReadPlacement("events"),
-                Step::ReadPlacement("metrics"),
-                Step::ReadData("events"),
-                Step::ReadData("metrics"),
+                Step::ReadPlacement("default/default/events"),
+                Step::ReadPlacement("default/default/metrics"),
+                Step::ReadData("default/default/events"),
+                Step::ReadData("default/default/metrics"),
+            ],
+        ),
+        (
+            "phase5-namespace-collision",
+            vec![
+                Step::CreateCollection("documents"),
+                Step::CreateCollection("tenant-a/analytics/documents"),
+                Step::WriteBatch("default/default/documents", 1),
+                Step::WriteBatch("tenant-a/analytics/documents", 1),
+                Step::ReadStatus,
+                Step::ReadPlacement("default/default/documents"),
+                Step::ReadPlacement("tenant-a/analytics/documents"),
+                Step::ReadData("default/default/documents"),
+                Step::ReadData("tenant-a/analytics/documents"),
+                Step::Restart,
+                Step::ReadStatus,
+                Step::ReadPlacement("default/default/documents"),
+                Step::ReadPlacement("tenant-a/analytics/documents"),
+                Step::ReadData("default/default/documents"),
+                Step::ReadData("tenant-a/analytics/documents"),
             ],
         ),
     ]
+}
+
+fn canonical_collection_name(collection_name: &str) -> String {
+    let mut parts = collection_name.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("default"), Some("default"), Some(name), None) => name.to_owned(),
+        _ => collection_name.to_owned(),
+    }
+}
+
+fn request_namespace_parts(collection_name: &str) -> (String, String, String) {
+    let mut parts = collection_name.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(tenant_name), Some(database_name), Some(name), None) => (
+            tenant_name.to_owned(),
+            database_name.to_owned(),
+            name.to_owned(),
+        ),
+        _ => (
+            "default".to_owned(),
+            "default".to_owned(),
+            collection_name.to_owned(),
+        ),
+    }
+}
+
+fn runtime_collection_identity(
+    tenant_name: &str,
+    database_name: &str,
+    collection_name: &str,
+) -> String {
+    canonical_collection_name(&format!("{tenant_name}/{database_name}/{collection_name}"))
+}
+
+fn encode_collection_path_segment(collection_name: &str) -> String {
+    collection_name
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace(' ', "%20")
+}
+
+fn encode_collection_query_value(value: &str) -> String {
+    value.replace('%', "%25").replace(' ', "%20")
 }
 
 #[allow(clippy::panic)]

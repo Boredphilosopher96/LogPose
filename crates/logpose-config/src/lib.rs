@@ -193,6 +193,25 @@ endpoints = []"#,
     }
 
     #[test]
+    fn from_toml_str_requires_explicit_etcd_endpoints_when_backend_is_selected() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd""#,
+        )
+        .expect_err("etcd backend without explicit endpoints should be rejected");
+
+        assert!(error.to_string().contains("metadata.etcd.endpoints"));
+    }
+
+    #[test]
     fn from_toml_str_rejects_reserved_local_node_name() {
         let error = LogPoseConfig::from_toml_str(
             r#"node_name = "local"

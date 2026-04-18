@@ -43,6 +43,7 @@ The remaining work should still follow a few fixed rules:
 Some missing work does not need its own chapter yet because it is part of the milestone set above:
 
 - auth, RBAC, and auditability belong inside the Web GUI and multi-cluster/operator stories
+- explicit user-created databases, tenant isolation, and database-scoped policy objects should grow out of the new default database catalog foundation rather than being bolted onto collections later
 - richer metrics and readiness belong inside the Web GUI and simulation stories
 - deeper fuzz/property work remains part of the testing ladder and should advance alongside new storage and index artifacts
 - adaptive memory management, SIMD kernels, and broader filtered-search strategy work are captured in the endgoal convergence chapter so the roadmap stays aligned with `better-vector-db.md`

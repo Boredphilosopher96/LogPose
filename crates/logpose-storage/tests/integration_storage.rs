@@ -14,7 +14,10 @@ use uuid as _;
 mod support;
 
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
-use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
+use logpose_types::{
+    DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId,
+    Snapshot, WriteOperation,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -30,11 +33,11 @@ async fn create_write_scan_and_delete_records() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "colors".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "colors",
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 
@@ -82,16 +85,227 @@ async fn create_write_scan_and_delete_records() {
 }
 
 #[tokio::test]
+async fn create_collection_persists_default_tenant_and_database_descriptors() {
+    let root = support::unique_temp_dir("storage-default-database");
+    let engine = LocalStorageEngine::new(&root);
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest::new(
+            "colors",
+            2,
+            DistanceMetric::Cosine,
+        ))
+        .await
+        .expect("collection should be created");
+
+    let tenant_descriptor_path = root.join("tenants").join("default").join("descriptor.json");
+    let tenant_descriptor: logpose_catalog::TenantDescriptor = serde_json::from_slice(
+        &fs::read(&tenant_descriptor_path).expect("tenant descriptor should exist"),
+    )
+    .expect("tenant descriptor JSON should parse");
+
+    let database_descriptor_path = root
+        .join("tenants")
+        .join(DEFAULT_TENANT_NAME)
+        .join("databases")
+        .join(DEFAULT_DATABASE_NAME)
+        .join("descriptor.json");
+    let database_descriptor: logpose_catalog::DatabaseDescriptor = serde_json::from_slice(
+        &fs::read(&database_descriptor_path).expect("database descriptor should exist"),
+    )
+    .expect("database descriptor JSON should parse");
+
+    assert_eq!(tenant_descriptor.name, DEFAULT_TENANT_NAME);
+    assert!(tenant_descriptor.is_default);
+    assert_eq!(database_descriptor.tenant_name, DEFAULT_TENANT_NAME);
+    assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
+    assert_eq!(database_descriptor.name, DEFAULT_DATABASE_NAME);
+    assert!(database_descriptor.is_default);
+}
+
+#[tokio::test]
+async fn duplicate_collection_names_can_exist_in_different_namespaces() {
+    let root = support::unique_temp_dir("storage-namespace-duplicates");
+    let engine = LocalStorageEngine::new(&root);
+
+    let default_descriptor = engine
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("default namespace collection should be created");
+    let tenant_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-a",
+            "analytics",
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("tenant namespace collection should be created");
+
+    assert_eq!(default_descriptor.tenant_name, "default");
+    assert_eq!(tenant_descriptor.tenant_name, "tenant-a");
+    assert_ne!(
+        default_descriptor.collection_id,
+        tenant_descriptor.collection_id
+    );
+
+    let opened_default = engine
+        .open_collection("documents")
+        .await
+        .expect("default namespace lookup should work");
+    let opened_tenant = engine
+        .open_collection("tenant-a/analytics/documents")
+        .await
+        .expect("qualified namespace lookup should work");
+
+    assert_eq!(opened_default.tenant_name, "default");
+    assert_eq!(opened_default.database_name, "default");
+    assert_eq!(opened_tenant.tenant_name, "tenant-a");
+    assert_eq!(opened_tenant.database_name, "analytics");
+
+    let explicit_tenant = engine
+        .open_collection_in_namespace("tenant-a", "analytics", "documents")
+        .await
+        .expect("explicit namespace lookup should work");
+    assert_eq!(
+        explicit_tenant.collection_id,
+        tenant_descriptor.collection_id
+    );
+}
+
+#[tokio::test]
+async fn create_collection_allows_duplicate_names_in_distinct_namespaces() {
+    let root = support::unique_temp_dir("storage-duplicate-collection-namespaces");
+    let engine = LocalStorageEngine::new(&root);
+
+    let left = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-a",
+            DEFAULT_DATABASE_NAME,
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("first collection should be created");
+
+    let right = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-b",
+            DEFAULT_DATABASE_NAME,
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("second collection in another tenant should be created");
+
+    assert_eq!(left.name, "events");
+    assert_eq!(right.name, "events");
+    assert_ne!(left.collection_id, right.collection_id);
+    assert_eq!(left.tenant_name, "tenant-a");
+    assert_eq!(right.tenant_name, "tenant-b");
+
+    let descriptors = engine
+        .list_collections()
+        .await
+        .expect("collection listing should succeed");
+    assert_eq!(
+        descriptors
+            .iter()
+            .filter(|descriptor| descriptor.name == "events")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn create_collection_rejects_reserved_namespace_separator() {
+    let root = support::unique_temp_dir("storage-reserved-separator");
+    let engine = LocalStorageEngine::new(&root);
+
+    let error = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-a",
+            "analytics",
+            "docs/v2",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect_err("slash-containing collection names should fail");
+
+    assert!(error.to_string().contains("collection_name"));
+    assert!(error.to_string().contains("/"));
+}
+
+#[tokio::test]
+async fn open_collection_resolves_namespace_tuple() {
+    let root = support::unique_temp_dir("storage-open-collection-namespace");
+    let engine = LocalStorageEngine::new(&root);
+
+    let default_descriptor = engine
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("default namespace collection should be created");
+    let tenant_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-b",
+            DEFAULT_DATABASE_NAME,
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("tenant namespace collection should be created");
+
+    let default_lookup = engine
+        .open_collection("events")
+        .await
+        .expect("default namespace lookup should succeed");
+    assert_eq!(
+        default_lookup.collection_id,
+        default_descriptor.collection_id
+    );
+    assert_eq!(default_lookup.tenant_name, DEFAULT_TENANT_NAME);
+
+    let explicit_lookup = engine
+        .open_collection_in_namespace("tenant-b", DEFAULT_DATABASE_NAME, "events")
+        .await
+        .expect("explicit namespace lookup should succeed");
+    assert_eq!(
+        explicit_lookup.collection_id,
+        tenant_descriptor.collection_id
+    );
+    assert_eq!(explicit_lookup.tenant_name, "tenant-b");
+
+    let slash_lookup = engine
+        .open_collection("tenant-b/default/events")
+        .await
+        .expect("slash-qualified lookup should succeed");
+    assert_eq!(slash_lookup.collection_id, tenant_descriptor.collection_id);
+}
+
+#[tokio::test]
 async fn flush_persists_visible_records_for_reopen() {
     let root = support::unique_temp_dir("storage-flush");
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 3,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            3,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -173,11 +387,11 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -232,11 +446,11 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -286,11 +500,11 @@ async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -337,11 +551,11 @@ async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending(
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -424,11 +638,11 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -480,11 +694,11 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -579,11 +793,11 @@ async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -648,11 +862,11 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "profiles".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::L2,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "profiles",
+            2,
+            DistanceMetric::L2,
+        ))
         .await
         .expect("collection should be created");
 
@@ -734,11 +948,11 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 
@@ -882,11 +1096,11 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     configure_thresholds(&descriptor.root_path, 1, 1024, 2);
@@ -939,16 +1153,74 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
 }
 
 #[tokio::test]
+async fn background_maintenance_preserves_namespace_for_duplicate_collection_names() {
+    let root = support::unique_temp_dir("storage-background-maintenance-namespace");
+    let engine = LocalStorageEngine::new(&root);
+
+    engine
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("default namespace collection should be created");
+    let tenant_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_namespace(
+            "tenant-a",
+            "analytics",
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("tenant namespace collection should be created");
+    configure_thresholds(&tenant_descriptor.root_path, 1, 1024, 2);
+
+    engine
+        .write(
+            "tenant-a/analytics/events",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("evt-1"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"namespace":"tenant-a","shard":1}),
+            })],
+        )
+        .await
+        .expect("tenant write should succeed");
+
+    wait_for_condition(&engine, "tenant-a/analytics/events", |stats| {
+        stats.segment_count == 1 && stats.mutable_op_count == 0
+    })
+    .await;
+
+    let default_stats = engine
+        .stats("events")
+        .await
+        .expect("default namespace stats should succeed");
+    assert_eq!(default_stats.segment_count, 0);
+    assert_eq!(default_stats.mutable_op_count, 0);
+
+    let tenant_stats = engine
+        .stats("tenant-a/analytics/events")
+        .await
+        .expect("tenant namespace stats should succeed");
+    assert_eq!(tenant_stats.segment_count, 1);
+    assert_eq!(tenant_stats.mutable_op_count, 0);
+    assert_eq!(tenant_stats.live_record_count, 1);
+}
+
+#[tokio::test]
 async fn ann_queries_surface_corrupted_hnsw_sidecars() {
     let root = support::unique_temp_dir("storage-hnsw-corruption");
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1022,11 +1294,11 @@ async fn ann_search_selected_enforces_a_global_candidate_budget() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1112,11 +1384,11 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     configure_thresholds(&descriptor.root_path, 1, 1024, 2);
@@ -1169,11 +1441,11 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 200_000,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            200_000,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     configure_thresholds(&descriptor.root_path, 1, usize::MAX, 99);
@@ -1227,11 +1499,11 @@ async fn reopening_resumes_persisted_background_maintenance() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1282,11 +1554,11 @@ async fn rejects_impossible_snapshots() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1326,11 +1598,11 @@ async fn rejects_snapshots_below_manifest_checkpoint() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1372,11 +1644,11 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1407,11 +1679,11 @@ async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1444,11 +1716,11 @@ async fn old_snapshot_remains_readable_after_flush() {
     let engine = LocalStorageEngine::new(&root);
 
     let descriptor = engine
-        .create_collection(CreateCollectionRequest {
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "events",
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1496,11 +1768,11 @@ async fn duplicate_id_batch_rejects_without_committing_anything() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "items".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "items",
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 
@@ -1537,11 +1809,11 @@ async fn dimension_error_batch_rejects_without_committing_anything() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "embeddings".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "embeddings",
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 

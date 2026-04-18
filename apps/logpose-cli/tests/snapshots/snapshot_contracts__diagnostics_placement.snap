@@ -7,6 +7,8 @@ expression: placement
   "assigned_role": "data",
   "collection_id": "[collection_id]",
   "collection_name": "documents",
+  "database_name": "default",
   "route_kind": "local",
-  "route_reason": "single-node combined runtime exposes a local data-plane assignment"
+  "route_reason": "single-node combined runtime exposes a local data-plane assignment",
+  "tenant_name": "default"
 }

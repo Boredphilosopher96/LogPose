@@ -153,10 +153,20 @@ impl AppState {
         }
 
         Err(ServiceError::InvalidArgument(format!(
-            "collection '{collection_name}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
-            placement.assigned_node, placement.assigned_role, self.config.node_name
+            "collection '{}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
+            placement_identity(&placement),
+            placement.assigned_node,
+            placement.assigned_role,
+            self.config.node_name
         )))
     }
+}
+
+fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {
+    format!(
+        "{}/{}/{}",
+        placement.tenant_name, placement.database_name, placement.collection_name
+    )
 }
 
 #[cfg(test)]

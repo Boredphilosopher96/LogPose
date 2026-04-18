@@ -20,7 +20,7 @@ The control-plane and data-plane split is real, but it is still in-process rathe
 
 ## Control Plane And Data Plane Today
 
-- the control plane owns collection lifecycle, runtime status, and placement diagnostics
+- the control plane owns database and collection lifecycle, runtime status, and placement diagnostics
 - the data plane owns writes, queries, maintenance execution, and storage inspection
 - wrong-plane requests are rejected based on node role and recorded collection placement
 - collection creation is currently accepted on `combined` nodes, not on `control`-only nodes
@@ -31,6 +31,7 @@ LogPose is still a local filesystem engine.
 
 - mutable writes land in WAL-backed local state under `storage_root`
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
+- a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
@@ -49,9 +50,10 @@ Placement is currently persisted local metadata per collection: an assigned node
 
 LogPose does not yet have:
 
-- a metadata service such as etcd
+- fully wired etcd control loops, even though an etcd-backed assignment metadata foundation exists
 - dynamic cluster membership or watch-driven placement updates
 - shard maps, replica sets, or failover controllers
+- database-scoped authn, authz, ACLs, or tenant isolation beyond the persisted default database catalog object
 - remote query dispatch or replication
 - real MinIO or S3-backed immutable artifact storage
 

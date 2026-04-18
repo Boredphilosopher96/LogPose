@@ -8,9 +8,9 @@ use logpose_query::{
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
-    CollectionPlacement, DeleteRecord, DistanceMetric, MaintenanceBacklog, MaintenanceStatus,
-    NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats, RecordId, ScalarFieldStats, Snapshot,
-    WriteOperation,
+    CollectionPlacement, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord, DistanceMetric,
+    MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats,
+    RecordId, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
@@ -112,10 +112,14 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
         let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         let descriptor = self
             .state
             .control
             .create_collection(StorageCreateCollectionRequest {
+                tenant_name,
+                database_name,
                 name: request.name,
                 dimensions: request.dimensions as usize,
                 metric: metric_from_proto(request.metric)?,
@@ -129,10 +133,15 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionPlacementRequest>,
     ) -> Result<Response<CollectionPlacementReply>, Status> {
+        let request = request.into_inner();
         let placement = self
             .state
             .control
-            .collection_placement(&request.into_inner().collection_name)
+            .collection_placement(&collection_lookup_key(
+                &request.tenant_name,
+                &request.database_name,
+                &request.collection_name,
+            ))
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_placement_reply_from_domain(
@@ -144,9 +153,14 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
+        let request = request.into_inner();
         let descriptor = self
             .state
-            .get_collection(&request.into_inner().collection_name)
+            .get_collection(&collection_lookup_key(
+                &request.tenant_name,
+                &request.database_name,
+                &request.collection_name,
+            ))
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_descriptor_reply(descriptor)))
@@ -157,6 +171,8 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<WriteCollectionRequest>,
     ) -> Result<Response<CommitAckReply>, Status> {
         let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         let operations = request
             .operations
             .into_iter()
@@ -164,12 +180,18 @@ impl LogPoseService for GrpcLogPoseService {
             .collect::<Result<Vec<_>, _>>()?;
         let ack = self
             .state
-            .write(&request.collection_name, operations)
+            .write(
+                &collection_lookup_key(&tenant_name, &database_name, &request.collection_name),
+                operations,
+            )
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(CommitAckReply {
             last_seq_no: ack.last_seq_no,
             applied_ops: ack.applied_ops as u64,
+            tenant_name,
+            database_name,
+            collection_name: request.collection_name,
         }))
     }
 
@@ -178,6 +200,8 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<QueryCollectionRequest>,
     ) -> Result<Response<QueryCollectionReply>, Status> {
         let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         if request.top_k == 0 {
             return Err(Status::invalid_argument("top_k must be greater than 0"));
         }
@@ -190,7 +214,11 @@ impl LogPoseService for GrpcLogPoseService {
         let response = self
             .state
             .query(QueryRequest {
-                collection_name: request.collection_name,
+                collection_name: collection_lookup_key(
+                    &tenant_name,
+                    &database_name,
+                    &request.collection_name,
+                ),
                 vector: request.vector,
                 top_k: request.top_k as usize,
                 snapshot: request.snapshot.map(snapshot_from_proto),
@@ -226,6 +254,9 @@ impl LogPoseService for GrpcLogPoseService {
                 .diagnostics
                 .map(query_diagnostics_to_proto)
                 .transpose()?,
+            tenant_name,
+            database_name,
+            collection_name: request.collection_name,
         }))
     }
 
@@ -233,9 +264,14 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetCollectionStatsRequest>,
     ) -> Result<Response<CollectionStatsReply>, Status> {
+        let request = request.into_inner();
         let stats = self
             .state
-            .stats(&request.into_inner().collection_name)
+            .stats(&collection_lookup_key(
+                &request.tenant_name,
+                &request.database_name,
+                &request.collection_name,
+            ))
             .await
             .map_err(status_from_service_error)?;
         Ok(Response::new(collection_stats_reply_from_domain(stats)?))
@@ -245,24 +281,48 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<FlushCollectionRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
+        let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         let snapshot = self
             .state
-            .flush(&request.into_inner().collection_name)
+            .flush(&collection_lookup_key(
+                &tenant_name,
+                &database_name,
+                &request.collection_name,
+            ))
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(snapshot_reply_from_domain(snapshot)))
+        Ok(Response::new(snapshot_reply_from_domain(
+            snapshot,
+            tenant_name,
+            database_name,
+            request.collection_name,
+        )))
     }
 
     async fn compact_collection(
         &self,
         request: Request<CompactCollectionRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
+        let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         let snapshot = self
             .state
-            .compact(&request.into_inner().collection_name)
+            .compact(&collection_lookup_key(
+                &tenant_name,
+                &database_name,
+                &request.collection_name,
+            ))
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(snapshot_reply_from_domain(snapshot)))
+        Ok(Response::new(snapshot_reply_from_domain(
+            snapshot,
+            tenant_name,
+            database_name,
+            request.collection_name,
+        )))
     }
 
     async fn inspect_collection(
@@ -270,10 +330,15 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<InspectCollectionRequest>,
     ) -> Result<Response<InspectCollectionReply>, Status> {
         let request = request.into_inner();
+        let (tenant_name, database_name) =
+            normalize_namespace(&request.tenant_name, &request.database_name);
         let target = inspect_target_from_proto(request.target, request.segment_id)?;
         let report = self
             .state
-            .inspect(&request.collection_name, target)
+            .inspect(
+                &collection_lookup_key(&tenant_name, &database_name, &request.collection_name),
+                target,
+            )
             .await
             .map_err(status_from_service_error)?;
         let payload_json = serde_json::to_string(&report.payload).map_err(|error| {
@@ -282,6 +347,9 @@ impl LogPoseService for GrpcLogPoseService {
         Ok(Response::new(InspectCollectionReply {
             target: report.target,
             payload_json,
+            tenant_name,
+            database_name,
+            collection_name: request.collection_name,
         }))
     }
 }
@@ -492,10 +560,18 @@ fn snapshot_message_from_domain(snapshot: Snapshot) -> proto::Snapshot {
     }
 }
 
-fn snapshot_reply_from_domain(snapshot: Snapshot) -> SnapshotReply {
+fn snapshot_reply_from_domain(
+    snapshot: Snapshot,
+    tenant_name: String,
+    database_name: String,
+    collection_name: String,
+) -> SnapshotReply {
     SnapshotReply {
         manifest_generation: snapshot.manifest_generation,
         visible_seq_no: snapshot.visible_seq_no,
+        tenant_name,
+        database_name,
+        collection_name,
     }
 }
 
@@ -576,6 +652,8 @@ fn collection_descriptor_reply(
             bucket: remote_blob.bucket,
             prefix: remote_blob.prefix,
         }),
+        database_name: descriptor.database_name,
+        tenant_name: descriptor.tenant_name,
     }
 }
 
@@ -608,6 +686,8 @@ fn collection_placement_reply_from_domain(
         assigned_role: node_role_to_proto(placement.assigned_role) as i32,
         route_kind: placement.route_kind,
         route_reason: placement.route_reason,
+        tenant_name: placement.tenant_name,
+        database_name: placement.database_name,
     }
 }
 
@@ -638,7 +718,28 @@ fn collection_stats_reply_from_domain(
             .into_iter()
             .map(query_unit_stats_to_proto)
             .collect::<Result<Vec<_>, _>>()?,
+        tenant_name: stats.tenant_name,
+        database_name: stats.database_name,
     })
+}
+
+fn normalize_namespace(tenant_name: &str, database_name: &str) -> (String, String) {
+    let tenant_name = if tenant_name.trim().is_empty() {
+        DEFAULT_TENANT_NAME.to_owned()
+    } else {
+        tenant_name.to_owned()
+    };
+    let database_name = if database_name.trim().is_empty() {
+        DEFAULT_DATABASE_NAME.to_owned()
+    } else {
+        database_name.to_owned()
+    };
+    (tenant_name, database_name)
+}
+
+fn collection_lookup_key(tenant_name: &str, database_name: &str, collection_name: &str) -> String {
+    let (tenant_name, database_name) = normalize_namespace(tenant_name, database_name);
+    format!("{tenant_name}/{database_name}/{collection_name}")
 }
 
 fn maintenance_status_to_proto(status: MaintenanceStatus) -> proto::MaintenanceStatus {
@@ -793,20 +894,20 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-workflow"))));
 
         let create = service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed")
             .into_inner();
         assert_eq!(create.name, "documents");
 
         service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![
                     proto::WriteOperation {
                         operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
                             id: "alpha".to_owned(),
@@ -829,24 +930,19 @@ mod tests {
                         })),
                     },
                 ],
-            }))
+            )))
             .await
             .expect("write should succeed");
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 3,
-                snapshot: None,
                 filters: vec![proto::MetadataFilter {
                     field: "kind".to_owned(),
                     value: Some(proto::ScalarValue {
                         kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
                     }),
                 }],
-                predicate: None,
-                explain: proto::ExplainMode::None as i32,
+                ..query_collection_request("documents", vec![1.0, 0.0], 3)
             }))
             .await
             .expect("query should succeed")
@@ -861,9 +957,7 @@ mod tests {
         );
 
         let stats = service
-            .get_collection_stats(Request::new(GetCollectionStatsRequest {
-                collection_name: "documents".to_owned(),
-            }))
+            .get_collection_stats(Request::new(get_collection_stats_request("documents")))
             .await
             .expect("stats should succeed")
             .into_inner();
@@ -881,29 +975,25 @@ mod tests {
         assert_eq!(stats.query_units.len(), 1);
 
         let flush = service
-            .flush_collection(Request::new(FlushCollectionRequest {
-                collection_name: "documents".to_owned(),
-            }))
+            .flush_collection(Request::new(flush_collection_request("documents")))
             .await
             .expect("flush should succeed")
             .into_inner();
         assert!(flush.manifest_generation >= 1);
 
         let compact = service
-            .compact_collection(Request::new(CompactCollectionRequest {
-                collection_name: "documents".to_owned(),
-            }))
+            .compact_collection(Request::new(compact_collection_request("documents")))
             .await
             .expect("compact should succeed")
             .into_inner();
         assert!(compact.manifest_generation >= flush.manifest_generation);
 
         let inspect = service
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
-                target: proto::InspectTarget::Manifest as i32,
-                segment_id: String::new(),
-            }))
+            .inspect_collection(Request::new(inspect_collection_request(
+                "documents",
+                proto::InspectTarget::Manifest,
+                String::new(),
+            )))
             .await
             .expect("inspect should succeed")
             .into_inner();
@@ -916,18 +1006,18 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-inspect-targets"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![
                     proto::WriteOperation {
                         operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
                             id: "alpha".to_owned(),
@@ -943,37 +1033,35 @@ mod tests {
                         })),
                     },
                 ],
-            }))
+            )))
             .await
             .expect("write should succeed");
 
         service
-            .flush_collection(Request::new(FlushCollectionRequest {
-                collection_name: "documents".to_owned(),
-            }))
+            .flush_collection(Request::new(flush_collection_request("documents")))
             .await
             .expect("flush should succeed");
 
         service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![proto::WriteOperation {
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![proto::WriteOperation {
                     operation: Some(proto::write_operation::Operation::Delete(
                         proto::DeleteRecord {
                             id: "alpha".to_owned(),
                         },
                     )),
                 }],
-            }))
+            )))
             .await
             .expect("delete should succeed");
 
         let manifest = service
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
-                target: proto::InspectTarget::Manifest as i32,
-                segment_id: String::new(),
-            }))
+            .inspect_collection(Request::new(inspect_collection_request(
+                "documents",
+                proto::InspectTarget::Manifest,
+                String::new(),
+            )))
             .await
             .expect("manifest inspect should succeed")
             .into_inner();
@@ -988,11 +1076,11 @@ mod tests {
             .to_owned();
 
         let wal = service
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
-                target: proto::InspectTarget::Wal as i32,
-                segment_id: String::new(),
-            }))
+            .inspect_collection(Request::new(inspect_collection_request(
+                "documents",
+                proto::InspectTarget::Wal,
+                String::new(),
+            )))
             .await
             .expect("wal inspect should succeed")
             .into_inner();
@@ -1010,11 +1098,11 @@ mod tests {
         );
 
         let segment = service
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
-                target: proto::InspectTarget::Segment as i32,
-                segment_id: segment_id.clone(),
-            }))
+            .inspect_collection(Request::new(inspect_collection_request(
+                "documents",
+                proto::InspectTarget::Segment,
+                segment_id.clone(),
+            )))
             .await
             .expect("segment inspect should succeed")
             .into_inner();
@@ -1032,11 +1120,11 @@ mod tests {
         );
 
         let maintenance = service
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
-                target: proto::InspectTarget::Maintenance as i32,
-                segment_id: String::new(),
-            }))
+            .inspect_collection(Request::new(inspect_collection_request(
+                "documents",
+                proto::InspectTarget::Maintenance,
+                String::new(),
+            )))
             .await
             .expect("maintenance inspect should succeed")
             .into_inner();
@@ -1066,11 +1154,11 @@ mod tests {
         let state = Arc::new(AppState::new(test_config("grpc-runtime-status")));
         state
             .control
-            .create_collection(StorageCreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(storage_create_collection_request(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         let service = GrpcLogPoseService::new(state);
@@ -1098,19 +1186,17 @@ mod tests {
         let state = Arc::new(AppState::new(test_config("grpc-placement")));
         state
             .control
-            .create_collection(StorageCreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(storage_create_collection_request(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         let service = GrpcLogPoseService::new(state);
 
         let placement = service
-            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
-                collection_name: "documents".to_owned(),
-            }))
+            .get_collection_placement(Request::new(get_collection_placement_request("documents")))
             .await
             .expect("placement should succeed")
             .into_inner();
@@ -1129,11 +1215,11 @@ mod tests {
         ))));
 
         let error = service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect_err("data-only node should reject collection creation");
 
@@ -1151,11 +1237,11 @@ mod tests {
         ))));
 
         let error = service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect_err("control-only node should reject collection creation");
 
@@ -1173,11 +1259,11 @@ mod tests {
         )));
         initial
             .control
-            .create_collection(StorageCreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(storage_create_collection_request(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         drop(initial);
@@ -1193,9 +1279,9 @@ mod tests {
             (
                 "write",
                 service
-                    .write_collection(Request::new(WriteCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        operations: vec![proto::WriteOperation {
+                    .write_collection(Request::new(write_collection_request(
+                        "documents",
+                        vec![proto::WriteOperation {
                             operation: Some(proto::write_operation::Operation::Put(
                                 proto::PutRecord {
                                     id: "alpha".to_owned(),
@@ -1204,60 +1290,50 @@ mod tests {
                                 },
                             )),
                         }],
-                    }))
+                    )))
                     .await
                     .expect_err("control-only node should reject writes"),
             ),
             (
                 "query",
                 service
-                    .query_collection(Request::new(QueryCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        vector: vec![1.0, 0.0],
-                        top_k: 1,
-                        snapshot: None,
-                        filters: Vec::new(),
-                        predicate: None,
-                        explain: proto::ExplainMode::None as i32,
-                    }))
+                    .query_collection(Request::new(query_collection_request(
+                        "documents",
+                        vec![1.0, 0.0],
+                        1,
+                    )))
                     .await
                     .expect_err("control-only node should reject queries"),
             ),
             (
                 "stats",
                 service
-                    .get_collection_stats(Request::new(GetCollectionStatsRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .get_collection_stats(Request::new(get_collection_stats_request("documents")))
                     .await
                     .expect_err("control-only node should reject stats"),
             ),
             (
                 "flush",
                 service
-                    .flush_collection(Request::new(FlushCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .flush_collection(Request::new(flush_collection_request("documents")))
                     .await
                     .expect_err("control-only node should reject flush"),
             ),
             (
                 "compact",
                 service
-                    .compact_collection(Request::new(CompactCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .compact_collection(Request::new(compact_collection_request("documents")))
                     .await
                     .expect_err("control-only node should reject compact"),
             ),
             (
                 "inspect",
                 service
-                    .inspect_collection(Request::new(InspectCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        target: InspectTarget::Manifest as i32,
-                        segment_id: String::new(),
-                    }))
+                    .inspect_collection(Request::new(inspect_collection_request(
+                        "documents",
+                        InspectTarget::Manifest,
+                        String::new(),
+                    )))
                     .await
                     .expect_err("control-only node should reject inspect"),
             ),
@@ -1286,11 +1362,11 @@ mod tests {
         )));
         initial
             .control
-            .create_collection(StorageCreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(storage_create_collection_request(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("collection should be created");
         drop(initial);
@@ -1306,9 +1382,9 @@ mod tests {
             (
                 "write",
                 service
-                    .write_collection(Request::new(WriteCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        operations: vec![proto::WriteOperation {
+                    .write_collection(Request::new(write_collection_request(
+                        "documents",
+                        vec![proto::WriteOperation {
                             operation: Some(proto::write_operation::Operation::Put(
                                 proto::PutRecord {
                                     id: "alpha".to_owned(),
@@ -1317,60 +1393,50 @@ mod tests {
                                 },
                             )),
                         }],
-                    }))
+                    )))
                     .await
                     .expect_err("recorded remote writes should be rejected"),
             ),
             (
                 "query",
                 service
-                    .query_collection(Request::new(QueryCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        vector: vec![1.0, 0.0],
-                        top_k: 1,
-                        snapshot: None,
-                        filters: Vec::new(),
-                        predicate: None,
-                        explain: proto::ExplainMode::None as i32,
-                    }))
+                    .query_collection(Request::new(query_collection_request(
+                        "documents",
+                        vec![1.0, 0.0],
+                        1,
+                    )))
                     .await
                     .expect_err("recorded remote queries should be rejected"),
             ),
             (
                 "stats",
                 service
-                    .get_collection_stats(Request::new(GetCollectionStatsRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .get_collection_stats(Request::new(get_collection_stats_request("documents")))
                     .await
                     .expect_err("recorded remote stats should be rejected"),
             ),
             (
                 "flush",
                 service
-                    .flush_collection(Request::new(FlushCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .flush_collection(Request::new(flush_collection_request("documents")))
                     .await
                     .expect_err("recorded remote flush should be rejected"),
             ),
             (
                 "compact",
                 service
-                    .compact_collection(Request::new(CompactCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                    }))
+                    .compact_collection(Request::new(compact_collection_request("documents")))
                     .await
                     .expect_err("recorded remote compaction should be rejected"),
             ),
             (
                 "inspect",
                 service
-                    .inspect_collection(Request::new(InspectCollectionRequest {
-                        collection_name: "documents".to_owned(),
-                        target: InspectTarget::Manifest as i32,
-                        segment_id: String::new(),
-                    }))
+                    .inspect_collection(Request::new(inspect_collection_request(
+                        "documents",
+                        InspectTarget::Manifest,
+                        String::new(),
+                    )))
                     .await
                     .expect_err("recorded remote inspect should be rejected"),
             ),
@@ -1394,9 +1460,7 @@ mod tests {
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-missing"))));
 
         let error = service
-            .get_collection(Request::new(GetCollectionRequest {
-                collection_name: "missing".to_owned(),
-            }))
+            .get_collection(Request::new(get_collection_request("missing")))
             .await
             .expect_err("missing collection should error");
 
@@ -1410,9 +1474,7 @@ mod tests {
         ))));
 
         let error = service
-            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
-                collection_name: "missing".to_owned(),
-            }))
+            .get_collection_placement(Request::new(get_collection_placement_request("missing")))
             .await
             .expect_err("missing collection placement should error");
 
@@ -1425,11 +1487,11 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-dimensions"))));
 
         let error = service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 0,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                0,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect_err("zero dimensions should error");
 
@@ -1448,9 +1510,12 @@ mod tests {
 
         let error = service
             .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: "documents".to_owned(),
                 target: 999,
-                segment_id: String::new(),
+                ..inspect_collection_request(
+                    "documents",
+                    proto::InspectTarget::Manifest,
+                    String::new(),
+                )
             }))
             .await
             .expect_err("unknown inspect target should error");
@@ -1464,18 +1529,18 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-large-integers"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![
                     proto::WriteOperation {
                         operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
                             id: "lower".to_owned(),
@@ -1491,24 +1556,19 @@ mod tests {
                         })),
                     },
                 ],
-            }))
+            )))
             .await
             .expect("write should succeed");
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 5,
-                snapshot: None,
                 filters: vec![proto::MetadataFilter {
                     field: "score".to_owned(),
                     value: Some(proto::ScalarValue {
                         kind: Some(proto::scalar_value::Kind::Uint64Value(9007199254740993)),
                     }),
                 }],
-                predicate: None,
-                explain: proto::ExplainMode::None as i32,
+                ..query_collection_request("documents", vec![1.0, 0.0], 5)
             }))
             .await
             .expect("query should succeed")
@@ -1531,18 +1591,18 @@ mod tests {
         ))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![
                     proto::WriteOperation {
                         operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
                             id: "alpha".to_owned(),
@@ -1579,17 +1639,12 @@ mod tests {
                         })),
                     },
                 ],
-            }))
+            )))
             .await
             .expect("write should succeed");
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                snapshot: None,
-                filters: Vec::new(),
                 predicate: Some(proto::Predicate {
                     node: Some(proto::predicate::Node::Comparison(
                         proto::PredicateComparison {
@@ -1604,6 +1659,7 @@ mod tests {
                     )),
                 }),
                 explain: proto::ExplainMode::Profile as i32,
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
             }))
             .await
             .expect("query should succeed")
@@ -1632,21 +1688,16 @@ mod tests {
         ))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                snapshot: None,
-                filters: Vec::new(),
                 predicate: Some(proto::Predicate {
                     node: Some(proto::predicate::Node::Comparison(
                         proto::PredicateComparison {
@@ -1656,7 +1707,7 @@ mod tests {
                         },
                     )),
                 }),
-                explain: proto::ExplainMode::None as i32,
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
             }))
             .await
             .expect_err("malformed predicate should error");
@@ -1671,27 +1722,22 @@ mod tests {
         ))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                snapshot: None,
-                filters: Vec::new(),
                 predicate: Some(proto::Predicate {
                     node: Some(proto::predicate::Node::And(proto::PredicateList {
                         children: Vec::new(),
                     })),
                 }),
-                explain: proto::ExplainMode::None as i32,
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
             }))
             .await
             .expect_err("empty logical predicate should error");
@@ -1705,23 +1751,18 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-invalid-explain"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
             .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                snapshot: None,
-                filters: Vec::new(),
-                predicate: None,
                 explain: 99,
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
             }))
             .await
             .expect_err("unknown explain mode should error");
@@ -1735,24 +1776,20 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-top-k"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
-            .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 0,
-                snapshot: None,
-                filters: Vec::new(),
-                predicate: None,
-                explain: proto::ExplainMode::None as i32,
-            }))
+            .query_collection(Request::new(query_collection_request(
+                "documents",
+                vec![1.0, 0.0],
+                0,
+            )))
             .await
             .expect_err("zero top_k should error");
 
@@ -1766,25 +1803,25 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-put-id"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![proto::WriteOperation {
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![proto::WriteOperation {
                     operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
                         id: String::new(),
                         vector: vec![1.0, 0.0],
                         metadata_json: "{}".to_owned(),
                     })),
                 }],
-            }))
+            )))
             .await
             .expect_err("empty put record id should error");
 
@@ -1802,23 +1839,23 @@ mod tests {
             GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-delete-id"))));
 
         service
-            .create_collection(Request::new(CreateCollectionRequest {
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-            }))
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
             .await
             .expect("create should succeed");
 
         let error = service
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: "documents".to_owned(),
-                operations: vec![proto::WriteOperation {
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![proto::WriteOperation {
                     operation: Some(proto::write_operation::Operation::Delete(
                         proto::DeleteRecord { id: String::new() },
                     )),
                 }],
-            }))
+            )))
             .await
             .expect_err("empty delete record id should error");
 
@@ -1828,6 +1865,135 @@ mod tests {
                 .message()
                 .contains("delete operation record id must not be empty")
         );
+    }
+
+    fn default_namespace() -> (String, String) {
+        (
+            DEFAULT_TENANT_NAME.to_owned(),
+            DEFAULT_DATABASE_NAME.to_owned(),
+        )
+    }
+
+    fn create_collection_request(
+        name: &str,
+        dimensions: u64,
+        metric: proto::DistanceMetric,
+    ) -> CreateCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        CreateCollectionRequest {
+            name: name.to_owned(),
+            dimensions,
+            metric: metric as i32,
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn storage_create_collection_request(
+        name: &str,
+        dimensions: usize,
+        metric: DistanceMetric,
+    ) -> StorageCreateCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        StorageCreateCollectionRequest {
+            tenant_name,
+            database_name,
+            name: name.to_owned(),
+            dimensions,
+            metric,
+        }
+    }
+
+    fn get_collection_request(collection_name: &str) -> GetCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        GetCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn get_collection_placement_request(collection_name: &str) -> GetCollectionPlacementRequest {
+        let (tenant_name, database_name) = default_namespace();
+        GetCollectionPlacementRequest {
+            collection_name: collection_name.to_owned(),
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn write_collection_request(
+        collection_name: &str,
+        operations: Vec<proto::WriteOperation>,
+    ) -> WriteCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        WriteCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            operations,
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn query_collection_request(
+        collection_name: &str,
+        vector: Vec<f32>,
+        top_k: u64,
+    ) -> QueryCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        QueryCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            vector,
+            top_k,
+            snapshot: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: proto::ExplainMode::None as i32,
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn get_collection_stats_request(collection_name: &str) -> GetCollectionStatsRequest {
+        let (tenant_name, database_name) = default_namespace();
+        GetCollectionStatsRequest {
+            collection_name: collection_name.to_owned(),
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn flush_collection_request(collection_name: &str) -> FlushCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        FlushCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn compact_collection_request(collection_name: &str) -> CompactCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        CompactCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            tenant_name,
+            database_name,
+        }
+    }
+
+    fn inspect_collection_request(
+        collection_name: &str,
+        target: proto::InspectTarget,
+        segment_id: impl Into<String>,
+    ) -> InspectCollectionRequest {
+        let (tenant_name, database_name) = default_namespace();
+        InspectCollectionRequest {
+            collection_name: collection_name.to_owned(),
+            target: target as i32,
+            segment_id: segment_id.into(),
+            tenant_name,
+            database_name,
+        }
     }
 
     fn test_config(label: &str) -> LogPoseConfig {

@@ -24,11 +24,11 @@ async fn queries_storage_records_and_honors_snapshots() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -134,11 +134,11 @@ async fn returns_empty_matches_for_empty_collection() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "empty".to_owned(),
-            dimensions: 3,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "empty",
+            3,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
 
@@ -176,11 +176,11 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "embeddings".to_owned(),
-            dimensions: 3,
-            metric: DistanceMetric::L2,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "embeddings",
+            3,
+            DistanceMetric::L2,
+        ))
         .await
         .expect("collection should be created");
 
@@ -213,11 +213,11 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "profiles".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::L2,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "profiles",
+            2,
+            DistanceMetric::L2,
+        ))
         .await
         .expect("collection should be created");
 
@@ -335,11 +335,11 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
     let engine = LocalStorageEngine::new(&root);
 
     engine
-        .create_collection(CreateCollectionRequest {
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 

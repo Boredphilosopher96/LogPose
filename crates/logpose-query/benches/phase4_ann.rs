@@ -203,11 +203,11 @@ fn validate_fixture(runtime: &Runtime, fixture: &BenchFixture) {
 
 fn create_collection(runtime: &Runtime, engine: &LocalStorageEngine, collection_name: &str) {
     runtime
-        .block_on(engine.create_collection(CreateCollectionRequest {
-            name: collection_name.to_owned(),
-            dimensions: DIMENSIONS,
-            metric: DistanceMetric::Dot,
-        }))
+        .block_on(engine.create_collection(CreateCollectionRequest::new(
+            collection_name,
+            DIMENSIONS,
+            DistanceMetric::Dot,
+        )))
         .expect("collection should be created");
 }
 

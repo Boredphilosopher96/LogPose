@@ -114,7 +114,8 @@ fn query_and_inspect_snapshot_contract() {
         ],
     ));
     let manifest = cli_json(&fixture, ["inspect", "manifest", "colors"]);
-    let segment_id = manifest["payload"]["segments"][0]["segment_id"]
+    let manifest_response = normalize_scoped_response(manifest.clone());
+    let segment_id = manifest_response["payload"]["segments"][0]["segment_id"]
         .as_str()
         .expect("segment id should exist")
         .to_owned();
@@ -153,6 +154,7 @@ fn normalize_placement(mut value: Value) -> Value {
 }
 
 fn normalize_query(value: Value) -> Value {
+    let value = normalize_scoped_response(value);
     let matches = value["matches"]
         .as_array()
         .expect("query matches should be an array")
@@ -207,8 +209,12 @@ fn normalize_segment_scoped(mut value: Value, segment_id: &str) -> Value {
     value
 }
 
+fn normalize_scoped_response(value: Value) -> Value {
+    value.get("response").cloned().unwrap_or(value)
+}
+
 fn project_manifest_contract(value: Value, segment_id: &str) -> Value {
-    let manifest = normalize_segment_scoped(value, segment_id);
+    let manifest = normalize_segment_scoped(normalize_scoped_response(value), segment_id);
     json!({
         "target": manifest["target"],
         "payload": {
@@ -233,7 +239,7 @@ fn project_manifest_contract(value: Value, segment_id: &str) -> Value {
 }
 
 fn project_segment_contract(value: Value, segment_id: &str) -> Value {
-    let segment = normalize_segment_scoped(value, segment_id);
+    let segment = normalize_segment_scoped(normalize_scoped_response(value), segment_id);
     json!({
         "target": segment["target"],
         "payload": {
@@ -262,6 +268,7 @@ fn project_segment_contract(value: Value, segment_id: &str) -> Value {
 }
 
 fn project_wal_contract(value: Value) -> Value {
+    let value = normalize_scoped_response(value);
     json!({
         "target": value["target"],
         "payload": {

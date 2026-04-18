@@ -5,7 +5,10 @@ use logpose_query::{
     ScalarMetadataValue,
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
-use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
+use logpose_types::{
+    CollectionRef, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord, DistanceMetric,
+    PutRecord, RecordId, Snapshot, WriteOperation,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -60,26 +63,26 @@ pub struct JsonlRecord {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectionCreateAction {
-    pub name: String,
+    pub collection: CollectionRef,
     pub dimensions: usize,
     pub metric: DistanceMetric,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordPutAction {
-    pub collection: String,
+    pub collection: CollectionRef,
     pub input: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordDeleteAction {
-    pub collection: String,
+    pub collection: CollectionRef,
     pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryAction {
-    pub collection: String,
+    pub collection: CollectionRef,
     pub top_k: usize,
     pub vector: QueryVector,
     pub filters: Vec<QueryFilter>,
@@ -95,16 +98,16 @@ pub enum Action {
     Status,
     ConfigShow,
     CollectionCreate(CollectionCreateAction),
-    CollectionShow(String),
-    CollectionStats(String),
-    CollectionPlacement(String),
-    CollectionFlush(String),
-    CollectionCompact(String),
+    CollectionShow(CollectionRef),
+    CollectionStats(CollectionRef),
+    CollectionPlacement(CollectionRef),
+    CollectionFlush(CollectionRef),
+    CollectionCompact(CollectionRef),
     RecordPut(RecordPutAction),
     RecordDelete(RecordDeleteAction),
     Query(QueryAction),
     Inspect {
-        collection: String,
+        collection: CollectionRef,
         target: InspectTarget,
     },
 }
@@ -528,7 +531,7 @@ pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRe
         })
         .collect();
     Ok(QueryRequest {
-        collection_name: action.collection.clone(),
+        collection_name: action.collection.collection_name.clone(),
         vector: action.vector.0.clone(),
         top_k: action.top_k,
         snapshot,
@@ -765,7 +768,12 @@ pub fn format_command(action: &Action) -> String {
         Action::CollectionCreate(action) => {
             parts.push("collection".to_owned());
             parts.push("create".to_owned());
-            parts.push(shell_quote(&action.name));
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &action.collection.tenant_name,
+                &action.collection.database_name,
+            );
             parts.push("--dimensions".to_owned());
             parts.push(action.dimensions.to_string());
             parts.push("--metric".to_owned());
@@ -774,44 +782,84 @@ pub fn format_command(action: &Action) -> String {
         Action::CollectionShow(collection) => {
             parts.push("collection".to_owned());
             parts.push("show".to_owned());
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
         Action::CollectionStats(collection) => {
             parts.push("collection".to_owned());
             parts.push("stats".to_owned());
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
         Action::CollectionPlacement(collection) => {
             parts.push("collection".to_owned());
             parts.push("placement".to_owned());
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
         Action::CollectionFlush(collection) => {
             parts.push("collection".to_owned());
             parts.push("flush".to_owned());
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
         Action::CollectionCompact(collection) => {
             parts.push("collection".to_owned());
             parts.push("compact".to_owned());
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
         Action::RecordPut(action) => {
             parts.push("record".to_owned());
             parts.push("put".to_owned());
-            parts.push(shell_quote(&action.collection));
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &action.collection.tenant_name,
+                &action.collection.database_name,
+            );
             parts.push("--input".to_owned());
             parts.push(shell_quote(&action.input.to_string_lossy()));
         }
         Action::RecordDelete(action) => {
             parts.push("record".to_owned());
             parts.push("delete".to_owned());
-            parts.push(shell_quote(&action.collection));
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &action.collection.tenant_name,
+                &action.collection.database_name,
+            );
             parts.push(shell_quote(&action.id));
         }
         Action::Query(action) => {
             parts.push("query".to_owned());
-            parts.push(shell_quote(&action.collection));
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &action.collection.tenant_name,
+                &action.collection.database_name,
+            );
             parts.push("--top-k".to_owned());
             parts.push(action.top_k.to_string());
             parts.push("--vector".to_owned());
@@ -852,15 +900,84 @@ pub fn format_command(action: &Action) -> String {
                 InspectTarget::Maintenance => parts.push("maintenance".to_owned()),
                 InspectTarget::Segment(segment_id) => {
                     parts.push("segment".to_owned());
-                    parts.push(shell_quote(collection));
+                    parts.push(shell_quote(&collection.collection_name));
                     parts.push(shell_quote(segment_id));
+                    push_namespace_flags(
+                        &mut parts,
+                        &collection.tenant_name,
+                        &collection.database_name,
+                    );
                     return parts.join(" ");
                 }
             }
-            parts.push(shell_quote(collection));
+            parts.push(shell_quote(&collection.collection_name));
+            push_namespace_flags(
+                &mut parts,
+                &collection.tenant_name,
+                &collection.database_name,
+            );
         }
     }
     parts.join(" ")
+}
+
+pub fn collection_lookup_name(
+    tenant_name: &str,
+    database_name: &str,
+    collection_name: &str,
+) -> String {
+    if tenant_name == DEFAULT_TENANT_NAME && database_name == DEFAULT_DATABASE_NAME {
+        collection_name.to_owned()
+    } else {
+        format!("{tenant_name}/{database_name}/{collection_name}")
+    }
+}
+
+pub fn split_collection_lookup_key(value: &str) -> (String, String, String) {
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+        (
+            parts[0].to_owned(),
+            parts[1].to_owned(),
+            parts[2].to_owned(),
+        )
+    } else {
+        (
+            DEFAULT_TENANT_NAME.to_owned(),
+            DEFAULT_DATABASE_NAME.to_owned(),
+            value.to_owned(),
+        )
+    }
+}
+
+pub fn collection_ref_from_lookup_key(value: &str) -> CollectionRef {
+    let (tenant_name, database_name, collection_name) = split_collection_lookup_key(value);
+    CollectionRef::new(tenant_name, database_name, collection_name)
+}
+
+pub fn collection_ref_from_lookup_or_namespace(
+    value: &str,
+    tenant_name: &str,
+    database_name: &str,
+) -> CollectionRef {
+    let trimmed = value.trim();
+    let parts = trimmed.split('/').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+        CollectionRef::new(parts[0], parts[1], parts[2])
+    } else {
+        CollectionRef::new(tenant_name, database_name, trimmed)
+    }
+}
+
+fn push_namespace_flags(parts: &mut Vec<String>, tenant_name: &str, database_name: &str) {
+    if tenant_name != DEFAULT_TENANT_NAME {
+        parts.push("--tenant".to_owned());
+        parts.push(shell_quote(tenant_name));
+    }
+    if database_name != DEFAULT_DATABASE_NAME {
+        parts.push("--database".to_owned());
+        parts.push(shell_quote(database_name));
+    }
 }
 
 pub fn metric_name(metric: DistanceMetric) -> &'static str {
@@ -929,7 +1046,9 @@ fn shell_quote(value: &str) -> String {
 impl CollectionCreateAction {
     pub fn request(&self) -> CreateCollectionRequest {
         CreateCollectionRequest {
-            name: self.name.clone(),
+            tenant_name: self.collection.tenant_name.clone(),
+            database_name: self.collection.database_name.clone(),
+            name: self.collection.collection_name.clone(),
             dimensions: self.dimensions,
             metric: self.metric,
         }
@@ -1057,5 +1176,27 @@ mod tests {
         );
 
         assert_eq!(ranked[0].display, "records.jsonl");
+    }
+
+    #[test]
+    fn collection_ref_from_lookup_or_namespace_uses_fallback_for_bare_names() {
+        let collection = collection_ref_from_lookup_or_namespace("documents", "acme", "analytics");
+
+        assert_eq!(collection.tenant_name, "acme");
+        assert_eq!(collection.database_name, "analytics");
+        assert_eq!(collection.collection_name, "documents");
+    }
+
+    #[test]
+    fn format_command_emits_namespace_flags_for_non_default_collection_refs() {
+        let command = format_command(&Action::RecordDelete(RecordDeleteAction {
+            collection: CollectionRef::new("acme", "analytics", "documents"),
+            id: "alpha".to_owned(),
+        }));
+
+        assert_eq!(
+            command,
+            "logpose record delete documents --tenant acme --database analytics alpha"
+        );
     }
 }

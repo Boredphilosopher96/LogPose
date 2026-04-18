@@ -4,13 +4,12 @@
 use async_trait as _;
 #[cfg(test)]
 use criterion as _;
-#[cfg(test)]
 use logpose_catalog as _;
 use logpose_storage::StorageEngine;
 pub use logpose_types::ScalarMetadataValue;
 use logpose_types::{
-    AnnSearchRequest, CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats, RecordId,
-    ScalarFieldStats, Snapshot, VisibleRecord,
+    AnnSearchRequest, CollectionRef, CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats,
+    RecordId, ScalarFieldStats, Snapshot, VisibleRecord,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -266,13 +265,33 @@ pub enum QueryError {
 /// Result type for query helpers.
 pub type Result<T> = std::result::Result<T, QueryError>;
 
+struct ResolvedCollectionDescriptor {
+    tenant_name: String,
+    database_name: String,
+    collection_name: String,
+    dimensions: usize,
+    metric: DistanceMetric,
+}
+
+impl ResolvedCollectionDescriptor {
+    fn lookup_name(&self) -> String {
+        CollectionRef::new(
+            self.tenant_name.clone(),
+            self.database_name.clone(),
+            self.collection_name.clone(),
+        )
+        .lookup_name()
+    }
+}
+
 /// Execute a storage-backed exact query for a single vector.
 pub async fn query_exact<S>(storage: &S, request: QueryRequest) -> Result<QueryResponse>
 where
     S: StorageEngine + ?Sized,
 {
     let planning_started = Instant::now();
-    let descriptor = storage.open_collection(&request.collection_name).await?;
+    let descriptor = resolve_collection_descriptor(storage, &request.collection_name).await?;
+    let collection_name = descriptor.lookup_name();
     if request.vector.len() != descriptor.dimensions {
         return Err(QueryError::RequestVectorDimensionMismatch {
             expected: descriptor.dimensions,
@@ -286,10 +305,10 @@ where
     }
     let snapshot = match request.snapshot.clone() {
         Some(snapshot) => snapshot,
-        None => storage.snapshot(&request.collection_name).await?,
+        None => storage.snapshot(&collection_name).await?,
     };
     let stats = storage
-        .stats_snapshot(&request.collection_name, Some(snapshot.clone()))
+        .stats_snapshot(&collection_name, Some(snapshot.clone()))
         .await?;
     let unit_selection = select_query_units(&stats, predicate.as_ref());
     let estimated_selectivity = predicate
@@ -318,7 +337,7 @@ where
         | QueryPlanKind::TinyPopulationExactFallback => {
             let records = storage
                 .scan_exact_selected(
-                    &request.collection_name,
+                    &collection_name,
                     Some(snapshot.clone()),
                     unit_selection.include_mutable,
                     unit_selection.exact_immutable_unit_ids.clone(),
@@ -428,7 +447,7 @@ where
             let candidate_generation_started = Instant::now();
             let ann_candidates = storage
                 .ann_search_selected(
-                    &request.collection_name,
+                    &collection_name,
                     Some(snapshot.clone()),
                     unit_selection.ann_immutable_unit_ids.clone(),
                     AnnSearchRequest {
@@ -448,7 +467,7 @@ where
             } else {
                 storage
                     .latest_visible_selected(
-                        &request.collection_name,
+                        &collection_name,
                         Some(snapshot.clone()),
                         ann_candidates
                             .iter()
@@ -467,12 +486,7 @@ where
             {
                 let prefilter_started = Instant::now();
                 let mutable_records = storage
-                    .scan_exact_selected(
-                        &request.collection_name,
-                        Some(snapshot.clone()),
-                        true,
-                        Vec::new(),
-                    )
+                    .scan_exact_selected(&collection_name, Some(snapshot.clone()), true, Vec::new())
                     .await?;
                 let filtered = filter_records_by_predicate(mutable_records, predicate.as_ref());
                 let prefilter_micros = prefilter_started.elapsed().as_micros() as u64;
@@ -535,6 +549,75 @@ where
         matches,
         diagnostics,
     ))
+}
+
+async fn resolve_collection_descriptor<S>(
+    storage: &S,
+    collection_name: &str,
+) -> Result<ResolvedCollectionDescriptor>
+where
+    S: StorageEngine + ?Sized,
+{
+    let reference = parse_collection_reference(collection_name)?;
+    let descriptor = storage
+        .open_collection(collection_name)
+        .await
+        .map_err(|error| qualify_collection_error(error, collection_name))?;
+    let resolved = ResolvedCollectionDescriptor {
+        tenant_name: descriptor.tenant_name,
+        database_name: descriptor.database_name,
+        collection_name: descriptor.name,
+        dimensions: descriptor.dimensions,
+        metric: descriptor.metric,
+    };
+    ensure_collection_reference_matches_descriptor(&reference, &resolved, collection_name)?;
+    Ok(resolved)
+}
+
+fn parse_collection_reference(collection_name: &str) -> Result<CollectionRef> {
+    let reference = match collection_name
+        .trim()
+        .split('/')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [collection_name] => CollectionRef::new_default(*collection_name),
+        [tenant_name, database_name, collection_name] => {
+            CollectionRef::new(*tenant_name, *database_name, *collection_name)
+        }
+        _ => {
+            return Err(QueryError::Storage(LogPoseError::Message(format!(
+                "unsupported collection reference '{collection_name}': expected 'collection' or 'tenant/database/collection'"
+            ))));
+        }
+    };
+    reference.validate().map_err(QueryError::Storage)?;
+    Ok(reference)
+}
+
+fn ensure_collection_reference_matches_descriptor(
+    reference: &CollectionRef,
+    descriptor: &ResolvedCollectionDescriptor,
+    original_name: &str,
+) -> Result<()> {
+    if reference.tenant_name != descriptor.tenant_name
+        || reference.database_name != descriptor.database_name
+        || reference.collection_name != descriptor.collection_name
+    {
+        return Err(QueryError::Storage(LogPoseError::Message(format!(
+            "collection '{original_name}' does not exist"
+        ))));
+    }
+    Ok(())
+}
+
+fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPoseError {
+    match error {
+        LogPoseError::Message(message) if message.contains("does not exist") => {
+            LogPoseError::Message(format!("collection '{collection_name}' does not exist"))
+        }
+        other => other,
+    }
 }
 
 fn ann_candidate_budget(top_k: usize, estimated_selectivity: f32) -> usize {
@@ -1401,7 +1484,7 @@ mod tests {
         CollectionStats, CommitAck, LogPoseError, MaintenanceStatus, QueryUnitStats, WriteOperation,
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, path::Path};
+    use std::{collections::BTreeMap, path::Path, sync::Mutex};
 
     fn record(id: &str, vector: Vec<f32>) -> VisibleRecord {
         VisibleRecord {
@@ -2011,7 +2094,189 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn query_exact_resolves_database_qualified_collection_refs_before_storage_calls() {
+        let storage = QualifiedReferenceStorage {
+            seen_names: Mutex::new(Vec::new()),
+        };
+
+        let result = query_exact(
+            &storage,
+            QueryRequest {
+                collection_name: "default/analytics/profiles".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                filters: Vec::new(),
+                predicate: None,
+                explain: ExplainMode::None,
+            },
+        )
+        .await
+        .expect("query should succeed");
+
+        assert_eq!(result.returned, 1);
+        assert_eq!(result.matches[0].id.as_str(), "alpha");
+        assert_eq!(
+            storage
+                .seen_names
+                .lock()
+                .expect("seen names should be readable")
+                .as_slice(),
+            &[
+                "default/analytics/profiles",
+                "default/analytics/profiles",
+                "default/analytics/profiles",
+                "default/analytics/profiles",
+            ]
+        );
+    }
+
     struct MalformedStorageEngine;
+
+    struct QualifiedReferenceStorage {
+        seen_names: Mutex<Vec<String>>,
+    }
+
+    impl QualifiedReferenceStorage {
+        fn record_name(&self, collection_name: &str) -> logpose_types::Result<()> {
+            if collection_name != "default/analytics/profiles" {
+                return Err(LogPoseError::Message(format!(
+                    "expected qualified collection name 'default/analytics/profiles', got '{collection_name}'"
+                )));
+            }
+            self.seen_names
+                .lock()
+                .expect("seen names lock should not be poisoned")
+                .push(collection_name.to_owned());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl StorageEngine for QualifiedReferenceStorage {
+        async fn engine_name(&self) -> &'static str {
+            "qualified"
+        }
+
+        async fn create_collection(
+            &self,
+            _request: CreateCollectionRequest,
+        ) -> logpose_types::Result<CollectionDescriptor> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
+            self.record_name(name)?;
+            Ok(CollectionDescriptor::new_in_database(
+                "analytics",
+                "profiles",
+                2,
+                DistanceMetric::Dot,
+                Path::new("/tmp"),
+            ))
+        }
+
+        async fn write(
+            &self,
+            _collection_name: &str,
+            _operations: Vec<WriteOperation>,
+        ) -> logpose_types::Result<CommitAck> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+            self.record_name(collection_name)?;
+            Ok(Snapshot {
+                manifest_generation: 5,
+                visible_seq_no: 9,
+            })
+        }
+
+        async fn scan_exact(
+            &self,
+            collection_name: &str,
+            _snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<Vec<VisibleRecord>> {
+            self.record_name(collection_name)?;
+            Ok(vec![VisibleRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![2.0, 0.0],
+                metadata: json!({ "kind": "keep" }),
+                seq_no: 9,
+            }])
+        }
+
+        async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+
+        async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
+            self.record_name(collection_name)?;
+            Ok(CollectionStats {
+                collection_id: CollectionDescriptor::new_in_database(
+                    "analytics",
+                    "profiles",
+                    2,
+                    DistanceMetric::Dot,
+                    Path::new("/tmp"),
+                )
+                .collection_id,
+                tenant_name: "default".to_owned(),
+                database_name: "analytics".to_owned(),
+                collection_name: "profiles".to_owned(),
+                manifest_generation: 5,
+                visible_seq_no: 9,
+                mutable_op_count: 1,
+                segment_count: 0,
+                live_record_count: 1,
+                deleted_record_count: 0,
+                maintenance: MaintenanceStatus::default(),
+                query_units: vec![QueryUnitStats {
+                    unit_id: "mutable-delta".to_owned(),
+                    tier: "mutable".to_owned(),
+                    index_kind: "raw".to_owned(),
+                    min_seq_no: 9,
+                    max_seq_no: 9,
+                    put_count: 1,
+                    delete_count: 0,
+                    approx_bytes: 32,
+                    scalar_fields: BTreeMap::new(),
+                    artifact_stats: vec![logpose_types::QueryUnitArtifactStats {
+                        kind: "mutable_delta".to_owned(),
+                        file_name: String::new(),
+                        approx_bytes: 32,
+                    }],
+                    component_bytes: BTreeMap::from([("mutable_delta".to_owned(), 32)]),
+                }],
+            })
+        }
+
+        async fn stats_snapshot(
+            &self,
+            collection_name: &str,
+            snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<CollectionStats> {
+            let mut stats = self.stats(collection_name).await?;
+            if let Some(snapshot) = snapshot {
+                stats.manifest_generation = snapshot.manifest_generation;
+                stats.visible_seq_no = snapshot.visible_seq_no;
+            }
+            Ok(stats)
+        }
+
+        async fn inspect(
+            &self,
+            _collection_name: &str,
+            _target: InspectTarget,
+        ) -> logpose_types::Result<InspectReport> {
+            Err(LogPoseError::Message("not implemented".to_owned()))
+        }
+    }
 
     #[async_trait]
     impl StorageEngine for MalformedStorageEngine {
@@ -2080,6 +2345,8 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .collection_id,
+                tenant_name: "default".to_owned(),
+                database_name: "default".to_owned(),
                 collection_name: "broken".to_owned(),
                 manifest_generation: 4,
                 visible_seq_no: 9,
@@ -2214,6 +2481,8 @@ mod tests {
                     Path::new("/tmp"),
                 )
                 .collection_id,
+                tenant_name: "default".to_owned(),
+                database_name: "default".to_owned(),
                 collection_name: "filtered".to_owned(),
                 manifest_generation: 3,
                 visible_seq_no: 8,

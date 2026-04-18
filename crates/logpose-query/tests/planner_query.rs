@@ -516,6 +516,8 @@ impl PlannerStorage {
         }
         let stats = CollectionStats {
             collection_id: descriptor.collection_id.clone(),
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             collection_name: descriptor.name.clone(),
             manifest_generation: snapshot.manifest_generation,
             visible_seq_no: snapshot.visible_seq_no,
@@ -560,6 +562,8 @@ impl DeleteAwarePlannerStorage {
         )]);
         let stats = CollectionStats {
             collection_id: descriptor.collection_id.clone(),
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             collection_name: descriptor.name.clone(),
             manifest_generation: snapshot.manifest_generation,
             visible_seq_no: snapshot.visible_seq_no,
@@ -658,6 +662,8 @@ impl ShadowingPlannerStorage {
         ]);
         let stats = CollectionStats {
             collection_id: descriptor.collection_id.clone(),
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             collection_name: descriptor.name.clone(),
             manifest_generation: snapshot.manifest_generation,
             visible_seq_no: snapshot.visible_seq_no,
@@ -780,6 +786,8 @@ impl MixedImmutableIndexPlannerStorage {
         ]);
         let stats = CollectionStats {
             collection_id: descriptor.collection_id.clone(),
+            tenant_name: "default".to_owned(),
+            database_name: "default".to_owned(),
             collection_name: descriptor.name.clone(),
             manifest_generation: snapshot.manifest_generation,
             visible_seq_no: snapshot.visible_seq_no,
