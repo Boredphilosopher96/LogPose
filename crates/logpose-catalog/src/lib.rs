@@ -1,11 +1,13 @@
 //! Metadata and collection catalog abstractions.
 
 use logpose_types::{
-    CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DatabaseId,
-    DistanceMetric, LogPoseError, RemoteBlobConfig, TenantId, WriteOperation,
+    CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, DistanceMetric,
+    LogPoseError, RemoteBlobConfig, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+use logpose_auth::{DatabaseAccessPolicy, Principal};
 
 /// Default mutable-op threshold before the engine should flush.
 pub const DEFAULT_FLUSH_THRESHOLD_OPS: usize = 10_000;
@@ -14,44 +16,11 @@ pub const DEFAULT_FLUSH_THRESHOLD_BYTES: usize = 64 * 1024 * 1024;
 /// Default number of immutable segments before compaction is recommended.
 pub const DEFAULT_COMPACTION_THRESHOLD_SEGMENTS: usize = 4;
 
-/// Tenant metadata scaffold for future namespace management.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TenantDescriptor {
-    /// Stable tenant identifier.
-    pub tenant_id: TenantId,
-    /// Human-readable tenant name.
-    pub name: String,
-    /// Whether this descriptor is the operator-provisioned default tenant.
-    pub is_default: bool,
-}
-
-impl TenantDescriptor {
-    /// Construct one tenant descriptor.
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
-        let name = name.into();
-        Self {
-            tenant_id: TenantId::default(),
-            is_default: name == DEFAULT_TENANT_NAME,
-            name,
-        }
-    }
-
-    /// Validate tenant-level configuration.
-    pub fn validate(&self) -> logpose_types::Result<()> {
-        validate_namespace_segment("tenant name", &self.name)?;
-        Ok(())
-    }
-}
-
-/// Logical database metadata scaffold for tenancy and policy.
+/// Logical database metadata scaffold for policy and isolation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseDescriptor {
     /// Stable database identifier.
     pub database_id: DatabaseId,
-    /// Tenant containing the database.
-    #[serde(default = "default_tenant_name")]
-    pub tenant_name: String,
     /// Human-readable database name.
     pub name: String,
     /// Whether this descriptor is the operator-provisioned default database.
@@ -62,16 +31,9 @@ impl DatabaseDescriptor {
     /// Construct one database descriptor.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
-        Self::new_in_tenant(DEFAULT_TENANT_NAME, name)
-    }
-
-    /// Construct one database descriptor in a tenant namespace.
-    #[must_use]
-    pub fn new_in_tenant(tenant_name: impl Into<String>, name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
             database_id: DatabaseId::default(),
-            tenant_name: tenant_name.into(),
             is_default: name == DEFAULT_DATABASE_NAME,
             name,
         }
@@ -79,9 +41,20 @@ impl DatabaseDescriptor {
 
     /// Validate database-level configuration.
     pub fn validate(&self) -> logpose_types::Result<()> {
-        validate_namespace_segment("tenant name", &self.tenant_name)?;
         validate_namespace_segment("database name", &self.name)?;
         Ok(())
+    }
+
+    /// Return the canonical database reference for this descriptor.
+    #[must_use]
+    pub fn database_ref(&self) -> DatabaseRef {
+        DatabaseRef::new(self.name.clone())
+    }
+
+    /// Return the canonical database lookup key for this descriptor.
+    #[must_use]
+    pub fn lookup_name(&self) -> String {
+        self.database_ref().lookup_name()
     }
 }
 
@@ -90,9 +63,6 @@ impl DatabaseDescriptor {
 pub struct CollectionDescriptor {
     /// Stable collection identifier.
     pub collection_id: CollectionId,
-    /// Tenant containing the collection.
-    #[serde(default = "default_tenant_name")]
-    pub tenant_name: String,
     /// Database containing the collection.
     #[serde(default = "default_database_name")]
     pub database_name: String,
@@ -123,8 +93,7 @@ impl CollectionDescriptor {
         metric: DistanceMetric,
         collections_root: impl AsRef<Path>,
     ) -> Self {
-        Self::new_in_namespace(
-            DEFAULT_TENANT_NAME,
+        Self::new_in_database(
             DEFAULT_DATABASE_NAME,
             name,
             dimensions,
@@ -142,30 +111,9 @@ impl CollectionDescriptor {
         metric: DistanceMetric,
         collections_root: impl AsRef<Path>,
     ) -> Self {
-        Self::new_in_namespace(
-            DEFAULT_TENANT_NAME,
-            database_name,
-            name,
-            dimensions,
-            metric,
-            collections_root,
-        )
-    }
-
-    /// Construct a collection descriptor inside one tenant/database namespace.
-    #[must_use]
-    pub fn new_in_namespace(
-        tenant_name: impl Into<String>,
-        database_name: impl Into<String>,
-        name: impl Into<String>,
-        dimensions: usize,
-        metric: DistanceMetric,
-        collections_root: impl AsRef<Path>,
-    ) -> Self {
         let collection_id = CollectionId::default();
         Self {
             collection_id: collection_id.clone(),
-            tenant_name: tenant_name.into(),
             database_name: database_name.into(),
             name: name.into(),
             dimensions,
@@ -178,17 +126,13 @@ impl CollectionDescriptor {
         }
     }
 
-    /// Return the canonical tenant/database/collection reference for this descriptor.
+    /// Return the canonical database/collection reference for this descriptor.
     #[must_use]
     pub fn collection_ref(&self) -> CollectionRef {
-        CollectionRef::new(
-            self.tenant_name.clone(),
-            self.database_name.clone(),
-            self.name.clone(),
-        )
+        CollectionRef::new(self.database_name.clone(), self.name.clone())
     }
 
-    /// Return the canonical tenant/database/collection lookup key for this descriptor.
+    /// Return the canonical database/collection lookup key for this descriptor.
     #[must_use]
     pub fn lookup_name(&self) -> String {
         self.collection_ref().lookup_name()
@@ -206,7 +150,6 @@ impl CollectionDescriptor {
     #[must_use]
     pub fn matches_serving_identity(&self, other: &Self) -> bool {
         self.collection_id == other.collection_id
-            && self.tenant_name == other.tenant_name
             && self.database_name == other.database_name
             && self.name == other.name
             && self.dimensions == other.dimensions
@@ -250,10 +193,6 @@ impl CollectionDescriptor {
     }
 }
 
-fn default_tenant_name() -> String {
-    DEFAULT_TENANT_NAME.to_owned()
-}
-
 fn default_database_name() -> String {
     DEFAULT_DATABASE_NAME.to_owned()
 }
@@ -270,9 +209,69 @@ fn validate_namespace_segment(label: &str, value: &str) -> logpose_types::Result
     Ok(())
 }
 
+/// Catalog metadata surface for databases, principals, and policies.
+pub trait CatalogStore: Send + Sync {
+    /// Create or replace a database descriptor.
+    fn put_database(
+        &self,
+        descriptor: DatabaseDescriptor,
+    ) -> logpose_types::Result<DatabaseDescriptor>;
+
+    /// Read one database descriptor by database name.
+    fn get_database(&self, database_name: &str) -> logpose_types::Result<DatabaseDescriptor>;
+
+    /// List every database descriptor.
+    fn list_databases(&self) -> logpose_types::Result<Vec<DatabaseDescriptor>>;
+
+    /// Create or replace a principal descriptor.
+    fn put_principal(&self, principal: Principal) -> logpose_types::Result<Principal>;
+
+    /// Read one principal descriptor by name.
+    fn get_principal(&self, principal_name: &str) -> logpose_types::Result<Principal>;
+
+    /// List every stored principal descriptor.
+    fn list_principals(&self) -> logpose_types::Result<Vec<Principal>>;
+
+    /// Create or replace one database access policy.
+    fn put_database_access_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> logpose_types::Result<DatabaseAccessPolicy>;
+
+    /// Read one database access policy.
+    fn get_database_access_policy(
+        &self,
+        database_name: &str,
+    ) -> logpose_types::Result<DatabaseAccessPolicy>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_descriptor_lookup_name_is_database_only() {
+        let descriptor = DatabaseDescriptor::new("analytics");
+
+        assert_eq!(descriptor.lookup_name(), "analytics");
+        assert_eq!(
+            serde_json::to_value(&descriptor).expect("database descriptor should serialize"),
+            serde_json::json!({
+                "database_id": descriptor.database_id.to_string(),
+                "name": "analytics",
+                "is_default": false,
+            })
+        );
+    }
+
+    #[test]
+    fn database_descriptor_rejects_empty_name() {
+        let error = DatabaseDescriptor::new("   ")
+            .validate()
+            .expect_err("blank database name should fail");
+
+        assert!(error.to_string().contains("database name"));
+    }
 
     #[test]
     fn collection_descriptor_defaults_to_default_database() {
@@ -283,42 +282,32 @@ mod tests {
             Path::new("/tmp/catalog-validation"),
         );
 
-        assert_eq!(descriptor.tenant_name, DEFAULT_TENANT_NAME);
         assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
-    }
-
-    #[test]
-    fn tenant_descriptor_rejects_empty_name() {
-        let error = TenantDescriptor::new("   ")
-            .validate()
-            .expect_err("blank tenant name should fail");
-
-        assert!(error.to_string().contains("tenant name"));
-    }
-
-    #[test]
-    fn database_descriptor_rejects_empty_name() {
-        let error = DatabaseDescriptor::new_in_tenant(DEFAULT_TENANT_NAME, "   ")
-            .validate()
-            .expect_err("blank database name should fail");
-
-        assert!(error.to_string().contains("database name"));
+        assert_eq!(
+            serde_json::to_value(&descriptor).expect("collection descriptor should serialize"),
+            serde_json::json!({
+                "collection_id": descriptor.collection_id.to_string(),
+                "database_name": DEFAULT_DATABASE_NAME,
+                "name": "events",
+                "dimensions": 2,
+                "metric": "dot",
+                "root_path": descriptor.root_path,
+                "remote_blob": null,
+                "flush_threshold_ops": DEFAULT_FLUSH_THRESHOLD_OPS,
+                "flush_threshold_bytes": DEFAULT_FLUSH_THRESHOLD_BYTES,
+                "compaction_threshold_segments": DEFAULT_COMPACTION_THRESHOLD_SEGMENTS,
+            })
+        );
     }
 
     #[test]
     fn namespace_descriptors_reject_reserved_separator() {
-        let tenant_error = TenantDescriptor::new("tenant/a")
-            .validate()
-            .expect_err("slash-containing tenant name should fail");
-        assert!(tenant_error.to_string().contains("tenant name"));
-
-        let database_error = DatabaseDescriptor::new_in_tenant("tenant-a", "analytics/v2")
+        let database_error = DatabaseDescriptor::new("analytics/v2")
             .validate()
             .expect_err("slash-containing database name should fail");
         assert!(database_error.to_string().contains("database name"));
 
-        let collection_error = CollectionDescriptor::new_in_namespace(
-            "tenant-a",
+        let collection_error = CollectionDescriptor::new_in_database(
             "analytics",
             "docs/v2",
             2,
@@ -328,6 +317,19 @@ mod tests {
         .validate()
         .expect_err("slash-containing collection name should fail");
         assert!(collection_error.to_string().contains("collection_name"));
+    }
+
+    #[test]
+    fn collection_descriptor_lookup_name_is_database_and_collection_only() {
+        let descriptor = CollectionDescriptor::new_in_database(
+            "analytics",
+            "events",
+            2,
+            DistanceMetric::Dot,
+            Path::new("/tmp/catalog-validation"),
+        );
+
+        assert_eq!(descriptor.lookup_name(), "analytics/events");
     }
 
     #[test]

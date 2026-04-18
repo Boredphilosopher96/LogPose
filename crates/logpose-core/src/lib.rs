@@ -2,16 +2,18 @@
 
 #[cfg(test)]
 use etcd_client as _;
+use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
 use logpose_service::{
     LogPoseControlService, LogPoseDataService, Result as ServiceResult, ServiceError,
 };
-use logpose_storage::{InspectReport, InspectTarget, LocalStorageEngine};
+use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
 use logpose_storage_etcd::EtcdBackedStorageEngine;
 use logpose_types::{
-    BuildInfo, CollectionStats, CommitAck, MetadataBackend, NodeMetadata, NodeRole, Snapshot,
-    WriteOperation,
+    BuildInfo, CollectionRef, CollectionStats, CommitAck, MetadataBackend, NodeMetadata, NodeRole,
+    Snapshot, WriteOperation,
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -19,6 +21,33 @@ use serde_json as _;
 use std::sync::Arc;
 #[cfg(test)]
 use tokio as _;
+
+/// Transport-neutral request authentication context.
+#[derive(Clone, Debug, Default)]
+pub struct RequestAuth {
+    bearer_token: Option<String>,
+}
+
+impl RequestAuth {
+    /// Build a request auth context with one bearer token.
+    #[must_use]
+    pub fn bearer_token(token: impl Into<String>) -> Self {
+        Self {
+            bearer_token: Some(token.into()),
+        }
+    }
+
+    fn bearer_token_str(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatabasePermission {
+    ReadOnly,
+    ReadWrite,
+    Owner,
+}
 
 /// Top-level state shared by transport layers and tools.
 #[derive(Clone, Debug, Serialize)]
@@ -51,11 +80,16 @@ impl AppState {
             ),
         };
         let data = Arc::new(LogPoseDataService::new(storage));
+        let catalog = logpose_service::local_catalog_store(&config.storage_root);
         let control = Arc::new(LogPoseControlService::new(
             Arc::clone(&data),
+            catalog,
             config.clone(),
             build.clone(),
         ));
+        control
+            .sync_bootstrap_principals()
+            .expect("failed to persist bootstrap principals");
         Self {
             control,
             data,
@@ -70,12 +104,130 @@ impl AppState {
         NodeMetadata::new(self.config.node_name.clone(), &self.build)
     }
 
+    /// Create or replace one database descriptor after enforcing operator access.
+    pub async fn put_database_with_auth(
+        &self,
+        auth: &RequestAuth,
+        descriptor: DatabaseDescriptor,
+    ) -> ServiceResult<DatabaseDescriptor> {
+        self.require_operator(auth).await?;
+        self.control.put_database(descriptor).await
+    }
+
+    /// Read one database descriptor after enforcing operator access.
+    pub async fn database_with_auth(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+    ) -> ServiceResult<DatabaseDescriptor> {
+        self.require_operator(auth).await?;
+        self.control.database(database_name).await
+    }
+
+    /// List database descriptors after enforcing operator access.
+    pub async fn databases_with_auth(
+        &self,
+        auth: &RequestAuth,
+    ) -> ServiceResult<Vec<DatabaseDescriptor>> {
+        self.require_operator(auth).await?;
+        self.control.databases().await
+    }
+
+    /// Return runtime status after enforcing operator access when auth is enabled.
+    pub async fn runtime_status_with_auth(
+        &self,
+        auth: &RequestAuth,
+    ) -> ServiceResult<logpose_types::NodeRuntimeStatus> {
+        self.require_operator(auth).await?;
+        self.control.runtime_status().await
+    }
+
+    /// Create one collection after enforcing database write access when auth is enabled.
+    pub async fn create_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        request: CreateCollectionRequest,
+    ) -> ServiceResult<logpose_catalog::CollectionDescriptor> {
+        self.require_database_permission(
+            auth,
+            &request.database_name,
+            DatabasePermission::ReadWrite,
+        )
+        .await?;
+        self.control.create_collection(request).await
+    }
+
+    /// Create or replace one database-scoped access policy after enforcing owner access.
+    pub async fn set_database_access_policy_with_auth(
+        &self,
+        auth: &RequestAuth,
+        policy: logpose_auth::DatabaseAccessPolicy,
+    ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
+        self.require_database_owner_permission(auth, &policy.database_name)
+            .await?;
+        self.control.set_database_access_policy(policy).await
+    }
+
+    /// Read one database-scoped access policy after enforcing owner access.
+    pub async fn database_access_policy_with_auth(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+    ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
+        self.require_database_owner_permission(auth, database_name)
+            .await?;
+        self.control.database_access_policy(database_name).await
+    }
+
+    /// Return collection placement after enforcing operator access when auth is enabled.
+    pub async fn collection_placement_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<logpose_types::CollectionPlacement> {
+        self.require_operator(auth).await?;
+        self.control.collection_placement(collection_name).await
+    }
+
+    /// Fetch collection metadata by name after enforcing database read access when auth is enabled.
+    pub async fn get_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<logpose_catalog::CollectionDescriptor> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadOnly,
+        )
+        .await?;
+        self.get_collection(collection_name).await
+    }
+
     /// Fetch collection metadata by name.
     pub async fn get_collection(
         &self,
         collection_name: &str,
     ) -> ServiceResult<logpose_catalog::CollectionDescriptor> {
         self.data.get_collection(collection_name).await
+    }
+
+    /// Persist one write batch after enforcing database write access when auth is enabled.
+    pub async fn write_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        operations: Vec<WriteOperation>,
+    ) -> ServiceResult<CommitAck> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadWrite,
+        )
+        .await?;
+        self.write(collection_name, operations).await
     }
 
     /// Persist one write batch through the data-plane surface.
@@ -87,6 +239,22 @@ impl AppState {
         self.require_local_data_plane_collection(collection_name)
             .await?;
         self.data.write(collection_name, operations).await
+    }
+
+    /// Execute a query after enforcing database read access when auth is enabled.
+    pub async fn query_with_auth(
+        &self,
+        auth: &RequestAuth,
+        request: QueryRequest,
+    ) -> ServiceResult<QueryResponse> {
+        let collection = parse_collection_reference(&request.collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadOnly,
+        )
+        .await?;
+        self.query(request).await
     }
 
     /// Execute a query through the data-plane surface.
@@ -103,11 +271,43 @@ impl AppState {
         self.data.snapshot(collection_name).await
     }
 
+    /// Return collection stats after enforcing database read access when auth is enabled.
+    pub async fn stats_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<CollectionStats> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadOnly,
+        )
+        .await?;
+        self.stats(collection_name).await
+    }
+
     /// Return collection stats through the data-plane surface.
     pub async fn stats(&self, collection_name: &str) -> ServiceResult<CollectionStats> {
         self.require_local_data_plane_collection(collection_name)
             .await?;
         self.data.stats(collection_name).await
+    }
+
+    /// Flush one collection after enforcing database write access when auth is enabled.
+    pub async fn flush_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<Snapshot> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadWrite,
+        )
+        .await?;
+        self.flush(collection_name).await
     }
 
     /// Flush one collection through the data-plane surface.
@@ -117,11 +317,44 @@ impl AppState {
         self.data.flush(collection_name).await
     }
 
+    /// Compact one collection after enforcing database write access when auth is enabled.
+    pub async fn compact_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<Snapshot> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadWrite,
+        )
+        .await?;
+        self.compact(collection_name).await
+    }
+
     /// Compact one collection through the data-plane surface.
     pub async fn compact(&self, collection_name: &str) -> ServiceResult<Snapshot> {
         self.require_local_data_plane_collection(collection_name)
             .await?;
         self.data.compact(collection_name).await
+    }
+
+    /// Inspect one collection after enforcing database read access when auth is enabled.
+    pub async fn inspect_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        target: InspectTarget,
+    ) -> ServiceResult<InspectReport> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(
+            auth,
+            &collection.database_name,
+            DatabasePermission::ReadOnly,
+        )
+        .await?;
+        self.inspect(collection_name, target).await
     }
 
     /// Inspect one collection through the data-plane surface.
@@ -133,6 +366,130 @@ impl AppState {
         self.require_local_data_plane_collection(collection_name)
             .await?;
         self.data.inspect(collection_name, target).await
+    }
+
+    fn auth_enabled(&self) -> bool {
+        !self.config.auth.bootstrap_tokens.is_empty()
+    }
+
+    async fn require_operator(&self, auth: &RequestAuth) -> ServiceResult<()> {
+        let principal = match self.authenticate(auth).await? {
+            Some(principal) => principal,
+            None => return Ok(()),
+        };
+
+        if matches!(principal.access_tier, AccessTier::Operator) {
+            Ok(())
+        } else {
+            Err(ServiceError::PermissionDenied(format!(
+                "principal '{}' is not allowed to perform operator actions",
+                principal.name
+            )))
+        }
+    }
+
+    async fn require_database_permission(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+        permission: DatabasePermission,
+    ) -> ServiceResult<()> {
+        self.require_database_permission_inner(auth, database_name, permission, true)
+            .await
+    }
+
+    async fn require_database_owner_permission(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+    ) -> ServiceResult<()> {
+        self.require_database_permission_inner(
+            auth,
+            database_name,
+            DatabasePermission::Owner,
+            false,
+        )
+        .await
+    }
+
+    async fn require_database_permission_inner(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+        permission: DatabasePermission,
+        allow_unauthenticated_if_disabled: bool,
+    ) -> ServiceResult<()> {
+        let policy = match self.control.database_access_policy(database_name).await {
+            Ok(policy) => Some(policy),
+            Err(ServiceError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+
+        if allow_unauthenticated_if_disabled
+            && matches!(
+                policy.as_ref().map(|policy| &policy.authentication_mode),
+                Some(AuthenticationMode::Disabled)
+            )
+        {
+            return Ok(());
+        }
+
+        let principal = match self.authenticate(auth).await? {
+            Some(principal) => principal,
+            None => return Ok(()),
+        };
+
+        if matches!(principal.access_tier, AccessTier::Operator) {
+            return Ok(());
+        }
+
+        let policy = match policy {
+            Some(policy) => policy,
+            None => {
+                return Err(ServiceError::PermissionDenied(format!(
+                    "principal '{}' is not allowed to access database '{database_name}'",
+                    principal.name
+                )));
+            }
+        };
+
+        let allowed = policy.role_bindings.iter().any(|binding| {
+            binding.principal_name == principal.name
+                && database_role_satisfies(&binding.role, permission)
+        });
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(ServiceError::PermissionDenied(format!(
+                "principal '{}' is not allowed to access database '{database_name}'",
+                principal.name
+            )))
+        }
+    }
+
+    async fn authenticate(&self, auth: &RequestAuth) -> ServiceResult<Option<Principal>> {
+        if !self.auth_enabled() {
+            return Ok(None);
+        }
+
+        let token = auth
+            .bearer_token_str()
+            .ok_or_else(|| ServiceError::Unauthenticated("missing bearer token".to_owned()))?;
+        let bootstrap_principal = self
+            .config
+            .auth
+            .bootstrap_tokens
+            .iter()
+            .find(|entry| entry.token == token)
+            .map(|entry| entry.principal.clone())
+            .ok_or_else(|| ServiceError::Unauthenticated("invalid bearer token".to_owned()))?;
+
+        match self.control.principal(&bootstrap_principal.name).await {
+            Ok(principal) => Ok(Some(principal)),
+            Err(ServiceError::NotFound(_)) => Ok(Some(bootstrap_principal)),
+            Err(error) => Err(error),
+        }
     }
 
     fn require_data_plane(&self) -> ServiceResult<()> {
@@ -169,15 +526,58 @@ impl AppState {
 }
 
 fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {
-    format!(
-        "{}/{}/{}",
-        placement.tenant_name, placement.database_name, placement.collection_name
-    )
+    format!("{}/{}", placement.database_name, placement.collection_name)
+}
+
+fn parse_collection_reference(collection_name: &str) -> ServiceResult<CollectionRef> {
+    let reference = match collection_name
+        .trim()
+        .split('/')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [collection_name] => CollectionRef::new_default(*collection_name),
+        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
+        _ => {
+            return Err(ServiceError::InvalidArgument(format!(
+                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
+            )));
+        }
+    };
+    reference
+        .validate()
+        .map_err(|error| ServiceError::InvalidArgument(error.to_string()))?;
+    Ok(reference)
+}
+
+fn database_role_satisfies(role: &DatabaseRole, permission: DatabasePermission) -> bool {
+    match permission {
+        DatabasePermission::ReadOnly => matches!(
+            role,
+            DatabaseRole::ReadOnly | DatabaseRole::ReadWrite | DatabaseRole::Owner
+        ),
+        DatabasePermission::ReadWrite => {
+            matches!(role, DatabaseRole::ReadWrite | DatabaseRole::Owner)
+        }
+        DatabasePermission::Owner => matches!(role, DatabaseRole::Owner),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use logpose_auth::{
+        AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+        Principal, PrincipalKind,
+    };
+    use logpose_config::BootstrapTokenConfig;
+    use logpose_service::local_catalog_store;
+    use logpose_storage::CreateCollectionRequest;
+    use logpose_types::DistanceMetric;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn rejects_reserved_anonymous_local_node_name_at_runtime_bootstrap() {
@@ -192,5 +592,171 @@ mod tests {
             result.is_err(),
             "reserved anonymous local node name should panic"
         );
+    }
+
+    #[test]
+    fn parse_collection_reference_accepts_database_collection_and_rejects_tenant_depth() {
+        let reference = parse_collection_reference("analytics/documents")
+            .expect("database-qualified collection name should parse");
+
+        assert_eq!(reference.database_name, "analytics");
+        assert_eq!(reference.collection_name, "documents");
+
+        let error = parse_collection_reference("tenant-a/analytics/documents")
+            .expect_err("tenant-qualified collection name should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("expected 'collection' or 'database/collection'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_collection_with_auth_binds_policy_checks_to_database_name() {
+        let state = AppState::new(auth_test_config(
+            "core-auth-database-scope",
+            vec![
+                BootstrapTokenConfig {
+                    token: "operator-token".to_owned(),
+                    principal: Principal::new_with_access_tier(
+                        "ops-admin",
+                        PrincipalKind::User,
+                        AccessTier::Operator,
+                    ),
+                },
+                BootstrapTokenConfig {
+                    token: "writer-token".to_owned(),
+                    principal: Principal::new_with_access_tier(
+                        "writer-service",
+                        PrincipalKind::Service,
+                        AccessTier::Service,
+                    ),
+                },
+            ],
+        ));
+        state
+            .control
+            .set_database_access_policy(DatabaseAccessPolicy {
+                database_name: "analytics".to_owned(),
+                authentication_mode: AuthenticationMode::ExternalToken,
+                role_bindings: vec![DatabaseRoleBinding {
+                    database_name: "analytics".to_owned(),
+                    principal_name: "writer-service".to_owned(),
+                    role: DatabaseRole::ReadWrite,
+                }],
+            })
+            .await
+            .expect("database policy should persist");
+
+        let descriptor = state
+            .create_collection_with_auth(
+                &RequestAuth::bearer_token("writer-token"),
+                CreateCollectionRequest {
+                    database_name: "analytics".to_owned(),
+                    name: "documents".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Dot,
+                },
+            )
+            .await
+            .expect("database-scoped policy should authorize the request");
+
+        assert_eq!(descriptor.database_name, "analytics");
+        assert_eq!(descriptor.name, "documents");
+    }
+
+    #[tokio::test]
+    async fn disabled_database_authentication_mode_allows_unauthenticated_database_access() {
+        let state = AppState::new(auth_test_config(
+            "core-auth-disabled-mode",
+            vec![BootstrapTokenConfig {
+                token: "operator-token".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            }],
+        ));
+        state
+            .control
+            .set_database_access_policy(DatabaseAccessPolicy {
+                database_name: "analytics".to_owned(),
+                authentication_mode: AuthenticationMode::Disabled,
+                role_bindings: Vec::new(),
+            })
+            .await
+            .expect("database policy should persist");
+
+        let descriptor = state
+            .create_collection_with_auth(
+                &RequestAuth::default(),
+                CreateCollectionRequest::in_database(
+                    "analytics",
+                    "documents",
+                    2,
+                    DistanceMetric::Dot,
+                ),
+            )
+            .await
+            .expect("disabled database auth should allow unauthenticated creation");
+
+        assert_eq!(descriptor.database_name, "analytics");
+        assert_eq!(descriptor.name, "documents");
+    }
+
+    #[tokio::test]
+    async fn persisted_principals_override_bootstrap_access_tier_during_authentication() {
+        let state = AppState::new(auth_test_config(
+            "core-auth-persisted-principal",
+            vec![BootstrapTokenConfig {
+                token: "operator-token".to_owned(),
+                principal: Principal::new_with_access_tier(
+                    "ops-admin",
+                    PrincipalKind::User,
+                    AccessTier::Operator,
+                ),
+            }],
+        ));
+        local_catalog_store(&state.config.storage_root)
+            .put_principal(Principal::new_with_access_tier(
+                "ops-admin",
+                PrincipalKind::User,
+                AccessTier::Observer,
+            ))
+            .expect("persisted principal should override bootstrap tier");
+
+        let error = state
+            .put_database_with_auth(
+                &RequestAuth::bearer_token("operator-token"),
+                DatabaseDescriptor::new("analytics"),
+            )
+            .await
+            .expect_err("observer-tier persisted principal should not retain operator access");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not allowed to perform operator actions"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn auth_test_config(label: &str, bootstrap_tokens: Vec<BootstrapTokenConfig>) -> LogPoseConfig {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let storage_root = std::env::temp_dir().join(format!("logpose-core-{label}-{suffix}"));
+        fs::create_dir_all(&storage_root).expect("auth test storage root should be created");
+
+        let mut config = LogPoseConfig {
+            node_name: label.to_owned(),
+            storage_root,
+            ..LogPoseConfig::default()
+        };
+        config.auth.bootstrap_tokens = bootstrap_tokens;
+        config
     }
 }

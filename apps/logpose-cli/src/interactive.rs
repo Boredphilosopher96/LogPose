@@ -43,15 +43,17 @@ pub async fn run_interactive(
     config: &LogPoseConfig,
     ui: &TerminalUi,
     output: OutputMode,
+    auth_token: Option<String>,
     args: InteractiveArgs,
 ) -> anyhow::Result<()> {
-    let session = load_session_context(config).await;
+    let session = load_session_context(config, auth_token.as_deref()).await;
     if ui.supports_fullscreen() {
-        run_tui(config, output, args, session).await
+        run_tui(config, output, auth_token, args, session).await
     } else {
         let action = run_scripted(ui, args, &session)?;
         let reporter = DirectReporter::new(ui);
-        let output_value = execute_action(config, &action, &reporter).await?;
+        let output_value =
+            execute_action(config, auth_token.as_deref(), &action, &reporter).await?;
         output_value.render_direct(output)
     }
 }
@@ -63,8 +65,8 @@ struct SessionContext {
     warning: Option<String>,
 }
 
-async fn load_session_context(config: &LogPoseConfig) -> SessionContext {
-    match connect_client(config).await {
+async fn load_session_context(config: &LogPoseConfig, auth_token: Option<&str>) -> SessionContext {
+    match connect_client(config, auth_token).await {
         Ok(client) => match client.runtime_status().await {
             Ok(status) => SessionContext {
                 collections: status
@@ -72,7 +74,6 @@ async fn load_session_context(config: &LogPoseConfig) -> SessionContext {
                     .into_iter()
                     .map(|placement| {
                         let collection_name = collection_lookup_name(
-                            &placement.tenant_name,
                             &placement.database_name,
                             &placement.collection_name,
                         );
@@ -419,15 +420,11 @@ fn required_collection_string(
 }
 
 fn collection_ref_for_namespace(namespace: &NamespaceArgs, value: &str) -> CollectionRef {
-    collection_ref_from_lookup_or_namespace(value, &namespace.tenant, &namespace.database)
+    collection_ref_from_lookup_or_namespace(value, &namespace.database)
 }
 
 fn collection_label(collection: &CollectionRef) -> String {
-    collection_lookup_name(
-        &collection.tenant_name,
-        &collection.database_name,
-        &collection.collection_name,
-    )
+    collection_lookup_name(&collection.database_name, &collection.collection_name)
 }
 
 fn choose_picker_item_scripted<T: Clone>(
@@ -518,13 +515,14 @@ fn choose_file_path_scripted(ui: &TerminalUi) -> anyhow::Result<PathBuf> {
 async fn run_tui(
     config: &LogPoseConfig,
     output_mode: OutputMode,
+    auth_token: Option<String>,
     args: InteractiveArgs,
     session: SessionContext,
 ) -> anyhow::Result<()> {
     let (mut terminal, _guard) = setup_terminal()?;
     let cwd = std::env::current_dir().context("failed to determine current working directory")?;
     let (tx, mut rx) = unbounded_channel();
-    let mut app = InteractiveApp::new(args, cwd, output_mode, session)?;
+    let mut app = InteractiveApp::new(args, cwd, output_mode, auth_token, session)?;
     let tick_rate = Duration::from_millis(80);
     let mut last_tick = Instant::now();
 
@@ -1107,6 +1105,7 @@ impl FormState {
 
 struct InteractiveApp {
     namespace: NamespaceArgs,
+    auth_token: Option<String>,
     screen: Screen,
     home: HomeState,
     dashboard: DashboardState,
@@ -1134,10 +1133,12 @@ impl InteractiveApp {
         args: InteractiveArgs,
         cwd: PathBuf,
         output_mode: OutputMode,
+        auth_token: Option<String>,
         session: SessionContext,
     ) -> anyhow::Result<Self> {
         let mut app = Self {
             namespace: args.namespace.clone(),
+            auth_token,
             screen: Screen::Home,
             home: HomeState {
                 search: String::new(),
@@ -1494,10 +1495,11 @@ impl InteractiveApp {
         self.status_message = format!("Running {}…", command_preview(&action));
         self.screen = Screen::Running;
         let config = config.clone();
+        let auth_token = self.auth_token.clone();
         tokio::spawn(async move {
             let reporter = ChannelReporter { tx: tx.clone() };
-            let result = execute_action(&config, &action, &reporter).await;
-            let session = load_session_context(&config).await;
+            let result = execute_action(&config, auth_token.as_deref(), &action, &reporter).await;
+            let session = load_session_context(&config, auth_token.as_deref()).await;
             let _ = tx.send(TuiEvent::ActionComplete {
                 action,
                 result: Box::new(result),
@@ -1611,7 +1613,13 @@ impl InteractiveApp {
             Action::RecordDelete(action) => Some(collection_label(&action.collection)),
             Action::Query(action) => Some(collection_label(&action.collection)),
             Action::Inspect { collection, .. } => Some(collection_label(collection)),
-            Action::Status | Action::ConfigShow => None,
+            Action::Status
+            | Action::ConfigShow
+            | Action::DatabaseList
+            | Action::DatabaseShow { .. }
+            | Action::DatabasePut(_)
+            | Action::DatabasePolicyShow { .. }
+            | Action::DatabasePolicySet(_) => None,
         };
         self.session.last_collection = collection;
     }
@@ -3307,6 +3315,7 @@ mod tests {
     fn dashboard_filter_prefers_matching_workflow_labels() {
         let app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Dashboard,
             home: HomeState {
                 search: String::new(),
@@ -3370,10 +3379,9 @@ mod tests {
     }
 
     #[test]
-    fn query_form_applies_interactive_namespace_to_bare_collection_names() {
+    fn query_form_applies_interactive_database_namespace_to_bare_collection_names() {
         let args = InteractiveArgs {
             namespace: NamespaceArgs {
-                tenant: "acme".to_owned(),
                 database: "analytics".to_owned(),
             },
             collection: Some("colors".to_owned()),
@@ -3391,7 +3399,6 @@ mod tests {
         let Action::Query(action) = action else {
             unreachable!("expected query action");
         };
-        assert_eq!(action.collection.tenant_name, "acme");
         assert_eq!(action.collection.database_name, "analytics");
         assert_eq!(action.collection.collection_name, "colors");
     }
@@ -3410,6 +3417,7 @@ mod tests {
     async fn running_quit_is_deferred_until_the_action_completes() {
         let mut app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Running,
             home: HomeState {
                 search: String::new(),
@@ -3466,6 +3474,7 @@ mod tests {
     async fn queued_quit_exits_the_app_after_the_action_completes() {
         let mut app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Running,
             home: HomeState {
                 search: String::new(),
@@ -3511,6 +3520,7 @@ mod tests {
     async fn dashboard_escape_does_not_exit_the_session() {
         let mut app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Dashboard,
             home: HomeState {
                 search: String::new(),
@@ -3553,6 +3563,7 @@ mod tests {
     fn result_back_returns_to_the_form_when_one_exists() {
         let mut app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Result,
             home: HomeState {
                 search: String::new(),
@@ -3650,6 +3661,7 @@ mod tests {
             .value = "records.jsonl".to_owned();
         let mut app = InteractiveApp {
             namespace: NamespaceArgs::default(),
+            auth_token: None,
             screen: Screen::Result,
             home: HomeState {
                 search: String::new(),
@@ -3672,7 +3684,6 @@ mod tests {
                     input: PathBuf::from("records.jsonl"),
                 }),
                 output: ActionOutput::RecordsWritten(logpose_client::ScopedCollectionResponse {
-                    tenant_name: "default".to_owned(),
                     database_name: "default".to_owned(),
                     collection_name: "colors".to_owned(),
                     response: logpose_types::CommitAck {

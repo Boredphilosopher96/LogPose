@@ -2,10 +2,12 @@ use axum::body::Body;
 use http_body_util::BodyExt;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
+use logpose_auth as _;
 use logpose_core::AppState;
 use logpose_query::{ExplainMode, QueryRequest};
 use logpose_storage::CreateCollectionRequest;
 use logpose_types::{DistanceMetric, NodeRole, PutRecord, RecordId, WriteOperation};
+use serde as _;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -262,18 +264,16 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
         match step {
             Step::ReadStatus => assert_status_matches(&harness, &model, &trace).await,
             Step::CreateCollection(collection_name) => {
-                let (tenant_name, database_name, bare_collection_name) =
-                    request_namespace_parts(collection_name);
+                let (database_name, bare_collection_name) = request_database_parts(collection_name);
                 harness
                     .state
                     .control
-                    .create_collection(CreateCollectionRequest {
-                        tenant_name,
+                    .create_collection(CreateCollectionRequest::in_database(
                         database_name,
-                        name: bare_collection_name,
-                        dimensions: 2,
-                        metric: DistanceMetric::Dot,
-                    })
+                        bare_collection_name,
+                        2,
+                        DistanceMetric::Dot,
+                    ))
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(&trace, format!("create collection failed: {error}"))
@@ -362,11 +362,7 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
         .collections
         .iter()
         .map(|placement| {
-            runtime_collection_identity(
-                &placement.tenant_name,
-                &placement.database_name,
-                &placement.collection_name,
-            )
+            runtime_collection_identity(&placement.database_name, &placement.collection_name)
         })
         .collect::<Vec<_>>();
 
@@ -452,7 +448,6 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
                     .iter()
                     .filter_map(|item| {
                         Some(runtime_collection_identity(
-                            item["tenant_name"].as_str()?,
                             item["database_name"].as_str()?,
                             item["collection_name"].as_str()?,
                         ))
@@ -466,9 +461,6 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
     if let Some(items) = rest_status["collections"].as_array() {
         for item in items {
             let collection_name = runtime_collection_identity(
-                item["tenant_name"]
-                    .as_str()
-                    .expect("tenant_name should be present"),
                 item["database_name"]
                     .as_str()
                     .expect("database_name should be present"),
@@ -476,6 +468,7 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
                     .as_str()
                     .expect("collection_name should be present"),
             );
+            assert!(item.get("tenant_name").is_none(), "trace: {trace:?}");
             assert_eq!(
                 item["assigned_node"],
                 model.collection(&collection_name).assigned_node,
@@ -545,22 +538,15 @@ async fn assert_status_matches(harness: &Harness, model: &ExpectedModel, trace: 
             .collections
             .iter()
             .map(|placement| {
-                runtime_collection_identity(
-                    &placement.tenant_name,
-                    &placement.database_name,
-                    &placement.collection_name,
-                )
+                runtime_collection_identity(&placement.database_name, &placement.collection_name)
             })
             .collect::<Vec<_>>(),
         expected_collections,
         "trace: {trace:?}"
     );
     for placement in &grpc_status.collections {
-        let collection_name = runtime_collection_identity(
-            &placement.tenant_name,
-            &placement.database_name,
-            &placement.collection_name,
-        );
+        let collection_name =
+            runtime_collection_identity(&placement.database_name, &placement.collection_name);
         assert_eq!(
             placement.assigned_node,
             model.collection(&collection_name).assigned_node,
@@ -619,13 +605,11 @@ async fn assert_placement_matches(
     let rest_placement = rest_collection_placement(harness, collection_name)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let grpc_placement = harness
         .grpc
         .get_collection_placement(Request::new(proto::GetCollectionPlacementRequest {
             collection_name: bare_collection_name.clone(),
-            tenant_name: tenant_name.clone(),
             database_name: database_name.clone(),
         }))
         .await
@@ -637,10 +621,6 @@ async fn assert_placement_matches(
     assert!(
         model.contains_collection(collection_name),
         "placement requested for unknown collection with trace: {trace:?}"
-    );
-    assert_eq!(
-        service_placement.tenant_name, tenant_name,
-        "trace: {trace:?}"
     );
     assert_eq!(
         service_placement.database_name, database_name,
@@ -672,8 +652,8 @@ async fn assert_placement_matches(
         "trace: {trace:?}"
     );
 
-    assert_eq!(
-        rest_placement["tenant_name"], tenant_name,
+    assert!(
+        rest_placement.get("tenant_name").is_none(),
         "trace: {trace:?}"
     );
     assert_eq!(
@@ -708,7 +688,6 @@ async fn assert_placement_matches(
         "trace: {trace:?}"
     );
 
-    assert_eq!(grpc_placement.tenant_name, tenant_name, "trace: {trace:?}");
     assert_eq!(
         grpc_placement.database_name, database_name,
         "trace: {trace:?}"
@@ -761,13 +740,11 @@ async fn assert_data_matches(
     let rest_stats = rest_collection_stats(harness, collection_name)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let grpc_stats = harness
         .grpc
         .get_collection_stats(Request::new(proto::GetCollectionStatsRequest {
             collection_name: bare_collection_name,
-            tenant_name,
             database_name,
         }))
         .await
@@ -845,8 +822,7 @@ async fn assert_data_matches(
     let rest_query = rest_collection_query(harness, collection_name, expected_record_count)
         .await
         .unwrap_or_else(|error| panic_with_context(trace, error));
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let grpc_query = harness
         .grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
@@ -857,7 +833,6 @@ async fn assert_data_matches(
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
-            tenant_name,
             database_name,
         }))
         .await
@@ -918,17 +893,15 @@ async fn rest_collection_placement(
     harness: &Harness,
     collection_name: &str,
 ) -> Result<Value, String> {
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let response = harness
         .rest
         .clone()
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!(
-                    "/v1/collections/{}/placement?tenant={}&database={}",
+                    "/v1/collections/{}/placement?database={}",
                     encode_collection_path_segment(&bare_collection_name),
-                    encode_collection_query_value(&tenant_name),
                     encode_collection_query_value(&database_name)
                 ))
                 .body(Body::empty())
@@ -946,17 +919,15 @@ async fn rest_collection_placement(
 }
 
 async fn rest_collection_stats(harness: &Harness, collection_name: &str) -> Result<Value, String> {
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let response = harness
         .rest
         .clone()
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!(
-                    "/v1/collections/{}/stats?tenant={}&database={}",
+                    "/v1/collections/{}/stats?database={}",
                     encode_collection_path_segment(&bare_collection_name),
-                    encode_collection_query_value(&tenant_name),
                     encode_collection_query_value(&database_name)
                 ))
                 .body(Body::empty())
@@ -978,8 +949,7 @@ async fn rest_collection_query(
     collection_name: &str,
     top_k: usize,
 ) -> Result<Value, String> {
-    let (tenant_name, database_name, bare_collection_name) =
-        request_namespace_parts(collection_name);
+    let (database_name, bare_collection_name) = request_database_parts(collection_name);
     let response = harness
         .rest
         .clone()
@@ -993,7 +963,6 @@ async fn rest_collection_query(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "tenant_name": tenant_name,
                         "database_name": database_name,
                         "vector": [1.0, 0.0],
                         "top_k": top_k
@@ -1033,40 +1002,40 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
                 Step::ReadStatus,
                 Step::CreateCollection("documents"),
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::WriteBatch("default/default/documents", 3),
-                Step::ReadData("default/default/documents"),
-                Step::Flush("default/default/documents"),
-                Step::ReadData("default/default/documents"),
+                Step::ReadPlacement("documents"),
+                Step::WriteBatch("documents", 3),
+                Step::ReadData("documents"),
+                Step::Flush("documents"),
+                Step::ReadData("documents"),
                 Step::ReadStatus,
                 Step::Restart,
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::ReadData("default/default/documents"),
+                Step::ReadPlacement("documents"),
+                Step::ReadData("documents"),
             ],
         ),
         (
             "phase5-control-only-recorded-route",
             vec![
                 Step::CreateCollection("documents"),
-                Step::WriteBatch("default/default/documents", 1),
+                Step::WriteBatch("documents", 1),
                 Step::ReadStatus,
                 Step::RestartAs(NodeRole::Control),
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::ExpectWriteRejected("default/default/documents"),
+                Step::ReadPlacement("documents"),
+                Step::ExpectWriteRejected("documents"),
             ],
         ),
         (
             "phase5-node-name-recorded-route",
             vec![
                 Step::CreateCollection("documents"),
-                Step::WriteBatch("default/default/documents", 1),
+                Step::WriteBatch("documents", 1),
                 Step::ReadStatus,
                 Step::RestartAsNamed("phase5-node-name-recorded-route-moved", NodeRole::Combined),
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::ExpectWriteRejected("default/default/documents"),
+                Step::ReadPlacement("documents"),
+                Step::ExpectWriteRejected("documents"),
             ],
         ),
         (
@@ -1074,38 +1043,38 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
             vec![
                 Step::CreateCollection("events"),
                 Step::CreateCollection("metrics"),
-                Step::WriteBatch("default/default/events", 2),
-                Step::WriteBatch("default/default/metrics", 1),
-                Step::ReadData("default/default/events"),
-                Step::ReadData("default/default/metrics"),
+                Step::WriteBatch("events", 2),
+                Step::WriteBatch("metrics", 1),
+                Step::ReadData("events"),
+                Step::ReadData("metrics"),
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/metrics"),
+                Step::ReadPlacement("metrics"),
                 Step::Restart,
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/events"),
-                Step::ReadPlacement("default/default/metrics"),
-                Step::ReadData("default/default/events"),
-                Step::ReadData("default/default/metrics"),
+                Step::ReadPlacement("events"),
+                Step::ReadPlacement("metrics"),
+                Step::ReadData("events"),
+                Step::ReadData("metrics"),
             ],
         ),
         (
             "phase5-namespace-collision",
             vec![
                 Step::CreateCollection("documents"),
-                Step::CreateCollection("tenant-a/analytics/documents"),
-                Step::WriteBatch("default/default/documents", 1),
-                Step::WriteBatch("tenant-a/analytics/documents", 1),
+                Step::CreateCollection("analytics/documents"),
+                Step::WriteBatch("documents", 1),
+                Step::WriteBatch("analytics/documents", 1),
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::ReadPlacement("tenant-a/analytics/documents"),
-                Step::ReadData("default/default/documents"),
-                Step::ReadData("tenant-a/analytics/documents"),
+                Step::ReadPlacement("documents"),
+                Step::ReadPlacement("analytics/documents"),
+                Step::ReadData("documents"),
+                Step::ReadData("analytics/documents"),
                 Step::Restart,
                 Step::ReadStatus,
-                Step::ReadPlacement("default/default/documents"),
-                Step::ReadPlacement("tenant-a/analytics/documents"),
-                Step::ReadData("default/default/documents"),
-                Step::ReadData("tenant-a/analytics/documents"),
+                Step::ReadPlacement("documents"),
+                Step::ReadPlacement("analytics/documents"),
+                Step::ReadData("documents"),
+                Step::ReadData("analytics/documents"),
             ],
         ),
     ]
@@ -1113,34 +1082,22 @@ fn scenarios() -> Vec<(&'static str, Vec<Step>)> {
 
 fn canonical_collection_name(collection_name: &str) -> String {
     let mut parts = collection_name.split('/');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("default"), Some("default"), Some(name), None) => name.to_owned(),
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("default"), Some(name), None) => name.to_owned(),
         _ => collection_name.to_owned(),
     }
 }
 
-fn request_namespace_parts(collection_name: &str) -> (String, String, String) {
+fn request_database_parts(collection_name: &str) -> (String, String) {
     let mut parts = collection_name.split('/');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(tenant_name), Some(database_name), Some(name), None) => (
-            tenant_name.to_owned(),
-            database_name.to_owned(),
-            name.to_owned(),
-        ),
-        _ => (
-            "default".to_owned(),
-            "default".to_owned(),
-            collection_name.to_owned(),
-        ),
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(database_name), Some(name), None) => (database_name.to_owned(), name.to_owned()),
+        _ => ("default".to_owned(), collection_name.to_owned()),
     }
 }
 
-fn runtime_collection_identity(
-    tenant_name: &str,
-    database_name: &str,
-    collection_name: &str,
-) -> String {
-    canonical_collection_name(&format!("{tenant_name}/{database_name}/{collection_name}"))
+fn runtime_collection_identity(database_name: &str, collection_name: &str) -> String {
+    canonical_collection_name(&format!("{database_name}/{collection_name}"))
 }
 
 fn encode_collection_path_segment(collection_name: &str) -> String {
@@ -1182,5 +1139,40 @@ fn proto_node_role(role: NodeRole) -> proto::NodeRole {
         NodeRole::Combined => proto::NodeRole::Combined,
         NodeRole::Control => proto::NodeRole::Control,
         NodeRole::Data => proto::NodeRole::Data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_database_parts_defaults_database_for_bare_collection() {
+        let (database_name, collection_name) = request_database_parts("documents");
+
+        assert_eq!(database_name, "default");
+        assert_eq!(collection_name, "documents");
+    }
+
+    #[test]
+    fn request_database_parts_preserves_explicit_database() {
+        let (database_name, collection_name) = request_database_parts("analytics/documents");
+
+        assert_eq!(database_name, "analytics");
+        assert_eq!(collection_name, "documents");
+    }
+
+    #[test]
+    fn runtime_collection_identity_collapses_default_database_prefix() {
+        assert_eq!(canonical_collection_name("documents"), "documents");
+        assert_eq!(canonical_collection_name("default/documents"), "documents");
+        assert_eq!(
+            runtime_collection_identity("default", "documents"),
+            "documents"
+        );
+        assert_eq!(
+            runtime_collection_identity("analytics", "documents"),
+            "analytics/documents"
+        );
     }
 }

@@ -12,6 +12,7 @@ workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm = "~0.29"
+logpose-auth = { path = "../../crates/logpose-auth" }
 logpose-client = { path = "../../crates/logpose-client" }
 logpose-catalog = { path = "../../crates/logpose-catalog" }
 logpose-config = { path = "../../crates/logpose-config" }

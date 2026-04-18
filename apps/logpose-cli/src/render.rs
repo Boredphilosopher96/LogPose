@@ -1,17 +1,26 @@
 use crate::action::{Action, format_command, metric_name};
 use crate::cli::OutputMode;
 use anyhow::Context;
-use logpose_catalog::CollectionDescriptor;
+use logpose_auth::DatabaseAccessPolicy;
+use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_client::ScopedCollectionResponse;
 use logpose_config::LogPoseConfig;
 use logpose_query::QueryResponse;
 use logpose_storage::InspectReport;
-use logpose_types::{CollectionPlacement, CollectionStats, CommitAck, NodeRuntimeStatus, Snapshot};
+use logpose_types::{
+    CollectionPlacement, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, NodeRuntimeStatus,
+    Snapshot,
+};
 use serde::Serialize;
 
 pub enum ActionOutput {
     Status(NodeRuntimeStatus),
     Config(LogPoseConfig),
+    DatabaseShown(DatabaseDescriptor),
+    DatabaseUpdated(DatabaseDescriptor),
+    DatabasesListed(Vec<DatabaseDescriptor>),
+    DatabasePolicyShown(DatabaseAccessPolicy),
+    DatabasePolicyUpdated(DatabaseAccessPolicy),
     CollectionCreated(CollectionDescriptor),
     CollectionShown(CollectionDescriptor),
     CollectionStats(CollectionStats),
@@ -39,23 +48,26 @@ impl ActionOutput {
         Ok(match self {
             ActionOutput::Status(status) => render_status(status),
             ActionOutput::Config(config) => render_config(config),
+            ActionOutput::DatabaseShown(descriptor) => render_database("Database", descriptor),
+            ActionOutput::DatabaseUpdated(descriptor) => {
+                render_database("Database updated", descriptor)
+            }
+            ActionOutput::DatabasesListed(descriptors) => render_databases(descriptors),
+            ActionOutput::DatabasePolicyShown(policy) => {
+                render_database_policy("Database Policy", policy)
+            }
+            ActionOutput::DatabasePolicyUpdated(policy) => {
+                render_database_policy("Database policy updated", policy)
+            }
             ActionOutput::CollectionCreated(descriptor) => format!(
                 "Collection created\nCollection: {}\nDimensions: {}\nMetric: {}",
-                collection_identity(
-                    &descriptor.tenant_name,
-                    &descriptor.database_name,
-                    &descriptor.name,
-                ),
+                collection_identity(&descriptor.database_name, &descriptor.name),
                 descriptor.dimensions,
                 metric_name(descriptor.metric)
             ),
             ActionOutput::CollectionShown(descriptor) => format!(
                 "Collection\nCollection: {}\nDimensions: {}\nMetric: {}",
-                collection_identity(
-                    &descriptor.tenant_name,
-                    &descriptor.database_name,
-                    &descriptor.name,
-                ),
+                collection_identity(&descriptor.database_name, &descriptor.name),
                 descriptor.dimensions,
                 metric_name(descriptor.metric)
             ),
@@ -63,33 +75,25 @@ impl ActionOutput {
             ActionOutput::CollectionPlacement(placement) => render_placement(placement),
             ActionOutput::CollectionFlushed(snapshot) => format!(
                 "Collection flushed\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}",
-                collection_identity(
-                    &snapshot.tenant_name,
-                    &snapshot.database_name,
-                    &snapshot.collection_name
-                ),
+                collection_identity(&snapshot.database_name, &snapshot.collection_name),
                 snapshot.manifest_generation,
                 snapshot.visible_seq_no
             ),
             ActionOutput::CollectionCompacted(snapshot) => format!(
                 "Collection compacted\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}",
-                collection_identity(
-                    &snapshot.tenant_name,
-                    &snapshot.database_name,
-                    &snapshot.collection_name
-                ),
+                collection_identity(&snapshot.database_name, &snapshot.collection_name),
                 snapshot.manifest_generation,
                 snapshot.visible_seq_no
             ),
             ActionOutput::RecordsWritten(ack) => format!(
                 "Write completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
-                collection_identity(&ack.tenant_name, &ack.database_name, &ack.collection_name),
+                collection_identity(&ack.database_name, &ack.collection_name),
                 ack.applied_ops,
                 ack.last_seq_no
             ),
             ActionOutput::RecordDeleted(ack) => format!(
                 "Delete completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
-                collection_identity(&ack.tenant_name, &ack.database_name, &ack.collection_name),
+                collection_identity(&ack.database_name, &ack.collection_name),
                 ack.applied_ops,
                 ack.last_seq_no
             ),
@@ -97,11 +101,7 @@ impl ActionOutput {
             ActionOutput::Inspect(report) => format!(
                 "Inspection: {}\nCollection: {}\n{}",
                 report.target,
-                collection_identity(
-                    &report.tenant_name,
-                    &report.database_name,
-                    &report.collection_name
-                ),
+                collection_identity(&report.database_name, &report.collection_name),
                 serde_json::to_string_pretty(&report.payload)
                     .context("failed to serialize inspect payload")?
             ),
@@ -112,6 +112,12 @@ impl ActionOutput {
         match self {
             ActionOutput::Status(status) => pretty_json(status),
             ActionOutput::Config(config) => pretty_json(config),
+            ActionOutput::DatabaseShown(descriptor) | ActionOutput::DatabaseUpdated(descriptor) => {
+                pretty_json(descriptor)
+            }
+            ActionOutput::DatabasesListed(descriptors) => pretty_json(descriptors),
+            ActionOutput::DatabasePolicyShown(policy)
+            | ActionOutput::DatabasePolicyUpdated(policy) => pretty_json(policy),
             ActionOutput::CollectionCreated(descriptor)
             | ActionOutput::CollectionShown(descriptor) => pretty_json(descriptor),
             ActionOutput::CollectionStats(stats) => pretty_json(stats),
@@ -135,6 +141,11 @@ impl ActionOutput {
         match self {
             ActionOutput::Status(_) => "Runtime Status",
             ActionOutput::Config(_) => "Configuration",
+            ActionOutput::DatabaseShown(_) => "Database",
+            ActionOutput::DatabaseUpdated(_) => "Database Updated",
+            ActionOutput::DatabasesListed(_) => "Databases",
+            ActionOutput::DatabasePolicyShown(_) => "Database Policy",
+            ActionOutput::DatabasePolicyUpdated(_) => "Database Policy Updated",
             ActionOutput::CollectionCreated(_) => "Collection Created",
             ActionOutput::CollectionShown(_) => "Collection",
             ActionOutput::CollectionStats(_) => "Collection Statistics",
@@ -178,11 +189,7 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
         for placement in status.collections.iter().take(5) {
             lines.push(format!(
                 "  - {} -> {} ({})",
-                collection_identity(
-                    &placement.tenant_name,
-                    &placement.database_name,
-                    &placement.collection_name,
-                ),
+                collection_identity(&placement.database_name, &placement.collection_name),
                 placement.assigned_node,
                 placement.route_kind
             ));
@@ -204,6 +211,68 @@ fn render_config(config: &LogPoseConfig) -> String {
     )
 }
 
+fn render_database_policy(title: &str, policy: &DatabaseAccessPolicy) -> String {
+    let mut lines = vec![
+        title.to_owned(),
+        format!("Database: {}", policy.database_name),
+        format!("Authentication mode: {}", authentication_mode_name(policy)),
+    ];
+    if policy.role_bindings.is_empty() {
+        lines.push("Role bindings: none".to_owned());
+    } else {
+        lines.push("Role bindings:".to_owned());
+        for binding in &policy.role_bindings {
+            lines.push(format!(
+                "  - {} => {}",
+                binding.principal_name,
+                database_role_name(binding.role.clone())
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_database(title: &str, descriptor: &DatabaseDescriptor) -> String {
+    format!(
+        "{title}\nDatabase: {}\nDefault: {}",
+        descriptor.name,
+        yes_no(descriptor.is_default)
+    )
+}
+
+fn render_databases(descriptors: &[DatabaseDescriptor]) -> String {
+    let mut lines = vec![format!("Databases ({})", descriptors.len())];
+    for descriptor in descriptors {
+        lines.push(format!(
+            "- {}{}",
+            descriptor.name,
+            if descriptor.is_default {
+                " (default)"
+            } else {
+                ""
+            }
+        ));
+    }
+    lines.join("\n")
+}
+
+fn authentication_mode_name(policy: &DatabaseAccessPolicy) -> &'static str {
+    match policy.authentication_mode {
+        logpose_auth::AuthenticationMode::Disabled => "disabled",
+        logpose_auth::AuthenticationMode::Password => "password",
+        logpose_auth::AuthenticationMode::MutualTls => "mutual_tls",
+        logpose_auth::AuthenticationMode::ExternalToken => "external_token",
+    }
+}
+
+fn database_role_name(role: logpose_auth::DatabaseRole) -> &'static str {
+    match role {
+        logpose_auth::DatabaseRole::Owner => "owner",
+        logpose_auth::DatabaseRole::ReadWrite => "read_write",
+        logpose_auth::DatabaseRole::ReadOnly => "read_only",
+    }
+}
+
 fn format_host_port(host: &str, port: u16) -> String {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(_)) => format!("[{host}]:{port}"),
@@ -214,11 +283,7 @@ fn format_host_port(host: &str, port: u16) -> String {
 fn render_stats(stats: &CollectionStats) -> String {
     format!(
         "Collection Statistics\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}\nLive records: {}\nDeleted records: {}\nMutable operations: {}\nSegments: {}\nPending maintenance: {}",
-        collection_identity(
-            &stats.tenant_name,
-            &stats.database_name,
-            &stats.collection_name
-        ),
+        collection_identity(&stats.database_name, &stats.collection_name),
         stats.manifest_generation,
         stats.visible_seq_no,
         stats.live_record_count,
@@ -232,11 +297,7 @@ fn render_stats(stats: &CollectionStats) -> String {
 fn render_placement(placement: &CollectionPlacement) -> String {
     format!(
         "Collection Placement\nCollection: {}\nAssigned node: {}\nAssigned role: {}\nRoute kind: {}\nReason: {}",
-        collection_identity(
-            &placement.tenant_name,
-            &placement.database_name,
-            &placement.collection_name,
-        ),
+        collection_identity(&placement.database_name, &placement.collection_name),
         placement.assigned_node,
         placement.assigned_role.as_str(),
         placement.route_kind,
@@ -249,11 +310,7 @@ fn render_query(response: &ScopedCollectionResponse<QueryResponse>) -> anyhow::R
         "Query Results".to_owned(),
         format!(
             "Collection: {}",
-            collection_identity(
-                &response.tenant_name,
-                &response.database_name,
-                &response.collection_name,
-            )
+            collection_identity(&response.database_name, &response.collection_name)
         ),
         format!("Metric: {}", metric_name(response.metric)),
         format!("Returned: {}/{}", response.returned, response.top_k),
@@ -300,8 +357,12 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-fn collection_identity(tenant_name: &str, database_name: &str, collection_name: &str) -> String {
-    format!("{tenant_name}/{database_name}/{collection_name}")
+fn collection_identity(database_name: &str, collection_name: &str) -> String {
+    if database_name == DEFAULT_DATABASE_NAME {
+        collection_name.to_owned()
+    } else {
+        format!("{database_name}/{collection_name}")
+    }
 }
 
 #[cfg(test)]
@@ -310,10 +371,9 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn collection_descriptors_render_fully_qualified_identity() {
+    fn collection_descriptors_render_database_scoped_identity() {
         let output = ActionOutput::CollectionShown(CollectionDescriptor {
             collection_id: logpose_types::CollectionId::default(),
-            tenant_name: "acme".to_owned(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
             dimensions: 2,
@@ -327,13 +387,13 @@ mod tests {
         .human_text()
         .expect("descriptor should render");
 
-        assert!(output.contains("acme/analytics/documents"));
+        assert!(output.contains("analytics/documents"));
+        assert!(!output.contains("acme/analytics/documents"));
     }
 
     #[test]
-    fn scoped_write_results_render_fully_qualified_identity() {
+    fn scoped_write_results_render_database_scoped_identity() {
         let output = ActionOutput::RecordsWritten(ScopedCollectionResponse {
-            tenant_name: "acme".to_owned(),
             database_name: "analytics".to_owned(),
             collection_name: "documents".to_owned(),
             response: CommitAck {
@@ -344,7 +404,29 @@ mod tests {
         .human_text()
         .expect("write result should render");
 
-        assert!(output.contains("acme/analytics/documents"));
+        assert!(output.contains("analytics/documents"));
+        assert!(!output.contains("acme/analytics/documents"));
         assert!(output.contains("Applied operations: 2"));
+    }
+
+    #[test]
+    fn default_database_collections_render_without_a_namespace_prefix() {
+        let output = ActionOutput::CollectionShown(CollectionDescriptor {
+            collection_id: logpose_types::CollectionId::default(),
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: logpose_types::DistanceMetric::Dot,
+            root_path: PathBuf::from("/tmp/documents"),
+            remote_blob: None,
+            flush_threshold_ops: 10,
+            flush_threshold_bytes: 20,
+            compaction_threshold_segments: 3,
+        })
+        .human_text()
+        .expect("descriptor should render");
+
+        assert!(output.contains("Collection: documents"));
+        assert!(!output.contains("default/default/documents"));
     }
 }

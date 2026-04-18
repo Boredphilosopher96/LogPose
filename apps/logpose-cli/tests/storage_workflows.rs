@@ -6,6 +6,7 @@ use crossterm as _;
 use insta as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_cli as _;
 use logpose_client as _;

@@ -28,7 +28,6 @@ expression: snapshot
       "manifest_generation": 0,
       "visible_seq_no": 3
     },
-    "tenant_name": "default",
     "top_k": 1
   },
   "manifest": {
@@ -47,8 +46,7 @@ expression: snapshot
         }
       ]
     },
-    "target": "manifest",
-    "tenant_name": "default"
+    "target": "manifest"
   },
   "profile_query": {
     "collection_name": "colors",
@@ -83,7 +81,6 @@ expression: snapshot
       "manifest_generation": 1,
       "visible_seq_no": 3
     },
-    "tenant_name": "default",
     "top_k": 1
   },
   "segment": {
@@ -127,8 +124,7 @@ expression: snapshot
         "segment_id": "[segment_id]"
       }
     },
-    "target": "segment:[segment_id]",
-    "tenant_name": "default"
+    "target": "segment:[segment_id]"
   },
   "wal": {
     "collection_name": "colors",
@@ -153,7 +149,6 @@ expression: snapshot
         }
       ]
     },
-    "target": "wal",
-    "tenant_name": "default"
+    "target": "wal"
   }
 }

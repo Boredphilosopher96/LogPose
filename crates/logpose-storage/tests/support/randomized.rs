@@ -3,9 +3,8 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    CollectionId, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME,
-    DeleteRecord, DistanceMetric, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation,
+    CollectionId, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
+    PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -139,7 +138,6 @@ impl ExpectedModel {
                 .collection_id
                 .clone()
                 .expect("collection id should be registered"),
-            tenant_name: DEFAULT_TENANT_NAME.to_owned(),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
             manifest_generation: self.manifest_generation,

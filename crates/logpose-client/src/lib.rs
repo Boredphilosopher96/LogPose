@@ -4,11 +4,14 @@ use logpose_api_grpc::proto::{
     self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
     CreateCollectionRequest as ProtoCreateCollectionRequest, FlushCollectionRequest,
     GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
-    GetMetadataRequest, GetRuntimeStatusRequest, InspectCollectionRequest, MaintenanceBacklogReply,
-    QueryCollectionRequest, ScalarValue, WriteCollectionRequest,
-    log_pose_service_client::LogPoseServiceClient,
+    GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataRequest, GetRuntimeStatusRequest,
+    InspectCollectionRequest, ListDatabasesRequest, MaintenanceBacklogReply,
+    PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest, ScalarValue,
+    WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
 };
-use logpose_catalog::CollectionDescriptor;
+use logpose_auth::{AuthenticationMode, DatabaseRole};
+pub use logpose_auth::{DatabaseAccessPolicy, DatabaseRoleBinding};
+pub use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 #[cfg(test)]
 use logpose_config as _;
 #[cfg(test)]
@@ -18,30 +21,41 @@ use logpose_query::{
     QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings,
     ScalarMetadataValue,
 };
-use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
+pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck, DistanceMetric,
-    LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
-    QueryUnitStats, RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
+    DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog, MaintenanceStatus,
+    NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId, RemoteBlobConfig,
+    ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use thiserror::Error;
 #[cfg(test)]
 use tokio as _;
-use tonic::{Request, transport::Channel};
+use tonic::{
+    Request,
+    codegen::InterceptedService,
+    metadata::{Ascii, MetadataValue},
+    service::Interceptor,
+    transport::{Channel, Endpoint},
+};
 
 /// Client connection settings shared across tools and SDKs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// gRPC endpoint URL.
     pub grpc_endpoint: String,
+    /// Optional bearer token attached to every gRPC request.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             grpc_endpoint: "http://127.0.0.1:50051".to_owned(),
+            auth_token: None,
         }
     }
 }
@@ -49,8 +63,6 @@ impl Default for ClientConfig {
 /// Namespace-aware response wrapper for operations whose payload omits collection identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScopedCollectionResponse<T> {
-    /// Tenant containing the collection.
-    pub tenant_name: String,
     /// Database containing the collection.
     pub database_name: String,
     /// Collection name inside the database.
@@ -64,11 +76,7 @@ impl<T> ScopedCollectionResponse<T> {
     /// Recover the collection reference attached to this response.
     #[must_use]
     pub fn collection(&self) -> CollectionRef {
-        CollectionRef::new(
-            self.tenant_name.clone(),
-            self.database_name.clone(),
-            self.collection_name.clone(),
-        )
+        CollectionRef::new(self.database_name.clone(), self.collection_name.clone())
     }
 }
 
@@ -95,27 +103,66 @@ pub enum ClientError {
     /// The server returned an invalid or incomplete payload.
     #[error("{0}")]
     InvalidResponse(String),
+    /// The caller supplied an invalid bearer token for client transport metadata.
+    #[error("{0}")]
+    InvalidAuthToken(String),
     /// The server returned malformed JSON payloads.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
+#[derive(Clone, Debug, Default)]
+struct AuthInterceptor {
+    authorization: Option<MetadataValue<Ascii>>,
+}
+
+impl AuthInterceptor {
+    fn new(auth_token: Option<&str>) -> Result<Self> {
+        let authorization = auth_token.map(bearer_metadata_value).transpose()?;
+        Ok(Self { authorization })
+    }
+}
+
+impl Interceptor for AuthInterceptor {
+    fn call(
+        &mut self,
+        mut request: Request<()>,
+    ) -> std::result::Result<Request<()>, tonic::Status> {
+        if let Some(value) = &self.authorization {
+            request
+                .metadata_mut()
+                .insert("authorization", value.clone());
+        }
+        Ok(request)
+    }
+}
+
 /// Thin gRPC client over the shared LogPose server contract.
 #[derive(Clone)]
 pub struct LogPoseClient {
-    inner: LogPoseServiceClient<Channel>,
+    inner: LogPoseServiceClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
 impl LogPoseClient {
     /// Connect to a LogPose gRPC endpoint.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
-        let inner = LogPoseServiceClient::connect(endpoint.into()).await?;
+        Self::connect_with_auth(endpoint, None).await
+    }
+
+    /// Connect to a LogPose gRPC endpoint with an optional bearer token.
+    pub async fn connect_with_auth(
+        endpoint: impl Into<String>,
+        auth_token: Option<&str>,
+    ) -> Result<Self> {
+        let channel = Endpoint::new(endpoint.into())?.connect().await?;
+        let inner =
+            LogPoseServiceClient::with_interceptor(channel, AuthInterceptor::new(auth_token)?);
         Ok(Self { inner })
     }
 
     /// Connect using a shared client configuration.
     pub async fn from_config(config: &ClientConfig) -> Result<Self> {
-        Self::connect(config.grpc_endpoint.clone()).await
+        Self::connect_with_auth(config.grpc_endpoint.clone(), config.auth_token.as_deref()).await
     }
 
     /// Fetch canonical node metadata from the server.
@@ -146,6 +193,47 @@ impl LogPoseClient {
         runtime_status_from_proto(response)
     }
 
+    /// Create or replace one database descriptor.
+    pub async fn set_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        let response = self
+            .inner
+            .clone()
+            .put_database(Request::new(PutDatabaseRequest {
+                descriptor: Some(database_descriptor_to_proto(descriptor)),
+            }))
+            .await?
+            .into_inner();
+        database_descriptor_from_proto(response)
+    }
+
+    /// Read one database descriptor.
+    pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        let response = self
+            .inner
+            .clone()
+            .get_database(Request::new(GetDatabaseRequest {
+                database_name: database_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        database_descriptor_from_proto(response)
+    }
+
+    /// List every database descriptor.
+    pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        let response = self
+            .inner
+            .clone()
+            .list_databases(Request::new(ListDatabasesRequest {}))
+            .await?
+            .into_inner();
+        response
+            .databases
+            .into_iter()
+            .map(database_descriptor_from_proto)
+            .collect()
+    }
+
     /// Create a collection through the shared service contract.
     pub async fn create_collection(
         &self,
@@ -158,7 +246,6 @@ impl LogPoseClient {
                 name: request.name,
                 dimensions: request.dimensions as u64,
                 metric: proto_metric(request.metric) as i32,
-                tenant_name: request.tenant_name,
                 database_name: request.database_name,
             }))
             .await?
@@ -168,16 +255,14 @@ impl LogPoseClient {
 
     /// Fetch placement metadata for one collection.
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
-        self.collection_placement_in_namespace(&tenant_name, &database_name, &collection_name)
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
+        self.collection_placement_in_database(&database_name, &collection_name)
             .await
     }
 
-    /// Fetch placement metadata for one collection in an explicit namespace.
-    pub async fn collection_placement_in_namespace(
+    /// Fetch placement metadata for one collection in an explicit database.
+    pub async fn collection_placement_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
     ) -> Result<CollectionPlacement> {
@@ -186,7 +271,6 @@ impl LogPoseClient {
             .clone()
             .get_collection_placement(Request::new(GetCollectionPlacementRequest {
                 collection_name: collection_name.to_owned(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
@@ -196,16 +280,14 @@ impl LogPoseClient {
 
     /// Fetch collection metadata by name.
     pub async fn get_collection(&self, collection_name: &str) -> Result<CollectionDescriptor> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
-        self.get_collection_in_namespace(&tenant_name, &database_name, &collection_name)
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
+        self.get_collection_in_database(&database_name, &collection_name)
             .await
     }
 
-    /// Fetch collection metadata by namespace-qualified identity.
-    pub async fn get_collection_in_namespace(
+    /// Fetch collection metadata by database-qualified identity.
+    pub async fn get_collection_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
     ) -> Result<CollectionDescriptor> {
@@ -214,12 +296,41 @@ impl LogPoseClient {
             .clone()
             .get_collection(Request::new(GetCollectionRequest {
                 collection_name: collection_name.to_owned(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         collection_descriptor_from_proto(response)
+    }
+
+    /// Create or replace one database access policy.
+    pub async fn set_database_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> Result<DatabaseAccessPolicy> {
+        let database_name = policy.database_name.clone();
+        let response = self
+            .inner
+            .clone()
+            .put_database_policy(Request::new(PutDatabasePolicyRequest {
+                policy: Some(database_policy_to_proto(policy)),
+            }))
+            .await?
+            .into_inner();
+        database_policy_from_proto(response, &database_name)
+    }
+
+    /// Read one database access policy.
+    pub async fn database_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
+        let response = self
+            .inner
+            .clone()
+            .get_database_policy(Request::new(GetDatabasePolicyRequest {
+                database_name: database_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        database_policy_from_proto(response, database_name)
     }
 
     /// Persist a write batch durably.
@@ -228,18 +339,16 @@ impl LogPoseClient {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
         Ok(self
-            .write_in_namespace(&tenant_name, &database_name, &collection_name, operations)
+            .write_in_database(&database_name, &collection_name, operations)
             .await?
             .response)
     }
 
-    /// Persist a write batch durably in an explicit namespace.
-    pub async fn write_in_namespace(
+    /// Persist a write batch durably in an explicit database.
+    pub async fn write_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
         operations: Vec<WriteOperation>,
@@ -253,16 +362,13 @@ impl LogPoseClient {
                     .into_iter()
                     .map(write_operation_to_proto)
                     .collect::<Vec<_>>(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         Ok(scoped_collection_response(
-            response.tenant_name,
             response.database_name,
             response.collection_name,
-            tenant_name,
             database_name,
             collection_name,
             CommitAck {
@@ -274,20 +380,19 @@ impl LogPoseClient {
 
     /// Execute an exact query through the shared service contract.
     pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse> {
-        let (tenant_name, database_name, collection_name) =
+        let (database_name, collection_name) =
             split_collection_lookup_key(&request.collection_name);
         let mut request = request;
         request.collection_name = collection_name;
         Ok(self
-            .query_in_namespace(&tenant_name, &database_name, request)
+            .query_in_database(&database_name, request)
             .await?
             .response)
     }
 
-    /// Execute an exact query through the shared service contract in an explicit namespace.
-    pub async fn query_in_namespace(
+    /// Execute an exact query through the shared service contract in an explicit database.
+    pub async fn query_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         request: QueryRequest,
     ) -> Result<ScopedCollectionResponse<QueryResponse>> {
@@ -307,17 +412,14 @@ impl LogPoseClient {
                     .collect::<Result<Vec<_>>>()?,
                 predicate: request.predicate.map(predicate_to_proto).transpose()?,
                 explain: explain_mode_to_proto(request.explain) as i32,
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
 
         Ok(scoped_collection_response(
-            response.tenant_name,
             response.database_name,
             response.collection_name,
-            tenant_name,
             database_name,
             &collection_name,
             QueryResponse {
@@ -342,16 +444,14 @@ impl LogPoseClient {
 
     /// Fetch collection-level statistics.
     pub async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
-        self.stats_in_namespace(&tenant_name, &database_name, &collection_name)
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
+        self.stats_in_database(&database_name, &collection_name)
             .await
     }
 
-    /// Fetch collection-level statistics in an explicit namespace.
-    pub async fn stats_in_namespace(
+    /// Fetch collection-level statistics in an explicit database.
+    pub async fn stats_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
     ) -> Result<CollectionStats> {
@@ -360,14 +460,12 @@ impl LogPoseClient {
             .clone()
             .get_collection_stats(Request::new(GetCollectionStatsRequest {
                 collection_name: collection_name.to_owned(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         Ok(CollectionStats {
             collection_id: parse_collection_id(&response.collection_id)?,
-            tenant_name: response.tenant_name,
             database_name: response.database_name,
             collection_name: response.collection_name,
             manifest_generation: response.manifest_generation,
@@ -391,18 +489,16 @@ impl LogPoseClient {
 
     /// Flush the mutable delta into a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
         Ok(self
-            .flush_in_namespace(&tenant_name, &database_name, &collection_name)
+            .flush_in_database(&database_name, &collection_name)
             .await?
             .response)
     }
 
-    /// Flush the mutable delta into a new segment in an explicit namespace.
-    pub async fn flush_in_namespace(
+    /// Flush the mutable delta into a new segment in an explicit database.
+    pub async fn flush_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
@@ -411,17 +507,14 @@ impl LogPoseClient {
             .clone()
             .flush_collection(Request::new(FlushCollectionRequest {
                 collection_name: collection_name.to_owned(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         let snapshot = snapshot_reply_from_proto(response.clone());
         Ok(scoped_collection_response(
-            response.tenant_name,
             response.database_name,
             response.collection_name,
-            tenant_name,
             database_name,
             collection_name,
             snapshot,
@@ -430,18 +523,16 @@ impl LogPoseClient {
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
         Ok(self
-            .compact_in_namespace(&tenant_name, &database_name, &collection_name)
+            .compact_in_database(&database_name, &collection_name)
             .await?
             .response)
     }
 
-    /// Compact immutable segments in an explicit namespace.
-    pub async fn compact_in_namespace(
+    /// Compact immutable segments in an explicit database.
+    pub async fn compact_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
@@ -450,17 +541,14 @@ impl LogPoseClient {
             .clone()
             .compact_collection(Request::new(CompactCollectionRequest {
                 collection_name: collection_name.to_owned(),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         let snapshot = snapshot_reply_from_proto(response.clone());
         Ok(scoped_collection_response(
-            response.tenant_name,
             response.database_name,
             response.collection_name,
-            tenant_name,
             database_name,
             collection_name,
             snapshot,
@@ -473,18 +561,16 @@ impl LogPoseClient {
         collection_name: &str,
         target: InspectTarget,
     ) -> Result<InspectReport> {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key(collection_name);
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
         Ok(self
-            .inspect_in_namespace(&tenant_name, &database_name, &collection_name, target)
+            .inspect_in_database(&database_name, &collection_name, target)
             .await?
             .response)
     }
 
-    /// Inspect operator-visible storage state in an explicit namespace.
-    pub async fn inspect_in_namespace(
+    /// Inspect operator-visible storage state in an explicit database.
+    pub async fn inspect_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         collection_name: &str,
         target: InspectTarget,
@@ -496,16 +582,13 @@ impl LogPoseClient {
                 collection_name: collection_name.to_owned(),
                 target: inspect_target_to_proto(&target) as i32,
                 segment_id: inspect_segment_id(&target),
-                tenant_name: tenant_name.to_owned(),
                 database_name: database_name.to_owned(),
             }))
             .await?
             .into_inner();
         Ok(scoped_collection_response(
-            response.tenant_name,
             response.database_name,
             response.collection_name,
-            tenant_name,
             database_name,
             collection_name,
             InspectReport {
@@ -516,12 +599,43 @@ impl LogPoseClient {
     }
 }
 
+fn bearer_metadata_value(token: &str) -> Result<MetadataValue<Ascii>> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ClientError::InvalidAuthToken(
+            "client auth token must not be empty".to_owned(),
+        ));
+    }
+    MetadataValue::try_from(format!("Bearer {token}")).map_err(|error| {
+        ClientError::InvalidAuthToken(format!(
+            "client auth token could not be encoded as authorization metadata: {error}"
+        ))
+    })
+}
+
+fn database_descriptor_to_proto(descriptor: DatabaseDescriptor) -> proto::DatabaseDescriptorReply {
+    proto::DatabaseDescriptorReply {
+        database_id: descriptor.database_id.to_string(),
+        name: descriptor.name,
+        is_default: descriptor.is_default,
+    }
+}
+
+fn database_descriptor_from_proto(
+    reply: proto::DatabaseDescriptorReply,
+) -> Result<DatabaseDescriptor> {
+    Ok(DatabaseDescriptor {
+        database_id: reply.database_id.parse()?,
+        name: reply.name,
+        is_default: reply.is_default,
+    })
+}
+
 fn collection_descriptor_from_proto(
     reply: CollectionDescriptorReply,
 ) -> Result<CollectionDescriptor> {
     Ok(CollectionDescriptor {
         collection_id: parse_collection_id(&reply.collection_id)?,
-        tenant_name: reply.tenant_name,
         database_name: reply.database_name,
         name: reply.name,
         dimensions: reply.dimensions as usize,
@@ -535,6 +649,62 @@ fn collection_descriptor_from_proto(
         flush_threshold_ops: reply.flush_threshold_ops as usize,
         flush_threshold_bytes: reply.flush_threshold_bytes as usize,
         compaction_threshold_segments: reply.compaction_threshold_segments as usize,
+    })
+}
+
+fn database_policy_to_proto(policy: DatabaseAccessPolicy) -> proto::DatabaseAccessPolicyReply {
+    proto::DatabaseAccessPolicyReply {
+        database_name: policy.database_name,
+        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
+        role_bindings: policy
+            .role_bindings
+            .into_iter()
+            .map(database_role_binding_to_proto)
+            .collect(),
+    }
+}
+
+fn database_policy_from_proto(
+    reply: proto::DatabaseAccessPolicyReply,
+    fallback_database: &str,
+) -> Result<DatabaseAccessPolicy> {
+    let database_name = if reply.database_name.trim().is_empty() {
+        fallback_database.to_owned()
+    } else {
+        reply.database_name
+    };
+
+    Ok(DatabaseAccessPolicy {
+        database_name: database_name.clone(),
+        authentication_mode: authentication_mode_from_proto(reply.authentication_mode)?,
+        role_bindings: reply
+            .role_bindings
+            .into_iter()
+            .map(|binding| database_role_binding_from_proto(binding, &database_name))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn database_role_binding_to_proto(binding: DatabaseRoleBinding) -> proto::DatabaseRoleBindingReply {
+    proto::DatabaseRoleBindingReply {
+        database_name: binding.database_name,
+        principal_name: binding.principal_name,
+        role: database_role_to_proto(binding.role) as i32,
+    }
+}
+
+fn database_role_binding_from_proto(
+    binding: proto::DatabaseRoleBindingReply,
+    fallback_database: &str,
+) -> Result<DatabaseRoleBinding> {
+    Ok(DatabaseRoleBinding {
+        database_name: if binding.database_name.trim().is_empty() {
+            fallback_database.to_owned()
+        } else {
+            binding.database_name
+        },
+        principal_name: binding.principal_name,
+        role: database_role_from_proto(binding.role)?,
     })
 }
 
@@ -572,7 +742,6 @@ fn runtime_status_from_proto(reply: proto::GetRuntimeStatusReply) -> Result<Node
 fn collection_placement_from_proto(reply: CollectionPlacementReply) -> Result<CollectionPlacement> {
     Ok(CollectionPlacement {
         collection_id: parse_collection_id(&reply.collection_id)?,
-        tenant_name: reply.tenant_name,
         database_name: reply.database_name,
         collection_name: reply.collection_name,
         assigned_node: reply.assigned_node,
@@ -588,30 +757,23 @@ fn parse_collection_id(value: &str) -> Result<CollectionId> {
     })
 }
 
-fn split_collection_lookup_key(value: &str) -> (String, String, String) {
-    let reference = CollectionRef::from_lookup_key(value);
-    (
-        reference.tenant_name,
-        reference.database_name,
-        reference.collection_name,
-    )
+fn split_collection_lookup_key(value: &str) -> (String, String) {
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+        (parts[0].to_owned(), parts[1].to_owned())
+    } else {
+        (DEFAULT_DATABASE_NAME.to_owned(), value.to_owned())
+    }
 }
 
 fn scoped_collection_response<T>(
-    tenant_name: String,
     database_name: String,
     collection_name: String,
-    fallback_tenant: &str,
     fallback_database: &str,
     fallback_collection: &str,
     response: T,
 ) -> ScopedCollectionResponse<T> {
     ScopedCollectionResponse {
-        tenant_name: if tenant_name.trim().is_empty() {
-            fallback_tenant.to_owned()
-        } else {
-            tenant_name
-        },
         database_name: if database_name.trim().is_empty() {
             fallback_database.to_owned()
         } else {
@@ -636,6 +798,50 @@ fn node_role_from_proto(role: i32) -> Result<NodeRole> {
         proto::NodeRole::Combined => Ok(NodeRole::Combined),
         proto::NodeRole::Control => Ok(NodeRole::Control),
         proto::NodeRole::Data => Ok(NodeRole::Data),
+    }
+}
+
+fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode> {
+    match proto::AuthenticationMode::try_from(mode).map_err(|_| {
+        ClientError::InvalidResponse(format!("unknown authentication mode '{mode}'"))
+    })? {
+        proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
+        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
+        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
+        proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
+        proto::AuthenticationMode::Unspecified => Err(ClientError::InvalidResponse(
+            "authentication mode must be set".to_owned(),
+        )),
+    }
+}
+
+fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
+    match mode {
+        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
+        AuthenticationMode::Password => proto::AuthenticationMode::Password,
+        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
+        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
+    }
+}
+
+fn database_role_from_proto(role: i32) -> Result<DatabaseRole> {
+    match proto::DatabaseRole::try_from(role)
+        .map_err(|_| ClientError::InvalidResponse(format!("unknown database role '{role}'")))?
+    {
+        proto::DatabaseRole::Owner => Ok(DatabaseRole::Owner),
+        proto::DatabaseRole::ReadWrite => Ok(DatabaseRole::ReadWrite),
+        proto::DatabaseRole::ReadOnly => Ok(DatabaseRole::ReadOnly),
+        proto::DatabaseRole::Unspecified => Err(ClientError::InvalidResponse(
+            "database role must be set".to_owned(),
+        )),
+    }
+}
+
+fn database_role_to_proto(role: DatabaseRole) -> proto::DatabaseRole {
+    match role {
+        DatabaseRole::Owner => proto::DatabaseRole::Owner,
+        DatabaseRole::ReadWrite => proto::DatabaseRole::ReadWrite,
+        DatabaseRole::ReadOnly => proto::DatabaseRole::ReadOnly,
     }
 }
 
@@ -966,22 +1172,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn split_collection_lookup_key_parses_explicit_namespace() {
-        let (tenant_name, database_name, collection_name) =
-            split_collection_lookup_key("acme/analytics/documents");
+    fn split_collection_lookup_key_parses_explicit_database_scope() {
+        let (database_name, collection_name) = split_collection_lookup_key("analytics/documents");
 
-        assert_eq!(tenant_name, "acme");
         assert_eq!(database_name, "analytics");
         assert_eq!(collection_name, "documents");
     }
 
     #[test]
-    fn scoped_collection_response_falls_back_to_requested_namespace() {
+    fn scoped_collection_response_falls_back_to_requested_database_scope() {
         let response = scoped_collection_response(
             String::new(),
             String::new(),
-            String::new(),
-            "acme",
             "analytics",
             "documents",
             CommitAck {
@@ -990,7 +1192,6 @@ mod tests {
             },
         );
 
-        assert_eq!(response.tenant_name, "acme");
         assert_eq!(response.database_name, "analytics");
         assert_eq!(response.collection_name, "documents");
         assert_eq!(response.last_seq_no, 7);
@@ -999,10 +1200,8 @@ mod tests {
     #[test]
     fn scoped_collection_response_serializes_flattened_payload() {
         let response = scoped_collection_response(
-            "acme".to_owned(),
             "analytics".to_owned(),
             "documents".to_owned(),
-            "acme",
             "analytics",
             "documents",
             CommitAck {
@@ -1012,7 +1211,6 @@ mod tests {
         );
 
         let json = serde_json::to_value(response).expect("response should serialize");
-        assert_eq!(json["tenant_name"], "acme");
         assert_eq!(json["database_name"], "analytics");
         assert_eq!(json["collection_name"], "documents");
         assert_eq!(json["last_seq_no"], 7);

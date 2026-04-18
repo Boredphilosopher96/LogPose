@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 logpose-api-grpc = { path = "../logpose-api-grpc" }
+logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-query = { path = "../logpose-query" }
 logpose-storage = { path = "../logpose-storage" }

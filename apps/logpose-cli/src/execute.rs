@@ -1,22 +1,26 @@
 use crate::{
-    action::{Action, CLI_PUT_BATCH_BYTES, query_request_from_action, read_jsonl_put_batches},
+    action::{
+        Action, CLI_PUT_BATCH_BYTES, database_descriptor, query_request_from_action,
+        read_database_policy_input, read_jsonl_put_batches,
+    },
     feedback::{ProgressHandle, Reporter},
     render::ActionOutput,
 };
 use anyhow::Context;
-use logpose_client::LogPoseClient;
+use logpose_client::{ClientConfig, LogPoseClient};
 use logpose_config::LogPoseConfig;
 use logpose_types::{DeleteRecord, RecordId, WriteOperation};
 
 pub async fn execute_action<R: Reporter>(
     config: &LogPoseConfig,
+    auth_token: Option<&str>,
     action: &Action,
     reporter: &R,
 ) -> anyhow::Result<ActionOutput> {
     match action {
         Action::Status => {
             let progress = ProgressHandle::start(reporter.clone(), "Fetching runtime status...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let status = client
                 .runtime_status()
                 .await
@@ -30,9 +34,61 @@ pub async fn execute_action<R: Reporter>(
             ));
             Ok(ActionOutput::Config(config.clone()))
         }
+        Action::DatabaseList => {
+            let progress = ProgressHandle::start(reporter.clone(), "Listing databases...");
+            let client = connect_client(config, auth_token).await?;
+            let databases = client
+                .databases()
+                .await
+                .context("failed to list databases")?;
+            progress.finish_success("Database list ready");
+            Ok(ActionOutput::DatabasesListed(databases))
+        }
+        Action::DatabaseShow { database_name } => {
+            let progress = ProgressHandle::start(reporter.clone(), "Fetching database...");
+            let client = connect_client(config, auth_token).await?;
+            let database = client
+                .database(database_name)
+                .await
+                .context("failed to fetch database")?;
+            progress.finish_success("Database ready");
+            Ok(ActionOutput::DatabaseShown(database))
+        }
+        Action::DatabasePut(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Updating database...");
+            let client = connect_client(config, auth_token).await?;
+            let database = client
+                .set_database(database_descriptor(&action.database_name))
+                .await
+                .context("failed to update database")?;
+            progress.finish_success("Database updated");
+            Ok(ActionOutput::DatabaseUpdated(database))
+        }
+        Action::DatabasePolicyShow { database_name } => {
+            let progress = ProgressHandle::start(reporter.clone(), "Fetching database policy...");
+            let client = connect_client(config, auth_token).await?;
+            let policy = client
+                .database_policy(database_name)
+                .await
+                .context("failed to fetch database policy")?;
+            progress.finish_success("Database policy ready");
+            Ok(ActionOutput::DatabasePolicyShown(policy))
+        }
+        Action::DatabasePolicySet(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Reading database policy...");
+            let policy = read_database_policy_input(&action.input, &action.database_name)?;
+            progress.set_message("Updating database policy...");
+            let client = connect_client(config, auth_token).await?;
+            let policy = client
+                .set_database_policy(policy)
+                .await
+                .context("failed to update database policy")?;
+            progress.finish_success("Database policy updated");
+            Ok(ActionOutput::DatabasePolicyUpdated(policy))
+        }
         Action::CollectionCreate(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Creating collection...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let descriptor = client
                 .create_collection(action.request())
                 .await
@@ -43,13 +99,9 @@ pub async fn execute_action<R: Reporter>(
         Action::CollectionShow(collection) => {
             let progress =
                 ProgressHandle::start(reporter.clone(), "Fetching collection metadata...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let descriptor = client
-                .get_collection_in_namespace(
-                    &collection.tenant_name,
-                    &collection.database_name,
-                    &collection.collection_name,
-                )
+                .get_collection_in_database(&collection.database_name, &collection.collection_name)
                 .await
                 .context("failed to fetch collection")?;
             progress.finish_success("Collection metadata ready");
@@ -57,13 +109,9 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::CollectionStats(collection) => {
             let progress = ProgressHandle::start(reporter.clone(), "Fetching collection stats...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let stats = client
-                .stats_in_namespace(
-                    &collection.tenant_name,
-                    &collection.database_name,
-                    &collection.collection_name,
-                )
+                .stats_in_database(&collection.database_name, &collection.collection_name)
                 .await
                 .context("failed to read collection stats")?;
             progress.finish_success("Collection stats ready");
@@ -72,10 +120,9 @@ pub async fn execute_action<R: Reporter>(
         Action::CollectionPlacement(collection) => {
             let progress =
                 ProgressHandle::start(reporter.clone(), "Fetching collection placement...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let placement = client
-                .collection_placement_in_namespace(
-                    &collection.tenant_name,
+                .collection_placement_in_database(
                     &collection.database_name,
                     &collection.collection_name,
                 )
@@ -86,13 +133,9 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::CollectionFlush(collection) => {
             let progress = ProgressHandle::start(reporter.clone(), "Flushing collection...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let snapshot = client
-                .flush_in_namespace(
-                    &collection.tenant_name,
-                    &collection.database_name,
-                    &collection.collection_name,
-                )
+                .flush_in_database(&collection.database_name, &collection.collection_name)
                 .await
                 .context("failed to flush collection")?;
             progress.finish_success("Flush completed");
@@ -100,13 +143,9 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::CollectionCompact(collection) => {
             let progress = ProgressHandle::start(reporter.clone(), "Compacting collection...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let snapshot = client
-                .compact_in_namespace(
-                    &collection.tenant_name,
-                    &collection.database_name,
-                    &collection.collection_name,
-                )
+                .compact_in_database(&collection.database_name, &collection.collection_name)
                 .await
                 .context("failed to compact collection")?;
             progress.finish_success("Compaction completed");
@@ -116,13 +155,12 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Reading JSONL input...");
             let batches = read_jsonl_put_batches(&action.input, CLI_PUT_BATCH_BYTES)?;
             progress.set_message("Writing records...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let mut last_seq_no = 0;
             let mut applied_ops = 0;
             for operations in batches {
                 let ack = client
-                    .write_in_namespace(
-                        &action.collection.tenant_name,
+                    .write_in_database(
                         &action.collection.database_name,
                         &action.collection.collection_name,
                         operations,
@@ -135,7 +173,6 @@ pub async fn execute_action<R: Reporter>(
             progress.finish_success("Write completed");
             Ok(ActionOutput::RecordsWritten(
                 logpose_client::ScopedCollectionResponse {
-                    tenant_name: action.collection.tenant_name.clone(),
                     database_name: action.collection.database_name.clone(),
                     collection_name: action.collection.collection_name.clone(),
                     response: logpose_types::CommitAck {
@@ -147,10 +184,9 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::RecordDelete(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Deleting record...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let ack = client
-                .write_in_namespace(
-                    &action.collection.tenant_name,
+                .write_in_database(
                     &action.collection.database_name,
                     &action.collection.collection_name,
                     vec![WriteOperation::Delete(DeleteRecord {
@@ -165,13 +201,9 @@ pub async fn execute_action<R: Reporter>(
         Action::Query(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Running query...");
             let request = query_request_from_action(action)?;
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let response = client
-                .query_in_namespace(
-                    &action.collection.tenant_name,
-                    &action.collection.database_name,
-                    request,
-                )
+                .query_in_database(&action.collection.database_name, request)
                 .await
                 .context("failed to query collection")?;
             progress.finish_success("Query completed");
@@ -180,10 +212,9 @@ pub async fn execute_action<R: Reporter>(
         Action::Inspect { collection, target } => {
             let progress =
                 ProgressHandle::start(reporter.clone(), "Inspecting collection storage...");
-            let client = connect_client(config).await?;
+            let client = connect_client(config, auth_token).await?;
             let report = client
-                .inspect_in_namespace(
-                    &collection.tenant_name,
+                .inspect_in_database(
                     &collection.database_name,
                     &collection.collection_name,
                     target.clone(),
@@ -196,11 +227,17 @@ pub async fn execute_action<R: Reporter>(
     }
 }
 
-pub async fn connect_client(config: &LogPoseConfig) -> anyhow::Result<LogPoseClient> {
+pub async fn connect_client(
+    config: &LogPoseConfig,
+    auth_token: Option<&str>,
+) -> anyhow::Result<LogPoseClient> {
     let endpoint = grpc_dial_endpoint(config);
-    LogPoseClient::connect(endpoint.clone())
-        .await
-        .with_context(|| format!("failed to connect to {endpoint}"))
+    LogPoseClient::from_config(&ClientConfig {
+        grpc_endpoint: endpoint.clone(),
+        auth_token: auth_token.map(str::to_owned),
+    })
+    .await
+    .with_context(|| format!("failed to connect to {endpoint}"))
 }
 
 #[cfg(test)]
@@ -251,6 +288,7 @@ mod tests {
             rest_port: 18080,
             grpc_host: "::1".to_owned(),
             grpc_port: 15051,
+            auth: Default::default(),
             ..LogPoseConfig::default()
         };
 
@@ -265,6 +303,7 @@ mod tests {
             rest_port: 18080,
             grpc_host: "::".to_owned(),
             grpc_port: 15051,
+            auth: Default::default(),
             ..LogPoseConfig::default()
         };
 

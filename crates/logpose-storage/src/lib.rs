@@ -7,7 +7,8 @@ use rand as _;
 
 use async_trait::async_trait;
 use crc32fast::hash;
-use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor, TenantDescriptor};
+use logpose_auth::{DatabaseAccessPolicy, Principal};
+use logpose_catalog::{CatalogStore, CollectionDescriptor, DatabaseDescriptor};
 use logpose_index::{
     FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
     HnswIndexSidecar, build_flat_index, build_hnsw_index, read_flat_index, read_hnsw_index,
@@ -15,9 +16,9 @@ use logpose_index::{
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DistanceMetric,
-    LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
-    RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError,
+    MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId,
+    Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
 use serde::{Deserialize, Serialize};
@@ -263,8 +264,6 @@ pub trait StorageEngine: Send + Sync {
 /// Request payload for creating a collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateCollectionRequest {
-    /// Tenant containing the collection. Blank values default to `default`.
-    pub tenant_name: String,
     /// Database containing the collection. Blank values default to `default`.
     pub database_name: String,
     /// Human-readable collection name.
@@ -276,29 +275,21 @@ pub struct CreateCollectionRequest {
 }
 
 impl CreateCollectionRequest {
-    /// Create a collection request in the default tenant/database namespace.
+    /// Create a collection request in the default database namespace.
     #[must_use]
     pub fn new(name: impl Into<String>, dimensions: usize, metric: DistanceMetric) -> Self {
-        Self::in_namespace(
-            DEFAULT_TENANT_NAME,
-            DEFAULT_DATABASE_NAME,
-            name,
-            dimensions,
-            metric,
-        )
+        Self::in_database(DEFAULT_DATABASE_NAME, name, dimensions, metric)
     }
 
-    /// Create a collection request in an explicit tenant/database namespace.
+    /// Create a collection request in an explicit database namespace.
     #[must_use]
-    pub fn in_namespace(
-        tenant_name: impl Into<String>,
+    pub fn in_database(
         database_name: impl Into<String>,
         name: impl Into<String>,
         dimensions: usize,
         metric: DistanceMetric,
     ) -> Self {
         Self {
-            tenant_name: tenant_name.into(),
             database_name: database_name.into(),
             name: name.into(),
             dimensions,
@@ -306,32 +297,26 @@ impl CreateCollectionRequest {
         }
     }
 
-    /// Return the canonical tenant/database/collection reference for this request.
+    /// Return the canonical database/collection reference for this request.
     #[must_use]
     pub fn collection_ref(&self) -> CollectionRef {
         let request = self.clone().with_defaults();
-        CollectionRef::new(request.tenant_name, request.database_name, request.name)
+        CollectionRef::new(request.database_name, request.name)
     }
 
-    /// Return the canonical tenant/database/collection lookup key for this request.
+    /// Return the canonical database/collection lookup key for this request.
     #[must_use]
     pub fn lookup_name(&self) -> String {
         self.collection_ref().lookup_name()
     }
 
     fn with_defaults(self) -> Self {
-        let tenant_name = if self.tenant_name.trim().is_empty() {
-            DEFAULT_TENANT_NAME.to_owned()
-        } else {
-            self.tenant_name
-        };
         let database_name = if self.database_name.trim().is_empty() {
             DEFAULT_DATABASE_NAME.to_owned()
         } else {
             self.database_name
         };
         Self {
-            tenant_name,
             database_name,
             name: self.name,
             dimensions: self.dimensions,
@@ -399,23 +384,29 @@ impl LocalStorageEngine {
         self.root.join("collections")
     }
 
-    fn tenants_root(&self) -> PathBuf {
-        self.root.join("tenants")
+    fn databases_root(&self) -> PathBuf {
+        self.root.join("databases")
     }
 
-    fn tenant_descriptor_path(&self, tenant_name: &str) -> PathBuf {
-        self.tenants_root()
-            .join(tenant_name)
+    fn database_descriptor_path(&self, database_name: &str) -> PathBuf {
+        self.databases_root()
+            .join(database_name)
             .join("descriptor.json")
     }
 
-    fn databases_root(&self, tenant_name: &str) -> PathBuf {
-        self.tenants_root().join(tenant_name).join("databases")
+    fn database_policy_path(&self, database_name: &str) -> PathBuf {
+        self.databases_root()
+            .join(database_name)
+            .join("policy.json")
     }
 
-    fn database_descriptor_path(&self, tenant_name: &str, database_name: &str) -> PathBuf {
-        self.databases_root(tenant_name)
-            .join(database_name)
+    fn principals_root(&self) -> PathBuf {
+        self.root.join("principals")
+    }
+
+    fn principal_descriptor_path(&self, principal_name: &str) -> PathBuf {
+        self.principals_root()
+            .join(principal_name)
             .join("descriptor.json")
     }
 
@@ -477,20 +468,15 @@ impl LocalStorageEngine {
         request: &CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
         let request = request.clone().with_defaults();
-        let collection = CollectionRef::new(
-            request.tenant_name.clone(),
-            request.database_name.clone(),
-            request.name.clone(),
-        );
+        let collection = CollectionRef::new(request.database_name.clone(), request.name.clone());
         if self.find_collection_descriptor_ref(&collection).is_ok() {
             return Err(LogPoseError::Message(format!(
-                "collection '{}/{}/{}' already exists",
-                collection.tenant_name, collection.database_name, collection.collection_name
+                "collection '{}/{}' already exists",
+                collection.database_name, collection.collection_name
             )));
         }
 
-        let descriptor = CollectionDescriptor::new_in_namespace(
-            request.tenant_name,
+        let descriptor = CollectionDescriptor::new_in_database(
             request.database_name,
             request.name,
             request.dimensions,
@@ -514,15 +500,14 @@ impl LocalStorageEngine {
             .is_ok()
         {
             return Err(LogPoseError::Message(format!(
-                "collection '{}/{}/{}' already exists",
-                descriptor.tenant_name, descriptor.database_name, descriptor.name
+                "collection '{}/{}' already exists",
+                descriptor.database_name, descriptor.name
             )));
         }
 
         descriptor.validate()?;
         let result = (|| -> Result<()> {
-            self.ensure_tenant_descriptor(&descriptor.tenant_name)?;
-            self.ensure_database_descriptor(&descriptor.tenant_name, &descriptor.database_name)?;
+            self.ensure_database_descriptor(&descriptor.database_name)?;
             self.create_collection_directories(&descriptor)?;
             if let Some(assignment) = assignment {
                 self.persist_collection_assignment(&descriptor, assignment)?;
@@ -580,62 +565,24 @@ impl LocalStorageEngine {
         self.create_collection_from_descriptor(descriptor, assignment)
     }
 
-    fn ensure_tenant_descriptor(&self, tenant_name: &str) -> Result<()> {
-        if tenant_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
-                "tenant name must not be empty".to_owned(),
-            ));
-        }
-        let path = self.tenant_descriptor_path(tenant_name);
-        if path.exists() {
-            let descriptor = read_json::<TenantDescriptor>(&path)?;
-            descriptor.validate()?;
-            return Ok(());
-        }
-
-        let descriptor = TenantDescriptor::new(tenant_name);
-        descriptor.validate()?;
-        let parent = path.parent().ok_or_else(|| {
-            LogPoseError::Message(format!(
-                "tenant descriptor path for '{tenant_name}' is missing a parent directory"
-            ))
-        })?;
-        fs::create_dir_all(parent)
-            .map_err(|error| io_message("failed to create tenants root", error))?;
-        atomic_write(
-            &path,
-            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-        )?;
-        Ok(())
-    }
-
-    fn ensure_database_descriptor(&self, tenant_name: &str, database_name: &str) -> Result<()> {
-        if tenant_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
-                "tenant name must not be empty".to_owned(),
-            ));
-        }
+    fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
         if database_name.trim().is_empty() {
             return Err(LogPoseError::Message(
                 "database name must not be empty".to_owned(),
             ));
         }
-        let path = self.database_descriptor_path(tenant_name, database_name);
+        let path = self.database_descriptor_path(database_name);
         if path.exists() {
             let descriptor = read_json::<DatabaseDescriptor>(&path)?;
             descriptor.validate()?;
             return Ok(());
         }
 
-        let descriptor = if database_name == DEFAULT_DATABASE_NAME {
-            DatabaseDescriptor::new_in_tenant(tenant_name, DEFAULT_DATABASE_NAME)
-        } else {
-            DatabaseDescriptor::new_in_tenant(tenant_name, database_name)
-        };
+        let descriptor = DatabaseDescriptor::new(database_name);
         descriptor.validate()?;
         let parent = path.parent().ok_or_else(|| {
             LogPoseError::Message(format!(
-                "database descriptor path for '{tenant_name}/{database_name}' is missing a parent directory"
+                "database descriptor path for '{database_name}' is missing a parent directory"
             ))
         })?;
         fs::create_dir_all(parent)
@@ -647,14 +594,13 @@ impl LocalStorageEngine {
         Ok(())
     }
 
-    /// Open a collection descriptor using an explicit tenant/database namespace.
-    pub async fn open_collection_in_namespace(
+    /// Open a collection descriptor using an explicit database namespace.
+    pub async fn open_collection_in_database(
         &self,
-        tenant_name: &str,
         database_name: &str,
         name: &str,
     ) -> Result<CollectionDescriptor> {
-        self.find_collection_descriptor_ref(&CollectionRef::new(tenant_name, database_name, name))
+        self.find_collection_descriptor_ref(&CollectionRef::new(database_name, name))
     }
 
     fn load_collection_state(
@@ -830,8 +776,8 @@ impl LocalStorageEngine {
         let collections_root = self.collections_root();
         if !collections_root.exists() {
             return Err(LogPoseError::Message(format!(
-                "collection '{}/{}/{}' does not exist",
-                collection.tenant_name, collection.database_name, collection.collection_name
+                "collection '{}/{}' does not exist",
+                collection.database_name, collection.collection_name
             )));
         }
 
@@ -846,8 +792,7 @@ impl LocalStorageEngine {
             }
 
             let descriptor = read_json::<CollectionDescriptor>(&path)?;
-            if descriptor.tenant_name == collection.tenant_name
-                && descriptor.database_name == collection.database_name
+            if descriptor.database_name == collection.database_name
                 && descriptor.name == collection.collection_name
             {
                 descriptor.validate()?;
@@ -856,8 +801,8 @@ impl LocalStorageEngine {
         }
 
         Err(LogPoseError::Message(format!(
-            "collection '{}/{}/{}' does not exist",
-            collection.tenant_name, collection.database_name, collection.collection_name
+            "collection '{}/{}' does not exist",
+            collection.database_name, collection.collection_name
         )))
     }
 
@@ -884,17 +829,18 @@ impl LocalStorageEngine {
         }
 
         descriptors.sort_by(|left, right| {
-            (&left.tenant_name, &left.database_name, &left.name).cmp(&(
-                &right.tenant_name,
-                &right.database_name,
-                &right.name,
-            ))
+            (&left.database_name, &left.name).cmp(&(&right.database_name, &right.name))
         });
         Ok(descriptors)
     }
 
     fn collection_ref_from_lookup(name: &str) -> CollectionRef {
-        CollectionRef::from_lookup_key(name)
+        let parts = name.split('/').collect::<Vec<_>>();
+        if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+            CollectionRef::new(parts[0], parts[1])
+        } else {
+            CollectionRef::new_default(name)
+        }
     }
 
     fn collection_stats_from_state(
@@ -925,7 +871,6 @@ impl LocalStorageEngine {
 
         Ok(CollectionStats {
             collection_id: state.descriptor.collection_id.clone(),
-            tenant_name: state.descriptor.tenant_name.clone(),
             database_name: state.descriptor.database_name.clone(),
             collection_name: state.descriptor.name.clone(),
             manifest_generation: effective_snapshot.manifest_generation,
@@ -937,6 +882,59 @@ impl LocalStorageEngine {
             maintenance,
             query_units,
         })
+    }
+
+    fn list_database_descriptors(&self) -> Result<Vec<DatabaseDescriptor>> {
+        let databases_root = self.databases_root();
+        if !databases_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut descriptors = Vec::new();
+        for entry in fs::read_dir(&databases_root)
+            .map_err(|error| io_message("failed to list databases root", error))?
+        {
+            let entry =
+                entry.map_err(|error| io_message("failed to read database entry", error))?;
+            let path = entry.path().join("descriptor.json");
+            if !path.exists() {
+                continue;
+            }
+
+            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+            descriptor.validate()?;
+            descriptors.push(descriptor);
+        }
+
+        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(descriptors)
+    }
+
+    fn list_principal_descriptors(&self) -> Result<Vec<Principal>> {
+        let principals_root = self.principals_root();
+        if !principals_root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut principals = Vec::new();
+        for entry in fs::read_dir(&principals_root)
+            .map_err(|error| io_message("failed to list principals root", error))?
+        {
+            let entry =
+                entry.map_err(|error| io_message("failed to read principal entry", error))?;
+            let path = entry.path().join("descriptor.json");
+            if !path.exists() {
+                continue;
+            }
+
+            let principal = read_json::<Principal>(&path)?;
+            validate_principal_name(&principal.name)?;
+            principal.validate().map_err(string_message)?;
+            principals.push(principal);
+        }
+
+        principals.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(principals)
     }
 
     fn load_manifest(
@@ -1621,6 +1619,95 @@ fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_message(context, error)),
+    }
+}
+
+impl CatalogStore for LocalStorageEngine {
+    fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        descriptor.validate()?;
+        atomic_write(
+            &self.database_descriptor_path(&descriptor.name),
+            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
+        )?;
+        Ok(descriptor)
+    }
+
+    fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        validate_namespace_segment("database name", database_name)?;
+        let path = self.database_descriptor_path(database_name);
+        if database_name == DEFAULT_DATABASE_NAME && !path.exists() {
+            self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
+        }
+        if !path.exists() {
+            return Err(LogPoseError::Message(format!(
+                "database '{database_name}' does not exist"
+            )));
+        }
+
+        let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
+        self.list_database_descriptors()
+    }
+
+    fn put_principal(&self, principal: Principal) -> Result<Principal> {
+        validate_principal_name(&principal.name)?;
+        principal.validate().map_err(string_message)?;
+        atomic_write(
+            &self.principal_descriptor_path(&principal.name),
+            serde_json::to_vec_pretty(&principal).map_err(json_message)?,
+        )?;
+        Ok(principal)
+    }
+
+    fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+        validate_principal_name(principal_name)?;
+        let path = self.principal_descriptor_path(principal_name);
+        if !path.exists() {
+            return Err(LogPoseError::Message(format!(
+                "principal '{principal_name}' does not exist"
+            )));
+        }
+
+        let principal = read_json::<Principal>(&path)?;
+        validate_principal_name(&principal.name)?;
+        principal.validate().map_err(string_message)?;
+        Ok(principal)
+    }
+
+    fn list_principals(&self) -> Result<Vec<Principal>> {
+        self.list_principal_descriptors()
+    }
+
+    fn put_database_access_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> Result<DatabaseAccessPolicy> {
+        policy.validate().map_err(string_message)?;
+        self.ensure_database_descriptor(&policy.database_name)?;
+        atomic_write(
+            &self.database_policy_path(&policy.database_name),
+            serde_json::to_vec_pretty(&policy).map_err(json_message)?,
+        )?;
+        Ok(policy)
+    }
+
+    fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
+        validate_namespace_segment("database name", database_name)?;
+        let path = self.database_policy_path(database_name);
+        if !path.exists() {
+            return Err(LogPoseError::Message(format!(
+                "database access policy '{database_name}' does not exist"
+            )));
+        }
+
+        let policy = read_json::<DatabaseAccessPolicy>(&path)?;
+        policy.validate().map_err(string_message)?;
+        Ok(policy)
     }
 }
 
@@ -2800,8 +2887,38 @@ fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
     LogPoseError::Message(format!("{context}: {error}"))
 }
 
+fn string_message(error: String) -> LogPoseError {
+    LogPoseError::Message(error)
+}
+
 fn json_message(error: serde_json::Error) -> LogPoseError {
     LogPoseError::Message(format!("failed to serialize or deserialize JSON: {error}"))
+}
+
+fn validate_principal_name(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(LogPoseError::Message(
+            "principal name must not be empty".to_owned(),
+        ));
+    }
+    if value.contains('/') {
+        return Err(LogPoseError::Message(
+            "principal name must not contain '/'".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(LogPoseError::Message(format!("{label} must not be empty")));
+    }
+    if value.contains('/') {
+        return Err(LogPoseError::Message(format!(
+            "{label} must not contain '/'"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2816,6 +2933,20 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn list_databases_bootstraps_the_default_database_descriptor() {
+        let root = unique_temp_dir("storage-default-database-bootstrap");
+        let engine = LocalStorageEngine::new(&root);
+
+        let databases = engine
+            .list_databases()
+            .expect("database listing should bootstrap the default database");
+
+        assert_eq!(databases.len(), 1);
+        assert_eq!(databases[0].name, DEFAULT_DATABASE_NAME);
+        assert!(databases[0].is_default);
+    }
 
     #[test]
     fn truncated_segment_returns_error_instead_of_panicking() {

@@ -2,6 +2,7 @@
 
 use async_trait as _;
 use crc32fast as _;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query as _;
@@ -13,10 +14,15 @@ use uuid as _;
 #[path = "support/fs.rs"]
 mod support;
 
+use logpose_auth::{
+    AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+    Principal, PrincipalKind,
+};
+use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    DEFAULT_DATABASE_NAME, DEFAULT_TENANT_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId,
-    Snapshot, WriteOperation,
+    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot,
+    WriteOperation,
 };
 use serde_json::{Value, json};
 use std::{
@@ -85,7 +91,7 @@ async fn create_write_scan_and_delete_records() {
 }
 
 #[tokio::test]
-async fn create_collection_persists_default_tenant_and_database_descriptors() {
+async fn create_collection_persists_default_database_descriptor_without_tenant_scaffold() {
     let root = support::unique_temp_dir("storage-default-database");
     let engine = LocalStorageEngine::new(&root);
 
@@ -98,15 +104,7 @@ async fn create_collection_persists_default_tenant_and_database_descriptors() {
         .await
         .expect("collection should be created");
 
-    let tenant_descriptor_path = root.join("tenants").join("default").join("descriptor.json");
-    let tenant_descriptor: logpose_catalog::TenantDescriptor = serde_json::from_slice(
-        &fs::read(&tenant_descriptor_path).expect("tenant descriptor should exist"),
-    )
-    .expect("tenant descriptor JSON should parse");
-
     let database_descriptor_path = root
-        .join("tenants")
-        .join(DEFAULT_TENANT_NAME)
         .join("databases")
         .join(DEFAULT_DATABASE_NAME)
         .join("descriptor.json");
@@ -115,16 +113,178 @@ async fn create_collection_persists_default_tenant_and_database_descriptors() {
     )
     .expect("database descriptor JSON should parse");
 
-    assert_eq!(tenant_descriptor.name, DEFAULT_TENANT_NAME);
-    assert!(tenant_descriptor.is_default);
-    assert_eq!(database_descriptor.tenant_name, DEFAULT_TENANT_NAME);
+    assert!(
+        !root.join("tenants").exists(),
+        "collection creation should not materialize a removed tenant scaffold"
+    );
     assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
     assert_eq!(database_descriptor.name, DEFAULT_DATABASE_NAME);
     assert!(database_descriptor.is_default);
 }
 
+#[test]
+fn catalog_store_round_trips_databases_principals_and_policies() {
+    let root = support::unique_temp_dir("storage-catalog-round-trip");
+    let engine = LocalStorageEngine::new(&root);
+
+    let database = engine
+        .put_database(DatabaseDescriptor::new("analytics"))
+        .expect("database descriptor should persist");
+    let principal = engine
+        .put_principal(Principal::new_with_access_tier(
+            "reader",
+            PrincipalKind::User,
+            AccessTier::Observer,
+        ))
+        .expect("principal descriptor should persist");
+    let policy = engine
+        .put_database_access_policy(DatabaseAccessPolicy {
+            database_name: "analytics".to_owned(),
+            authentication_mode: AuthenticationMode::Password,
+            role_bindings: vec![DatabaseRoleBinding {
+                database_name: "analytics".to_owned(),
+                principal_name: "reader".to_owned(),
+                role: DatabaseRole::ReadOnly,
+            }],
+        })
+        .expect("database policy should persist");
+
+    assert_eq!(
+        engine
+            .get_database("analytics")
+            .expect("database lookup should succeed"),
+        database
+    );
+    assert_eq!(
+        engine
+            .get_principal("reader")
+            .expect("principal lookup should succeed"),
+        principal
+    );
+    assert_eq!(
+        engine
+            .get_database_access_policy("analytics")
+            .expect("policy lookup should succeed"),
+        policy
+    );
+    let databases = engine
+        .list_databases()
+        .expect("database listing should succeed");
+    assert_eq!(databases.len(), 2);
+    assert!(
+        databases
+            .iter()
+            .any(|descriptor| descriptor.name == database.name && !descriptor.is_default)
+    );
+    assert!(
+        databases
+            .iter()
+            .any(|descriptor| descriptor.name == "default" && descriptor.is_default)
+    );
+    assert_eq!(
+        engine
+            .list_principals()
+            .expect("principal listing should succeed"),
+        vec![principal.clone()]
+    );
+
+    let database_descriptor_path = root.join("databases/analytics/descriptor.json");
+    let principal_descriptor_path = root.join("principals/reader/descriptor.json");
+    let policy_path = root.join("databases/analytics/policy.json");
+
+    assert_eq!(
+        serde_json::from_slice::<DatabaseDescriptor>(
+            &fs::read(&database_descriptor_path).expect("database descriptor file should exist")
+        )
+        .expect("database descriptor JSON should parse"),
+        database
+    );
+    assert_eq!(
+        serde_json::from_slice::<Principal>(
+            &fs::read(&principal_descriptor_path).expect("principal descriptor file should exist")
+        )
+        .expect("principal descriptor JSON should parse"),
+        principal
+    );
+    assert_eq!(
+        serde_json::from_slice::<DatabaseAccessPolicy>(
+            &fs::read(&policy_path).expect("policy file should exist")
+        )
+        .expect("policy JSON should parse"),
+        policy
+    );
+
+    let reopened = LocalStorageEngine::new(&root);
+    assert_eq!(
+        reopened
+            .get_database("analytics")
+            .expect("reopened database lookup should succeed"),
+        database
+    );
+    assert_eq!(
+        reopened
+            .get_principal("reader")
+            .expect("reopened principal lookup should succeed"),
+        principal
+    );
+    assert_eq!(
+        reopened
+            .get_database_access_policy("analytics")
+            .expect("reopened policy lookup should succeed"),
+        policy
+    );
+}
+
+#[test]
+fn catalog_store_overwrites_database_policy_by_database_name() {
+    let root = support::unique_temp_dir("storage-catalog-database-isolation");
+    let engine = LocalStorageEngine::new(&root);
+
+    let database = engine
+        .put_database(DatabaseDescriptor::new("analytics"))
+        .expect("database should persist");
+
+    let owner_policy = engine
+        .put_database_access_policy(DatabaseAccessPolicy {
+            database_name: "analytics".to_owned(),
+            authentication_mode: AuthenticationMode::Password,
+            role_bindings: vec![DatabaseRoleBinding {
+                database_name: "analytics".to_owned(),
+                principal_name: "owner-reader".to_owned(),
+                role: DatabaseRole::Owner,
+            }],
+        })
+        .expect("owner policy should persist");
+    let read_only_policy = engine
+        .put_database_access_policy(DatabaseAccessPolicy {
+            database_name: "analytics".to_owned(),
+            authentication_mode: AuthenticationMode::ExternalToken,
+            role_bindings: vec![DatabaseRoleBinding {
+                database_name: "analytics".to_owned(),
+                principal_name: "readonly-reader".to_owned(),
+                role: DatabaseRole::ReadOnly,
+            }],
+        })
+        .expect("read-only policy should replace the existing database policy");
+
+    assert_eq!(
+        engine
+            .get_database_access_policy("analytics")
+            .expect("database policy lookup should succeed"),
+        read_only_policy
+    );
+
+    assert_eq!(
+        engine
+            .get_database("analytics")
+            .expect("database descriptor should still load"),
+        database
+    );
+    assert_ne!(owner_policy, read_only_policy);
+}
+
 #[tokio::test]
-async fn duplicate_collection_names_can_exist_in_different_namespaces() {
+async fn duplicate_collection_names_can_exist_in_different_databases() {
     let root = support::unique_temp_dir("storage-namespace-duplicates");
     let engine = LocalStorageEngine::new(&root);
 
@@ -136,56 +296,49 @@ async fn duplicate_collection_names_can_exist_in_different_namespaces() {
         ))
         .await
         .expect("default namespace collection should be created");
-    let tenant_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-a",
+    let analytics_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_database(
             "analytics",
             "documents",
             2,
             DistanceMetric::Dot,
         ))
         .await
-        .expect("tenant namespace collection should be created");
-
-    assert_eq!(default_descriptor.tenant_name, "default");
-    assert_eq!(tenant_descriptor.tenant_name, "tenant-a");
+        .expect("analytics database collection should be created");
     assert_ne!(
         default_descriptor.collection_id,
-        tenant_descriptor.collection_id
+        analytics_descriptor.collection_id
     );
 
     let opened_default = engine
         .open_collection("documents")
         .await
         .expect("default namespace lookup should work");
-    let opened_tenant = engine
-        .open_collection("tenant-a/analytics/documents")
+    let opened_analytics = engine
+        .open_collection("analytics/documents")
         .await
-        .expect("qualified namespace lookup should work");
+        .expect("database-qualified lookup should work");
 
-    assert_eq!(opened_default.tenant_name, "default");
     assert_eq!(opened_default.database_name, "default");
-    assert_eq!(opened_tenant.tenant_name, "tenant-a");
-    assert_eq!(opened_tenant.database_name, "analytics");
+    assert_eq!(opened_analytics.database_name, "analytics");
 
-    let explicit_tenant = engine
-        .open_collection_in_namespace("tenant-a", "analytics", "documents")
+    let explicit_analytics = engine
+        .open_collection_in_database("analytics", "documents")
         .await
-        .expect("explicit namespace lookup should work");
+        .expect("explicit database lookup should work");
     assert_eq!(
-        explicit_tenant.collection_id,
-        tenant_descriptor.collection_id
+        explicit_analytics.collection_id,
+        analytics_descriptor.collection_id
     );
 }
 
 #[tokio::test]
-async fn create_collection_allows_duplicate_names_in_distinct_namespaces() {
+async fn create_collection_allows_duplicate_names_in_distinct_databases() {
     let root = support::unique_temp_dir("storage-duplicate-collection-namespaces");
     let engine = LocalStorageEngine::new(&root);
 
     let left = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-a",
+        .create_collection(CreateCollectionRequest::in_database(
             DEFAULT_DATABASE_NAME,
             "events",
             2,
@@ -195,21 +348,20 @@ async fn create_collection_allows_duplicate_names_in_distinct_namespaces() {
         .expect("first collection should be created");
 
     let right = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-b",
-            DEFAULT_DATABASE_NAME,
+        .create_collection(CreateCollectionRequest::in_database(
+            "analytics",
             "events",
             2,
             DistanceMetric::Dot,
         ))
         .await
-        .expect("second collection in another tenant should be created");
+        .expect("second collection in another database should be created");
 
     assert_eq!(left.name, "events");
     assert_eq!(right.name, "events");
     assert_ne!(left.collection_id, right.collection_id);
-    assert_eq!(left.tenant_name, "tenant-a");
-    assert_eq!(right.tenant_name, "tenant-b");
+    assert_eq!(left.database_name, DEFAULT_DATABASE_NAME);
+    assert_eq!(right.database_name, "analytics");
 
     let descriptors = engine
         .list_collections()
@@ -230,8 +382,7 @@ async fn create_collection_rejects_reserved_namespace_separator() {
     let engine = LocalStorageEngine::new(&root);
 
     let error = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-a",
+        .create_collection(CreateCollectionRequest::in_database(
             "analytics",
             "docs/v2",
             2,
@@ -245,7 +396,7 @@ async fn create_collection_rejects_reserved_namespace_separator() {
 }
 
 #[tokio::test]
-async fn open_collection_resolves_namespace_tuple() {
+async fn open_collection_resolves_database_collection_tuple() {
     let root = support::unique_temp_dir("storage-open-collection-namespace");
     let engine = LocalStorageEngine::new(&root);
 
@@ -257,16 +408,15 @@ async fn open_collection_resolves_namespace_tuple() {
         ))
         .await
         .expect("default namespace collection should be created");
-    let tenant_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-b",
-            DEFAULT_DATABASE_NAME,
+    let analytics_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_database(
+            "analytics",
             "events",
             2,
             DistanceMetric::Dot,
         ))
         .await
-        .expect("tenant namespace collection should be created");
+        .expect("analytics database collection should be created");
 
     let default_lookup = engine
         .open_collection("events")
@@ -276,23 +426,25 @@ async fn open_collection_resolves_namespace_tuple() {
         default_lookup.collection_id,
         default_descriptor.collection_id
     );
-    assert_eq!(default_lookup.tenant_name, DEFAULT_TENANT_NAME);
 
     let explicit_lookup = engine
-        .open_collection_in_namespace("tenant-b", DEFAULT_DATABASE_NAME, "events")
+        .open_collection_in_database("analytics", "events")
         .await
-        .expect("explicit namespace lookup should succeed");
+        .expect("explicit database lookup should succeed");
     assert_eq!(
         explicit_lookup.collection_id,
-        tenant_descriptor.collection_id
+        analytics_descriptor.collection_id
     );
-    assert_eq!(explicit_lookup.tenant_name, "tenant-b");
+    assert_eq!(explicit_lookup.database_name, "analytics");
 
     let slash_lookup = engine
-        .open_collection("tenant-b/default/events")
+        .open_collection("analytics/events")
         .await
-        .expect("slash-qualified lookup should succeed");
-    assert_eq!(slash_lookup.collection_id, tenant_descriptor.collection_id);
+        .expect("database-qualified lookup should succeed");
+    assert_eq!(
+        slash_lookup.collection_id,
+        analytics_descriptor.collection_id
+    );
 }
 
 #[tokio::test]
@@ -1165,31 +1317,30 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
         ))
         .await
         .expect("default namespace collection should be created");
-    let tenant_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_namespace(
-            "tenant-a",
+    let analytics_descriptor = engine
+        .create_collection(CreateCollectionRequest::in_database(
             "analytics",
             "events",
             2,
             DistanceMetric::Dot,
         ))
         .await
-        .expect("tenant namespace collection should be created");
-    configure_thresholds(&tenant_descriptor.root_path, 1, 1024, 2);
+        .expect("database namespace collection should be created");
+    configure_thresholds(&analytics_descriptor.root_path, 1, 1024, 2);
 
     engine
         .write(
-            "tenant-a/analytics/events",
+            "analytics/events",
             vec![WriteOperation::Put(PutRecord {
                 id: RecordId::new("evt-1"),
                 vector: vec![1.0, 0.0],
-                metadata: json!({"namespace":"tenant-a","shard":1}),
+                metadata: json!({"namespace":"analytics","shard":1}),
             })],
         )
         .await
-        .expect("tenant write should succeed");
+        .expect("database write should succeed");
 
-    wait_for_condition(&engine, "tenant-a/analytics/events", |stats| {
+    wait_for_condition(&engine, "analytics/events", |stats| {
         stats.segment_count == 1 && stats.mutable_op_count == 0
     })
     .await;
@@ -1201,13 +1352,13 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
     assert_eq!(default_stats.segment_count, 0);
     assert_eq!(default_stats.mutable_op_count, 0);
 
-    let tenant_stats = engine
-        .stats("tenant-a/analytics/events")
+    let analytics_stats = engine
+        .stats("analytics/events")
         .await
-        .expect("tenant namespace stats should succeed");
-    assert_eq!(tenant_stats.segment_count, 1);
-    assert_eq!(tenant_stats.mutable_op_count, 0);
-    assert_eq!(tenant_stats.live_record_count, 1);
+        .expect("database namespace stats should succeed");
+    assert_eq!(analytics_stats.segment_count, 1);
+    assert_eq!(analytics_stats.mutable_op_count, 0);
+    assert_eq!(analytics_stats.live_record_count, 1);
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@
 use clap as _;
 use crossterm as _;
 use insta as _;
+use logpose_auth::{AuthenticationMode, DatabaseRole};
 use logpose_catalog as _;
 use logpose_cli as _;
 use logpose_client as _;
@@ -13,7 +14,7 @@ use logpose_types as _;
 use ratatui as _;
 use serde as _;
 use serde_json::Value;
-use std::fs;
+use std::{fs, process::Command};
 use walkdir as _;
 
 #[path = "support/server_fixture.rs"]
@@ -79,6 +80,218 @@ fn diagnostics_status_reports_server_metadata_and_endpoints_as_json() {
             .is_some_and(|value| !value.is_empty()),
         "git_sha should be non-empty"
     );
+}
+
+#[test]
+fn authenticated_status_requires_token_and_accepts_flag_or_env() {
+    let fixture = TestServerFixture::spawn_with_auth("cli-auth-status");
+
+    let missing = fixture.run_cli_expect_failure(["status"]);
+    let missing_stderr = String::from_utf8(missing.stderr).expect("stderr should be utf8");
+    assert!(missing_stderr.contains("failed to fetch runtime status"));
+    assert!(missing_stderr.contains("missing bearer token"));
+
+    let token = fixture
+        .auth_token
+        .as_deref()
+        .expect("auth fixture should expose operator token");
+    let flagged = fixture.run_cli_json(&["--auth-token", token, "status"]);
+    let flagged_stdout = String::from_utf8(flagged.stdout).expect("stdout should be utf8");
+    let flagged_body: Value =
+        serde_json::from_str(&flagged_stdout).expect("status should print json");
+    assert_eq!(flagged_body["metadata"]["node_name"], "cli-auth-status");
+
+    let env_config = render_config_with_hosts(
+        "cli-auth-status",
+        logpose_types::NodeRole::Combined,
+        &fixture.temp_root.join("client-data"),
+        &fixture.rest_addr.ip().to_string(),
+        fixture.rest_addr.port(),
+        &fixture.grpc_addr.ip().to_string(),
+        fixture.grpc_addr.port(),
+    );
+    let env_output = Command::new(env!("CARGO_BIN_EXE_logpose-cli"))
+        .current_dir(&fixture.temp_root)
+        .env("LOGPOSE_CONFIG", env_config)
+        .env("LOGPOSE_AUTH_TOKEN", token)
+        .args(["--json", "status"])
+        .output()
+        .expect("cli should run");
+    assert!(
+        env_output.status.success(),
+        "env-auth command failed with stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&env_output.stdout),
+        String::from_utf8_lossy(&env_output.stderr)
+    );
+}
+
+#[test]
+fn database_policy_commands_round_trip_over_grpc() {
+    let fixture = TestServerFixture::spawn("cli-database-policy");
+    let policy_path = fixture.temp_root.join("policy.json");
+    fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "database_name": "default",
+            "authentication_mode": AuthenticationMode::Password,
+            "role_bindings": [
+                {
+                    "database_name": "default",
+                    "principal_name": "writer",
+                    "role": DatabaseRole::ReadWrite
+                },
+                {
+                    "database_name": "default",
+                    "principal_name": "reader",
+                    "role": DatabaseRole::ReadOnly
+                }
+            ]
+        }))
+        .expect("policy json should serialize"),
+    )
+    .expect("policy input should be written");
+
+    let set = fixture.run_cli([
+        "database",
+        "policy",
+        "set",
+        "--input",
+        policy_path.to_str().expect("path should be utf8"),
+    ]);
+    let set_stdout = String::from_utf8(set.stdout).expect("stdout should be utf8");
+    assert!(set_stdout.contains("Database policy updated"));
+    assert!(set_stdout.contains("Database: default"));
+    assert!(set_stdout.contains("password"));
+    assert!(set_stdout.contains("writer"));
+    assert!(set_stdout.contains("read_write"));
+
+    let show = fixture.run_cli_json(&["database", "policy", "show"]);
+    let show_stdout = String::from_utf8(show.stdout).expect("stdout should be utf8");
+    let show_body: Value =
+        serde_json::from_str(&show_stdout).expect("policy output should be valid json");
+
+    assert_eq!(show_body["database_name"], "default");
+    assert_eq!(show_body["authentication_mode"], "password");
+    assert_eq!(show_body["role_bindings"][0]["principal_name"], "writer");
+    assert_eq!(show_body["role_bindings"][0]["role"], "read_write");
+    assert_eq!(show_body["role_bindings"][1]["principal_name"], "reader");
+    assert_eq!(show_body["role_bindings"][1]["role"], "read_only");
+}
+
+#[test]
+fn database_commands_round_trip_over_grpc() {
+    let fixture = TestServerFixture::spawn_with_auth("cli-namespace");
+
+    let database = fixture.run_cli_json(&[
+        "--auth-token",
+        "operator-secret",
+        "database",
+        "put",
+        "analytics",
+    ]);
+    let database_stdout = String::from_utf8(database.stdout).expect("stdout should be utf8");
+    let database_body: Value =
+        serde_json::from_str(&database_stdout).expect("database should print json");
+    assert_eq!(database_body["name"], "analytics");
+
+    let database_show = fixture.run_cli_json(&[
+        "--auth-token",
+        "operator-secret",
+        "database",
+        "show",
+        "analytics",
+    ]);
+    let database_show_stdout =
+        String::from_utf8(database_show.stdout).expect("stdout should be utf8");
+    let database_show_body: Value =
+        serde_json::from_str(&database_show_stdout).expect("database should print json");
+    assert_eq!(database_show_body["name"], "analytics");
+
+    let databases = fixture.run_cli_json(&["--auth-token", "operator-secret", "database", "list"]);
+    let databases_stdout = String::from_utf8(databases.stdout).expect("stdout should be utf8");
+    let databases_body: Value =
+        serde_json::from_str(&databases_stdout).expect("database list should print json");
+    let databases = databases_body
+        .as_array()
+        .expect("databases should be an array");
+    assert!(
+        databases
+            .iter()
+            .any(|database| database["name"] == "default"),
+        "default database should still be visible"
+    );
+    assert!(
+        databases
+            .iter()
+            .any(|database| database["name"] == "analytics"),
+        "new database should be visible"
+    );
+}
+
+#[test]
+fn read_only_auth_token_can_read_but_cannot_write_over_cli() {
+    let fixture = TestServerFixture::spawn_with_auth("cli-auth-readonly");
+    let policy_path = fixture.temp_root.join("readonly-policy.json");
+    fs::write(
+        &policy_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "database_name": "default",
+            "authentication_mode": AuthenticationMode::ExternalToken,
+            "role_bindings": [
+                {
+                    "database_name": "default",
+                    "principal_name": "reader",
+                    "role": DatabaseRole::ReadOnly
+                }
+            ]
+        }))
+        .expect("policy json should serialize"),
+    )
+    .expect("policy input should be written");
+
+    fixture.run_cli([
+        "--auth-token",
+        "operator-secret",
+        "database",
+        "policy",
+        "set",
+        "--input",
+        policy_path.to_str().expect("path should be utf8"),
+    ]);
+    fixture.run_cli([
+        "--auth-token",
+        "operator-secret",
+        "collection",
+        "create",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let stats = fixture.run_cli_json(&[
+        "--auth-token",
+        "reader-secret",
+        "collection",
+        "stats",
+        "documents",
+    ]);
+    let stats_stdout = String::from_utf8(stats.stdout).expect("stdout should be utf8");
+    let stats_body: Value = serde_json::from_str(&stats_stdout).expect("stats should print json");
+    assert_eq!(stats_body["database_name"], "default");
+
+    let denied = fixture.run_cli_expect_failure([
+        "--auth-token",
+        "reader-secret",
+        "record",
+        "delete",
+        "documents",
+        "alpha",
+    ]);
+    let denied_stderr = String::from_utf8(denied.stderr).expect("stderr should be utf8");
+    assert!(denied_stderr.contains("failed to delete record"));
+    assert!(denied_stderr.contains("not allowed"));
 }
 
 #[test]

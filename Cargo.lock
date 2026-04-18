@@ -1254,6 +1254,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 name = "logpose-api-grpc"
 version = "0.1.0"
 dependencies = [
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",
@@ -1280,6 +1281,7 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.8",
  "http-body-util",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",
@@ -1297,13 +1299,19 @@ dependencies = [
 [[package]]
 name = "logpose-auth"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "logpose-catalog"
 version = "0.1.0"
 dependencies = [
+ "logpose-auth",
  "logpose-types",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1316,6 +1324,7 @@ dependencies = [
  "insta",
  "logpose-api-grpc",
  "logpose-api-rest",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-client",
  "logpose-config",
@@ -1336,6 +1345,7 @@ name = "logpose-client"
 version = "0.1.0"
 dependencies = [
  "logpose-api-grpc",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",
@@ -1353,6 +1363,7 @@ dependencies = [
 name = "logpose-config"
 version = "0.1.0"
 dependencies = [
+ "logpose-auth",
  "logpose-types",
  "serde",
  "toml",
@@ -1363,6 +1374,7 @@ name = "logpose-core"
 version = "0.1.0"
 dependencies = [
  "etcd-client",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-query",
@@ -1422,6 +1434,7 @@ dependencies = [
  "http-body-util",
  "logpose-api-grpc",
  "logpose-api-rest",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-config",
  "logpose-core",
@@ -1429,6 +1442,7 @@ dependencies = [
  "logpose-storage",
  "logpose-types",
  "rand 0.10.1",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1442,6 +1456,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "crc32fast",
+ "logpose-auth",
  "logpose-catalog",
  "logpose-index",
  "logpose-query",

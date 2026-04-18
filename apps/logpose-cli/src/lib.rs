@@ -59,13 +59,20 @@ async fn run(ui: &TerminalUi) -> anyhow::Result<()> {
     logpose_telemetry::init(&config.log_filter);
 
     match cli.into_request() {
-        CommandRequest::Direct { action, output } => {
+        CommandRequest::Direct {
+            action,
+            auth_token,
+            output,
+        } => {
             let reporter = DirectReporter::new(ui);
-            let output_value = execute_action(&config, &action, &reporter).await?;
+            let output_value =
+                execute_action(&config, auth_token.as_deref(), &action, &reporter).await?;
             output_value.render_direct(output)
         }
-        CommandRequest::Interactive { args, output } => {
-            run_interactive(&config, ui, output, args).await
-        }
+        CommandRequest::Interactive {
+            args,
+            auth_token,
+            output,
+        } => run_interactive(&config, ui, output, auth_token, args).await,
     }
 }

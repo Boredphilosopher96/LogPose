@@ -9,11 +9,15 @@ use logpose_api_grpc as _;
 #[cfg(test)]
 use logpose_api_rest as _;
 #[cfg(test)]
+use logpose_auth as _;
+#[cfg(test)]
 use logpose_config as _;
 #[cfg(test)]
 use logpose_core as _;
 #[cfg(test)]
 use rand as _;
+#[cfg(test)]
+use serde as _;
 #[cfg(test)]
 use serde_json as _;
 #[cfg(test)]
@@ -23,6 +27,8 @@ use tonic as _;
 #[cfg(test)]
 use tower as _;
 
+use logpose_auth::{DatabaseAccessPolicy, Principal};
+use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryError, QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
@@ -51,6 +57,12 @@ pub enum ServiceError {
     /// The caller supplied an invalid request.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The caller failed authentication.
+    #[error("{0}")]
+    Unauthenticated(String),
+    /// The caller lacks permission for this operation.
+    #[error("{0}")]
+    PermissionDenied(String),
     /// The system failed while processing the request.
     #[error("{0}")]
     Internal(String),
@@ -201,14 +213,10 @@ impl LogPoseDataService {
         descriptor: &logpose_catalog::CollectionDescriptor,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
-        let mut stats = self
-            .storage
+        self.storage
             .stats_descriptor(descriptor, snapshot)
             .await
-            .map_err(ServiceError::from)?;
-        stats.tenant_name = descriptor.tenant_name.clone();
-        stats.database_name = descriptor.database_name.clone();
-        Ok(stats)
+            .map_err(ServiceError::from)
     }
 
     /// Load persisted maintenance state without reconstructing full stats.
@@ -301,20 +309,45 @@ impl LogPoseDataService {
     }
 }
 
+/// Build a filesystem-backed catalog store rooted under the runtime storage directory.
+#[must_use]
+pub fn local_catalog_store(root: impl AsRef<Path>) -> Arc<dyn CatalogStore> {
+    Arc::new(LocalStorageEngine::new(root))
+}
+
 /// Shared control-plane orchestration over local data-plane services.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LogPoseControlService {
     data: Arc<LogPoseDataService>,
+    catalog: Arc<dyn CatalogStore>,
     config: LogPoseConfig,
     build: BuildInfo,
+}
+
+impl fmt::Debug for LogPoseControlService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogPoseControlService")
+            .field("data_service", &"<LogPoseDataService>")
+            .field("catalog_store", &"<dyn CatalogStore>")
+            .field("node_name", &self.config.node_name)
+            .field("node_role", &self.config.node_role)
+            .finish()
+    }
 }
 
 impl LogPoseControlService {
     /// Build a control-plane service over a shared data service and runtime config.
     #[must_use]
-    pub fn new(data: Arc<LogPoseDataService>, config: LogPoseConfig, build: BuildInfo) -> Self {
+    pub fn new(
+        data: Arc<LogPoseDataService>,
+        catalog: Arc<dyn CatalogStore>,
+        config: LogPoseConfig,
+        build: BuildInfo,
+    ) -> Self {
         Self {
             data,
+            catalog,
             config,
             build,
         }
@@ -343,6 +376,65 @@ impl LogPoseControlService {
         self.data
             .create_collection_with_assignment(request, self.initial_assignment())
             .await
+    }
+
+    /// Create or replace one database-scoped access policy.
+    pub async fn set_database_access_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> Result<DatabaseAccessPolicy> {
+        match self.config.node_role {
+            NodeRole::Data => {
+                return Err(ServiceError::InvalidArgument(
+                    "data-only nodes cannot accept control-plane database policy mutations"
+                        .to_owned(),
+                ));
+            }
+            NodeRole::Control | NodeRole::Combined => {}
+        }
+        self.catalog
+            .put_database_access_policy(policy)
+            .map_err(Into::into)
+    }
+
+    /// Create or replace one database descriptor.
+    pub async fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        match self.config.node_role {
+            NodeRole::Data => {
+                return Err(ServiceError::InvalidArgument(
+                    "data-only nodes cannot accept control-plane database mutations".to_owned(),
+                ));
+            }
+            NodeRole::Control | NodeRole::Combined => {}
+        }
+        self.catalog.put_database(descriptor).map_err(Into::into)
+    }
+
+    /// Read one database descriptor.
+    pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        self.catalog.get_database(database_name).map_err(Into::into)
+    }
+
+    /// List every database descriptor.
+    pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        self.catalog.list_databases().map_err(Into::into)
+    }
+
+    /// Read one database-scoped access policy.
+    pub async fn database_access_policy(
+        &self,
+        database_name: &str,
+    ) -> Result<DatabaseAccessPolicy> {
+        self.catalog
+            .get_database_access_policy(database_name)
+            .map_err(Into::into)
+    }
+
+    /// Read one persisted principal descriptor.
+    pub async fn principal(&self, principal_name: &str) -> Result<Principal> {
+        self.catalog
+            .get_principal(principal_name)
+            .map_err(Into::into)
     }
 
     /// Return the placement summary for one collection.
@@ -380,16 +472,8 @@ impl LogPoseControlService {
             placements.push(placement);
         }
         placements.sort_by(|left, right| {
-            (
-                &left.tenant_name,
-                &left.database_name,
-                &left.collection_name,
-            )
-                .cmp(&(
-                    &right.tenant_name,
-                    &right.database_name,
-                    &right.collection_name,
-                ))
+            (&left.database_name, &left.collection_name)
+                .cmp(&(&right.database_name, &right.collection_name))
         });
 
         let mut maintenance = MaintenanceBacklog::default();
@@ -429,6 +513,16 @@ impl LogPoseControlService {
         })
     }
 
+    /// Persist configured bootstrap principals into the catalog store.
+    pub fn sync_bootstrap_principals(&self) -> Result<()> {
+        for token in &self.config.auth.bootstrap_tokens {
+            self.catalog
+                .put_principal(token.principal.clone())
+                .map_err(ServiceError::from)?;
+        }
+        Ok(())
+    }
+
     fn local_placement(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
@@ -458,7 +552,6 @@ impl LogPoseControlService {
         };
         CollectionPlacement {
             collection_id: descriptor.collection_id.clone(),
-            tenant_name: descriptor.tenant_name.clone(),
             database_name: descriptor.database_name.clone(),
             collection_name: descriptor.name.clone(),
             assigned_node: assignment.assigned_node.clone(),
@@ -619,7 +712,22 @@ fn http_endpoint(host: &str, port: u16) -> String {
 }
 
 fn parse_collection_reference(collection_name: &str) -> logpose_types::Result<CollectionRef> {
-    CollectionRef::parse_reference(collection_name)
+    let reference = match collection_name
+        .trim()
+        .split('/')
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [collection_name] => CollectionRef::new_default(*collection_name),
+        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
+        _ => {
+            return Err(LogPoseError::Message(format!(
+                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
+            )));
+        }
+    };
+    reference.validate()?;
+    Ok(reference)
 }
 
 fn ensure_collection_reference_matches_descriptor(
@@ -627,8 +735,7 @@ fn ensure_collection_reference_matches_descriptor(
     descriptor: &logpose_catalog::CollectionDescriptor,
     original_name: &str,
 ) -> logpose_types::Result<()> {
-    if reference.tenant_name != descriptor.tenant_name
-        || reference.database_name != descriptor.database_name
+    if reference.database_name != descriptor.database_name
         || reference.collection_name != descriptor.name
     {
         return Err(LogPoseError::Message(format!(
@@ -662,6 +769,7 @@ mod tests {
             Arc,
             atomic::{AtomicU64, Ordering},
         },
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -678,10 +786,28 @@ mod tests {
     #[test]
     fn classifies_reconciliation_failures_as_invalid_argument() {
         let error = ServiceError::from(LogPoseError::Message(
-            "collection 'default/default/documents' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it".to_owned(),
+            "collection 'default/documents' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it".to_owned(),
         ));
 
         assert!(matches!(error, ServiceError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn parse_collection_reference_accepts_database_collection_and_rejects_tenant_depth() {
+        let reference = parse_collection_reference("analytics/documents")
+            .expect("database-qualified collection name should parse");
+
+        assert_eq!(reference.database_name, "analytics");
+        assert_eq!(reference.collection_name, "documents");
+
+        let error = parse_collection_reference("tenant-a/analytics/documents")
+            .expect_err("tenant-qualified collection name should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("expected 'collection' or 'database/collection'"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -804,7 +930,6 @@ mod tests {
 
         let descriptor = service
             .create_collection(CreateCollectionRequest {
-                tenant_name: "default".to_owned(),
                 database_name: "default".to_owned(),
                 name: "documents".to_owned(),
                 dimensions: 2,
@@ -937,8 +1062,19 @@ mod tests {
         let data = Arc::new(LogPoseDataService::new(Arc::new(
             MetadataUnavailableStorageEngine,
         )));
-        let control =
-            LogPoseControlService::new(data, LogPoseConfig::default(), BuildInfo::current());
+        let catalog_root = std::env::temp_dir().join(format!(
+            "logpose-service-metadata-unavailable-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        let control = LogPoseControlService::new(
+            data,
+            local_catalog_store(&catalog_root),
+            LogPoseConfig::default(),
+            BuildInfo::current(),
+        );
 
         let status = control
             .runtime_status()

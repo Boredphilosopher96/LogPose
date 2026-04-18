@@ -1,6 +1,7 @@
 //! End-to-end etcd metadata integration coverage for `AppState`.
 
 use etcd_client::{Client, DeleteOptions};
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_config::LogPoseConfig;
 use logpose_core::AppState;
@@ -94,7 +95,7 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         .expect_err("remote node must reject non-local data-plane operations");
 
     assert_eq!(remote_descriptor.collection_id, descriptor.collection_id);
-    assert_eq!(remote_descriptor.lookup_name(), "default/default/documents");
+    assert_eq!(remote_descriptor.lookup_name(), "default/documents");
     assert_eq!(local_stats.live_record_count, 1);
     assert!(local_runtime.control_plane_ready);
     assert!(local_runtime.data_plane_ready);

@@ -3,6 +3,7 @@
 use clap as _;
 use crossterm as _;
 use insta::assert_json_snapshot;
+use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_cli as _;
 use logpose_client as _;
@@ -155,6 +156,10 @@ fn normalize_placement(mut value: Value) -> Value {
 
 fn normalize_query(value: Value) -> Value {
     let value = normalize_scoped_response(value);
+    assert!(
+        value.get("tenant_name").is_none(),
+        "query responses must not include the removed tenant_name field"
+    );
     let matches = value["matches"]
         .as_array()
         .expect("query matches should be an array")
@@ -191,7 +196,6 @@ fn normalize_query(value: Value) -> Value {
         });
 
     let mut projected = json!({
-        "tenant_name": value["tenant_name"],
         "database_name": value["database_name"],
         "collection_name": value["collection_name"],
         "metric": value["metric"],
@@ -217,7 +221,11 @@ fn normalize_scoped_response(value: Value) -> Value {
         value.get("response").is_none(),
         "scoped transport responses must be flattened"
     );
-    for field in ["tenant_name", "database_name", "collection_name"] {
+    assert!(
+        value.get("tenant_name").is_none(),
+        "scoped transport responses must not include the removed tenant_name field"
+    );
+    for field in ["database_name", "collection_name"] {
         assert!(
             value.get(field).is_some(),
             "scoped transport responses must include '{field}'"
@@ -229,7 +237,6 @@ fn normalize_scoped_response(value: Value) -> Value {
 fn project_manifest_contract(value: Value, segment_id: &str) -> Value {
     let manifest = normalize_segment_scoped(normalize_scoped_response(value), segment_id);
     json!({
-        "tenant_name": manifest["tenant_name"],
         "database_name": manifest["database_name"],
         "collection_name": manifest["collection_name"],
         "target": manifest["target"],
@@ -257,7 +264,6 @@ fn project_manifest_contract(value: Value, segment_id: &str) -> Value {
 fn project_segment_contract(value: Value, segment_id: &str) -> Value {
     let segment = normalize_segment_scoped(normalize_scoped_response(value), segment_id);
     json!({
-        "tenant_name": segment["tenant_name"],
         "database_name": segment["database_name"],
         "collection_name": segment["collection_name"],
         "target": segment["target"],
@@ -289,7 +295,6 @@ fn project_segment_contract(value: Value, segment_id: &str) -> Value {
 fn project_wal_contract(value: Value) -> Value {
     let value = normalize_scoped_response(value);
     json!({
-        "tenant_name": value["tenant_name"],
         "database_name": value["database_name"],
         "collection_name": value["collection_name"],
         "target": value["target"],

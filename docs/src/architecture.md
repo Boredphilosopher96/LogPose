@@ -21,6 +21,7 @@ The control-plane and data-plane split is real, but it is still in-process rathe
 ## Control Plane And Data Plane Today
 
 - the control plane owns database and collection lifecycle, runtime status, and placement diagnostics
+- the control plane also owns database policy persistence and operator-gated namespace administration
 - the data plane owns writes, queries, maintenance execution, and storage inspection
 - wrong-plane requests are rejected based on node role and recorded collection placement
 - collection creation is currently accepted on `combined` nodes, not on `control`-only nodes
@@ -31,7 +32,8 @@ LogPose is still a local filesystem engine.
 
 - mutable writes land in WAL-backed local state under `storage_root`
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
-- a default database descriptor is now persisted under `storage_root/tenants/default/databases/default/descriptor.json`
+- a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
+- operator-facing namespaces are database-first: collection identities are `database/collection` outside the default database and just `collection` inside it
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
@@ -53,7 +55,7 @@ LogPose does not yet have:
 - fully wired etcd control loops, even though an etcd-backed assignment metadata foundation exists
 - dynamic cluster membership or watch-driven placement updates
 - shard maps, replica sets, or failover controllers
-- database-scoped authn, authz, ACLs, or tenant isolation beyond the persisted default database catalog object
+- principal lifecycle management beyond bootstrap tokens, richer database policy enumeration/delete workflows, or non-bootstrap identity providers
 - remote query dispatch or replication
 - real MinIO or S3-backed immutable artifact storage
 

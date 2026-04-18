@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 crc32fast = "1.4"
+logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-index = { path = "../logpose-index" }
 logpose-types = { path = "../logpose-types" }

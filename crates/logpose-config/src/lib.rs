@@ -1,9 +1,11 @@
 //! Configuration loading for LogPose services and tooling.
 
+use logpose_auth::Principal;
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, LogPoseError, MetadataBackend, MetadataConfig, NodeRole, Result,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Runtime configuration for the LogPose platform.
@@ -29,6 +31,56 @@ pub struct LogPoseConfig {
     /// Metadata control-plane backend and settings.
     #[serde(default)]
     pub metadata: MetadataConfig,
+    /// Authentication bootstrap configuration.
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// Authentication bootstrap and runtime configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Static bearer tokens bound to explicit principals for bootstrapping.
+    #[serde(default)]
+    pub bootstrap_tokens: Vec<BootstrapTokenConfig>,
+}
+
+impl AuthConfig {
+    fn validate(&self) -> Result<()> {
+        let mut seen_tokens = BTreeSet::new();
+        for (index, token) in self.bootstrap_tokens.iter().enumerate() {
+            token.validate().map_err(|message| {
+                LogPoseError::Message(format!(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens[{index}] {message}"
+                ))
+            })?;
+            if !seen_tokens.insert(token.token.clone()) {
+                return Err(LogPoseError::Message(format!(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate token values ('{}')",
+                    token.token
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One bearer token bootstrap binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BootstrapTokenConfig {
+    /// Shared secret bearer token value.
+    pub token: String,
+    /// Principal authenticated by this bootstrap token.
+    pub principal: Principal,
+}
+
+impl BootstrapTokenConfig {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.token.trim().is_empty() {
+            return Err("token must not be empty".to_owned());
+        }
+        self.principal.validate()?;
+        Ok(())
+    }
 }
 
 impl Default for LogPoseConfig {
@@ -43,6 +95,7 @@ impl Default for LogPoseConfig {
             log_filter: "info,logpose=debug".to_owned(),
             storage_root: PathBuf::from(".logpose"),
             metadata: MetadataConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -63,6 +116,7 @@ impl LogPoseConfig {
                 }
             })?;
         }
+        self.auth.validate()?;
         Ok(())
     }
 
@@ -278,5 +332,80 @@ storage_root = "tmp/logpose-data""#,
         .expect_err("reserved anonymous local node name should be rejected");
 
         assert!(error.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn from_toml_str_reads_bootstrap_auth_tokens() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[auth]
+
+[[auth.bootstrap_tokens]]
+token = "operator-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "ops-admin"
+kind = "user"
+access_tier = "operator"
+
+[[auth.bootstrap_tokens]]
+token = "service-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "ingest-service"
+kind = "service"
+access_tier = "service""#,
+        )
+        .expect("config should load");
+
+        assert_eq!(config.auth.bootstrap_tokens.len(), 2);
+        assert_eq!(config.auth.bootstrap_tokens[0].token, "operator-secret");
+        assert_eq!(config.auth.bootstrap_tokens[0].principal.name, "ops-admin");
+        assert_eq!(config.auth.bootstrap_tokens[1].token, "service-secret");
+        assert_eq!(
+            config.auth.bootstrap_tokens[1].principal.name,
+            "ingest-service"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_duplicate_bootstrap_auth_tokens() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[auth]
+
+[[auth.bootstrap_tokens]]
+token = "duplicate-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "ops-admin"
+kind = "user"
+access_tier = "operator"
+
+[[auth.bootstrap_tokens]]
+token = "duplicate-secret"
+
+[auth.bootstrap_tokens.principal]
+name = "other-admin"
+kind = "user"
+access_tier = "operator""#,
+        )
+        .expect_err("duplicate bootstrap tokens should fail");
+
+        assert!(error.to_string().contains("auth.bootstrap_tokens"));
     }
 }

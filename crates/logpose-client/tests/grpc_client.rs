@@ -1,14 +1,21 @@
 //! Integration tests for the gRPC-backed LogPose client.
 
+use logpose_auth::{
+    AccessTier, AuthenticationMode, DatabaseAccessPolicy as AuthDatabaseAccessPolicy, DatabaseRole,
+    DatabaseRoleBinding as AuthDatabaseRoleBinding, Principal, PrincipalKind,
+};
 use logpose_catalog as _;
-use logpose_client::{ClientError, LogPoseClient};
-use logpose_config::LogPoseConfig;
+use logpose_client::{
+    ClientError, CreateCollectionRequest, DatabaseAccessPolicy, DatabaseDescriptor,
+    DatabaseRoleBinding, LogPoseClient,
+};
+use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
 use logpose_query::{
     ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
     ScalarMetadataValue,
 };
-use logpose_storage::{CreateCollectionRequest, InspectTarget};
+use logpose_storage::{CreateCollectionRequest as StorageCreateCollectionRequest, InspectTarget};
 use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde as _;
 use serde_json::{Value, json};
@@ -45,7 +52,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert!(!metadata.git_sha.is_empty(), "git sha should be non-empty");
 
     let descriptor = client
-        .create_collection(CreateCollectionRequest::new(
+        .create_collection(CreateCollectionRequest::in_database(
+            "default",
             "documents",
             2,
             DistanceMetric::Dot,
@@ -53,7 +61,6 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .await
         .expect("collection should be created");
     let qualified = descriptor.lookup_name();
-    assert_eq!(descriptor.tenant_name, "default");
     assert_eq!(descriptor.database_name, "default");
     assert_eq!(descriptor.name, "documents");
 
@@ -61,7 +68,6 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .get_collection(&qualified)
         .await
         .expect("collection should load");
-    assert_eq!(read_back.tenant_name, "default");
     assert_eq!(read_back.database_name, "default");
     assert_eq!(read_back.collection_id, descriptor.collection_id);
 
@@ -129,8 +135,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let stats = client.stats(&qualified).await.expect("stats should load");
-    assert_eq!(stats.tenant_name, "default");
     assert_eq!(stats.database_name, "default");
+    assert_eq!(stats.collection_name, "documents");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.deleted_record_count, 0);
     assert_eq!(stats.mutable_op_count, 2);
@@ -306,6 +312,102 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 }
 
 #[tokio::test]
+async fn grpc_client_round_trips_database_policy_over_grpc() {
+    let temp_root = unique_temp_dir("client-grpc-policy");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let endpoint = format!("http://{grpc_addr}");
+    let client = LogPoseClient::connect(endpoint)
+        .await
+        .expect("client should connect");
+
+    let policy = DatabaseAccessPolicy {
+        database_name: "default".to_owned(),
+        authentication_mode: AuthenticationMode::Password,
+        role_bindings: vec![
+            DatabaseRoleBinding {
+                database_name: "default".to_owned(),
+                principal_name: "writer".to_owned(),
+                role: DatabaseRole::ReadWrite,
+            },
+            DatabaseRoleBinding {
+                database_name: "default".to_owned(),
+                principal_name: "reader".to_owned(),
+                role: DatabaseRole::ReadOnly,
+            },
+        ],
+    };
+
+    let stored = client
+        .set_database_policy(policy.clone())
+        .await
+        .expect("policy should be written");
+    assert_eq!(stored, policy);
+
+    let read_back = client
+        .database_policy("default")
+        .await
+        .expect("policy should be read");
+    assert_eq!(read_back, policy);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_round_trips_database_descriptors_over_grpc() {
+    let temp_root = unique_temp_dir("client-grpc-namespace");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+
+    let database = client
+        .set_database(DatabaseDescriptor::new("analytics"))
+        .await
+        .expect("database should be written");
+    assert_eq!(database.name, "analytics");
+
+    let read_back = client
+        .database("analytics")
+        .await
+        .expect("database should be read");
+    assert_eq!(read_back.name, "analytics");
+
+    let databases = client
+        .databases()
+        .await
+        .expect("databases should be listed");
+    assert_eq!(databases.len(), 2);
+    assert!(
+        databases
+            .iter()
+            .any(|database| database.name == "default" && database.is_default),
+        "default database should be bootstrapped lazily"
+    );
+    assert!(
+        databases
+            .iter()
+            .any(|database| database.name == "analytics" && !database.is_default),
+        "explicit database should still be listed"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn grpc_client_reads_runtime_status_and_collection_placement() {
     let temp_root = unique_temp_dir("client-runtime-status");
     let grpc_addr = reserve_local_addr();
@@ -314,7 +416,7 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest::new(
+        .create_collection(StorageCreateCollectionRequest::new(
             "documents",
             2,
             DistanceMetric::Dot,
@@ -336,21 +438,112 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
     assert_eq!(status.role.as_str(), "combined");
     assert_eq!(status.storage_engine, "local");
     assert_eq!(status.collection_count, 1);
-    assert_eq!(status.collections[0].tenant_name, "default");
     assert_eq!(status.collections[0].database_name, "default");
     assert_eq!(status.collections[0].collection_name, "documents");
     assert_eq!(status.collections[0].assigned_role.as_str(), "data");
 
     let placement = client
-        .collection_placement("default/default/documents")
+        .collection_placement("default/documents")
         .await
         .expect("placement should load");
-    assert_eq!(placement.tenant_name, "default");
     assert_eq!(placement.database_name, "default");
     assert_eq!(placement.collection_name, "documents");
     assert_eq!(placement.assigned_node, "client-grpc");
     assert_eq!(placement.assigned_role.as_str(), "data");
     assert_eq!(placement.route_kind, "local");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_requires_auth_token_for_runtime_status_when_server_auth_is_enabled() {
+    let temp_root = unique_temp_dir("client-runtime-auth");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(auth_test_config(
+        &temp_root, rest_addr, grpc_addr,
+    )));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let endpoint = format!("http://{grpc_addr}");
+    let unauthenticated = LogPoseClient::connect(endpoint.clone())
+        .await
+        .expect("client should connect")
+        .runtime_status()
+        .await
+        .expect_err("runtime status should require auth");
+    assert!(matches!(
+        unauthenticated,
+        ClientError::Status(status) if status.code() == tonic::Code::Unauthenticated
+    ));
+
+    let status = LogPoseClient::connect_with_auth(endpoint, Some("operator-secret"))
+        .await
+        .expect("client should connect with auth")
+        .runtime_status()
+        .await
+        .expect("operator token should load runtime status");
+    assert_eq!(status.metadata.node_name, "client-grpc");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_enforces_read_only_token_permissions() {
+    let temp_root = unique_temp_dir("client-readonly-auth");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(auth_test_config(
+        &temp_root, rest_addr, grpc_addr,
+    )));
+
+    state
+        .control
+        .set_database_access_policy(read_only_policy("default", "reader"))
+        .await
+        .expect("database policy should persist");
+    state
+        .control
+        .create_collection(StorageCreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created");
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client =
+        LogPoseClient::connect_with_auth(format!("http://{grpc_addr}"), Some("reader-secret"))
+            .await
+            .expect("client should connect with read-only auth");
+
+    client
+        .stats("documents")
+        .await
+        .expect("read-only token should read stats");
+
+    let write_error = client
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({}),
+            })],
+        )
+        .await
+        .expect_err("read-only token should not write");
+    assert!(matches!(
+        write_error,
+        ClientError::Status(status) if status.code() == tonic::Code::PermissionDenied
+    ));
 
     server.abort();
     let _ = server.await;
@@ -376,7 +569,8 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
         .expect("client should connect");
 
     let error = client
-        .create_collection(CreateCollectionRequest::new(
+        .create_collection(CreateCollectionRequest::in_database(
+            "default",
             "documents",
             2,
             DistanceMetric::Dot,
@@ -416,7 +610,8 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
         .await
         .expect("client should connect");
     client
-        .create_collection(CreateCollectionRequest::new(
+        .create_collection(CreateCollectionRequest::in_database(
+            "default",
             "documents",
             2,
             DistanceMetric::Dot,
@@ -435,17 +630,17 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
         })
         .collect::<Vec<_>>();
     client
-        .write("default/default/documents", operations)
+        .write("default/documents", operations)
         .await
         .expect("write should succeed");
     client
-        .flush("default/default/documents")
+        .flush("default/documents")
         .await
         .expect("flush should succeed");
 
     let response = client
         .query(QueryRequest {
-            collection_name: "default/default/documents".to_owned(),
+            collection_name: "default/documents".to_owned(),
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
@@ -519,6 +714,41 @@ fn test_config(root: &Path, rest_addr: SocketAddr, grpc_addr: SocketAddr) -> Log
     )
 }
 
+fn auth_test_config(root: &Path, rest_addr: SocketAddr, grpc_addr: SocketAddr) -> LogPoseConfig {
+    let mut config = test_config(root, rest_addr, grpc_addr);
+    config.auth.bootstrap_tokens = vec![
+        BootstrapTokenConfig {
+            token: "operator-secret".to_owned(),
+            principal: Principal::new_with_access_tier(
+                "ops-admin",
+                PrincipalKind::User,
+                AccessTier::Operator,
+            ),
+        },
+        BootstrapTokenConfig {
+            token: "reader-secret".to_owned(),
+            principal: Principal::new_with_access_tier(
+                "reader",
+                PrincipalKind::User,
+                AccessTier::Service,
+            ),
+        },
+    ];
+    config
+}
+
+fn read_only_policy(database_name: &str, principal_name: &str) -> AuthDatabaseAccessPolicy {
+    AuthDatabaseAccessPolicy {
+        database_name: database_name.to_owned(),
+        authentication_mode: AuthenticationMode::ExternalToken,
+        role_bindings: vec![AuthDatabaseRoleBinding {
+            database_name: database_name.to_owned(),
+            principal_name: principal_name.to_owned(),
+            role: DatabaseRole::ReadOnly,
+        }],
+    }
+}
+
 fn test_config_with_role(
     root: &Path,
     rest_addr: SocketAddr,
@@ -535,6 +765,7 @@ fn test_config_with_role(
         log_filter: "info".to_owned(),
         storage_root: root.join("data"),
         metadata: Default::default(),
+        auth: Default::default(),
     }
 }
 
