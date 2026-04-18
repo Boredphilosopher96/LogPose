@@ -575,24 +575,7 @@ where
 }
 
 fn parse_collection_reference(collection_name: &str) -> Result<CollectionRef> {
-    let reference = match collection_name
-        .trim()
-        .split('/')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [collection_name] => CollectionRef::new_default(*collection_name),
-        [tenant_name, database_name, collection_name] => {
-            CollectionRef::new(*tenant_name, *database_name, *collection_name)
-        }
-        _ => {
-            return Err(QueryError::Storage(LogPoseError::Message(format!(
-                "unsupported collection reference '{collection_name}': expected 'collection' or 'tenant/database/collection'"
-            ))));
-        }
-    };
-    reference.validate().map_err(QueryError::Storage)?;
-    Ok(reference)
+    CollectionRef::parse_reference(collection_name).map_err(QueryError::Storage)
 }
 
 fn ensure_collection_reference_matches_descriptor(

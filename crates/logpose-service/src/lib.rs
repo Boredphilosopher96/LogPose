@@ -619,24 +619,7 @@ fn http_endpoint(host: &str, port: u16) -> String {
 }
 
 fn parse_collection_reference(collection_name: &str) -> logpose_types::Result<CollectionRef> {
-    let reference = match collection_name
-        .trim()
-        .split('/')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [collection_name] => CollectionRef::new_default(*collection_name),
-        [tenant_name, database_name, collection_name] => {
-            CollectionRef::new(*tenant_name, *database_name, *collection_name)
-        }
-        _ => {
-            return Err(LogPoseError::Message(format!(
-                "unsupported collection reference '{collection_name}': expected 'collection' or 'tenant/database/collection'"
-            )));
-        }
-    };
-    reference.validate()?;
-    Ok(reference)
+    CollectionRef::parse_reference(collection_name)
 }
 
 fn ensure_collection_reference_matches_descriptor(

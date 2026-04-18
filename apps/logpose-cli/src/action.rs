@@ -934,25 +934,16 @@ pub fn collection_lookup_name(
 }
 
 pub fn split_collection_lookup_key(value: &str) -> (String, String, String) {
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-        (
-            parts[0].to_owned(),
-            parts[1].to_owned(),
-            parts[2].to_owned(),
-        )
-    } else {
-        (
-            DEFAULT_TENANT_NAME.to_owned(),
-            DEFAULT_DATABASE_NAME.to_owned(),
-            value.to_owned(),
-        )
-    }
+    let reference = CollectionRef::from_lookup_key(value);
+    (
+        reference.tenant_name,
+        reference.database_name,
+        reference.collection_name,
+    )
 }
 
 pub fn collection_ref_from_lookup_key(value: &str) -> CollectionRef {
-    let (tenant_name, database_name, collection_name) = split_collection_lookup_key(value);
-    CollectionRef::new(tenant_name, database_name, collection_name)
+    CollectionRef::from_lookup_key(value)
 }
 
 pub fn collection_ref_from_lookup_or_namespace(
