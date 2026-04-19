@@ -100,6 +100,9 @@ pub enum ClientError {
     /// The server returned a gRPC status error.
     #[error(transparent)]
     Status(#[from] tonic::Status),
+    /// The caller supplied an invalid client-side request.
+    #[error("{0}")]
+    InvalidRequest(String),
     /// The server returned an invalid or incomplete payload.
     #[error("{0}")]
     InvalidResponse(String),
@@ -399,6 +402,7 @@ impl LogPoseClient {
         database_name: &str,
         request: QueryRequest,
     ) -> Result<ScopedCollectionResponse<QueryResponse>> {
+        validate_read_constraints(request.snapshot.as_ref(), request.read_barrier.as_ref())?;
         let collection_name = request.collection_name.clone();
         let response = self
             .inner
@@ -408,6 +412,7 @@ impl LogPoseClient {
                 vector: request.vector,
                 top_k: request.top_k as u64,
                 snapshot: request.snapshot.map(snapshot_to_proto),
+                read_barrier: request.read_barrier.map(snapshot_to_proto),
                 filters: request
                     .filters
                     .into_iter()
@@ -458,7 +463,7 @@ impl LogPoseClient {
         database_name: &str,
         collection_name: &str,
     ) -> Result<CollectionStats> {
-        self.stats_in_database_at_snapshot(database_name, collection_name, None)
+        self.stats_in_database_for_read(database_name, collection_name, None, None)
             .await
     }
 
@@ -469,6 +474,19 @@ impl LogPoseClient {
         collection_name: &str,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
+        self.stats_in_database_for_read(database_name, collection_name, snapshot, None)
+            .await
+    }
+
+    /// Fetch collection-level statistics in an explicit database for one snapshot or barrier.
+    pub async fn stats_in_database_for_read(
+        &self,
+        database_name: &str,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        read_barrier: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        validate_read_constraints(snapshot.as_ref(), read_barrier.as_ref())?;
         let response = self
             .inner
             .clone()
@@ -476,6 +494,7 @@ impl LogPoseClient {
                 collection_name: collection_name.to_owned(),
                 database_name: database_name.to_owned(),
                 snapshot: snapshot.map(snapshot_to_proto),
+                read_barrier: read_barrier.map(snapshot_to_proto),
             }))
             .await?
             .into_inner();
@@ -612,6 +631,18 @@ impl LogPoseClient {
             },
         ))
     }
+}
+
+fn validate_read_constraints(
+    snapshot: Option<&Snapshot>,
+    read_barrier: Option<&Snapshot>,
+) -> Result<()> {
+    if snapshot.is_some() && read_barrier.is_some() {
+        return Err(ClientError::InvalidRequest(
+            "snapshot and read_barrier cannot be provided together".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn bearer_metadata_value(token: &str) -> Result<MetadataValue<Ascii>> {

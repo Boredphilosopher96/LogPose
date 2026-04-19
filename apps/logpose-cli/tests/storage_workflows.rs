@@ -72,6 +72,29 @@ fn query_requires_complete_snapshot_pair_as_cli_validation() {
 }
 
 #[test]
+fn query_requires_complete_read_barrier_pair_as_cli_validation() {
+    let temp_root = TempRoot::new("cli-query-invalid-read-barrier");
+
+    let output = run_cli_without_assert(
+        temp_root.path(),
+        [
+            "query",
+            "colors",
+            "--top-k",
+            "1",
+            "--vector",
+            "1.0,0.0",
+            "--read-barrier-manifest-generation",
+            "1",
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("--read-barrier-visible-seq-no"));
+}
+
+#[test]
 fn collection_stats_requires_complete_snapshot_pair_as_cli_validation() {
     let temp_root = TempRoot::new("cli-stats-invalid-snapshot");
 
@@ -89,6 +112,55 @@ fn collection_stats_requires_complete_snapshot_pair_as_cli_validation() {
     assert!(!output.status.success(), "command should fail validation");
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
     assert!(stderr.contains("--snapshot-visible-seq-no"));
+}
+
+#[test]
+fn collection_stats_requires_complete_read_barrier_pair_as_cli_validation() {
+    let temp_root = TempRoot::new("cli-stats-invalid-read-barrier");
+
+    let output = run_cli_without_assert(
+        temp_root.path(),
+        [
+            "collection",
+            "stats",
+            "colors",
+            "--read-barrier-manifest-generation",
+            "1",
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("--read-barrier-visible-seq-no"));
+}
+
+#[test]
+fn query_rejects_mixing_snapshot_and_read_barrier_as_cli_validation() {
+    let temp_root = TempRoot::new("cli-query-mixed-read-constraints");
+
+    let output = run_cli_without_assert(
+        temp_root.path(),
+        [
+            "query",
+            "colors",
+            "--top-k",
+            "1",
+            "--vector",
+            "1.0,0.0",
+            "--snapshot-manifest-generation",
+            "1",
+            "--snapshot-visible-seq-no",
+            "1",
+            "--read-barrier-manifest-generation",
+            "1",
+            "--read-barrier-visible-seq-no",
+            "1",
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("cannot be used with"));
 }
 
 #[test]

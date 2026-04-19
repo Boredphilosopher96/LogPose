@@ -355,6 +355,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "412":
+          description: The requested read barrier is not yet visible on the current serving node
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/placement:
     get:
       summary: Get collection placement
@@ -508,6 +514,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "412":
+          description: The requested read barrier is not yet visible on the current serving node
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/collections/{name}/stats:
     get:
       summary: Get collection stats
@@ -536,6 +548,18 @@ paths:
           in: query
           required: false
           description: Historical visible sequence number to inspect. Must be provided together with `snapshot_manifest_generation`.
+          schema:
+            type: integer
+        - name: read_barrier_manifest_generation
+          in: query
+          required: false
+          description: Lower-bound manifest generation that must already be visible. Must be provided together with `read_barrier_visible_seq_no`. Cannot be combined with the exact snapshot parameters.
+          schema:
+            type: integer
+        - name: read_barrier_visible_seq_no
+          in: query
+          required: false
+          description: Lower-bound visible sequence number that must already be visible. Must be provided together with `read_barrier_manifest_generation`. Cannot be combined with the exact snapshot parameters.
           schema:
             type: integer
       responses:
@@ -1136,6 +1160,11 @@ components:
           type: integer
           minimum: 1
         snapshot:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Snapshot"
+        read_barrier:
+          description: Lower-bound snapshot that the server must already satisfy or reject. Cannot be combined with `snapshot`.
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/Snapshot"

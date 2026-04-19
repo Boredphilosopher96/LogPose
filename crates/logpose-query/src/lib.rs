@@ -31,6 +31,9 @@ pub struct QueryRequest {
     pub top_k: usize,
     /// Optional caller-selected read snapshot.
     pub snapshot: Option<Snapshot>,
+    /// Optional lower-bound read barrier that the server must satisfy or reject.
+    #[serde(default)]
+    pub read_barrier: Option<Snapshot>,
     /// Optional top-level metadata equality filters combined with AND semantics.
     #[serde(default)]
     pub filters: Vec<MetadataFilter>,
@@ -297,10 +300,7 @@ where
     if let Some(predicate) = predicate.as_ref() {
         validate_predicate(predicate)?;
     }
-    let snapshot = match request.snapshot.clone() {
-        Some(snapshot) => snapshot,
-        None => storage.snapshot(&collection_name).await?,
-    };
+    let snapshot = resolve_requested_snapshot(storage, &collection_name, &request).await?;
     let stats = storage
         .stats_snapshot(&collection_name, Some(snapshot.clone()))
         .await?;
@@ -543,6 +543,37 @@ where
         matches,
         diagnostics,
     ))
+}
+
+async fn resolve_requested_snapshot<S>(
+    storage: &S,
+    collection_name: &str,
+    request: &QueryRequest,
+) -> Result<Snapshot>
+where
+    S: StorageEngine + ?Sized,
+{
+    match (&request.snapshot, &request.read_barrier) {
+        (Some(_), Some(_)) => Err(QueryError::Storage(LogPoseError::Message(
+            "snapshot and read_barrier cannot be provided together".to_owned(),
+        ))),
+        (Some(snapshot), None) => Ok(snapshot.clone()),
+        (None, None) => storage.snapshot(collection_name).await.map_err(Into::into),
+        (None, Some(read_barrier)) => {
+            let current = storage.snapshot(collection_name).await?;
+            if current.satisfies_read_barrier(read_barrier) {
+                Ok(current)
+            } else {
+                Err(QueryError::Storage(LogPoseError::Message(format!(
+                    "read barrier generation {}, seq {} is not yet visible; current snapshot is generation {}, seq {}",
+                    read_barrier.manifest_generation,
+                    read_barrier.visible_seq_no,
+                    current.manifest_generation,
+                    current.visible_seq_no
+                ))))
+            }
+        }
+    }
 }
 
 async fn resolve_collection_descriptor<S>(
@@ -1534,6 +1565,7 @@ mod tests {
                 manifest_generation: 7,
                 visible_seq_no: 11,
             }),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -1602,6 +1634,7 @@ mod tests {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: Some(snapshot.clone()),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -1645,6 +1678,7 @@ mod tests {
             vector: vec![1.0, 0.0],
             top_k: 4,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -1816,6 +1850,7 @@ mod tests {
                 vector: vec![1.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: None,
                 explain: ExplainMode::None,
@@ -1839,6 +1874,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: None,
                 explain: ExplainMode::None,
@@ -1865,6 +1901,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: Some(Predicate::Comparison(PredicateComparison {
                     field: "kind".to_owned(),
@@ -1892,6 +1929,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: Some(Predicate::Comparison(PredicateComparison {
                     field: "kind".to_owned(),
@@ -1919,6 +1957,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: Some(Predicate::And {
                     children: Vec::new(),
@@ -1944,6 +1983,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: Some(Predicate::Comparison(PredicateComparison {
                     field: "kind".to_owned(),
@@ -1971,6 +2011,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 3,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: Some(Predicate::Comparison(PredicateComparison {
                     field: "kind".to_owned(),
@@ -2071,6 +2112,7 @@ mod tests {
                     manifest_generation: 3,
                     visible_seq_no: 8,
                 }),
+                read_barrier: None,
                 filters: vec![MetadataFilter {
                     field: "kind".to_owned(),
                     value: ScalarMetadataValue::String("keep".to_owned()),
@@ -2094,6 +2136,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_exact_advances_to_current_snapshot_for_satisfied_read_barrier() {
+        let result = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                read_barrier: Some(Snapshot {
+                    manifest_generation: 99,
+                    visible_seq_no: 100,
+                }),
+                filters: Vec::new(),
+                predicate: None,
+                explain: ExplainMode::None,
+            },
+        )
+        .await
+        .expect("query should advance to the current snapshot");
+
+        assert_eq!(result.snapshot.manifest_generation, 99);
+        assert_eq!(result.snapshot.visible_seq_no, 101);
+    }
+
+    #[tokio::test]
+    async fn query_exact_rejects_unsatisfied_read_barrier() {
+        let error = query_exact(
+            &FilteredStorageEngine,
+            QueryRequest {
+                collection_name: "filtered".to_owned(),
+                vector: vec![1.0, 0.0],
+                top_k: 1,
+                snapshot: None,
+                read_barrier: Some(Snapshot {
+                    manifest_generation: 100,
+                    visible_seq_no: 102,
+                }),
+                filters: Vec::new(),
+                predicate: None,
+                explain: ExplainMode::None,
+            },
+        )
+        .await
+        .expect_err("query should reject an unsatisfied read barrier");
+
+        assert!(matches!(
+            error,
+            QueryError::Storage(LogPoseError::Message(message))
+                if message.contains("read barrier")
+        ));
+    }
+
+    #[tokio::test]
     async fn query_exact_resolves_database_qualified_collection_refs_before_storage_calls() {
         let storage = QualifiedReferenceStorage {
             seen_names: Mutex::new(Vec::new()),
@@ -2106,6 +2201,7 @@ mod tests {
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: None,
                 explain: ExplainMode::None,

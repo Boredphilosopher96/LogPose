@@ -84,6 +84,7 @@ fn build_immutable_ann_fixture(runtime: &Runtime) -> BenchFixture {
         vector: vec![1.0, 0.0],
         top_k: 10,
         snapshot: None,
+        read_barrier: None,
         filters: Vec::new(),
         predicate: None,
         explain: ExplainMode::None,
@@ -112,6 +113,7 @@ fn build_filtered_ann_fixture(runtime: &Runtime) -> BenchFixture {
         vector: vec![1.0, 0.0],
         top_k: 10,
         snapshot: None,
+        read_barrier: None,
         filters: vec![MetadataFilter {
             field: "bucket".to_owned(),
             value: ScalarMetadataValue::String("keep".to_owned()),
@@ -153,6 +155,7 @@ fn build_tiny_fallback_fixture(runtime: &Runtime) -> BenchFixture {
         vector: vec![1.0, 0.0],
         top_k: 3,
         snapshot: None,
+        read_barrier: None,
         filters: vec![MetadataFilter {
             field: "bucket".to_owned(),
             value: ScalarMetadataValue::String("rare".to_owned()),

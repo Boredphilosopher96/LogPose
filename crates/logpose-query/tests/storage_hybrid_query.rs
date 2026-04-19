@@ -67,6 +67,7 @@ async fn uses_vector_first_ann_after_flush_and_reranks_exact_vectors() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Profile,
@@ -142,6 +143,7 @@ async fn uses_cooperative_filtered_ann_for_selective_immutable_predicates() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -240,6 +242,7 @@ async fn hybrid_query_prefers_latest_mutable_version_over_stale_immutable_candid
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -327,6 +330,7 @@ async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),

@@ -96,6 +96,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -217,6 +218,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Profile,
@@ -644,6 +646,7 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),

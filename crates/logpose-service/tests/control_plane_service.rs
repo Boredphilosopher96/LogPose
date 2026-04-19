@@ -718,6 +718,7 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
                 vector: vec![1.0, 0.0],
                 top_k: 1,
                 snapshot: None,
+                read_barrier: None,
                 filters: Vec::new(),
                 predicate: None,
                 explain: ExplainMode::None,

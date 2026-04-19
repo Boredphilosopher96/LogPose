@@ -277,6 +277,7 @@ impl LogPoseService for GrpcLogPoseService {
                     vector: request.vector,
                     top_k: request.top_k as usize,
                     snapshot: request.snapshot.map(snapshot_from_proto),
+                    read_barrier: request.read_barrier.map(snapshot_from_proto),
                     filters,
                     predicate,
                     explain: explain_mode_from_proto(request.explain)?,
@@ -324,10 +325,11 @@ impl LogPoseService for GrpcLogPoseService {
         let database_name = normalize_database_name(&request.database_name);
         let stats = self
             .state
-            .stats_at_snapshot_with_auth(
+            .stats_for_read_with_auth(
                 &auth,
                 &collection_lookup_key(&database_name, &request.collection_name),
                 request.snapshot.map(snapshot_from_proto),
+                request.read_barrier.map(snapshot_from_proto),
             )
             .await
             .map_err(status_from_service_error)?;
@@ -1036,6 +1038,7 @@ fn status_from_service_error(error: ServiceError) -> Status {
         ServiceError::AlreadyExists(message) => Status::already_exists(message),
         ServiceError::NotFound(message) => Status::not_found(message),
         ServiceError::InvalidArgument(message) => Status::invalid_argument(message),
+        ServiceError::FailedPrecondition(message) => Status::failed_precondition(message),
         ServiceError::Unauthenticated(message) => Status::unauthenticated(message),
         ServiceError::PermissionDenied(message) => Status::permission_denied(message),
         ServiceError::Internal(message) => Status::internal(message),
@@ -1175,6 +1178,7 @@ mod tests {
         let stats = service
             .get_collection_stats(Request::new(GetCollectionStatsRequest {
                 snapshot: Some(write_snapshot),
+                read_barrier: None,
                 ..get_collection_stats_request("documents")
             }))
             .await
@@ -1247,6 +1251,86 @@ mod tests {
             .expect("inspect should succeed")
             .into_inner();
         assert_eq!(inspect.target, "manifest");
+    }
+
+    #[tokio::test]
+    async fn grpc_service_supports_read_barriers() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-read-barrier"))));
+
+        service
+            .create_collection(Request::new(create_collection_request(
+                "documents",
+                2,
+                proto::DistanceMetric::Dot,
+            )))
+            .await
+            .expect("create should succeed");
+
+        let write = service
+            .write_collection(Request::new(write_collection_request(
+                "documents",
+                vec![proto::WriteOperation {
+                    operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
+                        id: "alpha".to_owned(),
+                        vector: vec![1.0, 0.0],
+                        metadata_json: r#"{"kind":"keep"}"#.to_owned(),
+                    })),
+                }],
+            )))
+            .await
+            .expect("write should succeed")
+            .into_inner();
+        let write_snapshot = write
+            .snapshot
+            .expect("write reply should include a snapshot");
+
+        let flush = service
+            .flush_collection(Request::new(flush_collection_request("documents")))
+            .await
+            .expect("flush should succeed")
+            .into_inner();
+
+        let query = service
+            .query_collection(Request::new(QueryCollectionRequest {
+                read_barrier: Some(write_snapshot),
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
+            }))
+            .await
+            .expect("query with a satisfied read barrier should succeed")
+            .into_inner();
+        let query_snapshot = query
+            .snapshot
+            .expect("query reply should include a snapshot");
+        assert_eq!(
+            query_snapshot.manifest_generation,
+            flush.manifest_generation
+        );
+        assert_eq!(query_snapshot.visible_seq_no, flush.visible_seq_no);
+        assert_eq!(query.matches[0].id, "alpha");
+
+        let stats = service
+            .get_collection_stats(Request::new(GetCollectionStatsRequest {
+                read_barrier: Some(write_snapshot),
+                ..get_collection_stats_request("documents")
+            }))
+            .await
+            .expect("stats with a satisfied read barrier should succeed")
+            .into_inner();
+        assert_eq!(stats.manifest_generation, flush.manifest_generation);
+        assert_eq!(stats.visible_seq_no, flush.visible_seq_no);
+
+        let error = service
+            .query_collection(Request::new(QueryCollectionRequest {
+                read_barrier: Some(proto::Snapshot {
+                    manifest_generation: 0,
+                    visible_seq_no: 2,
+                }),
+                ..query_collection_request("documents", vec![1.0, 0.0], 1)
+            }))
+            .await
+            .expect_err("unsatisfied read barrier should fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -2418,6 +2502,7 @@ mod tests {
             vector,
             top_k,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
@@ -2430,6 +2515,7 @@ mod tests {
             collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
             snapshot: None,
+            read_barrier: None,
         }
     }
 

@@ -8,13 +8,13 @@ use logpose_auth::{
 use logpose_catalog::CollectionDescriptor;
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query as _;
+use logpose_query::{ExplainMode, QueryRequest};
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest;
 use logpose_storage_etcd::{EtcdCatalogStore, EtcdCoordinationClient, PromotionResult};
 use logpose_types::{
     CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, MetadataBackend,
-    MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
+    MetadataConfig, NodeRole, PutRecord, RecordId, Snapshot, WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -810,6 +810,148 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         matches!(owner_stats_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
         "old owner should reject reads after promotion: {owner_stats_error:?}"
     );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_owner_promotion_preserves_read_barriers() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("owner-promotion-read-barrier");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-owner-promotion-barrier";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-owner-promotion-barrier-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    owner_config.node_role = NodeRole::Combined;
+    let owner = Arc::new(AppState::new(owner_config.clone()));
+    wait_for_runtime_status(&owner, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+
+    let mut follower_config = test_config(
+        "owner-b",
+        unique_temp_dir("etcd-owner-promotion-barrier-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    let follower = Arc::new(AppState::new(follower_config.clone()));
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("owner-a")
+        })
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created by the owner");
+
+    let pre_promotion_ack = owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("current owner should accept writes before promotion");
+
+    let descriptor = owner
+        .get_collection("documents")
+        .await
+        .expect("owner descriptor should load before promotion");
+    mirror_collection_state(
+        &owner_config.storage_root,
+        &follower_config.storage_root,
+        &descriptor.root_path,
+    );
+
+    let coordination = EtcdCoordinationClient::new(owner_config.metadata.etcd.clone())
+        .expect("coordination client should build");
+    let current = coordination
+        .shard_owner(&CollectionRef::new_default("documents"), "0")
+        .await
+        .expect("owner lookup should succeed")
+        .expect("owner record should be seeded");
+    let promoted = coordination
+        .promote_shard_owner(&current, "owner-b")
+        .await
+        .expect("promotion should succeed");
+    assert!(matches!(promoted, PromotionResult::Applied(_)));
+
+    follower
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("promoted owner with mirrored local state should accept writes");
+
+    let query = follower
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            read_barrier: Some(pre_promotion_ack.snapshot.clone()),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("promoted owner should satisfy the pre-promotion read barrier");
+    let stats = follower
+        .stats_for_read("documents", None, Some(pre_promotion_ack.snapshot.clone()))
+        .await
+        .expect("promoted owner should satisfy stats read barrier");
+
+    assert!(
+        query
+            .snapshot
+            .satisfies_read_barrier(&pre_promotion_ack.snapshot)
+    );
+    assert_eq!(
+        query
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+    assert!(
+        Snapshot {
+            manifest_generation: stats.manifest_generation,
+            visible_seq_no: stats.visible_seq_no,
+        }
+        .satisfies_read_barrier(&pre_promotion_ack.snapshot)
+    );
+    assert_eq!(stats.live_record_count, 2);
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }

@@ -594,6 +594,7 @@ async fn assert_query_parity(
         vector: vector.clone(),
         top_k: EXACT_QUERY_TOP_K,
         snapshot: snapshot.clone(),
+        read_barrier: None,
         filters: Vec::new(),
         predicate: keep_only.then(keep_only_predicate),
         explain: ExplainMode::None,
@@ -663,6 +664,7 @@ async fn assert_query_parity(
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::None as i32,
@@ -817,6 +819,7 @@ async fn assert_query_parity(
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::Profile as i32,
@@ -1005,6 +1008,7 @@ async fn assert_stats_parity(
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
+            read_barrier: None,
         }))
         .await
         .unwrap_or_else(|error| {

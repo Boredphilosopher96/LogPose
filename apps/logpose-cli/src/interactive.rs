@@ -217,10 +217,33 @@ fn action_from_scripted_prompts(
                     },
                 )?,
             )?;
+            let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
+                build_snapshot_fields(
+                    ui.prompt_optional_parsed(
+                        "Read barrier manifest generation (optional)",
+                        Some("0"),
+                        |value| {
+                            value.parse::<u64>().map_err(|error| {
+                                format!("invalid read barrier manifest generation: {error}")
+                            })
+                        },
+                    )?,
+                    ui.prompt_optional_parsed(
+                        "Read barrier visible sequence number (optional)",
+                        Some("3"),
+                        |value| {
+                            value.parse::<u64>().map_err(|error| {
+                                format!("invalid read barrier visible sequence number: {error}")
+                            })
+                        },
+                    )?,
+                )?;
             Ok(Action::CollectionStats(CollectionStatsAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 snapshot_manifest_generation,
                 snapshot_visible_seq_no,
+                read_barrier_manifest_generation,
+                read_barrier_visible_seq_no,
             }))
         }
         WorkflowKind::CollectionPlacement => {
@@ -363,6 +386,27 @@ fn action_from_scripted_prompts(
                     },
                 )?,
             )?;
+            let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
+                build_snapshot_fields(
+                    ui.prompt_optional_parsed(
+                        "Read barrier manifest generation (optional)",
+                        Some("0"),
+                        |value| {
+                            value.parse::<u64>().map_err(|error| {
+                                format!("invalid read barrier manifest generation: {error}")
+                            })
+                        },
+                    )?,
+                    ui.prompt_optional_parsed(
+                        "Read barrier visible sequence number (optional)",
+                        Some("3"),
+                        |value| {
+                            value.parse::<u64>().map_err(|error| {
+                                format!("invalid read barrier visible sequence number: {error}")
+                            })
+                        },
+                    )?,
+                )?;
             Ok(Action::Query(QueryAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 top_k,
@@ -373,6 +417,8 @@ fn action_from_scripted_prompts(
                 explain,
                 snapshot_manifest_generation,
                 snapshot_visible_seq_no,
+                read_barrier_manifest_generation,
+                read_barrier_visible_seq_no,
             }))
         }
         WorkflowKind::InspectManifest => Ok(Action::Inspect {
@@ -638,7 +684,7 @@ impl Reporter for ChannelReporter {
 enum TuiEvent {
     Progress(ProgressEvent),
     ActionComplete {
-        action: Action,
+        action: Box<Action>,
         result: Box<anyhow::Result<ActionOutput>>,
         session: Box<SessionContext>,
     },
@@ -834,6 +880,22 @@ impl FormState {
                     false,
                     None,
                 ),
+                number_field(
+                    "read_barrier_manifest_generation",
+                    "Read barrier generation",
+                    "Optional lower-bound manifest generation. Pair with read barrier seq.",
+                    "0",
+                    false,
+                    None,
+                ),
+                number_field(
+                    "read_barrier_visible_seq_no",
+                    "Read barrier seq",
+                    "Optional lower-bound visible sequence number. Pair with read barrier generation.",
+                    "3",
+                    false,
+                    None,
+                ),
             ],
             WorkflowKind::RecordPut => vec![
                 collection_field(
@@ -957,6 +1019,22 @@ impl FormState {
                     "snapshot_visible_seq_no",
                     "Snapshot seq",
                     "Optional historical visible sequence number. Pair with snapshot generation.",
+                    "3",
+                    false,
+                    None,
+                ),
+                number_field(
+                    "read_barrier_manifest_generation",
+                    "Read barrier generation",
+                    "Optional lower-bound manifest generation. Pair with read barrier seq.",
+                    "0",
+                    false,
+                    None,
+                ),
+                number_field(
+                    "read_barrier_visible_seq_no",
+                    "Read barrier seq",
+                    "Optional lower-bound visible sequence number. Pair with read barrier generation.",
                     "3",
                     false,
                     None,
@@ -1172,10 +1250,17 @@ impl FormState {
                         "snapshot_manifest_generation",
                         "snapshot_visible_seq_no",
                     )?;
+                let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
+                    optional_snapshot_pair(
+                        "read_barrier_manifest_generation",
+                        "read_barrier_visible_seq_no",
+                    )?;
                 Ok(Action::CollectionStats(CollectionStatsAction {
                     collection: required_collection("collection")?,
                     snapshot_manifest_generation,
                     snapshot_visible_seq_no,
+                    read_barrier_manifest_generation,
+                    read_barrier_visible_seq_no,
                 }))
             }
             WorkflowKind::CollectionPlacement => Ok(Action::CollectionPlacement(
@@ -1202,6 +1287,11 @@ impl FormState {
                         "snapshot_manifest_generation",
                         "snapshot_visible_seq_no",
                     )?;
+                let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
+                    optional_snapshot_pair(
+                        "read_barrier_manifest_generation",
+                        "read_barrier_visible_seq_no",
+                    )?;
                 Ok(Action::Query(QueryAction {
                     collection: required_collection("collection")?,
                     top_k: required("top_k")?
@@ -1214,6 +1304,8 @@ impl FormState {
                     predicate_json: optional_path("predicate_json")?,
                     snapshot_manifest_generation,
                     snapshot_visible_seq_no,
+                    read_barrier_manifest_generation,
+                    read_barrier_visible_seq_no,
                 }))
             }
             WorkflowKind::InspectManifest => Ok(Action::Inspect {
@@ -1648,7 +1740,7 @@ impl InteractiveApp {
             let result = execute_action(&config, auth_token.as_deref(), &action, &reporter).await;
             let session = load_session_context(&config, auth_token.as_deref()).await;
             let _ = tx.send(TuiEvent::ActionComplete {
-                action,
+                action: Box::new(action),
                 result: Box::new(result),
                 session: Box::new(session),
             });
@@ -1679,6 +1771,7 @@ impl InteractiveApp {
                 result,
                 session,
             } => {
+                let action = *action;
                 self.session.collections = session.collections.clone();
                 self.session.warning = session.warning.clone();
                 self.remember_collection(&action);
@@ -3704,7 +3797,7 @@ mod tests {
         };
 
         app.apply_tui_event(TuiEvent::ActionComplete {
-            action: Action::Status,
+            action: Box::new(Action::Status),
             result: Box::new(Err(anyhow::anyhow!("boom"))),
             session: Box::new(test_session()),
         });
