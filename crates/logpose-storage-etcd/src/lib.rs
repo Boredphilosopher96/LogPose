@@ -41,6 +41,7 @@ pub struct EtcdCatalogStore {
 struct CollectionMetadataRevision {
     assignment_mod_revision: i64,
     descriptor_mod_revision: i64,
+    owner_mod_revision: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -626,6 +627,15 @@ impl EtcdPlacementStore {
         )
     }
 
+    fn shard_owner_key(&self, collection: &CollectionRef, shard_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/collections/{}/shards/{shard_id}/owner",
+            self.key_prefix,
+            self.cluster_name,
+            collection.lookup_name()
+        )
+    }
+
     fn database_descriptor_key(&self, database_name: &str) -> String {
         format!(
             "{}/clusters/{}/databases/{database_name}/descriptor",
@@ -665,16 +675,27 @@ impl EtcdPlacementStore {
         descriptor: &CollectionDescriptor,
         assignment: &CollectionAssignment,
     ) -> Result<CollectionMetadataRevision> {
+        let collection = collection_ref_from_lookup_name(collection_name);
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
+        let owner_key = self.shard_owner_key(&collection, "0");
         let assignment_value = serde_json::to_string(assignment).map_err(json_encode_message)?;
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::pending(descriptor))
                 .map_err(json_encode_message)?;
+        let owner_value = serde_json::to_string(&ShardOwnership {
+            collection,
+            shard_id: "0".to_owned(),
+            owner_node_id: assignment.assigned_node.clone(),
+            epoch: 1,
+            mod_revision: 0,
+        })
+        .map_err(json_encode_message)?;
         let txn = Txn::new()
             .when([
                 Compare::version(assignment_key.clone(), CompareOp::Equal, 0),
                 Compare::version(descriptor_key.clone(), CompareOp::Equal, 0),
+                Compare::version(owner_key.clone(), CompareOp::Equal, 0),
             ])
             .and_then([
                 TxnOp::put(
@@ -687,6 +708,7 @@ impl EtcdPlacementStore {
                     descriptor_value,
                     Some(PutOptions::new()),
                 ),
+                TxnOp::put(owner_key, owner_value, Some(PutOptions::new())),
             ]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
@@ -703,6 +725,7 @@ impl EtcdPlacementStore {
             Ok(CollectionMetadataRevision {
                 assignment_mod_revision: revision,
                 descriptor_mod_revision: revision,
+                owner_mod_revision: revision,
             })
         } else {
             Err(LogPoseError::Message(format!(
@@ -719,6 +742,8 @@ impl EtcdPlacementStore {
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
+        let owner_key =
+            self.shard_owner_key(&collection_ref_from_lookup_name(collection_name), "0");
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::ready(descriptor))
                 .map_err(json_encode_message)?;
@@ -734,6 +759,7 @@ impl EtcdPlacementStore {
                     CompareOp::Equal,
                     revision.descriptor_mod_revision,
                 ),
+                Compare::mod_revision(owner_key, CompareOp::Equal, revision.owner_mod_revision),
             ])
             .and_then([TxnOp::put(
                 descriptor_key,
@@ -776,6 +802,20 @@ impl EtcdPlacementStore {
         Ok(Some(descriptor))
     }
 
+    async fn get_descriptor_with_revision(
+        &self,
+        collection_name: &str,
+    ) -> Result<Option<(StoredCollectionDescriptor, i64)>> {
+        let key = self.descriptor_key(collection_name);
+        let mut client = self.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let descriptor = serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        Ok(Some((descriptor, kv.mod_revision())))
+    }
+
     async fn list_descriptors(&self) -> Result<Vec<StoredCollectionDescriptor>> {
         let mut client = self.client().await?;
         let response = client
@@ -809,6 +849,8 @@ impl EtcdPlacementStore {
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
+        let owner_key =
+            self.shard_owner_key(&collection_ref_from_lookup_name(collection_name), "0");
         let txn = Txn::new()
             .when([
                 Compare::mod_revision(
@@ -821,10 +863,16 @@ impl EtcdPlacementStore {
                     CompareOp::Equal,
                     revision.descriptor_mod_revision,
                 ),
+                Compare::mod_revision(
+                    owner_key.clone(),
+                    CompareOp::Equal,
+                    revision.owner_mod_revision,
+                ),
             ])
             .and_then([
                 TxnOp::delete(assignment_key, Some(DeleteOptions::new())),
                 TxnOp::delete(descriptor_key, Some(DeleteOptions::new())),
+                TxnOp::delete(owner_key, Some(DeleteOptions::new())),
             ]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
@@ -876,6 +924,14 @@ fn canonical_collection_lookup_name(collection_name: &str) -> String {
         format!("{}/{}", parts[0], parts[1])
     } else {
         CollectionRef::new_default(collection_name).lookup_name()
+    }
+}
+
+fn collection_ref_from_lookup_name(collection_name: &str) -> CollectionRef {
+    let canonical = canonical_collection_lookup_name(collection_name);
+    match canonical.split('/').collect::<Vec<_>>().as_slice() {
+        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
+        _ => CollectionRef::new_default(canonical),
     }
 }
 
@@ -1189,6 +1245,18 @@ impl EtcdCoordinationClient {
         new_owner_node_id: &str,
     ) -> Result<PromotionResult> {
         let key = self.shard_owner_key(&current.collection, &current.shard_id);
+        let descriptor_lookup_name = current.collection.lookup_name();
+        let Some((stored_descriptor, descriptor_mod_revision)) = self
+            .store
+            .get_descriptor_with_revision(&descriptor_lookup_name)
+            .await?
+        else {
+            return Ok(PromotionResult::Conflict);
+        };
+        if !stored_descriptor.ready {
+            return Ok(PromotionResult::Conflict);
+        }
+        let descriptor_key = self.store.descriptor_key(&descriptor_lookup_name);
         let mut candidate = ShardOwnership {
             collection: current.collection.clone(),
             shard_id: current.shard_id.clone(),
@@ -1198,11 +1266,10 @@ impl EtcdCoordinationClient {
         };
         let encoded = serde_json::to_string(&candidate).map_err(json_encode_message)?;
         let txn = Txn::new()
-            .when([Compare::mod_revision(
-                key.clone(),
-                CompareOp::Equal,
-                current.mod_revision,
-            )])
+            .when([
+                Compare::mod_revision(key.clone(), CompareOp::Equal, current.mod_revision),
+                Compare::mod_revision(descriptor_key, CompareOp::Equal, descriptor_mod_revision),
+            ])
             .and_then([TxnOp::put(key.clone(), encoded, None)]);
         let mut client = self.store.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;

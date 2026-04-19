@@ -834,6 +834,12 @@ pub struct CollectionPlacement {
     pub assigned_node: String,
     /// Runtime role recorded for the current placement assignment.
     pub assigned_role: NodeRole,
+    /// Active owner node when etcd-backed ownership fencing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node: Option<String>,
+    /// Monotonic ownership epoch when etcd-backed ownership fencing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_epoch: Option<u64>,
     /// Routing family selected for this placement.
     pub route_kind: String,
     /// Human-readable diagnostic reason for the current route.

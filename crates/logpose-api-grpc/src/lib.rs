@@ -792,6 +792,8 @@ fn collection_placement_reply_from_domain(
         collection_name: placement.collection_name,
         assigned_node: placement.assigned_node,
         assigned_role: node_role_to_proto(placement.assigned_role) as i32,
+        owner_node: placement.owner_node,
+        ownership_epoch: placement.ownership_epoch,
         route_kind: placement.route_kind,
         route_reason: placement.route_reason,
         database_name: placement.database_name,
@@ -1671,6 +1673,24 @@ mod tests {
         assert_eq!(placement.assigned_node, "grpc-placement");
         assert_eq!(placement.assigned_role, proto::NodeRole::Data as i32);
         assert_eq!(placement.route_kind, "local");
+    }
+
+    #[test]
+    fn collection_placement_reply_serializes_owner_fields_when_present() {
+        let reply = collection_placement_reply_from_domain(CollectionPlacement {
+            collection_id: logpose_types::CollectionId::default(),
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            assigned_node: "owner-a".to_owned(),
+            assigned_role: NodeRole::Data,
+            owner_node: Some("owner-b".to_owned()),
+            ownership_epoch: Some(2),
+            route_kind: "recorded".to_owned(),
+            route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
+        });
+
+        assert_eq!(reply.owner_node.as_deref(), Some("owner-b"));
+        assert_eq!(reply.ownership_epoch, Some(2));
     }
 
     #[tokio::test]

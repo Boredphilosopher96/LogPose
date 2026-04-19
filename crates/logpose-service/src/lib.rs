@@ -34,7 +34,7 @@ use logpose_query::{QueryError, QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
-use logpose_storage_etcd::{EtcdCoordinationClient, LeadershipLease};
+use logpose_storage_etcd::{EtcdCoordinationClient, LeadershipLease, ShardOwnership};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, CoordinationStatus, LogPoseError, MaintenanceBacklog,
@@ -549,6 +549,7 @@ pub struct LogPoseControlService {
     config: LogPoseConfig,
     build: BuildInfo,
     coordination: CoordinationRuntime,
+    coordination_client: Option<EtcdCoordinationClient>,
 }
 
 impl fmt::Debug for LogPoseControlService {
@@ -580,12 +581,21 @@ impl LogPoseControlService {
         build: BuildInfo,
     ) -> Self {
         let coordination = CoordinationRuntime::new(&config);
+        let coordination_client = if config.metadata.backend == MetadataBackend::Etcd {
+            Some(
+                EtcdCoordinationClient::new(config.metadata.etcd.clone())
+                    .expect("invalid etcd coordination configuration"),
+            )
+        } else {
+            None
+        };
         Self {
             data,
             catalog,
             config,
             build,
             coordination,
+            coordination_client,
         }
     }
 
@@ -680,11 +690,19 @@ impl LogPoseControlService {
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
         let descriptor = self.data.get_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
+        let ownership = self.ownership_for_descriptor(&descriptor).await?;
         let local_collection_available = self
             .data
             .local_collection_matches_descriptor(&descriptor)
             .await?;
-        Ok(self.local_placement(&descriptor, &assignment, local_collection_available))
+        let coordination = self.coordination.snapshot().await;
+        Ok(self.local_placement(
+            &descriptor,
+            &assignment,
+            ownership.as_ref(),
+            local_collection_available,
+            coordination.as_ref(),
+        ))
     }
 
     /// Return aggregated runtime and maintenance status for the local node.
@@ -700,12 +718,18 @@ impl LogPoseControlService {
         let mut local_descriptors = Vec::new();
         for descriptor in &descriptors {
             let assignment = self.assignment_for_descriptor(descriptor).await?;
+            let ownership = self.ownership_for_descriptor(descriptor).await?;
             let local_collection_available = self
                 .data
                 .local_collection_matches_descriptor(descriptor)
                 .await?;
-            let placement =
-                self.local_placement(descriptor, &assignment, local_collection_available);
+            let placement = self.local_placement(
+                descriptor,
+                &assignment,
+                ownership.as_ref(),
+                local_collection_available,
+                coordination.as_ref(),
+            );
             if placement.route_kind == "local" {
                 local_descriptors.push(descriptor);
             }
@@ -793,24 +817,68 @@ impl LogPoseControlService {
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
         assignment: &CollectionAssignment,
+        ownership: Option<&ShardOwnership>,
         local_collection_available: bool,
+        coordination: Option<&CoordinationStatus>,
     ) -> CollectionPlacement {
+        let owner_node = ownership.map(|ownership| ownership.owner_node_id.clone());
+        let ownership_epoch = ownership.map(|ownership| ownership.epoch);
+        if let Some(ownership) = ownership {
+            let owner_targets_this_runtime = ownership.owner_node_id == self.config.node_name;
+            let local_membership_ready = coordination
+                .map(|coordination| coordination.membership_registered)
+                .unwrap_or(true);
+            let serves_local_assignment = owner_targets_this_runtime
+                && local_collection_available
+                && local_membership_ready
+                && self.role_can_serve_assignment(assignment.assigned_role);
+            let route_kind = if serves_local_assignment {
+                "local"
+            } else {
+                "recorded"
+            };
+            return CollectionPlacement {
+                collection_id: descriptor.collection_id.clone(),
+                database_name: descriptor.database_name.clone(),
+                collection_name: descriptor.name.clone(),
+                assigned_node: assignment.assigned_node.clone(),
+                assigned_role: assignment.assigned_role,
+                owner_node,
+                ownership_epoch,
+                route_kind: route_kind.to_owned(),
+                route_reason: if serves_local_assignment {
+                    format!(
+                        "ownership epoch {} is active on this runtime",
+                        ownership.epoch
+                    )
+                } else if owner_targets_this_runtime && !local_collection_available {
+                    format!(
+                        "ownership epoch {} targets this runtime but local collection state is absent",
+                        ownership.epoch
+                    )
+                } else if owner_targets_this_runtime && !local_membership_ready {
+                    format!(
+                        "ownership epoch {} targets this runtime but the local membership lease is not active",
+                        ownership.epoch
+                    )
+                } else if owner_targets_this_runtime {
+                    format!(
+                        "ownership epoch {} targets this runtime but role '{}' cannot serve it from '{}'",
+                        ownership.epoch, assignment.assigned_role, self.config.node_role
+                    )
+                } else {
+                    format!(
+                        "ownership epoch {} is assigned to node '{}'",
+                        ownership.epoch, ownership.owner_node_id
+                    )
+                },
+            };
+        }
         let assignment_targets_this_runtime = assignment.assigned_node == self.config.node_name
             || assignment.assigned_node == ANONYMOUS_LOCAL_NODE_NAME;
         let serves_local_assignment = assignment_targets_this_runtime
             && local_collection_available
-            && match assignment.assigned_role {
-                NodeRole::Combined => self.config.node_role == NodeRole::Combined,
-                NodeRole::Control => {
-                    matches!(
-                        self.config.node_role,
-                        NodeRole::Combined | NodeRole::Control
-                    )
-                }
-                NodeRole::Data => {
-                    matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data)
-                }
-            };
+            && self.role_can_serve_assignment(assignment.assigned_role);
         let route_kind = if serves_local_assignment {
             "local"
         } else {
@@ -822,6 +890,8 @@ impl LogPoseControlService {
             collection_name: descriptor.name.clone(),
             assigned_node: assignment.assigned_node.clone(),
             assigned_role: assignment.assigned_role,
+            owner_node,
+            ownership_epoch,
             route_kind: route_kind.to_owned(),
             route_reason: match (
                 serves_local_assignment,
@@ -917,6 +987,83 @@ impl LogPoseControlService {
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
         self.data.collection_assignment_descriptor(descriptor).await
+    }
+
+    async fn ownership_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<Option<ShardOwnership>> {
+        let Some(client) = &self.coordination_client else {
+            return Ok(None);
+        };
+        client
+            .shard_owner(
+                &CollectionRef::new(descriptor.database_name.clone(), descriptor.name.clone()),
+                "0",
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Require this runtime to own the active write path for one collection.
+    pub async fn require_local_write_ownership(&self, collection_name: &str) -> Result<()> {
+        if !matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data) {
+            return Err(ServiceError::InvalidArgument(format!(
+                "node '{}' is running as '{}' and cannot accept data-plane operations",
+                self.config.node_name, self.config.node_role
+            )));
+        }
+        let descriptor = self.data.get_collection(collection_name).await?;
+        let assignment = self.assignment_for_descriptor(&descriptor).await?;
+        let ownership = self.ownership_for_descriptor(&descriptor).await?;
+        let local_collection_available = self
+            .data
+            .local_collection_matches_descriptor(&descriptor)
+            .await?;
+        let coordination = self.coordination.snapshot().await;
+        if self.coordination_client.is_some() && ownership.is_none() {
+            return Err(ServiceError::InvalidArgument(format!(
+                "collection '{}/{}' has no authoritative shard ownership metadata and cannot accept writes until reconciliation completes",
+                descriptor.database_name, descriptor.name
+            )));
+        }
+        let placement = self.local_placement(
+            &descriptor,
+            &assignment,
+            ownership.as_ref(),
+            local_collection_available,
+            coordination.as_ref(),
+        );
+        if placement.route_kind == "local"
+            && matches!(placement.assigned_role, NodeRole::Combined | NodeRole::Data)
+        {
+            return Ok(());
+        }
+        let routed_node = placement
+            .owner_node
+            .clone()
+            .unwrap_or_else(|| placement.assigned_node.clone());
+        Err(ServiceError::InvalidArgument(format!(
+            "collection '{}/{}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
+            descriptor.database_name,
+            descriptor.name,
+            routed_node,
+            placement.assigned_role,
+            self.config.node_name
+        )))
+    }
+
+    fn role_can_serve_assignment(&self, assigned_role: NodeRole) -> bool {
+        match assigned_role {
+            NodeRole::Combined => self.config.node_role == NodeRole::Combined,
+            NodeRole::Control => {
+                matches!(
+                    self.config.node_role,
+                    NodeRole::Combined | NodeRole::Control
+                )
+            }
+            NodeRole::Data => matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data),
+        }
     }
 
     /// Require this runtime to hold the active etcd-backed control-plane leadership.

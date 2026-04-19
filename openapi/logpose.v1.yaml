@@ -816,6 +816,12 @@ components:
           type: string
         assigned_role:
           $ref: "#/components/schemas/NodeRole"
+        owner_node:
+          type: string
+          nullable: true
+        ownership_epoch:
+          type: integer
+          nullable: true
         route_kind:
           type: string
         route_reason:

@@ -778,6 +778,8 @@ fn collection_placement_from_proto(reply: CollectionPlacementReply) -> Result<Co
         collection_name: reply.collection_name,
         assigned_node: reply.assigned_node,
         assigned_role: node_role_from_proto(reply.assigned_role)?,
+        owner_node: reply.owner_node,
+        ownership_epoch: reply.ownership_epoch,
         route_kind: reply.route_kind,
         route_reason: reply.route_reason,
     })
@@ -1377,5 +1379,24 @@ mod tests {
         );
         assert!(coordination.is_local_leader);
         assert_eq!(coordination.last_error.as_deref(), Some("warn"));
+    }
+
+    #[test]
+    fn collection_placement_from_proto_reads_owner_fields() {
+        let placement = collection_placement_from_proto(proto::CollectionPlacementReply {
+            collection_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            assigned_node: "owner-a".to_owned(),
+            assigned_role: proto::NodeRole::Data as i32,
+            owner_node: Some("owner-b".to_owned()),
+            ownership_epoch: Some(2),
+            route_kind: "recorded".to_owned(),
+            route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
+        })
+        .expect("placement should decode");
+
+        assert_eq!(placement.owner_node.as_deref(), Some("owner-b"));
+        assert_eq!(placement.ownership_epoch, Some(2));
     }
 }
