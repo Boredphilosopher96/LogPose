@@ -1,13 +1,16 @@
 //! Manual coordination smoke probe for a local etcd-backed LogPose cluster.
 
+use anyhow as _;
 use async_trait as _;
+use clap as _;
 use etcd_client::Client;
 use logpose_auth as _;
-use logpose_catalog as _;
+use logpose_catalog::CollectionDescriptor;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult, ShardOwnership};
-use logpose_types::{CollectionRef, EtcdMetadataConfig};
+use logpose_types::{CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig};
 use serde as _;
+use std::path::Path;
 use std::time::Duration;
 
 #[tokio::main]
@@ -20,8 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let cluster_name =
         std::env::var("LOGPOSE_ETCD_CLUSTER").unwrap_or_else(|_| "chaos-local".to_owned());
+    let key_prefix =
+        std::env::var("LOGPOSE_ETCD_KEY_PREFIX").unwrap_or_else(|_| "/logpose/metadata".to_owned());
     let config = EtcdMetadataConfig {
         endpoints: endpoints.clone(),
+        key_prefix: key_prefix.trim_end_matches('/').to_owned(),
         cluster_name: cluster_name.clone(),
         ..EtcdMetadataConfig::default()
     };
@@ -30,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_prefix = format!("{}/clusters/{}", config.key_prefix, config.cluster_name);
 
     raw.delete(
-        cluster_prefix.clone(),
+        format!("{cluster_prefix}/"),
         Some(etcd_client::DeleteOptions::new().with_prefix()),
     )
     .await?;
@@ -41,8 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_b = client
         .register_membership("node-b", logpose_types::NodeRole::Data)
         .await?;
+    let node_c = client
+        .register_membership("node-c", logpose_types::NodeRole::Data)
+        .await?;
     client.keep_alive(node_a.lease_id).await?;
     client.keep_alive(node_b.lease_id).await?;
+    client.keep_alive(node_c.lease_id).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let members = client.list_membership().await?;
@@ -57,10 +67,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("node-b leadership attempt: {second_leader:#?}");
 
     let collection = CollectionRef::new_default("chaos");
+    let descriptor = CollectionDescriptor::new("chaos", 2, DistanceMetric::Dot, Path::new("/tmp"))
+        .without_root_path();
+    let assignment = CollectionAssignment {
+        assigned_node: "node-a".to_owned(),
+        assigned_role: logpose_types::NodeRole::Combined,
+    };
+    let assignment_key = format!(
+        "{cluster_prefix}/collections/{}/assignment",
+        collection.lookup_name()
+    );
+    let descriptor_key = format!(
+        "{cluster_prefix}/collections/{}/descriptor",
+        collection.lookup_name()
+    );
     let shard_key = format!(
         "{cluster_prefix}/collections/{}/shards/0/owner",
         collection.lookup_name()
     );
+    raw.put(assignment_key, serde_json::to_string(&assignment)?, None)
+        .await?;
+    raw.put(
+        descriptor_key,
+        serde_json::json!({
+            "descriptor": descriptor,
+            "ready": true,
+        })
+        .to_string(),
+        None,
+    )
+    .await?;
     let seed = ShardOwnership {
         collection: collection.clone(),
         shard_id: "0".to_owned(),

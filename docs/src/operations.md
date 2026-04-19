@@ -35,6 +35,17 @@ The runtime boundary is explicit today:
 
 Operator-facing query diagnostics now include ANN-aware plan kinds, candidate generation and rerank timings, merge accounting, and fallback reasons. Query-unit artifact and component statistics are surfaced through collection stats and inspect outputs. Together, those surfaces make explain/profile and storage introspection part of the normal operational workflow rather than debugging-only escape hatches.
 
+## Local Podman Chaos
+
+PR4's local multi-node chaos workflow is documented in [Podman
+Chaos](./podman-chaos.md). That page covers the three-node Podman topology, the
+repo-owned shell contract checks, the etcd helper used for ownership races, and
+the exact invariants each scenario must preserve.
+
+One rule matters for every failover drill today: LogPose still has no public
+REST, gRPC, or CLI API for shard promotion. Ownership moves in the Podman chaos
+lab must use a helper or example instead of a normal operator endpoint.
+
 ## Current Limits
 
 Operationally, LogPose is still earlier than a distributed database:

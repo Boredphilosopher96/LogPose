@@ -81,6 +81,12 @@ Process-boundary tests sit between local harnesses and true full-system simulati
 
 This layer already exists in LogPose through CLI server fixtures and snapshot contracts. It should keep growing as operator-facing surfaces become more important.
 
+The local Podman chaos workflow documented in [Podman Chaos](./podman-chaos.md)
+belongs in this layer. It uses real etcd-backed runtimes, real readiness and
+placement surfaces, and explicit failover invariants. Because LogPose still
+lacks a public shard-promotion API, ownership moves in that workflow remain
+helper-driven rather than endpoint-driven.
+
 ### 5. Targeted Fuzzing and Property Tests
 
 The next deepening layer after those generative harnesses is subsystem fuzzing and property-style verification.
