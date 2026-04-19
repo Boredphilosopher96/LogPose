@@ -60,7 +60,7 @@ The harness brings up one Podman network, three etcd members, and three
 LogPose nodes:
 
 | Component | Count | Published ports | Purpose |
-|-----------|-------|-----------------|---------|
+| --------- | ----- | --------------- | ------- |
 | `etcd-1` | 1 | `2379 -> 2379` | cluster metadata quorum member |
 | `etcd-2` | 1 | `22379 -> 2379` | cluster metadata quorum member |
 | `etcd-3` | 1 | `32379 -> 2379` | cluster metadata quorum member |

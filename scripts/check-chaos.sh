@@ -42,7 +42,8 @@ assert_line() {
     fi
 }
 
-bash -n "$chaos_script" "$self_script"
+bash -n "$chaos_script"
+bash -n "$self_script"
 
 help_output="$("$chaos_script" help)"
 assert_contains "$help_output" "bootstrap"
