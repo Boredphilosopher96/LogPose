@@ -820,6 +820,7 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
                 assigned_node: "local-control-assignment".to_owned(),
                 assigned_role: logpose_types::NodeRole::Control,
             },
+            None,
         )
         .await
         .expect("collection should be created");

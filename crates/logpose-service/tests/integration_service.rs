@@ -397,6 +397,48 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
 }
 
 #[tokio::test]
+async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
+    let root = unique_temp_dir("service-query-read-barrier-conflict");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let error = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: Some(Snapshot {
+                manifest_generation: 0,
+                visible_seq_no: 0,
+            }),
+            read_barrier: Some(Snapshot {
+                manifest_generation: 0,
+                visible_seq_no: 0,
+            }),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect_err("snapshot and read barrier should conflict");
+
+    assert!(matches!(
+        error,
+        ServiceError::InvalidArgument(message)
+            if message.contains("snapshot and read_barrier cannot be provided together")
+    ));
+}
+
+#[tokio::test]
 async fn service_stats_read_barrier_advances_to_latest_snapshot() {
     let root = unique_temp_dir("service-stats-read-barrier-advances");
     let service = LogPoseDataService::local(&root);

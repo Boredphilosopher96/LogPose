@@ -16,9 +16,9 @@ use logpose_index::{
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError,
-    MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId,
-    Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DistanceMetric, LeadershipFence,
+    LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
+    RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
 use serde::{Deserialize, Serialize};
@@ -60,9 +60,11 @@ pub trait StorageEngine: Send + Sync {
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
+        leader_fence: Option<LeadershipFence>,
     ) -> Result<CollectionDescriptor> {
         let _ = request;
         let _ = assignment;
+        let _ = leader_fence;
         Err(LogPoseError::Message(
             "persisted collection assignments are not supported by this storage engine".to_owned(),
         ))
@@ -1743,6 +1745,7 @@ impl StorageEngine for LocalStorageEngine {
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
+        _leader_fence: Option<LeadershipFence>,
     ) -> Result<CollectionDescriptor> {
         self.create_collection_internal(request, Some(&assignment))
     }

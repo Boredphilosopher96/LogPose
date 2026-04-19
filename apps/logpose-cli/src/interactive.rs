@@ -154,9 +154,16 @@ fn action_from_scripted_prompts(
     session: &SessionContext,
 ) -> anyhow::Result<Action> {
     let build_snapshot_fields = |manifest_generation: Option<u64>,
-                                 visible_seq_no: Option<u64>|
+                                 visible_seq_no: Option<u64>,
+                                 manifest_label: &str,
+                                 visible_label: &str|
      -> anyhow::Result<(Option<u64>, Option<u64>)> {
-        validate_snapshot_pair(manifest_generation, visible_seq_no)?;
+        validate_snapshot_pair(
+            manifest_generation,
+            visible_seq_no,
+            manifest_label,
+            visible_label,
+        )?;
         Ok((manifest_generation, visible_seq_no))
     };
     match workflow {
@@ -216,6 +223,8 @@ fn action_from_scripted_prompts(
                         })
                     },
                 )?,
+                "snapshot_manifest_generation",
+                "snapshot_visible_seq_no",
             )?;
             let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
                 build_snapshot_fields(
@@ -237,7 +246,15 @@ fn action_from_scripted_prompts(
                             })
                         },
                     )?,
+                    "read_barrier_manifest_generation",
+                    "read_barrier_visible_seq_no",
                 )?;
+            validate_snapshot_and_read_barrier(
+                snapshot_manifest_generation,
+                snapshot_visible_seq_no,
+                read_barrier_manifest_generation,
+                read_barrier_visible_seq_no,
+            )?;
             Ok(Action::CollectionStats(CollectionStatsAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 snapshot_manifest_generation,
@@ -385,6 +402,8 @@ fn action_from_scripted_prompts(
                         })
                     },
                 )?,
+                "snapshot_manifest_generation",
+                "snapshot_visible_seq_no",
             )?;
             let (read_barrier_manifest_generation, read_barrier_visible_seq_no) =
                 build_snapshot_fields(
@@ -406,7 +425,15 @@ fn action_from_scripted_prompts(
                             })
                         },
                     )?,
+                    "read_barrier_manifest_generation",
+                    "read_barrier_visible_seq_no",
                 )?;
+            validate_snapshot_and_read_barrier(
+                snapshot_manifest_generation,
+                snapshot_visible_seq_no,
+                read_barrier_manifest_generation,
+                read_barrier_visible_seq_no,
+            )?;
             Ok(Action::Query(QueryAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 top_k,
@@ -883,7 +910,7 @@ impl FormState {
                 number_field(
                     "read_barrier_manifest_generation",
                     "Read barrier generation",
-                    "Optional lower-bound manifest generation. Pair with read barrier seq.",
+                    "Optional lower-bound manifest generation on the current owner. Pair with read barrier seq. Promoted owners reject read barriers until freshness metadata exists.",
                     "0",
                     false,
                     None,
@@ -891,7 +918,7 @@ impl FormState {
                 number_field(
                     "read_barrier_visible_seq_no",
                     "Read barrier seq",
-                    "Optional lower-bound visible sequence number. Pair with read barrier generation.",
+                    "Optional lower-bound visible sequence number on the current owner. Pair with read barrier generation. Promoted owners reject read barriers until freshness metadata exists.",
                     "3",
                     false,
                     None,
@@ -1026,7 +1053,7 @@ impl FormState {
                 number_field(
                     "read_barrier_manifest_generation",
                     "Read barrier generation",
-                    "Optional lower-bound manifest generation. Pair with read barrier seq.",
+                    "Optional lower-bound manifest generation on the current owner. Pair with read barrier seq. Promoted owners reject read barriers until freshness metadata exists.",
                     "0",
                     false,
                     None,
@@ -1034,7 +1061,7 @@ impl FormState {
                 number_field(
                     "read_barrier_visible_seq_no",
                     "Read barrier seq",
-                    "Optional lower-bound visible sequence number. Pair with read barrier generation.",
+                    "Optional lower-bound visible sequence number on the current owner. Pair with read barrier generation. Promoted owners reject read barriers until freshness metadata exists.",
                     "3",
                     false,
                     None,
@@ -1210,25 +1237,26 @@ impl FormState {
             }
             Ok(Some(resolve_user_path(cwd, value)))
         };
-        let optional_snapshot_pair =
-            |generation_key: &str, seq_key: &str| -> anyhow::Result<(Option<u64>, Option<u64>)> {
-                let manifest_generation = optional(generation_key)?
-                    .map(|value| {
-                        value
-                            .parse::<u64>()
-                            .context("snapshot_manifest_generation must be a non-negative integer")
-                    })
-                    .transpose()?;
-                let visible_seq_no = optional(seq_key)?
-                    .map(|value| {
-                        value
-                            .parse::<u64>()
-                            .context("snapshot_visible_seq_no must be a non-negative integer")
-                    })
-                    .transpose()?;
-                validate_snapshot_pair(manifest_generation, visible_seq_no)?;
-                Ok((manifest_generation, visible_seq_no))
-            };
+        let optional_snapshot_pair = |generation_key: &str,
+                                      seq_key: &str|
+         -> anyhow::Result<(Option<u64>, Option<u64>)> {
+            let manifest_generation = optional(generation_key)?
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .context(format!("{generation_key} must be a non-negative integer"))
+                })
+                .transpose()?;
+            let visible_seq_no = optional(seq_key)?
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .context(format!("{seq_key} must be a non-negative integer"))
+                })
+                .transpose()?;
+            validate_snapshot_pair(manifest_generation, visible_seq_no, generation_key, seq_key)?;
+            Ok((manifest_generation, visible_seq_no))
+        };
 
         match self.workflow {
             WorkflowKind::CollectionCreate => {
@@ -1255,6 +1283,12 @@ impl FormState {
                         "read_barrier_manifest_generation",
                         "read_barrier_visible_seq_no",
                     )?;
+                validate_snapshot_and_read_barrier(
+                    snapshot_manifest_generation,
+                    snapshot_visible_seq_no,
+                    read_barrier_manifest_generation,
+                    read_barrier_visible_seq_no,
+                )?;
                 Ok(Action::CollectionStats(CollectionStatsAction {
                     collection: required_collection("collection")?,
                     snapshot_manifest_generation,
@@ -1292,6 +1326,12 @@ impl FormState {
                         "read_barrier_manifest_generation",
                         "read_barrier_visible_seq_no",
                     )?;
+                validate_snapshot_and_read_barrier(
+                    snapshot_manifest_generation,
+                    snapshot_visible_seq_no,
+                    read_barrier_manifest_generation,
+                    read_barrier_visible_seq_no,
+                )?;
                 Ok(Action::Query(QueryAction {
                     collection: required_collection("collection")?,
                     top_k: required("top_k")?
@@ -1333,13 +1373,28 @@ impl FormState {
 fn validate_snapshot_pair(
     manifest_generation: Option<u64>,
     visible_seq_no: Option<u64>,
+    manifest_label: &str,
+    visible_label: &str,
 ) -> anyhow::Result<()> {
     match (manifest_generation, visible_seq_no) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
-        _ => bail!(
-            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
-        ),
+        _ => bail!("{manifest_label} and {visible_label} must be provided together"),
     }
+}
+
+fn validate_snapshot_and_read_barrier(
+    snapshot_manifest_generation: Option<u64>,
+    snapshot_visible_seq_no: Option<u64>,
+    read_barrier_manifest_generation: Option<u64>,
+    read_barrier_visible_seq_no: Option<u64>,
+) -> anyhow::Result<()> {
+    let snapshot = snapshot_manifest_generation.is_some() || snapshot_visible_seq_no.is_some();
+    let read_barrier =
+        read_barrier_manifest_generation.is_some() || read_barrier_visible_seq_no.is_some();
+    if snapshot && read_barrier {
+        bail!("snapshot fields and read barrier fields cannot be provided together");
+    }
+    Ok(())
 }
 
 struct InteractiveApp {
@@ -3693,6 +3748,144 @@ mod tests {
         assert!(error.to_string().contains(
             "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
         ));
+    }
+
+    #[test]
+    fn query_form_rejects_partial_read_barrier_pair() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            top_k: Some(1),
+            vector: Some(crate::action::QueryVector(vec![1.0, 0.0])),
+            ..empty_args()
+        };
+        let mut form =
+            FormState::from_workflow(WorkflowKind::Query, &args, Path::new("."), &test_session())
+                .expect("query form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_manifest_generation")
+            .expect("read barrier generation field")
+            .value = "7".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("partial read barrier pair should be rejected");
+        assert!(error.to_string().contains(
+            "read_barrier_manifest_generation and read_barrier_visible_seq_no must be provided together"
+        ));
+    }
+
+    #[test]
+    fn query_form_rejects_mixing_snapshot_and_read_barrier() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            top_k: Some(1),
+            vector: Some(crate::action::QueryVector(vec![1.0, 0.0])),
+            ..empty_args()
+        };
+        let mut form =
+            FormState::from_workflow(WorkflowKind::Query, &args, Path::new("."), &test_session())
+                .expect("query form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_manifest_generation")
+            .expect("snapshot generation field")
+            .value = "1".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_visible_seq_no")
+            .expect("snapshot seq field")
+            .value = "2".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_manifest_generation")
+            .expect("read barrier generation field")
+            .value = "1".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_visible_seq_no")
+            .expect("read barrier seq field")
+            .value = "2".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("snapshot and read barrier should conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot fields and read barrier fields cannot be provided together")
+        );
+    }
+
+    #[test]
+    fn collection_stats_form_rejects_partial_read_barrier_pair() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            ..empty_args()
+        };
+        let mut form = FormState::from_workflow(
+            WorkflowKind::CollectionStats,
+            &args,
+            Path::new("."),
+            &test_session(),
+        )
+        .expect("collection stats form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_visible_seq_no")
+            .expect("read barrier seq field")
+            .value = "9".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("partial read barrier pair should be rejected");
+        assert!(error.to_string().contains(
+            "read_barrier_manifest_generation and read_barrier_visible_seq_no must be provided together"
+        ));
+    }
+
+    #[test]
+    fn collection_stats_form_rejects_mixing_snapshot_and_read_barrier() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            ..empty_args()
+        };
+        let mut form = FormState::from_workflow(
+            WorkflowKind::CollectionStats,
+            &args,
+            Path::new("."),
+            &test_session(),
+        )
+        .expect("collection stats form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_manifest_generation")
+            .expect("snapshot generation field")
+            .value = "1".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_visible_seq_no")
+            .expect("snapshot seq field")
+            .value = "2".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_manifest_generation")
+            .expect("read barrier generation field")
+            .value = "1".to_owned();
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "read_barrier_visible_seq_no")
+            .expect("read barrier seq field")
+            .value = "2".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("snapshot and read barrier should conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot fields and read barrier fields cannot be provided together")
+        );
     }
 
     #[test]

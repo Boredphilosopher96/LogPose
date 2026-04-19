@@ -12,8 +12,8 @@ use logpose_storage::{
 };
 use logpose_types::{
     AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
-    CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LogPoseError, MaintenanceStatus,
-    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError,
+    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,7 +98,12 @@ impl EtcdCatalogStore {
     }
 
     /// Create or replace one database descriptor in shared metadata.
-    pub async fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+    pub async fn put_database(
+        &self,
+        descriptor: DatabaseDescriptor,
+        leader_node_id: &str,
+        leader_lease_id: i64,
+    ) -> Result<DatabaseDescriptor> {
         let mut descriptor = descriptor;
         descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
         match self.get_database(&descriptor.name).await {
@@ -111,22 +116,37 @@ impl EtcdCatalogStore {
         descriptor.validate()?;
         let key = self.etcd.database_descriptor_key(&descriptor.name);
         let value = serde_json::to_string(&descriptor).map_err(json_encode_message)?;
+        let leadership_key = self.etcd.leadership_key();
+        let leadership_value = self
+            .etcd
+            .leadership_value(leader_node_id, leader_lease_id)?;
+        let txn = Txn::new()
+            .when([Compare::value(
+                leadership_key,
+                CompareOp::Equal,
+                leadership_value,
+            )])
+            .and_then([TxnOp::put(key, value, Some(PutOptions::new()))]);
         let mut client = self.etcd.client().await?;
-        client
-            .put(key, value, Some(PutOptions::new()))
-            .await
-            .map_err(etcd_message)?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{leader_node_id}' is not the active control-plane leader"
+            )));
+        }
         Ok(descriptor)
     }
 
     /// Read one shared database descriptor.
     pub async fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
         validate_database_name(database_name)?;
-        self.ensure_default_database_descriptor().await?;
         let key = self.etcd.database_descriptor_key(database_name);
         let mut client = self.etcd.client().await?;
         let response = client.get(key, None).await.map_err(etcd_message)?;
         let Some(kv) = response.kvs().first() else {
+            if database_name == DEFAULT_DATABASE_NAME {
+                return Ok(DatabaseDescriptor::new(DEFAULT_DATABASE_NAME));
+            }
             return Err(LogPoseError::Message(format!(
                 "database '{database_name}' does not exist"
             )));
@@ -139,7 +159,6 @@ impl EtcdCatalogStore {
 
     /// List all shared database descriptors.
     pub async fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.ensure_default_database_descriptor().await?;
         let mut client = self.etcd.client().await?;
         let response = client
             .get(
@@ -164,6 +183,12 @@ impl EtcdCatalogStore {
                 serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
             descriptor.validate()?;
             descriptors.push(descriptor);
+        }
+        if !descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == DEFAULT_DATABASE_NAME)
+        {
+            descriptors.push(DatabaseDescriptor::new(DEFAULT_DATABASE_NAME));
         }
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(descriptors)
@@ -234,16 +259,31 @@ impl EtcdCatalogStore {
     pub async fn put_database_access_policy(
         &self,
         policy: DatabaseAccessPolicy,
+        leader_node_id: &str,
+        leader_lease_id: i64,
     ) -> Result<DatabaseAccessPolicy> {
         policy.validate().map_err(string_message)?;
         self.get_database(&policy.database_name).await?;
         let key = self.etcd.database_policy_key(&policy.database_name);
         let value = serde_json::to_string(&policy).map_err(json_encode_message)?;
+        let leadership_key = self.etcd.leadership_key();
+        let leadership_value = self
+            .etcd
+            .leadership_value(leader_node_id, leader_lease_id)?;
+        let txn = Txn::new()
+            .when([Compare::value(
+                leadership_key,
+                CompareOp::Equal,
+                leadership_value,
+            )])
+            .and_then([TxnOp::put(key, value, Some(PutOptions::new()))]);
         let mut client = self.etcd.client().await?;
-        client
-            .put(key, value, Some(PutOptions::new()))
-            .await
-            .map_err(etcd_message)?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{leader_node_id}' is not the active control-plane leader"
+            )));
+        }
         Ok(policy)
     }
 
@@ -265,18 +305,6 @@ impl EtcdCatalogStore {
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
         policy.validate().map_err(string_message)?;
         Ok(policy)
-    }
-
-    async fn ensure_default_database_descriptor(&self) -> Result<()> {
-        let descriptor = DatabaseDescriptor::new(DEFAULT_DATABASE_NAME);
-        let key = self.etcd.database_descriptor_key(DEFAULT_DATABASE_NAME);
-        let value = serde_json::to_string(&descriptor).map_err(json_encode_message)?;
-        let txn = Txn::new()
-            .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
-            .and_then([TxnOp::put(key, value, Some(PutOptions::new()))]);
-        let mut client = self.etcd.client().await?;
-        client.txn(txn).await.map_err(etcd_message)?;
-        Ok(())
     }
 }
 
@@ -304,7 +332,14 @@ impl StorageEngine for EtcdBackedStorageEngine {
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
+        leader_fence: Option<LeadershipFence>,
     ) -> Result<CollectionDescriptor> {
+        let leader_fence = leader_fence.ok_or_else(|| {
+            LogPoseError::Message(
+                "etcd-backed collection creation requires a control-plane leadership fence"
+                    .to_owned(),
+            )
+        })?;
         let collection_name = request.lookup_name();
         if self.local.open_collection(&collection_name).await.is_ok() {
             return Err(LogPoseError::Message(format!(
@@ -315,7 +350,12 @@ impl StorageEngine for EtcdBackedStorageEngine {
         let descriptor = self.local.plan_collection_descriptor(&request)?;
         let metadata_revision = match self
             .etcd
-            .put_collection_metadata_if_absent(&collection_name, &descriptor, &assignment)
+            .put_collection_metadata_if_absent(
+                &collection_name,
+                &descriptor,
+                &assignment,
+                &leader_fence,
+            )
             .await
         {
             Ok(revision) => revision,
@@ -352,6 +392,7 @@ impl StorageEngine for EtcdBackedStorageEngine {
                         &collection_name,
                         &descriptor,
                         metadata_revision,
+                        &leader_fence,
                     )
                     .await?;
                 Ok(local_descriptor)
@@ -636,6 +677,21 @@ impl EtcdPlacementStore {
         )
     }
 
+    fn leadership_key(&self) -> String {
+        format!(
+            "{}/clusters/{}/controllers/leader",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn leadership_value(&self, node_id: &str, lease_id: i64) -> Result<String> {
+        serde_json::to_string(&LeadershipRecord {
+            node_id: node_id.to_owned(),
+            lease_id,
+        })
+        .map_err(json_encode_message)
+    }
+
     fn database_descriptor_key(&self, database_name: &str) -> String {
         format!(
             "{}/clusters/{}/databases/{database_name}/descriptor",
@@ -674,6 +730,7 @@ impl EtcdPlacementStore {
         collection_name: &str,
         descriptor: &CollectionDescriptor,
         assignment: &CollectionAssignment,
+        leader_fence: &LeadershipFence,
     ) -> Result<CollectionMetadataRevision> {
         let collection = collection_ref_from_lookup_name(collection_name);
         let assignment_key = self.assignment_key(collection_name);
@@ -683,6 +740,9 @@ impl EtcdPlacementStore {
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::pending(descriptor))
                 .map_err(json_encode_message)?;
+        let leadership_key = self.leadership_key();
+        let leadership_value =
+            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
         let owner_value = serde_json::to_string(&ShardOwnership {
             collection,
             shard_id: "0".to_owned(),
@@ -693,6 +753,7 @@ impl EtcdPlacementStore {
         .map_err(json_encode_message)?;
         let txn = Txn::new()
             .when([
+                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
                 Compare::version(assignment_key.clone(), CompareOp::Equal, 0),
                 Compare::version(descriptor_key.clone(), CompareOp::Equal, 0),
                 Compare::version(owner_key.clone(), CompareOp::Equal, 0),
@@ -739,6 +800,7 @@ impl EtcdPlacementStore {
         collection_name: &str,
         descriptor: &CollectionDescriptor,
         revision: CollectionMetadataRevision,
+        leader_fence: &LeadershipFence,
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
@@ -747,8 +809,12 @@ impl EtcdPlacementStore {
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::ready(descriptor))
                 .map_err(json_encode_message)?;
+        let leadership_key = self.leadership_key();
+        let leadership_value =
+            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
         let txn = Txn::new()
             .when([
+                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
                 Compare::mod_revision(
                     assignment_key.clone(),
                     CompareOp::Equal,
@@ -995,6 +1061,8 @@ pub struct LeadershipLease {
 pub struct MembershipRecord {
     /// Node identifier registered in metadata.
     pub node_id: String,
+    /// Runtime role advertised by the member.
+    pub node_role: logpose_types::NodeRole,
     /// Node state marker used by control loops.
     pub state: String,
 }
@@ -1004,6 +1072,8 @@ pub struct MembershipRecord {
 pub struct LeadershipRecord {
     /// Current leader node identifier.
     pub node_id: String,
+    /// Active etcd lease backing the current leadership claim.
+    pub lease_id: i64,
 }
 
 /// Shard ownership record used for epoch-based write fencing.
@@ -1057,13 +1127,18 @@ impl EtcdCoordinationClient {
     }
 
     /// Register node membership with an etcd lease.
-    pub async fn register_membership(&self, node_id: &str) -> Result<MembershipLease> {
+    pub async fn register_membership(
+        &self,
+        node_id: &str,
+        node_role: logpose_types::NodeRole,
+    ) -> Result<MembershipLease> {
         let membership_key = format!(
             "{}/clusters/{}/members/{node_id}",
             self.store.key_prefix, self.config.cluster_name
         );
         let payload = serde_json::json!({
             "node_id": node_id,
+            "node_role": node_role,
             "state": "ready",
         });
         let encoded = serde_json::to_string(&payload).map_err(json_encode_message)?;
@@ -1126,16 +1201,17 @@ impl EtcdCoordinationClient {
             "{}/clusters/{}/controllers/leader",
             self.store.key_prefix, self.config.cluster_name
         );
-        let payload = serde_json::json!({
-            "node_id": node_id,
-        });
-        let encoded = serde_json::to_string(&payload).map_err(json_encode_message)?;
         let mut client = self.store.client().await?;
         let lease = client
             .lease_grant(self.config.leadership_ttl_secs, None)
             .await
             .map_err(etcd_message)?;
         let lease_id = lease.id();
+        let encoded = serde_json::to_string(&LeadershipRecord {
+            node_id: node_id.to_owned(),
+            lease_id,
+        })
+        .map_err(json_encode_message)?;
         let txn = Txn::new()
             .when([Compare::version(
                 leadership_key.clone(),
@@ -1244,6 +1320,17 @@ impl EtcdCoordinationClient {
         current: &ShardOwnership,
         new_owner_node_id: &str,
     ) -> Result<PromotionResult> {
+        let members = self.list_membership().await?;
+        if !members.iter().any(|member| {
+            member.node_id == new_owner_node_id
+                && member.state == "ready"
+                && matches!(
+                    member.node_role,
+                    logpose_types::NodeRole::Combined | logpose_types::NodeRole::Data
+                )
+        }) {
+            return Ok(PromotionResult::Conflict);
+        }
         let key = self.shard_owner_key(&current.collection, &current.shard_id);
         let descriptor_lookup_name = current.collection.lookup_name();
         let Some((stored_descriptor, descriptor_mod_revision)) = self
@@ -1452,6 +1539,7 @@ mod tests {
     fn membership_record_round_trip_json() {
         let payload = MembershipRecord {
             node_id: "node-a".to_owned(),
+            node_role: logpose_types::NodeRole::Combined,
             state: "ready".to_owned(),
         };
         let encoded = serde_json::to_vec(&payload);
@@ -1468,6 +1556,7 @@ mod tests {
     fn leadership_record_round_trip_json() {
         let payload = LeadershipRecord {
             node_id: "leader-a".to_owned(),
+            lease_id: 42,
         };
         let encoded = serde_json::to_vec(&payload);
         assert!(encoded.is_ok(), "payload should encode");

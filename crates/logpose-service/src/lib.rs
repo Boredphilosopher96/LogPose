@@ -37,8 +37,9 @@ use logpose_storage::{
 use logpose_storage_etcd::{EtcdCoordinationClient, LeadershipLease, ShardOwnership};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
-    CollectionStats, CommitAck, CoordinationStatus, LogPoseError, MaintenanceBacklog,
-    MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus, Snapshot, WriteOperation,
+    CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
+    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus, Snapshot,
+    WriteOperation,
 };
 use std::{
     fmt,
@@ -183,13 +184,11 @@ async fn run_coordination_loop(
         if let Some(lease_id) = membership_lease_id
             && let Err(error) = client.keep_alive(lease_id).await
         {
-            membership_lease_id = None;
-            leadership_lease = None;
             record_coordination_error(&snapshot, error.to_string()).await;
         }
 
         if membership_lease_id.is_none() {
-            match client.register_membership(&node_name).await {
+            match client.register_membership(&node_name, node_role).await {
                 Ok(lease) => {
                     membership_lease_id = Some(lease.lease_id);
                     clear_coordination_error(&snapshot).await;
@@ -204,7 +203,6 @@ async fn run_coordination_loop(
         if let Some(lease) = &leadership_lease
             && let Err(error) = client.keep_alive(lease.lease_id).await
         {
-            leadership_lease = None;
             record_coordination_error(&snapshot, error.to_string()).await;
         }
 
@@ -221,22 +219,56 @@ async fn run_coordination_loop(
 
         let members = client.list_membership().await;
         let leader = client.current_leader().await;
+        if let Ok(member_records) = &members
+            && membership_lease_id.is_some()
+            && !member_records
+                .iter()
+                .any(|member| member.node_id == node_name)
+        {
+            membership_lease_id = None;
+            leadership_lease = None;
+        }
+        if let Ok(Some(leader_record)) = &leader
+            && leadership_lease.is_some()
+            && (leader_record.node_id != node_name
+                || Some(leader_record.lease_id)
+                    != leadership_lease.as_ref().map(|lease| lease.lease_id))
+        {
+            leadership_lease = None;
+        }
+        let membership_confirmed = members.as_ref().is_ok_and(|member_records| {
+            membership_lease_id.is_some()
+                && member_records
+                    .iter()
+                    .any(|member| member.node_id == node_name)
+        });
+        let visible_leader = leader
+            .as_ref()
+            .ok()
+            .and_then(|leader_record| leader_record.as_ref().cloned());
         let mut current = coordination_write(&snapshot);
-        current.membership_registered = membership_lease_id.is_some();
-        current.membership_lease_id = membership_lease_id;
+        current.membership_registered = membership_confirmed;
+        current.membership_lease_id = membership_lease_id.filter(|_| membership_confirmed);
         if let Ok(member_records) = &members {
             current.registered_members = member_records
                 .iter()
                 .map(|member| member.node_id.clone())
                 .collect();
             current.registered_members.sort();
+        } else {
+            current.registered_members.clear();
         }
-        if let Ok(leader_record) = &leader {
-            current.leader_node = leader_record.as_ref().map(|record| record.node_id.clone());
-        }
-        current.is_local_leader = current.leader_node.as_deref() == Some(node_name.as_str())
-            && leadership_lease.is_some();
-        current.leadership_lease_id = leadership_lease.as_ref().map(|lease| lease.lease_id);
+        current.leader_node = visible_leader.as_ref().map(|record| record.node_id.clone());
+        current.is_local_leader = membership_confirmed
+            && leadership_lease.as_ref().is_some_and(|lease| {
+                visible_leader.as_ref().is_some_and(|record| {
+                    record.node_id == node_name && record.lease_id == lease.lease_id
+                })
+            });
+        current.leadership_lease_id = leadership_lease
+            .as_ref()
+            .map(|lease| lease.lease_id)
+            .filter(|_| current.is_local_leader);
         current.last_error = match (members, leader) {
             (Err(members_error), Err(leader_error)) => {
                 Some(format!("{members_error}; {leader_error}"))
@@ -331,9 +363,10 @@ impl LogPoseDataService {
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
+        leader_fence: Option<LeadershipFence>,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
         self.storage
-            .create_collection_with_assignment(request, assignment)
+            .create_collection_with_assignment(request, assignment, leader_fence)
             .await
             .map_err(Into::into)
     }
@@ -665,9 +698,19 @@ impl LogPoseControlService {
             }
             NodeRole::Combined => {}
         }
-        self.require_local_control_plane_leader().await?;
+        let leader_fence = self.require_local_control_plane_leader().await?;
+        let assignment = self.initial_assignment();
+        if self.config.metadata.backend == MetadataBackend::Etcd
+            && let Some(leader_fence) = leader_fence.as_ref()
+            && assignment.assigned_node != leader_fence.node_id
+        {
+            return Err(ServiceError::InvalidArgument(format!(
+                "etcd-backed collection creation requires the active control-plane leader '{}' to own the initial assignment; got '{}'",
+                leader_fence.node_id, assignment.assigned_node
+            )));
+        }
         self.data
-            .create_collection_with_assignment(request, self.initial_assignment())
+            .create_collection_with_assignment(request, assignment, leader_fence)
             .await
     }
 
@@ -920,6 +963,22 @@ impl LogPoseControlService {
                 },
             };
         }
+        if self.coordination_client.is_some() {
+            return CollectionPlacement {
+                collection_id: descriptor.collection_id.clone(),
+                database_name: descriptor.database_name.clone(),
+                collection_name: descriptor.name.clone(),
+                assigned_node: assignment.assigned_node.clone(),
+                assigned_role: assignment.assigned_role,
+                owner_node,
+                ownership_epoch,
+                route_kind: "recorded".to_owned(),
+                route_reason: format!(
+                    "authoritative shard ownership metadata is missing for collection '{}/{}'; reconciliation is required before this runtime can serve it",
+                    descriptor.database_name, descriptor.name
+                ),
+            };
+        }
         let assignment_targets_this_runtime = assignment.assigned_node == self.config.node_name
             || assignment.assigned_node == ANONYMOUS_LOCAL_NODE_NAME;
         let serves_local_assignment = assignment_targets_this_runtime
@@ -1113,20 +1172,29 @@ impl LogPoseControlService {
     }
 
     /// Require this runtime to hold the active etcd-backed control-plane leadership.
-    pub async fn require_local_control_plane_leader(&self) -> Result<()> {
+    pub async fn require_local_control_plane_leader(&self) -> Result<Option<LeadershipFence>> {
         if !matches!(
             self.config.node_role,
             NodeRole::Combined | NodeRole::Control
         ) {
-            return Ok(());
+            return Ok(None);
         }
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let Some(coordination) = self.coordination.snapshot().await else {
-                return Ok(());
+                return Ok(None);
             };
             if coordination.is_local_leader {
-                return Ok(());
+                let lease_id = coordination.leadership_lease_id.ok_or_else(|| {
+                    ServiceError::Internal(format!(
+                        "node '{}' reported local leadership without a lease id",
+                        self.config.node_name
+                    ))
+                })?;
+                return Ok(Some(LeadershipFence {
+                    node_id: self.config.node_name.clone(),
+                    lease_id,
+                }));
             }
             if coordination.leader_node.is_some() || Instant::now() >= deadline {
                 let leader = coordination
@@ -1178,6 +1246,9 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("authentication_mode")
         || message.contains("is_default")
         || message.contains("invalid snapshot")
+        || message.contains("not the active control-plane leader")
+        || message.contains("already has metadata assignment in etcd")
+        || message.contains("snapshot and read_barrier cannot be provided together")
         || message.contains("manual reconciliation is required")
         || message.contains("reconciliation is required")
         || is_dimension_validation_error(&message)

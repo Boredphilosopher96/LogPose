@@ -12,8 +12,8 @@ use logpose_service::{
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
-    BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, MetadataBackend,
-    NodeMetadata, NodeRole, Snapshot, WriteOperation,
+    BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
+    MetadataBackend, NodeMetadata, NodeRole, Snapshot, WriteOperation,
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -280,8 +280,10 @@ impl AppState {
 
     /// Execute a query through the data-plane surface.
     pub async fn query(&self, request: QueryRequest) -> ServiceResult<QueryResponse> {
-        self.require_local_data_plane_collection(&request.collection_name)
+        let placement = self
+            .require_local_data_plane_collection(&request.collection_name)
             .await?;
+        reject_promoted_read_barriers(&placement, request.read_barrier.as_ref())?;
         self.data.query(request).await
     }
 
@@ -353,8 +355,10 @@ impl AppState {
         snapshot: Option<Snapshot>,
         read_barrier: Option<Snapshot>,
     ) -> ServiceResult<CollectionStats> {
-        self.require_local_data_plane_collection(collection_name)
+        let placement = self
+            .require_local_data_plane_collection(collection_name)
             .await?;
+        reject_promoted_read_barriers(&placement, read_barrier.as_ref())?;
         self.data
             .stats_for_read(collection_name, snapshot, read_barrier)
             .await
@@ -597,13 +601,13 @@ impl AppState {
     async fn require_local_data_plane_collection(
         &self,
         collection_name: &str,
-    ) -> ServiceResult<()> {
+    ) -> ServiceResult<logpose_types::CollectionPlacement> {
         self.require_data_plane()?;
         let placement = self.control.collection_placement(collection_name).await?;
         if placement.route_kind == "local"
             && matches!(placement.assigned_role, NodeRole::Combined | NodeRole::Data)
         {
-            return Ok(());
+            return Ok(placement);
         }
 
         let routed_node = placement
@@ -625,11 +629,15 @@ impl AppState {
         descriptor: DatabaseDescriptor,
     ) -> ServiceResult<DatabaseDescriptor> {
         self.require_control_plane_database_mutation()?;
-        self.control.require_local_control_plane_leader().await?;
+        let leader_fence = self.control.require_local_control_plane_leader().await?;
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.put_database(descriptor).await,
             SharedCatalog::Etcd(catalog) => {
-                catalog.put_database(descriptor).await.map_err(Into::into)
+                let leader_fence = required_leadership_fence(leader_fence)?;
+                catalog
+                    .put_database(descriptor, &leader_fence.node_id, leader_fence.lease_id)
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -656,13 +664,20 @@ impl AppState {
         policy: logpose_auth::DatabaseAccessPolicy,
     ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
         self.require_control_plane_database_mutation()?;
-        self.control.require_local_control_plane_leader().await?;
+        let leader_fence = self.control.require_local_control_plane_leader().await?;
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.set_database_access_policy(policy).await,
-            SharedCatalog::Etcd(catalog) => catalog
-                .put_database_access_policy(policy)
-                .await
-                .map_err(Into::into),
+            SharedCatalog::Etcd(catalog) => {
+                let leader_fence = required_leadership_fence(leader_fence)?;
+                catalog
+                    .put_database_access_policy(
+                        policy,
+                        &leader_fence.node_id,
+                        leader_fence.lease_id,
+                    )
+                    .await
+                    .map_err(Into::into)
+            }
         }
     }
 
@@ -711,6 +726,28 @@ impl AppState {
 
 fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {
     format!("{}/{}", placement.database_name, placement.collection_name)
+}
+
+fn required_leadership_fence(fence: Option<LeadershipFence>) -> ServiceResult<LeadershipFence> {
+    fence.ok_or_else(|| {
+        ServiceError::Internal(
+            "etcd-backed control-plane mutations require a local leadership fence".to_owned(),
+        )
+    })
+}
+
+fn reject_promoted_read_barriers(
+    placement: &logpose_types::CollectionPlacement,
+    read_barrier: Option<&Snapshot>,
+) -> ServiceResult<()> {
+    if read_barrier.is_some() && placement.ownership_epoch.is_some_and(|epoch| epoch > 1) {
+        return Err(ServiceError::FailedPrecondition(format!(
+            "collection '{}' is serving at ownership epoch {} and cannot safely satisfy read barriers after promotion until replica freshness metadata is implemented",
+            placement_identity(placement),
+            placement.ownership_epoch.unwrap_or_default(),
+        )));
+    }
+    Ok(())
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {

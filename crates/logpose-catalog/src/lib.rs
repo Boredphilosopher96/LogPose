@@ -2,7 +2,7 @@
 
 use logpose_types::{
     CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, DistanceMetric,
-    LogPoseError, RemoteBlobConfig, WriteOperation,
+    LogPoseError, RemoteBlobConfig, WriteOperation, default_database_id,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,11 @@ impl DatabaseDescriptor {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
-            database_id: DatabaseId::default(),
+            database_id: if name == DEFAULT_DATABASE_NAME {
+                default_database_id()
+            } else {
+                DatabaseId::default()
+            },
             is_default: name == DEFAULT_DATABASE_NAME,
             name,
         }

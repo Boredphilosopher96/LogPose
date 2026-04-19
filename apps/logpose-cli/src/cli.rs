@@ -631,7 +631,7 @@ pub struct CollectionStatsArgs {
         value_name = "GENERATION",
         requires = "read_barrier_visible_seq_no",
         conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
-        help = "Lower-bound manifest generation that must already be visible. Must be paired with --read-barrier-visible-seq-no."
+        help = "Lower-bound manifest generation that must already be visible on the current owner. Must be paired with --read-barrier-visible-seq-no. Promoted owners reject read barriers until freshness metadata exists."
     )]
     pub read_barrier_manifest_generation: Option<u64>,
     #[arg(
@@ -639,7 +639,7 @@ pub struct CollectionStatsArgs {
         value_name = "SEQ_NO",
         requires = "read_barrier_manifest_generation",
         conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
-        help = "Lower-bound visible sequence number that must already be visible. Must be paired with --read-barrier-manifest-generation."
+        help = "Lower-bound visible sequence number that must already be visible on the current owner. Must be paired with --read-barrier-manifest-generation. Promoted owners reject read barriers until freshness metadata exists."
     )]
     pub read_barrier_visible_seq_no: Option<u64>,
 }
@@ -792,7 +792,7 @@ pub struct QueryArgs {
         value_name = "GENERATION",
         requires = "read_barrier_visible_seq_no",
         conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
-        help = "Lower-bound manifest generation that must already be visible. Must be paired with --read-barrier-visible-seq-no."
+        help = "Lower-bound manifest generation that must already be visible on the current owner. Must be paired with --read-barrier-visible-seq-no. Promoted owners reject read barriers until freshness metadata exists."
     )]
     pub read_barrier_manifest_generation: Option<u64>,
     #[arg(
@@ -800,7 +800,7 @@ pub struct QueryArgs {
         value_name = "SEQ_NO",
         requires = "read_barrier_manifest_generation",
         conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
-        help = "Lower-bound visible sequence number that must already be visible. Must be paired with --read-barrier-manifest-generation."
+        help = "Lower-bound visible sequence number that must already be visible on the current owner. Must be paired with --read-barrier-manifest-generation. Promoted owners reject read barriers until freshness metadata exists."
     )]
     pub read_barrier_visible_seq_no: Option<u64>,
 }
