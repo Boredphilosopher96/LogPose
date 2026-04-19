@@ -1438,6 +1438,7 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,

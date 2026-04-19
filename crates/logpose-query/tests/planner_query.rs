@@ -29,6 +29,7 @@ async fn planner_prunes_units_and_reports_tiny_population_fallback() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -72,6 +73,7 @@ async fn planner_uses_hybrid_ann_for_broad_predicates_and_profiles_stages() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "score".to_owned(),
@@ -106,6 +108,7 @@ async fn planner_uses_vector_first_ann_for_unfiltered_immutable_queries() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Plan,
@@ -137,6 +140,7 @@ async fn planner_requires_full_ann_coverage_before_using_ann_paths() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Plan,
@@ -176,6 +180,7 @@ async fn planner_keeps_delete_bearing_units_visible_during_predicate_pruning() {
             vector: vec![1.0, 0.0],
             top_k: 3,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -209,6 +214,7 @@ async fn planner_keeps_newer_non_matching_versions_visible_during_predicate_prun
             vector: vec![1.0, 0.0],
             top_k: 3,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -251,6 +257,7 @@ async fn planner_selectivity_ignores_empty_mutable_units() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),
@@ -288,6 +295,7 @@ async fn planner_keeps_units_for_exists_predicates_on_non_scalar_fields() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "details".to_owned(),
@@ -336,6 +344,7 @@ async fn planner_treats_sparse_ne_predicates_as_selective() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(Predicate::Comparison(PredicateComparison {
                 field: "kind".to_owned(),

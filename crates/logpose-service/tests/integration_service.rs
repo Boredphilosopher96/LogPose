@@ -94,6 +94,7 @@ async fn service_runs_filtered_query_and_storage_workflow() {
             vector: vec![1.0, 0.0],
             top_k: 3,
             snapshot: Some(snapshot.clone()),
+            read_barrier: None,
             filters: vec![MetadataFilter {
                 field: "kind".to_owned(),
                 value: ScalarMetadataValue::String("keep".to_owned()),
@@ -191,6 +192,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: Some(second_ack.snapshot.clone()),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -261,6 +263,7 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: Some(ack.snapshot.clone()),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -284,6 +287,200 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
     assert_eq!(stats.manifest_generation, 0);
     assert_eq!(stats.visible_seq_no, 1);
     assert_eq!(stats.live_record_count, 1);
+}
+
+#[tokio::test]
+async fn service_query_read_barrier_advances_to_latest_snapshot() {
+    let root = unique_temp_dir("service-query-read-barrier-advances");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let ack = service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let flushed = service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let response = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+            read_barrier: Some(ack.snapshot.clone()),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("read barrier should advance to the latest visible snapshot");
+
+    assert_eq!(response.snapshot, flushed);
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha"]
+    );
+}
+
+#[tokio::test]
+async fn service_rejects_unsatisfied_query_read_barrier() {
+    let root = unique_temp_dir("service-query-read-barrier-unsatisfied");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let error = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: None,
+            read_barrier: Some(Snapshot {
+                manifest_generation: 0,
+                visible_seq_no: 2,
+            }),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect_err("barrier above the current snapshot should fail");
+
+    assert!(matches!(
+        error,
+        ServiceError::FailedPrecondition(message) if message.contains("read barrier")
+    ));
+}
+
+#[tokio::test]
+async fn service_stats_read_barrier_advances_to_latest_snapshot() {
+    let root = unique_temp_dir("service-stats-read-barrier-advances");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let ack = service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let flushed = service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let stats = service
+        .stats_for_read("documents", None, Some(ack.snapshot))
+        .await
+        .expect("read barrier should advance stats to the latest visible snapshot");
+
+    assert_eq!(stats.manifest_generation, flushed.manifest_generation);
+    assert_eq!(stats.visible_seq_no, flushed.visible_seq_no);
+    assert_eq!(stats.live_record_count, 1);
+}
+
+#[tokio::test]
+async fn service_rejects_unsatisfied_stats_read_barrier() {
+    let root = unique_temp_dir("service-stats-read-barrier-unsatisfied");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    let error = service
+        .stats_for_read(
+            "documents",
+            None,
+            Some(Snapshot {
+                manifest_generation: 0,
+                visible_seq_no: 2,
+            }),
+        )
+        .await
+        .expect_err("barrier above the current stats snapshot should fail");
+
+    assert!(matches!(
+        error,
+        ServiceError::FailedPrecondition(message) if message.contains("read barrier")
+    ));
 }
 
 #[tokio::test]
@@ -322,6 +519,7 @@ async fn service_rejects_impossible_snapshots() {
                 manifest_generation: 0,
                 visible_seq_no: 99,
             }),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -376,6 +574,7 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
                 manifest_generation: flushed.manifest_generation,
                 visible_seq_no: flushed.visible_seq_no - 1,
             }),
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -441,6 +640,7 @@ async fn app_state_accepts_database_qualified_collection_references() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -520,6 +720,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(predicate.clone()),
             explain: ExplainMode::Profile,
@@ -568,6 +769,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             vector: vec![1.0, 0.0],
             top_k: 1,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(proto::Predicate {
                 node: Some(proto::predicate::Node::Comparison(
@@ -743,6 +945,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(predicate.clone()),
             explain: ExplainMode::Profile,
@@ -789,6 +992,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
             vector: vec![1.0, 0.0],
             top_k: 2,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: Some(proto::Predicate {
                 node: Some(proto::predicate::Node::Comparison(

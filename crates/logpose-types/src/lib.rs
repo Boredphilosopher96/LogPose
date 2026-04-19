@@ -432,6 +432,15 @@ pub struct Snapshot {
     pub visible_seq_no: SeqNo,
 }
 
+impl Snapshot {
+    /// Return whether this snapshot satisfies a lower-bound read barrier.
+    #[must_use]
+    pub fn satisfies_read_barrier(&self, barrier: &Self) -> bool {
+        self.manifest_generation >= barrier.manifest_generation
+            && self.visible_seq_no >= barrier.visible_seq_no
+    }
+}
+
 /// Visible user record reconstructed from mutable and immutable storage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisibleRecord {

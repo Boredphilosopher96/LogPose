@@ -255,6 +255,7 @@ async fn query_collection(
                 vector: request.vector,
                 top_k: request.top_k,
                 snapshot: request.snapshot,
+                read_barrier: request.read_barrier,
                 filters,
                 predicate: request.predicate,
                 explain: request.explain,
@@ -273,15 +274,19 @@ async fn get_collection_stats(
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let collection = params.namespace().collection(name);
+    let (snapshot, read_barrier) = read_constraints_from_query_pairs(
+        params.snapshot_manifest_generation,
+        params.snapshot_visible_seq_no,
+        params.read_barrier_manifest_generation,
+        params.read_barrier_visible_seq_no,
+    )?;
     Ok(Json(
         state
-            .stats_at_snapshot_with_auth(
+            .stats_for_read_with_auth(
                 &auth,
                 &collection_lookup_key(&collection),
-                snapshot_from_query_pair(
-                    params.snapshot_manifest_generation,
-                    params.snapshot_visible_seq_no,
-                )?,
+                snapshot,
+                read_barrier,
             )
             .await?,
     ))
@@ -373,6 +378,8 @@ struct CollectionStatsQuery {
     database: String,
     snapshot_manifest_generation: Option<u64>,
     snapshot_visible_seq_no: Option<u64>,
+    read_barrier_manifest_generation: Option<u64>,
+    read_barrier_visible_seq_no: Option<u64>,
 }
 
 impl CollectionStatsQuery {
@@ -433,6 +440,8 @@ struct QueryCollectionBody {
     top_k: usize,
     #[serde(default)]
     snapshot: Option<Snapshot>,
+    #[serde(default)]
+    read_barrier: Option<Snapshot>,
     #[serde(default)]
     filters: Map<String, Value>,
     #[serde(default)]
@@ -495,6 +504,7 @@ impl IntoResponse for ApiError {
             ServiceError::AlreadyExists(message) => (StatusCode::CONFLICT, message),
             ServiceError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ServiceError::InvalidArgument(message) => (StatusCode::BAD_REQUEST, message),
+            ServiceError::FailedPrecondition(message) => (StatusCode::PRECONDITION_FAILED, message),
             ServiceError::Unauthenticated(message) => (StatusCode::UNAUTHORIZED, message),
             ServiceError::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
             ServiceError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
@@ -579,6 +589,25 @@ fn snapshot_from_query_pair(
                 .to_owned(),
         ))),
     }
+}
+
+fn read_constraints_from_query_pairs(
+    snapshot_manifest_generation: Option<u64>,
+    snapshot_visible_seq_no: Option<u64>,
+    read_barrier_manifest_generation: Option<u64>,
+    read_barrier_visible_seq_no: Option<u64>,
+) -> Result<(Option<Snapshot>, Option<Snapshot>), ApiError> {
+    let snapshot = snapshot_from_query_pair(snapshot_manifest_generation, snapshot_visible_seq_no)?;
+    let read_barrier = snapshot_from_query_pair(
+        read_barrier_manifest_generation,
+        read_barrier_visible_seq_no,
+    )?;
+    if snapshot.is_some() && read_barrier.is_some() {
+        return Err(ApiError(ServiceError::InvalidArgument(
+            "snapshot and read_barrier cannot be provided together".to_owned(),
+        )));
+    }
+    Ok((snapshot, read_barrier))
 }
 
 fn collection_lookup_key(collection: &CollectionRef) -> String {
@@ -717,6 +746,18 @@ mod tests {
                     .to_owned(),
             )
         );
+    }
+
+    #[test]
+    fn read_constraints_reject_mixing_snapshot_and_read_barrier() {
+        let error = read_constraints_from_query_pairs(Some(1), Some(2), Some(1), Some(2))
+            .expect_err("exact snapshot and read barrier should conflict");
+
+        assert!(matches!(
+            error.0,
+            ServiceError::InvalidArgument(message)
+                if message == "snapshot and read_barrier cannot be provided together"
+        ));
     }
 
     #[tokio::test]
@@ -1128,6 +1169,144 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn data_endpoints_support_read_barriers() {
+        let state = Arc::new(AppState::new(test_config("rest-read-barrier")));
+        let app = router(state);
+
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [{
+                                "op": "put",
+                                "id": "alpha",
+                                "vector": [1.0, 0.0],
+                                "metadata": {"kind": "keep"}
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(write.status(), StatusCode::OK);
+        let write_body = json_body(write).await;
+
+        let flush = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/flush")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(flush.status(), StatusCode::OK);
+        let flush_body = json_body(flush).await;
+
+        let query = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 1,
+                            "read_barrier": write_body["snapshot"]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(query.status(), StatusCode::OK);
+        let query_body = json_body(query).await;
+        assert_eq!(
+            query_body["snapshot"]["manifest_generation"],
+            flush_body["manifest_generation"]
+        );
+        assert_eq!(
+            query_body["snapshot"]["visible_seq_no"],
+            flush_body["visible_seq_no"]
+        );
+        assert_eq!(query_body["matches"][0]["id"], "alpha");
+
+        let stats = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats?read_barrier_manifest_generation=0&read_barrier_visible_seq_no=1")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(stats.status(), StatusCode::OK);
+        let stats_body = json_body(stats).await;
+        assert_eq!(
+            stats_body["manifest_generation"],
+            flush_body["manifest_generation"]
+        );
+        assert_eq!(stats_body["visible_seq_no"], flush_body["visible_seq_no"]);
+
+        let unsatisfied = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "vector": [1.0, 0.0],
+                            "top_k": 1,
+                            "read_barrier": {
+                                "manifest_generation": 0,
+                                "visible_seq_no": 2
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(unsatisfied.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]

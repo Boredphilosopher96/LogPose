@@ -75,6 +75,8 @@ pub struct CollectionStatsAction {
     pub collection: CollectionRef,
     pub snapshot_manifest_generation: Option<u64>,
     pub snapshot_visible_seq_no: Option<u64>,
+    pub read_barrier_manifest_generation: Option<u64>,
+    pub read_barrier_visible_seq_no: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +113,8 @@ pub struct QueryAction {
     pub explain: Option<ExplainArg>,
     pub snapshot_manifest_generation: Option<u64>,
     pub snapshot_visible_seq_no: Option<u64>,
+    pub read_barrier_manifest_generation: Option<u64>,
+    pub read_barrier_visible_seq_no: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -519,20 +523,65 @@ fn snapshot_from_parts(
     }
 }
 
+fn read_constraints_from_parts(
+    snapshot_manifest_generation: Option<u64>,
+    snapshot_visible_seq_no: Option<u64>,
+    read_barrier_manifest_generation: Option<u64>,
+    read_barrier_visible_seq_no: Option<u64>,
+) -> anyhow::Result<(Option<Snapshot>, Option<Snapshot>)> {
+    let snapshot = snapshot_from_parts(snapshot_manifest_generation, snapshot_visible_seq_no)?;
+    let read_barrier = snapshot_from_parts(
+        read_barrier_manifest_generation,
+        read_barrier_visible_seq_no,
+    )?;
+    if snapshot.is_some() && read_barrier.is_some() {
+        bail!("--snapshot-* and --read-barrier-* cannot be provided together");
+    }
+    Ok((snapshot, read_barrier))
+}
+
 pub fn query_snapshot_from_action(action: &QueryAction) -> anyhow::Result<Option<Snapshot>> {
-    snapshot_from_parts(
+    let (snapshot, _) = read_constraints_from_parts(
         action.snapshot_manifest_generation,
         action.snapshot_visible_seq_no,
-    )
+        action.read_barrier_manifest_generation,
+        action.read_barrier_visible_seq_no,
+    )?;
+    Ok(snapshot)
+}
+
+pub fn query_read_barrier_from_action(action: &QueryAction) -> anyhow::Result<Option<Snapshot>> {
+    let (_, read_barrier) = read_constraints_from_parts(
+        action.snapshot_manifest_generation,
+        action.snapshot_visible_seq_no,
+        action.read_barrier_manifest_generation,
+        action.read_barrier_visible_seq_no,
+    )?;
+    Ok(read_barrier)
 }
 
 pub fn stats_snapshot_from_action(
     action: &CollectionStatsAction,
 ) -> anyhow::Result<Option<Snapshot>> {
-    snapshot_from_parts(
+    let (snapshot, _) = read_constraints_from_parts(
         action.snapshot_manifest_generation,
         action.snapshot_visible_seq_no,
-    )
+        action.read_barrier_manifest_generation,
+        action.read_barrier_visible_seq_no,
+    )?;
+    Ok(snapshot)
+}
+
+pub fn stats_read_barrier_from_action(
+    action: &CollectionStatsAction,
+) -> anyhow::Result<Option<Snapshot>> {
+    let (_, read_barrier) = read_constraints_from_parts(
+        action.snapshot_manifest_generation,
+        action.snapshot_visible_seq_no,
+        action.read_barrier_manifest_generation,
+        action.read_barrier_visible_seq_no,
+    )?;
+    Ok(read_barrier)
 }
 
 pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Option<Predicate>> {
@@ -564,6 +613,7 @@ pub fn query_explain_mode_from_action(action: &QueryAction) -> ExplainMode {
 
 pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRequest> {
     let snapshot = query_snapshot_from_action(action)?;
+    let read_barrier = query_read_barrier_from_action(action)?;
     let predicate = query_predicate_from_action(action)?;
     let explain = query_explain_mode_from_action(action);
     let filters = action
@@ -580,6 +630,7 @@ pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRe
         vector: action.vector.0.clone(),
         top_k: action.top_k,
         snapshot,
+        read_barrier,
         filters,
         predicate,
         explain,
@@ -892,6 +943,14 @@ pub fn format_command(action: &Action) -> String {
                 parts.push("--snapshot-visible-seq-no".to_owned());
                 parts.push(seq_no.to_string());
             }
+            if let Some(generation) = action.read_barrier_manifest_generation {
+                parts.push("--read-barrier-manifest-generation".to_owned());
+                parts.push(generation.to_string());
+            }
+            if let Some(seq_no) = action.read_barrier_visible_seq_no {
+                parts.push("--read-barrier-visible-seq-no".to_owned());
+                parts.push(seq_no.to_string());
+            }
         }
         Action::CollectionPlacement(collection) => {
             parts.push("collection".to_owned());
@@ -959,6 +1018,14 @@ pub fn format_command(action: &Action) -> String {
             }
             if let Some(seq_no) = action.snapshot_visible_seq_no {
                 parts.push("--snapshot-visible-seq-no".to_owned());
+                parts.push(seq_no.to_string());
+            }
+            if let Some(generation) = action.read_barrier_manifest_generation {
+                parts.push("--read-barrier-manifest-generation".to_owned());
+                parts.push(generation.to_string());
+            }
+            if let Some(seq_no) = action.read_barrier_visible_seq_no {
+                parts.push("--read-barrier-visible-seq-no".to_owned());
                 parts.push(seq_no.to_string());
             }
         }

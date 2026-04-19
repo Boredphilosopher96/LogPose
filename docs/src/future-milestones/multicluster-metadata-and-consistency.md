@@ -114,6 +114,7 @@ The repository now includes a first production-oriented metadata backend switch 
 - read paths fail closed if authoritative etcd metadata is unavailable instead of falling back to stale local placement files
 - local placement files are still written for recovery/bootstrap diagnostics, but they are no longer consulted as an authority once the etcd backend is selected
 - single-shard ownership records are now seeded in etcd, surfaced through placement diagnostics, and used to fence stale owners after an ownership promotion
+- query and stats requests now accept lower-bound read barriers derived from prior write or read snapshots, which gives clients a concrete read-your-own-writes and monotonic-read primitive without breaking exact historical snapshot reads
 
 This is still not full distributed control-plane completion. Remaining work from the streams below still applies, especially watch-driven caches, replica-aware placement, failover control loops, stronger leader fencing, and multi-node failover simulations.
 

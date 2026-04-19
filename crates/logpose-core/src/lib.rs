@@ -298,7 +298,7 @@ impl AppState {
         auth: &RequestAuth,
         collection_name: &str,
     ) -> ServiceResult<CollectionStats> {
-        self.stats_at_snapshot_with_auth(auth, collection_name, None)
+        self.stats_for_read_with_auth(auth, collection_name, None, None)
             .await
     }
 
@@ -309,6 +309,18 @@ impl AppState {
         collection_name: &str,
         snapshot: Option<Snapshot>,
     ) -> ServiceResult<CollectionStats> {
+        self.stats_for_read_with_auth(auth, collection_name, snapshot, None)
+            .await
+    }
+
+    /// Return collection stats for one exact snapshot or lower-bound read barrier.
+    pub async fn stats_for_read_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        read_barrier: Option<Snapshot>,
+    ) -> ServiceResult<CollectionStats> {
         let collection = parse_collection_reference(collection_name)?;
         self.require_database_permission(
             auth,
@@ -316,12 +328,13 @@ impl AppState {
             DatabasePermission::ReadOnly,
         )
         .await?;
-        self.stats_at_snapshot(collection_name, snapshot).await
+        self.stats_for_read(collection_name, snapshot, read_barrier)
+            .await
     }
 
     /// Return collection stats through the data-plane surface.
     pub async fn stats(&self, collection_name: &str) -> ServiceResult<CollectionStats> {
-        self.stats_at_snapshot(collection_name, None).await
+        self.stats_for_read(collection_name, None, None).await
     }
 
     /// Return collection stats through the data-plane surface for one explicit snapshot.
@@ -330,12 +343,21 @@ impl AppState {
         collection_name: &str,
         snapshot: Option<Snapshot>,
     ) -> ServiceResult<CollectionStats> {
+        self.stats_for_read(collection_name, snapshot, None).await
+    }
+
+    /// Return collection stats through the data-plane surface for one exact snapshot or barrier.
+    pub async fn stats_for_read(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        read_barrier: Option<Snapshot>,
+    ) -> ServiceResult<CollectionStats> {
         self.require_local_data_plane_collection(collection_name)
             .await?;
-        match snapshot {
-            Some(snapshot) => self.data.stats_at_snapshot(collection_name, snapshot).await,
-            None => self.data.stats(collection_name).await,
-        }
+        self.data
+            .stats_for_read(collection_name, snapshot, read_barrier)
+            .await
     }
 
     /// Flush one collection after enforcing database write access when auth is enabled.

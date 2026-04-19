@@ -699,6 +699,101 @@ fn data_commands_run_against_the_server_over_grpc() {
 }
 
 #[test]
+fn query_and_stats_support_read_barrier_flags_against_server() {
+    let fixture = TestServerFixture::spawn("cli-server-read-barrier");
+    let first_input = fixture.temp_root.join("records-first.jsonl");
+    let second_input = fixture.temp_root.join("records-second.jsonl");
+    fs::write(
+        &first_input,
+        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"kind":"keep"}}"#,
+    )
+    .expect("first jsonl input should be written");
+    fs::write(
+        &second_input,
+        r#"{"id":"beta","vector":[0.4,0.0],"metadata":{"kind":"keep"}}"#,
+    )
+    .expect("second jsonl input should be written");
+
+    fixture.run_cli([
+        "collection",
+        "create",
+        "colors",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let first_write = fixture.run_cli_json(&[
+        "record",
+        "put",
+        "colors",
+        "--input",
+        first_input
+            .to_str()
+            .expect("first input path should be utf8"),
+    ]);
+    let first_write_stdout = String::from_utf8(first_write.stdout).expect("stdout should be utf8");
+    let first_write_body: Value =
+        serde_json::from_str(&first_write_stdout).expect("write output should be valid json");
+    let barrier = first_write_body["snapshot"].clone();
+
+    fixture.run_cli([
+        "record",
+        "put",
+        "colors",
+        "--input",
+        second_input
+            .to_str()
+            .expect("second input path should be utf8"),
+    ]);
+
+    let barrier_generation = barrier["manifest_generation"]
+        .as_u64()
+        .expect("barrier generation should be numeric")
+        .to_string();
+    let barrier_seq = barrier["visible_seq_no"]
+        .as_u64()
+        .expect("barrier visible seq should be numeric")
+        .to_string();
+
+    let query = fixture.run_cli_json(&[
+        "query",
+        "colors",
+        "--top-k",
+        "2",
+        "--vector",
+        "1.0,0.0",
+        "--read-barrier-manifest-generation",
+        &barrier_generation,
+        "--read-barrier-visible-seq-no",
+        &barrier_seq,
+    ]);
+    let query_stdout = String::from_utf8(query.stdout).expect("stdout should be utf8");
+    let query_body: Value =
+        serde_json::from_str(&query_stdout).expect("query output should be valid json");
+    let query_response = query_response_body(&query_body);
+    assert_eq!(query_response["snapshot"]["visible_seq_no"], 2);
+    assert_eq!(query_response["matches"][0]["id"], "alpha");
+    assert_eq!(query_response["matches"][1]["id"], "beta");
+
+    let stats = fixture.run_cli_json(&[
+        "collection",
+        "stats",
+        "colors",
+        "--read-barrier-manifest-generation",
+        &barrier_generation,
+        "--read-barrier-visible-seq-no",
+        &barrier_seq,
+    ]);
+    let stats_stdout = String::from_utf8(stats.stdout).expect("stdout should be utf8");
+    let stats_body: Value =
+        serde_json::from_str(&stats_stdout).expect("stats output should be valid json");
+    assert_eq!(stats_body["visible_seq_no"], 2);
+    assert_eq!(stats_body["live_record_count"], 2);
+}
+
+#[test]
 fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
     let fixture = TestServerFixture::spawn("cli-cooperative-filtered-ann");
     let input_path = fixture.temp_root.join("cooperative-records.jsonl");

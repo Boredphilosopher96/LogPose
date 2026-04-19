@@ -742,6 +742,7 @@ async fn assert_data_matches(
             collection_name: bare_collection_name,
             database_name,
             snapshot: None,
+            read_barrier: None,
         }))
         .await
         .unwrap_or_else(|error| panic_with_context(trace, format!("grpc stats failed: {error}")))
@@ -807,6 +808,7 @@ async fn assert_data_matches(
             vector: vec![1.0, 0.0],
             top_k: expected_record_count,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
@@ -826,6 +828,7 @@ async fn assert_data_matches(
             vector: vec![1.0, 0.0],
             top_k: expected_record_count as u64,
             snapshot: None,
+            read_barrier: None,
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,

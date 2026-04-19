@@ -70,6 +70,9 @@ pub enum ServiceError {
     /// The caller supplied an invalid request.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The request is well-formed but cannot be satisfied by the current node state yet.
+    #[error("{0}")]
+    FailedPrecondition(String),
     /// The caller failed authentication.
     #[error("{0}")]
     Unauthenticated(String),
@@ -429,8 +432,22 @@ impl LogPoseDataService {
         collection_name: &str,
         snapshot: Snapshot,
     ) -> Result<CollectionStats> {
+        self.stats_for_read(collection_name, Some(snapshot), None)
+            .await
+    }
+
+    /// Return collection-level stats for one exact snapshot or lower-bound read barrier.
+    pub async fn stats_for_read(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        read_barrier: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.stats_descriptor(&descriptor, Some(snapshot)).await
+        let snapshot = self
+            .resolve_read_snapshot(&descriptor.lookup_name(), snapshot, read_barrier)
+            .await?;
+        self.stats_descriptor(&descriptor, snapshot).await
     }
 
     /// Return collection-level stats using a previously loaded descriptor.
@@ -532,6 +549,35 @@ impl LogPoseDataService {
         ensure_collection_reference_matches_descriptor(&reference, &descriptor, collection_name)
             .map_err(ServiceError::from)?;
         Ok(descriptor)
+    }
+
+    async fn resolve_read_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        read_barrier: Option<Snapshot>,
+    ) -> Result<Option<Snapshot>> {
+        match (snapshot, read_barrier) {
+            (Some(_), Some(_)) => Err(ServiceError::InvalidArgument(
+                "snapshot and read_barrier cannot be provided together".to_owned(),
+            )),
+            (Some(snapshot), None) => Ok(Some(snapshot)),
+            (None, None) => Ok(None),
+            (None, Some(read_barrier)) => {
+                let current = self.snapshot(collection_name).await?;
+                if current.satisfies_read_barrier(&read_barrier) {
+                    Ok(Some(current))
+                } else {
+                    Err(ServiceError::FailedPrecondition(format!(
+                        "read barrier generation {}, seq {} is not yet visible; current snapshot is generation {}, seq {}",
+                        read_barrier.manifest_generation,
+                        read_barrier.visible_seq_no,
+                        current.manifest_generation,
+                        current.visible_seq_no
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -1137,6 +1183,8 @@ fn classify_message(message: String) -> ServiceError {
         || is_dimension_validation_error(&message)
     {
         ServiceError::InvalidArgument(message)
+    } else if message.contains("read barrier") {
+        ServiceError::FailedPrecondition(message)
     } else {
         ServiceError::Internal(message)
     }

@@ -146,6 +146,8 @@ impl Cli {
                             collection: args.collection_ref(),
                             snapshot_manifest_generation: args.snapshot_manifest_generation,
                             snapshot_visible_seq_no: args.snapshot_visible_seq_no,
+                            read_barrier_manifest_generation: args.read_barrier_manifest_generation,
+                            read_barrier_visible_seq_no: args.read_barrier_visible_seq_no,
                         })
                     }
                     CollectionCommand::Placement(args) => {
@@ -192,6 +194,8 @@ impl Cli {
                     explain: args.explain,
                     snapshot_manifest_generation: args.snapshot_manifest_generation,
                     snapshot_visible_seq_no: args.snapshot_visible_seq_no,
+                    read_barrier_manifest_generation: args.read_barrier_manifest_generation,
+                    read_barrier_visible_seq_no: args.read_barrier_visible_seq_no,
                 }),
                 auth_token: auth_token.clone(),
                 output,
@@ -599,7 +603,7 @@ impl CollectionNameArg {
 #[derive(Debug, Args)]
 #[command(
     about = "Show collection-level storage statistics.",
-    after_long_help = "Examples:\n  logpose collection stats colors\n  logpose collection stats colors --snapshot-manifest-generation 0 --snapshot-visible-seq-no 3\n  logpose --json collection stats colors --database analytics"
+    after_long_help = "Examples:\n  logpose collection stats colors\n  logpose collection stats colors --snapshot-manifest-generation 0 --snapshot-visible-seq-no 3\n  logpose collection stats colors --read-barrier-manifest-generation 0 --read-barrier-visible-seq-no 3\n  logpose --json collection stats colors --database analytics"
 )]
 pub struct CollectionStatsArgs {
     #[command(flatten)]
@@ -610,6 +614,7 @@ pub struct CollectionStatsArgs {
         long,
         value_name = "GENERATION",
         requires = "snapshot_visible_seq_no",
+        conflicts_with_all = ["read_barrier_manifest_generation", "read_barrier_visible_seq_no"],
         help = "Historical manifest generation to inspect. Must be paired with --snapshot-visible-seq-no. Example: 0"
     )]
     pub snapshot_manifest_generation: Option<u64>,
@@ -617,9 +622,26 @@ pub struct CollectionStatsArgs {
         long,
         value_name = "SEQ_NO",
         requires = "snapshot_manifest_generation",
+        conflicts_with_all = ["read_barrier_manifest_generation", "read_barrier_visible_seq_no"],
         help = "Historical visible sequence number to inspect. Must be paired with --snapshot-manifest-generation. Example: 3"
     )]
     pub snapshot_visible_seq_no: Option<u64>,
+    #[arg(
+        long,
+        value_name = "GENERATION",
+        requires = "read_barrier_visible_seq_no",
+        conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
+        help = "Lower-bound manifest generation that must already be visible. Must be paired with --read-barrier-visible-seq-no."
+    )]
+    pub read_barrier_manifest_generation: Option<u64>,
+    #[arg(
+        long,
+        value_name = "SEQ_NO",
+        requires = "read_barrier_manifest_generation",
+        conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
+        help = "Lower-bound visible sequence number that must already be visible. Must be paired with --read-barrier-manifest-generation."
+    )]
+    pub read_barrier_visible_seq_no: Option<u64>,
 }
 
 impl CollectionStatsArgs {
@@ -699,7 +721,7 @@ impl RecordDeleteArgs {
 #[derive(Debug, Args)]
 #[command(
     about = "Run vector search with optional filters, predicates, and planner diagnostics.",
-    after_long_help = "Examples:\n  logpose query colors --vector 0.12,-0.44,0.90 --top-k 3\n  logpose query colors --vector 1.0,0.0 --top-k 2 --filter kind=article\n  logpose --json query colors --vector 1.0,0.0 --top-k 1 --where kind:eq:keep --explain profile\n  logpose interactive"
+    after_long_help = "Examples:\n  logpose query colors --vector 0.12,-0.44,0.90 --top-k 3\n  logpose query colors --vector 1.0,0.0 --top-k 2 --filter kind=article\n  logpose query colors --vector 1.0,0.0 --top-k 2 --read-barrier-manifest-generation 0 --read-barrier-visible-seq-no 3\n  logpose --json query colors --vector 1.0,0.0 --top-k 1 --where kind:eq:keep --explain profile\n  logpose interactive"
 )]
 pub struct QueryArgs {
     #[command(flatten)]
@@ -753,6 +775,7 @@ pub struct QueryArgs {
         long,
         value_name = "GENERATION",
         requires = "snapshot_visible_seq_no",
+        conflicts_with_all = ["read_barrier_manifest_generation", "read_barrier_visible_seq_no"],
         help = "Historical manifest generation to read. Must be paired with --snapshot-visible-seq-no. Example: 12"
     )]
     pub snapshot_manifest_generation: Option<u64>,
@@ -760,9 +783,26 @@ pub struct QueryArgs {
         long,
         value_name = "SEQ_NO",
         requires = "snapshot_manifest_generation",
+        conflicts_with_all = ["read_barrier_manifest_generation", "read_barrier_visible_seq_no"],
         help = "Historical visible sequence number to read. Must be paired with --snapshot-manifest-generation. Example: 44"
     )]
     pub snapshot_visible_seq_no: Option<u64>,
+    #[arg(
+        long,
+        value_name = "GENERATION",
+        requires = "read_barrier_visible_seq_no",
+        conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
+        help = "Lower-bound manifest generation that must already be visible. Must be paired with --read-barrier-visible-seq-no."
+    )]
+    pub read_barrier_manifest_generation: Option<u64>,
+    #[arg(
+        long,
+        value_name = "SEQ_NO",
+        requires = "read_barrier_manifest_generation",
+        conflicts_with_all = ["snapshot_manifest_generation", "snapshot_visible_seq_no"],
+        help = "Lower-bound visible sequence number that must already be visible. Must be paired with --read-barrier-manifest-generation."
+    )]
+    pub read_barrier_visible_seq_no: Option<u64>,
 }
 
 impl QueryArgs {

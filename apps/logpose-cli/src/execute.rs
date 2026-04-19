@@ -1,7 +1,8 @@
 use crate::{
     action::{
         Action, CLI_PUT_BATCH_BYTES, database_descriptor, query_request_from_action,
-        read_database_policy_input, read_jsonl_put_batches, stats_snapshot_from_action,
+        read_database_policy_input, read_jsonl_put_batches, stats_read_barrier_from_action,
+        stats_snapshot_from_action,
     },
     feedback::{ProgressHandle, Reporter},
     render::ActionOutput,
@@ -111,10 +112,11 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Fetching collection stats...");
             let client = connect_client(config, auth_token).await?;
             let stats = client
-                .stats_in_database_at_snapshot(
+                .stats_in_database_for_read(
                     &action.collection.database_name,
                     &action.collection.collection_name,
                     stats_snapshot_from_action(action)?,
+                    stats_read_barrier_from_action(action)?,
                 )
                 .await
                 .context("failed to read collection stats")?;

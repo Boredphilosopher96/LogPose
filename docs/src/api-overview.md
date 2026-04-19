@@ -398,6 +398,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | `vector`        | float[] | yes      | Query vector                                          |
 | `top_k`         | integer | yes      | Maximum results to return (>= 1)                      |
 | `snapshot`      | object  | no       | Pin query to a specific snapshot                      |
+| `read_barrier`  | object  | no       | Require a snapshot at or beyond one previously observed boundary; cannot be combined with `snapshot` |
 | `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata |
 | `predicate`     | object  | no       | Structured predicate tree (see below)                 |
 | `explain`       | string  | no       | `"none"`, `"plan"`, or `"profile"`                    |
@@ -498,7 +499,11 @@ filter selectivity:
 Returns storage statistics, maintenance state, and per-query-unit breakdowns.
 Use the `database` query parameter for non-default namespaces.
 Use `snapshot_manifest_generation` and `snapshot_visible_seq_no` together to inspect
-stats at one exact historical snapshot.
+stats at one exact historical snapshot. Use
+`read_barrier_manifest_generation` and `read_barrier_visible_seq_no`
+together to require stats from a snapshot at or beyond one previously observed
+write or read boundary. Exact snapshots and read barriers are mutually
+exclusive.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -686,7 +691,7 @@ service LogPoseService {
 
 The public APIs do not yet provide:
 
-- client-selectable consistency levels or monotonic-read session tokens
+- multiple named consistency levels beyond exact snapshots and lower-bound read barriers
 - multi-node data-plane failover orchestration and chaos-tested recovery workflows
 - collection listing or delete/drop lifecycle endpoints
 - record-browse or scroll-style inspection endpoints
