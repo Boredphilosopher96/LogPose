@@ -487,6 +487,116 @@ async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
 }
 
 #[tokio::test]
+async fn etcd_new_node_registration_updates_visible_membership() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("node-registration");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-node-registration";
+
+    let mut leader_config = test_config(
+        "node-a",
+        unique_temp_dir("etcd-node-registration-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    leader_config.node_role = NodeRole::Combined;
+    let leader = Arc::new(AppState::new(leader_config));
+    wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members.len() == 1
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-a")
+        })
+    })
+    .await;
+
+    let mut follower_config = test_config(
+        "node-b",
+        unique_temp_dir("etcd-node-registration-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    let follower = Arc::new(AppState::new(follower_config));
+    wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.is_local_leader
+                && coordination.registered_members.len() == 2
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-a")
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-b")
+        })
+    })
+    .await;
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("node-a")
+                && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+
+    let mut joining_config = test_config(
+        "node-c",
+        unique_temp_dir("etcd-node-registration-c"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    joining_config.node_role = NodeRole::Data;
+    let joining = Arc::new(AppState::new(joining_config));
+
+    let leader_status = wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.is_local_leader
+                && coordination.registered_members.len() == 3
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-c")
+        })
+    })
+    .await;
+    let joining_status = wait_for_runtime_status(&joining, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("node-a")
+                && coordination.registered_members.len() == 3
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-c")
+        })
+    })
+    .await;
+
+    assert!(
+        leader_status.control_plane_ready,
+        "leader should stay control-plane ready after new node registration"
+    );
+    assert!(
+        joining_status.data_plane_ready,
+        "joining node should report a data-plane-ready runtime status after registration"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_membership_leases_expire_after_state_drop() {
     let endpoints = test_etcd_endpoints();
     let key_prefix = unique_etcd_prefix("membership-expiry-after-drop");
@@ -535,6 +645,116 @@ async fn etcd_membership_leases_expire_after_state_drop() {
         );
         sleep(Duration::from_millis(100)).await;
     }
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_rejoining_node_re_registers_membership_after_restart() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("membership-rejoin");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-membership-rejoin";
+
+    let mut leader_config = test_config(
+        "node-a",
+        unique_temp_dir("etcd-membership-rejoin-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    leader_config.node_role = NodeRole::Combined;
+    leader_config.metadata.etcd.membership_ttl_secs = 2;
+    leader_config.metadata.etcd.leadership_ttl_secs = 2;
+    let leader = Arc::new(AppState::new(leader_config));
+    wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members.len() == 1
+        })
+    })
+    .await;
+
+    let follower_root = unique_temp_dir("etcd-membership-rejoin-b");
+    let mut follower_config = test_config(
+        "node-b",
+        follower_root.clone(),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Data;
+    follower_config.metadata.etcd.membership_ttl_secs = 2;
+    follower_config.metadata.etcd.leadership_ttl_secs = 2;
+    let follower = Arc::new(AppState::new(follower_config.clone()));
+    wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.is_local_leader
+                && coordination.registered_members.len() == 2
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-b")
+        })
+    })
+    .await;
+
+    drop(follower);
+    let leader_after_drop = wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members.len() == 1
+                && coordination
+                    .registered_members
+                    .iter()
+                    .all(|member| member == "node-a")
+        })
+    })
+    .await;
+
+    let rejoining = Arc::new(AppState::new(follower_config));
+    let leader_after_rejoin = wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members.len() == 2
+                && coordination
+                    .registered_members
+                    .iter()
+                    .any(|member| member == "node-b")
+        })
+    })
+    .await;
+    let rejoining_status = wait_for_runtime_status(&rejoining, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("node-a")
+                && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+
+    assert!(
+        leader_after_drop
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.registered_members == vec!["node-a"]),
+        "leader should observe the follower membership lease expiry before rejoin"
+    );
+    assert!(
+        leader_after_rejoin
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination
+                .registered_members
+                .iter()
+                .any(|member| member == "node-b")),
+        "leader should observe the rejoining node in visible membership"
+    );
+    assert!(rejoining_status.data_plane_ready);
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }

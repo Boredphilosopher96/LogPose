@@ -15,5 +15,6 @@
 - [API Overview](./api-overview.md)
 - [Testing](./testing.md)
 - [Operations](./operations.md)
+- [Podman Chaos](./podman-chaos.md)
 - [Security](./security.md)
 - [Contributing](./contributing.md)

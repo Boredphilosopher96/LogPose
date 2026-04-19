@@ -1,6 +1,10 @@
 //! Etcd-backed metadata overlay for collection placement assignments.
 
+#[cfg(test)]
+use anyhow as _;
 use async_trait::async_trait;
+#[cfg(test)]
+use clap as _;
 use etcd_client::{
     Client, Compare, CompareOp, DeleteOptions, GetOptions, LeaseKeepAliveStream, LeaseKeeper,
     PutOptions, ResponseHeader, Txn, TxnOp,

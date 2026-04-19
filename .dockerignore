@@ -1,0 +1,7 @@
+.git
+.github
+.logpose
+target
+**/target
+node_modules
+docs/book
