@@ -143,6 +143,12 @@ impl Default for DatabaseId {
     }
 }
 
+/// Stable identifier reserved for the implicit `default` database.
+#[must_use]
+pub fn default_database_id() -> DatabaseId {
+    DatabaseId(Uuid::from_u128(0x6c6f6750_6f73655f_64656661_756c7442))
+}
+
 impl fmt::Display for DatabaseId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
@@ -827,6 +833,15 @@ pub struct CollectionAssignment {
     pub assigned_node: String,
     /// Runtime role recorded for the node assignment.
     pub assigned_role: NodeRole,
+}
+
+/// Leadership token required to fence control-plane etcd transactions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeadershipFence {
+    /// Controller node performing the mutation.
+    pub node_id: String,
+    /// Active etcd leadership lease for that controller.
+    pub lease_id: i64,
 }
 
 /// Operator-visible explanation of where a collection is currently placed.

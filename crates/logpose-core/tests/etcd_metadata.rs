@@ -11,10 +11,12 @@ use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, QueryRequest};
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest;
-use logpose_storage_etcd::{EtcdCatalogStore, EtcdCoordinationClient, PromotionResult};
+use logpose_storage_etcd::{
+    EtcdCatalogStore, EtcdCoordinationClient, LeadershipRecord, PromotionResult,
+};
 use logpose_types::{
     CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, MetadataBackend,
-    MetadataConfig, NodeRole, PutRecord, RecordId, Snapshot, WriteOperation,
+    MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -628,6 +630,146 @@ async fn etcd_follower_nodes_reject_control_plane_mutations() {
 }
 
 #[tokio::test]
+async fn etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("stale-leader-catalog-fence");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-stale-leader-catalog-fence";
+    let bootstrap_tokens = vec![BootstrapTokenConfig {
+        token: "operator-token".to_owned(),
+        principal: Principal::new_with_access_tier(
+            "ops-admin",
+            PrincipalKind::User,
+            AccessTier::Operator,
+        ),
+    }];
+
+    let mut leader_config = test_config_with_auth(
+        "leader-a",
+        unique_temp_dir("etcd-stale-leader-catalog-fence"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+        bootstrap_tokens,
+    );
+    leader_config.node_role = NodeRole::Combined;
+    let leader = Arc::new(AppState::new(leader_config.clone()));
+    let leader_status = wait_for_runtime_status(&leader, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+    let leader_lease_id = leader_status
+        .coordination
+        .as_ref()
+        .and_then(|coordination| coordination.leadership_lease_id)
+        .expect("leader lease id should be visible");
+
+    leader
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("analytics"),
+        )
+        .await
+        .expect("leader should seed one shared database");
+
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .put(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            serde_json::to_string(&LeadershipRecord {
+                node_id: "leader-b".to_owned(),
+                lease_id: 9_999,
+            })
+            .expect("leadership record should encode"),
+            None,
+        )
+        .await
+        .expect("leadership key should be replaceable for the stale-leader test");
+    let demoted_status = wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("leader-b")
+        }) && !status.control_plane_ready
+            && status.data_plane_ready
+    })
+    .await;
+    let app_database_error = leader
+        .put_database_with_auth(
+            &RequestAuth::bearer_token("operator-token"),
+            logpose_catalog::DatabaseDescriptor::new("warehouse-app"),
+        )
+        .await
+        .expect_err("demoted leader should reject app-layer database mutations");
+    let app_policy_error = leader
+        .control
+        .set_database_access_policy(DatabaseAccessPolicy {
+            database_name: "analytics".to_owned(),
+            authentication_mode: AuthenticationMode::ExternalToken,
+            role_bindings: Vec::new(),
+        })
+        .await
+        .expect_err("demoted leader should reject app-layer policy mutations");
+
+    let catalog = EtcdCatalogStore::new(leader_config.metadata.etcd.clone())
+        .expect("shared catalog should build");
+    let stale_database_error = catalog
+        .put_database(
+            logpose_catalog::DatabaseDescriptor::new("warehouse"),
+            "leader-a",
+            leader_lease_id,
+        )
+        .await
+        .expect_err("stale leader should be fenced by the database txn");
+    let stale_policy_error = catalog
+        .put_database_access_policy(
+            DatabaseAccessPolicy {
+                database_name: "analytics".to_owned(),
+                authentication_mode: AuthenticationMode::ExternalToken,
+                role_bindings: vec![DatabaseRoleBinding {
+                    database_name: "analytics".to_owned(),
+                    principal_name: "ops-admin".to_owned(),
+                    role: DatabaseRole::Owner,
+                }],
+            },
+            "leader-a",
+            leader_lease_id,
+        )
+        .await
+        .expect_err("stale leader should be fenced by the policy txn");
+
+    assert!(
+        stale_database_error
+            .to_string()
+            .contains("not the active control-plane leader")
+    );
+    assert!(matches!(
+        app_database_error,
+        ServiceError::InvalidArgument(ref message)
+            if message.contains("not the active control-plane leader")
+    ));
+    assert!(matches!(
+        app_policy_error,
+        ServiceError::InvalidArgument(ref message)
+            if message.contains("not the active control-plane leader")
+    ));
+    assert!(
+        stale_policy_error
+            .to_string()
+            .contains("not the active control-plane leader")
+    );
+    assert!(demoted_status.data_plane_ready);
+    assert!(!demoted_status.control_plane_ready);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_owner_promotion_fences_the_old_owner() {
     let endpoints = test_etcd_endpoints();
     let key_prefix = unique_etcd_prefix("owner-promotion-fence");
@@ -710,6 +852,11 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .expect("owner record should be seeded");
     assert_eq!(current.owner_node_id, "owner-a");
     assert_eq!(current.epoch, 1);
+    let non_member_attempt = coordination
+        .promote_shard_owner(&current, "owner-z")
+        .await
+        .expect("non-member promotion attempt should return a conflict result");
+    assert!(matches!(non_member_attempt, PromotionResult::Conflict));
 
     let promoted = coordination
         .promote_shard_owner(&current, "owner-b")
@@ -815,7 +962,7 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
 }
 
 #[tokio::test]
-async fn etcd_owner_promotion_preserves_read_barriers() {
+async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata() {
     let endpoints = test_etcd_endpoints();
     let key_prefix = unique_etcd_prefix("owner-promotion-read-barrier");
     cleanup_prefix(&endpoints, &key_prefix).await;
@@ -901,7 +1048,7 @@ async fn etcd_owner_promotion_preserves_read_barriers() {
         .expect("promotion should succeed");
     assert!(matches!(promoted, PromotionResult::Applied(_)));
 
-    follower
+    let post_promotion_ack = follower
         .write(
             "documents",
             vec![WriteOperation::Put(PutRecord {
@@ -925,33 +1072,148 @@ async fn etcd_owner_promotion_preserves_read_barriers() {
             explain: ExplainMode::None,
         })
         .await
-        .expect("promoted owner should satisfy the pre-promotion read barrier");
+        .expect_err("promoted owner should fail closed on pre-promotion read barriers");
     let stats = follower
         .stats_for_read("documents", None, Some(pre_promotion_ack.snapshot.clone()))
         .await
-        .expect("promoted owner should satisfy stats read barrier");
+        .expect_err("promoted owner should fail closed on stats read barriers");
+    let post_promotion_query = follower
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: None,
+            read_barrier: Some(post_promotion_ack.snapshot.clone()),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect_err("promoted owner should fail closed on post-promotion read barriers too");
+    let post_promotion_stats = follower
+        .stats_for_read("documents", None, Some(post_promotion_ack.snapshot.clone()))
+        .await
+        .expect_err("promoted owner should fail closed on post-promotion stats barriers too");
+    let exact_snapshot_query = follower
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: Some(post_promotion_ack.snapshot.clone()),
+            read_barrier: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("exact snapshots should remain readable after promotion");
 
     assert!(
-        query
-            .snapshot
-            .satisfies_read_barrier(&pre_promotion_ack.snapshot)
+        matches!(query, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        "promoted owner should explain the fail-closed read-barrier behavior: {query:?}"
     );
+    assert!(
+        matches!(stats, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        "promoted owner should explain the fail-closed stats behavior: {stats:?}"
+    );
+    assert!(
+        matches!(post_promotion_query, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        "promoted owner should reject barriers minted after promotion too: {post_promotion_query:?}"
+    );
+    assert!(
+        matches!(post_promotion_stats, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        "promoted owner should reject stats barriers minted after promotion too: {post_promotion_stats:?}"
+    );
+    assert_eq!(exact_snapshot_query.snapshot, post_promotion_ack.snapshot);
     assert_eq!(
-        query
+        exact_snapshot_query
             .matches
             .iter()
             .map(|candidate| candidate.id.as_str())
             .collect::<Vec<_>>(),
         vec!["alpha", "beta"]
     );
-    assert!(
-        Snapshot {
-            manifest_generation: stats.manifest_generation,
-            visible_seq_no: stats.visible_seq_no,
-        }
-        .satisfies_read_barrier(&pre_promotion_ack.snapshot)
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("missing-owner-read-fence");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-missing-owner-read-fence";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-missing-owner-read-fence-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
     );
-    assert_eq!(stats.live_record_count, 2);
+    owner_config.node_role = NodeRole::Combined;
+    let owner = Arc::new(AppState::new(owner_config.clone()));
+    wait_for_runtime_status(&owner, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created by the owner");
+    owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("owner should serve writes before owner metadata is removed");
+
+    let owner_key = format!(
+        "{key_prefix}/clusters/{cluster_name}/collections/{}/shards/0/owner",
+        CollectionRef::new_default("documents").lookup_name()
+    );
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .delete(owner_key, None)
+        .await
+        .expect("owner metadata should be removable for the test");
+
+    let placement = owner
+        .control
+        .collection_placement("documents")
+        .await
+        .expect("placement should still load when owner metadata is missing");
+    let stats_error = owner
+        .stats("documents")
+        .await
+        .expect_err("reads should fail closed when owner metadata is missing");
+
+    assert_eq!(placement.route_kind, "recorded");
+    assert!(
+        placement
+            .route_reason
+            .contains("ownership metadata is missing")
+    );
+    assert!(
+        matches!(stats_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        "missing owner metadata should fence reads until reconciliation: {stats_error:?}"
+    );
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -1054,6 +1316,76 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
 }
 
 #[tokio::test]
+async fn etcd_owner_promotion_conflicts_for_control_only_members() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("owner-promotion-control-only");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-owner-promotion-control-only";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-owner-promotion-control-only-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    owner_config.node_role = NodeRole::Combined;
+    let owner = Arc::new(AppState::new(owner_config.clone()));
+    wait_for_runtime_status(&owner, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+
+    let mut control_config = test_config(
+        "control-b",
+        unique_temp_dir("etcd-owner-promotion-control-only-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    control_config.node_role = NodeRole::Control;
+    let control = Arc::new(AppState::new(control_config));
+    wait_for_runtime_status(&control, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("owner-a")
+        })
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created by the owner");
+
+    let coordination = EtcdCoordinationClient::new(owner_config.metadata.etcd.clone())
+        .expect("coordination client should build");
+    let current = coordination
+        .shard_owner(&CollectionRef::new_default("documents"), "0")
+        .await
+        .expect("owner lookup should succeed")
+        .expect("owner record should be seeded");
+
+    let promotion = coordination
+        .promote_shard_owner(&current, "control-b")
+        .await
+        .expect("control-only members should produce a conflict result");
+
+    assert!(matches!(promotion, PromotionResult::Conflict));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachable() {
     let root = unique_temp_dir("etcd-runtime-status-error");
     let mut config = LogPoseConfig {
@@ -1097,6 +1429,78 @@ async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachab
             .as_deref()
             .is_some_and(|message| message.contains("etcd metadata operation failed"))
     );
+}
+
+#[tokio::test]
+async fn etcd_runtime_status_drops_ready_flags_after_external_lease_revocation() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("runtime-status-lease-revocation");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-runtime-status-lease-revocation";
+
+    let mut config = test_config(
+        "coordinator-a",
+        unique_temp_dir("etcd-runtime-status-lease-revocation"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    config.node_role = NodeRole::Combined;
+    config.metadata.etcd.membership_ttl_secs = 15;
+    config.metadata.etcd.leadership_ttl_secs = 15;
+    let state = Arc::new(AppState::new(config.clone()));
+
+    let ready = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.membership_lease_id.is_some()
+                && coordination.leadership_lease_id.is_some()
+        }) && status.control_plane_ready
+            && status.data_plane_ready
+    })
+    .await;
+    let coordination = ready
+        .coordination
+        .as_ref()
+        .expect("coordination state should be present");
+    let revoker = EtcdCoordinationClient::new(config.metadata.etcd.clone())
+        .expect("coordination client should build");
+    revoker
+        .revoke_lease(
+            coordination
+                .leadership_lease_id
+                .expect("leadership lease id should be present"),
+        )
+        .await
+        .expect("leadership lease should be revocable");
+    revoker
+        .revoke_lease(
+            coordination
+                .membership_lease_id
+                .expect("membership lease id should be present"),
+        )
+        .await
+        .expect("membership lease should be revocable");
+
+    let degraded = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            !coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.membership_lease_id.is_none()
+                && coordination.leadership_lease_id.is_none()
+        }) && !status.control_plane_ready
+            && !status.data_plane_ready
+    })
+    .await;
+    let degraded_coordination = degraded
+        .coordination
+        .expect("coordination state should remain present");
+
+    assert!(!degraded_coordination.membership_registered);
+    assert!(!degraded_coordination.is_local_leader);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
 fn test_config(

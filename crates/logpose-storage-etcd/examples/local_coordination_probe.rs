@@ -35,8 +35,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let node_a = client.register_membership("node-a").await?;
-    let node_b = client.register_membership("node-b").await?;
+    let node_a = client
+        .register_membership("node-a", logpose_types::NodeRole::Combined)
+        .await?;
+    let node_b = client
+        .register_membership("node-b", logpose_types::NodeRole::Data)
+        .await?;
     client.keep_alive(node_a.lease_id).await?;
     client.keep_alive(node_b.lease_id).await?;
     tokio::time::sleep(Duration::from_millis(50)).await;

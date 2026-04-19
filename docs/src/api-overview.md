@@ -392,16 +392,18 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 
 **Request body**:
 
-| Field           | Type    | Required | Description                                           |
-|-----------------|---------|----------|-------------------------------------------------------|
-| `database_name` | string  | no       | Database namespace; defaults to `default`             |
-| `vector`        | float[] | yes      | Query vector                                          |
-| `top_k`         | integer | yes      | Maximum results to return (>= 1)                      |
-| `snapshot`      | object  | no       | Pin query to a specific snapshot                      |
-| `read_barrier`  | object  | no       | Require a snapshot at or beyond one previously observed boundary; cannot be combined with `snapshot` |
-| `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata |
-| `predicate`     | object  | no       | Structured predicate tree (see below)                 |
-| `explain`       | string  | no       | `"none"`, `"plan"`, or `"profile"`                    |
+<!-- markdownlint-disable MD060 -->
+| Field           | Type    | Required | Description                                                                    |
+|-----------------|---------|----------|--------------------------------------------------------------------------------|
+| `database_name` | string  | no       | Database namespace; defaults to `default`                                      |
+| `vector`        | float[] | yes      | Query vector                                                                   |
+| `top_k`         | integer | yes      | Maximum results to return (>= 1)                                               |
+| `snapshot`      | object  | no       | Pin query to a specific snapshot                                               |
+| `read_barrier`  | object  | no       | Require a lower-bound previously observed snapshot on the current owner; cannot be combined with `snapshot` |
+| `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata                          |
+| `predicate`     | object  | no       | Structured predicate tree (see below)                                          |
+| `explain`       | string  | no       | `"none"`, `"plan"`, or `"profile"`                                             |
+<!-- markdownlint-enable MD060 -->
 
 **Response** (`200`):
 
@@ -442,6 +444,15 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
   }
 }
 ```
+
+<!-- markdownlint-disable MD060 -->
+| Status | Meaning                                  |
+|--------|------------------------------------------|
+| `200`  | Query returned                           |
+| `400`  | Invalid request or collection not servable |
+| `404`  | Collection not found                     |
+| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+<!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
 
@@ -501,9 +512,10 @@ Use the `database` query parameter for non-default namespaces.
 Use `snapshot_manifest_generation` and `snapshot_visible_seq_no` together to inspect
 stats at one exact historical snapshot. Use
 `read_barrier_manifest_generation` and `read_barrier_visible_seq_no`
-together to require stats from a snapshot at or beyond one previously observed
-write or read boundary. Exact snapshots and read barriers are mutually
-exclusive.
+together to require the current serving node to expose stats from a snapshot at
+or beyond one previously observed write or read boundary. Exact snapshots and
+read barriers are mutually exclusive. After ownership promotion, promoted
+owners fail read barriers closed until replica freshness metadata exists.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -546,11 +558,14 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 }
 ```
 
-| Status | Meaning                                    |
-|--------|--------------------------------------------|
-| `200`  | Collection stats returned                  |
-| `400`  | Collection not locally servable            |
-| `404`  | Collection not found                       |
+<!-- markdownlint-disable MD060 -->
+| Status | Meaning                                  |
+|--------|------------------------------------------|
+| `200`  | Collection stats returned                |
+| `400`  | Invalid request or collection not locally servable |
+| `404`  | Collection not found                     |
+| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+<!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
 
@@ -691,7 +706,7 @@ service LogPoseService {
 
 The public APIs do not yet provide:
 
-- multiple named consistency levels beyond exact snapshots and lower-bound read barriers
+- multiple named consistency levels beyond exact snapshots and lower-bound read barriers, including read-barrier continuity across ownership promotion
 - multi-node data-plane failover orchestration and chaos-tested recovery workflows
 - collection listing or delete/drop lifecycle endpoints
 - record-browse or scroll-style inspection endpoints
