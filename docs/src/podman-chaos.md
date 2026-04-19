@@ -61,7 +61,7 @@ LogPose nodes:
 
 | Component | Count | Published ports | Purpose |
 | --------- | ----- | --------------- | ------- |
-| `etcd-1` | 1 | `2379 -> 2379` | cluster metadata quorum member |
+| `etcd-1` | 1 | `12379 -> 2379` | cluster metadata quorum member |
 | `etcd-2` | 1 | `22379 -> 2379` | cluster metadata quorum member |
 | `etcd-3` | 1 | `32379 -> 2379` | cluster metadata quorum member |
 | `node-a` | 1 | REST `18080`, gRPC `15051` | combined node, normal initial owner and leader |
@@ -71,6 +71,9 @@ LogPose nodes:
 All LogPose nodes share the same `metadata.etcd.cluster_name`,
 `metadata.etcd.key_prefix`, and endpoint set, but each node gets its own local
 `storage_root`.
+
+The first published etcd client port is `12379` instead of `2379` so the Podman
+lab does not collide with a developer's local standalone etcd.
 
 `node-a` and `node-b` are combined nodes because the current promotion drills
 expect the promoted owner to be able to serve both placement inspection and
@@ -172,9 +175,14 @@ Optional overrides:
 - `LOGPOSE_PODMAN_CHAOS_CLUSTER`
 - `LOGPOSE_PODMAN_CHAOS_STATE_DIR`
 - `LOGPOSE_PODMAN_CHAOS_IMAGE`
+- `LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE=1`
 - `LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE`
 - `LOGPOSE_PODMAN_CHAOS_KEY_PREFIX`
 - `LOGPOSE_PODMAN_MACHINE_NAME`
+
+The harness reuses an existing `LOGPOSE_PODMAN_CHAOS_IMAGE` by default. Set
+`LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE=1` when you need to force a fresh image
+build after local code changes.
 
 ## Major Commands
 
@@ -228,13 +236,13 @@ Because ownership promotion is not exposed as a public server API, use the
 checked-in etcd helper for ownership inspection or promotion drills:
 
 ```bash
-LOGPOSE_ETCD_ENDPOINTS=http://127.0.0.1:2379,http://127.0.0.1:22379,http://127.0.0.1:32379 \
+LOGPOSE_ETCD_ENDPOINTS=http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379 \
 LOGPOSE_ETCD_CLUSTER=pr4-chaos \
 LOGPOSE_ETCD_KEY_PREFIX=/logpose/chaos \
 cargo run -p logpose-storage-etcd --example etcd_coordination_admin -- \
   list-membership
 
-LOGPOSE_ETCD_ENDPOINTS=http://127.0.0.1:2379,http://127.0.0.1:22379,http://127.0.0.1:32379 \
+LOGPOSE_ETCD_ENDPOINTS=http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379 \
 LOGPOSE_ETCD_CLUSTER=pr4-chaos \
 LOGPOSE_ETCD_KEY_PREFIX=/logpose/chaos \
 cargo run -p logpose-storage-etcd --example etcd_coordination_admin -- \

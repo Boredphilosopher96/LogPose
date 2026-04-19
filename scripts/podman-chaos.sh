@@ -50,6 +50,7 @@ Scenarios:
 Environment:
   LOGPOSE_PODMAN_CHAOS_STATE_DIR  Base state directory (default: .logpose/podman-chaos)
   LOGPOSE_PODMAN_CHAOS_IMAGE      Server image tag (default: localhost/logpose-chaos:dev)
+  LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE  Rebuild the server image even if the tag already exists (default: 0)
   LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE Etcd image tag (default: quay.io/coreos/etcd:v3.5.18)
   LOGPOSE_PODMAN_CHAOS_KEY_PREFIX Etcd key prefix (default: /logpose/chaos)
   LOGPOSE_PODMAN_MACHINE_NAME     Podman machine name (default: podman-machine-default)
@@ -59,6 +60,7 @@ EOF
 cluster_name="${LOGPOSE_PODMAN_CHAOS_CLUSTER:-podman-chaos}"
 state_root="${LOGPOSE_PODMAN_CHAOS_STATE_DIR:-$state_root_default}"
 image_tag="${LOGPOSE_PODMAN_CHAOS_IMAGE:-$image_tag_default}"
+rebuild_image="${LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE:-0}"
 etcd_image="${LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE:-$etcd_image_default}"
 key_prefix="${LOGPOSE_PODMAN_CHAOS_KEY_PREFIX:-$key_prefix_default}"
 machine_name="${LOGPOSE_PODMAN_MACHINE_NAME:-$machine_name_default}"
@@ -166,7 +168,7 @@ etcd_data_dir() {
 
 etcd_host_client_port() {
     case "$1" in
-        etcd-1) printf '2379\n' ;;
+        etcd-1) printf '12379\n' ;;
         etcd-2) printf '22379\n' ;;
         etcd-3) printf '32379\n' ;;
         *) die "unknown etcd member '$1'" ;;
@@ -174,7 +176,7 @@ etcd_host_client_port() {
 }
 
 etcd_host_endpoints_csv() {
-    printf 'http://127.0.0.1:2379,http://127.0.0.1:22379,http://127.0.0.1:32379\n'
+    printf 'http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379\n'
 }
 
 etcd_container_endpoints_toml() {
@@ -344,14 +346,17 @@ ensure_podman_ready() {
             podman machine stop "$machine_name" >/dev/null || true
         fi
     fi
-    if run_with_timeout 120 podman machine start "$machine_name" >/dev/null; then
+    local start_output=""
+    if start_output="$(run_with_timeout 120 podman machine start "$machine_name" 2>&1 >/dev/null)"; then
         :
     else
         local start_exit=$?
         if [[ "$start_exit" -eq 124 ]]; then
             die "timed out while starting podman machine '${machine_name}'"
         fi
-        die "failed to start podman machine '${machine_name}'. If macOS is configured for libkrun without krunkit, recreate the machine with CONTAINERS_MACHINE_PROVIDER=applehv and vfkit installed."
+        if [[ "$start_output" != *"already running"* && "$start_output" != *"proxy already running"* ]]; then
+            die "failed to start podman machine '${machine_name}'. If macOS is configured for libkrun without krunkit, recreate the machine with CONTAINERS_MACHINE_PROVIDER=applehv and vfkit installed."
+        fi
     fi
     for _ in $(seq 1 30); do
         if podman info >/dev/null 2>&1; then
@@ -370,6 +375,10 @@ reject_remaining_args() {
 
 build_server_image() {
     ensure_podman_ready
+    if [[ "$rebuild_image" != "1" ]] && podman image exists "$image_tag" >/dev/null 2>&1; then
+        log "reusing existing server image ${image_tag}"
+        return
+    fi
     log "building server image ${image_tag}"
     podman build -t "$image_tag" -f "$repo_root/deploy/Dockerfile" "$repo_root" >/dev/null
 }
@@ -434,7 +443,7 @@ start_etcd_cluster() {
     start_etcd_member etcd-1
     start_etcd_member etcd-2
     start_etcd_member etcd-3
-    wait_for_etcd "http://127.0.0.1:2379"
+    wait_for_etcd "http://127.0.0.1:12379"
     wait_for_etcd "http://127.0.0.1:22379"
     wait_for_etcd "http://127.0.0.1:32379"
 }
@@ -1077,6 +1086,8 @@ run_named_scenario() {
 self_test() {
     [[ "$(printf '%s\n' "${nodes[@]}" | wc -l | tr -d ' ')" == "3" ]] || die "expected three nodes"
     [[ "$(printf '%s\n' "${scenarios[@]}" | wc -l | tr -d ' ')" == "8" ]] || die "expected eight scenarios"
+    [[ "$(etcd_host_client_port etcd-1)" == "12379" ]] || die "expected dedicated host port for etcd-1"
+    [[ "$(etcd_host_endpoints_csv)" == "http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379" ]] || die "unexpected etcd host endpoint set"
     render_node_config node-a | grep -Fq 'backend = "etcd"' || die "rendered config missing etcd backend"
     render_node_config node-a | grep -Fq "cluster_name = $(toml_basic_string "$cluster_name")" || die "rendered config missing cluster name"
 }
