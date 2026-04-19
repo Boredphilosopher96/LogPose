@@ -1827,6 +1827,10 @@ impl StorageEngine for LocalStorageEngine {
         Ok(CommitAck {
             last_seq_no,
             applied_ops: operations.len(),
+            snapshot: Snapshot {
+                manifest_generation: state.manifest.generation,
+                visible_seq_no: last_seq_no,
+            },
         })
     }
 

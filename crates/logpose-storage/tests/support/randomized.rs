@@ -55,6 +55,12 @@ enum ExpectedState {
     Deleted,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExpectedGenerationState {
+    checkpoint_seq_no: SeqNo,
+    segment_count: usize,
+}
+
 #[derive(Debug)]
 struct ExpectedModel {
     collection_id: Option<CollectionId>,
@@ -63,11 +69,20 @@ struct ExpectedModel {
     checkpoint_seq_no: SeqNo,
     next_seq_no: SeqNo,
     segment_count: usize,
+    generation_states: BTreeMap<u64, ExpectedGenerationState>,
     history: Vec<(SeqNo, WriteOperation)>,
 }
 
 impl ExpectedModel {
     fn new() -> Self {
+        let mut generation_states = BTreeMap::new();
+        generation_states.insert(
+            0,
+            ExpectedGenerationState {
+                checkpoint_seq_no: 0,
+                segment_count: 0,
+            },
+        );
         Self {
             collection_id: None,
             metric: None,
@@ -75,6 +90,7 @@ impl ExpectedModel {
             checkpoint_seq_no: 0,
             next_seq_no: 0,
             segment_count: 0,
+            generation_states,
             history: Vec::new(),
         }
     }
@@ -98,6 +114,13 @@ impl ExpectedModel {
         self.manifest_generation += 1;
         self.checkpoint_seq_no = self.next_seq_no;
         self.segment_count += 1;
+        self.generation_states.insert(
+            self.manifest_generation,
+            ExpectedGenerationState {
+                checkpoint_seq_no: self.checkpoint_seq_no,
+                segment_count: self.segment_count,
+            },
+        );
     }
 
     fn record_compact(&mut self) {
@@ -106,6 +129,13 @@ impl ExpectedModel {
         }
         self.manifest_generation += 1;
         self.segment_count = 1;
+        self.generation_states.insert(
+            self.manifest_generation,
+            ExpectedGenerationState {
+                checkpoint_seq_no: self.checkpoint_seq_no,
+                segment_count: self.segment_count,
+            },
+        );
     }
 
     fn current_snapshot(&self) -> Snapshot {
@@ -122,8 +152,16 @@ impl ExpectedModel {
             .count()
     }
 
-    fn expected_stats(&self) -> CollectionStats {
-        let resolved = self.resolve_latest(self.next_seq_no);
+    fn generation_state(&self, manifest_generation: u64) -> ExpectedGenerationState {
+        *self
+            .generation_states
+            .get(&manifest_generation)
+            .expect("snapshot generation should be tracked")
+    }
+
+    fn expected_stats(&self, snapshot: Snapshot) -> CollectionStats {
+        let generation_state = self.generation_state(snapshot.manifest_generation);
+        let resolved = self.resolve_latest(snapshot.visible_seq_no);
         let live_record_count = resolved
             .values()
             .filter(|state| matches!(state, ExpectedState::Visible(_)))
@@ -131,6 +169,13 @@ impl ExpectedModel {
         let deleted_record_count = resolved
             .values()
             .filter(|state| matches!(state, ExpectedState::Deleted))
+            .count();
+        let mutable_op_count = self
+            .history
+            .iter()
+            .filter(|(seq_no, _)| {
+                *seq_no > generation_state.checkpoint_seq_no && *seq_no <= snapshot.visible_seq_no
+            })
             .count();
 
         CollectionStats {
@@ -140,10 +185,10 @@ impl ExpectedModel {
                 .expect("collection id should be registered"),
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
-            manifest_generation: self.manifest_generation,
-            visible_seq_no: self.next_seq_no,
-            mutable_op_count: self.mutable_op_count(),
-            segment_count: self.segment_count,
+            manifest_generation: snapshot.manifest_generation,
+            visible_seq_no: snapshot.visible_seq_no,
+            mutable_op_count,
+            segment_count: generation_state.segment_count,
             live_record_count,
             deleted_record_count,
             maintenance: Default::default(),
@@ -223,7 +268,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
         });
     disable_background_maintenance(&descriptor.root_path);
     model.register_collection(descriptor.collection_id.clone(), descriptor.metric);
-    assert_stats_match(&engine, &model, seed, &trace).await;
+    assert_stats_match(&engine, &model, None, seed, &trace).await;
     assert_current_scan_matches(&engine, &model, seed, &trace).await;
     assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
 
@@ -256,7 +301,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
             StorageAction::Delete { id } => {
                 let operations = vec![WriteOperation::Delete(DeleteRecord {
@@ -272,7 +317,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
             StorageAction::Snapshot => {
                 let snapshot = engine
@@ -286,6 +331,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 snapshots.push(snapshot.clone());
                 assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
                 assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
+                assert_stats_match(&engine, &model, Some(snapshot), seed, &trace).await;
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
             }
@@ -303,6 +349,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 });
                 assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
                 assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
+                assert_stats_match(&engine, &model, Some(snapshot), seed, &trace).await;
             }
             StorageAction::Flush => {
                 let snapshot = engine.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
@@ -319,7 +366,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 );
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
             StorageAction::Compact => {
                 let before = engine
@@ -366,10 +413,10 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 );
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
             StorageAction::Stats => {
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
             StorageAction::InspectManifest => {
                 assert_manifest_inspect_matches(&engine, &model, seed, &trace).await;
@@ -384,7 +431,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 engine = LocalStorageEngine::new(&root);
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
-                assert_stats_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
         }
     }
@@ -575,14 +622,23 @@ async fn assert_exact_queries_match(
 async fn assert_stats_match(
     engine: &LocalStorageEngine,
     model: &ExpectedModel,
+    snapshot: Option<Snapshot>,
     seed: u64,
     trace: &[StorageAction],
 ) {
-    let actual = engine
-        .stats(COLLECTION_NAME)
-        .await
-        .unwrap_or_else(|error| panic_with_context(seed, trace, format!("stats failed: {error}")));
-    let expected = model.expected_stats();
+    let actual = match snapshot.clone() {
+        Some(snapshot) => engine
+            .stats_snapshot(COLLECTION_NAME, Some(snapshot))
+            .await
+            .unwrap_or_else(|error| {
+                panic_with_context(seed, trace, format!("snapshot stats failed: {error}"))
+            }),
+        None => engine.stats(COLLECTION_NAME).await.unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("stats failed: {error}"))
+        }),
+    };
+    let expected_snapshot = snapshot.unwrap_or_else(|| model.current_snapshot());
+    let expected = model.expected_stats(expected_snapshot);
     assert_eq_with_context(
         seed,
         trace,
@@ -649,7 +705,7 @@ async fn assert_stats_match(
         "seed={seed} trace={trace:?} query_units={:?}",
         actual.query_units
     );
-    if model.segment_count > 0 {
+    if expected.segment_count > 0 {
         let immutable = actual
             .query_units
             .iter()
@@ -795,6 +851,7 @@ fn assert_ack_matches(
     let expected = CommitAck {
         last_seq_no: model.current_snapshot().visible_seq_no,
         applied_ops,
+        snapshot: model.current_snapshot(),
     };
     assert_eq_with_context(seed, trace, "commit ack mismatch", &expected, ack);
 }

@@ -139,6 +139,154 @@ async fn service_runs_filtered_query_and_storage_workflow() {
 }
 
 #[tokio::test]
+async fn service_write_ack_returns_immediate_read_snapshot() {
+    let root = unique_temp_dir("service-write-ack-session-snapshot");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let first_ack = service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("first write should succeed");
+
+    assert_eq!(first_ack.last_seq_no, 1);
+    assert_eq!(first_ack.snapshot.manifest_generation, 0);
+    assert_eq!(first_ack.snapshot.visible_seq_no, 1);
+
+    let second_ack = service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("second write should succeed");
+
+    assert_eq!(second_ack.last_seq_no, 2);
+    assert_eq!(second_ack.snapshot.manifest_generation, 0);
+    assert_eq!(second_ack.snapshot.visible_seq_no, 2);
+
+    let response = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot: Some(second_ack.snapshot.clone()),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("query at write ack snapshot should succeed");
+
+    assert_eq!(response.snapshot, second_ack.snapshot);
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"]
+    );
+
+    let first_stats = service
+        .stats_at_snapshot("documents", first_ack.snapshot.clone())
+        .await
+        .expect("stats at first write snapshot should succeed");
+    assert_eq!(first_stats.visible_seq_no, 1);
+    assert_eq!(first_stats.live_record_count, 1);
+
+    let second_stats = service
+        .stats_at_snapshot("documents", second_ack.snapshot.clone())
+        .await
+        .expect("stats at second write snapshot should succeed");
+    assert_eq!(second_stats.visible_seq_no, 2);
+    assert_eq!(second_stats.live_record_count, 2);
+}
+
+#[tokio::test]
+async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
+    let root = unique_temp_dir("service-write-ack-snapshot-after-rotation");
+    let service = LogPoseDataService::local(&root);
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let ack = service
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("write should succeed");
+
+    service
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let response = service
+        .query(QueryRequest {
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 1,
+            snapshot: Some(ack.snapshot.clone()),
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("pre-flush write snapshot should still be readable after rotation");
+    assert_eq!(response.snapshot, ack.snapshot);
+    assert_eq!(
+        response
+            .matches
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha"]
+    );
+
+    let stats = service
+        .stats_at_snapshot("documents", ack.snapshot)
+        .await
+        .expect("pre-flush write snapshot should still be valid for stats");
+    assert_eq!(stats.manifest_generation, 0);
+    assert_eq!(stats.visible_seq_no, 1);
+    assert_eq!(stats.live_record_count, 1);
+}
+
+#[tokio::test]
 async fn service_rejects_impossible_snapshots() {
     let root = unique_temp_dir("service-invalid-snapshot");
     let service = LogPoseDataService::local(&root);

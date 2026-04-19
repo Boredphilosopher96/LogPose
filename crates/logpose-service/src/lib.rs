@@ -423,6 +423,16 @@ impl LogPoseDataService {
         self.stats_descriptor(&descriptor, None).await
     }
 
+    /// Return collection-level stats for an explicit read snapshot.
+    pub async fn stats_at_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Snapshot,
+    ) -> Result<CollectionStats> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.stats_descriptor(&descriptor, Some(snapshot)).await
+    }
+
     /// Return collection-level stats using a previously loaded descriptor.
     pub async fn stats_descriptor(
         &self,

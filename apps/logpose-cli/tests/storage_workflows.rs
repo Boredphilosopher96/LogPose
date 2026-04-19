@@ -68,7 +68,27 @@ fn query_requires_complete_snapshot_pair_as_cli_validation() {
 
     assert!(!output.status.success(), "command should fail validation");
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("must be provided together"));
+    assert!(stderr.contains("--snapshot-visible-seq-no"));
+}
+
+#[test]
+fn collection_stats_requires_complete_snapshot_pair_as_cli_validation() {
+    let temp_root = TempRoot::new("cli-stats-invalid-snapshot");
+
+    let output = run_cli_without_assert(
+        temp_root.path(),
+        [
+            "collection",
+            "stats",
+            "colors",
+            "--snapshot-manifest-generation",
+            "1",
+        ],
+    );
+
+    assert!(!output.status.success(), "command should fail validation");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stderr.contains("--snapshot-visible-seq-no"));
 }
 
 #[test]

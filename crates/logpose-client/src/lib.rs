@@ -374,6 +374,9 @@ impl LogPoseClient {
             CommitAck {
                 last_seq_no: response.last_seq_no,
                 applied_ops: response.applied_ops as usize,
+                snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
+                    ClientError::InvalidResponse("write response missing write snapshot".to_owned())
+                })?,
             },
         ))
     }
@@ -455,12 +458,24 @@ impl LogPoseClient {
         database_name: &str,
         collection_name: &str,
     ) -> Result<CollectionStats> {
+        self.stats_in_database_at_snapshot(database_name, collection_name, None)
+            .await
+    }
+
+    /// Fetch collection-level statistics in an explicit database for one snapshot.
+    pub async fn stats_in_database_at_snapshot(
+        &self,
+        database_name: &str,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
         let response = self
             .inner
             .clone()
             .get_collection_stats(Request::new(GetCollectionStatsRequest {
                 collection_name: collection_name.to_owned(),
                 database_name: database_name.to_owned(),
+                snapshot: snapshot.map(snapshot_to_proto),
             }))
             .await?
             .into_inner();
@@ -1206,12 +1221,17 @@ mod tests {
             CommitAck {
                 last_seq_no: 7,
                 applied_ops: 2,
+                snapshot: Snapshot {
+                    manifest_generation: 3,
+                    visible_seq_no: 7,
+                },
             },
         );
 
         assert_eq!(response.database_name, "analytics");
         assert_eq!(response.collection_name, "documents");
         assert_eq!(response.last_seq_no, 7);
+        assert_eq!(response.snapshot.visible_seq_no, 7);
     }
 
     #[test]
@@ -1224,6 +1244,10 @@ mod tests {
             CommitAck {
                 last_seq_no: 7,
                 applied_ops: 2,
+                snapshot: Snapshot {
+                    manifest_generation: 3,
+                    visible_seq_no: 7,
+                },
             },
         );
 
@@ -1232,6 +1256,8 @@ mod tests {
         assert_eq!(json["collection_name"], "documents");
         assert_eq!(json["last_seq_no"], 7);
         assert_eq!(json["applied_ops"], 2);
+        assert_eq!(json["snapshot"]["manifest_generation"], 3);
+        assert_eq!(json["snapshot"]["visible_seq_no"], 7);
         assert!(json.get("response").is_none());
     }
 

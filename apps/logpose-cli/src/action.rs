@@ -71,6 +71,13 @@ pub struct CollectionCreateAction {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CollectionStatsAction {
+    pub collection: CollectionRef,
+    pub snapshot_manifest_generation: Option<u64>,
+    pub snapshot_visible_seq_no: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DatabasePolicySetAction {
     pub database_name: String,
     pub input: PathBuf,
@@ -121,7 +128,7 @@ pub enum Action {
     DatabasePolicySet(DatabasePolicySetAction),
     CollectionCreate(CollectionCreateAction),
     CollectionShow(CollectionRef),
-    CollectionStats(CollectionRef),
+    CollectionStats(CollectionStatsAction),
     CollectionPlacement(CollectionRef),
     CollectionFlush(CollectionRef),
     CollectionCompact(CollectionRef),
@@ -496,11 +503,11 @@ pub fn relative_path(path: &Path, root: &Path) -> String {
         .to_string()
 }
 
-pub fn query_snapshot_from_action(action: &QueryAction) -> anyhow::Result<Option<Snapshot>> {
-    match (
-        action.snapshot_manifest_generation,
-        action.snapshot_visible_seq_no,
-    ) {
+fn snapshot_from_parts(
+    manifest_generation: Option<u64>,
+    visible_seq_no: Option<u64>,
+) -> anyhow::Result<Option<Snapshot>> {
+    match (manifest_generation, visible_seq_no) {
         (Some(manifest_generation), Some(visible_seq_no)) => Ok(Some(Snapshot {
             manifest_generation,
             visible_seq_no,
@@ -510,6 +517,22 @@ pub fn query_snapshot_from_action(action: &QueryAction) -> anyhow::Result<Option
             "--snapshot-manifest-generation and --snapshot-visible-seq-no must be provided together"
         ),
     }
+}
+
+pub fn query_snapshot_from_action(action: &QueryAction) -> anyhow::Result<Option<Snapshot>> {
+    snapshot_from_parts(
+        action.snapshot_manifest_generation,
+        action.snapshot_visible_seq_no,
+    )
+}
+
+pub fn stats_snapshot_from_action(
+    action: &CollectionStatsAction,
+) -> anyhow::Result<Option<Snapshot>> {
+    snapshot_from_parts(
+        action.snapshot_manifest_generation,
+        action.snapshot_visible_seq_no,
+    )
 }
 
 pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Option<Predicate>> {
@@ -856,11 +879,19 @@ pub fn format_command(action: &Action) -> String {
             parts.push(shell_quote(&collection.collection_name));
             push_database_flag(&mut parts, &collection.database_name);
         }
-        Action::CollectionStats(collection) => {
+        Action::CollectionStats(action) => {
             parts.push("collection".to_owned());
             parts.push("stats".to_owned());
-            parts.push(shell_quote(&collection.collection_name));
-            push_database_flag(&mut parts, &collection.database_name);
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            if let Some(generation) = action.snapshot_manifest_generation {
+                parts.push("--snapshot-manifest-generation".to_owned());
+                parts.push(generation.to_string());
+            }
+            if let Some(seq_no) = action.snapshot_visible_seq_no {
+                parts.push("--snapshot-visible-seq-no".to_owned());
+                parts.push(seq_no.to_string());
+            }
         }
         Action::CollectionPlacement(collection) => {
             parts.push("collection".to_owned());

@@ -208,6 +208,7 @@ message CommitAckReply {
   uint64 applied_ops = 2;
   string database_name = 3;
   string collection_name = 4;
+  Snapshot snapshot = 5;
 }
 
 message Snapshot {
@@ -347,6 +348,7 @@ message QueryCollectionReply {
 message GetCollectionStatsRequest {
   string collection_name = 1;
   string database_name = 2;
+  Snapshot snapshot = 3;
 }
 
 message CollectionStatsReply {
