@@ -225,8 +225,8 @@ async fn run_coordination_loop(
                 .iter()
                 .any(|member| member.node_id == node_name)
         {
-            membership_lease_id = None;
-            leadership_lease = None;
+            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
+            revoke_tracked_membership_lease(&client, &mut membership_lease_id).await;
         }
         if let Ok(Some(leader_record)) = &leader
             && leadership_lease.is_some()
@@ -234,7 +234,7 @@ async fn run_coordination_loop(
                 || Some(leader_record.lease_id)
                     != leadership_lease.as_ref().map(|lease| lease.lease_id))
         {
-            leadership_lease = None;
+            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
         }
         let membership_confirmed = members.as_ref().is_ok_and(|member_records| {
             membership_lease_id.is_some()
@@ -281,6 +281,24 @@ async fn run_coordination_loop(
     if let Some(lease) = leadership_lease.take() {
         let _ = client.revoke_lease(lease.lease_id).await;
     }
+    if let Some(lease_id) = membership_lease_id.take() {
+        let _ = client.revoke_lease(lease_id).await;
+    }
+}
+
+async fn revoke_tracked_leadership_lease(
+    client: &EtcdCoordinationClient,
+    leadership_lease: &mut Option<LeadershipLease>,
+) {
+    if let Some(lease) = leadership_lease.take() {
+        let _ = client.revoke_lease(lease.lease_id).await;
+    }
+}
+
+async fn revoke_tracked_membership_lease(
+    client: &EtcdCoordinationClient,
+    membership_lease_id: &mut Option<i64>,
+) {
     if let Some(lease_id) = membership_lease_id.take() {
         let _ = client.revoke_lease(lease_id).await;
     }

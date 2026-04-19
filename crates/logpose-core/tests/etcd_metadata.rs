@@ -1503,6 +1503,85 @@ async fn etcd_runtime_status_drops_ready_flags_after_external_lease_revocation()
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
+#[tokio::test]
+async fn etcd_runtime_revokes_stale_leadership_when_membership_record_disappears() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("runtime-status-membership-loss-revokes-leader");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-runtime-status-membership-loss-revokes-leader";
+
+    let mut leader_config = test_config(
+        "leader-a",
+        unique_temp_dir("etcd-runtime-status-membership-loss-leader-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    leader_config.node_role = NodeRole::Combined;
+    leader_config.metadata.etcd.membership_ttl_secs = 3;
+    leader_config.metadata.etcd.leadership_ttl_secs = 30;
+    let leader = Arc::new(AppState::new(leader_config.clone()));
+
+    wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.membership_lease_id.is_some()
+                && coordination.leadership_lease_id.is_some()
+        })
+    })
+    .await;
+
+    let membership_key = format!(
+        "{}/clusters/{}/members/{}",
+        key_prefix, cluster_name, leader_config.node_name
+    );
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd client should connect");
+    client
+        .delete(membership_key, None)
+        .await
+        .expect("membership record should be removable without revoking the lease");
+
+    let degraded = wait_for_runtime_status(&leader, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            !coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.membership_lease_id.is_none()
+                && coordination.leadership_lease_id.is_none()
+        })
+    })
+    .await;
+    assert!(!degraded.control_plane_ready);
+
+    drop(leader);
+
+    let mut follower_config = test_config(
+        "leader-b",
+        unique_temp_dir("etcd-runtime-status-membership-loss-leader-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    follower_config.metadata.etcd.membership_ttl_secs = 3;
+    follower_config.metadata.etcd.leadership_ttl_secs = 30;
+    let follower = Arc::new(AppState::new(follower_config));
+
+    let follower_status = wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("leader-b")
+        })
+    })
+    .await;
+    assert!(follower_status.control_plane_ready);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
 fn test_config(
     node_name: &str,
     storage_root: PathBuf,

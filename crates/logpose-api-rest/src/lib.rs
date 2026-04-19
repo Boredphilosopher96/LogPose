@@ -577,6 +577,8 @@ fn default_database_if_blank(value: String) -> String {
 fn snapshot_from_query_pair(
     manifest_generation: Option<u64>,
     visible_seq_no: Option<u64>,
+    manifest_field: &str,
+    visible_seq_field: &str,
 ) -> Result<Option<Snapshot>, ApiError> {
     match (manifest_generation, visible_seq_no) {
         (Some(manifest_generation), Some(visible_seq_no)) => Ok(Some(Snapshot {
@@ -584,10 +586,9 @@ fn snapshot_from_query_pair(
             visible_seq_no,
         })),
         (None, None) => Ok(None),
-        _ => Err(ApiError(ServiceError::InvalidArgument(
-            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
-                .to_owned(),
-        ))),
+        _ => Err(ApiError(ServiceError::InvalidArgument(format!(
+            "{manifest_field} and {visible_seq_field} must be provided together"
+        )))),
     }
 }
 
@@ -597,10 +598,17 @@ fn read_constraints_from_query_pairs(
     read_barrier_manifest_generation: Option<u64>,
     read_barrier_visible_seq_no: Option<u64>,
 ) -> Result<(Option<Snapshot>, Option<Snapshot>), ApiError> {
-    let snapshot = snapshot_from_query_pair(snapshot_manifest_generation, snapshot_visible_seq_no)?;
+    let snapshot = snapshot_from_query_pair(
+        snapshot_manifest_generation,
+        snapshot_visible_seq_no,
+        "snapshot_manifest_generation",
+        "snapshot_visible_seq_no",
+    )?;
     let read_barrier = snapshot_from_query_pair(
         read_barrier_manifest_generation,
         read_barrier_visible_seq_no,
+        "read_barrier_manifest_generation",
+        "read_barrier_visible_seq_no",
     )?;
     if snapshot.is_some() && read_barrier.is_some() {
         return Err(ApiError(ServiceError::InvalidArgument(
@@ -727,8 +735,13 @@ mod tests {
 
     #[test]
     fn snapshot_query_pair_requires_both_fields() {
-        let snapshot = snapshot_from_query_pair(Some(7), Some(11))
-            .expect("complete snapshot pair should parse");
+        let snapshot = snapshot_from_query_pair(
+            Some(7),
+            Some(11),
+            "snapshot_manifest_generation",
+            "snapshot_visible_seq_no",
+        )
+        .expect("complete snapshot pair should parse");
         assert_eq!(
             snapshot,
             Some(Snapshot {
@@ -737,8 +750,13 @@ mod tests {
             })
         );
 
-        let error =
-            snapshot_from_query_pair(Some(7), None).expect_err("partial snapshot pair should fail");
+        let error = snapshot_from_query_pair(
+            Some(7),
+            None,
+            "snapshot_manifest_generation",
+            "snapshot_visible_seq_no",
+        )
+        .expect_err("partial snapshot pair should fail");
         assert_eq!(
             error.0,
             ServiceError::InvalidArgument(
@@ -758,6 +776,20 @@ mod tests {
             ServiceError::InvalidArgument(message)
                 if message == "snapshot and read_barrier cannot be provided together"
         ));
+    }
+
+    #[test]
+    fn read_barrier_query_pair_requires_both_fields() {
+        let error = read_constraints_from_query_pairs(None, None, Some(7), None)
+            .expect_err("partial read barrier pair should fail");
+
+        assert_eq!(
+            error.0,
+            ServiceError::InvalidArgument(
+                "read_barrier_manifest_generation and read_barrier_visible_seq_no must be provided together"
+                    .to_owned(),
+            )
+        );
     }
 
     #[tokio::test]
