@@ -256,7 +256,8 @@ impl AppState {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> ServiceResult<CommitAck> {
-        self.require_local_data_plane_collection(collection_name)
+        self.control
+            .require_local_write_ownership(collection_name)
             .await?;
         self.data.write(collection_name, operations).await
     }
@@ -355,7 +356,8 @@ impl AppState {
 
     /// Flush one collection through the data-plane surface.
     pub async fn flush(&self, collection_name: &str) -> ServiceResult<Snapshot> {
-        self.require_local_data_plane_collection(collection_name)
+        self.control
+            .require_local_write_ownership(collection_name)
             .await?;
         self.data.flush(collection_name).await
     }
@@ -378,7 +380,8 @@ impl AppState {
 
     /// Compact one collection through the data-plane surface.
     pub async fn compact(&self, collection_name: &str) -> ServiceResult<Snapshot> {
-        self.require_local_data_plane_collection(collection_name)
+        self.control
+            .require_local_write_ownership(collection_name)
             .await?;
         self.data.compact(collection_name).await
     }
@@ -581,10 +584,15 @@ impl AppState {
             return Ok(());
         }
 
+        let routed_node = placement
+            .owner_node
+            .clone()
+            .unwrap_or_else(|| placement.assigned_node.clone());
+
         Err(ServiceError::InvalidArgument(format!(
             "collection '{}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
             placement_identity(&placement),
-            placement.assigned_node,
+            routed_node,
             placement.assigned_role,
             self.config.node_name
         )))

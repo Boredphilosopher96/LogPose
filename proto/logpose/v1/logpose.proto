@@ -66,6 +66,8 @@ message CollectionPlacementReply {
   string route_kind = 5;
   string route_reason = 6;
   string database_name = 7;
+  optional string owner_node = 8;
+  optional uint64 ownership_epoch = 9;
 }
 
 message GetRuntimeStatusReply {

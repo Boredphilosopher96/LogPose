@@ -146,7 +146,7 @@ curl http://127.0.0.1:8080/v1/runtime/status \
   "role": "combined",
   "rest_endpoint": "http://127.0.0.1:8080",
   "grpc_endpoint": "http://127.0.0.1:50051",
-  "storage_engine": "local",
+  "storage_engine": "local+etcd-metadata",
   "control_plane_ready": true,
   "data_plane_ready": true,
   "collection_count": 1,
@@ -157,8 +157,10 @@ curl http://127.0.0.1:8080/v1/runtime/status \
       "collection_name": "embeddings",
       "assigned_node": "node-alpha",
       "assigned_role": "data",
+      "owner_node": "node-alpha",
+      "ownership_epoch": 1,
       "route_kind": "local",
-      "route_reason": "assigned data-plane collection is stored locally on this runtime"
+      "route_reason": "ownership epoch 1 is active on this runtime"
     }
   ],
   "maintenance": {
@@ -284,7 +286,8 @@ curl http://127.0.0.1:8080/v1/collections/embeddings
 ### Get Collection Placement
 
 Returns placement routing information for a collection. Use the `database`
-query parameter for non-default namespaces.
+query parameter for non-default namespaces. When etcd-backed ownership fencing
+is active, the reply also surfaces the current owner node and ownership epoch.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/placement
@@ -299,8 +302,10 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/placement
   "collection_name": "embeddings",
   "assigned_node": "node-alpha",
   "assigned_role": "data",
+  "owner_node": "node-alpha",
+  "ownership_epoch": 1,
   "route_kind": "local",
-  "route_reason": "assigned data-plane collection is stored locally on this runtime"
+  "route_reason": "ownership epoch 1 is active on this runtime"
 }
 ```
 

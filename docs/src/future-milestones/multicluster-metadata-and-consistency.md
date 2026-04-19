@@ -113,8 +113,9 @@ The repository now includes a first production-oriented metadata backend switch 
 - collection create writes use create-if-absent transactions for both the authoritative assignment and descriptor metadata
 - read paths fail closed if authoritative etcd metadata is unavailable instead of falling back to stale local placement files
 - local placement files are still written for recovery/bootstrap diagnostics, but they are no longer consulted as an authority once the etcd backend is selected
+- single-shard ownership records are now seeded in etcd, surfaced through placement diagnostics, and used to fence stale owners after an ownership promotion
 
-This is intentionally a foundation milestone and not full distributed control-plane completion. Remaining work from the streams below still applies (leases, elections, shard/replica control loops, epoch-gated serving, and multi-node failover simulations).
+This is still not full distributed control-plane completion. Remaining work from the streams below still applies, especially watch-driven caches, replica-aware placement, failover control loops, stronger leader fencing, and multi-node failover simulations.
 
 ### 1. Metadata Model
 

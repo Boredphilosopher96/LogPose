@@ -1394,6 +1394,25 @@ mod tests {
         assert_eq!(body["route_kind"], "local");
     }
 
+    #[test]
+    fn collection_placement_serializes_owner_fields_when_present() {
+        let payload = serde_json::to_value(logpose_types::CollectionPlacement {
+            collection_id: logpose_types::CollectionId::default(),
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            assigned_node: "owner-a".to_owned(),
+            assigned_role: logpose_types::NodeRole::Data,
+            owner_node: Some("owner-b".to_owned()),
+            ownership_epoch: Some(2),
+            route_kind: "recorded".to_owned(),
+            route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
+        })
+        .expect("placement should serialize");
+
+        assert_eq!(payload["owner_node"], "owner-b");
+        assert_eq!(payload["ownership_epoch"], 2);
+    }
+
     #[tokio::test]
     async fn rest_round_trips_explicit_database_requests() {
         let state = Arc::new(AppState::new(test_config("rest-namespace-reject")));
