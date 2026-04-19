@@ -510,6 +510,8 @@ pub fn relative_path(path: &Path, root: &Path) -> String {
 fn snapshot_from_parts(
     manifest_generation: Option<u64>,
     visible_seq_no: Option<u64>,
+    manifest_flag: &str,
+    visible_seq_flag: &str,
 ) -> anyhow::Result<Option<Snapshot>> {
     match (manifest_generation, visible_seq_no) {
         (Some(manifest_generation), Some(visible_seq_no)) => Ok(Some(Snapshot {
@@ -517,9 +519,7 @@ fn snapshot_from_parts(
             visible_seq_no,
         })),
         (None, None) => Ok(None),
-        _ => bail!(
-            "--snapshot-manifest-generation and --snapshot-visible-seq-no must be provided together"
-        ),
+        _ => bail!("{manifest_flag} and {visible_seq_flag} must be provided together"),
     }
 }
 
@@ -529,10 +529,17 @@ fn read_constraints_from_parts(
     read_barrier_manifest_generation: Option<u64>,
     read_barrier_visible_seq_no: Option<u64>,
 ) -> anyhow::Result<(Option<Snapshot>, Option<Snapshot>)> {
-    let snapshot = snapshot_from_parts(snapshot_manifest_generation, snapshot_visible_seq_no)?;
+    let snapshot = snapshot_from_parts(
+        snapshot_manifest_generation,
+        snapshot_visible_seq_no,
+        "--snapshot-manifest-generation",
+        "--snapshot-visible-seq-no",
+    )?;
     let read_barrier = snapshot_from_parts(
         read_barrier_manifest_generation,
         read_barrier_visible_seq_no,
+        "--read-barrier-manifest-generation",
+        "--read-barrier-visible-seq-no",
     )?;
     if snapshot.is_some() && read_barrier.is_some() {
         bail!("--snapshot-* and --read-barrier-* cannot be provided together");
@@ -1344,5 +1351,16 @@ mod tests {
         assert!(error.to_string().contains("database_name"));
 
         std::fs::remove_file(&path).expect("temp file should be removed");
+    }
+
+    #[test]
+    fn read_constraints_use_read_barrier_flag_names_in_pair_error() {
+        let error = read_constraints_from_parts(None, None, Some(7), None)
+            .expect_err("partial read barrier pair should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "--read-barrier-manifest-generation and --read-barrier-visible-seq-no must be provided together"
+        );
     }
 }
