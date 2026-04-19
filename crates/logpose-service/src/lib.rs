@@ -34,7 +34,9 @@ use logpose_query::{QueryError, QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
-use logpose_storage_etcd::{EtcdCoordinationClient, LeadershipLease, ShardOwnership};
+use logpose_storage_etcd::{
+    EtcdCoordinationClient, LeadershipLease, LeadershipRecord, MembershipRecord, ShardOwnership,
+};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
@@ -173,6 +175,7 @@ async fn run_coordination_loop(
     let mut leadership_lease: Option<LeadershipLease> = None;
     let mut ticker = interval(tick);
     loop {
+        let mut pending_error = None;
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -184,7 +187,7 @@ async fn run_coordination_loop(
         if let Some(lease_id) = membership_lease_id
             && let Err(error) = client.keep_alive(lease_id).await
         {
-            record_coordination_error(&snapshot, error.to_string()).await;
+            note_coordination_error(&mut pending_error, error.to_string());
         }
 
         if membership_lease_id.is_none() {
@@ -203,7 +206,7 @@ async fn run_coordination_loop(
         if let Some(lease) = &leadership_lease
             && let Err(error) = client.keep_alive(lease.lease_id).await
         {
-            record_coordination_error(&snapshot, error.to_string()).await;
+            note_coordination_error(&mut pending_error, error.to_string());
         }
 
         if leadership_lease.is_none() && matches!(node_role, NodeRole::Combined | NodeRole::Control)
@@ -213,7 +216,7 @@ async fn run_coordination_loop(
                     leadership_lease = lease;
                     clear_coordination_error(&snapshot).await;
                 }
-                Err(error) => record_coordination_error(&snapshot, error.to_string()).await,
+                Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
             }
         }
 
@@ -236,46 +239,15 @@ async fn run_coordination_loop(
         {
             revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
         }
-        let membership_confirmed = members.as_ref().is_ok_and(|member_records| {
-            membership_lease_id.is_some()
-                && member_records
-                    .iter()
-                    .any(|member| member.node_id == node_name)
-        });
-        let visible_leader = leader
-            .as_ref()
-            .ok()
-            .and_then(|leader_record| leader_record.as_ref().cloned());
-        let mut current = coordination_write(&snapshot);
-        current.membership_registered = membership_confirmed;
-        current.membership_lease_id = membership_lease_id.filter(|_| membership_confirmed);
-        if let Ok(member_records) = &members {
-            current.registered_members = member_records
-                .iter()
-                .map(|member| member.node_id.clone())
-                .collect();
-            current.registered_members.sort();
-        } else {
-            current.registered_members.clear();
-        }
-        current.leader_node = visible_leader.as_ref().map(|record| record.node_id.clone());
-        current.is_local_leader = membership_confirmed
-            && leadership_lease.as_ref().is_some_and(|lease| {
-                visible_leader.as_ref().is_some_and(|record| {
-                    record.node_id == node_name && record.lease_id == lease.lease_id
-                })
-            });
-        current.leadership_lease_id = leadership_lease
-            .as_ref()
-            .map(|lease| lease.lease_id)
-            .filter(|_| current.is_local_leader);
-        current.last_error = match (members, leader) {
-            (Err(members_error), Err(leader_error)) => {
-                Some(format!("{members_error}; {leader_error}"))
-            }
-            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Some(error.to_string()),
-            (Ok(_), Ok(_)) => None,
-        };
+        reconcile_coordination_snapshot(
+            &snapshot,
+            &node_name,
+            membership_lease_id,
+            leadership_lease.as_ref(),
+            &members,
+            &leader,
+            pending_error,
+        );
     }
 
     if let Some(lease) = leadership_lease.take() {
@@ -301,6 +273,77 @@ async fn revoke_tracked_membership_lease(
 ) {
     if let Some(lease_id) = membership_lease_id.take() {
         let _ = client.revoke_lease(lease_id).await;
+    }
+}
+
+fn note_coordination_error(pending_error: &mut Option<String>, error: String) {
+    if pending_error.is_none() {
+        *pending_error = Some(error);
+    }
+}
+
+fn reconcile_coordination_snapshot(
+    snapshot: &RwLock<CoordinationStatus>,
+    node_name: &str,
+    membership_lease_id: Option<i64>,
+    leadership_lease: Option<&LeadershipLease>,
+    members: &logpose_types::Result<Vec<MembershipRecord>>,
+    leader: &logpose_types::Result<Option<LeadershipRecord>>,
+    pending_error: Option<String>,
+) {
+    let membership_confirmed = members.as_ref().is_ok_and(|member_records| {
+        membership_lease_id.is_some()
+            && member_records
+                .iter()
+                .any(|member| member.node_id == node_name)
+    });
+    let visible_leader = leader
+        .as_ref()
+        .ok()
+        .and_then(|leader_record| leader_record.as_ref().cloned());
+    let mut current = coordination_write(snapshot);
+    current.membership_registered = membership_confirmed;
+    current.membership_lease_id = membership_lease_id.filter(|_| membership_confirmed);
+    if let Ok(member_records) = members {
+        current.registered_members = member_records
+            .iter()
+            .map(|member| member.node_id.clone())
+            .collect();
+        current.registered_members.sort();
+    } else {
+        current.registered_members.clear();
+    }
+    current.leader_node = visible_leader.as_ref().map(|record| record.node_id.clone());
+    current.is_local_leader = membership_confirmed
+        && leadership_lease.is_some_and(|lease| {
+            visible_leader.as_ref().is_some_and(|record| {
+                record.node_id == node_name && record.lease_id == lease.lease_id
+            })
+        });
+    current.leadership_lease_id = leadership_lease
+        .map(|lease| lease.lease_id)
+        .filter(|_| current.is_local_leader);
+    current.last_error = reconcile_coordination_last_error(pending_error, members, leader);
+}
+
+fn reconcile_coordination_last_error(
+    pending_error: Option<String>,
+    members: &logpose_types::Result<Vec<MembershipRecord>>,
+    leader: &logpose_types::Result<Option<LeadershipRecord>>,
+) -> Option<String> {
+    match (pending_error, members, leader) {
+        (Some(pending_error), Ok(_), Ok(_)) => Some(pending_error),
+        (Some(pending_error), Err(members_error), Err(leader_error)) => {
+            Some(format!("{pending_error}; {members_error}; {leader_error}"))
+        }
+        (Some(pending_error), Err(error), Ok(_)) | (Some(pending_error), Ok(_), Err(error)) => {
+            Some(format!("{pending_error}; {error}"))
+        }
+        (None, Err(members_error), Err(leader_error)) => {
+            Some(format!("{members_error}; {leader_error}"))
+        }
+        (None, Err(error), Ok(_)) | (None, Ok(_), Err(error)) => Some(error.to_string()),
+        (None, Ok(_), Ok(_)) => None,
     }
 }
 
@@ -1382,6 +1425,53 @@ mod tests {
 
         assert_eq!(reference.database_name, "analytics");
         assert_eq!(reference.collection_name, "documents");
+    }
+
+    #[test]
+    fn reconcile_coordination_snapshot_preserves_healthy_fields_with_pending_error() {
+        let snapshot = RwLock::new(CoordinationStatus {
+            cluster_name: "default".to_owned(),
+            membership_registered: false,
+            membership_lease_id: None,
+            registered_members: Vec::new(),
+            leader_node: None,
+            is_local_leader: false,
+            leadership_lease_id: None,
+            last_error: None,
+        });
+
+        reconcile_coordination_snapshot(
+            &snapshot,
+            "node-a",
+            Some(11),
+            Some(&LeadershipLease {
+                node_id: "node-a".to_owned(),
+                lease_id: 22,
+                key: "/leaders/node-a".to_owned(),
+            }),
+            &Ok(vec![MembershipRecord {
+                node_id: "node-a".to_owned(),
+                node_role: NodeRole::Combined,
+                state: "ready".to_owned(),
+            }]),
+            &Ok(Some(LeadershipRecord {
+                node_id: "node-a".to_owned(),
+                lease_id: 22,
+            })),
+            Some("membership keep-alive failed".to_owned()),
+        );
+
+        let current = coordination_read(&snapshot).clone();
+        assert!(current.membership_registered);
+        assert_eq!(current.membership_lease_id, Some(11));
+        assert_eq!(current.registered_members, vec!["node-a".to_owned()]);
+        assert_eq!(current.leader_node.as_deref(), Some("node-a"));
+        assert!(current.is_local_leader);
+        assert_eq!(current.leadership_lease_id, Some(22));
+        assert_eq!(
+            current.last_error.as_deref(),
+            Some("membership keep-alive failed")
+        );
     }
 
     #[tokio::test]
