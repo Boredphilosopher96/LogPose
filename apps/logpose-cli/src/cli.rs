@@ -1,7 +1,8 @@
 use crate::action::{
-    Action, CollectionCreateAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg,
-    MetricArg, QueryAction, QueryFilter, QueryVector, RecordDeleteAction, RecordPutAction,
-    WorkflowKind, parse_query_filter, parse_query_vector, parse_query_where,
+    Action, CollectionCreateAction, CollectionStatsAction, DatabasePolicySetAction,
+    DatabasePutAction, ExplainArg, MetricArg, QueryAction, QueryFilter, QueryVector,
+    RecordDeleteAction, RecordPutAction, WorkflowKind, parse_query_filter, parse_query_vector,
+    parse_query_where,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use logpose_storage::InspectTarget;
@@ -141,7 +142,11 @@ impl Cli {
                     }
                     CollectionCommand::Show(args) => Action::CollectionShow(args.collection_ref()),
                     CollectionCommand::Stats(args) => {
-                        Action::CollectionStats(args.collection_ref())
+                        Action::CollectionStats(CollectionStatsAction {
+                            collection: args.collection_ref(),
+                            snapshot_manifest_generation: args.snapshot_manifest_generation,
+                            snapshot_visible_seq_no: args.snapshot_visible_seq_no,
+                        })
                     }
                     CollectionCommand::Placement(args) => {
                         Action::CollectionPlacement(args.collection_ref())
@@ -543,7 +548,7 @@ pub enum CollectionCommand {
     /// Show metadata for a collection.
     Show(CollectionNameArg),
     /// Show collection-level storage statistics.
-    Stats(CollectionNameArg),
+    Stats(CollectionStatsArgs),
     /// Explain where a collection is placed.
     Placement(CollectionNameArg),
     /// Flush the mutable delta into an immutable segment.
@@ -586,6 +591,38 @@ pub struct CollectionNameArg {
 }
 
 impl CollectionNameArg {
+    pub fn collection_ref(&self) -> CollectionRef {
+        self.namespace.collection_ref(self.collection.clone())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Show collection-level storage statistics.",
+    after_long_help = "Examples:\n  logpose collection stats colors\n  logpose collection stats colors --snapshot-manifest-generation 0 --snapshot-visible-seq-no 3\n  logpose --json collection stats colors --database analytics"
+)]
+pub struct CollectionStatsArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(value_name = "NAME", help = "Collection name. Example: colors")]
+    pub collection: String,
+    #[arg(
+        long,
+        value_name = "GENERATION",
+        requires = "snapshot_visible_seq_no",
+        help = "Historical manifest generation to inspect. Must be paired with --snapshot-visible-seq-no. Example: 0"
+    )]
+    pub snapshot_manifest_generation: Option<u64>,
+    #[arg(
+        long,
+        value_name = "SEQ_NO",
+        requires = "snapshot_manifest_generation",
+        help = "Historical visible sequence number to inspect. Must be paired with --snapshot-manifest-generation. Example: 3"
+    )]
+    pub snapshot_visible_seq_no: Option<u64>,
+}
+
+impl CollectionStatsArgs {
     pub fn collection_ref(&self) -> CollectionRef {
         self.namespace.collection_ref(self.collection.clone())
     }
@@ -715,12 +752,14 @@ pub struct QueryArgs {
     #[arg(
         long,
         value_name = "GENERATION",
+        requires = "snapshot_visible_seq_no",
         help = "Historical manifest generation to read. Must be paired with --snapshot-visible-seq-no. Example: 12"
     )]
     pub snapshot_manifest_generation: Option<u64>,
     #[arg(
         long,
         value_name = "SEQ_NO",
+        requires = "snapshot_manifest_generation",
         help = "Historical visible sequence number to read. Must be paired with --snapshot-manifest-generation. Example: 44"
     )]
     pub snapshot_visible_seq_no: Option<u64>,

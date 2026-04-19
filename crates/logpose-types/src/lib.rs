@@ -419,6 +419,8 @@ pub struct CommitAck {
     pub last_seq_no: SeqNo,
     /// Number of operations durably recorded.
     pub applied_ops: usize,
+    /// Read snapshot observed immediately after the write completed.
+    pub snapshot: Snapshot,
 }
 
 /// Stable visibility boundary for reads.

@@ -1,7 +1,7 @@
 use crate::{
     action::{
         Action, CLI_PUT_BATCH_BYTES, database_descriptor, query_request_from_action,
-        read_database_policy_input, read_jsonl_put_batches,
+        read_database_policy_input, read_jsonl_put_batches, stats_snapshot_from_action,
     },
     feedback::{ProgressHandle, Reporter},
     render::ActionOutput,
@@ -107,11 +107,15 @@ pub async fn execute_action<R: Reporter>(
             progress.finish_success("Collection metadata ready");
             Ok(ActionOutput::CollectionShown(descriptor))
         }
-        Action::CollectionStats(collection) => {
+        Action::CollectionStats(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Fetching collection stats...");
             let client = connect_client(config, auth_token).await?;
             let stats = client
-                .stats_in_database(&collection.database_name, &collection.collection_name)
+                .stats_in_database_at_snapshot(
+                    &action.collection.database_name,
+                    &action.collection.collection_name,
+                    stats_snapshot_from_action(action)?,
+                )
                 .await
                 .context("failed to read collection stats")?;
             progress.finish_success("Collection stats ready");
@@ -158,17 +162,31 @@ pub async fn execute_action<R: Reporter>(
             let client = connect_client(config, auth_token).await?;
             let mut last_seq_no = 0;
             let mut applied_ops = 0;
+            let mut acknowledged_snapshot = None;
             for operations in batches {
-                let ack = client
+                let ack = match client
                     .write_in_database(
                         &action.collection.database_name,
                         &action.collection.collection_name,
                         operations,
                     )
                     .await
-                    .context("failed to write records")?;
+                {
+                    Ok(ack) => ack,
+                    Err(error) if applied_ops > 0 => {
+                        return Err(error).context(format!(
+                            "failed to write records after {applied_ops} fully acknowledged operations; the failing batch may have partially committed, so verify collection state before retrying"
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(error).context(
+                            "failed to write records; the failing batch may have partially committed, so verify collection state before retrying",
+                        )
+                    }
+                };
                 last_seq_no = ack.last_seq_no;
                 applied_ops += ack.applied_ops;
+                acknowledged_snapshot = Some(ack.snapshot.clone());
             }
             progress.finish_success("Write completed");
             Ok(ActionOutput::RecordsWritten(
@@ -178,6 +196,8 @@ pub async fn execute_action<R: Reporter>(
                     response: logpose_types::CommitAck {
                         last_seq_no,
                         applied_ops,
+                        snapshot: acknowledged_snapshot
+                            .expect("at least one acknowledged batch should produce a snapshot"),
                     },
                 },
             ))
@@ -194,7 +214,9 @@ pub async fn execute_action<R: Reporter>(
                     })],
                 )
                 .await
-                .context("failed to delete record")?;
+                .context(
+                    "failed to delete record; the delete may have been durably recorded before the error was returned, so verify collection state before retrying",
+                )?;
             progress.finish_success("Delete completed");
             Ok(ActionOutput::RecordDeleted(ack))
         }

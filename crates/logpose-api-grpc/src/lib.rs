@@ -245,6 +245,7 @@ impl LogPoseService for GrpcLogPoseService {
             applied_ops: ack.applied_ops as u64,
             database_name,
             collection_name: request.collection_name,
+            snapshot: Some(snapshot_message_from_domain(ack.snapshot)),
         }))
     }
 
@@ -320,11 +321,13 @@ impl LogPoseService for GrpcLogPoseService {
     ) -> Result<Response<CollectionStatsReply>, Status> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
+        let database_name = normalize_database_name(&request.database_name);
         let stats = self
             .state
-            .stats_with_auth(
+            .stats_at_snapshot_with_auth(
                 &auth,
-                &collection_lookup_key(&request.database_name, &request.collection_name),
+                &collection_lookup_key(&database_name, &request.collection_name),
+                request.snapshot.map(snapshot_from_proto),
             )
             .await
             .map_err(status_from_service_error)?;
@@ -1131,7 +1134,7 @@ mod tests {
             .into_inner();
         assert_eq!(create.name, "documents");
 
-        service
+        let write = service
             .write_collection(Request::new(write_collection_request(
                 "documents",
                 vec![
@@ -1159,7 +1162,24 @@ mod tests {
                 ],
             )))
             .await
-            .expect("write should succeed");
+            .expect("write should succeed")
+            .into_inner();
+        let write_snapshot = write
+            .snapshot
+            .expect("write reply should include a write snapshot");
+        assert_eq!(write_snapshot.manifest_generation, 0);
+        assert_eq!(write_snapshot.visible_seq_no, 3);
+
+        let stats = service
+            .get_collection_stats(Request::new(GetCollectionStatsRequest {
+                snapshot: Some(write_snapshot),
+                ..get_collection_stats_request("documents")
+            }))
+            .await
+            .expect("stats at write snapshot should succeed")
+            .into_inner();
+        assert_eq!(stats.visible_seq_no, 3);
+        assert_eq!(stats.live_record_count, 3);
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
@@ -2389,6 +2409,7 @@ mod tests {
         GetCollectionStatsRequest {
             collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            snapshot: None,
         }
     }
 

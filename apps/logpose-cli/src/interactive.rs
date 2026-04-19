@@ -1,10 +1,10 @@
 use crate::{
     action::{
-        Action, CollectionCreateAction, ExplainArg, MetricArg, QueryAction, RecordDeleteAction,
-        RecordPutAction, WorkflowDefinition, WorkflowKind, collect_picker_files,
-        collection_lookup_name, collection_ref_from_lookup_or_namespace, explain_choices,
-        format_command, format_filter, format_predicate, metric_choices, parse_filter_list,
-        parse_query_vector, parse_where_list, picker_choice, rank_path_choices,
+        Action, CollectionCreateAction, CollectionStatsAction, ExplainArg, MetricArg, QueryAction,
+        RecordDeleteAction, RecordPutAction, WorkflowDefinition, WorkflowKind,
+        collect_picker_files, collection_lookup_name, collection_ref_from_lookup_or_namespace,
+        explain_choices, format_command, format_filter, format_predicate, metric_choices,
+        parse_filter_list, parse_query_vector, parse_where_list, picker_choice, rank_path_choices,
         rank_picker_choices, workflow_choices, workflow_definitions,
     },
     cli::{InteractiveArgs, NamespaceArgs, OutputMode},
@@ -153,6 +153,12 @@ fn action_from_scripted_prompts(
     workflow: WorkflowKind,
     session: &SessionContext,
 ) -> anyhow::Result<Action> {
+    let build_snapshot_fields = |manifest_generation: Option<u64>,
+                                 visible_seq_no: Option<u64>|
+     -> anyhow::Result<(Option<u64>, Option<u64>)> {
+        validate_snapshot_pair(manifest_generation, visible_seq_no)?;
+        Ok((manifest_generation, visible_seq_no))
+    };
     match workflow {
         WorkflowKind::CollectionCreate => {
             let name = args
@@ -188,10 +194,35 @@ fn action_from_scripted_prompts(
             &args.namespace,
             &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
         ))),
-        WorkflowKind::CollectionStats => Ok(Action::CollectionStats(collection_ref_for_namespace(
-            &args.namespace,
-            &required_collection_string(ui, args.collection.clone(), session, Some("colors"))?,
-        ))),
+        WorkflowKind::CollectionStats => {
+            let collection =
+                required_collection_string(ui, args.collection.clone(), session, Some("colors"))?;
+            let (snapshot_manifest_generation, snapshot_visible_seq_no) = build_snapshot_fields(
+                ui.prompt_optional_parsed(
+                    "Snapshot manifest generation (optional)",
+                    Some("0"),
+                    |value| {
+                        value.parse::<u64>().map_err(|error| {
+                            format!("invalid snapshot manifest generation: {error}")
+                        })
+                    },
+                )?,
+                ui.prompt_optional_parsed(
+                    "Snapshot visible sequence number (optional)",
+                    Some("3"),
+                    |value| {
+                        value.parse::<u64>().map_err(|error| {
+                            format!("invalid snapshot visible sequence number: {error}")
+                        })
+                    },
+                )?,
+            )?;
+            Ok(Action::CollectionStats(CollectionStatsAction {
+                collection: collection_ref_for_namespace(&args.namespace, &collection),
+                snapshot_manifest_generation,
+                snapshot_visible_seq_no,
+            }))
+        }
         WorkflowKind::CollectionPlacement => {
             Ok(Action::CollectionPlacement(collection_ref_for_namespace(
                 &args.namespace,
@@ -312,6 +343,26 @@ fn action_from_scripted_prompts(
             let predicate_json = args.predicate_json.clone().or(ui
                 .prompt_optional_string("Predicate JSON path (optional)", Some("predicate.json"))?
                 .map(PathBuf::from));
+            let (snapshot_manifest_generation, snapshot_visible_seq_no) = build_snapshot_fields(
+                ui.prompt_optional_parsed(
+                    "Snapshot manifest generation (optional)",
+                    Some("0"),
+                    |value| {
+                        value.parse::<u64>().map_err(|error| {
+                            format!("invalid snapshot manifest generation: {error}")
+                        })
+                    },
+                )?,
+                ui.prompt_optional_parsed(
+                    "Snapshot visible sequence number (optional)",
+                    Some("3"),
+                    |value| {
+                        value.parse::<u64>().map_err(|error| {
+                            format!("invalid snapshot visible sequence number: {error}")
+                        })
+                    },
+                )?,
+            )?;
             Ok(Action::Query(QueryAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 top_k,
@@ -320,8 +371,8 @@ fn action_from_scripted_prompts(
                 where_clauses,
                 predicate_json,
                 explain,
-                snapshot_manifest_generation: None,
-                snapshot_visible_seq_no: None,
+                snapshot_manifest_generation,
+                snapshot_visible_seq_no,
             }))
         }
         WorkflowKind::InspectManifest => Ok(Action::Inspect {
@@ -743,7 +794,6 @@ impl FormState {
                 ),
             ],
             WorkflowKind::CollectionShow
-            | WorkflowKind::CollectionStats
             | WorkflowKind::CollectionPlacement
             | WorkflowKind::CollectionFlush
             | WorkflowKind::CollectionCompact
@@ -758,6 +808,33 @@ impl FormState {
                 args.collection.clone(),
                 session,
             )],
+            WorkflowKind::CollectionStats => vec![
+                collection_field(
+                    "collection",
+                    "Collection name",
+                    "Collection to inspect or operate on.",
+                    "colors",
+                    true,
+                    args.collection.clone(),
+                    session,
+                ),
+                number_field(
+                    "snapshot_manifest_generation",
+                    "Snapshot generation",
+                    "Optional historical manifest generation. Pair with snapshot seq.",
+                    "0",
+                    false,
+                    None,
+                ),
+                number_field(
+                    "snapshot_visible_seq_no",
+                    "Snapshot seq",
+                    "Optional historical visible sequence number. Pair with snapshot generation.",
+                    "3",
+                    false,
+                    None,
+                ),
+            ],
             WorkflowKind::RecordPut => vec![
                 collection_field(
                     "collection",
@@ -867,6 +944,22 @@ impl FormState {
                     vec!["none", "plan", "profile"],
                     args.explain.map(explain_to_value),
                     "none",
+                ),
+                number_field(
+                    "snapshot_manifest_generation",
+                    "Snapshot generation",
+                    "Optional historical manifest generation. Pair with snapshot seq.",
+                    "0",
+                    false,
+                    None,
+                ),
+                number_field(
+                    "snapshot_visible_seq_no",
+                    "Snapshot seq",
+                    "Optional historical visible sequence number. Pair with snapshot generation.",
+                    "3",
+                    false,
+                    None,
                 ),
                 path_field(
                     "predicate_json",
@@ -1019,6 +1112,13 @@ impl FormState {
             }
             Ok(value.to_owned())
         };
+        let optional = |key: &str| -> anyhow::Result<Option<String>> {
+            let value = field(key)?.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(value.to_owned()))
+        };
         let required_collection = |key: &str| -> anyhow::Result<CollectionRef> {
             Ok(collection_ref_for_namespace(
                 &self.namespace,
@@ -1032,6 +1132,25 @@ impl FormState {
             }
             Ok(Some(resolve_user_path(cwd, value)))
         };
+        let optional_snapshot_pair =
+            |generation_key: &str, seq_key: &str| -> anyhow::Result<(Option<u64>, Option<u64>)> {
+                let manifest_generation = optional(generation_key)?
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .context("snapshot_manifest_generation must be a non-negative integer")
+                    })
+                    .transpose()?;
+                let visible_seq_no = optional(seq_key)?
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .context("snapshot_visible_seq_no must be a non-negative integer")
+                    })
+                    .transpose()?;
+                validate_snapshot_pair(manifest_generation, visible_seq_no)?;
+                Ok((manifest_generation, visible_seq_no))
+            };
 
         match self.workflow {
             WorkflowKind::CollectionCreate => {
@@ -1048,7 +1167,16 @@ impl FormState {
                 Ok(Action::CollectionShow(required_collection("collection")?))
             }
             WorkflowKind::CollectionStats => {
-                Ok(Action::CollectionStats(required_collection("collection")?))
+                let (snapshot_manifest_generation, snapshot_visible_seq_no) =
+                    optional_snapshot_pair(
+                        "snapshot_manifest_generation",
+                        "snapshot_visible_seq_no",
+                    )?;
+                Ok(Action::CollectionStats(CollectionStatsAction {
+                    collection: required_collection("collection")?,
+                    snapshot_manifest_generation,
+                    snapshot_visible_seq_no,
+                }))
             }
             WorkflowKind::CollectionPlacement => Ok(Action::CollectionPlacement(
                 required_collection("collection")?,
@@ -1068,19 +1196,26 @@ impl FormState {
                 collection: required_collection("collection")?,
                 id: required("id")?,
             })),
-            WorkflowKind::Query => Ok(Action::Query(QueryAction {
-                collection: required_collection("collection")?,
-                top_k: required("top_k")?
-                    .parse::<usize>()
-                    .context("top_k must be a positive integer")?,
-                vector: parse_query_vector(&required("vector")?).map_err(anyhow::Error::msg)?,
-                filters: parse_optional_filters(field("filters")?)?,
-                where_clauses: parse_optional_predicates(field("where")?)?,
-                explain: parse_explain(field("explain")?)?,
-                predicate_json: optional_path("predicate_json")?,
-                snapshot_manifest_generation: None,
-                snapshot_visible_seq_no: None,
-            })),
+            WorkflowKind::Query => {
+                let (snapshot_manifest_generation, snapshot_visible_seq_no) =
+                    optional_snapshot_pair(
+                        "snapshot_manifest_generation",
+                        "snapshot_visible_seq_no",
+                    )?;
+                Ok(Action::Query(QueryAction {
+                    collection: required_collection("collection")?,
+                    top_k: required("top_k")?
+                        .parse::<usize>()
+                        .context("top_k must be a positive integer")?,
+                    vector: parse_query_vector(&required("vector")?).map_err(anyhow::Error::msg)?,
+                    filters: parse_optional_filters(field("filters")?)?,
+                    where_clauses: parse_optional_predicates(field("where")?)?,
+                    explain: parse_explain(field("explain")?)?,
+                    predicate_json: optional_path("predicate_json")?,
+                    snapshot_manifest_generation,
+                    snapshot_visible_seq_no,
+                }))
+            }
             WorkflowKind::InspectManifest => Ok(Action::Inspect {
                 collection: required_collection("collection")?,
                 target: InspectTarget::Manifest,
@@ -1100,6 +1235,18 @@ impl FormState {
             WorkflowKind::Status => Ok(Action::Status),
             WorkflowKind::ConfigShow => Ok(Action::ConfigShow),
         }
+    }
+}
+
+fn validate_snapshot_pair(
+    manifest_generation: Option<u64>,
+    visible_seq_no: Option<u64>,
+) -> anyhow::Result<()> {
+    match (manifest_generation, visible_seq_no) {
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        _ => bail!(
+            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+        ),
     }
 }
 
@@ -1605,10 +1752,10 @@ impl InteractiveApp {
         let collection = match action {
             Action::CollectionCreate(action) => Some(collection_label(&action.collection)),
             Action::CollectionShow(collection)
-            | Action::CollectionStats(collection)
             | Action::CollectionPlacement(collection)
             | Action::CollectionFlush(collection)
             | Action::CollectionCompact(collection) => Some(collection_label(collection)),
+            Action::CollectionStats(action) => Some(collection_label(&action.collection)),
             Action::RecordPut(action) => Some(collection_label(&action.collection)),
             Action::RecordDelete(action) => Some(collection_label(&action.collection)),
             Action::Query(action) => Some(collection_label(&action.collection)),
@@ -3404,6 +3551,58 @@ mod tests {
     }
 
     #[test]
+    fn query_form_rejects_partial_snapshot_pair() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            top_k: Some(1),
+            vector: Some(crate::action::QueryVector(vec![1.0, 0.0])),
+            ..empty_args()
+        };
+        let mut form =
+            FormState::from_workflow(WorkflowKind::Query, &args, Path::new("."), &test_session())
+                .expect("query form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_manifest_generation")
+            .expect("snapshot generation field")
+            .value = "7".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("partial snapshot pair should be rejected");
+        assert!(error.to_string().contains(
+            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+        ));
+    }
+
+    #[test]
+    fn collection_stats_form_rejects_partial_snapshot_pair() {
+        let args = InteractiveArgs {
+            collection: Some("colors".to_owned()),
+            ..empty_args()
+        };
+        let mut form = FormState::from_workflow(
+            WorkflowKind::CollectionStats,
+            &args,
+            Path::new("."),
+            &test_session(),
+        )
+        .expect("collection stats form should build");
+        form.fields
+            .iter_mut()
+            .find(|field| field.key == "snapshot_visible_seq_no")
+            .expect("snapshot seq field")
+            .value = "3".to_owned();
+
+        let error = form
+            .build_action(Path::new("."))
+            .expect_err("partial snapshot pair should be rejected");
+        assert!(error.to_string().contains(
+            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+        ));
+    }
+
+    #[test]
     fn destructive_actions_require_confirmation_prompt() {
         let action = Action::RecordDelete(RecordDeleteAction {
             collection: NamespaceArgs::default().collection_ref("colors"),
@@ -3690,6 +3889,10 @@ mod tests {
                     response: logpose_types::CommitAck {
                         applied_ops: 1,
                         last_seq_no: 7,
+                        snapshot: logpose_types::Snapshot {
+                            manifest_generation: 0,
+                            visible_seq_no: 7,
+                        },
                     },
                 }),
                 tab: ResultTab::Summary,

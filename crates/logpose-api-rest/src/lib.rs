@@ -268,14 +268,21 @@ async fn query_collection(
 async fn get_collection_stats(
     headers: HeaderMap,
     Path(name): Path<String>,
-    Query(namespace): Query<NamespaceQuery>,
+    Query(params): Query<CollectionStatsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = namespace.collection(name);
+    let collection = params.namespace().collection(name);
     Ok(Json(
         state
-            .stats_with_auth(&auth, &collection_lookup_key(&collection))
+            .stats_at_snapshot_with_auth(
+                &auth,
+                &collection_lookup_key(&collection),
+                snapshot_from_query_pair(
+                    params.snapshot_manifest_generation,
+                    params.snapshot_visible_seq_no,
+                )?,
+            )
             .await?,
     ))
 }
@@ -353,6 +360,26 @@ impl NamespaceQuery {
             default_database_if_blank(self.database.clone()),
             name.into(),
         )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionStatsQuery {
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
+    database: String,
+    snapshot_manifest_generation: Option<u64>,
+    snapshot_visible_seq_no: Option<u64>,
+}
+
+impl CollectionStatsQuery {
+    fn namespace(&self) -> NamespaceQuery {
+        NamespaceQuery {
+            database: default_database_if_blank(self.database.clone()),
+        }
     }
 }
 
@@ -537,6 +564,23 @@ fn default_database_if_blank(value: String) -> String {
     }
 }
 
+fn snapshot_from_query_pair(
+    manifest_generation: Option<u64>,
+    visible_seq_no: Option<u64>,
+) -> Result<Option<Snapshot>, ApiError> {
+    match (manifest_generation, visible_seq_no) {
+        (Some(manifest_generation), Some(visible_seq_no)) => Ok(Some(Snapshot {
+            manifest_generation,
+            visible_seq_no,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(ApiError(ServiceError::InvalidArgument(
+            "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+                .to_owned(),
+        ))),
+    }
+}
+
 fn collection_lookup_key(collection: &CollectionRef) -> String {
     collection.lookup_name()
 }
@@ -650,6 +694,29 @@ mod tests {
         );
         assert_eq!(payload["diagnostics"]["stage_timings"]["rerank_micros"], 55);
         assert_eq!(payload["diagnostics"]["stage_timings"]["merge_micros"], 66);
+    }
+
+    #[test]
+    fn snapshot_query_pair_requires_both_fields() {
+        let snapshot = snapshot_from_query_pair(Some(7), Some(11))
+            .expect("complete snapshot pair should parse");
+        assert_eq!(
+            snapshot,
+            Some(Snapshot {
+                manifest_generation: 7,
+                visible_seq_no: 11,
+            })
+        );
+
+        let error =
+            snapshot_from_query_pair(Some(7), None).expect_err("partial snapshot pair should fail");
+        assert_eq!(
+            error.0,
+            ServiceError::InvalidArgument(
+                "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+                    .to_owned(),
+            )
+        );
     }
 
     #[tokio::test]
@@ -905,6 +972,8 @@ mod tests {
         let write_body = json_body(write).await;
         assert_eq!(write_body["database_name"], "default");
         assert_eq!(write_body["collection_name"], "documents");
+        assert_eq!(write_body["snapshot"]["manifest_generation"], 0);
+        assert_eq!(write_body["snapshot"]["visible_seq_no"], 3);
 
         let query = app
             .clone()
@@ -943,7 +1012,7 @@ mod tests {
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats")
+                    .uri("/v1/collections/documents/stats?snapshot_manifest_generation=0&snapshot_visible_seq_no=3")
                     .body(Body::empty())
                     .expect("request should build"),
             )

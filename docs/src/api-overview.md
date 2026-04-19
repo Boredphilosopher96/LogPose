@@ -130,7 +130,8 @@ rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
 ### Runtime Status
 
 Returns a control-plane summary including node role, listener endpoints,
-collection placements, and maintenance backlog.
+collection placements, maintenance backlog, and cluster coordination status
+when etcd-backed metadata is enabled.
 
 ```bash
 curl http://127.0.0.1:8080/v1/runtime/status \
@@ -165,6 +166,16 @@ curl http://127.0.0.1:8080/v1/runtime/status \
     "pending_operations": 0,
     "collections_in_progress": 0,
     "collections_with_errors": 0
+  },
+  "coordination": {
+    "cluster_name": "prod-cluster",
+    "membership_registered": true,
+    "membership_lease_id": 17,
+    "registered_members": ["node-alpha", "node-beta"],
+    "is_local_leader": true,
+    "leadership_lease_id": 23,
+    "leader_node": "node-alpha",
+    "last_error": null
   }
 }
 ```
@@ -338,7 +349,11 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
   "database_name": "default",
   "collection_name": "embeddings",
   "last_seq_no": 1023,
-  "applied_ops": 3
+  "applied_ops": 3,
+  "snapshot": {
+    "manifest_generation": 0,
+    "visible_seq_no": 1023
+  }
 }
 ```
 
@@ -477,6 +492,8 @@ filter selectivity:
 
 Returns storage statistics, maintenance state, and per-query-unit breakdowns.
 Use the `database` query parameter for non-default namespaces.
+Use `snapshot_manifest_generation` and `snapshot_visible_seq_no` together to inspect
+stats at one exact historical snapshot.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -664,7 +681,8 @@ service LogPoseService {
 
 The public APIs do not yet provide:
 
-- multi-node control-plane coordination or consistency-mode selection
+- client-selectable consistency levels or monotonic-read session tokens
+- multi-node data-plane failover orchestration and chaos-tested recovery workflows
 - collection listing or delete/drop lifecycle endpoints
 - record-browse or scroll-style inspection endpoints
 - browser-ready authentication or RBAC enforcement

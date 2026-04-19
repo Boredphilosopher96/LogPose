@@ -86,16 +86,20 @@ impl ActionOutput {
                 snapshot.visible_seq_no
             ),
             ActionOutput::RecordsWritten(ack) => format!(
-                "Write completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
+                "Write completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}\nWrite snapshot: generation {}, seq {}",
                 collection_identity(&ack.database_name, &ack.collection_name),
                 ack.applied_ops,
-                ack.last_seq_no
+                ack.last_seq_no,
+                ack.snapshot.manifest_generation,
+                ack.snapshot.visible_seq_no,
             ),
             ActionOutput::RecordDeleted(ack) => format!(
-                "Delete completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}",
+                "Delete completed\nCollection: {}\nApplied operations: {}\nLast sequence number: {}\nWrite snapshot: generation {}, seq {}",
                 collection_identity(&ack.database_name, &ack.collection_name),
                 ack.applied_ops,
-                ack.last_seq_no
+                ack.last_seq_no,
+                ack.snapshot.manifest_generation,
+                ack.snapshot.visible_seq_no,
             ),
             ActionOutput::Query(response) => render_query(response)?,
             ActionOutput::Inspect(report) => format!(
@@ -459,6 +463,10 @@ mod tests {
             response: CommitAck {
                 last_seq_no: 7,
                 applied_ops: 2,
+                snapshot: Snapshot {
+                    manifest_generation: 3,
+                    visible_seq_no: 7,
+                },
             },
         })
         .human_text()
@@ -467,6 +475,7 @@ mod tests {
         assert!(output.contains("analytics/documents"));
         assert!(!output.contains("acme/analytics/documents"));
         assert!(output.contains("Applied operations: 2"));
+        assert!(output.contains("Write snapshot: generation 3, seq 7"));
     }
 
     #[test]

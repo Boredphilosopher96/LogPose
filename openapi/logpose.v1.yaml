@@ -526,6 +526,18 @@ paths:
           schema:
             type: string
             default: default
+        - name: snapshot_manifest_generation
+          in: query
+          required: false
+          description: Historical manifest generation to inspect. Must be provided together with `snapshot_visible_seq_no`.
+          schema:
+            type: integer
+        - name: snapshot_visible_seq_no
+          in: query
+          required: false
+          description: Historical visible sequence number to inspect. Must be provided together with `snapshot_manifest_generation`.
+          schema:
+            type: integer
       responses:
         "200":
           description: Collection stats
@@ -1015,12 +1027,14 @@ components:
             $ref: "#/components/schemas/WriteOperation"
     CommitAck:
       type: object
-      required: [last_seq_no, applied_ops]
+      required: [last_seq_no, applied_ops, snapshot]
       properties:
         last_seq_no:
           type: integer
         applied_ops:
           type: integer
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
     Snapshot:
       type: object
       required: [manifest_generation, visible_seq_no]

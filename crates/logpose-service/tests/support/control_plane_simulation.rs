@@ -741,6 +741,7 @@ async fn assert_data_matches(
         .get_collection_stats(Request::new(proto::GetCollectionStatsRequest {
             collection_name: bare_collection_name,
             database_name,
+            snapshot: None,
         }))
         .await
         .unwrap_or_else(|error| panic_with_context(trace, format!("grpc stats failed: {error}")))
