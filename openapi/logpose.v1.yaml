@@ -60,6 +60,117 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/runtime/nodes/{name}:
+    get:
+      summary: Get node membership
+      operationId: getNodeMembership
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Membership state for one node
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeMembershipStatus"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Node membership record not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/runtime/nodes/{name}/drain:
+    post:
+      summary: Mark a node as draining
+      operationId: drainNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated node membership state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeMembershipStatus"
+        "400":
+          description: Invalid drain request or node is not the active control-plane leader
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/runtime/nodes/{name}/undrain:
+    post:
+      summary: Restore a node to ready state
+      operationId: undrainNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated node membership state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeMembershipStatus"
+        "400":
+          description: Invalid undrain request or node is not the active control-plane leader
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/databases:
     get:
       summary: List databases
@@ -406,6 +517,92 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "500":
           description: Internal placement lookup failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/promote:
+    post:
+      summary: Promote collection ownership
+      operationId: promoteCollectionOwner
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromoteCollectionOwnerRequest"
+      responses:
+        "200":
+          description: Updated collection placement summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionPlacement"
+        "400":
+          description: Invalid promotion request or local node is not the active control-plane leader
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/collections/{name}/rebalance:
+    post:
+      summary: Rebalance collection ownership
+      operationId: rebalanceCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RebalanceCollectionRequest"
+      responses:
+        "200":
+          description: Updated collection placement summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionPlacement"
+        "400":
+          description: Invalid rebalance request or no ready target was available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Operator access required
           content:
             application/json:
               schema:
@@ -846,9 +1043,33 @@ components:
         ownership_epoch:
           type: integer
           nullable: true
+        replicas:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReplicaPlacement"
+        failover_reason:
+          type: string
+          nullable: true
+        metadata_revision:
+          type: integer
+          format: int64
+          nullable: true
         route_kind:
           type: string
         route_reason:
+          type: string
+    ReplicaPlacement:
+      type: object
+      required:
+        - node_id
+        - node_role
+        - state
+      properties:
+        node_id:
+          type: string
+        node_role:
+          $ref: "#/components/schemas/NodeRole"
+        state:
           type: string
     MaintenanceBacklog:
       type: object
@@ -878,6 +1099,9 @@ components:
           type: string
         membership_registered:
           type: boolean
+        membership_state:
+          type: string
+          nullable: true
         membership_lease_id:
           type: integer
           format: int64
@@ -895,7 +1119,27 @@ components:
           type: integer
           format: int64
           nullable: true
+        metadata_revision:
+          type: integer
+          format: int64
+          nullable: true
+        watch_lag:
+          type: integer
+          nullable: true
         last_error:
+          type: string
+    NodeMembershipStatus:
+      type: object
+      required:
+        - node_id
+        - node_role
+        - state
+      properties:
+        node_id:
+          type: string
+        node_role:
+          $ref: "#/components/schemas/NodeRole"
+        state:
           type: string
           nullable: true
     NodeRuntimeStatus:
@@ -957,6 +1201,29 @@ components:
           minimum: 1
         metric:
           $ref: "#/components/schemas/DistanceMetric"
+        replication_factor:
+          type: integer
+          minimum: 1
+    PromoteCollectionOwnerRequest:
+      type: object
+      required:
+        - database_name
+        - node_name
+      properties:
+        database_name:
+          type: string
+          default: default
+        node_name:
+          type: string
+    RebalanceCollectionRequest:
+      type: object
+      properties:
+        database_name:
+          type: string
+          default: default
+        target_node_name:
+          type: string
+          default: 1
     CollectionDescriptor:
       type: object
       required:
@@ -965,6 +1232,7 @@ components:
         - name
         - dimensions
         - metric
+        - replication_factor
         - root_path
         - remote_blob
         - flush_threshold_ops
@@ -982,6 +1250,9 @@ components:
           type: integer
         metric:
           $ref: "#/components/schemas/DistanceMetric"
+        replication_factor:
+          type: integer
+          minimum: 1
         root_path:
           type: string
         remote_blob:

@@ -846,6 +846,17 @@ pub struct LeadershipFence {
 
 /// Operator-visible explanation of where a collection is currently placed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaPlacement {
+    /// Node currently selected as a desired replica target.
+    pub node_id: String,
+    /// Runtime role recorded for the replica target.
+    pub node_role: NodeRole,
+    /// Current replica materialization state from the perspective of this runtime.
+    pub state: String,
+}
+
+/// Operator-visible explanation of where a collection is currently placed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionPlacement {
     /// Stable collection identifier.
     pub collection_id: CollectionId,
@@ -864,6 +875,15 @@ pub struct CollectionPlacement {
     /// Monotonic ownership epoch when etcd-backed ownership fencing is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership_epoch: Option<u64>,
+    /// Desired replica targets currently derived for the collection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replicas: Vec<ReplicaPlacement>,
+    /// Last operator-visible reason recorded for the current owner transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_reason: Option<String>,
+    /// Cluster metadata revision used to compute this placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_revision: Option<i64>,
     /// Routing family selected for this placement.
     pub route_kind: String,
     /// Human-readable diagnostic reason for the current route.
@@ -877,6 +897,9 @@ pub struct CoordinationStatus {
     pub cluster_name: String,
     /// Whether this runtime currently holds a live membership lease.
     pub membership_registered: bool,
+    /// Current operator-assigned membership state for this runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_state: Option<String>,
     /// Current etcd lease backing node membership when one is active.
     pub membership_lease_id: Option<i64>,
     /// Visible member node identifiers in the cluster.
@@ -887,8 +910,25 @@ pub struct CoordinationStatus {
     pub is_local_leader: bool,
     /// Current etcd lease backing the local leadership claim when one is active.
     pub leadership_lease_id: Option<i64>,
+    /// Cluster metadata revision currently reflected by the local watch cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_revision: Option<i64>,
+    /// Approximate watch lag in revisions behind the current cluster head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_lag: Option<u64>,
     /// Last coordination-loop error observed by this runtime.
     pub last_error: Option<String>,
+}
+
+/// Operator-facing membership state for one node in the coordination plane.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeMembershipStatus {
+    /// Stable node identifier.
+    pub node_id: String,
+    /// Runtime role currently advertised by the node.
+    pub node_role: NodeRole,
+    /// Current coordination state, such as `ready` or `draining`.
+    pub state: String,
 }
 
 /// Aggregated maintenance backlog surfaced through control-plane diagnostics.

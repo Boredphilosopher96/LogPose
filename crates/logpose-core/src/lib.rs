@@ -13,7 +13,7 @@ use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, Loc
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
-    MetadataBackend, NodeMetadata, NodeRole, Snapshot, WriteOperation,
+    MetadataBackend, NodeMembershipStatus, NodeMetadata, NodeRole, Snapshot, WriteOperation,
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -159,6 +159,36 @@ impl AppState {
         self.control.runtime_status().await
     }
 
+    /// Read one node membership status after enforcing operator access when auth is enabled.
+    pub async fn node_membership_status_with_auth(
+        &self,
+        auth: &RequestAuth,
+        node_id: &str,
+    ) -> ServiceResult<NodeMembershipStatus> {
+        self.require_operator(auth).await?;
+        self.control.node_membership_status(node_id).await
+    }
+
+    /// Mark one node as draining after enforcing operator access when auth is enabled.
+    pub async fn drain_node_with_auth(
+        &self,
+        auth: &RequestAuth,
+        node_id: &str,
+    ) -> ServiceResult<NodeMembershipStatus> {
+        self.require_operator(auth).await?;
+        self.control.drain_node(node_id).await
+    }
+
+    /// Restore one node to ready serving state after enforcing operator access when auth is enabled.
+    pub async fn undrain_node_with_auth(
+        &self,
+        auth: &RequestAuth,
+        node_id: &str,
+    ) -> ServiceResult<NodeMembershipStatus> {
+        self.require_operator(auth).await?;
+        self.control.undrain_node(node_id).await
+    }
+
     /// Create one collection after enforcing database write access when auth is enabled.
     pub async fn create_collection_with_auth(
         &self,
@@ -207,6 +237,32 @@ impl AppState {
     ) -> ServiceResult<logpose_types::CollectionPlacement> {
         self.require_operator(auth).await?;
         self.control.collection_placement(collection_name).await
+    }
+
+    /// Promote one collection owner after enforcing operator access when auth is enabled.
+    pub async fn promote_collection_owner_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        node_id: &str,
+    ) -> ServiceResult<logpose_types::CollectionPlacement> {
+        self.require_operator(auth).await?;
+        self.control
+            .promote_collection_owner(collection_name, node_id)
+            .await
+    }
+
+    /// Rebalance one collection after enforcing operator access when auth is enabled.
+    pub async fn rebalance_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        node_id: Option<&str>,
+    ) -> ServiceResult<logpose_types::CollectionPlacement> {
+        self.require_operator(auth).await?;
+        self.control
+            .rebalance_collection(collection_name, node_id)
+            .await
     }
 
     /// Fetch collection metadata by name after enforcing database read access when auth is enabled.
@@ -889,6 +945,7 @@ mod tests {
                     name: "documents".to_owned(),
                     dimensions: 2,
                     metric: DistanceMetric::Dot,
+                    replication_factor: 1,
                 },
             )
             .await

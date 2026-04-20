@@ -39,21 +39,24 @@ Operator-facing query diagnostics now include ANN-aware plan kinds, candidate ge
 
 PR4's local multi-node chaos workflow is documented in [Podman
 Chaos](./podman-chaos.md). That page covers the three-node Podman topology, the
-repo-owned shell contract checks, the etcd helper used for ownership races, and
-the exact invariants each scenario must preserve.
-
-One rule matters for every failover drill today: LogPose still has no public
-REST, gRPC, or CLI API for shard promotion. Ownership moves in the Podman chaos
-lab must use a helper or example instead of a normal operator endpoint.
+repo-owned shell contract checks, the public drain and ownership-control
+surfaces, and the exact invariants each scenario must preserve.
 
 ## Current Limits
 
 Operationally, LogPose is still earlier than a distributed database:
 
-- etcd-backed collection-assignment metadata can now be enabled, but metadata quorum, membership leases, and replica controllers are not complete
+- authoritative etcd-backed database and collection metadata, membership
+  leases, public drain, undrain, promote, and rebalance controls,
+  replica-aware placement diagnostics, and seeded Podman chaos validation are
+  now in place, but automatic owner failover still promotes only a desired
+  replica that already has local materialized state; remote artifact transfer
+  remains a later storage concern
 - bootstrap bearer authentication, operator-gated database admin, and database-scoped read/write/owner policies now exist, but principal lifecycle and richer policy listing/delete workflows are not complete
 - health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
-- database descriptors are now explicit control-plane objects, but etcd-backed catalog replication and distributed namespace controllers are not implemented yet
+- richer namespace controllers, auditability, and deeper operator workflows are
+  still incomplete even though descriptors and policies now live in
+  authoritative metadata
 - tracing is initialized, but a metrics endpoint and richer telemetry surfaces do not exist yet
 - remote blob synchronization to MinIO or S3 is not implemented yet
 

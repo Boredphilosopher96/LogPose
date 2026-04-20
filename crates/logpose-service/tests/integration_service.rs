@@ -47,6 +47,7 @@ async fn service_runs_filtered_query_and_storage_workflow() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -150,6 +151,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -236,6 +238,7 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -300,6 +303,7 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -357,6 +361,7 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -407,6 +412,7 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -449,6 +455,7 @@ async fn service_stats_read_barrier_advances_to_latest_snapshot() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -491,6 +498,7 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -536,6 +544,7 @@ async fn service_rejects_impossible_snapshots() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -586,6 +595,7 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -643,6 +653,7 @@ async fn app_state_accepts_database_qualified_collection_references() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -717,6 +728,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -952,6 +964,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -1313,6 +1326,7 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");

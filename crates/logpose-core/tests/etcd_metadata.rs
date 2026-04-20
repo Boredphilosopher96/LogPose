@@ -105,10 +105,29 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(local_stats.live_record_count, 1);
     assert!(local_runtime.control_plane_ready);
     assert!(local_runtime.data_plane_ready);
+    assert!(
+        local_runtime
+            .coordination
+            .as_ref()
+            .and_then(|coordination| coordination.metadata_revision)
+            .is_some_and(|revision| revision > 0)
+    );
+    assert_eq!(
+        local_runtime
+            .coordination
+            .as_ref()
+            .and_then(|coordination| coordination.watch_lag),
+        Some(0)
+    );
     assert_eq!(placement.collection_id, descriptor.collection_id);
     assert_eq!(placement.assigned_node, "node-a");
     assert_eq!(placement.owner_node.as_deref(), Some("node-a"));
     assert_eq!(placement.ownership_epoch, Some(1));
+    assert!(
+        placement
+            .metadata_revision
+            .is_some_and(|revision| revision > 0)
+    );
     assert_eq!(placement.route_kind, "recorded");
     assert!(!runtime.control_plane_ready);
     assert!(runtime.data_plane_ready);
@@ -117,11 +136,115 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(runtime.collections[0].assigned_node, "node-a");
     assert_eq!(runtime.collections[0].owner_node.as_deref(), Some("node-a"));
     assert_eq!(runtime.collections[0].ownership_epoch, Some(1));
+    assert!(
+        runtime.collections[0]
+            .metadata_revision
+            .is_some_and(|revision| revision > 0)
+    );
+    assert!(
+        runtime
+            .coordination
+            .as_ref()
+            .and_then(|coordination| coordination.metadata_revision)
+            .is_some_and(|revision| revision > 0)
+    );
+    assert_eq!(
+        runtime
+            .coordination
+            .as_ref()
+            .and_then(|coordination| coordination.watch_lag),
+        Some(0)
+    );
     assert_eq!(runtime.collections[0].route_kind, "recorded");
     assert!(matches!(
         stats_error,
         ServiceError::InvalidArgument(message) if message.contains("not locally served")
     ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_metadata_backend_surfaces_replica_targets_from_replication_factor() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("replica-targets");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-replica-targets";
+
+    let state_a = Arc::new(AppState::new(test_config(
+        "node-a",
+        unique_temp_dir("etcd-replica-targets-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let state_b = Arc::new(AppState::new(test_config(
+        "node-b",
+        unique_temp_dir("etcd-replica-targets-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+
+    wait_for_runtime_status(&state_a, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+    wait_for_runtime_status(&state_b, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+
+    let leader_name = state_a
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load after membership stabilizes")
+        .coordination
+        .and_then(|coordination| coordination.leader_node)
+        .expect("one node should be elected leader");
+    let (leader, replica, replica_node_id) = if leader_name == "node-a" {
+        (&state_a, &state_b, "node-b")
+    } else {
+        (&state_b, &state_a, "node-a")
+    };
+
+    leader
+        .control
+        .create_collection(
+            CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+                .with_replication_factor(2),
+        )
+        .await
+        .expect("collection should be created with replication factor 2");
+
+    let leader_placement = leader
+        .control
+        .collection_placement("documents")
+        .await
+        .expect("owner placement should load");
+    let replica_placement = replica
+        .control
+        .collection_placement("documents")
+        .await
+        .expect("replica placement should load");
+
+    assert_eq!(
+        leader_placement.owner_node.as_deref(),
+        Some(leader_name.as_str())
+    );
+    assert_eq!(leader_placement.replicas.len(), 1);
+    assert_eq!(leader_placement.replicas[0].node_id, replica_node_id);
+    assert_eq!(leader_placement.replicas[0].node_role, NodeRole::Combined);
+    assert_eq!(leader_placement.replicas[0].state, "unknown");
+
+    assert_eq!(replica_placement.replicas.len(), 1);
+    assert_eq!(replica_placement.replicas[0].node_id, replica_node_id);
+    assert_eq!(replica_placement.replicas[0].state, "absent");
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -1358,6 +1481,258 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
 }
 
 #[tokio::test]
+async fn etcd_public_drain_fences_local_serving_until_undrain() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("public-drain-fence");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-public-drain";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-public-drain-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    owner_config.node_role = NodeRole::Combined;
+    let owner = Arc::new(AppState::new(owner_config));
+    wait_for_runtime_status(&owner, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.is_local_leader)
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created before draining");
+    owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("owner should accept writes before draining");
+
+    let drained = owner
+        .control
+        .drain_node("owner-a")
+        .await
+        .expect("leader should be able to drain the local node");
+    wait_for_runtime_status(&owner, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_state.as_deref() == Some("draining")
+                && !status.control_plane_ready
+                && !status.data_plane_ready
+        })
+    })
+    .await;
+
+    let drained_write = owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect_err("drained owner must reject writes");
+    let drained_stats = owner
+        .stats("documents")
+        .await
+        .expect_err("drained owner must reject reads");
+
+    assert_eq!(drained.node_id, "owner-a");
+    assert_eq!(drained.state, "draining");
+    assert!(
+        matches!(drained_write, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        "drained owners must stop serving writes: {drained_write:?}"
+    );
+    assert!(
+        matches!(drained_stats, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        "drained owners must stop serving reads: {drained_stats:?}"
+    );
+
+    let ready = owner
+        .control
+        .undrain_node("owner-a")
+        .await
+        .expect("leader should be able to restore local readiness");
+    wait_for_runtime_status(&owner, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_state.as_deref() == Some("ready")
+                && status.control_plane_ready
+                && status.data_plane_ready
+        })
+    })
+    .await;
+
+    let recovered_ack = owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("gamma"),
+                vector: vec![0.5, 0.5],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("undrained owner should resume serving writes");
+
+    assert_eq!(ready.state, "ready");
+    assert_eq!(recovered_ack.last_seq_no, 2);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_public_promotion_updates_assignment_and_owner() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("public-promotion-api");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-public-promotion";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-public-promotion-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    owner_config.node_role = NodeRole::Combined;
+    let owner = Arc::new(AppState::new(owner_config.clone()));
+    wait_for_runtime_status(&owner, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members == vec!["owner-a".to_owned()]
+        })
+    })
+    .await;
+
+    let mut follower_config = test_config(
+        "owner-b",
+        unique_temp_dir("etcd-public-promotion-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    let follower = Arc::new(AppState::new(follower_config.clone()));
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.leader_node.as_deref() == Some("owner-a")
+        })
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(
+            CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+                .with_replication_factor(2),
+        )
+        .await
+        .expect("collection should be created before public promotion");
+    owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("owner should accept writes before public promotion");
+
+    let descriptor = owner
+        .get_collection("documents")
+        .await
+        .expect("owner descriptor should load before public promotion");
+    mirror_collection_state(
+        &owner_config.storage_root,
+        &follower_config.storage_root,
+        &descriptor.root_path,
+    );
+
+    let placement = owner
+        .control
+        .promote_collection_owner("documents", "owner-b")
+        .await
+        .expect("public promotion API should succeed");
+    let follower_ack = follower
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("promoted owner should accept writes after public promotion");
+    let owner_error = owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("gamma"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect_err("demoted owner must reject writes after public promotion");
+    let owner_status = wait_for_runtime_status(&owner, |status| {
+        status.collections.iter().any(|collection| {
+            collection.collection_name == "documents"
+                && collection.owner_node.as_deref() == Some("owner-b")
+                && collection.failover_reason.as_deref()
+                    == Some("manual promotion to node 'owner-b' from node 'owner-a'")
+        })
+    })
+    .await;
+    let owner_status_placement = owner_status
+        .collections
+        .iter()
+        .find(|collection| collection.collection_name == "documents")
+        .expect("promoted placement should appear in owner status");
+
+    assert_eq!(placement.assigned_node, "owner-b");
+    assert_eq!(placement.owner_node.as_deref(), Some("owner-b"));
+    assert_eq!(placement.ownership_epoch, Some(2));
+    assert_eq!(placement.replicas.len(), 1);
+    assert_eq!(placement.replicas[0].node_id, "owner-a");
+    assert_eq!(placement.replicas[0].state, "ready");
+    assert_eq!(
+        owner_status_placement.failover_reason.as_deref(),
+        Some("manual promotion to node 'owner-b' from node 'owner-a'")
+    );
+    assert_eq!(placement.route_kind, "recorded");
+    assert_eq!(follower_ack.last_seq_no, 2);
+    assert!(
+        matches!(owner_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        "public promotion should fence the old owner: {owner_error:?}"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
     let endpoints = test_etcd_endpoints();
     let key_prefix = unique_etcd_prefix("missing-owner-read-fence");
@@ -1434,6 +1809,137 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
         matches!(stats_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
         "missing owner metadata should fence reads until reconciliation: {stats_error:?}"
     );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_owner_loss_auto_promotes_local_leader_with_materialized_replica() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("auto-owner-failover");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-auto-owner-failover";
+
+    let mut owner_config = test_config(
+        "owner-a",
+        unique_temp_dir("etcd-auto-owner-failover-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    owner_config.node_role = NodeRole::Combined;
+    owner_config.metadata.etcd.membership_ttl_secs = 3;
+    owner_config.metadata.etcd.leadership_ttl_secs = 3;
+    let owner = Arc::new(AppState::new(owner_config.clone()));
+    wait_for_runtime_status(&owner, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members == vec!["owner-a".to_owned()]
+        })
+    })
+    .await;
+
+    let mut follower_config = test_config(
+        "owner-b",
+        unique_temp_dir("etcd-auto-owner-failover-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    follower_config.node_role = NodeRole::Combined;
+    follower_config.metadata.etcd.membership_ttl_secs = 3;
+    follower_config.metadata.etcd.leadership_ttl_secs = 3;
+    let follower = Arc::new(AppState::new(follower_config.clone()));
+
+    wait_for_runtime_status(&owner, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.registered_members.len() == 2
+        })
+    })
+    .await;
+
+    owner
+        .control
+        .create_collection(
+            CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+                .with_replication_factor(2),
+        )
+        .await
+        .expect("collection should be created before owner loss");
+    let write_ack = owner
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("alpha"),
+                vector: vec![1.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
+        .await
+        .expect("owner should accept writes before failover");
+    let descriptor = owner
+        .get_collection("documents")
+        .await
+        .expect("owner descriptor should be readable before failover");
+
+    mirror_collection_state(
+        owner_config.storage_root.as_path(),
+        follower_config.storage_root.as_path(),
+        &descriptor.root_path,
+    );
+
+    drop(owner);
+
+    let promoted = wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("owner-b")
+        }) && status.collections.iter().any(|placement| {
+            placement.collection_name == "documents"
+                && placement.owner_node.as_deref() == Some("owner-b")
+                && placement.ownership_epoch == Some(2)
+        })
+    })
+    .await;
+
+    follower
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"kind":"post-failover"}),
+            })],
+        )
+        .await
+        .expect("promoted leader should accept writes after automatic failover");
+
+    let promoted_placement = promoted
+        .collections
+        .iter()
+        .find(|placement| placement.collection_name == "documents")
+        .expect("promoted placement should be visible");
+    assert_eq!(promoted_placement.assigned_node, "owner-b");
+    assert_eq!(promoted_placement.owner_node.as_deref(), Some("owner-b"));
+    assert_eq!(promoted_placement.ownership_epoch, Some(2));
+    assert!(promoted_placement.replicas.is_empty());
+    assert_eq!(
+        promoted_placement.failover_reason.as_deref(),
+        Some("automatic self-promotion on node 'owner-b' after owner 'owner-a' lost readiness")
+    );
+    assert_eq!(write_ack.snapshot.manifest_generation, 0);
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }

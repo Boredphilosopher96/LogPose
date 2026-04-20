@@ -3,11 +3,13 @@
 use logpose_api_grpc::proto::{
     self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
     CoordinationStatusReply, CreateCollectionRequest as ProtoCreateCollectionRequest,
-    FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
+    DrainNodeRequest, FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
     GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataRequest,
-    GetRuntimeStatusRequest, InspectCollectionRequest, ListDatabasesRequest,
-    MaintenanceBacklogReply, PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest,
-    ScalarValue, WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
+    GetNodeMembershipRequest, GetRuntimeStatusRequest, InspectCollectionRequest,
+    ListDatabasesRequest, MaintenanceBacklogReply, NodeMembershipStatusReply,
+    PromoteCollectionOwnerRequest, PutDatabasePolicyRequest, PutDatabaseRequest,
+    QueryCollectionRequest, RebalanceCollectionRequest, ReplicaPlacementReply, ScalarValue,
+    UndrainNodeRequest, WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
 };
 use logpose_auth::{AuthenticationMode, DatabaseRole};
 pub use logpose_auth::{DatabaseAccessPolicy, DatabaseRoleBinding};
@@ -25,8 +27,9 @@ pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget}
 use logpose_types::{
     CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
     CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog,
-    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
-    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    MaintenanceStatus, NodeMembershipStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
+    QueryUnitStats, RecordId, RemoteBlobConfig, ReplicaPlacement, ScalarFieldStats, Snapshot,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -196,6 +199,45 @@ impl LogPoseClient {
         runtime_status_from_proto(response)
     }
 
+    /// Fetch one node membership status from the control plane.
+    pub async fn node_membership(&self, node_name: &str) -> Result<NodeMembershipStatus> {
+        let response = self
+            .inner
+            .clone()
+            .get_node_membership(Request::new(GetNodeMembershipRequest {
+                node_name: node_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        node_membership_from_proto(response)
+    }
+
+    /// Mark one node as draining.
+    pub async fn drain_node(&self, node_name: &str) -> Result<NodeMembershipStatus> {
+        let response = self
+            .inner
+            .clone()
+            .drain_node(Request::new(DrainNodeRequest {
+                node_name: node_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        node_membership_from_proto(response)
+    }
+
+    /// Restore one node to the ready serving state.
+    pub async fn undrain_node(&self, node_name: &str) -> Result<NodeMembershipStatus> {
+        let response = self
+            .inner
+            .clone()
+            .undrain_node(Request::new(UndrainNodeRequest {
+                node_name: node_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        node_membership_from_proto(response)
+    }
+
     /// Create or replace one database descriptor.
     pub async fn set_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
         let response = self
@@ -250,6 +292,7 @@ impl LogPoseClient {
                 dimensions: request.dimensions as u64,
                 metric: proto_metric(request.metric) as i32,
                 database_name: request.database_name,
+                replication_factor: request.replication_factor as u64,
             }))
             .await?
             .into_inner();
@@ -275,6 +318,68 @@ impl LogPoseClient {
             .get_collection_placement(Request::new(GetCollectionPlacementRequest {
                 collection_name: collection_name.to_owned(),
                 database_name: database_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        collection_placement_from_proto(response)
+    }
+
+    /// Promote one collection owner to a specific node.
+    pub async fn promote_collection_owner(
+        &self,
+        collection_name: &str,
+        node_name: &str,
+    ) -> Result<CollectionPlacement> {
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
+        self.promote_collection_owner_in_database(&database_name, &collection_name, node_name)
+            .await
+    }
+
+    /// Promote one collection owner in an explicit database.
+    pub async fn promote_collection_owner_in_database(
+        &self,
+        database_name: &str,
+        collection_name: &str,
+        node_name: &str,
+    ) -> Result<CollectionPlacement> {
+        let response = self
+            .inner
+            .clone()
+            .promote_collection_owner(Request::new(PromoteCollectionOwnerRequest {
+                collection_name: collection_name.to_owned(),
+                database_name: database_name.to_owned(),
+                node_name: node_name.to_owned(),
+            }))
+            .await?
+            .into_inner();
+        collection_placement_from_proto(response)
+    }
+
+    /// Rebalance one collection to a ready peer.
+    pub async fn rebalance_collection(
+        &self,
+        collection_name: &str,
+        target_node_name: Option<&str>,
+    ) -> Result<CollectionPlacement> {
+        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
+        self.rebalance_collection_in_database(&database_name, &collection_name, target_node_name)
+            .await
+    }
+
+    /// Rebalance one collection in an explicit database.
+    pub async fn rebalance_collection_in_database(
+        &self,
+        database_name: &str,
+        collection_name: &str,
+        target_node_name: Option<&str>,
+    ) -> Result<CollectionPlacement> {
+        let response = self
+            .inner
+            .clone()
+            .rebalance_collection(Request::new(RebalanceCollectionRequest {
+                collection_name: collection_name.to_owned(),
+                database_name: database_name.to_owned(),
+                target_node_name: target_node_name.map(ToOwned::to_owned),
             }))
             .await?
             .into_inner();
@@ -686,6 +791,7 @@ fn collection_descriptor_from_proto(
         name: reply.name,
         dimensions: reply.dimensions as usize,
         metric: metric_from_proto(reply.metric)?,
+        replication_factor: normalize_replication_factor(reply.replication_factor),
         root_path: reply.root_path.into(),
         remote_blob: reply.remote_blob.map(|remote| RemoteBlobConfig {
             endpoint: remote.endpoint,
@@ -696,6 +802,14 @@ fn collection_descriptor_from_proto(
         flush_threshold_bytes: reply.flush_threshold_bytes as usize,
         compaction_threshold_segments: reply.compaction_threshold_segments as usize,
     })
+}
+
+fn normalize_replication_factor(replication_factor: u64) -> usize {
+    if replication_factor == 0 {
+        1
+    } else {
+        replication_factor as usize
+    }
 }
 
 fn database_policy_to_proto(policy: DatabaseAccessPolicy) -> proto::DatabaseAccessPolicyReply {
@@ -789,15 +903,26 @@ fn runtime_status_from_proto(reply: proto::GetRuntimeStatusReply) -> Result<Node
     })
 }
 
+fn node_membership_from_proto(reply: NodeMembershipStatusReply) -> Result<NodeMembershipStatus> {
+    Ok(NodeMembershipStatus {
+        node_id: reply.node_id,
+        node_role: node_role_from_proto(reply.node_role)?,
+        state: reply.state,
+    })
+}
+
 fn coordination_status_from_proto(reply: CoordinationStatusReply) -> Result<CoordinationStatus> {
     Ok(CoordinationStatus {
         cluster_name: reply.cluster_name,
         membership_registered: reply.membership_registered,
+        membership_state: reply.membership_state,
         membership_lease_id: reply.membership_lease_id,
         registered_members: reply.registered_members,
         leader_node: reply.leader_node,
         is_local_leader: reply.is_local_leader,
         leadership_lease_id: reply.leadership_lease_id,
+        metadata_revision: reply.metadata_revision,
+        watch_lag: reply.watch_lag,
         last_error: reply.last_error,
     })
 }
@@ -811,8 +936,23 @@ fn collection_placement_from_proto(reply: CollectionPlacementReply) -> Result<Co
         assigned_role: node_role_from_proto(reply.assigned_role)?,
         owner_node: reply.owner_node,
         ownership_epoch: reply.ownership_epoch,
+        replicas: reply
+            .replicas
+            .into_iter()
+            .map(replica_placement_from_proto)
+            .collect::<Result<Vec<_>>>()?,
+        failover_reason: reply.failover_reason,
+        metadata_revision: reply.metadata_revision,
         route_kind: reply.route_kind,
         route_reason: reply.route_reason,
+    })
+}
+
+fn replica_placement_from_proto(reply: ReplicaPlacementReply) -> Result<ReplicaPlacement> {
+    Ok(ReplicaPlacement {
+        node_id: reply.node_id,
+        node_role: node_role_from_proto(reply.node_role)?,
+        state: reply.state,
     })
 }
 
@@ -1361,6 +1501,47 @@ mod tests {
     }
 
     #[test]
+    fn collection_descriptor_from_proto_reads_replication_factor() {
+        let descriptor = collection_descriptor_from_proto(proto::CollectionDescriptorReply {
+            collection_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: proto::DistanceMetric::Dot as i32,
+            root_path: "/tmp/documents".to_owned(),
+            flush_threshold_ops: 10,
+            flush_threshold_bytes: 20,
+            compaction_threshold_segments: 3,
+            remote_blob: None,
+            replication_factor: 3,
+        })
+        .expect("descriptor should decode");
+
+        assert_eq!(descriptor.database_name, "analytics");
+        assert_eq!(descriptor.replication_factor, 3);
+    }
+
+    #[test]
+    fn collection_descriptor_from_proto_defaults_replication_factor_to_one() {
+        let descriptor = collection_descriptor_from_proto(proto::CollectionDescriptorReply {
+            collection_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            database_name: "analytics".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: proto::DistanceMetric::Dot as i32,
+            root_path: "/tmp/documents".to_owned(),
+            flush_threshold_ops: 10,
+            flush_threshold_bytes: 20,
+            compaction_threshold_segments: 3,
+            remote_blob: None,
+            replication_factor: 0,
+        })
+        .expect("descriptor should decode");
+
+        assert_eq!(descriptor.replication_factor, 1);
+    }
+
+    #[test]
     fn runtime_status_from_proto_reads_coordination_fields() {
         let status = runtime_status_from_proto(proto::GetRuntimeStatusReply {
             metadata: Some(proto::GetMetadataReply {
@@ -1381,11 +1562,14 @@ mod tests {
             coordination: Some(proto::CoordinationStatusReply {
                 cluster_name: "prod-cluster".to_owned(),
                 membership_registered: true,
+                membership_state: Some("ready".to_owned()),
                 membership_lease_id: Some(17),
                 registered_members: vec!["client-node".to_owned(), "client-peer".to_owned()],
                 leader_node: Some("client-node".to_owned()),
                 is_local_leader: true,
                 leadership_lease_id: Some(23),
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
                 last_error: Some("warn".to_owned()),
             }),
             maintenance: Some(proto::MaintenanceBacklogReply {
@@ -1403,6 +1587,8 @@ mod tests {
         assert_eq!(coordination.cluster_name, "prod-cluster");
         assert_eq!(coordination.membership_lease_id, Some(17));
         assert_eq!(coordination.leadership_lease_id, Some(23));
+        assert_eq!(coordination.metadata_revision, Some(42));
+        assert_eq!(coordination.watch_lag, Some(0));
         assert_eq!(coordination.leader_node.as_deref(), Some("client-node"));
         assert_eq!(
             coordination.registered_members,
@@ -1422,6 +1608,13 @@ mod tests {
             assigned_role: proto::NodeRole::Data as i32,
             owner_node: Some("owner-b".to_owned()),
             ownership_epoch: Some(2),
+            metadata_revision: Some(42),
+            replicas: vec![proto::ReplicaPlacementReply {
+                node_id: "replica-a".to_owned(),
+                node_role: proto::NodeRole::Combined as i32,
+                state: "unknown".to_owned(),
+            }],
+            failover_reason: Some("automatic self-promotion".to_owned()),
             route_kind: "recorded".to_owned(),
             route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
         })
@@ -1429,5 +1622,13 @@ mod tests {
 
         assert_eq!(placement.owner_node.as_deref(), Some("owner-b"));
         assert_eq!(placement.ownership_epoch, Some(2));
+        assert_eq!(placement.metadata_revision, Some(42));
+        assert_eq!(placement.replicas.len(), 1);
+        assert_eq!(placement.replicas[0].node_id, "replica-a");
+        assert_eq!(placement.replicas[0].state, "unknown");
+        assert_eq!(
+            placement.failover_reason.as_deref(),
+            Some("automatic self-promotion")
+        );
     }
 }

@@ -13,6 +13,10 @@ The original phase roadmap is complete. LogPose already has:
 - local filesystem durability with WAL, manifests, immutable segments, and maintenance recovery
 - planner-led exact, ANN, and hybrid query execution
 - operator-visible runtime status, placement diagnostics, stats, and inspect surfaces
+- [multi-cluster metadata and consistency](./future-milestones/multicluster-metadata-and-consistency.md):
+  authoritative etcd-backed descriptors and assignments, membership leases,
+  controller fencing, public drain, promote, and rebalance controls,
+  replica-aware placement diagnostics, and the seeded Podman chaos gate
 - layered integration, randomized, process-boundary, and deterministic service-boundary testing
 
 What remains is the next layer of system work: turning those local contracts into resilient multi-node behavior, broadening the vector operator family, deepening the testing model, and adding the missing product surfaces around storage and operations.
@@ -21,7 +25,6 @@ What remains is the next layer of system work: turning those local contracts int
 
 | Milestone | Program Shift | Primary Outcome | Testing Shift | Details |
 | --- | --- | --- | --- | --- |
-| Multi-Cluster Metadata and Consistency | Move from local placement metadata to an authoritative distributed control plane | etcd-backed membership, controller elections, shard or replica ownership, failover, resilience, and explicit consistency modes | Multi-process metadata tests, lease loss, election handoff, failover simulation, and fault-injection around metadata outages | [Details](./future-milestones/multicluster-metadata-and-consistency.md) |
 | Additional Vector Index Families | Move from one ANN family to planner-selected index families | IVF-based and compression-aware operators alongside HNSW, with better workload fit and richer explain surfaces | Exact-oracle validation, filtered-selectivity regressions, codec corruption tests, and family-specific benchmarks | [Details](./future-milestones/additional-vector-index-families.md) |
 | Full-System Simulation | Move from local and service-boundary harnesses to deterministic system simulation | TigerBeetle-style seeded simulation with virtual time, network and crash faults, replayability, safety checks, and liveness checks | Multi-node simulator campaigns, replayable failures, and healthy-core convergence testing in CI | [Details](./future-milestones/full-system-simulation.md) |
 | Web GUI | Move from CLI plus raw API surfaces to a real operator and developer console | Browser-based runtime, collection, query, inspect, and maintenance workflows | Browser end-to-end coverage plus API contract tests for all UI-backed operations | [Details](./future-milestones/web-gui.md) |
@@ -35,7 +38,7 @@ The remaining work should still follow a few fixed rules:
 1. Metadata authority must come before real multi-node serving.
 2. New vector indexes must fit the planner model instead of bypassing it.
 3. Object storage and multi-cluster work should share one immutable-artifact contract rather than inventing competing durability paths.
-4. Simulation should deepen before chaos-style experimentation becomes the default systems test.
+4. Seeded Podman chaos is now the local control-plane gate, and the later simulation milestone should deepen that into deterministic whole-system replay.
 5. Operator ergonomics, auth, and observability must grow with the runtime instead of arriving after it.
 
 ## Additional Gaps Folded Into These Milestones

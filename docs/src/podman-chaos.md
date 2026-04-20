@@ -14,19 +14,19 @@ The current repo truth for the local chaos flow is:
 
 - `deploy/Dockerfile` builds the container image used for the local lab
 - `scripts/podman-chaos.sh` is the checked-in wrapper for bootstrap, status,
-  failure injection, and teardown
+  failure injection, campaign replay, and teardown
 - `scripts/check-chaos.sh` is the repo-owned verification entrypoint for the
   shell harness contract
 - `crates/logpose-storage-etcd/examples/etcd_coordination_admin.rs` is the
-  operator-facing helper for membership, leader, and shard-owner inspection or
-  promotion
+  low-level helper for membership, leader, and shard-owner inspection or
+  direct metadata mutation
 - `crates/logpose-core/tests/etcd_metadata.rs` remains the authoritative
   in-repo safety coverage for lease loss, leadership handoff, ownership
   fencing, and fail-closed read barriers after promotion
 
-There is still no public REST, gRPC, or CLI API for shard promotion. Local
-failover drills that move ownership must use the etcd helper instead of a
-server endpoint.
+Public REST, gRPC, and CLI APIs now exist for drain, undrain, promote, and
+rebalance workflows. The etcd helper is still useful when you want raw
+metadata inspection or a direct low-level promotion primitive during debugging.
 
 `scripts/check-chaos.sh` fixes the wrapper contract around these commands:
 
@@ -39,7 +39,12 @@ server endpoint.
 - `reset [--cluster <name>]`
 - `status [--cluster <name>] [collection]`
 - `scenario <name> [--cluster <name>]`
+- `campaign [--cluster <name>] [--seed <u64>]`
 - `self-test`
+
+Without `--integration`, `scripts/check-chaos.sh` validates only the checked
+wrapper contract. The seeded multi-node campaign gate runs only through the
+`--integration` path.
 
 The checked node set is `node-a`, `node-b`, and `node-c`.
 
@@ -151,6 +156,15 @@ By default the wrapper writes cluster state under
     etcd-1/
     etcd-2/
     etcd-3/
+  campaigns/
+    seed-<u64>/
+      replay.json
+      scenario-sequence.txt
+      steps.tsv
+      steps/
+        01-smoke/
+          stdout.log
+          stderr.log
   tmp/
 ```
 
@@ -161,6 +175,8 @@ Operator rules:
 - never share a `storage_root` across two nodes
 - `bootstrap` deletes and recreates the selected cluster state directory before
   starting a fresh lab for that cluster name
+- `campaign` keeps its replay artifacts under `campaigns/seed-<u64>/` even
+  though each scenario still bootstraps a clean cluster for itself
 - authoritative coordination keys live under
   `<key_prefix>/clusters/<cluster_name>/...`
 - enabling etcd-backed metadata does not remove local storage; WAL, manifests,
@@ -168,7 +184,8 @@ Operator rules:
   `storage_root`
 - if you expect a promoted owner to serve local reads or writes immediately,
   mirror the collection's local state into that node's `storage_root` before
-  the ownership move
+  the ownership move; the current automatic failover path only promotes a
+  desired replica that already has materialized local state
 
 Optional overrides:
 
@@ -215,7 +232,11 @@ Run the checked harness contract:
 ```bash
 ./scripts/check-chaos.sh
 ./scripts/check-chaos.sh --integration --cluster pr4-chaos
+./scripts/check-chaos.sh --integration --cluster pr4-chaos --seed 18446744073709551615
 ```
+
+The integration form runs the seeded campaign gate and leaves the cluster
+state directory in place so the replay bundle is still available afterward.
 
 Run named scenarios directly:
 
@@ -225,6 +246,22 @@ Run named scenarios directly:
 ./scripts/podman-chaos.sh scenario partition-heal --cluster pr4-chaos
 ```
 
+Run a seeded campaign and keep the replay bundle:
+
+```bash
+./scripts/podman-chaos.sh campaign --cluster pr4-chaos
+./scripts/podman-chaos.sh campaign --cluster pr4-chaos --seed 18446744073709551615
+```
+
+If you omit `--seed`, the wrapper generates one, prints it clearly, and saves
+the resolved seed in `campaigns/seed-<u64>/replay.json`. That manifest also
+records the scenario order and the per-step stdout/stderr artifact paths. Use
+the stored seed to replay the exact schedule:
+
+```bash
+./scripts/podman-chaos.sh campaign --cluster pr4-chaos --seed <seed-from-replay.json>
+```
+
 Tear down or fully reset the lab:
 
 ```bash
@@ -232,8 +269,9 @@ Tear down or fully reset the lab:
 ./scripts/podman-chaos.sh reset --cluster pr4-chaos
 ```
 
-Because ownership promotion is not exposed as a public server API, use the
-checked-in etcd helper for ownership inspection or promotion drills:
+The public operator path now includes `logpose-cli collection promote` and
+`logpose-cli collection rebalance`. Use the checked-in etcd helper when you
+want raw metadata inspection or a direct low-level promotion drill:
 
 ```bash
 LOGPOSE_ETCD_ENDPOINTS=http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379 \
@@ -291,26 +329,30 @@ Required invariants:
 
 ### `owner-failover`
 
-Use `owner-failover` to validate explicit ownership promotion after the current
-owner disappears.
+Use `owner-failover` to validate automatic ownership promotion after the
+current owner disappears.
 
 Required invariants:
 
 - the old owner can be stopped while a write is in flight
 - shard ownership is promoted through etcd compare-and-swap, not blind update
+- promotion happens only after a desired replica already has mirrored local
+  state and the surviving leader observes the owner as lost
 - post-promotion read barriers fail closed until replica freshness metadata
   exists
 
 ### `leader-failover`
 
-Use `leader-failover` for a combined-node control-plane handoff with an
-explicit owner promotion.
+Use `leader-failover` for a combined-node control-plane handoff with automatic
+owner promotion on the new leader.
 
 Required invariants:
 
 - the stopped node disappears from visible membership
 - a surviving combined node becomes the promoted owner
 - new writes succeed on the promoted owner after local state is mirrored
+- the scenario proves promotion-on-preseeded-state, not background replica
+  catch-up
 
 ### `lagging-node-rejoin`
 
@@ -345,12 +387,13 @@ Required invariants:
 
 ## Ownership Promotion Drill
 
-The helper-driven ownership promotion drill remains separate from the normal
-REST, gRPC, and CLI operator path.
+The low-level helper-driven ownership promotion drill remains useful even
+though normal REST, gRPC, and CLI operator paths now exist.
 
 Required invariants:
 
-- there is still no public server API for shard promotion
+- public server APIs exist for promotion, but the helper is still available for
+  raw metadata inspection and direct low-level mutation
 - promotion is compare-and-swap based, so stale promotions must conflict
 - after promotion, the old owner must reject reads and writes as not locally
   served

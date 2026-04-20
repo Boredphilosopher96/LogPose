@@ -14,7 +14,8 @@ use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, Scalar
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Snapshot, WriteOperation,
+    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, NodeMembershipStatus, Snapshot,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -27,6 +28,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/v1/metadata", get(metadata))
         .route("/v1/runtime/status", get(runtime_status))
+        .route("/v1/runtime/nodes/{name}", get(get_node_membership))
+        .route("/v1/runtime/nodes/{name}/drain", post(drain_node))
+        .route("/v1/runtime/nodes/{name}/undrain", post(undrain_node))
         .route("/v1/databases", get(list_databases))
         .route("/v1/databases/{name}", get(get_database).put(put_database))
         .route("/v1/collections", post(create_collection))
@@ -38,6 +42,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/collections/{name}/placement",
             get(get_collection_placement),
+        )
+        .route(
+            "/v1/collections/{name}/promote",
+            post(promote_collection_owner),
+        )
+        .route(
+            "/v1/collections/{name}/rebalance",
+            post(rebalance_collection),
         )
         .route("/v1/collections/{name}/writes", post(write_collection))
         .route("/v1/collections/{name}/query", post(query_collection))
@@ -90,6 +102,35 @@ async fn runtime_status(
     Ok(Json(state.runtime_status_with_auth(&auth).await?))
 }
 
+async fn get_node_membership(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(
+        state.node_membership_status_with_auth(&auth, &name).await?,
+    ))
+}
+
+async fn drain_node(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.drain_node_with_auth(&auth, &name).await?))
+}
+
+async fn undrain_node(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.undrain_node_with_auth(&auth, &name).await?))
+}
+
 async fn put_database(
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -132,7 +173,8 @@ async fn create_collection(
                 request.name,
                 request.dimensions,
                 request.metric,
-            ),
+            )
+            .with_replication_factor(request.replication_factor),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(descriptor)))
@@ -190,6 +232,44 @@ async fn get_collection_placement(
     Ok(Json(
         state
             .collection_placement_with_auth(&auth, &collection_lookup_key(&collection))
+            .await?,
+    ))
+}
+
+async fn promote_collection_owner(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PromoteCollectionOwnerBody>,
+) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let collection = CollectionRef::new(default_database_if_blank(request.database_name), name);
+    Ok(Json(
+        state
+            .promote_collection_owner_with_auth(
+                &auth,
+                &collection_lookup_key(&collection),
+                &request.node_name,
+            )
+            .await?,
+    ))
+}
+
+async fn rebalance_collection(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RebalanceCollectionBody>,
+) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let collection = CollectionRef::new(default_database_if_blank(request.database_name), name);
+    Ok(Json(
+        state
+            .rebalance_collection_with_auth(
+                &auth,
+                &collection_lookup_key(&collection),
+                request.target_node_name.as_deref(),
+            )
             .await?,
     ))
 }
@@ -347,6 +427,22 @@ struct CreateCollectionBody {
     name: String,
     dimensions: usize,
     metric: DistanceMetric,
+    #[serde(default = "default_replication_factor")]
+    replication_factor: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteCollectionOwnerBody {
+    #[serde(default = "default_database_name")]
+    database_name: String,
+    node_name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RebalanceCollectionBody {
+    #[serde(default = "default_database_name")]
+    database_name: String,
+    target_node_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +497,10 @@ fn validate_policy_scope(
         ))));
     }
     Ok(())
+}
+
+fn default_replication_factor() -> usize {
+    1
 }
 
 fn validate_database_scope(
@@ -1550,11 +1650,14 @@ mod tests {
             coordination: Some(logpose_types::CoordinationStatus {
                 cluster_name: "prod-cluster".to_owned(),
                 membership_registered: true,
+                membership_state: Some("ready".to_owned()),
                 membership_lease_id: Some(17),
                 registered_members: vec!["rest-node".to_owned(), "rest-peer".to_owned()],
                 leader_node: Some("rest-node".to_owned()),
                 is_local_leader: true,
                 leadership_lease_id: Some(23),
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
                 last_error: Some("warn".to_owned()),
             }),
             maintenance: logpose_types::MaintenanceBacklog::default(),
@@ -1564,6 +1667,8 @@ mod tests {
         assert_eq!(payload["coordination"]["cluster_name"], "prod-cluster");
         assert_eq!(payload["coordination"]["membership_lease_id"], 17);
         assert_eq!(payload["coordination"]["leadership_lease_id"], 23);
+        assert_eq!(payload["coordination"]["metadata_revision"], 42);
+        assert_eq!(payload["coordination"]["watch_lag"], 0);
         assert_eq!(payload["coordination"]["leader_node"], "rest-node");
         assert_eq!(
             payload["coordination"]["registered_members"],
@@ -1615,6 +1720,13 @@ mod tests {
             assigned_role: logpose_types::NodeRole::Data,
             owner_node: Some("owner-b".to_owned()),
             ownership_epoch: Some(2),
+            replicas: vec![logpose_types::ReplicaPlacement {
+                node_id: "replica-a".to_owned(),
+                node_role: logpose_types::NodeRole::Combined,
+                state: "unknown".to_owned(),
+            }],
+            failover_reason: Some("automatic self-promotion".to_owned()),
+            metadata_revision: Some(42),
             route_kind: "recorded".to_owned(),
             route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
         })
@@ -1622,6 +1734,10 @@ mod tests {
 
         assert_eq!(payload["owner_node"], "owner-b");
         assert_eq!(payload["ownership_epoch"], 2);
+        assert_eq!(payload["metadata_revision"], 42);
+        assert_eq!(payload["replicas"][0]["node_id"], "replica-a");
+        assert_eq!(payload["replicas"][0]["state"], "unknown");
+        assert_eq!(payload["failover_reason"], "automatic self-promotion");
     }
 
     #[tokio::test]
@@ -1668,6 +1784,38 @@ mod tests {
         let get_body = json_body(get).await;
         assert_eq!(get_body["database_name"], "analytics");
         assert_eq!(get_body["name"], "documents");
+    }
+
+    #[tokio::test]
+    async fn create_collection_accepts_replication_factor() {
+        let state = Arc::new(AppState::new(test_config("rest-replication-factor")));
+        let app = router(state);
+
+        let create = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "database_name": "analytics",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot",
+                            "replication_factor": 2
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["database_name"], "analytics");
+        assert_eq!(create_body["replication_factor"], 2);
     }
 
     #[tokio::test]

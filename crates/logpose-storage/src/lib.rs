@@ -274,6 +274,8 @@ pub struct CreateCollectionRequest {
     pub dimensions: usize,
     /// Distance metric reserved for future query layers.
     pub metric: DistanceMetric,
+    /// Desired number of replicas recorded in authoritative metadata.
+    pub replication_factor: usize,
 }
 
 impl CreateCollectionRequest {
@@ -296,7 +298,15 @@ impl CreateCollectionRequest {
             name: name.into(),
             dimensions,
             metric,
+            replication_factor: 1,
         }
+    }
+
+    /// Override the desired replica count for the collection.
+    #[must_use]
+    pub fn with_replication_factor(mut self, replication_factor: usize) -> Self {
+        self.replication_factor = replication_factor;
+        self
     }
 
     /// Return the canonical database/collection reference for this request.
@@ -323,6 +333,7 @@ impl CreateCollectionRequest {
             name: self.name,
             dimensions: self.dimensions,
             metric: self.metric,
+            replication_factor: self.replication_factor,
         }
     }
 }
@@ -484,7 +495,8 @@ impl LocalStorageEngine {
             request.dimensions,
             request.metric,
             self.collections_root(),
-        );
+        )
+        .with_replication_factor(request.replication_factor);
         descriptor.validate()?;
         Ok(descriptor)
     }

@@ -36,6 +36,7 @@ Commands:
   status [--cluster <name>] [collection]
   self-test
   scenario <name> [--cluster <name>]
+  campaign [--cluster <name>] [--seed <u64>]
 
 Scenarios:
   smoke
@@ -64,6 +65,14 @@ rebuild_image="${LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE:-0}"
 etcd_image="${LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE:-$etcd_image_default}"
 key_prefix="${LOGPOSE_PODMAN_CHAOS_KEY_PREFIX:-$key_prefix_default}"
 machine_name="${LOGPOSE_PODMAN_MACHINE_NAME:-$machine_name_default}"
+requested_seed=""
+campaign_seed=""
+campaign_artifact_dir=""
+campaign_sequence_file=""
+campaign_steps_file=""
+campaign_manifest_file=""
+preserve_campaign_artifacts=0
+seed_source=""
 
 parse_cluster_flag() {
     local args=()
@@ -73,6 +82,31 @@ parse_cluster_flag() {
             --cluster)
                 shift
                 cluster_name="${1:?--cluster requires a value}"
+                ;;
+            *)
+                args+=("$1")
+                ;;
+        esac
+        shift || true
+    done
+    if ((${#args[@]} > 0)); then
+        remaining_args=("${args[@]}")
+    fi
+}
+
+parse_cluster_and_seed_flags() {
+    local args=()
+    remaining_args=()
+    requested_seed=""
+    while (($# > 0)); do
+        case "$1" in
+            --cluster)
+                shift
+                cluster_name="${1:?--cluster requires a value}"
+                ;;
+            --seed)
+                shift
+                requested_seed="${1:?--seed requires a value}"
                 ;;
             *)
                 args+=("$1")
@@ -495,7 +529,12 @@ bootstrap_cluster() {
     build_host_binaries
     build_server_image
     teardown_cluster
-    rm -rf "$(cluster_state_dir)"
+    if [[ "$preserve_campaign_artifacts" == "1" ]]; then
+        ensure_dir "$(cluster_state_dir)"
+        find "$(cluster_state_dir)" -mindepth 1 -maxdepth 1 ! -name campaigns -exec rm -rf {} +
+    else
+        rm -rf "$(cluster_state_dir)"
+    fi
     ensure_dir "$(cluster_state_dir)"
     start_etcd_cluster
     admin_json wipe-cluster --yes >/dev/null
@@ -844,7 +883,12 @@ reconnect_node() {
 create_collection() {
     local node="$1"
     local collection="$2"
-    cli_json "$node" collection create "$collection" --dimensions 2 --metric dot >/dev/null
+    local replication_factor="${3:-1}"
+    cli_json "$node" collection create "$collection" \
+        --dimensions 2 \
+        --metric dot \
+        --replication-factor "$replication_factor" \
+        >/dev/null
 }
 
 run_write() {
@@ -921,7 +965,7 @@ scenario_smoke() {
     input_file="${batch_dir}/smoke.jsonl"
     output_file="${batch_dir}/smoke-write.json"
     write_batch_file "$input_file" "smoke" 2 1.0 0.0
-    create_collection node-a "$collection"
+    create_collection node-a "$collection" 2
     run_write node-a "$collection" "$input_file" "$output_file"
     local manifest visible stats_payload
     manifest="$(extract_snapshot_arg "$output_file" manifest_generation)"
@@ -955,7 +999,7 @@ scenario_concurrent_writers() {
     out_b="${tmp_dir}/writers-b.json"
     write_batch_file "$input_a" "writer-a" 20 1.0 0.0
     write_batch_file "$input_b" "writer-b" 20 0.0 1.0
-    create_collection node-a "$collection"
+    create_collection node-a "$collection" 2
     run_write node-a "$collection" "$input_a" "$out_a" &
     local pid_a=$!
     run_write node-b "$collection" "$input_b" "$out_b" &
@@ -985,7 +1029,7 @@ scenario_owner_failover() {
     flood_err="${tmp_dir}/owner-flood.err"
     write_batch_file "$seed_input" "seed" 1 1.0 0.0
     write_batch_file "$flood_input" "flood" 5000 0.5 0.5
-    create_collection node-a "$collection"
+    create_collection node-a "$collection" 2
     run_write node-a "$collection" "$seed_input" "$seed_output"
     mirror_collection_root node-a "$collection" node-b
     run_write node-a "$collection" "$flood_input" "$flood_output" 2>"$flood_err" &
@@ -995,7 +1039,8 @@ scenario_owner_failover() {
     if wait "$flood_pid"; then
         die "expected in-flight write to fail when stopping the owner"
     fi
-    admin_json promote-shard-owner "$collection" node-b >/dev/null
+    wait_for_member_absent node-b node-a
+    wait_for_local_leader node-b node-b
     wait_for_owner node-b "$collection" node-b 2
     local manifest visible query_err stats_err query_out stats_out
     manifest="$(extract_snapshot_arg "$seed_output" manifest_generation)"
@@ -1020,14 +1065,13 @@ scenario_leader_failover() {
     seed_input="${tmp_dir}/leader-seed.jsonl"
     seed_output="${tmp_dir}/leader-seed.json"
     write_batch_file "$seed_input" "leader" 2 1.0 0.0
-    create_collection node-a "$collection"
+    create_collection node-a "$collection" 2
     run_write node-a "$collection" "$seed_input" "$seed_output"
     mirror_collection_root node-a "$collection" node-b
     stop_node node-a
     wait_for_member_absent node-b node-a
     wait_for_local_leader node-b node-b
     wait_for_follower_of_leader node-c node-b
-    admin_json promote-shard-owner "$collection" node-b >/dev/null
     wait_for_owner node-b "$collection" node-b 2
     local post_input post_output
     post_input="${tmp_dir}/leader-post.jsonl"
@@ -1083,9 +1127,177 @@ run_named_scenario() {
     esac
 }
 
+generate_campaign_seed() {
+    python3 - <<'PY'
+import secrets
+
+print(secrets.randbits(64))
+PY
+}
+
+validate_campaign_seed() {
+    python3 - "$1" <<'PY'
+import sys
+
+seed = sys.argv[1]
+try:
+    value = int(seed, 10)
+except ValueError:
+    raise SystemExit("campaign seed must be an unsigned integer")
+if value < 0 or value >= 2**64:
+    raise SystemExit("campaign seed must fit in an unsigned 64-bit integer")
+PY
+}
+
+campaign_scenarios() {
+    python3 - "$1" "${scenarios[@]}" <<'PY'
+import random
+import sys
+
+seed = int(sys.argv[1], 10)
+items = sys.argv[2:]
+rng = random.Random(seed)
+rng.shuffle(items)
+for item in items:
+    print(item)
+PY
+}
+
+campaign_artifact_step_dir() {
+    local step_index="$1"
+    local scenario_name="$2"
+    printf '%s/steps/%02d-%s\n' "$campaign_artifact_dir" "$step_index" "$scenario_name"
+}
+
+write_campaign_manifest() {
+    python3 - "$campaign_manifest_file" "$cluster_name" "$campaign_seed" "$campaign_sequence_file" "$campaign_steps_file" "$campaign_artifact_dir" "$seed_source" <<'PY'
+import json
+import pathlib
+import shlex
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+cluster_name = sys.argv[2]
+seed = int(sys.argv[3], 10)
+sequence_path = pathlib.Path(sys.argv[4])
+steps_path = pathlib.Path(sys.argv[5])
+campaign_dir = pathlib.Path(sys.argv[6])
+
+scenario_sequence = [
+    line.strip()
+    for line in sequence_path.read_text().splitlines()
+    if line.strip()
+]
+steps = []
+artifact_paths = [
+    str(manifest_path),
+    str(sequence_path),
+    str(steps_path),
+]
+for line in steps_path.read_text().splitlines():
+    if not line:
+        continue
+    scenario, status, stdout_path, stderr_path = line.split("\t")
+    steps.append({
+        "scenario": scenario,
+        "exit_code": int(status, 10),
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+    })
+    artifact_paths.extend([stdout_path, stderr_path])
+
+payload = {
+    "cluster_name": cluster_name,
+    "cluster_state_dir": str(campaign_dir.parent),
+    "campaign_dir": str(campaign_dir),
+    "seed": seed,
+    "seed_source": sys.argv[7],
+    "requested_seed": None if sys.argv[7] == "generated" else seed,
+    "replay_command": "./scripts/podman-chaos.sh campaign --cluster "
+    + shlex.quote(cluster_name)
+    + " --seed "
+    + shlex.quote(str(seed)),
+    "scenario_sequence": scenario_sequence,
+    "steps": steps,
+    "artifact_paths": artifact_paths,
+}
+manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+run_campaign() {
+    parse_cluster_and_seed_flags "$@"
+    reject_remaining_args
+    local -a campaign_sequence=()
+
+    if [[ -n "$requested_seed" ]]; then
+        validate_campaign_seed "$requested_seed"
+        campaign_seed="$requested_seed"
+        seed_source="provided"
+    else
+        campaign_seed="$(generate_campaign_seed)"
+        seed_source="generated"
+    fi
+
+    campaign_artifact_dir="$(cluster_state_dir)/campaigns/seed-${campaign_seed}"
+    campaign_sequence_file="${campaign_artifact_dir}/scenario-sequence.txt"
+    campaign_steps_file="${campaign_artifact_dir}/steps.tsv"
+    campaign_manifest_file="${campaign_artifact_dir}/replay.json"
+
+    preserve_campaign_artifacts=1
+    rm -rf "$campaign_artifact_dir"
+    ensure_dir "$campaign_artifact_dir/steps"
+
+    if [[ -n "$requested_seed" ]]; then
+        log "campaign seed: ${campaign_seed}"
+    else
+        log "campaign seed not provided; generated seed: ${campaign_seed}"
+    fi
+    log "campaign artifacts: ${campaign_artifact_dir}"
+
+    campaign_sequence=()
+    while IFS= read -r scenario_name; do
+        campaign_sequence+=("$scenario_name")
+    done < <(campaign_scenarios "$campaign_seed")
+    printf '%s\n' "${campaign_sequence[@]}" >"$campaign_sequence_file"
+    : >"$campaign_steps_file"
+
+    local scenario step_index step_dir scenario_stdout scenario_stderr status exit_code
+    exit_code=0
+    step_index=0
+    for scenario in "${campaign_sequence[@]}"; do
+        step_index=$((step_index + 1))
+        step_dir="$(campaign_artifact_step_dir "$step_index" "$scenario")"
+        ensure_dir "$step_dir"
+        scenario_stdout="${step_dir}/stdout.log"
+        scenario_stderr="${step_dir}/stderr.log"
+        log "campaign step ${step_index}/${#campaign_sequence[@]}: ${scenario}"
+        if run_named_scenario "$scenario" >"$scenario_stdout" 2>"$scenario_stderr"; then
+            status=0
+        else
+            status=$?
+            exit_code="$status"
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$scenario" "$status" "$scenario_stdout" "$scenario_stderr" >>"$campaign_steps_file"
+        if ((status != 0)); then
+            break
+        fi
+    done
+
+    write_campaign_manifest
+
+    if ((exit_code != 0)); then
+        log "campaign failed on scenario '${scenario}' with exit code ${exit_code}; replay manifest: ${campaign_manifest_file}"
+        exit "$exit_code"
+    fi
+
+    log "campaign completed successfully; replay manifest: ${campaign_manifest_file}"
+}
+
 self_test() {
     [[ "$(printf '%s\n' "${nodes[@]}" | wc -l | tr -d ' ')" == "3" ]] || die "expected three nodes"
     [[ "$(printf '%s\n' "${scenarios[@]}" | wc -l | tr -d ' ')" == "8" ]] || die "expected eight scenarios"
+    [[ "$(campaign_scenarios 1 | wc -l | tr -d ' ')" == "8" ]] || die "expected eight campaign scenarios"
     [[ "$(etcd_host_client_port etcd-1)" == "12379" ]] || die "expected dedicated host port for etcd-1"
     [[ "$(etcd_host_endpoints_csv)" == "http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379" ]] || die "unexpected etcd host endpoint set"
     render_node_config node-a | grep -Fq 'backend = "etcd"' || die "rendered config missing etcd backend"
@@ -1153,6 +1365,9 @@ case "$command" in
         ;;
     self-test)
         self_test
+        ;;
+    campaign)
+        run_campaign "$@"
         ;;
     scenario)
         scenario_name="${1:?scenario requires a name}"

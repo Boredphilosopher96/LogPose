@@ -35,15 +35,17 @@ use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_storage_etcd::{
-    EtcdCoordinationClient, LeadershipLease, LeadershipRecord, MembershipRecord, ShardOwnership,
+    ClusterCollectionMetadata, ClusterMetadataSnapshot, EtcdCoordinationClient, LeadershipLease,
+    LeadershipRecord, MembershipRecord, PromotionResult, ShardOwnership,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
-    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus, Snapshot,
-    WriteOperation,
+    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeMembershipStatus, NodeRole,
+    NodeRuntimeStatus, ReplicaPlacement, Snapshot, WriteOperation,
 };
 use std::{
+    collections::BTreeMap,
     fmt,
     net::IpAddr,
     path::Path,
@@ -96,7 +98,14 @@ enum CoordinationRuntime {
 #[derive(Debug)]
 struct EtcdRuntime {
     snapshot: Arc<RwLock<CoordinationStatus>>,
+    metadata: Arc<RwLock<MetadataRuntimeState>>,
     shutdown: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataRuntimeState {
+    snapshot: ClusterMetadataSnapshot,
+    last_error: Option<String>,
 }
 
 impl Drop for EtcdRuntime {
@@ -106,7 +115,7 @@ impl Drop for EtcdRuntime {
 }
 
 impl CoordinationRuntime {
-    fn new(config: &LogPoseConfig) -> Self {
+    fn new(config: &LogPoseConfig, data: Arc<LogPoseDataService>) -> Self {
         if config.metadata.backend != MetadataBackend::Etcd {
             return Self::Local;
         }
@@ -114,15 +123,20 @@ impl CoordinationRuntime {
         let snapshot = Arc::new(RwLock::new(CoordinationStatus {
             cluster_name: config.metadata.etcd.cluster_name.clone(),
             membership_registered: false,
+            membership_state: None,
             membership_lease_id: None,
             registered_members: Vec::new(),
             leader_node: None,
             is_local_leader: false,
             leadership_lease_id: None,
+            metadata_revision: None,
+            watch_lag: None,
             last_error: None,
         }));
+        let metadata = Arc::new(RwLock::new(MetadataRuntimeState::default()));
         let runtime = Arc::new(EtcdRuntime {
             snapshot: Arc::clone(&snapshot),
+            metadata: Arc::clone(&metadata),
             shutdown: Arc::new(AtomicBool::new(false)),
         });
         let client = EtcdCoordinationClient::new(config.metadata.etcd.clone())
@@ -133,9 +147,24 @@ impl CoordinationRuntime {
         let shutdown = Arc::clone(&runtime.shutdown);
         match Handle::try_current() {
             Ok(handle) => {
+                let watch_client = client.clone();
+                let watch_snapshot = Arc::clone(&snapshot);
+                let watch_metadata = Arc::clone(&metadata);
+                let watch_shutdown = Arc::clone(&shutdown);
                 handle.spawn(async move {
-                    run_coordination_loop(client, snapshot, shutdown, node_name, node_role, tick)
-                        .await;
+                    run_metadata_watch_loop(
+                        watch_client,
+                        watch_snapshot,
+                        watch_metadata,
+                        watch_shutdown,
+                    )
+                    .await;
+                });
+                handle.spawn(async move {
+                    run_coordination_loop(
+                        client, data, snapshot, metadata, shutdown, node_name, node_role, tick,
+                    )
+                    .await;
                 });
             }
             Err(error) => {
@@ -153,6 +182,13 @@ impl CoordinationRuntime {
             Self::Etcd(runtime) => Some(coordination_read(&runtime.snapshot).clone()),
         }
     }
+
+    async fn metadata_snapshot(&self) -> Option<ClusterMetadataSnapshot> {
+        match self {
+            Self::Local => None,
+            Self::Etcd(runtime) => Some(metadata_read(&runtime.metadata).snapshot.clone()),
+        }
+    }
 }
 
 fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
@@ -165,7 +201,9 @@ fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
 
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
+    data: Arc<LogPoseDataService>,
     snapshot: Arc<RwLock<CoordinationStatus>>,
+    metadata: Arc<RwLock<MetadataRuntimeState>>,
     shutdown: Arc<AtomicBool>,
     node_name: String,
     node_role: NodeRole,
@@ -174,12 +212,18 @@ async fn run_coordination_loop(
     let mut membership_lease_id = None;
     let mut leadership_lease: Option<LeadershipLease> = None;
     let mut ticker = interval(tick);
+    let mut first_iteration = true;
     loop {
         let mut pending_error = None;
+        let mut force_refresh = false;
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        ticker.tick().await;
+        if first_iteration {
+            first_iteration = false;
+        } else {
+            ticker.tick().await;
+        }
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -187,13 +231,22 @@ async fn run_coordination_loop(
         if let Some(lease_id) = membership_lease_id
             && let Err(error) = client.keep_alive(lease_id).await
         {
-            note_coordination_error(&mut pending_error, error.to_string());
+            let error = error.to_string();
+            if recover_tracked_membership_after_keep_alive_error(
+                &error,
+                &mut membership_lease_id,
+                &mut leadership_lease,
+            ) {
+                force_refresh = true;
+            }
+            note_coordination_error(&mut pending_error, error);
         }
 
         if membership_lease_id.is_none() {
             match client.register_membership(&node_name, node_role).await {
                 Ok(lease) => {
                     membership_lease_id = Some(lease.lease_id);
+                    force_refresh = true;
                     clear_coordination_error(&snapshot).await;
                 }
                 Err(error) => {
@@ -206,22 +259,85 @@ async fn run_coordination_loop(
         if let Some(lease) = &leadership_lease
             && let Err(error) = client.keep_alive(lease.lease_id).await
         {
-            note_coordination_error(&mut pending_error, error.to_string());
+            let error = error.to_string();
+            if recover_tracked_leadership_after_keep_alive_error(&error, &mut leadership_lease) {
+                force_refresh = true;
+            }
+            note_coordination_error(&mut pending_error, error);
         }
 
-        if leadership_lease.is_none() && matches!(node_role, NodeRole::Combined | NodeRole::Control)
+        let cached_membership_ready = metadata_read(&metadata)
+            .snapshot
+            .members
+            .iter()
+            .find(|member| member.node_id == node_name)
+            .is_none_or(|member| member.state == "ready");
+        if leadership_lease.is_none()
+            && cached_membership_ready
+            && matches!(node_role, NodeRole::Combined | NodeRole::Control)
         {
             match client.try_acquire_leadership(&node_name).await {
                 Ok(lease) => {
                     leadership_lease = lease;
+                    force_refresh = true;
                     clear_coordination_error(&snapshot).await;
                 }
                 Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
             }
         }
 
-        let members = client.list_membership().await;
-        let leader = client.current_leader().await;
+        if force_refresh {
+            match client.load_cluster_metadata().await {
+                Ok(cluster_snapshot) => {
+                    let mut current = metadata_write(&metadata);
+                    current.snapshot = cluster_snapshot;
+                    current.last_error = None;
+                }
+                Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
+            }
+        }
+
+        let metadata_state = metadata_read(&metadata).clone();
+        if let Some(error) = metadata_state.last_error {
+            note_coordination_error(&mut pending_error, error);
+        }
+        if metadata_state.snapshot.revision == 0 {
+            if let Some(error) = pending_error {
+                record_coordination_error(&snapshot, error).await;
+            }
+            continue;
+        }
+        if let Some(leadership_lease) = leadership_lease.as_ref()
+            && matches!(node_role, NodeRole::Combined | NodeRole::Data)
+        {
+            match reconcile_local_leader_failover(
+                &client,
+                &data,
+                &node_name,
+                leadership_lease,
+                &metadata_state.snapshot,
+            )
+            .await
+            {
+                Ok(applied) => {
+                    if applied {
+                        match client.load_cluster_metadata().await {
+                            Ok(cluster_snapshot) => {
+                                let mut current = metadata_write(&metadata);
+                                current.snapshot = cluster_snapshot;
+                                current.last_error = None;
+                            }
+                            Err(error) => {
+                                note_coordination_error(&mut pending_error, error.to_string())
+                            }
+                        }
+                    }
+                }
+                Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
+            }
+        }
+        let members = Ok(metadata_state.snapshot.members);
+        let leader = Ok(metadata_state.snapshot.leader);
         if let Ok(member_records) = &members
             && membership_lease_id.is_some()
             && !member_records
@@ -230,6 +346,15 @@ async fn run_coordination_loop(
         {
             revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
             revoke_tracked_membership_lease(&client, &mut membership_lease_id).await;
+        }
+        if let Ok(member_records) = &members
+            && leadership_lease.is_some()
+            && member_records
+                .iter()
+                .find(|member| member.node_id == node_name)
+                .is_some_and(|member| member.state != "ready")
+        {
+            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
         }
         if let Ok(Some(leader_record)) = &leader
             && leadership_lease.is_some()
@@ -246,7 +371,11 @@ async fn run_coordination_loop(
             leadership_lease.as_ref(),
             &members,
             &leader,
-            pending_error,
+            CoordinationSnapshotUpdate {
+                metadata_revision: Some(metadata_state.snapshot.revision),
+                watch_lag: Some(0),
+                pending_error,
+            },
         );
     }
 
@@ -276,10 +405,135 @@ async fn revoke_tracked_membership_lease(
     }
 }
 
+async fn reconcile_local_leader_failover(
+    client: &EtcdCoordinationClient,
+    data: &LogPoseDataService,
+    node_name: &str,
+    leadership_lease: &LeadershipLease,
+    snapshot: &ClusterMetadataSnapshot,
+) -> Result<bool> {
+    for collection in &snapshot.collections {
+        let Some(descriptor) = collection.descriptor.as_ref() else {
+            continue;
+        };
+        if !collection.descriptor_ready || descriptor.replication_factor <= 1 {
+            continue;
+        }
+        let Some(ownership) = collection.owner.as_ref() else {
+            continue;
+        };
+        if ownership.owner_node_id == node_name {
+            continue;
+        }
+        let owner_ready = snapshot
+            .members
+            .iter()
+            .find(|member| member.node_id == ownership.owner_node_id)
+            .is_some_and(|member| member.state == "ready");
+        if owner_ready {
+            continue;
+        }
+        let mut replica_candidates = snapshot
+            .members
+            .iter()
+            .filter(|member| {
+                member.node_id != ownership.owner_node_id
+                    && matches!(member.node_role, NodeRole::Combined | NodeRole::Data)
+                    && member.state == "ready"
+            })
+            .collect::<Vec<_>>();
+        replica_candidates.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let local_is_desired_replica = replica_candidates
+            .into_iter()
+            .take(descriptor.replication_factor.saturating_sub(1))
+            .any(|member| member.node_id == node_name);
+        if !local_is_desired_replica {
+            continue;
+        }
+        if !data.local_collection_matches_descriptor(descriptor).await? {
+            continue;
+        }
+
+        let promotion = client
+            .promote_shard_owner(ownership, node_name)
+            .await
+            .map_err(ServiceError::from)?;
+        let PromotionResult::Applied(_) = promotion else {
+            continue;
+        };
+
+        client
+            .set_collection_assignment(
+                &collection.collection,
+                CollectionAssignment {
+                    assigned_node: node_name.to_owned(),
+                    assigned_role: NodeRole::Data,
+                },
+                &LeadershipFence {
+                    node_id: node_name.to_owned(),
+                    lease_id: leadership_lease.lease_id,
+                },
+            )
+            .await
+            .map_err(ServiceError::from)?;
+        client
+            .set_shard_failover_reason(
+                &collection.collection,
+                &ownership.shard_id,
+                &format!(
+                    "automatic self-promotion on node '{node_name}' after owner '{}' lost readiness",
+                    ownership.owner_node_id
+                ),
+                &LeadershipFence {
+                    node_id: node_name.to_owned(),
+                    lease_id: leadership_lease.lease_id,
+                },
+            )
+            .await
+            .map_err(ServiceError::from)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn recover_tracked_membership_after_keep_alive_error(
+    error: &str,
+    membership_lease_id: &mut Option<i64>,
+    leadership_lease: &mut Option<LeadershipLease>,
+) -> bool {
+    if !keep_alive_session_missing(error) {
+        return false;
+    }
+    *membership_lease_id = None;
+    *leadership_lease = None;
+    true
+}
+
+fn recover_tracked_leadership_after_keep_alive_error(
+    error: &str,
+    leadership_lease: &mut Option<LeadershipLease>,
+) -> bool {
+    if !keep_alive_session_missing(error) {
+        return false;
+    }
+    *leadership_lease = None;
+    true
+}
+
+fn keep_alive_session_missing(error: &str) -> bool {
+    error.contains("no keep-alive session is registered for lease '")
+}
+
 fn note_coordination_error(pending_error: &mut Option<String>, error: String) {
     if pending_error.is_none() {
         *pending_error = Some(error);
     }
+}
+
+struct CoordinationSnapshotUpdate {
+    metadata_revision: Option<i64>,
+    watch_lag: Option<u64>,
+    pending_error: Option<String>,
 }
 
 fn reconcile_coordination_snapshot(
@@ -289,8 +543,14 @@ fn reconcile_coordination_snapshot(
     leadership_lease: Option<&LeadershipLease>,
     members: &logpose_types::Result<Vec<MembershipRecord>>,
     leader: &logpose_types::Result<Option<LeadershipRecord>>,
-    pending_error: Option<String>,
+    update: CoordinationSnapshotUpdate,
 ) {
+    let local_membership_state = members.as_ref().ok().and_then(|member_records| {
+        member_records
+            .iter()
+            .find(|member| member.node_id == node_name)
+            .map(|member| member.state.clone())
+    });
     let membership_confirmed = members.as_ref().is_ok_and(|member_records| {
         membership_lease_id.is_some()
             && member_records
@@ -303,6 +563,7 @@ fn reconcile_coordination_snapshot(
         .and_then(|leader_record| leader_record.as_ref().cloned());
     let mut current = coordination_write(snapshot);
     current.membership_registered = membership_confirmed;
+    current.membership_state = local_membership_state;
     current.membership_lease_id = membership_lease_id.filter(|_| membership_confirmed);
     if let Ok(member_records) = members {
         current.registered_members = member_records
@@ -323,7 +584,9 @@ fn reconcile_coordination_snapshot(
     current.leadership_lease_id = leadership_lease
         .map(|lease| lease.lease_id)
         .filter(|_| current.is_local_leader);
-    current.last_error = reconcile_coordination_last_error(pending_error, members, leader);
+    current.metadata_revision = update.metadata_revision;
+    current.watch_lag = update.watch_lag;
+    current.last_error = reconcile_coordination_last_error(update.pending_error, members, leader);
 }
 
 fn reconcile_coordination_last_error(
@@ -351,11 +614,14 @@ async fn record_coordination_error(snapshot: &RwLock<CoordinationStatus>, error:
     let mut current = coordination_write(snapshot);
     current.last_error = Some(error);
     current.membership_registered = false;
+    current.membership_state = None;
     current.membership_lease_id = None;
     current.registered_members.clear();
     current.leader_node = None;
     current.is_local_leader = false;
     current.leadership_lease_id = None;
+    current.metadata_revision = None;
+    current.watch_lag = None;
 }
 
 async fn clear_coordination_error(snapshot: &RwLock<CoordinationStatus>) {
@@ -377,6 +643,68 @@ fn coordination_write(
     match snapshot.write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn metadata_read(
+    snapshot: &RwLock<MetadataRuntimeState>,
+) -> RwLockReadGuard<'_, MetadataRuntimeState> {
+    match snapshot.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn metadata_write(
+    snapshot: &RwLock<MetadataRuntimeState>,
+) -> RwLockWriteGuard<'_, MetadataRuntimeState> {
+    match snapshot.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn record_metadata_watch_error(snapshot: &RwLock<MetadataRuntimeState>, error: String) {
+    let mut current = metadata_write(snapshot);
+    current.snapshot = ClusterMetadataSnapshot::default();
+    current.last_error = Some(error);
+}
+
+async fn run_metadata_watch_loop(
+    client: EtcdCoordinationClient,
+    coordination: Arc<RwLock<CoordinationStatus>>,
+    metadata: Arc<RwLock<MetadataRuntimeState>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match client.load_cluster_metadata().await {
+            Ok(snapshot) => {
+                let mut current = metadata_write(&metadata);
+                current.snapshot = snapshot;
+                current.last_error = None;
+            }
+            Err(error) => {
+                let error = error.to_string();
+                record_metadata_watch_error(&metadata, error.clone());
+                record_coordination_error(&coordination, error).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        }
+
+        let current_revision = metadata_read(&metadata).snapshot.revision;
+        match client
+            .wait_for_cluster_metadata_change(current_revision)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let error = error.to_string();
+                record_metadata_watch_error(&metadata, error.clone());
+                record_coordination_error(&coordination, error).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
     }
 }
 
@@ -720,7 +1048,7 @@ impl LogPoseControlService {
         config: LogPoseConfig,
         build: BuildInfo,
     ) -> Self {
-        let coordination = CoordinationRuntime::new(&config);
+        let coordination = CoordinationRuntime::new(&config, Arc::clone(&data));
         let coordination_client = if config.metadata.backend == MetadataBackend::Etcd {
             Some(
                 EtcdCoordinationClient::new(config.metadata.etcd.clone())
@@ -838,18 +1166,33 @@ impl LogPoseControlService {
 
     /// Return the placement summary for one collection.
     pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
-        let descriptor = self.data.get_collection(collection_name).await?;
-        let assignment = self.assignment_for_descriptor(&descriptor).await?;
-        let ownership = self.ownership_for_descriptor(&descriptor).await?;
+        let descriptor = self.descriptor_for_collection(collection_name).await?;
+        let assignment = self
+            .authoritative_assignment_for_descriptor(&descriptor)
+            .await?;
+        let ownership = self
+            .authoritative_ownership_for_descriptor(&descriptor)
+            .await?;
         let local_collection_available = self
             .data
             .local_collection_matches_descriptor(&descriptor)
             .await?;
         let coordination = self.coordination.snapshot().await;
+        let replicas = self
+            .replica_targets_for_descriptor(
+                &descriptor,
+                &assignment,
+                ownership.as_ref(),
+                local_collection_available,
+            )
+            .await;
+        let failover_reason = self.failover_reason_for_descriptor(&descriptor).await;
         Ok(self.local_placement(
             &descriptor,
             &assignment,
             ownership.as_ref(),
+            replicas,
+            failover_reason,
             local_collection_available,
             coordination.as_ref(),
         ))
@@ -860,28 +1203,60 @@ impl LogPoseControlService {
         let metadata_ready = self.data.metadata_status().await.is_ok();
         let coordination = self.coordination.snapshot().await;
         let descriptors = if metadata_ready {
-            self.data.list_collections().await?
+            let local_descriptors = self.data.list_collections().await?;
+            if let Some(cached_descriptors) = self.cached_ready_descriptors().await {
+                let mut descriptors_by_lookup = BTreeMap::new();
+                for descriptor in local_descriptors {
+                    descriptors_by_lookup.insert(descriptor.lookup_name(), descriptor);
+                }
+                for descriptor in cached_descriptors {
+                    descriptors_by_lookup.insert(descriptor.lookup_name(), descriptor);
+                }
+                descriptors_by_lookup.into_values().collect()
+            } else {
+                local_descriptors
+            }
         } else {
             Vec::new()
         };
         let mut placements = Vec::with_capacity(descriptors.len());
         let mut local_descriptors = Vec::new();
         for descriptor in &descriptors {
-            let assignment = self.assignment_for_descriptor(descriptor).await?;
-            let ownership = self.ownership_for_descriptor(descriptor).await?;
+            let assignment = self.status_assignment_for_descriptor(descriptor).await?;
+            let ownership = self.status_ownership_for_descriptor(descriptor).await?;
             let local_collection_available = self
                 .data
                 .local_collection_matches_descriptor(descriptor)
                 .await?;
+            let replicas = self
+                .replica_targets_for_descriptor(
+                    descriptor,
+                    &assignment,
+                    ownership.as_ref(),
+                    local_collection_available,
+                )
+                .await;
+            let failover_reason = self.failover_reason_for_descriptor(descriptor).await;
             let placement = self.local_placement(
                 descriptor,
                 &assignment,
                 ownership.as_ref(),
+                replicas,
+                failover_reason,
                 local_collection_available,
                 coordination.as_ref(),
             );
             if placement.route_kind == "local" {
-                local_descriptors.push(descriptor);
+                if descriptor.root_path.as_os_str().is_empty() {
+                    local_descriptors.push(
+                        self.data
+                            .get_collection(&descriptor.lookup_name())
+                            .await
+                            .unwrap_or_else(|_| descriptor.clone()),
+                    );
+                } else {
+                    local_descriptors.push(descriptor.clone());
+                }
             }
             placements.push(placement);
         }
@@ -892,7 +1267,7 @@ impl LogPoseControlService {
 
         let mut maintenance = MaintenanceBacklog::default();
         for descriptor in local_descriptors {
-            let status = self.data.maintenance_status_descriptor(descriptor).await?;
+            let status = self.data.maintenance_status_descriptor(&descriptor).await?;
             if !status.pending.is_empty() {
                 maintenance.collections_with_pending += 1;
                 maintenance.pending_operations += status.pending.len();
@@ -906,16 +1281,16 @@ impl LogPoseControlService {
         }
 
         let control_coordination_ready = coordination.as_ref().is_none_or(|status| {
-            status.membership_registered
+            coordination_membership_ready(status)
                 && status.last_error.is_none()
                 && (!matches!(
                     self.config.node_role,
                     NodeRole::Combined | NodeRole::Control
                 ) || status.is_local_leader)
         });
-        let data_coordination_ready = coordination
-            .as_ref()
-            .is_none_or(|status| status.membership_registered && status.last_error.is_none());
+        let data_coordination_ready = coordination.as_ref().is_none_or(|status| {
+            coordination_membership_ready(status) && status.last_error.is_none()
+        });
 
         Ok(NodeRuntimeStatus {
             metadata: logpose_types::NodeMetadata::new(self.config.node_name.clone(), &self.build),
@@ -963,20 +1338,210 @@ impl LogPoseControlService {
         self.coordination.snapshot().await
     }
 
+    /// Read one node membership status from authoritative metadata.
+    pub async fn node_membership_status(&self, node_id: &str) -> Result<NodeMembershipStatus> {
+        let Some(client) = &self.coordination_client else {
+            return Err(ServiceError::InvalidArgument(
+                "node membership operations require the etcd metadata backend".to_owned(),
+            ));
+        };
+        let record = client.membership(node_id).await?.ok_or_else(|| {
+            ServiceError::NotFound(format!(
+                "membership record for node '{node_id}' does not exist"
+            ))
+        })?;
+        Ok(NodeMembershipStatus {
+            node_id: record.node_id,
+            node_role: record.node_role,
+            state: record.state,
+        })
+    }
+
+    /// Mark one node as draining in authoritative metadata.
+    pub async fn drain_node(&self, node_id: &str) -> Result<NodeMembershipStatus> {
+        self.set_node_membership_state(node_id, "draining").await
+    }
+
+    /// Restore one node to the ready serving state in authoritative metadata.
+    pub async fn undrain_node(&self, node_id: &str) -> Result<NodeMembershipStatus> {
+        self.set_node_membership_state(node_id, "ready").await
+    }
+
+    async fn set_node_membership_state(
+        &self,
+        node_id: &str,
+        state: &str,
+    ) -> Result<NodeMembershipStatus> {
+        let Some(client) = &self.coordination_client else {
+            return Err(ServiceError::InvalidArgument(
+                "node membership operations require the etcd metadata backend".to_owned(),
+            ));
+        };
+        let local_leader = match self.require_local_control_plane_leader().await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => client
+                .current_leader()
+                .await?
+                .as_ref()
+                .is_some_and(|leader| leader.node_id == self.config.node_name),
+        };
+        if !(local_leader || state == "ready" && node_id == self.config.node_name) {
+            return Err(ServiceError::InvalidArgument(format!(
+                "node '{}' is not the active control-plane leader",
+                self.config.node_name
+            )));
+        }
+        let record = client.set_membership_state(node_id, state).await?;
+        Ok(NodeMembershipStatus {
+            node_id: record.node_id,
+            node_role: record.node_role,
+            state: record.state,
+        })
+    }
+
+    /// Promote one collection shard to a specific owner and update the recorded assignment.
+    pub async fn promote_collection_owner(
+        &self,
+        collection_name: &str,
+        new_owner_node_id: &str,
+    ) -> Result<CollectionPlacement> {
+        let Some(client) = &self.coordination_client else {
+            return Err(ServiceError::InvalidArgument(
+                "manual promotion requires the etcd metadata backend".to_owned(),
+            ));
+        };
+        let descriptor = self.descriptor_for_collection(collection_name).await?;
+        let Some(current) = self
+            .authoritative_ownership_for_descriptor(&descriptor)
+            .await?
+        else {
+            return Err(ServiceError::InvalidArgument(format!(
+                "collection '{}/{}' has no authoritative shard ownership metadata",
+                descriptor.database_name, descriptor.name
+            )));
+        };
+        let leader_fence = self
+            .require_local_control_plane_leader()
+            .await?
+            .ok_or_else(|| {
+                ServiceError::Internal(
+                    "etcd-backed promotion requires a local leadership fence".to_owned(),
+                )
+            })?;
+        match client
+            .promote_shard_owner(&current, new_owner_node_id)
+            .await?
+        {
+            PromotionResult::Applied(promoted) => {
+                client
+                    .set_collection_assignment(
+                        &promoted.collection,
+                        CollectionAssignment {
+                            assigned_node: promoted.owner_node_id.clone(),
+                            assigned_role: NodeRole::Data,
+                        },
+                        &leader_fence,
+                    )
+                    .await?;
+                client
+                    .set_shard_failover_reason(
+                        &promoted.collection,
+                        &promoted.shard_id,
+                        &format!(
+                            "manual promotion to node '{new_owner_node_id}' from node '{}'",
+                            current.owner_node_id
+                        ),
+                        &leader_fence,
+                    )
+                    .await?;
+                self.collection_placement(&descriptor.lookup_name()).await
+            }
+            PromotionResult::Conflict => Err(ServiceError::FailedPrecondition(format!(
+                "failed to promote collection '{}/{}' to node '{new_owner_node_id}' because the current owner or candidate readiness changed",
+                descriptor.database_name, descriptor.name
+            ))),
+        }
+    }
+
+    /// Rebalance one collection by promoting it to a ready peer.
+    pub async fn rebalance_collection(
+        &self,
+        collection_name: &str,
+        target_node_id: Option<&str>,
+    ) -> Result<CollectionPlacement> {
+        let Some(client) = &self.coordination_client else {
+            return Err(ServiceError::InvalidArgument(
+                "rebalance requires the etcd metadata backend".to_owned(),
+            ));
+        };
+        let descriptor = self.descriptor_for_collection(collection_name).await?;
+        let Some(current) = self
+            .authoritative_ownership_for_descriptor(&descriptor)
+            .await?
+        else {
+            return Err(ServiceError::InvalidArgument(format!(
+                "collection '{}/{}' has no authoritative shard ownership metadata",
+                descriptor.database_name, descriptor.name
+            )));
+        };
+        let target_node_id = match target_node_id {
+            Some(target_node_id) => target_node_id.to_owned(),
+            None => client
+                .list_membership()
+                .await?
+                .into_iter()
+                .find(|member| {
+                    member.node_id != current.owner_node_id
+                        && member.state == "ready"
+                        && matches!(member.node_role, NodeRole::Combined | NodeRole::Data)
+                })
+                .map(|member| member.node_id)
+                .ok_or_else(|| {
+                    ServiceError::FailedPrecondition(format!(
+                        "no ready rebalance target is available for collection '{}/{}'",
+                        descriptor.database_name, descriptor.name
+                    ))
+                })?,
+        };
+        let placement = self
+            .promote_collection_owner(&descriptor.lookup_name(), &target_node_id)
+            .await?;
+        if let (Some(client), Some(leader_fence)) = (
+            self.coordination_client.as_ref(),
+            self.require_local_control_plane_leader().await?,
+        ) {
+            let reference = CollectionRef::new(&descriptor.database_name, &descriptor.name);
+            client
+                .set_shard_failover_reason(
+                    &reference,
+                    "0",
+                    &format!("manual rebalance to node '{target_node_id}'"),
+                    &leader_fence,
+                )
+                .await?;
+        }
+        Ok(placement)
+    }
+
     fn local_placement(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
         assignment: &CollectionAssignment,
         ownership: Option<&ShardOwnership>,
+        replicas: Vec<ReplicaPlacement>,
+        failover_reason: Option<String>,
         local_collection_available: bool,
         coordination: Option<&CoordinationStatus>,
     ) -> CollectionPlacement {
         let owner_node = ownership.map(|ownership| ownership.owner_node_id.clone());
         let ownership_epoch = ownership.map(|ownership| ownership.epoch);
+        let metadata_revision =
+            coordination.and_then(|coordination| coordination.metadata_revision);
         if let Some(ownership) = ownership {
             let owner_targets_this_runtime = ownership.owner_node_id == self.config.node_name;
             let local_membership_ready = coordination
-                .map(|coordination| coordination.membership_registered)
+                .map(coordination_membership_ready)
                 .unwrap_or(true);
             let serves_local_assignment = owner_targets_this_runtime
                 && local_collection_available
@@ -995,6 +1560,9 @@ impl LogPoseControlService {
                 assigned_role: assignment.assigned_role,
                 owner_node,
                 ownership_epoch,
+                replicas,
+                failover_reason,
+                metadata_revision,
                 route_kind: route_kind.to_owned(),
                 route_reason: if serves_local_assignment {
                     format!(
@@ -1033,6 +1601,9 @@ impl LogPoseControlService {
                 assigned_role: assignment.assigned_role,
                 owner_node,
                 ownership_epoch,
+                replicas,
+                failover_reason,
+                metadata_revision,
                 route_kind: "recorded".to_owned(),
                 route_reason: format!(
                     "authoritative shard ownership metadata is missing for collection '{}/{}'; reconciliation is required before this runtime can serve it",
@@ -1058,6 +1629,9 @@ impl LogPoseControlService {
             assigned_role: assignment.assigned_role,
             owner_node,
             ownership_epoch,
+            replicas,
+            failover_reason,
+            metadata_revision,
             route_kind: route_kind.to_owned(),
             route_reason: match (
                 serves_local_assignment,
@@ -1148,17 +1722,178 @@ impl LogPoseControlService {
         }
     }
 
+    async fn replica_targets_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+        assignment: &CollectionAssignment,
+        ownership: Option<&ShardOwnership>,
+        local_collection_available: bool,
+    ) -> Vec<ReplicaPlacement> {
+        let desired_replica_count = descriptor.replication_factor.saturating_sub(1);
+        if desired_replica_count == 0 {
+            return Vec::new();
+        }
+        let Some(snapshot) = self.coordination.metadata_snapshot().await else {
+            return Vec::new();
+        };
+        if snapshot.revision == 0 {
+            return Vec::new();
+        }
+        let owner_node = ownership
+            .map(|ownership| ownership.owner_node_id.as_str())
+            .unwrap_or(assignment.assigned_node.as_str());
+        let mut candidates = snapshot
+            .members
+            .into_iter()
+            .filter(|member| {
+                member.node_id != owner_node
+                    && matches!(member.node_role, NodeRole::Combined | NodeRole::Data)
+                    && member.state == "ready"
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        candidates
+            .into_iter()
+            .take(desired_replica_count)
+            .map(|member| ReplicaPlacement {
+                node_id: member.node_id.clone(),
+                node_role: member.node_role,
+                state: if member.node_id == self.config.node_name {
+                    if local_collection_available {
+                        "ready".to_owned()
+                    } else {
+                        "absent".to_owned()
+                    }
+                } else {
+                    "unknown".to_owned()
+                },
+            })
+            .collect()
+    }
+
+    async fn failover_reason_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Option<String> {
+        self.cached_collection_metadata(&descriptor.lookup_name())
+            .await
+            .and_then(|collection| collection.failover_reason)
+    }
+
+    async fn cached_ready_descriptors(&self) -> Option<Vec<logpose_catalog::CollectionDescriptor>> {
+        let snapshot = self.coordination.metadata_snapshot().await?;
+        if snapshot.revision == 0 {
+            return None;
+        }
+        Some(
+            snapshot
+                .collections
+                .into_iter()
+                .filter_map(|collection| {
+                    if collection.descriptor_ready {
+                        collection.descriptor
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    async fn cached_collection_metadata(
+        &self,
+        collection_name: &str,
+    ) -> Option<ClusterCollectionMetadata> {
+        let reference = parse_collection_reference(collection_name).ok()?;
+        let lookup_name = reference.lookup_name();
+        let snapshot = self.coordination.metadata_snapshot().await?;
+        if snapshot.revision == 0 {
+            return None;
+        }
+        snapshot
+            .collections
+            .into_iter()
+            .find(|collection| collection.collection.lookup_name() == lookup_name)
+    }
+
+    async fn descriptor_for_collection(
+        &self,
+        collection_name: &str,
+    ) -> Result<logpose_catalog::CollectionDescriptor> {
+        if let Some(descriptor) = self
+            .cached_collection_metadata(collection_name)
+            .await
+            .and_then(|collection| {
+                if collection.descriptor_ready {
+                    collection.descriptor
+                } else {
+                    None
+                }
+            })
+        {
+            return Ok(descriptor);
+        }
+        self.data.get_collection(collection_name).await
+    }
+
     async fn assignment_for_descriptor(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
+        if let Some(assignment) = self
+            .cached_collection_metadata(&descriptor.lookup_name())
+            .await
+            .and_then(|collection| collection.assignment)
+        {
+            return Ok(assignment);
+        }
         self.data.collection_assignment_descriptor(descriptor).await
+    }
+
+    async fn authoritative_assignment_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        let Some(client) = &self.coordination_client else {
+            return self.assignment_for_descriptor(descriptor).await;
+        };
+        if let Some(assignment) = client
+            .collection_assignment(&CollectionRef::new(
+                descriptor.database_name.clone(),
+                descriptor.name.clone(),
+            ))
+            .await?
+        {
+            Ok(assignment)
+        } else {
+            self.assignment_for_descriptor(descriptor).await
+        }
+    }
+
+    async fn status_assignment_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        match self
+            .authoritative_assignment_for_descriptor(descriptor)
+            .await
+        {
+            Ok(assignment) => Ok(assignment),
+            Err(_) => self.assignment_for_descriptor(descriptor).await,
+        }
     }
 
     async fn ownership_for_descriptor(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<Option<ShardOwnership>> {
+        if let Some(owner) = self
+            .cached_collection_metadata(&descriptor.lookup_name())
+            .await
+            .and_then(|collection| collection.owner)
+        {
+            return Ok(Some(owner));
+        }
         let Some(client) = &self.coordination_client else {
             return Ok(None);
         };
@@ -1171,6 +1906,35 @@ impl LogPoseControlService {
             .map_err(Into::into)
     }
 
+    async fn authoritative_ownership_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<Option<ShardOwnership>> {
+        let Some(client) = &self.coordination_client else {
+            return self.ownership_for_descriptor(descriptor).await;
+        };
+        client
+            .shard_owner(
+                &CollectionRef::new(descriptor.database_name.clone(), descriptor.name.clone()),
+                "0",
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn status_ownership_for_descriptor(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<Option<ShardOwnership>> {
+        match self
+            .authoritative_ownership_for_descriptor(descriptor)
+            .await
+        {
+            Ok(ownership) => Ok(ownership),
+            Err(_) => self.ownership_for_descriptor(descriptor).await,
+        }
+    }
+
     /// Require this runtime to own the active write path for one collection.
     pub async fn require_local_write_ownership(&self, collection_name: &str) -> Result<()> {
         if !matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data) {
@@ -1179,9 +1943,11 @@ impl LogPoseControlService {
                 self.config.node_name, self.config.node_role
             )));
         }
-        let descriptor = self.data.get_collection(collection_name).await?;
+        let descriptor = self.descriptor_for_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
-        let ownership = self.ownership_for_descriptor(&descriptor).await?;
+        let ownership = self
+            .authoritative_ownership_for_descriptor(&descriptor)
+            .await?;
         let local_collection_available = self
             .data
             .local_collection_matches_descriptor(&descriptor)
@@ -1193,10 +1959,21 @@ impl LogPoseControlService {
                 descriptor.database_name, descriptor.name
             )));
         }
+        let replicas = self
+            .replica_targets_for_descriptor(
+                &descriptor,
+                &assignment,
+                ownership.as_ref(),
+                local_collection_available,
+            )
+            .await;
+        let failover_reason = self.failover_reason_for_descriptor(&descriptor).await;
         let placement = self.local_placement(
             &descriptor,
             &assignment,
             ownership.as_ref(),
+            replicas,
+            failover_reason,
             local_collection_available,
             coordination.as_ref(),
         );
@@ -1245,7 +2022,7 @@ impl LogPoseControlService {
             let Some(coordination) = self.coordination.snapshot().await else {
                 return Ok(None);
             };
-            if coordination.is_local_leader {
+            if coordination.is_local_leader && coordination_membership_ready(&coordination) {
                 let lease_id = coordination.leadership_lease_id.ok_or_else(|| {
                     ServiceError::Internal(format!(
                         "node '{}' reported local leadership without a lease id",
@@ -1256,6 +2033,21 @@ impl LogPoseControlService {
                     node_id: self.config.node_name.clone(),
                     lease_id,
                 }));
+            }
+            if coordination.leader_node.is_none()
+                && let Some(client) = &self.coordination_client
+                && let Ok(Some(leader_record)) = client.current_leader().await
+            {
+                if leader_record.node_id == self.config.node_name {
+                    return Ok(Some(LeadershipFence {
+                        node_id: self.config.node_name.clone(),
+                        lease_id: leader_record.lease_id,
+                    }));
+                }
+                return Err(ServiceError::InvalidArgument(format!(
+                    "node '{}' is not the active control-plane leader; current leader is '{}'",
+                    self.config.node_name, leader_record.node_id
+                )));
             }
             if coordination.leader_node.is_some() || Instant::now() >= deadline {
                 let leader = coordination
@@ -1356,6 +2148,15 @@ fn parse_collection_reference(collection_name: &str) -> logpose_types::Result<Co
     Ok(reference)
 }
 
+fn coordination_membership_ready(status: &CoordinationStatus) -> bool {
+    status.membership_registered
+        && status
+            .membership_state
+            .as_deref()
+            .unwrap_or("ready")
+            .eq("ready")
+}
+
 fn ensure_collection_reference_matches_descriptor(
     reference: &CollectionRef,
     descriptor: &logpose_catalog::CollectionDescriptor,
@@ -1432,11 +2233,14 @@ mod tests {
         let snapshot = RwLock::new(CoordinationStatus {
             cluster_name: "default".to_owned(),
             membership_registered: false,
+            membership_state: None,
             membership_lease_id: None,
             registered_members: Vec::new(),
             leader_node: None,
             is_local_leader: false,
             leadership_lease_id: None,
+            metadata_revision: None,
+            watch_lag: None,
             last_error: None,
         });
 
@@ -1458,7 +2262,11 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 lease_id: 22,
             })),
-            Some("membership keep-alive failed".to_owned()),
+            CoordinationSnapshotUpdate {
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
+                pending_error: Some("membership keep-alive failed".to_owned()),
+            },
         );
 
         let current = coordination_read(&snapshot).clone();
@@ -1468,9 +2276,82 @@ mod tests {
         assert_eq!(current.leader_node.as_deref(), Some("node-a"));
         assert!(current.is_local_leader);
         assert_eq!(current.leadership_lease_id, Some(22));
+        assert_eq!(current.metadata_revision, Some(42));
+        assert_eq!(current.watch_lag, Some(0));
         assert_eq!(
             current.last_error.as_deref(),
             Some("membership keep-alive failed")
+        );
+    }
+
+    #[test]
+    fn missing_membership_keep_alive_session_drops_tracked_membership_and_leadership() {
+        let mut membership_lease_id = Some(11);
+        let mut leadership_lease = Some(LeadershipLease {
+            node_id: "node-a".to_owned(),
+            lease_id: 22,
+            key: "/leaders/node-a".to_owned(),
+        });
+
+        let reset = recover_tracked_membership_after_keep_alive_error(
+            "no keep-alive session is registered for lease '11'",
+            &mut membership_lease_id,
+            &mut leadership_lease,
+        );
+
+        assert!(reset);
+        assert_eq!(membership_lease_id, None);
+        assert_eq!(leadership_lease, None);
+    }
+
+    #[test]
+    fn missing_leadership_keep_alive_session_drops_only_tracked_leadership() {
+        let mut leadership_lease = Some(LeadershipLease {
+            node_id: "node-a".to_owned(),
+            lease_id: 22,
+            key: "/leaders/node-a".to_owned(),
+        });
+
+        let reset = recover_tracked_leadership_after_keep_alive_error(
+            "no keep-alive session is registered for lease '22'",
+            &mut leadership_lease,
+        );
+
+        assert!(reset);
+        assert_eq!(leadership_lease, None);
+    }
+
+    #[test]
+    fn transport_keep_alive_errors_do_not_drop_tracked_leases() {
+        let mut membership_lease_id = Some(11);
+        let mut leadership_lease = Some(LeadershipLease {
+            node_id: "node-a".to_owned(),
+            lease_id: 22,
+            key: "/leaders/node-a".to_owned(),
+        });
+
+        let membership_reset = recover_tracked_membership_after_keep_alive_error(
+            "transport error: connection refused",
+            &mut membership_lease_id,
+            &mut leadership_lease,
+        );
+
+        assert!(!membership_reset);
+        assert_eq!(membership_lease_id, Some(11));
+        assert_eq!(
+            leadership_lease.as_ref().map(|lease| lease.lease_id),
+            Some(22)
+        );
+
+        let leadership_reset = recover_tracked_leadership_after_keep_alive_error(
+            "transport error: connection refused",
+            &mut leadership_lease,
+        );
+
+        assert!(!leadership_reset);
+        assert_eq!(
+            leadership_lease.as_ref().map(|lease| lease.lease_id),
+            Some(22)
         );
     }
 
@@ -1598,6 +2479,7 @@ mod tests {
                 name: "documents".to_owned(),
                 dimensions: 2,
                 metric: DistanceMetric::Dot,
+                replication_factor: 1,
             })
             .await
             .expect("plain storage create should still succeed");
