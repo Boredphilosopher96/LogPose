@@ -2,12 +2,14 @@
 
 use async_trait as _;
 use crc32fast as _;
+use flate2 as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query as _;
 use logpose_wal as _;
 use serde as _;
+use tar as _;
 use uuid as _;
 
 #[path = "support/randomized.rs"]

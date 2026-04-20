@@ -2,30 +2,53 @@
 
 ## Goal
 
-Replace LogPose's local per-collection placement files with an authoritative metadata plane that can support multi-node and eventually multi-cluster serving, failover, and explicit consistency modes without losing the clean operator contracts the system already has today.
+Replace LogPose's local per-collection placement files with an authoritative metadata plane that can support multi-node and eventually multi-cluster serving, failover, and explicit read-barrier contracts without losing the clean operator contracts the system already has today.
 
 ## Status
 
-This milestone is complete as of April 19, 2026.
+This milestone is **in progress** as of April 20, 2026.
+
+This branch lands a substantial control-plane slice for one authoritative etcd
+metadata domain, but it does **not** close every exit criterion in this
+milestone yet. Remote multi-cluster replication, discovery, and routing are
+still later work that build on this control plane, and some same-domain
+consistency and validation work remains open too.
 
 LogPose now has:
 
 - authoritative etcd-backed metadata for database descriptors, collection
   descriptors, assignments, and failover-critical owner records
 - membership leases, explicit controller leadership, and watch-driven metadata
-  caches with fail-closed recovery on metadata loss
+  caches, with direct authoritative etcd reads used when serving decisions
+  need to stay safe during cache loss or lag
 - epoch-fenced shard ownership plus public drain, undrain, promote, and
   rebalance controls over REST, gRPC, and CLI
 - replica-aware placement diagnostics with desired replicas, metadata revision,
-  watch lag, ownership epoch, and operator-visible failover reasons
+  ownership epoch, the current `watch_lag` field, and operator-visible
+  failover reasons
 - automatic leader-side owner failover when a desired replica already has
-  materialized local state
+  materialized local state, while stale replicas stay fenced instead of
+  auto-promoting
 - concrete client-visible consistency contracts through exact historical
   snapshots and lower-bound read barriers, including fail-closed behavior after
-  promotion until freshness metadata exists
+  ownership promotion
 - seeded multi-process Podman chaos coverage as the required local
-  control-plane gate for failover, lease loss, partitions, and metadata
-  outages
+  control-plane gate for failover, lease loss, partitions, metadata outages,
+  and stale-replica non-promotion
+
+What is still pending before this milestone can be called complete:
+
+- the product still exposes exact snapshots plus lower-bound read barriers,
+  not the fuller named consistency surface originally sketched for this
+  milestone such as session tokens or bounded-staleness reads
+- replica repair and catch-up exist for the current archive-transfer path, but
+  the broader replica-read serving contract and the richer freshness model are
+  not fully closed yet
+- the branch has targeted etcd, API, config, and docs verification, but the
+  full local completion gate (`scripts/check.sh`, `scripts/pre-push-checks.sh`)
+  was still in progress when this snapshot was pushed
+- the requested five-agent holistic review swarm and the follow-up fix loop are
+  still pending on top of this branch state
 
 The separate [Full-System Simulation](./full-system-simulation.md) milestone is
 still open. That later milestone owns TigerBeetle-style deterministic
@@ -113,8 +136,8 @@ What LogPose built on top of etcd for this milestone:
 - controller election policy and fencing for old leaders
 - shard and replica placement policy
 - failover and promotion state machines
-- replica catch-up and repair logic
-- query and write consistency-mode contracts
+- stale-replica fencing and fail-closed read-barrier behavior
+- exact snapshot plus lower-bound read-barrier contracts
 - data-plane split-brain prevention and ownership enforcement
 
 ## Consistency Contracts Added
@@ -128,9 +151,12 @@ The current client-visible read contracts are:
 - lower-bound read barriers for current-owner monotonic reads after prior
   writes or reads
 
-Promoted owners fail read barriers closed until freshness metadata exists, so
+Promoted owners fail read barriers closed after ownership promotion, so
 consistency remains explicit instead of becoming a side effect of whichever
-node answered.
+node answered. Read-barrier continuity across ownership promotion is still a
+later feature.
+There are not multiple named consistency levels yet; the product exposes the
+exact snapshot and lower-bound barrier contract directly.
 
 ## Delivered Work Streams
 
@@ -149,8 +175,8 @@ node answered.
   assignments, membership records, leadership records, owner epochs, and
   failover reasons
 - services load a point-in-time snapshot, watch for changes from that
-  revision, and fail closed on watch or snapshot loss until the metadata view
-  is re-established
+  revision, and fall back to direct authoritative etcd reads when the watch
+  cache is unavailable so serving decisions stay fenced by current metadata
 - `placement.json` remains a local recovery artifact only; it is not the
   authority once the etcd backend is selected
 
@@ -179,40 +205,42 @@ node answered.
 ### 5. Operator Surfaces
 
 - runtime status and placement diagnostics now expose metadata revision,
-  ownership epoch, replica targets, watch lag, and failover reasons
+  ownership epoch, replica targets, the current `watch_lag` field, and
+  failover reasons
 - public CLI, REST, and gRPC controls exist for drain, undrain, promote, and
   rebalance workflows
 - the seeded Podman chaos harness is now the checked local gate for metadata
-  outage, failover, membership churn, and partition recovery
+  outage, failover, membership churn, partition recovery, and stale-replica
+  non-promotion
 
-## Testing And Validation At Completion
+## Current Validation
 
-This milestone extends the current testing ladder upward instead of replacing
-it.
+This branch extends the current testing ladder upward instead of replacing it.
+What has been verified on this branch so far:
 
 - unit and service-boundary tests cover watch-state handling, CAS conflicts,
   lease expiry, read-barrier fencing, and control-plane routing decisions
 - real etcd integration tests cover snapshot plus watch catch-up, membership
-  leases, leadership handoff, public promotion, automatic failover, and
-  fail-closed behavior on metadata loss
-- seeded Podman chaos campaigns now act as the required local PR gate for the
-  multi-node control plane
+  leases, leadership handoff, public promotion, automatic failover, stale
+  replica fencing, and fail-closed behavior on metadata loss
+- mdBook documentation still builds cleanly
+- seeded Podman chaos campaigns are the intended required local PR gate for the
+  multi-node control plane, but the full end-to-end `scripts/check.sh` run was
+  interrupted before this branch snapshot was published
 - the later full-system simulation milestone still owns deterministic
   whole-system event replay and virtual-time campaigns
 
-## Completed Exit Criteria
+## Remaining Exit Criteria
 
-- etcd-backed metadata is authoritative for catalog, placement, and
-  failover-critical state
-- nodes register membership through leases and lose liveness by lease expiry
-- controller leader election and fencing are explicit and tested
-- placement is replica-aware instead of only collection-to-node local metadata
-- ownership is epoch-based and prevents double serving
-- failover and promotion behavior are deterministic and operator-visible
-- client-visible consistency contracts now exist beyond local-node behavior via
-  exact snapshots and lower-bound read barriers
-- operators can inspect metadata revision, ownership epoch, replica targets,
-  watch lag, and failover reasons
-- multi-process tests plus the seeded Podman chaos gate cover metadata loss,
-  failover, and recovery; the separate full-system simulation milestone goes
-  further with deterministic whole-system replay
+The milestone should only be marked complete once all of these are true:
+
+- the current exact-snapshot and read-barrier contract is either accepted as
+  the final consistency surface for this milestone or is expanded into the
+  richer named consistency and session-token model originally planned
+- replica repair, catch-up, and freshness semantics are documented and exposed
+  clearly enough that replica serving behavior is operator-visible instead of
+  inferred from current implementation details
+- the full local completion gate finishes cleanly on the branch, including the
+  repo-wide `scripts/check.sh` path and `scripts/pre-push-checks.sh`
+- the requested five-agent holistic review swarm is completed on the current
+  branch state, and any serious findings from that review loop are fixed

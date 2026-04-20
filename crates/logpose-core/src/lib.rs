@@ -18,7 +18,7 @@ use logpose_types::{
 use serde::Serialize;
 #[cfg(test)]
 use serde_json as _;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 #[cfg(test)]
 use tokio as _;
 
@@ -103,6 +103,7 @@ impl AppState {
             config.clone(),
             build.clone(),
         ));
+        control.register_local_replica_archive_exporter();
         control
             .sync_bootstrap_principals()
             .expect("failed to persist bootstrap principals");
@@ -169,6 +170,17 @@ impl AppState {
         self.control.node_membership_status(node_id).await
     }
 
+    /// Export one locally owned collection as an internal replica-repair archive.
+    pub async fn export_local_replica_archive(
+        &self,
+        collection_name: &str,
+        expected_snapshot: Option<&Snapshot>,
+    ) -> ServiceResult<PathBuf> {
+        self.control
+            .export_local_replica_archive(collection_name, expected_snapshot)
+            .await
+    }
+
     /// Mark one node as draining after enforcing operator access when auth is enabled.
     pub async fn drain_node_with_auth(
         &self,
@@ -204,7 +216,11 @@ impl AppState {
         self.require_control_plane_collection_mutation()?;
         self.ensure_shared_database_descriptor(&request.database_name)
             .await?;
-        self.control.create_collection(request).await
+        let descriptor = self.control.create_collection(request).await?;
+        self.control
+            .acknowledge_local_replica_update(&descriptor.lookup_name(), None, true)
+            .await?;
+        Ok(descriptor)
     }
 
     /// Create or replace one database-scoped access policy after enforcing owner access.
@@ -315,7 +331,33 @@ impl AppState {
         self.control
             .require_local_write_ownership(collection_name)
             .await?;
-        self.data.write(collection_name, operations).await
+        let stale_report_already_cleared = self
+            .control
+            .prepare_local_replica_update(collection_name)
+            .await?;
+        let ack = match self.data.write(collection_name, operations).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                return match self
+                    .control
+                    .restore_local_replica_report_after_failed_update(collection_name)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(ServiceError::Internal(format!(
+                        "write for collection '{collection_name}' failed with '{error}', and restoring authoritative replica metadata also failed with '{restore_error}'"
+                    ))),
+                };
+            }
+        };
+        self.control
+            .acknowledge_local_replica_update(
+                collection_name,
+                Some(ack.snapshot.clone()),
+                stale_report_already_cleared,
+            )
+            .await?;
+        Ok(ack)
     }
 
     /// Execute a query after enforcing database read access when auth is enabled.
@@ -441,7 +483,33 @@ impl AppState {
         self.control
             .require_local_write_ownership(collection_name)
             .await?;
-        self.data.flush(collection_name).await
+        let stale_report_already_cleared = self
+            .control
+            .prepare_local_replica_update(collection_name)
+            .await?;
+        let snapshot = match self.data.flush(collection_name).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return match self
+                    .control
+                    .restore_local_replica_report_after_failed_update(collection_name)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(ServiceError::Internal(format!(
+                        "flush for collection '{collection_name}' failed with '{error}', and restoring authoritative replica metadata also failed with '{restore_error}'"
+                    ))),
+                };
+            }
+        };
+        self.control
+            .acknowledge_local_replica_update(
+                collection_name,
+                Some(snapshot.clone()),
+                stale_report_already_cleared,
+            )
+            .await?;
+        Ok(snapshot)
     }
 
     /// Compact one collection after enforcing database write access when auth is enabled.
@@ -465,7 +533,33 @@ impl AppState {
         self.control
             .require_local_write_ownership(collection_name)
             .await?;
-        self.data.compact(collection_name).await
+        let stale_report_already_cleared = self
+            .control
+            .prepare_local_replica_update(collection_name)
+            .await?;
+        let snapshot = match self.data.compact(collection_name).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return match self
+                    .control
+                    .restore_local_replica_report_after_failed_update(collection_name)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(ServiceError::Internal(format!(
+                        "compact for collection '{collection_name}' failed with '{error}', and restoring authoritative replica metadata also failed with '{restore_error}'"
+                    ))),
+                };
+            }
+        };
+        self.control
+            .acknowledge_local_replica_update(
+                collection_name,
+                Some(snapshot.clone()),
+                stale_report_already_cleared,
+            )
+            .await?;
+        Ok(snapshot)
     }
 
     /// Inspect one collection after enforcing database read access when auth is enabled.

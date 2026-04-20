@@ -50,8 +50,15 @@ Operationally, LogPose is still earlier than a distributed database:
   leases, public drain, undrain, promote, and rebalance controls,
   replica-aware placement diagnostics, and seeded Podman chaos validation are
   now in place, but automatic owner failover still promotes only a desired
-  replica that already has local materialized state; remote artifact transfer
-  remains a later storage concern
+  replica that already has local materialized state; stale replicas stay
+  fenced and do not auto-promote; background replica repair now transfers
+  authenticated archive snapshots over the internal REST path instead of
+  relying on an out-of-band operator copy step
+- the current etcd-backed coordination plane is one authoritative cluster
+  domain keyed by `metadata.etcd.cluster_name`; cross-cluster replication and
+  routing remain later work
+- the current client-visible read contract is exact snapshots plus
+  lower-bound read barriers, not multiple named consistency levels
 - bootstrap bearer authentication, operator-gated database admin, and database-scoped read/write/owner policies now exist, but principal lifecycle and richer policy listing/delete workflows are not complete
 - health and readiness are still simple role-oriented signals, not dependency-aware distributed probes
 - richer namespace controllers, auditability, and deeper operator workflows are

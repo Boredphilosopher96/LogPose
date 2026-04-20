@@ -6,7 +6,7 @@ use logpose_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 /// Runtime configuration for the LogPose platform.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -18,10 +18,16 @@ pub struct LogPoseConfig {
     pub node_role: NodeRole,
     /// Host address for the REST listener.
     pub rest_host: String,
+    /// Peer-visible host advertised for the REST endpoint.
+    #[serde(default)]
+    pub rest_advertise_host: Option<String>,
     /// Port for the REST listener.
     pub rest_port: u16,
     /// Host address for the gRPC listener.
     pub grpc_host: String,
+    /// Peer-visible host advertised for the gRPC endpoint.
+    #[serde(default)]
+    pub grpc_advertise_host: Option<String>,
     /// Port for the gRPC listener.
     pub grpc_port: u16,
     /// Default log filter string.
@@ -34,6 +40,9 @@ pub struct LogPoseConfig {
     /// Authentication bootstrap configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Internal peer-to-peer coordination settings.
+    #[serde(default)]
+    pub internal: InternalConfig,
 }
 
 /// Authentication bootstrap and runtime configuration.
@@ -42,6 +51,43 @@ pub struct AuthConfig {
     /// Static bearer tokens bound to explicit principals for bootstrapping.
     #[serde(default)]
     pub bootstrap_tokens: Vec<BootstrapTokenConfig>,
+}
+
+/// Internal peer-to-peer coordination settings.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InternalConfig {
+    /// Shared bearer token required for internal replica transfer.
+    #[serde(default)]
+    pub replica_token: Option<String>,
+    /// Per-request timeout for internal replica transfer over HTTP.
+    #[serde(default = "default_replica_transfer_timeout_ms")]
+    pub replica_transfer_timeout_ms: u64,
+    /// Explicit single-host escape hatch for loopback or otherwise non-routable replica endpoints.
+    #[serde(default)]
+    pub allow_non_routable_rest_advertise_host: bool,
+}
+
+impl Default for InternalConfig {
+    fn default() -> Self {
+        Self {
+            replica_token: None,
+            replica_transfer_timeout_ms: default_replica_transfer_timeout_ms(),
+            allow_non_routable_rest_advertise_host: false,
+        }
+    }
+}
+
+impl InternalConfig {
+    fn validate(&self) -> Result<()> {
+        validate_optional_token("internal.replica_token", &self.replica_token)?;
+        if self.replica_transfer_timeout_ms == 0 {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: internal.replica_transfer_timeout_ms must be greater than zero"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl AuthConfig {
@@ -100,13 +146,16 @@ impl Default for LogPoseConfig {
             node_name: "logpose-node-1".to_owned(),
             node_role: NodeRole::Combined,
             rest_host: "127.0.0.1".to_owned(),
+            rest_advertise_host: None,
             rest_port: 8080,
             grpc_host: "127.0.0.1".to_owned(),
+            grpc_advertise_host: None,
             grpc_port: 50051,
             log_filter: "info,logpose=debug".to_owned(),
             storage_root: PathBuf::from(".logpose"),
             metadata: MetadataConfig::default(),
             auth: AuthConfig::default(),
+            internal: InternalConfig::default(),
         }
     }
 }
@@ -120,12 +169,16 @@ impl LogPoseConfig {
                 ANONYMOUS_LOCAL_NODE_NAME
             )));
         }
+        validate_optional_advertise_host("rest_advertise_host", &self.rest_advertise_host)?;
+        validate_optional_advertise_host("grpc_advertise_host", &self.grpc_advertise_host)?;
+        self.internal.validate()?;
         if self.metadata.backend == MetadataBackend::Etcd {
             self.metadata.etcd.validate().map_err(|error| match error {
                 LogPoseError::Message(message) => {
                     LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {message}"))
                 }
             })?;
+            self.validate_etcd_peer_connectivity()?;
         }
         self.auth.validate()?;
         Ok(())
@@ -150,6 +203,116 @@ impl LogPoseConfig {
             }
         }
     }
+
+    /// Return the peer-visible REST host, falling back to the bind host.
+    #[must_use]
+    pub fn advertised_rest_host(&self) -> &str {
+        self.rest_advertise_host
+            .as_deref()
+            .unwrap_or(&self.rest_host)
+    }
+
+    /// Return the peer-visible gRPC host, falling back to the bind host.
+    #[must_use]
+    pub fn advertised_grpc_host(&self) -> &str {
+        self.grpc_advertise_host
+            .as_deref()
+            .unwrap_or(&self.grpc_host)
+    }
+
+    fn validate_etcd_peer_connectivity(&self) -> Result<()> {
+        if !matches!(self.node_role, NodeRole::Combined | NodeRole::Data) {
+            return Ok(());
+        }
+        if self.internal.replica_token.is_none() {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: internal.replica_token must be configured for etcd data-serving nodes"
+                    .to_owned(),
+            ));
+        }
+        if self.rest_advertise_host.is_none()
+            && listener_host_requires_advertise_host(&self.rest_host)
+        {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: rest_advertise_host must be configured for etcd data-serving nodes when rest_host is not peer-routable"
+                    .to_owned(),
+            ));
+        }
+        if self.grpc_advertise_host.is_none()
+            && listener_host_requires_advertise_host(&self.grpc_host)
+        {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: grpc_advertise_host must be configured for etcd data-serving nodes when grpc_host is not peer-routable"
+                    .to_owned(),
+            ));
+        }
+        if listener_host_requires_advertise_host(self.advertised_rest_host())
+            && !self.internal.allow_non_routable_rest_advertise_host
+        {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: advertised REST endpoints for etcd data-serving nodes must be peer-routable unless internal.allow_non_routable_rest_advertise_host = true"
+                    .to_owned(),
+            ));
+        }
+        if listener_host_requires_advertise_host(self.advertised_grpc_host())
+            && !self.internal.allow_non_routable_rest_advertise_host
+        {
+            return Err(LogPoseError::Message(
+                "invalid LOGPOSE_CONFIG: advertised gRPC endpoints for etcd data-serving nodes must be peer-routable unless internal.allow_non_routable_rest_advertise_host = true"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_optional_advertise_host(label: &str, value: &Option<String>) -> Result<()> {
+    let Some(value) = value.as_deref() else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(LogPoseError::Message(format!(
+            "invalid LOGPOSE_CONFIG: {label} must not be empty"
+        )));
+    }
+    if value.trim() != value {
+        return Err(LogPoseError::Message(format!(
+            "invalid LOGPOSE_CONFIG: {label} must not include leading or trailing whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_token(label: &str, value: &Option<String>) -> Result<()> {
+    let Some(value) = value.as_deref() else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        return Err(LogPoseError::Message(format!(
+            "invalid LOGPOSE_CONFIG: {label} must not be empty"
+        )));
+    }
+    if value.trim() != value {
+        return Err(LogPoseError::Message(format!(
+            "invalid LOGPOSE_CONFIG: {label} must not include leading or trailing whitespace"
+        )));
+    }
+    Ok(())
+}
+
+fn listener_host_requires_advertise_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed == "[::1]" {
+        return true;
+    }
+    trimmed
+        .parse::<IpAddr>()
+        .map(|address| address.is_unspecified() || address.is_loopback())
+        .unwrap_or(false)
+}
+
+const fn default_replica_transfer_timeout_ms() -> u64 {
+    5_000
 }
 
 #[cfg(test)]
@@ -179,6 +342,8 @@ storage_root = "tmp/logpose-data""#,
         assert_eq!(config.node_role, NodeRole::Data);
         assert_eq!(config.rest_port, 18080);
         assert_eq!(config.metadata.backend.to_string(), "local");
+        assert_eq!(config.advertised_rest_host(), "0.0.0.0");
+        assert_eq!(config.advertised_grpc_host(), "0.0.0.0");
     }
 
     #[test]
@@ -187,8 +352,10 @@ storage_root = "tmp/logpose-data""#,
             r#"node_name = "edge-a"
 rest_host = "0.0.0.0"
 rest_port = 18080
+rest_advertise_host = "127.0.0.1"
 grpc_host = "0.0.0.0"
 grpc_port = 15051
+grpc_advertise_host = "127.0.0.1"
 log_filter = "info"
 storage_root = "tmp/logpose-data"
 
@@ -201,7 +368,11 @@ key_prefix = "/logpose/prod"
 timeout_ms = 900
 membership_ttl_secs = 25
 leadership_ttl_secs = 12
-cluster_name = "prod-cluster""#,
+cluster_name = "prod-cluster"
+
+[internal]
+replica_token = "replica-secret"
+allow_non_routable_rest_advertise_host = true"#,
         )
         .expect("config should load");
 
@@ -237,12 +408,180 @@ storage_root = "tmp/logpose-data""#,
     }
 
     #[test]
+    fn from_toml_str_reads_advertised_hosts() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_advertise_host = "node-a"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_advertise_host = "node-a"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data""#,
+        )
+        .expect("config should load");
+
+        assert_eq!(config.advertised_rest_host(), "node-a");
+        assert_eq!(config.advertised_grpc_host(), "node-a");
+    }
+
+    #[test]
+    fn from_toml_str_rejects_blank_advertised_hosts() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_advertise_host = " "
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data""#,
+        )
+        .expect_err("blank advertised host should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("rest_advertise_host must not be empty")
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_etcd_data_node_without_replica_token() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+node_role = "data"
+rest_host = "127.0.0.1"
+rest_port = 18080
+grpc_host = "127.0.0.1"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379"]
+cluster_name = "prod-cluster""#,
+        )
+        .expect_err("etcd data nodes should require an internal replica token");
+
+        assert!(
+            error
+                .to_string()
+                .contains("internal.replica_token must be configured"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_etcd_data_node_with_wildcard_rest_host_and_missing_advertise_host() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+node_role = "data"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "127.0.0.1"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://127.0.0.1:2379"]
+cluster_name = "prod-cluster"
+
+[internal]
+replica_token = "replica-secret""#,
+        )
+        .expect_err("wildcard etcd data nodes should require an advertised REST host");
+
+        assert!(
+            error
+                .to_string()
+                .contains("rest_advertise_host must be configured"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_rejects_remote_etcd_data_node_with_loopback_rest_advertise_host() {
+        let error = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+node_role = "data"
+rest_host = "0.0.0.0"
+rest_advertise_host = "127.0.0.1"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_advertise_host = "edge-a.internal"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://10.0.0.5:2379"]
+cluster_name = "prod-cluster"
+
+[internal]
+replica_token = "replica-secret""#,
+        )
+        .expect_err("etcd data nodes should require a peer-routable REST advertise host unless explicitly overridden");
+
+        assert!(
+            error.to_string().contains(
+                "advertised REST endpoints for etcd data-serving nodes must be peer-routable unless internal.allow_non_routable_rest_advertise_host = true"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_allows_loopback_rest_advertise_host_with_explicit_override() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+node_role = "data"
+rest_host = "0.0.0.0"
+rest_advertise_host = "127.0.0.1"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_advertise_host = "127.0.0.1"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+
+[metadata]
+backend = "etcd"
+
+[metadata.etcd]
+endpoints = ["http://10.0.0.5:2379"]
+cluster_name = "prod-cluster"
+
+[internal]
+replica_token = "replica-secret"
+allow_non_routable_rest_advertise_host = true"#,
+        )
+        .expect("explicit loopback override should allow single-host development config");
+
+        assert!(config.internal.allow_non_routable_rest_advertise_host);
+        assert_eq!(config.advertised_rest_host(), "127.0.0.1");
+    }
+
+    #[test]
     fn from_toml_str_rejects_etcd_backend_with_empty_endpoints() {
         let error = LogPoseConfig::from_toml_str(
             r#"node_name = "edge-a"
 rest_host = "0.0.0.0"
+rest_advertise_host = "edge-a.internal"
 rest_port = 18080
 grpc_host = "0.0.0.0"
+grpc_advertise_host = "edge-a.internal"
 grpc_port = 15051
 log_filter = "info"
 storage_root = "tmp/logpose-data"
@@ -263,8 +602,10 @@ endpoints = []"#,
         let error = LogPoseConfig::from_toml_str(
             r#"node_name = "edge-a"
 rest_host = "0.0.0.0"
+rest_advertise_host = "edge-a.internal"
 rest_port = 18080
 grpc_host = "0.0.0.0"
+grpc_advertise_host = "edge-a.internal"
 grpc_port = 15051
 log_filter = "info"
 storage_root = "tmp/logpose-data"
@@ -286,8 +627,10 @@ cluster_name = "   ""#,
         let error = LogPoseConfig::from_toml_str(
             r#"node_name = "edge-a"
 rest_host = "0.0.0.0"
+rest_advertise_host = "edge-a.internal"
 rest_port = 18080
 grpc_host = "0.0.0.0"
+grpc_advertise_host = "edge-a.internal"
 grpc_port = 15051
 log_filter = "info"
 storage_root = "tmp/logpose-data"

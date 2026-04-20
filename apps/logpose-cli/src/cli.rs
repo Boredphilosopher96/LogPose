@@ -9,6 +9,16 @@ use logpose_storage::InspectTarget;
 use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME};
 use std::path::PathBuf;
 
+fn parse_replication_factor(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{value}' for replication factor"))?;
+    if parsed == 0 {
+        return Err("replication factor must be greater than 0".to_owned());
+    }
+    Ok(parsed)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputMode {
     Human,
@@ -646,6 +656,7 @@ pub struct CollectionCreateArgs {
     pub metric: MetricArg,
     #[arg(
         long,
+        value_parser = parse_replication_factor,
         default_value_t = 1,
         value_name = "REPLICAS",
         help = "Desired total replica count, including the owner. Example: 2"
@@ -1043,6 +1054,24 @@ mod tests {
         };
         assert_eq!(collection.database_name, "analytics");
         assert_eq!(collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn collection_create_rejects_zero_replication_factor() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "collection",
+            "create",
+            "colors",
+            "--dimensions",
+            "2",
+            "--metric",
+            "dot",
+            "--replication-factor",
+            "0",
+        ]);
+
+        assert!(cli.is_err(), "zero replication factor should be rejected");
     }
 
     #[test]

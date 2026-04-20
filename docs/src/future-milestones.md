@@ -16,7 +16,8 @@ The original phase roadmap is complete. LogPose already has:
 - [multi-cluster metadata and consistency](./future-milestones/multicluster-metadata-and-consistency.md):
   authoritative etcd-backed descriptors and assignments, membership leases,
   controller fencing, public drain, promote, and rebalance controls,
-  replica-aware placement diagnostics, and the seeded Podman chaos gate
+  replica-aware placement diagnostics, and the seeded Podman chaos gate,
+  with the milestone page tracking what is already landed versus still pending
 - layered integration, randomized, process-boundary, and deterministic service-boundary testing
 
 What remains is the next layer of system work: turning those local contracts into resilient multi-node behavior, broadening the vector operator family, deepening the testing model, and adding the missing product surfaces around storage and operations.

@@ -14,7 +14,7 @@ use logpose_types::{
     PutRecord, QueryUnitStats, RecordId, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde_json::{Number, Value};
-use std::{net::SocketAddr, sync::Arc};
+use std::{convert::TryFrom, net::SocketAddr, sync::Arc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_health::server::health_reporter;
@@ -221,7 +221,9 @@ impl LogPoseService for GrpcLogPoseService {
                     request.dimensions as usize,
                     metric_from_proto(request.metric)?,
                 )
-                .with_replication_factor(normalize_replication_factor(request.replication_factor)),
+                .with_replication_factor(replication_factor_from_proto(
+                    request.replication_factor,
+                )?),
             )
             .await
             .map_err(status_from_service_error)?;
@@ -508,7 +510,7 @@ impl LogPoseService for GrpcLogPoseService {
             .set_database_access_policy_with_auth(&auth, policy)
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(stored)))
+        Ok(Response::new(database_access_policy_to_proto(stored)?))
     }
 
     async fn get_database_policy(
@@ -523,7 +525,7 @@ impl LogPoseService for GrpcLogPoseService {
             .database_access_policy_with_auth(&auth, &database_name)
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(policy)))
+        Ok(Response::new(database_access_policy_to_proto(policy)?))
     }
 }
 
@@ -852,11 +854,16 @@ fn collection_descriptor_reply(
     }
 }
 
-fn normalize_replication_factor(replication_factor: u64) -> usize {
+fn replication_factor_from_proto(replication_factor: u64) -> Result<usize, Status> {
+    let replication_factor = usize::try_from(replication_factor)
+        .map_err(|_| Status::invalid_argument("replication_factor must fit into usize"))?;
+
     if replication_factor == 0 {
-        1
+        Err(Status::invalid_argument(
+            "replication_factor must be greater than 0",
+        ))
     } else {
-        replication_factor as usize
+        Ok(replication_factor)
     }
 }
 
@@ -968,16 +975,18 @@ fn collection_stats_reply_from_domain(
     })
 }
 
-fn database_access_policy_to_proto(policy: DatabaseAccessPolicy) -> DatabaseAccessPolicyReply {
-    DatabaseAccessPolicyReply {
+fn database_access_policy_to_proto(
+    policy: DatabaseAccessPolicy,
+) -> Result<DatabaseAccessPolicyReply, Status> {
+    Ok(DatabaseAccessPolicyReply {
         database_name: policy.database_name,
-        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
+        authentication_mode: authentication_mode_to_proto(policy.authentication_mode)? as i32,
         role_bindings: policy
             .role_bindings
             .into_iter()
             .map(database_role_binding_to_proto)
             .collect(),
-    }
+    })
 }
 
 fn database_access_policy_from_proto(
@@ -1045,12 +1054,15 @@ fn node_role_to_proto(role: NodeRole) -> ProtoNodeRole {
     }
 }
 
-fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
+fn authentication_mode_to_proto(
+    mode: AuthenticationMode,
+) -> Result<proto::AuthenticationMode, Status> {
     match mode {
-        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
-        AuthenticationMode::Password => proto::AuthenticationMode::Password,
-        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
-        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
+        AuthenticationMode::Disabled => Ok(proto::AuthenticationMode::Disabled),
+        AuthenticationMode::ExternalToken => Ok(proto::AuthenticationMode::ExternalToken),
+        AuthenticationMode::Password | AuthenticationMode::MutualTls => Err(Status::internal(
+            "unsupported authentication mode reached the gRPC transport",
+        )),
     }
 }
 
@@ -1059,8 +1071,6 @@ fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, Statu
         Status::invalid_argument(format!("unsupported authentication mode '{mode}'"))
     })? {
         proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
-        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
-        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
         proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
         proto::AuthenticationMode::Unspecified => {
             Err(Status::invalid_argument("authentication mode is required"))
@@ -1396,6 +1406,25 @@ mod tests {
 
         assert_eq!(create.database_name, "analytics");
         assert_eq!(create.replication_factor, 3);
+    }
+
+    #[tokio::test]
+    async fn grpc_service_rejects_zero_replication_factor() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-replicas"))));
+
+        let error = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+                database_name: "analytics".to_owned(),
+                replication_factor: 0,
+            }))
+            .await
+            .expect_err("zero replication factor should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

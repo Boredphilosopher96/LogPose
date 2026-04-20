@@ -98,13 +98,16 @@ impl TestServerFixture {
                 node_name: node_name.to_owned(),
                 node_role,
                 rest_host: rest_host.to_owned(),
+                rest_advertise_host: None,
                 rest_port: rest_addr.port(),
                 grpc_host: grpc_host.to_owned(),
+                grpc_advertise_host: None,
                 grpc_port: grpc_addr.port(),
                 log_filter: "info".to_owned(),
                 storage_root: storage_root.clone(),
                 metadata: Default::default(),
                 auth: auth.clone(),
+                internal: Default::default(),
             }));
             let mut server = runtime.spawn(async move {
                 let rest_listener = tokio::net::TcpListener::from_std(rest_listener)

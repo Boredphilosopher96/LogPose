@@ -27,6 +27,8 @@ The current repo truth for the local chaos flow is:
 Public REST, gRPC, and CLI APIs now exist for drain, undrain, promote, and
 rebalance workflows. The etcd helper is still useful when you want raw
 metadata inspection or a direct low-level promotion primitive during debugging.
+The current read contract is exact snapshots plus lower-bound read barriers;
+there are not multiple named consistency levels in the product yet.
 
 `scripts/check-chaos.sh` fixes the wrapper contract around these commands:
 
@@ -54,6 +56,7 @@ The checked scenario set is:
 - `new-node-registration`
 - `concurrent-writers`
 - `owner-failover`
+- `stale-replica-non-promotion`
 - `leader-failover`
 - `lagging-node-rejoin`
 - `etcd-outage`
@@ -100,8 +103,10 @@ shape for `node-a` is:
 node_name = "node-a"
 node_role = "combined"
 rest_host = "0.0.0.0"
+rest_advertise_host = "node-a"
 rest_port = 8080
 grpc_host = "0.0.0.0"
+grpc_advertise_host = "node-a"
 grpc_port = 50051
 log_filter = "info,logpose=debug"
 storage_root = "/var/lib/logpose"
@@ -116,10 +121,18 @@ timeout_ms = 1500
 membership_ttl_secs = 4
 leadership_ttl_secs = 3
 cluster_name = "podman-chaos"
+
+[internal]
+replica_token = "podman-chaos-replica-token"
+replica_transfer_timeout_ms = 30000
 ```
 
 Change only the cluster name, node name, and host-side mount roots through the
 wrapper. Keep the etcd metadata section shared across the cluster.
+The wrapper binds listeners on `0.0.0.0` inside each container but advertises
+the stable Podman network alias for cross-node repair and placement metadata.
+Background replica repair uses authenticated cluster-internal REST between nodes,
+and the rendered advertise hosts satisfy that peer-connectivity requirement.
 
 ## Prerequisites
 
@@ -186,6 +199,7 @@ Operator rules:
   mirror the collection's local state into that node's `storage_root` before
   the ownership move; the current automatic failover path only promotes a
   desired replica that already has materialized local state
+- stale replicas stay fenced after owner loss and do not auto-promote
 
 Optional overrides:
 
@@ -243,6 +257,7 @@ Run named scenarios directly:
 ```bash
 ./scripts/podman-chaos.sh scenario smoke --cluster pr4-chaos
 ./scripts/podman-chaos.sh scenario owner-failover --cluster pr4-chaos
+./scripts/podman-chaos.sh scenario stale-replica-non-promotion --cluster pr4-chaos
 ./scripts/podman-chaos.sh scenario partition-heal --cluster pr4-chaos
 ```
 
@@ -334,12 +349,28 @@ current owner disappears.
 
 Required invariants:
 
-- the old owner can be stopped while a write is in flight
+- the old owner is stopped only after an acknowledged write and an automatically
+  repaired ready replica already exist
 - shard ownership is promoted through etcd compare-and-swap, not blind update
-- promotion happens only after a desired replica already has mirrored local
-  state and the surviving leader observes the owner as lost
+- promotion happens only after a desired replica already has ready local state
+  through the normal repair path and the surviving leader observes the owner as
+  lost
 - post-promotion read barriers fail closed until replica freshness metadata
   exists
+
+### `stale-replica-non-promotion`
+
+Use `stale-replica-non-promotion` to verify that a replica which fell behind
+after mirroring stays fenced when the owner disappears.
+
+Required invariants:
+
+- the owner is written again after the follower is mirrored, so the follower
+  becomes stale
+- the surviving node becomes the local leader but keeps the old owner fenced
+- placement still reports the stale replica under the old owner and the
+  ownership epoch does not advance
+- direct writes against the stale replica fail because it is not locally served
 
 ### `leader-failover`
 
@@ -350,9 +381,9 @@ Required invariants:
 
 - the stopped node disappears from visible membership
 - a surviving combined node becomes the promoted owner
-- new writes succeed on the promoted owner after local state is mirrored
-- the scenario proves promotion-on-preseeded-state, not background replica
-  catch-up
+- new writes succeed on the promoted owner after the background replica repair
+  path has made it ready
+- the scenario proves automatic replica catch-up, not only manual mirroring
 
 ### `lagging-node-rejoin`
 

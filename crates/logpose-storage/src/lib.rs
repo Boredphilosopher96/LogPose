@@ -7,6 +7,7 @@ use rand as _;
 
 use async_trait::async_trait;
 use crc32fast::hash;
+use flate2::{Compression, write::GzEncoder};
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, CollectionDescriptor, DatabaseDescriptor};
 use logpose_index::{
@@ -36,6 +37,7 @@ use std::{
     },
     thread,
 };
+use tar::Builder;
 use uuid::Uuid;
 
 /// Durable storage surface for future engine implementations.
@@ -99,6 +101,37 @@ pub trait StorageEngine: Send + Sync {
         Err(LogPoseError::Message(
             "listing collections is not supported by this storage engine".to_owned(),
         ))
+    }
+
+    /// List the collection descriptors materialized on this node's local storage root.
+    async fn list_local_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.list_collections().await
+    }
+
+    /// Export one locally materialized collection as a stable replica-repair archive.
+    async fn export_local_collection_archive(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<Vec<u8>> {
+        let _ = descriptor;
+        Err(LogPoseError::Message(
+            "local replica archive export is not supported by this storage engine".to_owned(),
+        ))
+    }
+
+    /// Export one locally materialized collection archive directly to a file.
+    async fn export_local_collection_archive_to_path(
+        &self,
+        descriptor: &CollectionDescriptor,
+        archive_path: &Path,
+    ) -> Result<()> {
+        let archive = self.export_local_collection_archive(descriptor).await?;
+        fs::write(archive_path, archive).map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to write replica archive to '{}': {error}",
+                archive_path.display()
+            ))
+        })
     }
 
     /// Load the persisted placement assignment for a collection descriptor.
@@ -475,6 +508,87 @@ impl LocalStorageEngine {
         descriptor.root_path.join("descriptor.json")
     }
 
+    fn archive_collection_root_to_writer<W: Write>(root: &Path, writer: W) -> Result<W> {
+        let encoder = GzEncoder::new(writer, Compression::default());
+        let mut builder = Builder::new(encoder);
+        builder.append_dir_all(".", root).map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to archive collection state from '{}': {error}",
+                root.display()
+            ))
+        })?;
+        let encoder = builder.into_inner().map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to finalize collection archive for '{}': {error}",
+                root.display()
+            ))
+        })?;
+        encoder.finish().map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to finish collection archive for '{}': {error}",
+                root.display()
+            ))
+        })
+    }
+
+    fn archive_collection_root(root: &Path) -> Result<Vec<u8>> {
+        Self::archive_collection_root_to_writer(root, Vec::new())
+    }
+
+    fn archive_collection_root_to_path(root: &Path, archive_path: &Path) -> Result<()> {
+        let parent = archive_path.parent().ok_or_else(|| {
+            LogPoseError::Message(format!(
+                "replica archive path '{}' is missing a parent directory",
+                archive_path.display()
+            ))
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to create replica archive directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+        let file = File::create(archive_path).map_err(|error| {
+            LogPoseError::Message(format!(
+                "failed to create replica archive '{}': {error}",
+                archive_path.display()
+            ))
+        })?;
+        let _ = Self::archive_collection_root_to_writer(root, file)?;
+        Ok(())
+    }
+
+    fn export_collection_archive_locked(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<Vec<u8>> {
+        let manifest_lock = maintenance_operation_lock(&descriptor.root_path);
+        let _manifest_guard = manifest_lock
+            .lock()
+            .expect("maintenance operation lock should not be poisoned");
+        let wal_lock = wal_rotation_lock(&descriptor.root_path);
+        let _wal_guard = wal_lock
+            .lock()
+            .expect("wal rotation lock should not be poisoned");
+        Self::archive_collection_root(&descriptor.root_path)
+    }
+
+    fn export_collection_archive_to_path_locked(
+        &self,
+        descriptor: &CollectionDescriptor,
+        archive_path: &Path,
+    ) -> Result<()> {
+        let manifest_lock = maintenance_operation_lock(&descriptor.root_path);
+        let _manifest_guard = manifest_lock
+            .lock()
+            .expect("maintenance operation lock should not be poisoned");
+        let wal_lock = wal_rotation_lock(&descriptor.root_path);
+        let _wal_guard = wal_lock
+            .lock()
+            .expect("wal rotation lock should not be poisoned");
+        Self::archive_collection_root_to_path(&descriptor.root_path, archive_path)
+    }
+
     /// Build the descriptor that would be persisted for one collection request.
     pub fn plan_collection_descriptor(
         &self,
@@ -800,12 +914,16 @@ impl LocalStorageEngine {
         {
             let entry =
                 entry.map_err(|error| io_message("failed to read collection entry", error))?;
-            let path = entry.path().join("descriptor.json");
+            let collection_root = entry.path();
+            let path = collection_root.join("descriptor.json");
             if !path.exists() {
                 continue;
             }
 
-            let descriptor = read_json::<CollectionDescriptor>(&path)?;
+            let descriptor = normalize_collection_descriptor_root(
+                read_json::<CollectionDescriptor>(&path)?,
+                collection_root,
+            );
             if descriptor.database_name == collection.database_name
                 && descriptor.name == collection.collection_name
             {
@@ -832,12 +950,16 @@ impl LocalStorageEngine {
         {
             let entry =
                 entry.map_err(|error| io_message("failed to read collection entry", error))?;
-            let path = entry.path().join("descriptor.json");
+            let collection_root = entry.path();
+            let path = collection_root.join("descriptor.json");
             if !path.exists() {
                 continue;
             }
 
-            let descriptor = read_json::<CollectionDescriptor>(&path)?;
+            let descriptor = normalize_collection_descriptor_root(
+                read_json::<CollectionDescriptor>(&path)?,
+                collection_root,
+            );
             descriptor.validate()?;
             descriptors.push(descriptor);
         }
@@ -1783,6 +1905,39 @@ impl StorageEngine for LocalStorageEngine {
 
     async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
         self.list_collection_descriptors()
+    }
+
+    async fn list_local_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.list_collection_descriptors()
+    }
+
+    async fn export_local_collection_archive(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<Vec<u8>> {
+        let local_descriptor = self.find_collection_descriptor(&descriptor.lookup_name())?;
+        if !local_descriptor.matches_serving_identity(descriptor) {
+            return Err(LogPoseError::Message(format!(
+                "local collection '{}' does not match the requested descriptor identity",
+                descriptor.lookup_name()
+            )));
+        }
+        self.export_collection_archive_locked(&local_descriptor)
+    }
+
+    async fn export_local_collection_archive_to_path(
+        &self,
+        descriptor: &CollectionDescriptor,
+        archive_path: &Path,
+    ) -> Result<()> {
+        let local_descriptor = self.find_collection_descriptor(&descriptor.lookup_name())?;
+        if !local_descriptor.matches_serving_identity(descriptor) {
+            return Err(LogPoseError::Message(format!(
+                "local collection '{}' does not match the requested descriptor identity",
+                descriptor.lookup_name()
+            )));
+        }
+        self.export_collection_archive_to_path_locked(&local_descriptor, archive_path)
     }
 
     async fn collection_assignment_descriptor(
@@ -2873,6 +3028,14 @@ where
 {
     let bytes = fs::read(path).map_err(|error| io_message("failed to read JSON file", error))?;
     serde_json::from_slice(&bytes).map_err(json_message)
+}
+
+fn normalize_collection_descriptor_root(
+    mut descriptor: CollectionDescriptor,
+    collection_root: PathBuf,
+) -> CollectionDescriptor {
+    descriptor.root_path = collection_root;
+    descriptor
 }
 
 fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {

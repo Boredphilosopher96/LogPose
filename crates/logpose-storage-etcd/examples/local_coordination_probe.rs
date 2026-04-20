@@ -8,7 +8,9 @@ use logpose_auth as _;
 use logpose_catalog::CollectionDescriptor;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult, ShardOwnership};
-use logpose_types::{CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig};
+use logpose_types::{
+    CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, LeadershipFence,
+};
 use serde as _;
 use std::path::Path;
 use std::time::Duration;
@@ -59,10 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("members: {members:#?}");
 
     let leader = client
-        .try_acquire_leadership("node-a")
+        .try_acquire_leadership("node-a", node_a.lease_id)
         .await?
         .expect("node-a should acquire leadership");
-    let second_leader = client.try_acquire_leadership("node-b").await?;
+    let second_leader = client
+        .try_acquire_leadership("node-b", node_b.lease_id)
+        .await?;
     println!("leader: {leader:#?}");
     println!("node-b leadership attempt: {second_leader:#?}");
 
@@ -83,6 +87,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let shard_key = format!(
         "{cluster_prefix}/collections/{}/shards/0/owner",
+        collection.lookup_name()
+    );
+    let replica_a_key = format!(
+        "{cluster_prefix}/collections/{}/shards/0/replicas/node-a",
+        collection.lookup_name()
+    );
+    let replica_b_key = format!(
+        "{cluster_prefix}/collections/{}/shards/0/replicas/node-b",
+        collection.lookup_name()
+    );
+    let replica_c_key = format!(
+        "{cluster_prefix}/collections/{}/shards/0/replicas/node-c",
         collection.lookup_name()
     );
     raw.put(assignment_key, serde_json::to_string(&assignment)?, None)
@@ -106,6 +122,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     raw.put(shard_key, serde_json::to_string(&seed)?, None)
         .await?;
+    raw.put(
+        replica_a_key,
+        serde_json::json!({
+            "node_id": "node-a",
+            "node_role": "combined",
+            "materialized": true,
+            "ownership_epoch": 1,
+            "snapshot": {
+                "manifest_generation": 0,
+                "visible_seq_no": 0,
+            }
+        })
+        .to_string(),
+        None,
+    )
+    .await?;
+    raw.put(
+        replica_b_key,
+        serde_json::json!({
+            "node_id": "node-b",
+            "node_role": "data",
+            "materialized": true,
+            "ownership_epoch": 1,
+            "snapshot": {
+                "manifest_generation": 0,
+                "visible_seq_no": 0,
+            }
+        })
+        .to_string(),
+        None,
+    )
+    .await?;
+    raw.put(
+        replica_c_key,
+        serde_json::json!({
+            "node_id": "node-c",
+            "node_role": "data",
+            "materialized": true,
+            "ownership_epoch": 1,
+            "snapshot": {
+                "manifest_generation": 0,
+                "visible_seq_no": 0,
+            }
+        })
+        .to_string(),
+        None,
+    )
+    .await?;
 
     let current = client
         .shard_owner(&collection, "0")
@@ -115,16 +179,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let contender_b = client.clone();
     let current_for_a = current.clone();
     let current_for_b = current.clone();
+    let leader_fence = LeadershipFence {
+        node_id: leader.node_id.clone(),
+        lease_id: leader.lease_id,
+        membership_lease_id: node_a.lease_id,
+    };
+    let leader_fence_for_a = leader_fence.clone();
+    let leader_fence_for_b = leader_fence.clone();
 
     let (result_a, result_b) = tokio::join!(
         async move {
             contender_a
-                .promote_shard_owner(&current_for_a, "node-b")
+                .promote_shard_owner(&current_for_a, "node-b", &leader_fence_for_a)
                 .await
         },
         async move {
             contender_b
-                .promote_shard_owner(&current_for_b, "node-c")
+                .promote_shard_owner(&current_for_b, "node-c", &leader_fence_for_b)
                 .await
         }
     );

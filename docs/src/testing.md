@@ -83,9 +83,10 @@ This layer already exists in LogPose through CLI server fixtures and snapshot co
 
 The local Podman chaos workflow documented in [Podman Chaos](./podman-chaos.md)
 belongs in this layer. It uses real etcd-backed runtimes, real readiness and
-placement surfaces, and explicit failover invariants. Because LogPose still
-lacks a public shard-promotion API, ownership moves in that workflow remain
-helper-driven rather than endpoint-driven.
+placement surfaces, and explicit failover invariants. LogPose now exposes
+public REST, gRPC, and CLI workflows for drain, undrain, promotion, and
+rebalance, so the chaos scenarios in that workflow should exercise the public
+operator surface rather than helper-only ownership moves.
 
 ### 5. Targeted Fuzzing and Property Tests
 

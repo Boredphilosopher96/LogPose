@@ -762,13 +762,16 @@ fn test_config_with_role(
         node_name: "client-grpc".to_owned(),
         node_role,
         rest_host: rest_addr.ip().to_string(),
+        rest_advertise_host: None,
         rest_port: rest_addr.port(),
         grpc_host: grpc_addr.ip().to_string(),
+        grpc_advertise_host: None,
         grpc_port: grpc_addr.port(),
         log_filter: "info".to_owned(),
         storage_root: root.join("data"),
         metadata: Default::default(),
         auth: Default::default(),
+        internal: Default::default(),
     }
 }
 

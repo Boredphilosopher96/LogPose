@@ -2,6 +2,7 @@
 
 use async_trait as _;
 use axum as _;
+use flate2 as _;
 use http_body_util as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
@@ -21,6 +22,7 @@ use logpose_types::{
     CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
 };
 use rand as _;
+use reqwest as _;
 use serde as _;
 use std::{
     fs,
@@ -28,6 +30,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tar as _;
 use thiserror as _;
 use tokio as _;
 use tonic as _;
@@ -35,7 +38,9 @@ use tower as _;
 
 #[tokio::test]
 async fn control_plane_reports_runtime_status_and_local_placement() {
-    let config = test_config("control-runtime");
+    let mut config = test_config("control-runtime");
+    config.rest_advertise_host = Some("replica-source.internal".to_owned());
+    config.grpc_advertise_host = Some("grpc-source.internal".to_owned());
     let state = Arc::new(AppState::new(config.clone()));
 
     let descriptor = state
@@ -79,11 +84,19 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
     assert_eq!(status.role.as_str(), "combined");
     assert_eq!(
         status.rest_endpoint,
-        format!("http://{}:{}", config.rest_host, config.rest_port)
+        format!(
+            "http://{}:{}",
+            config.advertised_rest_host(),
+            config.rest_port
+        )
     );
     assert_eq!(
         status.grpc_endpoint,
-        format!("http://{}:{}", config.grpc_host, config.grpc_port)
+        format!(
+            "http://{}:{}",
+            config.advertised_grpc_host(),
+            config.grpc_port
+        )
     );
     assert_eq!(status.storage_engine, "local");
     assert!(status.control_plane_ready);

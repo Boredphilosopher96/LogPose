@@ -7,6 +7,7 @@ image_tag_default="localhost/logpose-chaos:dev"
 etcd_image_default="quay.io/coreos/etcd:v3.5.18"
 key_prefix_default="/logpose/chaos"
 machine_name_default="podman-machine-default"
+replica_token_default="podman-chaos-replica-token"
 logpose_server_container_port=8080
 logpose_server_grpc_port=50051
 readonly nodes=("node-a" "node-b" "node-c")
@@ -15,6 +16,7 @@ readonly scenarios=(
     "new-node-registration"
     "concurrent-writers"
     "owner-failover"
+    "stale-replica-non-promotion"
     "leader-failover"
     "lagging-node-rejoin"
     "etcd-outage"
@@ -43,6 +45,7 @@ Scenarios:
   new-node-registration
   concurrent-writers
   owner-failover
+  stale-replica-non-promotion
   leader-failover
   lagging-node-rejoin
   etcd-outage
@@ -55,6 +58,7 @@ Environment:
   LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE Etcd image tag (default: quay.io/coreos/etcd:v3.5.18)
   LOGPOSE_PODMAN_CHAOS_KEY_PREFIX Etcd key prefix (default: /logpose/chaos)
   LOGPOSE_PODMAN_MACHINE_NAME     Podman machine name (default: podman-machine-default)
+  LOGPOSE_PODMAN_CHAOS_REPLICA_TOKEN Internal replica transfer token (default: podman-chaos-replica-token)
 EOF
 }
 
@@ -65,6 +69,7 @@ rebuild_image="${LOGPOSE_PODMAN_CHAOS_REBUILD_IMAGE:-0}"
 etcd_image="${LOGPOSE_PODMAN_CHAOS_ETCD_IMAGE:-$etcd_image_default}"
 key_prefix="${LOGPOSE_PODMAN_CHAOS_KEY_PREFIX:-$key_prefix_default}"
 machine_name="${LOGPOSE_PODMAN_MACHINE_NAME:-$machine_name_default}"
+replica_token="${LOGPOSE_PODMAN_CHAOS_REPLICA_TOKEN:-$replica_token_default}"
 requested_seed=""
 campaign_seed=""
 campaign_artifact_dir=""
@@ -73,6 +78,7 @@ campaign_steps_file=""
 campaign_manifest_file=""
 preserve_campaign_artifacts=0
 seed_source=""
+remaining_args=()
 
 parse_cluster_flag() {
     local args=()
@@ -304,8 +310,10 @@ render_node_config() {
 node_name = $(toml_basic_string "$node")
 node_role = $(toml_basic_string "$(node_role "$node")")
 rest_host = "0.0.0.0"
+rest_advertise_host = $(toml_basic_string "$node")
 rest_port = ${logpose_server_container_port}
 grpc_host = "0.0.0.0"
+grpc_advertise_host = $(toml_basic_string "$node")
 grpc_port = ${logpose_server_grpc_port}
 log_filter = "info,logpose=debug"
 storage_root = "/var/lib/logpose"
@@ -320,6 +328,10 @@ timeout_ms = 1500
 membership_ttl_secs = 4
 leadership_ttl_secs = 3
 cluster_name = $(toml_basic_string "$cluster_name")
+
+[internal]
+replica_token = $(toml_basic_string "$replica_token")
+replica_transfer_timeout_ms = 30000
 EOF
 }
 
@@ -688,6 +700,39 @@ wait_for_owner() {
     die "timed out waiting for owner ${expected_owner} epoch ${expected_epoch} on ${collection}"
 }
 
+wait_for_ready_replica() {
+    local probe="$1"
+    local collection="$2"
+    local expected_owner="$3"
+    local expected_epoch="$4"
+    local replica_node="$5"
+    for _ in $(seq 1 40); do
+        if placement_json "$probe" "$collection" | python3 -c '
+import json
+import sys
+
+expected_owner = sys.argv[1]
+expected_epoch = int(sys.argv[2], 10)
+replica_node = sys.argv[3]
+placement = json.load(sys.stdin)
+
+if placement.get("owner_node") != expected_owner:
+    raise SystemExit(1)
+if placement.get("ownership_epoch") != expected_epoch:
+    raise SystemExit(1)
+for replica in placement.get("replicas", []):
+    if replica.get("node_id") == replica_node and replica.get("state") == "ready":
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$expected_owner" "$expected_epoch" "$replica_node"
+        then
+            return
+        fi
+        sleep 1
+    done
+    die "timed out waiting for ready replica ${replica_node} under owner ${expected_owner} epoch ${expected_epoch} on ${collection}"
+}
+
 wait_for_local_leader() {
     local probe="$1"
     local expected_leader="$2"
@@ -1021,24 +1066,14 @@ scenario_owner_failover() {
     local tmp_dir
     tmp_dir="$(cluster_state_dir)/tmp"
     ensure_dir "$tmp_dir"
-    local seed_input seed_output flood_input flood_output flood_err
+    local seed_input seed_output
     seed_input="${tmp_dir}/owner-seed.jsonl"
     seed_output="${tmp_dir}/owner-seed.json"
-    flood_input="${tmp_dir}/owner-flood.jsonl"
-    flood_output="${tmp_dir}/owner-flood.json"
-    flood_err="${tmp_dir}/owner-flood.err"
     write_batch_file "$seed_input" "seed" 1 1.0 0.0
-    write_batch_file "$flood_input" "flood" 5000 0.5 0.5
     create_collection node-a "$collection" 2
     run_write node-a "$collection" "$seed_input" "$seed_output"
-    mirror_collection_root node-a "$collection" node-b
-    run_write node-a "$collection" "$flood_input" "$flood_output" 2>"$flood_err" &
-    local flood_pid=$!
-    wait_for_pid_running "$flood_pid" "owner failover flood write"
+    wait_for_ready_replica node-b "$collection" node-a 1 node-b
     stop_node node-a
-    if wait "$flood_pid"; then
-        die "expected in-flight write to fail when stopping the owner"
-    fi
     wait_for_member_absent node-b node-a
     wait_for_local_leader node-b node-b
     wait_for_owner node-b "$collection" node-b 2
@@ -1055,6 +1090,48 @@ scenario_owner_failover() {
     assert_failure_contains "$stats_err" "cannot safely satisfy read barriers after promotion"
 }
 
+scenario_stale_replica_non_promotion() {
+    bootstrap_cluster "${nodes[@]}"
+    local collection="stale-replica-non-promotion"
+    local tmp_dir
+    tmp_dir="$(cluster_state_dir)/tmp"
+    ensure_dir "$tmp_dir"
+    local seed_input seed_output stale_input stale_owner_output stale_follower_output stale_err
+    seed_input="${tmp_dir}/stale-seed.jsonl"
+    seed_output="${tmp_dir}/stale-seed.json"
+    stale_input="${tmp_dir}/stale-post-mirror.jsonl"
+    stale_owner_output="${tmp_dir}/stale-owner.json"
+    stale_follower_output="${tmp_dir}/stale-follower.json"
+    stale_err="${tmp_dir}/stale-follower.err"
+    write_batch_file "$seed_input" "seed" 1 1.0 0.0
+    write_batch_file "$stale_input" "stale" 1 0.0 1.0
+    create_collection node-a "$collection" 2
+    run_write node-a "$collection" "$seed_input" "$seed_output"
+    mirror_collection_root node-a "$collection" node-b
+    run_write node-a "$collection" "$stale_input" "$stale_owner_output"
+    stop_node node-a
+    wait_for_member_absent node-b node-a
+    wait_for_local_leader node-b node-b
+    wait_for_owner node-b "$collection" node-a 1
+    placement_json node-b "$collection" | python3 -c '
+import json
+import sys
+
+placement = json.load(sys.stdin)
+if placement.get("owner_node") != "node-a" or placement.get("ownership_epoch") != 1:
+    raise SystemExit(f"expected stale placement to stay pinned to node-a epoch 1: {placement}")
+if not any(
+    replica.get("node_id") == "node-b" and replica.get("state") == "stale"
+    for replica in placement.get("replicas", [])
+):
+    raise SystemExit(f"expected node-b replica to remain stale: {placement}")
+'
+    if run_write node-b "$collection" "$stale_input" "$stale_follower_output" 2>"$stale_err"; then
+        die "expected stale replica to remain fenced after owner loss"
+    fi
+    assert_failure_contains "$stale_err" "not locally served"
+}
+
 scenario_leader_failover() {
     bootstrap_cluster "${nodes[@]}"
     local collection="leader-failover"
@@ -1067,7 +1144,7 @@ scenario_leader_failover() {
     write_batch_file "$seed_input" "leader" 2 1.0 0.0
     create_collection node-a "$collection" 2
     run_write node-a "$collection" "$seed_input" "$seed_output"
-    mirror_collection_root node-a "$collection" node-b
+    wait_for_ready_replica node-b "$collection" node-a 1 node-b
     stop_node node-a
     wait_for_member_absent node-b node-a
     wait_for_local_leader node-b node-b
@@ -1119,6 +1196,7 @@ run_named_scenario() {
         new-node-registration) scenario_new_node_registration ;;
         concurrent-writers) scenario_concurrent_writers ;;
         owner-failover) scenario_owner_failover ;;
+        stale-replica-non-promotion) scenario_stale_replica_non_promotion ;;
         leader-failover) scenario_leader_failover ;;
         lagging-node-rejoin) scenario_lagging_node_rejoin ;;
         etcd-outage) scenario_etcd_outage ;;
@@ -1296,12 +1374,15 @@ run_campaign() {
 
 self_test() {
     [[ "$(printf '%s\n' "${nodes[@]}" | wc -l | tr -d ' ')" == "3" ]] || die "expected three nodes"
-    [[ "$(printf '%s\n' "${scenarios[@]}" | wc -l | tr -d ' ')" == "8" ]] || die "expected eight scenarios"
-    [[ "$(campaign_scenarios 1 | wc -l | tr -d ' ')" == "8" ]] || die "expected eight campaign scenarios"
+    [[ "$(printf '%s\n' "${scenarios[@]}" | wc -l | tr -d ' ')" == "9" ]] || die "expected nine scenarios"
+    [[ "$(campaign_scenarios 1 | wc -l | tr -d ' ')" == "9" ]] || die "expected nine campaign scenarios"
     [[ "$(etcd_host_client_port etcd-1)" == "12379" ]] || die "expected dedicated host port for etcd-1"
     [[ "$(etcd_host_endpoints_csv)" == "http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379" ]] || die "unexpected etcd host endpoint set"
     render_node_config node-a | grep -Fq 'backend = "etcd"' || die "rendered config missing etcd backend"
     render_node_config node-a | grep -Fq "cluster_name = $(toml_basic_string "$cluster_name")" || die "rendered config missing cluster name"
+    render_node_config node-a | grep -Fq 'rest_advertise_host = "node-a"' || die "rendered config missing rest advertise host"
+    render_node_config node-a | grep -Fq 'grpc_advertise_host = "node-a"' || die "rendered config missing grpc advertise host"
+    render_node_config node-a | grep -Fq "replica_token = $(toml_basic_string "$replica_token")" || die "rendered config missing internal replica token"
 }
 
 status_command() {
@@ -1361,7 +1442,11 @@ case "$command" in
         ;;
     status)
         parse_cluster_flag "$@"
-        status_command "${remaining_args[@]}"
+        if ((${#remaining_args[@]} > 0)); then
+            status_command "${remaining_args[@]}"
+        else
+            status_command
+        fi
         ;;
     self-test)
         self_test

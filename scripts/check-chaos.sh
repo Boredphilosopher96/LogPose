@@ -64,6 +64,7 @@ assert_line "$node_output" "node-c"
 scenario_output="$("$chaos_script" list-scenarios)"
 assert_line "$scenario_output" "smoke"
 assert_line "$scenario_output" "leader-failover"
+assert_line "$scenario_output" "stale-replica-non-promotion"
 assert_line "$scenario_output" "etcd-outage"
 
 config_output="$("$chaos_script" render-config node-a --cluster "$cluster")"

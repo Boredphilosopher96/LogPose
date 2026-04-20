@@ -552,6 +552,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "412":
+          description: Promotion was refused because the current owner is still live, the candidate is not eligible, or authoritative promotion state changed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           description: Missing or invalid bearer token
           content:
@@ -590,7 +596,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionPlacement"
         "400":
-          description: Invalid rebalance request or no ready target was available
+          description: Invalid rebalance request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "412":
+          description: Rebalance was refused because the current owner is still live, no fresh target exists, or authoritative promotion state changed
           content:
             application/json:
               schema:
@@ -1207,7 +1219,6 @@ components:
     PromoteCollectionOwnerRequest:
       type: object
       required:
-        - database_name
         - node_name
       properties:
         database_name:
@@ -1223,7 +1234,6 @@ components:
           default: default
         target_node_name:
           type: string
-          default: 1
     CollectionDescriptor:
       type: object
       required:

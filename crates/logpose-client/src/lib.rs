@@ -421,7 +421,7 @@ impl LogPoseClient {
             .inner
             .clone()
             .put_database_policy(Request::new(PutDatabasePolicyRequest {
-                policy: Some(database_policy_to_proto(policy)),
+                policy: Some(database_policy_to_proto(policy)?),
             }))
             .await?
             .into_inner();
@@ -812,16 +812,18 @@ fn normalize_replication_factor(replication_factor: u64) -> usize {
     }
 }
 
-fn database_policy_to_proto(policy: DatabaseAccessPolicy) -> proto::DatabaseAccessPolicyReply {
-    proto::DatabaseAccessPolicyReply {
+fn database_policy_to_proto(
+    policy: DatabaseAccessPolicy,
+) -> Result<proto::DatabaseAccessPolicyReply> {
+    Ok(proto::DatabaseAccessPolicyReply {
         database_name: policy.database_name,
-        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
+        authentication_mode: authentication_mode_to_proto(policy.authentication_mode)? as i32,
         role_bindings: policy
             .role_bindings
             .into_iter()
             .map(database_role_binding_to_proto)
             .collect(),
-    }
+    })
 }
 
 fn database_policy_from_proto(
@@ -1011,8 +1013,6 @@ fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode> {
         ClientError::InvalidResponse(format!("unknown authentication mode '{mode}'"))
     })? {
         proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
-        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
-        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
         proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
         proto::AuthenticationMode::Unspecified => Err(ClientError::InvalidResponse(
             "authentication mode must be set".to_owned(),
@@ -1020,12 +1020,15 @@ fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode> {
     }
 }
 
-fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
+fn authentication_mode_to_proto(mode: AuthenticationMode) -> Result<proto::AuthenticationMode> {
     match mode {
-        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
-        AuthenticationMode::Password => proto::AuthenticationMode::Password,
-        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
-        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
+        AuthenticationMode::Disabled => Ok(proto::AuthenticationMode::Disabled),
+        AuthenticationMode::ExternalToken => Ok(proto::AuthenticationMode::ExternalToken),
+        AuthenticationMode::Password | AuthenticationMode::MutualTls => {
+            Err(ClientError::InvalidRequest(
+                "unsupported authentication mode cannot be sent over the gRPC API".to_owned(),
+            ))
+        }
     }
 }
 

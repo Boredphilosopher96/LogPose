@@ -842,6 +842,8 @@ pub struct LeadershipFence {
     pub node_id: String,
     /// Active etcd leadership lease for that controller.
     pub lease_id: i64,
+    /// Active etcd membership lease proving the leader runtime is still the live node instance.
+    pub membership_lease_id: i64,
 }
 
 /// Operator-visible explanation of where a collection is currently placed.
