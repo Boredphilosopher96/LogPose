@@ -1,13 +1,23 @@
 use crate::action::{
-    Action, CollectionCreateAction, CollectionStatsAction, DatabasePolicySetAction,
-    DatabasePutAction, ExplainArg, MetricArg, QueryAction, QueryFilter, QueryVector,
-    RecordDeleteAction, RecordPutAction, WorkflowKind, parse_query_filter, parse_query_vector,
-    parse_query_where,
+    Action, CollectionCreateAction, CollectionPromoteAction, CollectionRebalanceAction,
+    CollectionStatsAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg, MetricArg,
+    NodeMembershipAction, QueryAction, QueryFilter, QueryVector, RecordDeleteAction,
+    RecordPutAction, WorkflowKind, parse_query_filter, parse_query_vector, parse_query_where,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use logpose_storage::InspectTarget;
 use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME};
 use std::path::PathBuf;
+
+fn parse_replication_factor(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{value}' for replication factor"))?;
+    if parsed == 0 {
+        return Err("replication factor must be greater than 0".to_owned());
+    }
+    Ok(parsed)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputMode {
@@ -131,6 +141,24 @@ impl Cli {
                     output,
                 }
             }
+            Commands::Node(args) => {
+                let action = match args.command {
+                    NodeCommand::Show(args) => Action::NodeMembership(NodeMembershipAction {
+                        node_name: args.node_name,
+                    }),
+                    NodeCommand::Drain(args) => Action::NodeDrain(NodeMembershipAction {
+                        node_name: args.node_name,
+                    }),
+                    NodeCommand::Undrain(args) => Action::NodeUndrain(NodeMembershipAction {
+                        node_name: args.node_name,
+                    }),
+                };
+                CommandRequest::Direct {
+                    action,
+                    auth_token: auth_token.clone(),
+                    output,
+                }
+            }
             Commands::Collection(args) => {
                 let action = match args.command {
                     CollectionCommand::Create(args) => {
@@ -138,6 +166,7 @@ impl Cli {
                             collection: args.namespace.collection_ref(args.name),
                             dimensions: args.dimensions,
                             metric: args.metric.into(),
+                            replication_factor: args.replication_factor,
                         })
                     }
                     CollectionCommand::Show(args) => Action::CollectionShow(args.collection_ref()),
@@ -152,6 +181,18 @@ impl Cli {
                     }
                     CollectionCommand::Placement(args) => {
                         Action::CollectionPlacement(args.collection_ref())
+                    }
+                    CollectionCommand::Promote(args) => {
+                        Action::CollectionPromote(CollectionPromoteAction {
+                            collection: args.collection_ref(),
+                            node_name: args.node_name,
+                        })
+                    }
+                    CollectionCommand::Rebalance(args) => {
+                        Action::CollectionRebalance(CollectionRebalanceAction {
+                            collection: args.collection_ref(),
+                            target_node_name: args.node_name,
+                        })
                     }
                     CollectionCommand::Flush(args) => {
                         Action::CollectionFlush(args.collection_ref())
@@ -273,6 +314,8 @@ pub enum Commands {
     Config(ConfigGroup),
     /// Create, inspect, and list databases or manage database policies.
     Database(DatabaseGroup),
+    /// Inspect or change distributed node membership state.
+    Node(NodeGroup),
     /// Create, inspect, place, and maintain collections.
     Collection(CollectionGroup),
     /// Ingest and delete records.
@@ -540,6 +583,29 @@ pub struct DatabasePolicySetArgs {
 
 #[derive(Debug, Args)]
 #[command(arg_required_else_help = true)]
+pub struct NodeGroup {
+    #[command(subcommand)]
+    pub command: NodeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NodeCommand {
+    /// Show one node membership record.
+    Show(NodeNameArgs),
+    /// Mark one node as draining.
+    Drain(NodeNameArgs),
+    /// Restore one node to the ready serving state.
+    Undrain(NodeNameArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NodeNameArgs {
+    #[arg(value_name = "NODE", help = "Node identifier. Example: node-a")]
+    pub node_name: String,
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
 pub struct CollectionGroup {
     #[command(subcommand)]
     pub command: CollectionCommand,
@@ -555,6 +621,10 @@ pub enum CollectionCommand {
     Stats(CollectionStatsArgs),
     /// Explain where a collection is placed.
     Placement(CollectionNameArg),
+    /// Promote one collection owner to a specific node.
+    Promote(CollectionMoveArgs),
+    /// Rebalance one collection to a ready peer or specific node.
+    Rebalance(CollectionRebalanceArgs),
     /// Flush the mutable delta into an immutable segment.
     Flush(CollectionNameArg),
     /// Compact immutable segments into a replacement segment.
@@ -584,6 +654,14 @@ pub struct CollectionCreateArgs {
         help = "Distance metric used when scoring matches."
     )]
     pub metric: MetricArg,
+    #[arg(
+        long,
+        value_parser = parse_replication_factor,
+        default_value_t = 1,
+        value_name = "REPLICAS",
+        help = "Desired total replica count, including the owner. Example: 2"
+    )]
+    pub replication_factor: usize,
 }
 
 #[derive(Debug, Args)]
@@ -595,6 +673,50 @@ pub struct CollectionNameArg {
 }
 
 impl CollectionNameArg {
+    pub fn collection_ref(&self) -> CollectionRef {
+        self.namespace.collection_ref(self.collection.clone())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Promote one collection owner to a specific node.",
+    after_long_help = "Examples:\n  logpose collection promote colors --node node-b\n  logpose collection promote colors --database analytics --node node-b\n  logpose --json collection promote colors --node node-b"
+)]
+pub struct CollectionMoveArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(value_name = "NAME", help = "Collection name. Example: colors")]
+    pub collection: String,
+    #[arg(long, value_name = "NODE", help = "Target owner node. Example: node-b")]
+    pub node_name: String,
+}
+
+impl CollectionMoveArgs {
+    pub fn collection_ref(&self) -> CollectionRef {
+        self.namespace.collection_ref(self.collection.clone())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Rebalance one collection to a ready peer or explicit target node.",
+    after_long_help = "Examples:\n  logpose collection rebalance colors\n  logpose collection rebalance colors --node node-b\n  logpose --json collection rebalance colors --database analytics"
+)]
+pub struct CollectionRebalanceArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(value_name = "NAME", help = "Collection name. Example: colors")]
+    pub collection: String,
+    #[arg(
+        long,
+        value_name = "NODE",
+        help = "Optional explicit target node. Example: node-b"
+    )]
+    pub node_name: Option<String>,
+}
+
+impl CollectionRebalanceArgs {
     pub fn collection_ref(&self) -> CollectionRef {
         self.namespace.collection_ref(self.collection.clone())
     }
@@ -932,6 +1054,24 @@ mod tests {
         };
         assert_eq!(collection.database_name, "analytics");
         assert_eq!(collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn collection_create_rejects_zero_replication_factor() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "collection",
+            "create",
+            "colors",
+            "--dimensions",
+            "2",
+            "--metric",
+            "dot",
+            "--replication-factor",
+            "0",
+        ]);
+
+        assert!(cli.is_err(), "zero replication factor should be rejected");
     }
 
     #[test]

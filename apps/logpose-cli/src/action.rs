@@ -68,6 +68,7 @@ pub struct CollectionCreateAction {
     pub collection: CollectionRef,
     pub dimensions: usize,
     pub metric: DistanceMetric,
+    pub replication_factor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +92,11 @@ pub struct DatabasePutAction {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct NodeMembershipAction {
+    pub node_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordPutAction {
     pub collection: CollectionRef,
     pub input: PathBuf,
@@ -100,6 +106,18 @@ pub struct RecordPutAction {
 pub struct RecordDeleteAction {
     pub collection: CollectionRef,
     pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionPromoteAction {
+    pub collection: CollectionRef,
+    pub node_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionRebalanceAction {
+    pub collection: CollectionRef,
+    pub target_node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +144,9 @@ pub enum Action {
         database_name: String,
     },
     DatabasePut(DatabasePutAction),
+    NodeMembership(NodeMembershipAction),
+    NodeDrain(NodeMembershipAction),
+    NodeUndrain(NodeMembershipAction),
     DatabasePolicyShow {
         database_name: String,
     },
@@ -134,6 +155,8 @@ pub enum Action {
     CollectionShow(CollectionRef),
     CollectionStats(CollectionStatsAction),
     CollectionPlacement(CollectionRef),
+    CollectionPromote(CollectionPromoteAction),
+    CollectionRebalance(CollectionRebalanceAction),
     CollectionFlush(CollectionRef),
     CollectionCompact(CollectionRef),
     RecordPut(RecordPutAction),
@@ -907,6 +930,21 @@ pub fn format_command(action: &Action) -> String {
             parts.push("put".to_owned());
             parts.push(shell_quote(&action.database_name));
         }
+        Action::NodeMembership(action) => {
+            parts.push("node".to_owned());
+            parts.push("show".to_owned());
+            parts.push(shell_quote(&action.node_name));
+        }
+        Action::NodeDrain(action) => {
+            parts.push("node".to_owned());
+            parts.push("drain".to_owned());
+            parts.push(shell_quote(&action.node_name));
+        }
+        Action::NodeUndrain(action) => {
+            parts.push("node".to_owned());
+            parts.push("undrain".to_owned());
+            parts.push(shell_quote(&action.node_name));
+        }
         Action::DatabasePolicyShow { database_name } => {
             parts.push("database".to_owned());
             parts.push("policy".to_owned());
@@ -930,6 +968,10 @@ pub fn format_command(action: &Action) -> String {
             parts.push(action.dimensions.to_string());
             parts.push("--metric".to_owned());
             parts.push(metric_name(action.metric).to_owned());
+            if action.replication_factor != 1 {
+                parts.push("--replication-factor".to_owned());
+                parts.push(action.replication_factor.to_string());
+            }
         }
         Action::CollectionShow(collection) => {
             parts.push("collection".to_owned());
@@ -964,6 +1006,24 @@ pub fn format_command(action: &Action) -> String {
             parts.push("placement".to_owned());
             parts.push(shell_quote(&collection.collection_name));
             push_database_flag(&mut parts, &collection.database_name);
+        }
+        Action::CollectionPromote(action) => {
+            parts.push("collection".to_owned());
+            parts.push("promote".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            parts.push("--node".to_owned());
+            parts.push(shell_quote(&action.node_name));
+        }
+        Action::CollectionRebalance(action) => {
+            parts.push("collection".to_owned());
+            parts.push("rebalance".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            if let Some(node_name) = &action.target_node_name {
+                parts.push("--node".to_owned());
+                parts.push(shell_quote(node_name));
+            }
         }
         Action::CollectionFlush(collection) => {
             parts.push("collection".to_owned());
@@ -1170,6 +1230,7 @@ impl CollectionCreateAction {
             name: self.collection.collection_name.clone(),
             dimensions: self.dimensions,
             metric: self.metric,
+            replication_factor: self.replication_factor,
         }
     }
 }
@@ -1330,6 +1391,21 @@ mod tests {
         assert_eq!(
             command,
             "logpose record delete documents --database analytics alpha"
+        );
+    }
+
+    #[test]
+    fn format_command_emits_replication_factor_for_collection_create() {
+        let command = format_command(&Action::CollectionCreate(CollectionCreateAction {
+            collection: CollectionRef::new_default("documents"),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+            replication_factor: 2,
+        }));
+
+        assert_eq!(
+            command,
+            "logpose collection create documents --dimensions 2 --metric dot --replication-factor 2"
         );
     }
 

@@ -35,6 +35,36 @@ pub async fn execute_action<R: Reporter>(
             ));
             Ok(ActionOutput::Config(config.clone()))
         }
+        Action::NodeMembership(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Fetching node membership...");
+            let client = connect_client(config, auth_token).await?;
+            let membership = client
+                .node_membership(&action.node_name)
+                .await
+                .context("failed to fetch node membership")?;
+            progress.finish_success("Node membership ready");
+            Ok(ActionOutput::NodeMembership(membership))
+        }
+        Action::NodeDrain(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Draining node...");
+            let client = connect_client(config, auth_token).await?;
+            let membership = client
+                .drain_node(&action.node_name)
+                .await
+                .context("failed to drain node")?;
+            progress.finish_success("Node drain applied");
+            Ok(ActionOutput::NodeDrained(membership))
+        }
+        Action::NodeUndrain(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Restoring node readiness...");
+            let client = connect_client(config, auth_token).await?;
+            let membership = client
+                .undrain_node(&action.node_name)
+                .await
+                .context("failed to undrain node")?;
+            progress.finish_success("Node restored");
+            Ok(ActionOutput::NodeUndrained(membership))
+        }
         Action::DatabaseList => {
             let progress = ProgressHandle::start(reporter.clone(), "Listing databases...");
             let client = connect_client(config, auth_token).await?;
@@ -136,6 +166,34 @@ pub async fn execute_action<R: Reporter>(
                 .context("failed to fetch collection placement")?;
             progress.finish_success("Collection placement ready");
             Ok(ActionOutput::CollectionPlacement(placement))
+        }
+        Action::CollectionPromote(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Promoting collection owner...");
+            let client = connect_client(config, auth_token).await?;
+            let placement = client
+                .promote_collection_owner_in_database(
+                    &action.collection.database_name,
+                    &action.collection.collection_name,
+                    &action.node_name,
+                )
+                .await
+                .context("failed to promote collection owner")?;
+            progress.finish_success("Collection owner promoted");
+            Ok(ActionOutput::CollectionPromoted(placement))
+        }
+        Action::CollectionRebalance(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Rebalancing collection...");
+            let client = connect_client(config, auth_token).await?;
+            let placement = client
+                .rebalance_collection_in_database(
+                    &action.collection.database_name,
+                    &action.collection.collection_name,
+                    action.target_node_name.as_deref(),
+                )
+                .await
+                .context("failed to rebalance collection")?;
+            progress.finish_success("Collection rebalanced");
+            Ok(ActionOutput::CollectionRebalanced(placement))
         }
         Action::CollectionFlush(collection) => {
             let progress = ProgressHandle::start(reporter.clone(), "Flushing collection...");

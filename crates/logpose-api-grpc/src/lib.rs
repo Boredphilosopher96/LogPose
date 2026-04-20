@@ -10,11 +10,11 @@ use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
     CollectionPlacement, CoordinationStatus, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats,
-    RecordId, ScalarFieldStats, Snapshot, WriteOperation,
+    MaintenanceBacklog, MaintenanceStatus, NodeMembershipStatus, NodeRole, NodeRuntimeStatus,
+    PutRecord, QueryUnitStats, RecordId, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde_json::{Number, Value};
-use std::{net::SocketAddr, sync::Arc};
+use std::{convert::TryFrom, net::SocketAddr, sync::Arc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_health::server::health_reporter;
@@ -30,14 +30,16 @@ use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
 use proto::{
     CollectionDescriptorReply, CollectionPlacementReply, CollectionStatsReply, CommitAckReply,
     CompactCollectionRequest, CoordinationStatusReply, CreateCollectionRequest,
-    DatabaseAccessPolicyReply, DatabaseDescriptorReply, DatabaseRoleBindingReply,
+    DatabaseAccessPolicyReply, DatabaseDescriptorReply, DatabaseRoleBindingReply, DrainNodeRequest,
     FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
     GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataReply,
-    GetMetadataRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest, InspectCollectionReply,
-    InspectCollectionRequest, InspectTarget, ListDatabasesReply, ListDatabasesRequest,
-    MaintenanceBacklogReply, NodeRole as ProtoNodeRole, PutDatabasePolicyRequest,
-    PutDatabaseRequest, QueryCollectionReply, QueryCollectionRequest, QueryMatch, RemoteBlobConfig,
-    ScalarValue, SnapshotReply, WriteCollectionRequest,
+    GetMetadataRequest, GetNodeMembershipRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest,
+    InspectCollectionReply, InspectCollectionRequest, InspectTarget, ListDatabasesReply,
+    ListDatabasesRequest, MaintenanceBacklogReply, NodeMembershipStatusReply,
+    NodeRole as ProtoNodeRole, PromoteCollectionOwnerRequest, PutDatabasePolicyRequest,
+    PutDatabaseRequest, QueryCollectionReply, QueryCollectionRequest, QueryMatch,
+    RebalanceCollectionRequest, RemoteBlobConfig, ReplicaPlacementReply, ScalarValue,
+    SnapshotReply, UndrainNodeRequest, WriteCollectionRequest,
 };
 
 /// Serve the gRPC API until shutdown.
@@ -111,6 +113,48 @@ impl LogPoseService for GrpcLogPoseService {
         Ok(Response::new(runtime_status_reply_from_domain(status)))
     }
 
+    async fn get_node_membership(
+        &self,
+        request: Request<GetNodeMembershipRequest>,
+    ) -> Result<Response<NodeMembershipStatusReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let membership = self
+            .state
+            .node_membership_status_with_auth(&auth, &request.node_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(node_membership_reply_from_domain(membership)))
+    }
+
+    async fn drain_node(
+        &self,
+        request: Request<DrainNodeRequest>,
+    ) -> Result<Response<NodeMembershipStatusReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let membership = self
+            .state
+            .drain_node_with_auth(&auth, &request.node_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(node_membership_reply_from_domain(membership)))
+    }
+
+    async fn undrain_node(
+        &self,
+        request: Request<UndrainNodeRequest>,
+    ) -> Result<Response<NodeMembershipStatusReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let membership = self
+            .state
+            .undrain_node_with_auth(&auth, &request.node_name)
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(node_membership_reply_from_domain(membership)))
+    }
+
     async fn put_database(
         &self,
         request: Request<PutDatabaseRequest>,
@@ -176,7 +220,10 @@ impl LogPoseService for GrpcLogPoseService {
                     request.name,
                     request.dimensions as usize,
                     metric_from_proto(request.metric)?,
-                ),
+                )
+                .with_replication_factor(replication_factor_from_proto(
+                    request.replication_factor,
+                )?),
             )
             .await
             .map_err(status_from_service_error)?;
@@ -194,6 +241,46 @@ impl LogPoseService for GrpcLogPoseService {
             .collection_placement_with_auth(
                 &auth,
                 &collection_lookup_key(&request.database_name, &request.collection_name),
+            )
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(collection_placement_reply_from_domain(
+            placement,
+        )))
+    }
+
+    async fn promote_collection_owner(
+        &self,
+        request: Request<PromoteCollectionOwnerRequest>,
+    ) -> Result<Response<CollectionPlacementReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let placement = self
+            .state
+            .promote_collection_owner_with_auth(
+                &auth,
+                &collection_lookup_key(&request.database_name, &request.collection_name),
+                &request.node_name,
+            )
+            .await
+            .map_err(status_from_service_error)?;
+        Ok(Response::new(collection_placement_reply_from_domain(
+            placement,
+        )))
+    }
+
+    async fn rebalance_collection(
+        &self,
+        request: Request<RebalanceCollectionRequest>,
+    ) -> Result<Response<CollectionPlacementReply>, Status> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let placement = self
+            .state
+            .rebalance_collection_with_auth(
+                &auth,
+                &collection_lookup_key(&request.database_name, &request.collection_name),
+                request.target_node_name.as_deref(),
             )
             .await
             .map_err(status_from_service_error)?;
@@ -423,7 +510,7 @@ impl LogPoseService for GrpcLogPoseService {
             .set_database_access_policy_with_auth(&auth, policy)
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(stored)))
+        Ok(Response::new(database_access_policy_to_proto(stored)?))
     }
 
     async fn get_database_policy(
@@ -438,7 +525,7 @@ impl LogPoseService for GrpcLogPoseService {
             .database_access_policy_with_auth(&auth, &database_name)
             .await
             .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(policy)))
+        Ok(Response::new(database_access_policy_to_proto(policy)?))
     }
 }
 
@@ -753,6 +840,7 @@ fn collection_descriptor_reply(
         name: descriptor.name,
         dimensions: descriptor.dimensions as u64,
         metric: proto_metric(descriptor.metric) as i32,
+        replication_factor: descriptor.replication_factor as u64,
         root_path: descriptor.root_path.display().to_string(),
         flush_threshold_ops: descriptor.flush_threshold_ops as u64,
         flush_threshold_bytes: descriptor.flush_threshold_bytes as u64,
@@ -763,6 +851,19 @@ fn collection_descriptor_reply(
             prefix: remote_blob.prefix,
         }),
         database_name: descriptor.database_name,
+    }
+}
+
+fn replication_factor_from_proto(replication_factor: u64) -> Result<usize, Status> {
+    let replication_factor = usize::try_from(replication_factor)
+        .map_err(|_| Status::invalid_argument("replication_factor must fit into usize"))?;
+
+    if replication_factor == 0 {
+        Err(Status::invalid_argument(
+            "replication_factor must be greater than 0",
+        ))
+    } else {
+        Ok(replication_factor)
     }
 }
 
@@ -786,6 +887,14 @@ fn runtime_status_reply_from_domain(status: NodeRuntimeStatus) -> GetRuntimeStat
     }
 }
 
+fn node_membership_reply_from_domain(status: NodeMembershipStatus) -> NodeMembershipStatusReply {
+    NodeMembershipStatusReply {
+        node_id: status.node_id,
+        node_role: node_role_to_proto(status.node_role) as i32,
+        state: status.state,
+    }
+}
+
 fn collection_placement_reply_from_domain(
     placement: CollectionPlacement,
 ) -> CollectionPlacementReply {
@@ -796,9 +905,26 @@ fn collection_placement_reply_from_domain(
         assigned_role: node_role_to_proto(placement.assigned_role) as i32,
         owner_node: placement.owner_node,
         ownership_epoch: placement.ownership_epoch,
+        metadata_revision: placement.metadata_revision,
+        replicas: placement
+            .replicas
+            .into_iter()
+            .map(replica_placement_reply_from_domain)
+            .collect(),
+        failover_reason: placement.failover_reason,
         route_kind: placement.route_kind,
         route_reason: placement.route_reason,
         database_name: placement.database_name,
+    }
+}
+
+fn replica_placement_reply_from_domain(
+    replica: logpose_types::ReplicaPlacement,
+) -> ReplicaPlacementReply {
+    ReplicaPlacementReply {
+        node_id: replica.node_id,
+        node_role: node_role_to_proto(replica.node_role) as i32,
+        state: replica.state,
     }
 }
 
@@ -815,11 +941,14 @@ fn coordination_status_to_proto(status: CoordinationStatus) -> CoordinationStatu
     CoordinationStatusReply {
         cluster_name: status.cluster_name,
         membership_registered: status.membership_registered,
+        membership_state: status.membership_state,
         membership_lease_id: status.membership_lease_id,
         registered_members: status.registered_members,
         leader_node: status.leader_node,
         is_local_leader: status.is_local_leader,
         leadership_lease_id: status.leadership_lease_id,
+        metadata_revision: status.metadata_revision,
+        watch_lag: status.watch_lag,
         last_error: status.last_error,
     }
 }
@@ -846,16 +975,18 @@ fn collection_stats_reply_from_domain(
     })
 }
 
-fn database_access_policy_to_proto(policy: DatabaseAccessPolicy) -> DatabaseAccessPolicyReply {
-    DatabaseAccessPolicyReply {
+fn database_access_policy_to_proto(
+    policy: DatabaseAccessPolicy,
+) -> Result<DatabaseAccessPolicyReply, Status> {
+    Ok(DatabaseAccessPolicyReply {
         database_name: policy.database_name,
-        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
+        authentication_mode: authentication_mode_to_proto(policy.authentication_mode)? as i32,
         role_bindings: policy
             .role_bindings
             .into_iter()
             .map(database_role_binding_to_proto)
             .collect(),
-    }
+    })
 }
 
 fn database_access_policy_from_proto(
@@ -923,12 +1054,15 @@ fn node_role_to_proto(role: NodeRole) -> ProtoNodeRole {
     }
 }
 
-fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
+fn authentication_mode_to_proto(
+    mode: AuthenticationMode,
+) -> Result<proto::AuthenticationMode, Status> {
     match mode {
-        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
-        AuthenticationMode::Password => proto::AuthenticationMode::Password,
-        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
-        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
+        AuthenticationMode::Disabled => Ok(proto::AuthenticationMode::Disabled),
+        AuthenticationMode::ExternalToken => Ok(proto::AuthenticationMode::ExternalToken),
+        AuthenticationMode::Password | AuthenticationMode::MutualTls => Err(Status::internal(
+            "unsupported authentication mode reached the gRPC transport",
+        )),
     }
 }
 
@@ -937,8 +1071,6 @@ fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, Statu
         Status::invalid_argument(format!("unsupported authentication mode '{mode}'"))
     })? {
         proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
-        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
-        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
         proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
         proto::AuthenticationMode::Unspecified => {
             Err(Status::invalid_argument("authentication mode is required"))
@@ -1138,6 +1270,7 @@ mod tests {
             .expect("create should succeed")
             .into_inner();
         assert_eq!(create.name, "documents");
+        assert_eq!(create.replication_factor, 1);
 
         let write = service
             .write_collection(Request::new(write_collection_request(
@@ -1251,6 +1384,47 @@ mod tests {
             .expect("inspect should succeed")
             .into_inner();
         assert_eq!(inspect.target, "manifest");
+    }
+
+    #[tokio::test]
+    async fn grpc_service_accepts_replication_factor() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
+            "grpc-replication-factor",
+        ))));
+
+        let create = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+                database_name: "analytics".to_owned(),
+                replication_factor: 3,
+            }))
+            .await
+            .expect("create should succeed")
+            .into_inner();
+
+        assert_eq!(create.database_name, "analytics");
+        assert_eq!(create.replication_factor, 3);
+    }
+
+    #[tokio::test]
+    async fn grpc_service_rejects_zero_replication_factor() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-replicas"))));
+
+        let error = service
+            .create_collection(Request::new(CreateCollectionRequest {
+                name: "documents".to_owned(),
+                dimensions: 2,
+                metric: proto::DistanceMetric::Dot as i32,
+                database_name: "analytics".to_owned(),
+                replication_factor: 0,
+            }))
+            .await
+            .expect_err("zero replication factor should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1708,11 +1882,14 @@ mod tests {
             coordination: Some(logpose_types::CoordinationStatus {
                 cluster_name: "prod-cluster".to_owned(),
                 membership_registered: true,
+                membership_state: Some("ready".to_owned()),
                 membership_lease_id: Some(17),
                 registered_members: vec!["grpc-node".to_owned(), "grpc-peer".to_owned()],
                 leader_node: Some("grpc-node".to_owned()),
                 is_local_leader: true,
                 leadership_lease_id: Some(23),
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
                 last_error: Some("warn".to_owned()),
             }),
             maintenance: MaintenanceBacklog::default(),
@@ -1724,6 +1901,8 @@ mod tests {
         assert_eq!(coordination.cluster_name, "prod-cluster");
         assert_eq!(coordination.membership_lease_id, Some(17));
         assert_eq!(coordination.leadership_lease_id, Some(23));
+        assert_eq!(coordination.metadata_revision, Some(42));
+        assert_eq!(coordination.watch_lag, Some(0));
         assert_eq!(
             coordination.registered_members,
             vec!["grpc-node".to_owned(), "grpc-peer".to_owned()]
@@ -1769,12 +1948,27 @@ mod tests {
             assigned_role: NodeRole::Data,
             owner_node: Some("owner-b".to_owned()),
             ownership_epoch: Some(2),
+            replicas: vec![logpose_types::ReplicaPlacement {
+                node_id: "replica-a".to_owned(),
+                node_role: NodeRole::Combined,
+                state: "unknown".to_owned(),
+            }],
+            failover_reason: Some("automatic self-promotion".to_owned()),
+            metadata_revision: Some(42),
             route_kind: "recorded".to_owned(),
             route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
         });
 
         assert_eq!(reply.owner_node.as_deref(), Some("owner-b"));
         assert_eq!(reply.ownership_epoch, Some(2));
+        assert_eq!(reply.metadata_revision, Some(42));
+        assert_eq!(reply.replicas.len(), 1);
+        assert_eq!(reply.replicas[0].node_id, "replica-a");
+        assert_eq!(reply.replicas[0].state, "unknown");
+        assert_eq!(
+            reply.failover_reason.as_deref(),
+            Some("automatic self-promotion")
+        );
     }
 
     #[tokio::test]
@@ -2451,6 +2645,7 @@ mod tests {
             dimensions,
             metric: metric as i32,
             database_name: default_database_name(),
+            replication_factor: 1,
         }
     }
 

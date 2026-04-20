@@ -2,6 +2,7 @@
 
 use async_trait as _;
 use axum as _;
+use flate2 as _;
 use http_body_util as _;
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
@@ -21,6 +22,7 @@ use logpose_types::{
     CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
 };
 use rand as _;
+use reqwest as _;
 use serde as _;
 use std::{
     fs,
@@ -28,6 +30,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tar as _;
 use thiserror as _;
 use tokio as _;
 use tonic as _;
@@ -35,7 +38,9 @@ use tower as _;
 
 #[tokio::test]
 async fn control_plane_reports_runtime_status_and_local_placement() {
-    let config = test_config("control-runtime");
+    let mut config = test_config("control-runtime");
+    config.rest_advertise_host = Some("replica-source.internal".to_owned());
+    config.grpc_advertise_host = Some("grpc-source.internal".to_owned());
     let state = Arc::new(AppState::new(config.clone()));
 
     let descriptor = state
@@ -45,6 +50,7 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -78,11 +84,19 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
     assert_eq!(status.role.as_str(), "combined");
     assert_eq!(
         status.rest_endpoint,
-        format!("http://{}:{}", config.rest_host, config.rest_port)
+        format!(
+            "http://{}:{}",
+            config.advertised_rest_host(),
+            config.rest_port
+        )
     );
     assert_eq!(
         status.grpc_endpoint,
-        format!("http://{}:{}", config.grpc_host, config.grpc_port)
+        format!(
+            "http://{}:{}",
+            config.advertised_grpc_host(),
+            config.grpc_port
+        )
     );
     assert_eq!(status.storage_engine, "local");
     assert!(status.control_plane_ready);
@@ -119,6 +133,7 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Cosine,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -129,6 +144,7 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
             name: "events".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -180,6 +196,7 @@ async fn control_plane_reports_non_default_database_collection_identity() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -219,6 +236,7 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("default namespace collection should be created");
@@ -229,6 +247,7 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("database namespace collection should be created");
@@ -320,6 +339,7 @@ async fn data_only_nodes_reject_control_plane_collection_creation() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect_err("data-only nodes should reject collection creation");
@@ -367,6 +387,7 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect_err("control-only nodes should reject collection creation");
@@ -401,6 +422,7 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -452,6 +474,7 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -521,6 +544,7 @@ async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -590,6 +614,7 @@ async fn combined_runtime_status_reads_persisted_maintenance_without_resuming_it
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -659,6 +684,7 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -771,6 +797,7 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -815,6 +842,7 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
                 name: "documents".to_owned(),
                 dimensions: 2,
                 metric: DistanceMetric::Dot,
+                replication_factor: 1,
             },
             CollectionAssignment {
                 assigned_node: "local-control-assignment".to_owned(),
@@ -882,6 +910,7 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("collection should be created");
@@ -920,6 +949,7 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("default namespace collection should be created");
@@ -930,6 +960,7 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
             name: "documents".to_owned(),
             dimensions: 2,
             metric: DistanceMetric::Dot,
+            replication_factor: 1,
         })
         .await
         .expect("database namespace collection should be created");

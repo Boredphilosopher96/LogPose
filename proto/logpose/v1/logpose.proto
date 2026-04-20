@@ -5,12 +5,17 @@ package logpose.v1;
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
   rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
+  rpc GetNodeMembership(GetNodeMembershipRequest) returns (NodeMembershipStatusReply);
+  rpc DrainNode(DrainNodeRequest) returns (NodeMembershipStatusReply);
+  rpc UndrainNode(UndrainNodeRequest) returns (NodeMembershipStatusReply);
   rpc PutDatabase(PutDatabaseRequest) returns (DatabaseDescriptorReply);
   rpc GetDatabase(GetDatabaseRequest) returns (DatabaseDescriptorReply);
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
+  rpc PromoteCollectionOwner(PromoteCollectionOwnerRequest) returns (CollectionPlacementReply);
+  rpc RebalanceCollection(RebalanceCollectionRequest) returns (CollectionPlacementReply);
   rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
@@ -33,6 +38,18 @@ message GetMetadataReply {
 
 message GetRuntimeStatusRequest {}
 
+message GetNodeMembershipRequest {
+  string node_name = 1;
+}
+
+message DrainNodeRequest {
+  string node_name = 1;
+}
+
+message UndrainNodeRequest {
+  string node_name = 1;
+}
+
 enum NodeRole {
   NODE_ROLE_UNSPECIFIED = 0;
   NODE_ROLE_COMBINED = 1;
@@ -50,12 +67,27 @@ message MaintenanceBacklogReply {
 message CoordinationStatusReply {
   string cluster_name = 1;
   bool membership_registered = 2;
-  optional int64 membership_lease_id = 3;
-  repeated string registered_members = 4;
-  optional string leader_node = 5;
-  bool is_local_leader = 6;
-  optional int64 leadership_lease_id = 7;
-  optional string last_error = 8;
+  optional string membership_state = 3;
+  optional int64 membership_lease_id = 4;
+  repeated string registered_members = 5;
+  optional string leader_node = 6;
+  bool is_local_leader = 7;
+  optional int64 leadership_lease_id = 8;
+  optional string last_error = 9;
+  optional int64 metadata_revision = 10;
+  optional uint64 watch_lag = 11;
+}
+
+message NodeMembershipStatusReply {
+  string node_id = 1;
+  NodeRole node_role = 2;
+  string state = 3;
+}
+
+message ReplicaPlacementReply {
+  string node_id = 1;
+  NodeRole node_role = 2;
+  string state = 3;
 }
 
 message CollectionPlacementReply {
@@ -68,6 +100,9 @@ message CollectionPlacementReply {
   string database_name = 7;
   optional string owner_node = 8;
   optional uint64 ownership_epoch = 9;
+  optional int64 metadata_revision = 10;
+  repeated ReplicaPlacementReply replicas = 11;
+  optional string failover_reason = 12;
 }
 
 message GetRuntimeStatusReply {
@@ -122,6 +157,7 @@ message CreateCollectionRequest {
   uint64 dimensions = 2;
   DistanceMetric metric = 3;
   string database_name = 4;
+  uint64 replication_factor = 5;
 }
 
 message GetCollectionRequest {
@@ -132,6 +168,18 @@ message GetCollectionRequest {
 message GetCollectionPlacementRequest {
   string collection_name = 1;
   string database_name = 2;
+}
+
+message PromoteCollectionOwnerRequest {
+  string collection_name = 1;
+  string database_name = 2;
+  string node_name = 3;
+}
+
+message RebalanceCollectionRequest {
+  string collection_name = 1;
+  string database_name = 2;
+  optional string target_node_name = 3;
 }
 
 message CollectionDescriptorReply {
@@ -145,14 +193,13 @@ message CollectionDescriptorReply {
   uint64 compaction_threshold_segments = 8;
   RemoteBlobConfig remote_blob = 9;
   string database_name = 10;
+  uint64 replication_factor = 11;
 }
 
 enum AuthenticationMode {
   AUTHENTICATION_MODE_UNSPECIFIED = 0;
   AUTHENTICATION_MODE_DISABLED = 1;
-  AUTHENTICATION_MODE_PASSWORD = 2;
-  AUTHENTICATION_MODE_MUTUAL_TLS = 3;
-  AUTHENTICATION_MODE_EXTERNAL_TOKEN = 4;
+  AUTHENTICATION_MODE_EXTERNAL_TOKEN = 2;
 }
 
 enum DatabaseRole {

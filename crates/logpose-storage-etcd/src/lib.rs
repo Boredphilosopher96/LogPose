@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use clap as _;
 use etcd_client::{
     Client, Compare, CompareOp, DeleteOptions, GetOptions, LeaseKeepAliveStream, LeaseKeeper,
-    PutOptions, ResponseHeader, Txn, TxnOp,
+    PutOptions, ResponseHeader, Txn, TxnOp, WatchOptions,
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
@@ -17,7 +17,7 @@ use logpose_storage::{
 use logpose_types::{
     AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
     CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError,
-    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    MaintenanceStatus, NodeRole, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,6 +52,47 @@ struct CollectionMetadataRevision {
 struct StoredCollectionDescriptor {
     descriptor: CollectionDescriptor,
     ready: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct ShardReplicaTargetSet {
+    replicas: Vec<ShardReplicaTarget>,
+}
+
+/// Leader-selected desired replica target for one shard.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardReplicaTarget {
+    /// Node identifier selected as a replica target.
+    pub node_id: String,
+    /// Runtime role recorded for the replica target node.
+    pub node_role: NodeRole,
+}
+
+/// One node's published local materialization report for a shard.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardReplicaReport {
+    /// Reporting node identifier.
+    pub node_id: String,
+    /// Runtime role recorded for the reporting node.
+    pub node_role: NodeRole,
+    /// Whether the node currently has matching local collection state.
+    pub materialized: bool,
+    /// Local snapshot when the collection is materialized.
+    pub snapshot: Option<Snapshot>,
+    /// Ownership epoch observed when the report was published.
+    pub ownership_epoch: Option<u64>,
+    /// Membership mod revision observed when the report was published.
+    #[serde(default)]
+    pub membership_mod_revision: Option<i64>,
+    /// Etcd mod revision observed when the report was read.
+    #[serde(skip_serializing, default)]
+    pub mod_revision: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShardReplicaReportWithRevision {
+    report: ShardReplicaReport,
+    mod_revision: i64,
 }
 
 impl StoredCollectionDescriptor {
@@ -390,17 +431,54 @@ impl StorageEngine for EtcdBackedStorageEngine {
             .local
             .create_collection_from_descriptor(descriptor.clone(), Some(&assignment))
         {
-            Ok(local_descriptor) => {
-                self.etcd
-                    .mark_collection_ready_if_revision_matches(
-                        &collection_name,
-                        &descriptor,
-                        metadata_revision,
-                        &leader_fence,
-                    )
-                    .await?;
-                Ok(local_descriptor)
-            }
+            Ok(local_descriptor) => match self
+                .etcd
+                .mark_collection_ready_if_revision_matches(
+                    &collection_name,
+                    &descriptor,
+                    metadata_revision,
+                    &leader_fence,
+                )
+                .await
+            {
+                Ok(()) => Ok(local_descriptor),
+                Err(error) => {
+                    let local_cleanup = match std::fs::remove_dir_all(&local_descriptor.root_path) {
+                        Ok(()) => Ok(()),
+                        Err(cleanup_error)
+                            if cleanup_error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Ok(())
+                        }
+                        Err(cleanup_error) => Err(LogPoseError::Message(format!(
+                            "failed to remove partially finalized local collection state for '{}': {cleanup_error}",
+                            collection_name
+                        ))),
+                    };
+                    let metadata_cleanup = self
+                        .etcd
+                        .delete_collection_metadata_if_revision_matches(
+                            &collection_name,
+                            metadata_revision,
+                        )
+                        .await;
+                    match (local_cleanup, metadata_cleanup) {
+                        (Ok(()), Ok(())) => Err(error),
+                        (Err(cleanup_error), Ok(())) => Err(rollback_failure_error(
+                            &collection_name,
+                            &error.to_string(),
+                            cleanup_error,
+                        )),
+                        (Ok(()), Err(rollback_error)) | (Err(_), Err(rollback_error)) => {
+                            Err(rollback_failure_error(
+                                &collection_name,
+                                &error.to_string(),
+                                rollback_error,
+                            ))
+                        }
+                    }
+                }
+            },
             Err(error) => match self
                 .etcd
                 .delete_collection_metadata_if_revision_matches(&collection_name, metadata_revision)
@@ -459,6 +537,27 @@ impl StorageEngine for EtcdBackedStorageEngine {
             );
         }
         Ok(descriptors)
+    }
+
+    async fn list_local_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.local.list_local_collections().await
+    }
+
+    async fn export_local_collection_archive(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<Vec<u8>> {
+        self.local.export_local_collection_archive(descriptor).await
+    }
+
+    async fn export_local_collection_archive_to_path(
+        &self,
+        descriptor: &CollectionDescriptor,
+        archive_path: &Path,
+    ) -> Result<()> {
+        self.local
+            .export_local_collection_archive_to_path(descriptor, archive_path)
+            .await
     }
 
     async fn collection_assignment_descriptor(
@@ -642,6 +741,10 @@ impl EtcdPlacementStore {
         )
     }
 
+    fn cluster_prefix(&self) -> String {
+        format!("{}/clusters/{}/", self.key_prefix, self.cluster_name)
+    }
+
     fn databases_prefix(&self) -> String {
         format!(
             "{}/clusters/{}/databases/",
@@ -681,9 +784,55 @@ impl EtcdPlacementStore {
         )
     }
 
+    fn shard_failover_key(&self, collection: &CollectionRef, shard_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/collections/{}/shards/{shard_id}/failover",
+            self.key_prefix,
+            self.cluster_name,
+            collection.lookup_name()
+        )
+    }
+
+    fn shard_replica_targets_key(&self, collection: &CollectionRef, shard_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/collections/{}/shards/{shard_id}/replica_targets",
+            self.key_prefix,
+            self.cluster_name,
+            collection.lookup_name()
+        )
+    }
+
+    fn shard_replica_report_prefix(&self, collection: &CollectionRef, shard_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/collections/{}/shards/{shard_id}/replicas/",
+            self.key_prefix,
+            self.cluster_name,
+            collection.lookup_name()
+        )
+    }
+
+    fn shard_replica_report_key(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        node_id: &str,
+    ) -> String {
+        format!(
+            "{}{node_id}",
+            self.shard_replica_report_prefix(collection, shard_id)
+        )
+    }
+
     fn leadership_key(&self) -> String {
         format!(
             "{}/clusters/{}/controllers/leader",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn membership_key(&self, node_id: &str) -> String {
+        format!(
+            "{}/clusters/{}/members/{node_id}",
             self.key_prefix, self.cluster_name
         )
     }
@@ -729,6 +878,171 @@ impl EtcdPlacementStore {
         Ok(())
     }
 
+    async fn load_cluster_metadata(&self) -> Result<ClusterMetadataSnapshot> {
+        #[derive(Default)]
+        struct CollectionAccumulator {
+            assignment: Option<CollectionAssignment>,
+            descriptor: Option<CollectionDescriptor>,
+            descriptor_ready: bool,
+            owner: Option<ShardOwnership>,
+            replica_targets: Vec<ShardReplicaTarget>,
+            replica_reports: Vec<ShardReplicaReport>,
+            failover_reason: Option<String>,
+        }
+
+        let collections_prefix = self.collections_prefix();
+        let members_prefix = format!(
+            "{}/clusters/{}/members/",
+            self.key_prefix, self.cluster_name
+        );
+        let leadership_key = self.leadership_key();
+        let mut client = self.client().await?;
+        let response = client
+            .get(
+                self.cluster_prefix(),
+                Some(
+                    GetOptions::new()
+                        .with_prefix()
+                        .with_sort(etcd_client::SortTarget::Key, etcd_client::SortOrder::Ascend),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        let revision = response
+            .header()
+            .map(ResponseHeader::revision)
+            .unwrap_or_default();
+        let mut members = Vec::<MembershipRecord>::new();
+        let mut leader = None;
+        let mut collections = BTreeMap::<String, CollectionAccumulator>::new();
+        for kv in response.kvs() {
+            let key = std::str::from_utf8(kv.key()).map_err(|error| {
+                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+            })?;
+            if key.starts_with(&members_prefix) {
+                let mut record: MembershipRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                record.lease_id = kv.lease();
+                record.mod_revision = kv.mod_revision();
+                members.push(record);
+                continue;
+            }
+            if key == leadership_key {
+                leader = Some(serde_json::from_slice(kv.value()).map_err(json_decode_message)?);
+                continue;
+            }
+            let Some(collection_suffix) = key.strip_prefix(&collections_prefix) else {
+                continue;
+            };
+            if let Some(lookup_name) = collection_suffix.strip_suffix("/assignment") {
+                collections
+                    .entry(canonical_collection_lookup_name(lookup_name))
+                    .or_default()
+                    .assignment =
+                    Some(serde_json::from_slice(kv.value()).map_err(json_decode_message)?);
+                continue;
+            }
+            if let Some(lookup_name) = collection_suffix.strip_suffix("/descriptor") {
+                let stored: StoredCollectionDescriptor =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                let entry = collections
+                    .entry(canonical_collection_lookup_name(lookup_name))
+                    .or_default();
+                entry.descriptor = Some(stored.descriptor);
+                entry.descriptor_ready = stored.ready;
+                continue;
+            }
+            if collection_suffix.ends_with("/owner") && collection_suffix.contains("/shards/") {
+                let mut ownership: ShardOwnership =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                ownership.mod_revision = kv.mod_revision();
+                let lookup_name = ownership.collection.lookup_name();
+                collections.entry(lookup_name).or_default().owner = Some(ownership);
+                continue;
+            }
+            if let Some(lookup_name) = collection_suffix
+                .strip_suffix("/replica_targets")
+                .filter(|suffix| suffix.contains("/shards/"))
+            {
+                let lookup_name = collection_ref_from_lookup_name(
+                    lookup_name.split("/shards/").next().unwrap_or_default(),
+                )
+                .lookup_name();
+                let target_set: ShardReplicaTargetSet =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                collections.entry(lookup_name).or_default().replica_targets = target_set.replicas;
+                continue;
+            }
+            if collection_suffix.contains("/replicas/") && collection_suffix.contains("/shards/") {
+                let lookup_name = collection_ref_from_lookup_name(
+                    collection_suffix
+                        .split("/shards/")
+                        .next()
+                        .unwrap_or_default(),
+                )
+                .lookup_name();
+                let mut report: ShardReplicaReport =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                report.mod_revision = kv.mod_revision();
+                collections
+                    .entry(lookup_name)
+                    .or_default()
+                    .replica_reports
+                    .push(report);
+                continue;
+            }
+            if collection_suffix.ends_with("/failover") && collection_suffix.contains("/shards/") {
+                let reason: ShardFailoverReason =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                let lookup_name = collection_ref_from_lookup_name(
+                    collection_suffix
+                        .split("/shards/")
+                        .next()
+                        .unwrap_or_default(),
+                )
+                .lookup_name();
+                collections.entry(lookup_name).or_default().failover_reason = Some(reason.reason);
+            }
+        }
+        members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        Ok(ClusterMetadataSnapshot {
+            revision,
+            members,
+            leader,
+            collections: collections
+                .into_iter()
+                .map(|(lookup_name, mut accumulator)| {
+                    accumulator
+                        .replica_targets
+                        .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+                    accumulator
+                        .replica_reports
+                        .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+                    ClusterCollectionMetadata {
+                        collection: accumulator
+                            .descriptor
+                            .as_ref()
+                            .map(CollectionDescriptor::collection_ref)
+                            .or_else(|| {
+                                accumulator
+                                    .owner
+                                    .as_ref()
+                                    .map(|owner| owner.collection.clone())
+                            })
+                            .unwrap_or_else(|| collection_ref_from_lookup_name(&lookup_name)),
+                        assignment: accumulator.assignment,
+                        descriptor: accumulator.descriptor,
+                        descriptor_ready: accumulator.descriptor_ready,
+                        owner: accumulator.owner,
+                        replica_targets: accumulator.replica_targets,
+                        replica_reports: accumulator.replica_reports,
+                        failover_reason: accumulator.failover_reason,
+                    }
+                })
+                .collect(),
+        })
+    }
+
     async fn put_collection_metadata_if_absent(
         &self,
         collection_name: &str,
@@ -744,9 +1058,6 @@ impl EtcdPlacementStore {
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::pending(descriptor))
                 .map_err(json_encode_message)?;
-        let leadership_key = self.leadership_key();
-        let leadership_value =
-            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
         let owner_value = serde_json::to_string(&ShardOwnership {
             collection,
             shard_id: "0".to_owned(),
@@ -755,26 +1066,25 @@ impl EtcdPlacementStore {
             mod_revision: 0,
         })
         .map_err(json_encode_message)?;
-        let txn = Txn::new()
-            .when([
-                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
-                Compare::version(assignment_key.clone(), CompareOp::Equal, 0),
-                Compare::version(descriptor_key.clone(), CompareOp::Equal, 0),
-                Compare::version(owner_key.clone(), CompareOp::Equal, 0),
-            ])
-            .and_then([
-                TxnOp::put(
-                    assignment_key.clone(),
-                    assignment_value,
-                    Some(PutOptions::new()),
-                ),
-                TxnOp::put(
-                    descriptor_key.clone(),
-                    descriptor_value,
-                    Some(PutOptions::new()),
-                ),
-                TxnOp::put(owner_key, owner_value, Some(PutOptions::new())),
-            ]);
+        let mut compares = self.leader_fence_compares(leader_fence).await?;
+        compares.extend([
+            Compare::version(assignment_key.clone(), CompareOp::Equal, 0),
+            Compare::version(descriptor_key.clone(), CompareOp::Equal, 0),
+            Compare::version(owner_key.clone(), CompareOp::Equal, 0),
+        ]);
+        let txn = Txn::new().when(compares).and_then([
+            TxnOp::put(
+                assignment_key.clone(),
+                assignment_value,
+                Some(PutOptions::new()),
+            ),
+            TxnOp::put(
+                descriptor_key.clone(),
+                descriptor_value,
+                Some(PutOptions::new()),
+            ),
+            TxnOp::put(owner_key, owner_value, Some(PutOptions::new())),
+        ]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
         if response.succeeded() {
@@ -813,29 +1123,25 @@ impl EtcdPlacementStore {
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::ready(descriptor))
                 .map_err(json_encode_message)?;
-        let leadership_key = self.leadership_key();
-        let leadership_value =
-            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
-        let txn = Txn::new()
-            .when([
-                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
-                Compare::mod_revision(
-                    assignment_key.clone(),
-                    CompareOp::Equal,
-                    revision.assignment_mod_revision,
-                ),
-                Compare::mod_revision(
-                    descriptor_key.clone(),
-                    CompareOp::Equal,
-                    revision.descriptor_mod_revision,
-                ),
-                Compare::mod_revision(owner_key, CompareOp::Equal, revision.owner_mod_revision),
-            ])
-            .and_then([TxnOp::put(
-                descriptor_key,
-                descriptor_value,
-                Some(PutOptions::new()),
-            )]);
+        let mut compares = self.leader_fence_compares(leader_fence).await?;
+        compares.extend([
+            Compare::mod_revision(
+                assignment_key.clone(),
+                CompareOp::Equal,
+                revision.assignment_mod_revision,
+            ),
+            Compare::mod_revision(
+                descriptor_key.clone(),
+                CompareOp::Equal,
+                revision.descriptor_mod_revision,
+            ),
+            Compare::mod_revision(owner_key, CompareOp::Equal, revision.owner_mod_revision),
+        ]);
+        let txn = Txn::new().when(compares).and_then([TxnOp::put(
+            descriptor_key,
+            descriptor_value,
+            Some(PutOptions::new()),
+        )]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
         if response.succeeded() {
@@ -886,6 +1192,113 @@ impl EtcdPlacementStore {
         Ok(Some((descriptor, kv.mod_revision())))
     }
 
+    async fn get_replica_report_with_revision(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        node_id: &str,
+    ) -> Result<Option<ShardReplicaReportWithRevision>> {
+        let key = self.shard_replica_report_key(collection, shard_id, node_id);
+        let mut client = self.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let mut report: ShardReplicaReport =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        report.mod_revision = kv.mod_revision();
+        Ok(Some(ShardReplicaReportWithRevision {
+            report,
+            mod_revision: kv.mod_revision(),
+        }))
+    }
+
+    async fn ready_member_with_revision(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<(MembershipRecord, i64)>> {
+        let key = self.membership_key(node_id);
+        let mut client = self.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let mut record: MembershipRecord =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        record.lease_id = kv.lease();
+        record.mod_revision = kv.mod_revision();
+        Ok(Some((record, kv.mod_revision())))
+    }
+
+    async fn member_with_expected_lease_and_revision(
+        &self,
+        node_id: &str,
+        expected_lease_id: i64,
+    ) -> Result<Option<(MembershipRecord, i64)>> {
+        let Some((record, mod_revision)) = self.ready_member_with_revision(node_id).await? else {
+            return Ok(None);
+        };
+        if record.lease_id != expected_lease_id {
+            return Ok(None);
+        }
+        Ok(Some((record, mod_revision)))
+    }
+
+    async fn ready_member_with_expected_lease_and_revision(
+        &self,
+        node_id: &str,
+        expected_lease_id: i64,
+    ) -> Result<Option<(MembershipRecord, i64)>> {
+        let Some((record, mod_revision)) = self
+            .member_with_expected_lease_and_revision(node_id, expected_lease_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if record.state != "ready" {
+            return Ok(None);
+        }
+        Ok(Some((record, mod_revision)))
+    }
+
+    async fn leader_fence_compares(&self, leader_fence: &LeadershipFence) -> Result<Vec<Compare>> {
+        let Some((member, membership_mod_revision)) = self
+            .ready_member_with_expected_lease_and_revision(
+                &leader_fence.node_id,
+                leader_fence.membership_lease_id,
+            )
+            .await?
+        else {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not the active control-plane leader",
+                leader_fence.node_id
+            )));
+        };
+        if !matches!(member.node_role, NodeRole::Combined | NodeRole::Control) {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not a registered control-plane member",
+                leader_fence.node_id
+            )));
+        }
+        let leadership_key = self.leadership_key();
+        let leadership_value =
+            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
+        let membership_key = self.membership_key(&leader_fence.node_id);
+        Ok(vec![
+            Compare::value(leadership_key, CompareOp::Equal, leadership_value),
+            Compare::mod_revision(
+                membership_key.clone(),
+                CompareOp::Equal,
+                membership_mod_revision,
+            ),
+            Compare::lease(
+                membership_key,
+                CompareOp::Equal,
+                leader_fence.membership_lease_id,
+            ),
+        ])
+    }
+
     async fn list_descriptors(&self) -> Result<Vec<StoredCollectionDescriptor>> {
         let mut client = self.client().await?;
         let response = client
@@ -919,8 +1332,14 @@ impl EtcdPlacementStore {
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
-        let owner_key =
-            self.shard_owner_key(&collection_ref_from_lookup_name(collection_name), "0");
+        let collection = collection_ref_from_lookup_name(collection_name);
+        let owner_key = self.shard_owner_key(&collection, "0");
+        let shard_prefix = format!(
+            "{}/clusters/{}/collections/{}/shards/0/",
+            self.key_prefix,
+            self.cluster_name,
+            collection.lookup_name()
+        );
         let txn = Txn::new()
             .when([
                 Compare::mod_revision(
@@ -943,6 +1362,7 @@ impl EtcdPlacementStore {
                 TxnOp::delete(assignment_key, Some(DeleteOptions::new())),
                 TxnOp::delete(descriptor_key, Some(DeleteOptions::new())),
                 TxnOp::delete(owner_key, Some(DeleteOptions::new())),
+                TxnOp::delete(shard_prefix, Some(DeleteOptions::new().with_prefix())),
             ]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
@@ -1069,6 +1489,15 @@ pub struct MembershipRecord {
     pub node_role: logpose_types::NodeRole,
     /// Node state marker used by control loops.
     pub state: String,
+    /// Active etcd lease currently backing this membership row.
+    #[serde(default)]
+    pub lease_id: i64,
+    /// Etcd mod revision observed when the membership row was read.
+    #[serde(skip_serializing, default)]
+    pub mod_revision: i64,
+    /// Advertised REST endpoint for peer-to-peer replica repair.
+    #[serde(default)]
+    pub rest_endpoint: Option<String>,
 }
 
 /// Leadership payload persisted in etcd.
@@ -1097,6 +1526,13 @@ pub struct ShardOwnership {
     pub mod_revision: i64,
 }
 
+/// Operator-visible owner-transition reason persisted in etcd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShardFailoverReason {
+    /// Human-readable reason for the most recent owner change.
+    pub reason: String,
+}
+
 /// Result of a promotion or ownership move transaction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PromotionResult {
@@ -1104,6 +1540,40 @@ pub enum PromotionResult {
     Applied(ShardOwnership),
     /// Ownership update conflicted with a newer revision.
     Conflict,
+}
+
+/// Watch-friendly cluster metadata snapshot loaded from authoritative etcd keys.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterMetadataSnapshot {
+    /// Cluster-wide etcd revision observed for the snapshot.
+    pub revision: i64,
+    /// All currently visible membership records.
+    pub members: Vec<MembershipRecord>,
+    /// Current controller leader when one exists.
+    pub leader: Option<LeadershipRecord>,
+    /// Collection-level metadata bundles keyed under the collections prefix.
+    pub collections: Vec<ClusterCollectionMetadata>,
+}
+
+/// Authoritative metadata bundle for one collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterCollectionMetadata {
+    /// Canonical database/collection identity.
+    pub collection: CollectionRef,
+    /// Current placement assignment when one exists.
+    pub assignment: Option<CollectionAssignment>,
+    /// Current descriptor payload when one exists.
+    pub descriptor: Option<CollectionDescriptor>,
+    /// Whether the authoritative descriptor has been marked ready for serving.
+    pub descriptor_ready: bool,
+    /// Current shard owner for shard `0` when one exists.
+    pub owner: Option<ShardOwnership>,
+    /// Leader-selected desired replica targets for shard `0`.
+    pub replica_targets: Vec<ShardReplicaTarget>,
+    /// Per-node replica materialization reports for shard `0`.
+    pub replica_reports: Vec<ShardReplicaReport>,
+    /// Last recorded reason for an owner transition when one exists.
+    pub failover_reason: Option<String>,
 }
 
 /// Distributed coordination helper over etcd leases and CAS primitives.
@@ -1130,28 +1600,105 @@ impl EtcdCoordinationClient {
         })
     }
 
+    /// Load a point-in-time cluster metadata snapshot from authoritative etcd keys.
+    pub async fn load_cluster_metadata(&self) -> Result<ClusterMetadataSnapshot> {
+        self.store.load_cluster_metadata().await
+    }
+
+    /// Block until any authoritative metadata under the cluster prefix changes.
+    pub async fn wait_for_cluster_metadata_change(&self, revision: i64) -> Result<i64> {
+        let start_revision = revision.saturating_add(1);
+        let mut client = self.store.client().await?;
+        let (_, mut stream) = client
+            .watch(
+                self.store.cluster_prefix(),
+                Some(
+                    WatchOptions::new()
+                        .with_prefix()
+                        .with_start_revision(start_revision)
+                        .with_progress_notify(),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        loop {
+            let Some(response) = stream.message().await.map_err(etcd_message)? else {
+                return Err(LogPoseError::Message(
+                    "etcd metadata watch stream ended unexpectedly".to_owned(),
+                ));
+            };
+            if response.canceled() {
+                let compact_revision = response.compact_revision();
+                let cancel_reason = response.cancel_reason();
+                let detail = if compact_revision > 0 {
+                    format!("watch was compacted at revision {compact_revision}")
+                } else if cancel_reason.is_empty() {
+                    "watch was canceled".to_owned()
+                } else {
+                    cancel_reason.to_owned()
+                };
+                return Err(LogPoseError::Message(format!(
+                    "etcd metadata watch failed: {detail}"
+                )));
+            }
+            if response.created() || response.events().is_empty() {
+                continue;
+            }
+            return Ok(response
+                .header()
+                .map(ResponseHeader::revision)
+                .unwrap_or(start_revision));
+        }
+    }
+
     /// Register node membership with an etcd lease.
     pub async fn register_membership(
         &self,
         node_id: &str,
         node_role: logpose_types::NodeRole,
     ) -> Result<MembershipLease> {
-        let membership_key = format!(
-            "{}/clusters/{}/members/{node_id}",
-            self.store.key_prefix, self.config.cluster_name
-        );
-        let payload = serde_json::json!({
-            "node_id": node_id,
-            "node_role": node_role,
-            "state": "ready",
-        });
-        let encoded = serde_json::to_string(&payload).map_err(json_encode_message)?;
+        self.register_membership_with_endpoint(node_id, node_role, None)
+            .await
+    }
+
+    /// Register node membership with an advertised REST endpoint.
+    pub async fn register_membership_with_endpoint(
+        &self,
+        node_id: &str,
+        node_role: logpose_types::NodeRole,
+        rest_endpoint: Option<&str>,
+    ) -> Result<MembershipLease> {
+        let membership_key = self.store.membership_key(node_id);
         let mut client = self.store.client().await?;
         let lease = client
             .lease_grant(self.config.membership_ttl_secs, None)
             .await
             .map_err(etcd_message)?;
         let lease_id = lease.id();
+        let existing_state = client
+            .get(membership_key.clone(), None)
+            .await
+            .map_err(etcd_message)?
+            .kvs()
+            .first()
+            .map(|kv| {
+                let mut record: MembershipRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                record.lease_id = kv.lease();
+                record.mod_revision = kv.mod_revision();
+                Ok(record.state)
+            })
+            .transpose()?
+            .unwrap_or_else(|| "ready".to_owned());
+        let encoded = serde_json::to_string(&MembershipRecord {
+            node_id: node_id.to_owned(),
+            node_role,
+            state: existing_state,
+            lease_id,
+            mod_revision: 0,
+            rest_endpoint: rest_endpoint.map(ToOwned::to_owned),
+        })
+        .map_err(json_encode_message)?;
         match client
             .put(
                 membership_key.clone(),
@@ -1200,11 +1747,26 @@ impl EtcdCoordinationClient {
     }
 
     /// Try to acquire controller leadership using lease-backed CAS.
-    pub async fn try_acquire_leadership(&self, node_id: &str) -> Result<Option<LeadershipLease>> {
+    pub async fn try_acquire_leadership(
+        &self,
+        node_id: &str,
+        expected_membership_lease_id: i64,
+    ) -> Result<Option<LeadershipLease>> {
         let leadership_key = format!(
             "{}/clusters/{}/controllers/leader",
             self.store.key_prefix, self.config.cluster_name
         );
+        let Some((member, membership_mod_revision)) = self
+            .store
+            .ready_member_with_expected_lease_and_revision(node_id, expected_membership_lease_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !matches!(member.node_role, NodeRole::Combined | NodeRole::Control) {
+            return Ok(None);
+        }
+        let membership_key = self.store.membership_key(node_id);
         let mut client = self.store.client().await?;
         let lease = client
             .lease_grant(self.config.leadership_ttl_secs, None)
@@ -1217,11 +1779,19 @@ impl EtcdCoordinationClient {
         })
         .map_err(json_encode_message)?;
         let txn = Txn::new()
-            .when([Compare::version(
-                leadership_key.clone(),
-                CompareOp::Equal,
-                0,
-            )])
+            .when([
+                Compare::version(leadership_key.clone(), CompareOp::Equal, 0),
+                Compare::mod_revision(
+                    membership_key.clone(),
+                    CompareOp::Equal,
+                    membership_mod_revision,
+                ),
+                Compare::lease(
+                    membership_key,
+                    CompareOp::Equal,
+                    expected_membership_lease_id,
+                ),
+            ])
             .and_then([TxnOp::put(
                 leadership_key.clone(),
                 encoded,
@@ -1249,6 +1819,28 @@ impl EtcdCoordinationClient {
         }))
     }
 
+    /// Validate that one runtime still holds both the local membership lease and controller leadership.
+    pub async fn validate_local_leadership(
+        &self,
+        node_id: &str,
+        expected_membership_lease_id: i64,
+        expected_leadership_lease_id: i64,
+    ) -> Result<bool> {
+        let Some((member, _)) = self
+            .store
+            .ready_member_with_expected_lease_and_revision(node_id, expected_membership_lease_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !matches!(member.node_role, NodeRole::Combined | NodeRole::Control) {
+            return Ok(false);
+        }
+        Ok(self.current_leader().await?.is_some_and(|leader| {
+            leader.node_id == node_id && leader.lease_id == expected_leadership_lease_id
+        }))
+    }
+
     /// Return all currently visible membership records under the configured cluster.
     pub async fn list_membership(&self) -> Result<Vec<MembershipRecord>> {
         let membership_prefix = format!(
@@ -1270,8 +1862,141 @@ impl EtcdCoordinationClient {
         response
             .kvs()
             .iter()
-            .map(|kv| serde_json::from_slice(kv.value()).map_err(json_decode_message))
+            .map(|kv| {
+                let mut record: MembershipRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+                record.lease_id = kv.lease();
+                record.mod_revision = kv.mod_revision();
+                Ok(record)
+            })
             .collect()
+    }
+
+    /// Read one membership record by node identifier.
+    pub async fn membership(&self, node_id: &str) -> Result<Option<MembershipRecord>> {
+        let key = self.store.membership_key(node_id);
+        let mut client = self.store.client().await?;
+        let response = client.get(key, None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(None);
+        };
+        let mut record: MembershipRecord =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        record.lease_id = kv.lease();
+        record.mod_revision = kv.mod_revision();
+        Ok(Some(record))
+    }
+
+    /// Read the authoritative placement assignment for one collection.
+    pub async fn collection_assignment(
+        &self,
+        collection: &CollectionRef,
+    ) -> Result<Option<CollectionAssignment>> {
+        self.store.get_assignment(&collection.lookup_name()).await
+    }
+
+    /// Update one node membership state while preserving the active lease.
+    pub async fn set_membership_state(
+        &self,
+        node_id: &str,
+        state: &str,
+        leader_fence: &LeadershipFence,
+    ) -> Result<MembershipRecord> {
+        let state = state.trim();
+        if state.is_empty() {
+            return Err(LogPoseError::Message(
+                "membership state must not be empty".to_owned(),
+            ));
+        }
+        let key = self.store.membership_key(node_id);
+        let mut client = self.store.client().await?;
+        let response = client.get(key.clone(), None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Err(LogPoseError::Message(format!(
+                "membership record for node '{node_id}' does not exist"
+            )));
+        };
+        let mut record: MembershipRecord =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        record.state = state.to_owned();
+        let lease_id = kv.lease();
+        record.lease_id = lease_id;
+        record.mod_revision = kv.mod_revision();
+        let encoded = serde_json::to_string(&record).map_err(json_encode_message)?;
+        let mut compares = self.store.leader_fence_compares(leader_fence).await?;
+        compares.push(Compare::mod_revision(
+            key.clone(),
+            CompareOp::Equal,
+            kv.mod_revision(),
+        ));
+        let txn = Txn::new().when(compares).and_then([TxnOp::put(
+            key,
+            encoded,
+            Some(PutOptions::new().with_lease(lease_id)),
+        )]);
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not the active control-plane leader, or membership state for node '{node_id}' changed concurrently; retry the operation",
+                leader_fence.node_id,
+            )));
+        }
+        Ok(record)
+    }
+
+    /// Restore one local membership record from an expected prior state without
+    /// mutating any other node's membership.
+    pub async fn restore_local_membership_state(
+        &self,
+        node_id: &str,
+        expected_state: &str,
+        state: &str,
+    ) -> Result<MembershipRecord> {
+        let expected_state = expected_state.trim();
+        let state = state.trim();
+        if expected_state.is_empty() || state.is_empty() {
+            return Err(LogPoseError::Message(
+                "membership state must not be empty".to_owned(),
+            ));
+        }
+        let key = self.store.membership_key(node_id);
+        let mut client = self.store.client().await?;
+        let response = client.get(key.clone(), None).await.map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Err(LogPoseError::Message(format!(
+                "membership record for node '{node_id}' does not exist"
+            )));
+        };
+        let mut record: MembershipRecord =
+            serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
+        if record.state != expected_state {
+            return Err(LogPoseError::Message(format!(
+                "membership record for node '{node_id}' is '{}' and cannot be restored to '{state}' from '{expected_state}'",
+                record.state
+            )));
+        }
+        record.state = state.to_owned();
+        let lease_id = kv.lease();
+        record.lease_id = lease_id;
+        let encoded = serde_json::to_string(&record).map_err(json_encode_message)?;
+        let txn = Txn::new()
+            .when([Compare::mod_revision(
+                key.clone(),
+                CompareOp::Equal,
+                kv.mod_revision(),
+            )])
+            .and_then([TxnOp::put(
+                key,
+                encoded,
+                Some(PutOptions::new().with_lease(lease_id)),
+            )]);
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "membership state for node '{node_id}' changed concurrently; retry the operation"
+            )));
+        }
+        Ok(record)
     }
 
     /// Return the current controller leader when one exists.
@@ -1310,6 +2035,191 @@ impl EtcdCoordinationClient {
         Ok(Some(ownership))
     }
 
+    /// Persist the leader-selected desired replica targets for one shard.
+    pub async fn set_shard_replica_targets(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        replica_targets: Vec<ShardReplicaTarget>,
+        leader_fence: &LeadershipFence,
+    ) -> Result<Vec<ShardReplicaTarget>> {
+        let key = self.store.shard_replica_targets_key(collection, shard_id);
+        let encoded = serde_json::to_string(&ShardReplicaTargetSet {
+            replicas: replica_targets.clone(),
+        })
+        .map_err(json_encode_message)?;
+        let txn = Txn::new()
+            .when(self.store.leader_fence_compares(leader_fence).await?)
+            .and_then([TxnOp::put(key, encoded, Some(PutOptions::new()))]);
+        let mut client = self.store.client().await?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not the active control-plane leader",
+                leader_fence.node_id
+            )));
+        }
+        Ok(replica_targets)
+    }
+
+    /// Publish one node's current local materialization report for a shard.
+    pub async fn publish_shard_replica_report(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        report: &ShardReplicaReport,
+        expected_membership_lease_id: i64,
+        expected_report_mod_revision: Option<i64>,
+    ) -> Result<bool> {
+        let Some((member, membership_mod_revision)) = self
+            .store
+            .member_with_expected_lease_and_revision(&report.node_id, expected_membership_lease_id)
+            .await?
+        else {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not currently registered in cluster membership",
+                report.node_id
+            )));
+        };
+        if !matches!(member.node_role, NodeRole::Combined | NodeRole::Data)
+            || member.node_role != report.node_role
+        {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not a registered data-serving member",
+                report.node_id
+            )));
+        }
+        if report.materialized && member.state != "ready" {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not a ready data-serving member",
+                report.node_id
+            )));
+        }
+        let membership_key = self.store.membership_key(&report.node_id);
+        let key = self
+            .store
+            .shard_replica_report_key(collection, shard_id, &report.node_id);
+        let mut persisted = report.clone();
+        persisted.membership_mod_revision = Some(membership_mod_revision);
+        let existing_report = self
+            .store
+            .get_replica_report_with_revision(collection, shard_id, &report.node_id)
+            .await?;
+        if let Some(existing) = existing_report.as_ref() {
+            persisted.mod_revision = existing.mod_revision;
+        }
+        if existing_report
+            .as_ref()
+            .is_some_and(|existing| existing.report == persisted)
+        {
+            return Ok(false);
+        }
+        let encoded = serde_json::to_string(&persisted).map_err(json_encode_message)?;
+        let report_compare = match expected_report_mod_revision {
+            Some(expected_mod_revision) => {
+                Compare::mod_revision(key.clone(), CompareOp::Equal, expected_mod_revision)
+            }
+            None => existing_report.map_or_else(
+                || Compare::create_revision(key.clone(), CompareOp::Equal, 0),
+                |existing| {
+                    Compare::mod_revision(key.clone(), CompareOp::Equal, existing.mod_revision)
+                },
+            ),
+        };
+        let txn = Txn::new()
+            .when([
+                Compare::mod_revision(
+                    membership_key.clone(),
+                    CompareOp::Equal,
+                    membership_mod_revision,
+                ),
+                Compare::lease(
+                    membership_key,
+                    CompareOp::Equal,
+                    expected_membership_lease_id,
+                ),
+                report_compare,
+            ])
+            .and_then([TxnOp::put(key, encoded, Some(PutOptions::new()))]);
+        let mut client = self.store.client().await?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "membership for node '{}' changed while publishing replica state; retry the update",
+                report.node_id
+            )));
+        }
+        Ok(true)
+    }
+
+    /// Read one node's authoritative shard replica report when it exists.
+    pub async fn shard_replica_report(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        node_id: &str,
+    ) -> Result<Option<ShardReplicaReport>> {
+        Ok(self
+            .store
+            .get_replica_report_with_revision(collection, shard_id, node_id)
+            .await?
+            .map(|report| report.report))
+    }
+
+    /// Remove one node's authoritative shard replica report.
+    pub async fn delete_shard_replica_report(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        node_id: &str,
+        expected_membership_lease_id: i64,
+    ) -> Result<()> {
+        let Some((member, membership_mod_revision)) = self
+            .store
+            .ready_member_with_expected_lease_and_revision(node_id, expected_membership_lease_id)
+            .await?
+        else {
+            return Err(LogPoseError::Message(format!(
+                "node '{node_id}' is not currently registered in cluster membership"
+            )));
+        };
+        if !matches!(member.node_role, NodeRole::Combined | NodeRole::Data) {
+            return Err(LogPoseError::Message(format!(
+                "node '{node_id}' is not a registered data-serving member"
+            )));
+        }
+        let membership_key = self.store.membership_key(node_id);
+        let key = self
+            .store
+            .shard_replica_report_key(collection, shard_id, node_id);
+        let mut client = self.store.client().await?;
+        let response = client
+            .txn(
+                Txn::new()
+                    .when([
+                        Compare::mod_revision(
+                            membership_key.clone(),
+                            CompareOp::Equal,
+                            membership_mod_revision,
+                        ),
+                        Compare::lease(
+                            membership_key,
+                            CompareOp::Equal,
+                            expected_membership_lease_id,
+                        ),
+                    ])
+                    .and_then([TxnOp::delete(key, None)]),
+            )
+            .await
+            .map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "membership for node '{node_id}' changed while clearing replica state; retry the update"
+            )));
+        }
+        Ok(())
+    }
+
     /// Promote or move shard ownership using revision-based CAS fencing.
     ///
     /// On a successful CAS, the returned [`ShardOwnership`] observes *our own
@@ -1323,16 +2233,31 @@ impl EtcdCoordinationClient {
         &self,
         current: &ShardOwnership,
         new_owner_node_id: &str,
+        leader_fence: &LeadershipFence,
     ) -> Result<PromotionResult> {
-        let members = self.list_membership().await?;
-        if !members.iter().any(|member| {
-            member.node_id == new_owner_node_id
-                && member.state == "ready"
-                && matches!(
-                    member.node_role,
-                    logpose_types::NodeRole::Combined | logpose_types::NodeRole::Data
-                )
-        }) {
+        if current.owner_node_id == new_owner_node_id {
+            return Ok(PromotionResult::Conflict);
+        }
+        let Some((member, membership_mod_revision)) = self
+            .store
+            .ready_member_with_revision(new_owner_node_id)
+            .await?
+        else {
+            return Ok(PromotionResult::Conflict);
+        };
+        if member.state != "ready"
+            || !matches!(member.node_role, NodeRole::Combined | NodeRole::Data)
+        {
+            return Ok(PromotionResult::Conflict);
+        }
+        let current_owner_membership = self
+            .store
+            .ready_member_with_revision(&current.owner_node_id)
+            .await?;
+        if current_owner_membership
+            .as_ref()
+            .is_some_and(|(member, _)| member.state == "ready")
+        {
             return Ok(PromotionResult::Conflict);
         }
         let key = self.shard_owner_key(&current.collection, &current.shard_id);
@@ -1347,7 +2272,50 @@ impl EtcdCoordinationClient {
         if !stored_descriptor.ready {
             return Ok(PromotionResult::Conflict);
         }
+        let Some(current_owner_report) = self
+            .store
+            .get_replica_report_with_revision(
+                &current.collection,
+                &current.shard_id,
+                &current.owner_node_id,
+            )
+            .await?
+        else {
+            return Ok(PromotionResult::Conflict);
+        };
+        let Some(candidate_report) = self
+            .store
+            .get_replica_report_with_revision(
+                &current.collection,
+                &current.shard_id,
+                new_owner_node_id,
+            )
+            .await?
+        else {
+            return Ok(PromotionResult::Conflict);
+        };
+        if !candidate_report.report.materialized
+            || current_owner_report.report.ownership_epoch != Some(current.epoch)
+            || candidate_report.report.ownership_epoch != Some(current.epoch)
+            || candidate_report.report.membership_mod_revision != Some(membership_mod_revision)
+            || current_owner_report.report.snapshot.is_none()
+            || candidate_report.report.snapshot != current_owner_report.report.snapshot
+        {
+            return Ok(PromotionResult::Conflict);
+        }
         let descriptor_key = self.store.descriptor_key(&descriptor_lookup_name);
+        let membership_key = self.store.membership_key(new_owner_node_id);
+        let current_owner_membership_key = self.store.membership_key(&current.owner_node_id);
+        let current_owner_report_key = self.store.shard_replica_report_key(
+            &current.collection,
+            &current.shard_id,
+            &current.owner_node_id,
+        );
+        let candidate_report_key = self.store.shard_replica_report_key(
+            &current.collection,
+            &current.shard_id,
+            new_owner_node_id,
+        );
         let mut candidate = ShardOwnership {
             collection: current.collection.clone(),
             shard_id: current.shard_id.clone(),
@@ -1356,11 +2324,37 @@ impl EtcdCoordinationClient {
             mod_revision: 0,
         };
         let encoded = serde_json::to_string(&candidate).map_err(json_encode_message)?;
+        let mut compares = self.store.leader_fence_compares(leader_fence).await?;
+        compares.extend([
+            Compare::mod_revision(key.clone(), CompareOp::Equal, current.mod_revision),
+            Compare::mod_revision(descriptor_key, CompareOp::Equal, descriptor_mod_revision),
+            Compare::mod_revision(membership_key, CompareOp::Equal, membership_mod_revision),
+            Compare::mod_revision(
+                current_owner_report_key,
+                CompareOp::Equal,
+                current_owner_report.mod_revision,
+            ),
+            Compare::mod_revision(
+                candidate_report_key,
+                CompareOp::Equal,
+                candidate_report.mod_revision,
+            ),
+        ]);
+        if let Some((_, current_owner_membership_mod_revision)) = current_owner_membership {
+            compares.push(Compare::mod_revision(
+                current_owner_membership_key,
+                CompareOp::Equal,
+                current_owner_membership_mod_revision,
+            ));
+        } else {
+            compares.push(Compare::version(
+                current_owner_membership_key,
+                CompareOp::Equal,
+                0,
+            ));
+        }
         let txn = Txn::new()
-            .when([
-                Compare::mod_revision(key.clone(), CompareOp::Equal, current.mod_revision),
-                Compare::mod_revision(descriptor_key, CompareOp::Equal, descriptor_mod_revision),
-            ])
+            .when(compares)
             .and_then([TxnOp::put(key.clone(), encoded, None)]);
         let mut client = self.store.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
@@ -1377,6 +2371,64 @@ impl EtcdCoordinationClient {
             })?;
         candidate.mod_revision = revision;
         Ok(PromotionResult::Applied(candidate))
+    }
+
+    /// Persist a new authoritative placement assignment under the active control-plane leader fence.
+    pub async fn set_collection_assignment(
+        &self,
+        collection: &CollectionRef,
+        assignment: CollectionAssignment,
+        leader_fence: &LeadershipFence,
+    ) -> Result<CollectionAssignment> {
+        let assignment_key = self.store.assignment_key(&collection.lookup_name());
+        let assignment_value = serde_json::to_string(&assignment).map_err(json_encode_message)?;
+        let txn = Txn::new()
+            .when(self.store.leader_fence_compares(leader_fence).await?)
+            .and_then([TxnOp::put(
+                assignment_key,
+                assignment_value,
+                Some(PutOptions::new()),
+            )]);
+        let mut client = self.store.client().await?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not the active control-plane leader",
+                leader_fence.node_id
+            )));
+        }
+        Ok(assignment)
+    }
+
+    /// Persist the last owner-transition reason under the active control-plane leader fence.
+    pub async fn set_shard_failover_reason(
+        &self,
+        collection: &CollectionRef,
+        shard_id: &str,
+        reason: &str,
+        leader_fence: &LeadershipFence,
+    ) -> Result<()> {
+        let failover_key = self.store.shard_failover_key(collection, shard_id);
+        let failover_value = serde_json::to_string(&ShardFailoverReason {
+            reason: reason.to_owned(),
+        })
+        .map_err(json_encode_message)?;
+        let txn = Txn::new()
+            .when(self.store.leader_fence_compares(leader_fence).await?)
+            .and_then([TxnOp::put(
+                failover_key,
+                failover_value,
+                Some(PutOptions::new()),
+            )]);
+        let mut client = self.store.client().await?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if !response.succeeded() {
+            return Err(LogPoseError::Message(format!(
+                "node '{}' is not the active control-plane leader",
+                leader_fence.node_id
+            )));
+        }
+        Ok(())
     }
 
     fn shard_owner_key(&self, collection: &CollectionRef, shard_id: &str) -> String {
@@ -1444,6 +2496,19 @@ mod tests {
             leadership_ttl_secs: 10,
             cluster_name: "test-cluster".to_owned(),
         }
+    }
+
+    fn test_etcd_endpoint() -> String {
+        std::env::var("LOGPOSE_TEST_ETCD_ENDPOINTS")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .find(|endpoint| !endpoint.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned())
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -1545,6 +2610,9 @@ mod tests {
             node_id: "node-a".to_owned(),
             node_role: logpose_types::NodeRole::Combined,
             state: "ready".to_owned(),
+            lease_id: 11,
+            mod_revision: 0,
+            rest_endpoint: Some("http://127.0.0.1:8080".to_owned()),
         };
         let encoded = serde_json::to_vec(&payload);
         assert!(encoded.is_ok(), "payload should encode");
@@ -1790,5 +2858,446 @@ mod tests {
             .expect_err("authoritative metadata lookup should fail closed");
 
         assert!(error.to_string().contains("etcd metadata operation failed"));
+    }
+
+    #[tokio::test]
+    async fn collection_metadata_rollback_deletes_shard_replica_state() {
+        let endpoint = test_etcd_endpoint();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let config = EtcdMetadataConfig {
+            endpoints: vec![endpoint],
+            key_prefix: format!("/logpose/metadata/rollback-cleanup-{suffix}"),
+            cluster_name: format!("rollback-cleanup-{suffix}"),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+        };
+        let store = EtcdPlacementStore::new(config.clone()).expect("store should build");
+        let collection = CollectionRef::new_default("documents");
+        let assignment_key = store.assignment_key(&collection.lookup_name());
+        let descriptor_key = store.descriptor_key(&collection.lookup_name());
+        let owner_key = store.shard_owner_key(&collection, "0");
+        let replica_targets_key = store.shard_replica_targets_key(&collection, "0");
+        let replica_report_key = store.shard_replica_report_key(&collection, "0", "node-b");
+        let failover_key = store.shard_failover_key(&collection, "0");
+        let shard_prefix = format!(
+            "{}/clusters/{}/collections/{}/shards/0/",
+            config.key_prefix,
+            config.cluster_name,
+            collection.lookup_name()
+        );
+
+        let mut client = Client::connect(config.endpoints.clone(), None)
+            .await
+            .expect("etcd client should connect");
+        client
+            .put(
+                assignment_key.clone(),
+                serde_json::to_string(&assignment("node-a")).expect("assignment should serialize"),
+                None,
+            )
+            .await
+            .expect("assignment metadata should be seeded");
+        client
+            .put(
+                descriptor_key.clone(),
+                serde_json::to_string(&StoredCollectionDescriptor::ready(
+                    &CollectionDescriptor::new(
+                        "documents",
+                        2,
+                        DistanceMetric::Dot,
+                        unique_temp_dir("rollback-cleanup-root"),
+                    ),
+                ))
+                .expect("descriptor should serialize"),
+                None,
+            )
+            .await
+            .expect("descriptor metadata should be seeded");
+        client
+            .put(
+                owner_key.clone(),
+                serde_json::to_string(&ShardOwnership {
+                    collection: collection.clone(),
+                    shard_id: "0".to_owned(),
+                    owner_node_id: "node-a".to_owned(),
+                    epoch: 1,
+                    mod_revision: 0,
+                })
+                .expect("owner should serialize"),
+                None,
+            )
+            .await
+            .expect("owner metadata should be seeded");
+        client
+            .put(
+                replica_targets_key,
+                serde_json::to_string(&ShardReplicaTargetSet {
+                    replicas: vec![ShardReplicaTarget {
+                        node_id: "node-b".to_owned(),
+                        node_role: NodeRole::Data,
+                    }],
+                })
+                .expect("replica targets should serialize"),
+                None,
+            )
+            .await
+            .expect("replica targets should be seeded");
+        client
+            .put(
+                replica_report_key,
+                serde_json::to_string(&ShardReplicaReport {
+                    node_id: "node-b".to_owned(),
+                    node_role: NodeRole::Data,
+                    materialized: true,
+                    snapshot: Some(Snapshot {
+                        manifest_generation: 3,
+                        visible_seq_no: 9,
+                    }),
+                    ownership_epoch: Some(1),
+                    membership_mod_revision: Some(7),
+                    mod_revision: 0,
+                })
+                .expect("replica report should serialize"),
+                None,
+            )
+            .await
+            .expect("replica report should be seeded");
+        client
+            .put(
+                failover_key,
+                serde_json::to_string(&ShardFailoverReason {
+                    reason: "seeded failover".to_owned(),
+                })
+                .expect("failover reason should serialize"),
+                None,
+            )
+            .await
+            .expect("failover reason should be seeded");
+
+        let assignment_mod_revision = client
+            .get(assignment_key.clone(), None)
+            .await
+            .expect("assignment metadata should be readable")
+            .kvs()[0]
+            .mod_revision();
+        let descriptor_mod_revision = client
+            .get(descriptor_key.clone(), None)
+            .await
+            .expect("descriptor metadata should be readable")
+            .kvs()[0]
+            .mod_revision();
+        let owner_mod_revision = client
+            .get(owner_key.clone(), None)
+            .await
+            .expect("owner metadata should be readable")
+            .kvs()[0]
+            .mod_revision();
+
+        store
+            .delete_collection_metadata_if_revision_matches(
+                &collection.lookup_name(),
+                CollectionMetadataRevision {
+                    assignment_mod_revision,
+                    descriptor_mod_revision,
+                    owner_mod_revision,
+                },
+            )
+            .await
+            .expect("rollback cleanup should succeed");
+
+        let shard_entries = client
+            .get(shard_prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .expect("shard metadata should be readable after cleanup");
+        assert!(
+            shard_entries.kvs().is_empty(),
+            "rollback should remove shard replica targets, reports, and failover metadata too"
+        );
+        let snapshot = store
+            .load_cluster_metadata()
+            .await
+            .expect("cluster metadata snapshot should load after cleanup");
+        assert!(
+            snapshot.collections.is_empty(),
+            "rollback cleanup should leave no collection metadata behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_shard_replica_report_is_idempotent() {
+        let endpoint = test_etcd_endpoint();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let config = EtcdMetadataConfig {
+            endpoints: vec![endpoint],
+            key_prefix: format!("/logpose/metadata/report-idempotency-{suffix}"),
+            cluster_name: format!("report-idempotency-{suffix}"),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+        };
+        let coordination =
+            EtcdCoordinationClient::new(config).expect("coordination client should build");
+        let membership = coordination
+            .register_membership("node-a", NodeRole::Data)
+            .await
+            .expect("membership should register");
+        let collection = CollectionRef::new_default("documents");
+        let report = ShardReplicaReport {
+            node_id: "node-a".to_owned(),
+            node_role: NodeRole::Data,
+            materialized: true,
+            snapshot: Some(Snapshot {
+                manifest_generation: 4,
+                visible_seq_no: 12,
+            }),
+            ownership_epoch: Some(2),
+            membership_mod_revision: None,
+            mod_revision: 0,
+        };
+
+        let first = coordination
+            .publish_shard_replica_report(&collection, "0", &report, membership.lease_id, None)
+            .await
+            .expect("initial report publish should succeed");
+        let second = coordination
+            .publish_shard_replica_report(&collection, "0", &report, membership.lease_id, None)
+            .await
+            .expect("replaying the same report should stay idempotent");
+
+        assert!(first);
+        assert!(!second);
+
+        coordination
+            .revoke_lease(membership.lease_id)
+            .await
+            .expect("membership lease should revoke during cleanup");
+    }
+
+    #[tokio::test]
+    async fn stale_membership_lease_cannot_publish_replica_report() {
+        let endpoint = test_etcd_endpoint();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let config = EtcdMetadataConfig {
+            endpoints: vec![endpoint],
+            key_prefix: format!("/logpose/metadata/report-fence-{suffix}"),
+            cluster_name: format!("report-fence-{suffix}"),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+        };
+        let stale = EtcdCoordinationClient::new(config.clone())
+            .expect("stale coordination client should build");
+        let fresh =
+            EtcdCoordinationClient::new(config).expect("fresh coordination client should build");
+        let stale_membership = stale
+            .register_membership("node-a", NodeRole::Data)
+            .await
+            .expect("stale membership should register");
+        let fresh_membership = fresh
+            .register_membership("node-a", NodeRole::Data)
+            .await
+            .expect("fresh membership should replace the stale one");
+        let collection = CollectionRef::new_default("documents");
+        let report = ShardReplicaReport {
+            node_id: "node-a".to_owned(),
+            node_role: NodeRole::Data,
+            materialized: true,
+            snapshot: Some(Snapshot {
+                manifest_generation: 4,
+                visible_seq_no: 12,
+            }),
+            ownership_epoch: Some(2),
+            membership_mod_revision: None,
+            mod_revision: 0,
+        };
+
+        let stale_error = stale
+            .publish_shard_replica_report(
+                &collection,
+                "0",
+                &report,
+                stale_membership.lease_id,
+                None,
+            )
+            .await
+            .expect_err("stale membership should not publish replica state");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("not currently registered in cluster membership"),
+            "unexpected error: {stale_error}"
+        );
+
+        let published = fresh
+            .publish_shard_replica_report(
+                &collection,
+                "0",
+                &report,
+                fresh_membership.lease_id,
+                None,
+            )
+            .await
+            .expect("fresh membership should publish replica state");
+        assert!(published);
+
+        fresh
+            .revoke_lease(fresh_membership.lease_id)
+            .await
+            .expect("fresh membership lease should revoke during cleanup");
+    }
+
+    #[tokio::test]
+    async fn stale_membership_lease_cannot_acquire_leadership() {
+        let endpoint = test_etcd_endpoint();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let config = EtcdMetadataConfig {
+            endpoints: vec![endpoint],
+            key_prefix: format!("/logpose/metadata/leadership-fence-{suffix}"),
+            cluster_name: format!("leadership-fence-{suffix}"),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+        };
+        let stale = EtcdCoordinationClient::new(config.clone())
+            .expect("stale coordination client should build");
+        let fresh =
+            EtcdCoordinationClient::new(config).expect("fresh coordination client should build");
+        let stale_membership = stale
+            .register_membership("node-a", NodeRole::Combined)
+            .await
+            .expect("stale membership should register");
+        let fresh_membership = fresh
+            .register_membership("node-a", NodeRole::Combined)
+            .await
+            .expect("fresh membership should replace the stale one");
+
+        let stale_leadership = stale
+            .try_acquire_leadership("node-a", stale_membership.lease_id)
+            .await
+            .expect("stale leadership attempt should not error");
+        assert!(
+            stale_leadership.is_none(),
+            "stale membership should not acquire leadership"
+        );
+
+        let fresh_leadership = fresh
+            .try_acquire_leadership("node-a", fresh_membership.lease_id)
+            .await
+            .expect("fresh leadership attempt should succeed");
+        assert!(
+            fresh_leadership.is_some(),
+            "fresh membership should acquire leadership"
+        );
+
+        if let Some(leadership) = fresh_leadership {
+            fresh
+                .revoke_lease(leadership.lease_id)
+                .await
+                .expect("leadership lease should revoke during cleanup");
+        }
+        fresh
+            .revoke_lease(fresh_membership.lease_id)
+            .await
+            .expect("fresh membership lease should revoke during cleanup");
+    }
+
+    #[tokio::test]
+    async fn stale_membership_lease_cannot_delete_replica_report() {
+        let endpoint = test_etcd_endpoint();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let config = EtcdMetadataConfig {
+            endpoints: vec![endpoint],
+            key_prefix: format!("/logpose/metadata/report-delete-fence-{suffix}"),
+            cluster_name: format!("report-delete-fence-{suffix}"),
+            timeout_ms: 1_500,
+            membership_ttl_secs: 15,
+            leadership_ttl_secs: 10,
+        };
+        let stale = EtcdCoordinationClient::new(config.clone())
+            .expect("stale coordination client should build");
+        let fresh =
+            EtcdCoordinationClient::new(config).expect("fresh coordination client should build");
+        let stale_membership = stale
+            .register_membership("node-a", NodeRole::Data)
+            .await
+            .expect("stale membership should register");
+        let collection = CollectionRef::new_default("documents");
+        let report = ShardReplicaReport {
+            node_id: "node-a".to_owned(),
+            node_role: NodeRole::Data,
+            materialized: true,
+            snapshot: Some(Snapshot {
+                manifest_generation: 4,
+                visible_seq_no: 12,
+            }),
+            ownership_epoch: Some(2),
+            membership_mod_revision: None,
+            mod_revision: 0,
+        };
+        stale
+            .publish_shard_replica_report(
+                &collection,
+                "0",
+                &report,
+                stale_membership.lease_id,
+                None,
+            )
+            .await
+            .expect("initial report publish should succeed");
+        let fresh_membership = fresh
+            .register_membership("node-a", NodeRole::Data)
+            .await
+            .expect("fresh membership should replace the stale one");
+
+        let stale_error = stale
+            .delete_shard_replica_report(&collection, "0", "node-a", stale_membership.lease_id)
+            .await
+            .expect_err("stale membership should not clear replica state");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("node 'node-a' is not currently registered in cluster membership"),
+            "unexpected error: {stale_error}"
+        );
+
+        let persisted = fresh
+            .shard_replica_report(&collection, "0", "node-a")
+            .await
+            .expect("replica report lookup should succeed");
+        assert!(
+            persisted.is_some(),
+            "stale delete must not remove the report"
+        );
+
+        fresh
+            .delete_shard_replica_report(&collection, "0", "node-a", fresh_membership.lease_id)
+            .await
+            .expect("fresh membership should clear replica state");
+        let cleared = fresh
+            .shard_replica_report(&collection, "0", "node-a")
+            .await
+            .expect("replica report lookup should succeed after delete");
+        assert!(cleared.is_none(), "fresh delete should remove the report");
+
+        fresh
+            .revoke_lease(fresh_membership.lease_id)
+            .await
+            .expect("fresh membership lease should revoke during cleanup");
     }
 }

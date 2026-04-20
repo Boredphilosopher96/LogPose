@@ -195,6 +195,7 @@ fn action_from_scripted_prompts(
                 collection: collection_ref_for_namespace(&args.namespace, &name),
                 dimensions,
                 metric: metric.into(),
+                replication_factor: 1,
             }))
         }
         WorkflowKind::CollectionShow => Ok(Action::CollectionShow(collection_ref_for_namespace(
@@ -1267,6 +1268,7 @@ impl FormState {
                         .parse::<usize>()
                         .context("dimensions must be a positive integer")?,
                     metric: parse_metric(field("metric")?)?.into(),
+                    replication_factor: 1,
                 }))
             }
             WorkflowKind::CollectionShow => {
@@ -1913,8 +1915,13 @@ impl InteractiveApp {
             | Action::DatabaseList
             | Action::DatabaseShow { .. }
             | Action::DatabasePut(_)
+            | Action::NodeMembership(_)
+            | Action::NodeDrain(_)
+            | Action::NodeUndrain(_)
             | Action::DatabasePolicyShow { .. }
-            | Action::DatabasePolicySet(_) => None,
+            | Action::DatabasePolicySet(_)
+            | Action::CollectionPromote(_)
+            | Action::CollectionRebalance(_) => None,
         };
         self.session.last_collection = collection;
     }
@@ -3112,6 +3119,11 @@ fn confirmation_prompt(action: &Action) -> Option<String> {
             "Delete record '{}' from collection '{}' now?",
             action.id,
             collection_label(&action.collection)
+        )),
+        Action::NodeDrain(action) => Some(format!("Drain node '{}' now?", action.node_name)),
+        Action::NodeUndrain(action) => Some(format!(
+            "Restore node '{}' to ready state now?",
+            action.node_name
         )),
         _ => None,
     }

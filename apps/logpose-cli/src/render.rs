@@ -8,14 +8,17 @@ use logpose_config::LogPoseConfig;
 use logpose_query::QueryResponse;
 use logpose_storage::InspectReport;
 use logpose_types::{
-    CollectionPlacement, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, NodeRuntimeStatus,
-    Snapshot,
+    CollectionPlacement, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, NodeMembershipStatus,
+    NodeRuntimeStatus, Snapshot,
 };
 use serde::Serialize;
 
 pub enum ActionOutput {
     Status(NodeRuntimeStatus),
     Config(LogPoseConfig),
+    NodeMembership(NodeMembershipStatus),
+    NodeDrained(NodeMembershipStatus),
+    NodeUndrained(NodeMembershipStatus),
     DatabaseShown(DatabaseDescriptor),
     DatabaseUpdated(DatabaseDescriptor),
     DatabasesListed(Vec<DatabaseDescriptor>),
@@ -25,6 +28,8 @@ pub enum ActionOutput {
     CollectionShown(CollectionDescriptor),
     CollectionStats(CollectionStats),
     CollectionPlacement(CollectionPlacement),
+    CollectionPromoted(CollectionPlacement),
+    CollectionRebalanced(CollectionPlacement),
     CollectionFlushed(ScopedCollectionResponse<Snapshot>),
     CollectionCompacted(ScopedCollectionResponse<Snapshot>),
     RecordsWritten(ScopedCollectionResponse<CommitAck>),
@@ -48,6 +53,11 @@ impl ActionOutput {
         Ok(match self {
             ActionOutput::Status(status) => render_status(status),
             ActionOutput::Config(config) => render_config(config),
+            ActionOutput::NodeMembership(status) => {
+                render_node_membership("Node Membership", status)
+            }
+            ActionOutput::NodeDrained(status) => render_node_membership("Node Drained", status),
+            ActionOutput::NodeUndrained(status) => render_node_membership("Node Ready", status),
             ActionOutput::DatabaseShown(descriptor) => render_database("Database", descriptor),
             ActionOutput::DatabaseUpdated(descriptor) => {
                 render_database("Database updated", descriptor)
@@ -60,19 +70,23 @@ impl ActionOutput {
                 render_database_policy("Database policy updated", policy)
             }
             ActionOutput::CollectionCreated(descriptor) => format!(
-                "Collection created\nCollection: {}\nDimensions: {}\nMetric: {}",
+                "Collection created\nCollection: {}\nDimensions: {}\nMetric: {}\nReplication factor: {}",
                 collection_identity(&descriptor.database_name, &descriptor.name),
                 descriptor.dimensions,
-                metric_name(descriptor.metric)
+                metric_name(descriptor.metric),
+                descriptor.replication_factor
             ),
             ActionOutput::CollectionShown(descriptor) => format!(
-                "Collection\nCollection: {}\nDimensions: {}\nMetric: {}",
+                "Collection\nCollection: {}\nDimensions: {}\nMetric: {}\nReplication factor: {}",
                 collection_identity(&descriptor.database_name, &descriptor.name),
                 descriptor.dimensions,
-                metric_name(descriptor.metric)
+                metric_name(descriptor.metric),
+                descriptor.replication_factor
             ),
             ActionOutput::CollectionStats(stats) => render_stats(stats),
             ActionOutput::CollectionPlacement(placement) => render_placement(placement),
+            ActionOutput::CollectionPromoted(placement) => render_placement(placement),
+            ActionOutput::CollectionRebalanced(placement) => render_placement(placement),
             ActionOutput::CollectionFlushed(snapshot) => format!(
                 "Collection flushed\nCollection: {}\nManifest generation: {}\nVisible sequence number: {}",
                 collection_identity(&snapshot.database_name, &snapshot.collection_name),
@@ -116,6 +130,9 @@ impl ActionOutput {
         match self {
             ActionOutput::Status(status) => pretty_json(status),
             ActionOutput::Config(config) => pretty_json(&redacted_config_json(config)?),
+            ActionOutput::NodeMembership(status)
+            | ActionOutput::NodeDrained(status)
+            | ActionOutput::NodeUndrained(status) => pretty_json(status),
             ActionOutput::DatabaseShown(descriptor) | ActionOutput::DatabaseUpdated(descriptor) => {
                 pretty_json(descriptor)
             }
@@ -125,7 +142,9 @@ impl ActionOutput {
             ActionOutput::CollectionCreated(descriptor)
             | ActionOutput::CollectionShown(descriptor) => pretty_json(descriptor),
             ActionOutput::CollectionStats(stats) => pretty_json(stats),
-            ActionOutput::CollectionPlacement(placement) => pretty_json(placement),
+            ActionOutput::CollectionPlacement(placement)
+            | ActionOutput::CollectionPromoted(placement)
+            | ActionOutput::CollectionRebalanced(placement) => pretty_json(placement),
             ActionOutput::CollectionFlushed(snapshot)
             | ActionOutput::CollectionCompacted(snapshot) => pretty_json(snapshot),
             ActionOutput::RecordsWritten(ack) | ActionOutput::RecordDeleted(ack) => {
@@ -145,6 +164,9 @@ impl ActionOutput {
         match self {
             ActionOutput::Status(_) => "Runtime Status",
             ActionOutput::Config(_) => "Configuration",
+            ActionOutput::NodeMembership(_) => "Node Membership",
+            ActionOutput::NodeDrained(_) => "Node Drained",
+            ActionOutput::NodeUndrained(_) => "Node Ready",
             ActionOutput::DatabaseShown(_) => "Database",
             ActionOutput::DatabaseUpdated(_) => "Database Updated",
             ActionOutput::DatabasesListed(_) => "Databases",
@@ -154,6 +176,8 @@ impl ActionOutput {
             ActionOutput::CollectionShown(_) => "Collection",
             ActionOutput::CollectionStats(_) => "Collection Statistics",
             ActionOutput::CollectionPlacement(_) => "Collection Placement",
+            ActionOutput::CollectionPromoted(_) => "Collection Promoted",
+            ActionOutput::CollectionRebalanced(_) => "Collection Rebalanced",
             ActionOutput::CollectionFlushed(_) => "Collection Flushed",
             ActionOutput::CollectionCompacted(_) => "Collection Compacted",
             ActionOutput::RecordsWritten(_) => "Write Completed",
@@ -194,6 +218,9 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
             "Membership Registered: {}",
             yes_no(coordination.membership_registered)
         ));
+        if let Some(state) = &coordination.membership_state {
+            lines.push(format!("Membership State: {state}"));
+        }
         if let Some(lease_id) = coordination.membership_lease_id {
             lines.push(format!("Membership Lease: {lease_id}"));
         }
@@ -214,6 +241,12 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
         if let Some(lease_id) = coordination.leadership_lease_id {
             lines.push(format!("Leadership Lease: {lease_id}"));
         }
+        if let Some(revision) = coordination.metadata_revision {
+            lines.push(format!("Metadata Revision: {revision}"));
+        }
+        if let Some(watch_lag) = coordination.watch_lag {
+            lines.push(format!("Watch Lag: {watch_lag}"));
+        }
         lines.push(format!(
             "Members: {}",
             if coordination.registered_members.is_empty() {
@@ -230,12 +263,22 @@ fn render_status(status: &NodeRuntimeStatus) -> String {
     if !status.collections.is_empty() {
         lines.push("Placements:".to_owned());
         for placement in status.collections.iter().take(5) {
-            lines.push(format!(
+            let mut summary = format!(
                 "  - {} -> {} ({})",
                 collection_identity(&placement.database_name, &placement.collection_name),
                 placement.assigned_node,
                 placement.route_kind
-            ));
+            );
+            if let Some(owner) = &placement.owner_node {
+                summary.push_str(&format!(", owner={owner}"));
+            }
+            if let Some(epoch) = placement.ownership_epoch {
+                summary.push_str(&format!(", epoch={epoch}"));
+            }
+            if !placement.replicas.is_empty() {
+                summary.push_str(&format!(", replicas={}", placement.replicas.len()));
+            }
+            lines.push(summary);
         }
     }
 
@@ -302,6 +345,15 @@ fn render_database(title: &str, descriptor: &DatabaseDescriptor) -> String {
     )
 }
 
+fn render_node_membership(title: &str, status: &NodeMembershipStatus) -> String {
+    format!(
+        "{title}\nNode: {}\nRole: {}\nState: {}",
+        status.node_id,
+        status.node_role.as_str(),
+        status.state
+    )
+}
+
 fn render_databases(descriptors: &[DatabaseDescriptor]) -> String {
     let mut lines = vec![format!("Databases ({})", descriptors.len())];
     for descriptor in descriptors {
@@ -357,14 +409,43 @@ fn render_stats(stats: &CollectionStats) -> String {
 }
 
 fn render_placement(placement: &CollectionPlacement) -> String {
-    format!(
-        "Collection Placement\nCollection: {}\nAssigned node: {}\nAssigned role: {}\nRoute kind: {}\nReason: {}",
-        collection_identity(&placement.database_name, &placement.collection_name),
-        placement.assigned_node,
-        placement.assigned_role.as_str(),
-        placement.route_kind,
-        placement.route_reason
-    )
+    let mut lines = vec![
+        "Collection Placement".to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(&placement.database_name, &placement.collection_name)
+        ),
+        format!("Assigned node: {}", placement.assigned_node),
+        format!("Assigned role: {}", placement.assigned_role.as_str()),
+    ];
+    if let Some(owner) = &placement.owner_node {
+        lines.push(format!("Owner node: {owner}"));
+    }
+    if let Some(epoch) = placement.ownership_epoch {
+        lines.push(format!("Ownership epoch: {epoch}"));
+    }
+    if let Some(revision) = placement.metadata_revision {
+        lines.push(format!("Metadata revision: {revision}"));
+    }
+    if let Some(reason) = &placement.failover_reason {
+        lines.push(format!("Failover reason: {reason}"));
+    }
+    if placement.replicas.is_empty() {
+        lines.push("Replicas: none".to_owned());
+    } else {
+        lines.push("Replicas:".to_owned());
+        for replica in &placement.replicas {
+            lines.push(format!(
+                "  - {} ({}, {})",
+                replica.node_id,
+                replica.node_role.as_str(),
+                replica.state
+            ));
+        }
+    }
+    lines.push(format!("Route kind: {}", placement.route_kind));
+    lines.push(format!("Reason: {}", placement.route_reason));
+    lines.join("\n")
 }
 
 fn render_query(response: &ScopedCollectionResponse<QueryResponse>) -> anyhow::Result<String> {
@@ -442,6 +523,7 @@ mod tests {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: logpose_types::DistanceMetric::Dot,
+            replication_factor: 1,
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,
@@ -486,6 +568,7 @@ mod tests {
             name: "documents".to_owned(),
             dimensions: 2,
             metric: logpose_types::DistanceMetric::Dot,
+            replication_factor: 1,
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,
@@ -542,11 +625,14 @@ mod tests {
             coordination: Some(logpose_types::CoordinationStatus {
                 cluster_name: "prod-cluster".to_owned(),
                 membership_registered: true,
+                membership_state: Some("ready".to_owned()),
                 membership_lease_id: Some(17),
                 registered_members: vec!["node-a".to_owned(), "node-b".to_owned()],
                 leader_node: Some("node-a".to_owned()),
                 is_local_leader: true,
                 leadership_lease_id: Some(23),
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
                 last_error: None,
             }),
             maintenance: logpose_types::MaintenanceBacklog::default(),
@@ -559,6 +645,39 @@ mod tests {
         assert!(output.contains("Membership Lease: 17"));
         assert!(output.contains("Leader: node-a (local leader)"));
         assert!(output.contains("Leadership Lease: 23"));
+        assert!(output.contains("Metadata Revision: 42"));
+        assert!(output.contains("Watch Lag: 0"));
         assert!(output.contains("Members: node-a, node-b"));
+    }
+
+    #[test]
+    fn placement_render_includes_replicas_and_failover_reason() {
+        let output = ActionOutput::CollectionPlacement(CollectionPlacement {
+            collection_id: logpose_types::CollectionId::default(),
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            assigned_node: "owner-a".to_owned(),
+            assigned_role: logpose_types::NodeRole::Data,
+            owner_node: Some("owner-b".to_owned()),
+            ownership_epoch: Some(2),
+            replicas: vec![logpose_types::ReplicaPlacement {
+                node_id: "replica-a".to_owned(),
+                node_role: logpose_types::NodeRole::Combined,
+                state: "absent".to_owned(),
+            }],
+            failover_reason: Some("automatic self-promotion".to_owned()),
+            metadata_revision: Some(42),
+            route_kind: "recorded".to_owned(),
+            route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
+        })
+        .human_text()
+        .expect("placement should render");
+
+        assert!(output.contains("Owner node: owner-b"));
+        assert!(output.contains("Ownership epoch: 2"));
+        assert!(output.contains("Metadata revision: 42"));
+        assert!(output.contains("Failover reason: automatic self-promotion"));
+        assert!(output.contains("Replicas:"));
+        assert!(output.contains("replica-a (combined, absent)"));
     }
 }

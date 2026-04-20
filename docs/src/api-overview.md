@@ -53,6 +53,9 @@ REST  :  http://127.0.0.1:8080/v1/...
 gRPC  :  logpose.v1.LogPoseService
 ```
 
+Replica-repair HTTP between nodes uses a separate internal path and is intentionally excluded
+from the public REST and gRPC contract documented here.
+
 ## Common Response Schemas
 
 Every error from the REST surface returns the same envelope:
@@ -159,6 +162,11 @@ curl http://127.0.0.1:8080/v1/runtime/status \
       "assigned_role": "data",
       "owner_node": "node-alpha",
       "ownership_epoch": 1,
+      "replicas": [
+        { "node_id": "node-beta", "node_role": "data", "state": "ready" }
+      ],
+      "failover_reason": "automatic promotion after owner lease expiry",
+      "metadata_revision": 128,
       "route_kind": "local",
       "route_reason": "ownership epoch 1 is active on this runtime"
     }
@@ -177,6 +185,8 @@ curl http://127.0.0.1:8080/v1/runtime/status \
     "is_local_leader": true,
     "leadership_lease_id": 23,
     "leader_node": "node-alpha",
+    "metadata_revision": 128,
+    "watch_lag": 0,
     "last_error": null
   }
 }
@@ -187,6 +197,40 @@ gRPC equivalent:
 ```protobuf
 rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
 ```
+
+### Node Membership and Failover Controls
+
+Runtime membership and failover workflows are now public operator APIs on REST
+and gRPC. These controls require an operator-tier bearer token.
+
+```bash
+curl http://127.0.0.1:8080/v1/runtime/nodes/node-beta \
+  -H "Authorization: Bearer operator-secret"
+
+curl -X POST http://127.0.0.1:8080/v1/runtime/nodes/node-beta/drain \
+  -H "Authorization: Bearer operator-secret"
+
+curl -X POST http://127.0.0.1:8080/v1/runtime/nodes/node-beta/undrain \
+  -H "Authorization: Bearer operator-secret"
+
+curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/promote \
+  -H "Authorization: Bearer operator-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"database_name":"default","node_name":"node-beta"}'
+
+curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/rebalance \
+  -H "Authorization: Bearer operator-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"database_name":"default","target_node_name":"node-beta"}'
+```
+
+These routes surface:
+
+- one node's current membership state through `GET /v1/runtime/nodes/{name}`
+- an operator drain transition through `POST /v1/runtime/nodes/{name}/drain`
+- restoring a node to `ready` through `POST /v1/runtime/nodes/{name}/undrain`
+- a manual ownership promotion through `POST /v1/collections/{name}/promote`
+- a leader-fenced ownership rebalance through `POST /v1/collections/{name}/rebalance`
 
 ### Database Management
 
@@ -217,7 +261,8 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
     "database_name": "analytics",
     "name": "embeddings",
     "dimensions": 768,
-    "metric": "cosine"
+    "metric": "cosine",
+    "replication_factor": 2
   }'
 ```
 
@@ -229,6 +274,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 | `name`          | string  | yes      | Unique collection name inside the selected database      |
 | `dimensions`    | integer | yes      | Vector dimensionality (>= 1)                             |
 | `metric`        | string  | yes      | Distance metric: `cosine`, `dot`, `l2`                   |
+| `replication_factor` | integer | no  | Desired shard copy count; defaults to `1`                |
 
 **Response** (`201`):
 
@@ -239,6 +285,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
   "name": "embeddings",
   "dimensions": 768,
   "metric": "cosine",
+  "replication_factor": 2,
   "root_path": "/data/collections/embeddings",
   "remote_blob": null,
   "flush_threshold_ops": 10000,
@@ -287,7 +334,9 @@ curl http://127.0.0.1:8080/v1/collections/embeddings
 
 Returns placement routing information for a collection. Use the `database`
 query parameter for non-default namespaces. When etcd-backed ownership fencing
-is active, the reply also surfaces the current owner node and ownership epoch.
+is active, the reply also surfaces the current owner node, ownership epoch,
+desired replica targets, the last failover reason, and the metadata revision
+used to compute the answer.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/placement
@@ -304,6 +353,11 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/placement
   "assigned_role": "data",
   "owner_node": "node-alpha",
   "ownership_epoch": 1,
+  "replicas": [
+    { "node_id": "node-beta", "node_role": "data", "state": "ready" }
+  ],
+  "failover_reason": "automatic promotion after owner lease expiry",
+  "metadata_revision": 128,
   "route_kind": "local",
   "route_reason": "ownership epoch 1 is active on this runtime"
 }
@@ -451,7 +505,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | `200`  | Query returned                           |
 | `400`  | Invalid request or collection not servable |
 | `404`  | Collection not found                     |
-| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
@@ -515,7 +569,8 @@ stats at one exact historical snapshot. Use
 together to require the current serving node to expose stats from a snapshot at
 or beyond one previously observed write or read boundary. Exact snapshots and
 read barriers are mutually exclusive. After ownership promotion, promoted
-owners fail read barriers closed until replica freshness metadata exists.
+owners fail read barriers closed; continuity across ownership promotion is not
+yet implemented.
 
 ```bash
 curl http://127.0.0.1:8080/v1/collections/embeddings/stats
@@ -564,7 +619,7 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 | `200`  | Collection stats returned                |
 | `400`  | Invalid request or collection not locally servable |
 | `404`  | Collection not found                     |
-| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
@@ -675,15 +730,25 @@ The full gRPC contract is defined in `proto/logpose/v1/logpose.proto`:
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
   rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
+  rpc GetNodeMembership(GetNodeMembershipRequest) returns (NodeMembershipStatusReply);
+  rpc DrainNode(DrainNodeRequest) returns (NodeMembershipStatusReply);
+  rpc UndrainNode(UndrainNodeRequest) returns (NodeMembershipStatusReply);
+  rpc PutDatabase(PutDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc GetDatabase(GetDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
+  rpc PromoteCollectionOwner(PromoteCollectionOwnerRequest) returns (CollectionPlacementReply);
+  rpc RebalanceCollection(RebalanceCollectionRequest) returns (CollectionPlacementReply);
   rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
   rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
   rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
   rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
+  rpc PutDatabasePolicy(PutDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
+  rpc GetDatabasePolicy(GetDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
 }
 ```
 

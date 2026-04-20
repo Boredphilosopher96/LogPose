@@ -2,9 +2,59 @@
 
 ## Goal
 
-Replace LogPose's local per-collection placement files with an authoritative metadata plane that can support multi-node and eventually multi-cluster serving, failover, and explicit consistency modes without losing the clean operator contracts the system already has today.
+Replace LogPose's local per-collection placement files with an authoritative metadata plane that can support multi-node and eventually multi-cluster serving, failover, and explicit read-barrier contracts without losing the clean operator contracts the system already has today.
 
-## Current State
+## Status
+
+This milestone is **in progress** as of April 20, 2026.
+
+This branch lands a substantial control-plane slice for one authoritative etcd
+metadata domain, but it does **not** close every exit criterion in this
+milestone yet. Remote multi-cluster replication, discovery, and routing are
+still later work that build on this control plane, and some same-domain
+consistency and validation work remains open too.
+
+LogPose now has:
+
+- authoritative etcd-backed metadata for database descriptors, collection
+  descriptors, assignments, and failover-critical owner records
+- membership leases, explicit controller leadership, and watch-driven metadata
+  caches, with direct authoritative etcd reads used when serving decisions
+  need to stay safe during cache loss or lag
+- epoch-fenced shard ownership plus public drain, undrain, promote, and
+  rebalance controls over REST, gRPC, and CLI
+- replica-aware placement diagnostics with desired replicas, metadata revision,
+  ownership epoch, the current `watch_lag` field, and operator-visible
+  failover reasons
+- automatic leader-side owner failover when a desired replica already has
+  materialized local state, while stale replicas stay fenced instead of
+  auto-promoting
+- concrete client-visible consistency contracts through exact historical
+  snapshots and lower-bound read barriers, including fail-closed behavior after
+  ownership promotion
+- seeded multi-process Podman chaos coverage as the required local
+  control-plane gate for failover, lease loss, partitions, metadata outages,
+  and stale-replica non-promotion
+
+What is still pending before this milestone can be called complete:
+
+- the product still exposes exact snapshots plus lower-bound read barriers,
+  not the fuller named consistency surface originally sketched for this
+  milestone such as session tokens or bounded-staleness reads
+- replica repair and catch-up exist for the current archive-transfer path, but
+  the broader replica-read serving contract and the richer freshness model are
+  not fully closed yet
+- the branch has targeted etcd, API, config, and docs verification, but the
+  full local completion gate (`scripts/check.sh`, `scripts/pre-push-checks.sh`)
+  was still in progress when this snapshot was pushed
+- the requested five-agent holistic review swarm and the follow-up fix loop are
+  still pending on top of this branch state
+
+The separate [Full-System Simulation](./full-system-simulation.md) milestone is
+still open. That later milestone owns TigerBeetle-style deterministic
+whole-system replay rather than the real-process chaos gate used here.
+
+## Starting State
 
 LogPose has the beginnings of a control plane, but it is still local:
 
@@ -68,7 +118,7 @@ Use epoch-based ownership instead of implicit trust in node names. A node should
 
 Start with one authoritative metadata control domain, not active-active global writes. Multi-cluster should first mean shared authoritative metadata plus remote consumers and replicas. Global multi-writer metadata is a later problem.
 
-## What etcd Gives And What LogPose Must Still Build
+## What etcd Gives And What LogPose Built On Top
 
 etcd is the metadata substrate, not the distributed database itself.
 
@@ -80,95 +130,117 @@ What etcd gives LogPose directly:
 - compare-and-swap transactions for ownership epochs and promotions
 - building blocks for controller leader election
 
-What LogPose still has to build on top of etcd:
+What LogPose built on top of etcd for this milestone:
 
 - node membership semantics and health rules
 - controller election policy and fencing for old leaders
 - shard and replica placement policy
 - failover and promotion state machines
-- replica catch-up and repair logic
-- query and write consistency-mode contracts
+- stale-replica fencing and fail-closed read-barrier behavior
+- exact snapshot plus lower-bound read-barrier contracts
 - data-plane split-brain prevention and ownership enforcement
 
-## Consistency Modes To Add
+## Consistency Contracts Added
 
-Keep metadata writes strongly consistent by default. Placement, failover, and lifecycle changes should be linearizable.
+Metadata writes remain strongly consistent by default. Placement, failover, and
+lifecycle changes are linearizable through authoritative etcd metadata.
 
-Add read-side consistency modes intentionally:
+The current client-visible read contracts are:
 
-- strong: authoritative metadata and ownership reads that drive routing or failover
-- session: read-your-writes behavior after DDL or placement updates
-- bounded staleness: lower-latency diagnostic or remote read paths that can tolerate lag behind the latest metadata revision
-- eventual: non-authoritative observability caches only
+- exact snapshots for historical reads against a specific visible state
+- lower-bound read barriers for current-owner monotonic reads after prior
+  writes or reads
 
-The system should document which APIs allow which modes. Consistency should be a product contract, not a side effect of which node answered.
+Promoted owners fail read barriers closed after ownership promotion, so
+consistency remains explicit instead of becoming a side effect of whichever
+node answered. Read-barrier continuity across ownership promotion is still a
+later feature.
+There are not multiple named consistency levels yet; the product exposes the
+exact snapshot and lower-bound barrier contract directly.
 
-## Main Work Streams
-
-## Implementation Checkpoint (April 17, 2026)
-
-The repository now includes a first production-oriented metadata backend switch with an etcd option:
-
-- `metadata.backend = "etcd"` enables etcd-backed authoritative collection assignment metadata
-- collection create writes use create-if-absent transactions for both the authoritative assignment and descriptor metadata
-- read paths fail closed if authoritative etcd metadata is unavailable instead of falling back to stale local placement files
-- local placement files are still written for recovery/bootstrap diagnostics, but they are no longer consulted as an authority once the etcd backend is selected
-- single-shard ownership records are now seeded in etcd, surfaced through placement diagnostics, and used to fence stale owners after an ownership promotion
-- query and stats requests now accept lower-bound read barriers derived from prior write or read snapshots, which gives clients a concrete current-node monotonic-read primitive without breaking exact historical snapshot reads; once ownership is promoted, the system now fails those barriers closed until replica freshness metadata exists
-
-This is still not full distributed control-plane completion. Remaining work from the streams below still applies, especially watch-driven caches, replica-aware placement, failover control loops, stronger leader fencing, and multi-node failover simulations.
+## Delivered Work Streams
 
 ### 1. Metadata Model
 
-- add first-class shard, replica, and epoch types
-- distinguish desired placement from current ownership and health
-- track replica freshness and recovery progress explicitly
+- first-class ownership epochs, desired replicas, failover reasons, and
+  metadata revisions are now surfaced through placement diagnostics
+- desired placement is distinguished from current ownership and membership
+  readiness
+- collection creation persists explicit `replication_factor` intent in
+  authoritative metadata
 
 ### 2. Metadata Service Layer
 
-- add an etcd-backed metadata crate for transactions, watches, leases, and recovery
-- add config for endpoints, TLS, auth, timeouts, and lease tuning
-- replace `placement.json` as the authoritative source of truth
+- the etcd-backed metadata layer now owns authoritative descriptors,
+  assignments, membership records, leadership records, owner epochs, and
+  failover reasons
+- services load a point-in-time snapshot, watch for changes from that
+  revision, and fall back to direct authoritative etcd reads when the watch
+  cache is unavailable so serving decisions stay fenced by current metadata
+- `placement.json` remains a local recovery artifact only; it is not the
+  authority once the etcd backend is selected
 
 ### 3. Control Loops
 
-- membership registration through leases plus watch-driven cache updates
-- controller leader election, leader handoff, and fencing
-- placement and rebalance control
-- failover and promotion control
-- repair and catch-up control for lagging replicas
+- membership registration is lease-backed and operator-visible through runtime
+  status
+- controller leader election and handoff are explicit and fenced by leased
+  leadership metadata
+- placement, drain, undrain, rebalance, and promotion controls are now public
+  server surfaces
+- automatic owner failover promotes a desired local replica through
+  compare-and-swap when the leader sees the old owner lose readiness and the
+  replacement already has materialized state
 
 ### 4. Data-Plane Enforcement
 
-- gate writes on current ownership epoch
-- surface serving consistency and replica freshness in query diagnostics
-- make wrong-plane rejection metadata-driven instead of purely local-file driven
+- writes are gated on the current ownership epoch
+- wrong-plane reads and writes are rejected from authoritative metadata rather
+  than local placement files
+- exact snapshots and lower-bound read barriers form the current client-visible
+  consistency contract beyond local-node behavior
+- promoted owners fail lower-bound read barriers closed until freshness
+  metadata exists
 
 ### 5. Operator Surfaces
 
-- show metadata revision, ownership epoch, replica health, and watch lag
-- explain why a collection or shard is placed where it is
-- expose failover history and rebuild progress
+- runtime status and placement diagnostics now expose metadata revision,
+  ownership epoch, replica targets, the current `watch_lag` field, and
+  failover reasons
+- public CLI, REST, and gRPC controls exist for drain, undrain, promote, and
+  rebalance workflows
+- the seeded Podman chaos harness is now the checked local gate for metadata
+  outage, failover, membership churn, partition recovery, and stale-replica
+  non-promotion
 
-## Testing And Validation
+## Current Validation
 
-This milestone should extend the current testing ladder upward, not replace it.
+This branch extends the current testing ladder upward instead of replacing it.
+What has been verified on this branch so far:
 
-- unit-test revision handling, CAS failures, lease expiry, and watch replay logic
-- integration-test real etcd snapshot plus watch catch-up, watch compaction, lease loss, election handoff, and transactional placement updates
-- add deterministic failover simulations for owner loss during write, flush, and index publication
-- add multi-process tests with several metadata members and multiple LogPose nodes
-- add metadata fault-injection inspired by Milvus' etcd chaos tests
-- validate that strong, session, bounded-staleness, and eventual modes behave exactly as documented
+- unit and service-boundary tests cover watch-state handling, CAS conflicts,
+  lease expiry, read-barrier fencing, and control-plane routing decisions
+- real etcd integration tests cover snapshot plus watch catch-up, membership
+  leases, leadership handoff, public promotion, automatic failover, stale
+  replica fencing, and fail-closed behavior on metadata loss
+- mdBook documentation still builds cleanly
+- seeded Podman chaos campaigns are the intended required local PR gate for the
+  multi-node control plane, but the full end-to-end `scripts/check.sh` run was
+  interrupted before this branch snapshot was published
+- the later full-system simulation milestone still owns deterministic
+  whole-system event replay and virtual-time campaigns
 
-## Exit Criteria
+## Remaining Exit Criteria
 
-- etcd-backed metadata is authoritative for catalog, placement, and failover-critical state
-- nodes register membership through leases and lose liveness by lease expiry
-- controller leader election and fencing are explicit and tested
-- placement is shard and replica-aware, not just collection-to-node local metadata
-- ownership is epoch-based and prevents double serving
-- failover and promotion behavior are deterministic and operator-visible
-- at least one client-visible consistency contract exists beyond local-node behavior
-- operators can inspect metadata revision, ownership epoch, replica health, and failover reasons
-- deterministic simulation and multi-process tests cover metadata loss, failover, and recovery
+The milestone should only be marked complete once all of these are true:
+
+- the current exact-snapshot and read-barrier contract is either accepted as
+  the final consistency surface for this milestone or is expanded into the
+  richer named consistency and session-token model originally planned
+- replica repair, catch-up, and freshness semantics are documented and exposed
+  clearly enough that replica serving behavior is operator-visible instead of
+  inferred from current implementation details
+- the full local completion gate finishes cleanly on the branch, including the
+  repo-wide `scripts/check.sh` path and `scripts/pre-push-checks.sh`
+- the requested five-agent holistic review swarm is completed on the current
+  branch state, and any serious findings from that review loop are fixed

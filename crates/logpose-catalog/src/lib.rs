@@ -83,6 +83,9 @@ pub struct CollectionDescriptor {
     pub dimensions: usize,
     /// Distance metric configured for the collection.
     pub metric: DistanceMetric,
+    /// Desired number of replicas recorded in authoritative metadata.
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
     /// Local filesystem root for this collection.
     pub root_path: PathBuf,
     /// Optional remote blob-store configuration for immutable artifacts.
@@ -129,12 +132,20 @@ impl CollectionDescriptor {
             name: name.into(),
             dimensions,
             metric,
+            replication_factor: default_replication_factor(),
             root_path: collections_root.as_ref().join(collection_id.to_string()),
             remote_blob: None,
             flush_threshold_ops: DEFAULT_FLUSH_THRESHOLD_OPS,
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD_BYTES,
             compaction_threshold_segments: DEFAULT_COMPACTION_THRESHOLD_SEGMENTS,
         }
+    }
+
+    /// Override the desired replica count recorded on the descriptor.
+    #[must_use]
+    pub fn with_replication_factor(mut self, replication_factor: usize) -> Self {
+        self.replication_factor = replication_factor;
+        self
     }
 
     /// Return the canonical database/collection reference for this descriptor.
@@ -165,6 +176,7 @@ impl CollectionDescriptor {
             && self.name == other.name
             && self.dimensions == other.dimensions
             && self.metric == other.metric
+            && self.replication_factor == other.replication_factor
             && self.remote_blob == other.remote_blob
             && self.flush_threshold_ops == other.flush_threshold_ops
             && self.flush_threshold_bytes == other.flush_threshold_bytes
@@ -177,6 +189,11 @@ impl CollectionDescriptor {
         if self.dimensions == 0 {
             return Err(LogPoseError::Message(
                 "dimensions must be greater than 0".to_owned(),
+            ));
+        }
+        if self.replication_factor == 0 {
+            return Err(LogPoseError::Message(
+                "replication_factor must be greater than 0".to_owned(),
             ));
         }
         if self.flush_threshold_ops == 0 {
@@ -206,6 +223,10 @@ impl CollectionDescriptor {
 
 fn default_database_name() -> String {
     DEFAULT_DATABASE_NAME.to_owned()
+}
+
+fn default_replication_factor() -> usize {
+    1
 }
 
 fn validate_namespace_segment(label: &str, value: &str) -> logpose_types::Result<()> {
@@ -321,6 +342,7 @@ mod tests {
                 "name": "events",
                 "dimensions": 2,
                 "metric": "dot",
+                "replication_factor": 1,
                 "root_path": descriptor.root_path,
                 "remote_blob": null,
                 "flush_threshold_ops": DEFAULT_FLUSH_THRESHOLD_OPS,
@@ -413,6 +435,21 @@ mod tests {
                 .expect_err("compaction threshold of one should fail")
                 .to_string()
                 .contains("compaction_threshold_segments")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_replication_factor() {
+        let root = Path::new("/tmp/catalog-validation");
+        let descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root)
+            .with_replication_factor(0);
+
+        assert!(
+            descriptor
+                .validate()
+                .expect_err("zero replication factor should fail")
+                .to_string()
+                .contains("replication_factor")
         );
     }
 

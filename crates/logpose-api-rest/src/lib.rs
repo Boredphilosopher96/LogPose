@@ -2,8 +2,12 @@
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -14,19 +18,31 @@ use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, Scalar
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Snapshot, WriteOperation,
+    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, NodeMembershipStatus, Snapshot,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 
 /// Create the versioned REST router.
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/v1/metadata", get(metadata))
         .route("/v1/runtime/status", get(runtime_status))
+        .route("/v1/runtime/nodes/{name}", get(get_node_membership))
+        .route("/v1/runtime/nodes/{name}/drain", post(drain_node))
+        .route("/v1/runtime/nodes/{name}/undrain", post(undrain_node))
         .route("/v1/databases", get(list_databases))
         .route("/v1/databases/{name}", get(get_database).put(put_database))
         .route("/v1/collections", post(create_collection))
@@ -39,14 +55,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/collections/{name}/placement",
             get(get_collection_placement),
         )
+        .route(
+            "/v1/collections/{name}/promote",
+            post(promote_collection_owner),
+        )
+        .route(
+            "/v1/collections/{name}/rebalance",
+            post(rebalance_collection),
+        )
         .route("/v1/collections/{name}/writes", post(write_collection))
         .route("/v1/collections/{name}/query", post(query_collection))
         .route("/v1/collections/{name}/stats", get(get_collection_stats))
         .route("/v1/collections/{name}/flush", post(flush_collection))
         .route("/v1/collections/{name}/compact", post(compact_collection))
-        .route("/v1/collections/{name}/inspect", get(inspect_collection))
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .route("/v1/collections/{name}/inspect", get(inspect_collection));
+    if state.config.internal.replica_token.is_some() {
+        router = router.route("/internal/replica", get(get_internal_replica_archive));
+    }
+    router.with_state(state).layer(TraceLayer::new_for_http())
 }
 
 /// Serve the REST API until shutdown.
@@ -90,6 +116,65 @@ async fn runtime_status(
     Ok(Json(state.runtime_status_with_auth(&auth).await?))
 }
 
+async fn get_node_membership(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(
+        state.node_membership_status_with_auth(&auth, &name).await?,
+    ))
+}
+
+async fn drain_node(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.drain_node_with_auth(&auth, &name).await?))
+}
+
+async fn undrain_node(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<NodeMembershipStatus>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(state.undrain_node_with_auth(&auth, &name).await?))
+}
+
+async fn get_internal_replica_archive(
+    headers: HeaderMap,
+    Query(query): Query<InternalReplicaQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    authorize_internal_replica_request(&headers, &state)?;
+    let expected_snapshot = query.expected_snapshot();
+    let archive_path = state
+        .export_local_replica_archive(
+            &collection_lookup_key(&query.collection()),
+            expected_snapshot.as_ref(),
+        )
+        .await?;
+    let archive = tokio::fs::File::open(&archive_path)
+        .await
+        .map_err(|error| {
+            ApiError(ServiceError::Internal(format!(
+                "failed to open internal replica archive '{}': {error}",
+                archive_path.display()
+            )))
+        })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
+    let stream = TempReplicaArchive {
+        file: archive,
+        path: archive_path,
+    };
+    Ok((headers, Body::from_stream(ReaderStream::new(stream))).into_response())
+}
+
 async fn put_database(
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -124,6 +209,7 @@ async fn create_collection(
     Json(request): Json<CreateCollectionBody>,
 ) -> Result<(StatusCode, Json<logpose_catalog::CollectionDescriptor>), ApiError> {
     let auth = request_auth_from_headers(&headers)?;
+    let replication_factor = validate_replication_factor(request.replication_factor)?;
     let descriptor = state
         .create_collection_with_auth(
             &auth,
@@ -132,7 +218,8 @@ async fn create_collection(
                 request.name,
                 request.dimensions,
                 request.metric,
-            ),
+            )
+            .with_replication_factor(replication_factor),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(descriptor)))
@@ -190,6 +277,45 @@ async fn get_collection_placement(
     Ok(Json(
         state
             .collection_placement_with_auth(&auth, &collection_lookup_key(&collection))
+            .await?,
+    ))
+}
+
+async fn promote_collection_owner(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PromoteCollectionOwnerBody>,
+) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let collection = CollectionRef::new(default_database_if_blank(request.database_name), name);
+    Ok(Json(
+        state
+            .promote_collection_owner_with_auth(
+                &auth,
+                &collection_lookup_key(&collection),
+                &request.node_name,
+            )
+            .await?,
+    ))
+}
+
+async fn rebalance_collection(
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<RebalanceCollectionBody>>,
+) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let collection = CollectionRef::new(default_database_if_blank(request.database_name), name);
+    Ok(Json(
+        state
+            .rebalance_collection_with_auth(
+                &auth,
+                &collection_lookup_key(&collection),
+                request.target_node_name.as_deref(),
+            )
             .await?,
     ))
 }
@@ -347,6 +473,22 @@ struct CreateCollectionBody {
     name: String,
     dimensions: usize,
     metric: DistanceMetric,
+    #[serde(default = "default_replication_factor")]
+    replication_factor: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteCollectionOwnerBody {
+    #[serde(default = "default_database_name")]
+    database_name: String,
+    node_name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RebalanceCollectionBody {
+    #[serde(default = "default_database_name")]
+    database_name: String,
+    target_node_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +499,38 @@ struct NamespaceQuery {
         rename = "database"
     )]
     database: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalReplicaQuery {
+    #[serde(
+        default = "default_database_name",
+        alias = "database_name",
+        rename = "database"
+    )]
+    database: String,
+    collection: String,
+    manifest_generation: Option<u64>,
+    visible_seq_no: Option<u64>,
+}
+
+impl InternalReplicaQuery {
+    fn collection(&self) -> CollectionRef {
+        CollectionRef::new(
+            default_database_if_blank(self.database.clone()),
+            self.collection.clone(),
+        )
+    }
+
+    fn expected_snapshot(&self) -> Option<Snapshot> {
+        match (self.manifest_generation, self.visible_seq_no) {
+            (Some(manifest_generation), Some(visible_seq_no)) => Some(Snapshot {
+                manifest_generation,
+                visible_seq_no,
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl NamespaceQuery {
@@ -401,6 +575,20 @@ fn validate_policy_scope(
         ))));
     }
     Ok(())
+}
+
+fn default_replication_factor() -> usize {
+    1
+}
+
+fn validate_replication_factor(replication_factor: usize) -> Result<usize, ApiError> {
+    if replication_factor == 0 {
+        Err(ApiError(ServiceError::InvalidArgument(
+            "replication_factor must be greater than 0".to_owned(),
+        )))
+    } else {
+        Ok(replication_factor)
+    }
 }
 
 fn validate_database_scope(
@@ -489,6 +677,27 @@ impl<T> CollectionScopedResponse<T> {
     }
 }
 
+struct TempReplicaArchive {
+    file: tokio::fs::File,
+    path: PathBuf,
+}
+
+impl AsyncRead for TempReplicaArchive {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+impl Drop for TempReplicaArchive {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[derive(Debug)]
 struct ApiError(ServiceError);
 
@@ -514,10 +723,41 @@ impl IntoResponse for ApiError {
 }
 
 fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiError> {
-    let value = match headers.get(AUTHORIZATION) {
-        Some(value) => value,
-        None => return Ok(RequestAuth::default()),
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Ok(RequestAuth::default());
     };
+    Ok(RequestAuth::bearer_token(parse_bearer_token(value)?))
+}
+
+fn authorize_internal_replica_request(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(), ApiError> {
+    let expected = state
+        .config
+        .internal
+        .replica_token
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError(ServiceError::FailedPrecondition(
+                "internal replica transfer is not configured on this node".to_owned(),
+            ))
+        })?;
+    let value = headers.get(AUTHORIZATION).ok_or_else(|| {
+        ApiError(ServiceError::Unauthenticated(
+            "missing internal replica bearer token".to_owned(),
+        ))
+    })?;
+    if parse_bearer_token(value)? == expected {
+        Ok(())
+    } else {
+        Err(ApiError(ServiceError::Unauthenticated(
+            "invalid internal replica bearer token".to_owned(),
+        )))
+    }
+}
+
+fn parse_bearer_token(value: &HeaderValue) -> Result<&str, ApiError> {
     let value = value.to_str().map_err(|_| {
         ApiError(ServiceError::Unauthenticated(
             "authorization header must be valid ASCII".to_owned(),
@@ -533,7 +773,7 @@ fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiErro
             "authorization header must use the Bearer scheme".to_owned(),
         )));
     }
-    Ok(RequestAuth::bearer_token(token.trim()))
+    Ok(token.trim())
 }
 
 fn inspect_target_from_params(
@@ -831,6 +1071,47 @@ mod tests {
                 axum::http::Request::builder()
                     .uri("/v1/runtime/status")
                     .header("authorization", "Bearer operator-secret")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_replica_archive_requires_internal_replica_token() {
+        let mut config = test_config("rest-internal-replica-auth");
+        config.internal.replica_token = Some("replica-secret".to_owned());
+        let state = Arc::new(AppState::new(config));
+        state
+            .control
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/internal/replica?collection=documents")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/internal/replica?collection=documents")
+                    .header("authorization", "Bearer replica-secret")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1550,11 +1831,14 @@ mod tests {
             coordination: Some(logpose_types::CoordinationStatus {
                 cluster_name: "prod-cluster".to_owned(),
                 membership_registered: true,
+                membership_state: Some("ready".to_owned()),
                 membership_lease_id: Some(17),
                 registered_members: vec!["rest-node".to_owned(), "rest-peer".to_owned()],
                 leader_node: Some("rest-node".to_owned()),
                 is_local_leader: true,
                 leadership_lease_id: Some(23),
+                metadata_revision: Some(42),
+                watch_lag: Some(0),
                 last_error: Some("warn".to_owned()),
             }),
             maintenance: logpose_types::MaintenanceBacklog::default(),
@@ -1564,6 +1848,8 @@ mod tests {
         assert_eq!(payload["coordination"]["cluster_name"], "prod-cluster");
         assert_eq!(payload["coordination"]["membership_lease_id"], 17);
         assert_eq!(payload["coordination"]["leadership_lease_id"], 23);
+        assert_eq!(payload["coordination"]["metadata_revision"], 42);
+        assert_eq!(payload["coordination"]["watch_lag"], 0);
         assert_eq!(payload["coordination"]["leader_node"], "rest-node");
         assert_eq!(
             payload["coordination"]["registered_members"],
@@ -1615,6 +1901,13 @@ mod tests {
             assigned_role: logpose_types::NodeRole::Data,
             owner_node: Some("owner-b".to_owned()),
             ownership_epoch: Some(2),
+            replicas: vec![logpose_types::ReplicaPlacement {
+                node_id: "replica-a".to_owned(),
+                node_role: logpose_types::NodeRole::Combined,
+                state: "unknown".to_owned(),
+            }],
+            failover_reason: Some("automatic self-promotion".to_owned()),
+            metadata_revision: Some(42),
             route_kind: "recorded".to_owned(),
             route_reason: "ownership epoch 2 is assigned to node 'owner-b'".to_owned(),
         })
@@ -1622,6 +1915,10 @@ mod tests {
 
         assert_eq!(payload["owner_node"], "owner-b");
         assert_eq!(payload["ownership_epoch"], 2);
+        assert_eq!(payload["metadata_revision"], 42);
+        assert_eq!(payload["replicas"][0]["node_id"], "replica-a");
+        assert_eq!(payload["replicas"][0]["state"], "unknown");
+        assert_eq!(payload["failover_reason"], "automatic self-promotion");
     }
 
     #[tokio::test]
@@ -1668,6 +1965,124 @@ mod tests {
         let get_body = json_body(get).await;
         assert_eq!(get_body["database_name"], "analytics");
         assert_eq!(get_body["name"], "documents");
+    }
+
+    #[tokio::test]
+    async fn create_collection_accepts_replication_factor() {
+        let state = Arc::new(AppState::new(test_config("rest-replication-factor")));
+        let app = router(state);
+
+        let create = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "database_name": "analytics",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot",
+                            "replication_factor": 2
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["database_name"], "analytics");
+        assert_eq!(create_body["replication_factor"], 2);
+    }
+
+    #[tokio::test]
+    async fn create_collection_rejects_zero_replication_factor() {
+        let state = Arc::new(AppState::new(test_config("rest-zero-replication-factor")));
+        let app = router(state);
+
+        let create = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "database_name": "analytics",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot",
+                            "replication_factor": 0
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rebalance_collection_accepts_empty_body_without_target_node() {
+        let state = Arc::new(AppState::new(test_config("rest-rebalance-empty-body")));
+        let app = router(state);
+
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "database_name": "analytics",
+                            "name": "documents",
+                            "dimensions": 2,
+                            "metric": "dot"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("collection create should succeed");
+
+        let rebalance_with_empty_object = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/rebalance")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(
+            rebalance_with_empty_object.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let rebalance_without_body = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/rebalance")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(rebalance_without_body.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

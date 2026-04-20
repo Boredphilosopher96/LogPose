@@ -8,7 +8,7 @@ use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult};
-use logpose_types::{CollectionRef, EtcdMetadataConfig};
+use logpose_types::{CollectionRef, EtcdMetadataConfig, LeadershipFence};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{process::ExitCode, time::Duration};
@@ -139,8 +139,21 @@ async fn run(cli: Cli) -> Result<Value> {
                         shard_id
                     )
                 })?;
+            let leader = client
+                .current_leader()
+                .await?
+                .with_context(|| "cluster has no active controller leader")?;
+            let leader_membership = client
+                .membership(&leader.node_id)
+                .await?
+                .with_context(|| "leader membership record is missing")?;
+            let leader_fence = LeadershipFence {
+                node_id: leader.node_id,
+                lease_id: leader.lease_id,
+                membership_lease_id: leader_membership.lease_id,
+            };
             let result = client
-                .promote_shard_owner(&current, &new_owner_node_id)
+                .promote_shard_owner(&current, &new_owner_node_id, &leader_fence)
                 .await
                 .with_context(|| {
                     format!(
