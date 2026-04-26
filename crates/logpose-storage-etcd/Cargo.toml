@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-etcd-client = "0.14"
+etcd-client = "0.18"
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-storage = { path = "../logpose-storage" }
