@@ -18,7 +18,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-criterion = "0.5"
+criterion = "0.8"
 tokio.workspace = true
 
 [[bench]]
