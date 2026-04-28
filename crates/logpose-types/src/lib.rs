@@ -201,6 +201,64 @@ impl CollectionRef {
         Self::new(DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME, collection_name)
     }
 
+    /// Build a reference from a possibly-qualified lookup key, falling back to
+    /// the bootstrap default namespace when the value is a bare collection
+    /// name.
+    ///
+    /// A fully qualified `tenant/database/collection` lookup key is parsed
+    /// into its three segments verbatim. Anything else (including empty
+    /// segments or extra slashes) is treated as a bare collection name and
+    /// placed inside the default namespace.
+    #[must_use]
+    pub fn from_lookup_key(value: &str) -> Self {
+        Self::from_lookup_key_or(value, DEFAULT_TENANT_NAME, DEFAULT_DATABASE_NAME)
+    }
+
+    /// Build a reference from a possibly-qualified lookup key, using the
+    /// supplied tenant and database namespace as the fallback when the value
+    /// is a bare collection name.
+    ///
+    /// A fully qualified `tenant/database/collection` lookup key is parsed
+    /// into its three segments verbatim and the supplied fallback namespace
+    /// is ignored.
+    #[must_use]
+    pub fn from_lookup_key_or(
+        value: &str,
+        fallback_tenant: impl Into<String>,
+        fallback_database: impl Into<String>,
+    ) -> Self {
+        let parts = value.split('/').collect::<Vec<_>>();
+        if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
+            Self::new(parts[0], parts[1], parts[2])
+        } else {
+            Self::new(fallback_tenant, fallback_database, value)
+        }
+    }
+
+    /// Parse a reference from either a bare `collection` name or a fully
+    /// qualified `tenant/database/collection` lookup key, validating the
+    /// resulting segments.
+    ///
+    /// Bare collection names are placed inside the bootstrap default
+    /// namespace. Any other slash count (zero, two, four, ...) is rejected
+    /// with a [`LogPoseError::Message`] describing the supported shapes.
+    pub fn parse_reference(value: &str) -> Result<Self> {
+        let trimmed = value.trim();
+        let reference = match trimmed.split('/').collect::<Vec<_>>().as_slice() {
+            [collection_name] => Self::new_default(*collection_name),
+            [tenant_name, database_name, collection_name] => {
+                Self::new(*tenant_name, *database_name, *collection_name)
+            }
+            _ => {
+                return Err(LogPoseError::Message(format!(
+                    "unsupported collection reference '{value}': expected 'collection' or 'tenant/database/collection'"
+                )));
+            }
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
     /// Build the canonical tenant/database/collection lookup key.
     #[must_use]
     pub fn lookup_name(&self) -> String {

@@ -934,25 +934,16 @@ pub fn collection_lookup_name(
 }
 
 pub fn split_collection_lookup_key(value: &str) -> (String, String, String) {
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-        (
-            parts[0].to_owned(),
-            parts[1].to_owned(),
-            parts[2].to_owned(),
-        )
-    } else {
-        (
-            DEFAULT_TENANT_NAME.to_owned(),
-            DEFAULT_DATABASE_NAME.to_owned(),
-            value.to_owned(),
-        )
-    }
+    let collection = CollectionRef::from_lookup_key(value);
+    (
+        collection.tenant_name,
+        collection.database_name,
+        collection.collection_name,
+    )
 }
 
 pub fn collection_ref_from_lookup_key(value: &str) -> CollectionRef {
-    let (tenant_name, database_name, collection_name) = split_collection_lookup_key(value);
-    CollectionRef::new(tenant_name, database_name, collection_name)
+    CollectionRef::from_lookup_key(value)
 }
 
 pub fn collection_ref_from_lookup_or_namespace(
@@ -960,13 +951,7 @@ pub fn collection_ref_from_lookup_or_namespace(
     tenant_name: &str,
     database_name: &str,
 ) -> CollectionRef {
-    let trimmed = value.trim();
-    let parts = trimmed.split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-        CollectionRef::new(parts[0], parts[1], parts[2])
-    } else {
-        CollectionRef::new(tenant_name, database_name, trimmed)
-    }
+    CollectionRef::from_lookup_key_or(value.trim(), tenant_name, database_name)
 }
 
 fn push_namespace_flags(parts: &mut Vec<String>, tenant_name: &str, database_name: &str) {

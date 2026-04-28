@@ -624,12 +624,7 @@ fn assignment_conflict(error: &LogPoseError) -> bool {
 }
 
 fn canonical_collection_lookup_name(collection_name: &str) -> String {
-    let parts = collection_name.split('/').collect::<Vec<_>>();
-    if parts.len() == 3 && parts.iter().all(|part| !part.trim().is_empty()) {
-        format!("{}/{}/{}", parts[0], parts[1], parts[2])
-    } else {
-        CollectionRef::new_default(collection_name).lookup_name()
-    }
+    CollectionRef::from_lookup_key(collection_name).lookup_name()
 }
 
 fn matching_assignment_without_local_state(
