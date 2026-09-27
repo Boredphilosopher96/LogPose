@@ -1507,6 +1507,7 @@ version = "0.1.0"
 name = "logpose-wal"
 version = "0.1.0"
 dependencies = [
+ "crc32c",
  "crc32fast",
  "logpose-types",
  "logpose-vfs",
