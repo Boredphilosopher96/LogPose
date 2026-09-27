@@ -4,6 +4,7 @@
 - [Architecture](./architecture.md)
 - [Engine Core Design](./engine-core-design.md)
 - [Better Vector DB Architecture](./better-vector-db.md)
+- [Engine V2 Plan](./engine-v2-plan.md)
 - [Future Milestones](./future-milestones.md)
   - [Multi-Cluster Metadata and Consistency](./future-milestones/multicluster-metadata-and-consistency.md)
   - [Additional Vector Index Families](./future-milestones/additional-vector-index-families.md)
