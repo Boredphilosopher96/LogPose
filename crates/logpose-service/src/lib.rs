@@ -732,7 +732,8 @@ impl LogPoseDataService {
 
 /// Build a filesystem-backed catalog store rooted under the runtime storage directory.
 ///
-/// Fails if another process holds the storage root.
+/// Opens its own engine, so it fails if another engine holds the storage root; a process that
+/// already serves the root shares that engine's catalog instead.
 pub fn local_catalog_store(root: impl AsRef<Path>) -> Result<Arc<dyn CatalogStore>> {
     Ok(Arc::new(LocalStorageEngine::new(root)?))
 }
@@ -793,6 +794,12 @@ impl LogPoseControlService {
             coordination,
             coordination_client,
         }
+    }
+
+    /// The catalog store behind this control plane.
+    #[must_use]
+    pub fn catalog_store(&self) -> &Arc<dyn CatalogStore> {
+        &self.catalog
     }
 
     /// Create a collection through the control-plane surface.
@@ -1331,6 +1338,9 @@ impl From<LogPoseError> for ServiceError {
     fn from(error: LogPoseError) -> Self {
         match error {
             LogPoseError::Message(message) => classify_message(message),
+            error @ LogPoseError::StorageRootLocked { .. } => {
+                ServiceError::FailedPrecondition(error.to_string())
+            }
         }
     }
 }
