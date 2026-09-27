@@ -2,6 +2,9 @@
 
 mod error;
 
+#[cfg(test)]
+use yaml_rust2 as _;
+
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
@@ -9,8 +12,8 @@ use axum::{
     response::IntoResponse,
     routing::{MethodRouter, get, post},
 };
-pub use error::ErrorBody;
 use error::{ApiError, ApiJson, ApiQuery};
+pub use error::{ErrorBody, http_status};
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
 use logpose_core::{AppState, RequestAuth};

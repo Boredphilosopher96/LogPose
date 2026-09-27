@@ -25,3 +25,4 @@ tower-http.workspace = true
 http-body-util = "~0.1"
 logpose-config = { path = "../logpose-config" }
 tower.workspace = true
+yaml-rust2 = { version = "~0.13", default-features = false }
