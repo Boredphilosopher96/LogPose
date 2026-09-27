@@ -7,8 +7,7 @@ use rand as _;
 
 use async_trait::async_trait;
 use crc32fast::hash;
-use logpose_auth::{DatabaseAccessPolicy, Principal};
-use logpose_catalog::{CatalogStore, CollectionDescriptor, DatabaseDescriptor};
+use logpose_catalog::CollectionDescriptor;
 use logpose_index::{
     FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
     HnswIndexSidecar, build_flat_index, build_hnsw_index, read_flat_index, read_hnsw_index,
@@ -16,13 +15,13 @@ use logpose_index::{
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence, LogPoseError,
-    MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId,
-    Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
+    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo,
+    Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{
-    ACTIVE_WAL_FILE_NAME, WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint,
-    replay_file, rotate_active,
+    WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file,
+    rotate_active,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,15 +34,19 @@ use std::{
 };
 use uuid::Uuid;
 
+mod catalog;
 mod durable_fs;
 mod error;
 mod fs_util;
 mod metric;
+mod paths;
 mod root_lock;
 mod storage_engine;
+#[cfg(test)]
+mod test_support;
 
 use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir, write_file_synced};
-use error::{io_message, json_message, string_message};
+use error::{io_message, json_message};
 use fs_util::{atomic_write, cleanup_dir, cleanup_file, read_json, remove_file_if_exists};
 use metric::storage_metric_compare;
 use root_lock::StorageRootLock;
@@ -86,88 +89,6 @@ impl LocalStorageEngine {
             blob_store,
             _root_lock: Arc::new(root_lock),
         })
-    }
-
-    fn collections_root(&self) -> PathBuf {
-        self.root.join("collections")
-    }
-
-    fn databases_root(&self) -> PathBuf {
-        self.root.join("databases")
-    }
-
-    fn database_descriptor_path(&self, database_name: &str) -> PathBuf {
-        self.databases_root()
-            .join(database_name)
-            .join("descriptor.json")
-    }
-
-    fn database_policy_path(&self, database_name: &str) -> PathBuf {
-        self.databases_root()
-            .join(database_name)
-            .join("policy.json")
-    }
-
-    fn principals_root(&self) -> PathBuf {
-        self.root.join("principals")
-    }
-
-    fn principal_descriptor_path(&self, principal_name: &str) -> PathBuf {
-        self.principals_root()
-            .join(principal_name)
-            .join("descriptor.json")
-    }
-
-    fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join(ACTIVE_WAL_FILE_NAME)
-    }
-
-    fn rolled_wal_path(descriptor: &CollectionDescriptor, checkpoint_seq_no: SeqNo) -> PathBuf {
-        descriptor
-            .root_path
-            .join("wal")
-            .join(format!("{checkpoint_seq_no:020}.wal"))
-    }
-
-    fn flat_index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
-        descriptor
-            .root_path
-            .join("indexes")
-            .join(format!("{segment_id}.flat.json"))
-    }
-
-    fn hnsw_index_file_path(descriptor: &CollectionDescriptor, segment_id: &str) -> PathBuf {
-        descriptor
-            .root_path
-            .join("indexes")
-            .join(format!("{segment_id}.hnsw.bin"))
-    }
-
-    fn manifest_file_path(descriptor: &CollectionDescriptor, generation: u64) -> PathBuf {
-        descriptor
-            .root_path
-            .join("manifests")
-            .join(format!("{generation:020}.json"))
-    }
-
-    fn maintenance_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("maintenance.json")
-    }
-
-    fn placement_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("placement.json")
-    }
-
-    fn current_manifest_pointer(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("CURRENT")
-    }
-
-    fn pending_rotation_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join("PENDING_ROTATION")
-    }
-
-    fn descriptor_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("descriptor.json")
     }
 
     /// Build the descriptor that would be persisted for one collection request.
@@ -271,34 +192,6 @@ impl LocalStorageEngine {
     ) -> Result<CollectionDescriptor> {
         let descriptor = self.plan_collection_descriptor(&request)?;
         self.create_collection_from_descriptor(descriptor, assignment)
-    }
-
-    fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
-        if database_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
-                "database name must not be empty".to_owned(),
-            ));
-        }
-        let path = self.database_descriptor_path(database_name);
-        if path.exists() {
-            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
-            descriptor.validate()?;
-            return Ok(());
-        }
-
-        let descriptor = DatabaseDescriptor::new(database_name);
-        descriptor.validate()?;
-        let parent = path.parent().ok_or_else(|| {
-            LogPoseError::Message(format!(
-                "database descriptor path for '{database_name}' is missing a parent directory"
-            ))
-        })?;
-        create_dir_all_synced(parent)?;
-        atomic_write(
-            &path,
-            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-        )?;
-        Ok(())
     }
 
     /// Open a collection descriptor using an explicit database namespace.
@@ -601,59 +494,6 @@ impl LocalStorageEngine {
             maintenance,
             query_units,
         })
-    }
-
-    fn list_database_descriptors(&self) -> Result<Vec<DatabaseDescriptor>> {
-        let databases_root = self.databases_root();
-        if !databases_root.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut descriptors = Vec::new();
-        for entry in fs::read_dir(&databases_root)
-            .map_err(|error| io_message("failed to list databases root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read database entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
-            descriptor.validate()?;
-            descriptors.push(descriptor);
-        }
-
-        descriptors.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(descriptors)
-    }
-
-    fn list_principal_descriptors(&self) -> Result<Vec<Principal>> {
-        let principals_root = self.principals_root();
-        if !principals_root.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut principals = Vec::new();
-        for entry in fs::read_dir(&principals_root)
-            .map_err(|error| io_message("failed to list principals root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read principal entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let principal = read_json::<Principal>(&path)?;
-            validate_principal_name(&principal.name)?;
-            principal.validate().map_err(string_message)?;
-            principals.push(principal);
-        }
-
-        principals.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(principals)
     }
 
     fn load_manifest(
@@ -1370,104 +1210,6 @@ fn ensure_active_wal_is_checkpointed(
         active_wal_path.display(),
         marker_path.display(),
     )))
-}
-
-impl CatalogStore for LocalStorageEngine {
-    fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
-        let mut descriptor = descriptor;
-        descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
-        match self.get_database(&descriptor.name) {
-            Ok(existing) => {
-                descriptor.database_id = existing.database_id;
-            }
-            Err(error) if error.to_string().contains("does not exist") => {}
-            Err(error) => return Err(error),
-        }
-        descriptor.validate()?;
-        atomic_write(
-            &self.database_descriptor_path(&descriptor.name),
-            serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-        )?;
-        Ok(descriptor)
-    }
-
-    fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        validate_namespace_segment("database name", database_name)?;
-        let path = self.database_descriptor_path(database_name);
-        if database_name == DEFAULT_DATABASE_NAME && !path.exists() {
-            self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
-        }
-        if !path.exists() {
-            return Err(LogPoseError::Message(format!(
-                "database '{database_name}' does not exist"
-            )));
-        }
-
-        let descriptor = read_json::<DatabaseDescriptor>(&path)?;
-        descriptor.validate()?;
-        Ok(descriptor)
-    }
-
-    fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
-        self.list_database_descriptors()
-    }
-
-    fn put_principal(&self, principal: Principal) -> Result<Principal> {
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(string_message)?;
-        atomic_write(
-            &self.principal_descriptor_path(&principal.name),
-            serde_json::to_vec_pretty(&principal).map_err(json_message)?,
-        )?;
-        Ok(principal)
-    }
-
-    fn get_principal(&self, principal_name: &str) -> Result<Principal> {
-        validate_principal_name(principal_name)?;
-        let path = self.principal_descriptor_path(principal_name);
-        if !path.exists() {
-            return Err(LogPoseError::Message(format!(
-                "principal '{principal_name}' does not exist"
-            )));
-        }
-
-        let principal = read_json::<Principal>(&path)?;
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(string_message)?;
-        Ok(principal)
-    }
-
-    fn list_principals(&self) -> Result<Vec<Principal>> {
-        self.list_principal_descriptors()
-    }
-
-    fn put_database_access_policy(
-        &self,
-        policy: DatabaseAccessPolicy,
-    ) -> Result<DatabaseAccessPolicy> {
-        policy.validate().map_err(string_message)?;
-        self.ensure_database_descriptor(&policy.database_name)?;
-        atomic_write(
-            &self.database_policy_path(&policy.database_name),
-            serde_json::to_vec_pretty(&policy).map_err(json_message)?,
-        )?;
-        Ok(policy)
-    }
-
-    fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
-        validate_namespace_segment("database name", database_name)?;
-        let path = self.database_policy_path(database_name);
-        if !path.exists() {
-            return Err(LogPoseError::Message(format!(
-                "database access policy '{database_name}' does not exist"
-            )));
-        }
-
-        let policy = read_json::<DatabaseAccessPolicy>(&path)?;
-        policy.validate().map_err(string_message)?;
-        Ok(policy)
-    }
 }
 
 #[async_trait]
@@ -2565,44 +2307,6 @@ fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> 
     Ok(&bytes[start..end])
 }
 
-fn validate_principal_name(value: &str) -> Result<()> {
-    let trimmed = value.trim();
-    if value.trim().is_empty() {
-        return Err(LogPoseError::Message(
-            "principal name must not be empty".to_owned(),
-        ));
-    }
-    if value.contains('/') {
-        return Err(LogPoseError::Message(
-            "principal name must not contain '/'".to_owned(),
-        ));
-    }
-    if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(
-            "principal name must not be a relative path component".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
-    let trimmed = value.trim();
-    if value.trim().is_empty() {
-        return Err(LogPoseError::Message(format!("{label} must not be empty")));
-    }
-    if value.contains('/') {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not contain '/'"
-        )));
-    }
-    if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not be a relative path component"
-        )));
-    }
-    Ok(())
-}
-
 /// Test-only fault injection for failures that cannot be provoked through the filesystem when
 /// tests run with elevated privileges.
 #[cfg(test)]
@@ -2652,40 +2356,12 @@ mod failpoints {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{put, unique_temp_dir, visible_ids};
     use logpose_index::FlatIndexEntrySource;
     use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
     use rand as _;
     use serde_json::json;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    #[test]
-    fn list_databases_bootstraps_the_default_database_descriptor() {
-        let root = unique_temp_dir("storage-default-database-bootstrap");
-        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-        let databases = engine
-            .list_databases()
-            .expect("database listing should bootstrap the default database");
-
-        assert_eq!(databases.len(), 1);
-        assert_eq!(databases[0].name, DEFAULT_DATABASE_NAME);
-        assert!(databases[0].is_default);
-    }
-
-    #[test]
-    fn catalog_validation_rejects_relative_path_components() {
-        let principal_error =
-            validate_principal_name("..").expect_err("relative principal names should fail");
-        assert!(principal_error.to_string().contains("relative path"));
-
-        let database_error = validate_namespace_segment("database name", "..")
-            .expect_err("relative database names should fail");
-        assert!(database_error.to_string().contains("relative path"));
-    }
+    use std::fs;
 
     #[test]
     fn truncated_segment_returns_error_instead_of_panicking() {
@@ -2918,21 +2594,6 @@ mod tests {
             !coordinator.contains_key(&coordinator_key),
             "descriptor lookup failure should clear runtime coordinator state"
         );
-    }
-
-    fn put(id: &str, vector: Vec<f32>) -> WriteOperation {
-        WriteOperation::Put(PutRecord {
-            id: RecordId::new(id),
-            vector,
-            metadata: json!({"id": id}),
-        })
-    }
-
-    fn visible_ids(records: &[VisibleRecord]) -> Vec<String> {
-        records
-            .iter()
-            .map(|record| record.id.as_str().to_owned())
-            .collect()
     }
 
     #[test]
@@ -3179,15 +2840,5 @@ mod tests {
             0,
             "the checkpointed records and the torn tail should be truncated"
         );
-    }
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-        fs::create_dir_all(&dir).expect("temp dir should be created");
-        dir
     }
 }
