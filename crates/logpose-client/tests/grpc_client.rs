@@ -12,7 +12,7 @@ use logpose_client::{
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
 use logpose_query::{
-    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
     ScalarMetadataValue,
 };
 use logpose_storage::{CreateCollectionRequest as StorageCreateCollectionRequest, InspectTarget};
@@ -98,9 +98,9 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
@@ -648,9 +648,9 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,

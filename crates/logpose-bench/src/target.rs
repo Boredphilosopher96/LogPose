@@ -7,7 +7,7 @@
 
 use crate::dataset::Metric;
 use anyhow::{Context, Result, anyhow, ensure};
-use logpose_query::{ExplainMode, Predicate, QueryRequest, query_exact};
+use logpose_query::{ExplainMode, FilterExpr, QueryRequest, query_exact};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde_json::{Map, Value};
@@ -47,7 +47,7 @@ pub struct SearchRequest<'a> {
     /// Query vector.
     pub vector: &'a [f32],
     /// Optional filter in the query crate's predicate AST.
-    pub filter: Option<&'a Predicate>,
+    pub filter: Option<&'a FilterExpr>,
     /// Number of neighbors to return.
     pub k: usize,
 }

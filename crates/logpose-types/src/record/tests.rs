@@ -502,3 +502,48 @@ fn typed_json_null_is_treated_as_null() {
         })
     );
 }
+
+#[test]
+fn rejects_dynamic_keys_with_retired_names() {
+    let mut schema = products_schema(true);
+    schema.drop_field("price").expect("drop should succeed");
+
+    let mut dropped = document();
+    dropped["price"] = json!(3.5);
+    assert_eq!(
+        Record::from_json(&schema, dropped),
+        Err(RecordError::RetiredKey {
+            key: "price".to_owned()
+        })
+    );
+
+    let mut update = PartialUpdate::new("A-1");
+    update.extra.insert("price".to_owned(), json!(null));
+    assert_eq!(
+        schema.validate_update(update),
+        Err(RecordError::RetiredKey {
+            key: "price".to_owned()
+        })
+    );
+
+    schema
+        .add_field(crate::schema::ScalarFieldSpec::new(
+            "price",
+            FieldType::Int64,
+        ))
+        .expect("re-adding the name should succeed");
+    let mut readded = document();
+    readded["price"] = json!(3);
+    let record = Record::from_json(&schema, readded).expect("the name is declared again");
+    assert_eq!(record.fields["price"], Value::Int64(3));
+}
+
+#[test]
+fn client_op_exposes_its_primary_key() {
+    let upsert = ClientOp::Upsert(Record::new("a"));
+    let update = ClientOp::Update(PartialUpdate::new(7));
+    let delete = ClientOp::Delete(PrimaryKey::from("c"));
+    assert_eq!(upsert.pk(), &PrimaryKey::from("a"));
+    assert_eq!(update.pk(), &PrimaryKey::Int64(7));
+    assert_eq!(delete.pk(), &PrimaryKey::from("c"));
+}

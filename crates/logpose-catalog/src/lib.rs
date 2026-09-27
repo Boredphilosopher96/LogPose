@@ -2,7 +2,8 @@
 
 use logpose_types::{
     CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, DistanceMetric,
-    LogPoseError, RemoteBlobConfig, WriteOperation, default_database_id,
+    LogPoseError, RemoteBlobConfig, WriteOperation, default_database_id, legacy,
+    schema::CollectionSchema,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -171,8 +172,30 @@ impl CollectionDescriptor {
             && self.compaction_threshold_segments == other.compaction_threshold_segments
     }
 
+    /// The collection's typed schema.
+    ///
+    /// Collections are still created through the v1 request, so every
+    /// collection has the legacy schema derived from `dimensions` and
+    /// `metric`: string primary key `id`, one vector field `vector`, and
+    /// dynamic fields on (see [`legacy::legacy_schema`]). The schema is
+    /// derived rather than stored because it cannot change yet; once schema
+    /// changes land, the schema moves to the manifest, not this descriptor.
+    pub fn schema(&self) -> logpose_types::Result<CollectionSchema> {
+        legacy::legacy_schema(self.dimensions, self.metric).map_err(|error| {
+            LogPoseError::Message(format!(
+                "collection '{}' has an invalid schema: {error}",
+                self.name
+            ))
+        })
+    }
+
     /// Validate collection-level configuration values.
     pub fn validate(&self) -> logpose_types::Result<()> {
+        self.validated_schema().map(|_| ())
+    }
+
+    /// Validate configuration values and return the collection schema.
+    fn validated_schema(&self) -> logpose_types::Result<CollectionSchema> {
         self.collection_ref().validate()?;
         if self.dimensions == 0 {
             return Err(LogPoseError::Message(
@@ -194,13 +217,25 @@ impl CollectionDescriptor {
                 "compaction_threshold_segments must be greater than 1".to_owned(),
             ));
         }
-        Ok(())
+        self.schema()
     }
 
-    /// Validate whether an operation matches this collection's configured dimensions.
+    /// Validate an operation against this collection's schema.
+    ///
+    /// The operation is mapped to the v2 model with
+    /// [`legacy::validate_write`] and checked like any v2 write: the key is
+    /// a non-empty string of at most 1,024 bytes, the vector has the
+    /// configured dimensions and finite components, and metadata is a JSON
+    /// object (or null) whose keys become dynamic fields, so it cannot use
+    /// the names `id` or `vector`, or the reserved name `$extra`.
     pub fn validate_operation(&self, operation: &WriteOperation) -> logpose_types::Result<()> {
-        self.validate()?;
-        operation.validate_dimensions(self.dimensions)
+        let schema = self.validated_schema()?;
+        operation.validate_dimensions(self.dimensions)?;
+        legacy::validate_write(&schema, operation.clone())
+            .map(|_| ())
+            .map_err(|error| {
+                LogPoseError::Message(format!("record '{}' is invalid: {error}", operation.id()))
+            })
     }
 }
 
@@ -438,5 +473,83 @@ mod tests {
 
         assert!(descriptor.matches_serving_identity(&stripped));
         assert_eq!(stripped.root_path, PathBuf::new());
+    }
+
+    #[test]
+    fn collection_schema_is_the_legacy_schema() {
+        let descriptor = CollectionDescriptor::new("docs", 3, DistanceMetric::L2, "/tmp/logpose");
+        let schema = descriptor.schema().expect("schema should build");
+        assert_eq!(schema.primary_key().name, "id");
+        assert_eq!(schema.vectors()[0].name, "vector");
+        assert_eq!(schema.vectors()[0].dimensions, 3);
+        assert_eq!(schema.vectors()[0].metric, DistanceMetric::L2);
+        assert!(schema.dynamic_fields());
+    }
+
+    #[test]
+    fn rejects_dimensions_above_the_schema_limit() {
+        let descriptor =
+            CollectionDescriptor::new("docs", 65_537, DistanceMetric::L2, "/tmp/logpose");
+        let error = descriptor
+            .validate()
+            .expect_err("too many dimensions should fail");
+        assert!(error.to_string().contains("65537 dimensions"), "{error}");
+    }
+
+    #[test]
+    fn validates_operations_through_the_schema() {
+        use logpose_types::{DeleteRecord, PutRecord, RecordId};
+
+        let descriptor = CollectionDescriptor::new("docs", 2, DistanceMetric::L2, "/tmp/logpose");
+        let put = |id: &str, vector: Vec<f32>, metadata| {
+            WriteOperation::Put(PutRecord {
+                id: RecordId::new(id),
+                vector,
+                metadata,
+            })
+        };
+        descriptor
+            .validate_operation(&put("a", vec![1.0, 2.0], serde_json::json!({ "k": 1 })))
+            .expect("valid put");
+        descriptor
+            .validate_operation(&put("a", vec![1.0, 2.0], serde_json::Value::Null))
+            .expect("null metadata is allowed");
+        descriptor
+            .validate_operation(&WriteOperation::Delete(DeleteRecord {
+                id: RecordId::new("a"),
+            }))
+            .expect("valid delete");
+
+        let wrong_dimensions = descriptor
+            .validate_operation(&put("a", vec![1.0], serde_json::Value::Null))
+            .expect_err("wrong dimensions");
+        assert_eq!(
+            wrong_dimensions.to_string(),
+            "record 'a' expected 2 dimensions but found 1"
+        );
+
+        for (operation, message) in [
+            (
+                put("a", vec![f32::NAN, 0.0], serde_json::Value::Null),
+                "component 0 is not a finite f32",
+            ),
+            (
+                put("", vec![1.0, 2.0], serde_json::Value::Null),
+                "must not be an empty string",
+            ),
+            (
+                put("a", vec![1.0, 2.0], serde_json::json!("text")),
+                "metadata must be a JSON object or null",
+            ),
+            (
+                put("a", vec![1.0, 2.0], serde_json::json!({ "vector": 1 })),
+                "dynamic key 'vector' collides",
+            ),
+        ] {
+            let error = descriptor
+                .validate_operation(&operation)
+                .expect_err("invalid operation");
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 }

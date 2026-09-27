@@ -22,7 +22,7 @@ impl CollectionSchema {
     /// - undeclared scalar keys move into `extra` when dynamic fields are
     ///   enabled, and are rejected otherwise
     /// - `extra` is empty unless dynamic fields are enabled, and its keys do
-    ///   not collide with declared fields or `$extra`
+    ///   not collide with declared fields, retired names, or `$extra`
     ///
     /// The canonical form drops null scalar values, since absent means null.
     ///
@@ -30,7 +30,7 @@ impl CollectionSchema {
     ///
     /// Returns the first [`RecordError`] found.
     pub fn validate_record(&self, record: Record) -> Result<Record, RecordError> {
-        self.check_primary_key(&record.pk)?;
+        self.validate_primary_key(&record.pk)?;
         self.check_vectors(&record.vectors)?;
         if let Some(missing) = self
             .vectors()
@@ -79,7 +79,7 @@ impl CollectionSchema {
         if update.is_empty() {
             return Err(RecordError::EmptyUpdate);
         }
-        self.check_primary_key(&update.pk)?;
+        self.validate_primary_key(&update.pk)?;
         self.check_vectors(&update.vectors)?;
         let (fields, extra) = self.check_fields(update.fields, update.extra)?;
         for (name, value) in &fields {
@@ -98,7 +98,15 @@ impl CollectionSchema {
         })
     }
 
-    fn check_primary_key(&self, pk: &PrimaryKey) -> Result<(), RecordError> {
+    /// Check that a primary key has the schema's key type and, for string
+    /// keys, is non-empty and at most [`MAX_STRING_PRIMARY_KEY_BYTES`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::PrimaryKeyType`],
+    /// [`RecordError::EmptyPrimaryKey`], or
+    /// [`RecordError::PrimaryKeyTooLong`].
+    pub fn validate_primary_key(&self, pk: &PrimaryKey) -> Result<(), RecordError> {
         let field = self.primary_key();
         if pk.key_type() != field.key_type {
             return Err(RecordError::PrimaryKeyType {
@@ -183,6 +191,11 @@ impl CollectionSchema {
         }
         if self.field(key).is_some() {
             return Err(RecordError::ExtraKeyConflict {
+                key: key.to_owned(),
+            });
+        }
+        if self.is_retired(key) {
+            return Err(RecordError::RetiredKey {
                 key: key.to_owned(),
             });
         }

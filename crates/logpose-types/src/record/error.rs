@@ -147,6 +147,15 @@ pub enum RecordError {
         /// The colliding key.
         key: String,
     },
+    /// A dynamic key uses a retired name: one that a field declared once and
+    /// that was dropped or renamed away. Readers shadow `$extra` keys with
+    /// retired names, so storing one would silently hide the value. Add a
+    /// field with that name to use it again.
+    #[error("dynamic key '{key}' is a retired field name; add a field with that name to use it")]
+    RetiredKey {
+        /// The retired key.
+        key: String,
+    },
     /// A partial update changes nothing.
     #[error("a partial update must set at least one field or vector")]
     EmptyUpdate,

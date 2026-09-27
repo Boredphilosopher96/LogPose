@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
 use logpose_query::{
-    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryRequest,
     ScalarMetadataValue,
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
@@ -108,7 +108,7 @@ pub struct QueryAction {
     pub top_k: usize,
     pub vector: QueryVector,
     pub filters: Vec<QueryFilter>,
-    pub where_clauses: Vec<Predicate>,
+    pub where_clauses: Vec<FilterExpr>,
     pub predicate_json: Option<PathBuf>,
     pub explain: Option<ExplainArg>,
     pub snapshot_manifest_generation: Option<u64>,
@@ -591,12 +591,12 @@ pub fn stats_read_barrier_from_action(
     Ok(read_barrier)
 }
 
-pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Option<Predicate>> {
+pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Option<FilterExpr>> {
     let mut predicates = action.where_clauses.clone();
     if let Some(path) = &action.predicate_json {
         let file = File::open(path)
             .with_context(|| format!("failed to open predicate json '{}'", path.display()))?;
-        let predicate = serde_json::from_reader::<_, Predicate>(file)
+        let predicate = serde_json::from_reader::<_, FilterExpr>(file)
             .with_context(|| format!("failed to parse predicate json '{}'", path.display()))?;
         predicates.push(predicate);
     }
@@ -604,7 +604,7 @@ pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Optio
     Ok(match predicates.len() {
         0 => None,
         1 => predicates.into_iter().next(),
-        _ => Some(Predicate::And {
+        _ => Some(FilterExpr::And {
             children: predicates,
         }),
     })
@@ -772,7 +772,7 @@ pub fn parse_filter_list(value: &str) -> Result<Vec<QueryFilter>, String> {
         .collect()
 }
 
-pub fn parse_query_where(value: &str) -> Result<Predicate, String> {
+pub fn parse_query_where(value: &str) -> Result<FilterExpr, String> {
     let mut parts = value.splitn(3, ':');
     let field = parts
         .next()
@@ -788,7 +788,7 @@ pub fn parse_query_where(value: &str) -> Result<Predicate, String> {
 
     let operator = parse_predicate_operator(operator)?;
     let value = match operator {
-        PredicateOperator::Exists | PredicateOperator::IsNull => {
+        FilterOperator::Exists | FilterOperator::IsNull => {
             if raw_value.is_some() {
                 return Err(format!(
                     "where operator '{}' does not accept a value",
@@ -808,14 +808,14 @@ pub fn parse_query_where(value: &str) -> Result<Predicate, String> {
         }
     };
 
-    Ok(Predicate::Comparison(PredicateComparison {
+    Ok(FilterExpr::Comparison(FilterComparison {
         field: field.to_owned(),
         operator,
         value,
     }))
 }
 
-pub fn parse_where_list(value: &str) -> Result<Vec<Predicate>, String> {
+pub fn parse_where_list(value: &str) -> Result<Vec<FilterExpr>, String> {
     split_multi_value(value)
         .into_iter()
         .map(|item| parse_query_where(&item))
@@ -831,32 +831,32 @@ fn split_multi_value(value: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn parse_predicate_operator(value: &str) -> Result<PredicateOperator, String> {
+pub fn parse_predicate_operator(value: &str) -> Result<FilterOperator, String> {
     match value {
-        "eq" => Ok(PredicateOperator::Eq),
-        "ne" => Ok(PredicateOperator::Ne),
-        "lt" => Ok(PredicateOperator::Lt),
-        "lte" => Ok(PredicateOperator::Lte),
-        "gt" => Ok(PredicateOperator::Gt),
-        "gte" => Ok(PredicateOperator::Gte),
-        "exists" => Ok(PredicateOperator::Exists),
-        "is_null" => Ok(PredicateOperator::IsNull),
+        "eq" => Ok(FilterOperator::Eq),
+        "ne" => Ok(FilterOperator::Ne),
+        "lt" => Ok(FilterOperator::Lt),
+        "lte" => Ok(FilterOperator::Lte),
+        "gt" => Ok(FilterOperator::Gt),
+        "gte" => Ok(FilterOperator::Gte),
+        "exists" => Ok(FilterOperator::Exists),
+        "is_null" => Ok(FilterOperator::IsNull),
         _ => Err(format!(
             "unsupported where operator '{value}'. Supported operators: eq, ne, lt, lte, gt, gte, exists, is_null"
         )),
     }
 }
 
-pub fn operator_name(operator: PredicateOperator) -> &'static str {
+pub fn operator_name(operator: FilterOperator) -> &'static str {
     match operator {
-        PredicateOperator::Eq => "eq",
-        PredicateOperator::Ne => "ne",
-        PredicateOperator::Lt => "lt",
-        PredicateOperator::Lte => "lte",
-        PredicateOperator::Gt => "gt",
-        PredicateOperator::Gte => "gte",
-        PredicateOperator::Exists => "exists",
-        PredicateOperator::IsNull => "is_null",
+        FilterOperator::Eq => "eq",
+        FilterOperator::Ne => "ne",
+        FilterOperator::Lt => "lt",
+        FilterOperator::Lte => "lte",
+        FilterOperator::Gt => "gt",
+        FilterOperator::Gte => "gte",
+        FilterOperator::Exists => "exists",
+        FilterOperator::IsNull => "is_null",
     }
 }
 
@@ -1125,9 +1125,9 @@ pub fn format_filter(filter: &QueryFilter) -> String {
     )
 }
 
-pub fn format_predicate(predicate: &Predicate) -> String {
+pub fn format_predicate(predicate: &FilterExpr) -> String {
     match predicate {
-        Predicate::Comparison(PredicateComparison {
+        FilterExpr::Comparison(FilterComparison {
             field,
             operator,
             value,
@@ -1208,9 +1208,9 @@ mod tests {
 
         assert_eq!(
             parsed,
-            Predicate::Comparison(PredicateComparison {
+            FilterExpr::Comparison(FilterComparison {
                 field: "score".to_owned(),
-                operator: PredicateOperator::Gte,
+                operator: FilterOperator::Gte,
                 value: Some(ScalarMetadataValue::Number(7.into())),
             })
         );
@@ -1222,9 +1222,9 @@ mod tests {
 
         assert_eq!(
             parsed,
-            Predicate::Comparison(PredicateComparison {
+            FilterExpr::Comparison(FilterComparison {
                 field: "archived".to_owned(),
-                operator: PredicateOperator::IsNull,
+                operator: FilterOperator::IsNull,
                 value: None,
             })
         );

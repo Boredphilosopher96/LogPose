@@ -1369,6 +1369,7 @@ fn classify_message(message: String) -> ServiceError {
         || message.contains("manual reconciliation is required")
         || message.contains("reconciliation is required")
         || is_dimension_validation_error(&message)
+        || is_schema_validation_error(&message)
     {
         ServiceError::InvalidArgument(message)
     } else if message.contains("read barrier") {
@@ -1383,6 +1384,14 @@ fn is_dimension_validation_error(message: &str) -> bool {
         && message.contains(" dimensions")
         && message.contains(" expected ")
         && message.contains(" found ")
+}
+
+/// Errors from `CollectionDescriptor::validate_operation` ("record '<id>' is
+/// invalid: ...") and from deriving a collection's schema ("collection
+/// '<name>' has an invalid schema: ...") are caused by the request.
+fn is_schema_validation_error(message: &str) -> bool {
+    (message.starts_with("record '") && message.contains("' is invalid: "))
+        || (message.starts_with("collection '") && message.contains("' has an invalid schema: "))
 }
 
 fn http_endpoint(host: &str, port: u16) -> String {

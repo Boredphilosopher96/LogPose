@@ -106,10 +106,16 @@ impl<'a> FieldRef<'a> {
 /// - vector dimensions are within 1 to 65,536
 /// - scalar indexes are concrete (never `auto`) and valid for their type
 /// - field ids are unique and below `next_field_id`
+/// - every retired name is a valid field name that is not declared
 ///
 /// Every successful change through [`add_field`](Self::add_field),
 /// [`drop_field`](Self::drop_field), or [`rename_field`](Self::rename_field)
 /// increments `schema_version` by one. A new schema starts at version 1.
+///
+/// The schema also remembers *retired names*: names that were declared once
+/// and then dropped or renamed away. Keys stored in the dynamic `$extra`
+/// field under a declared or retired name are shadowed on read; see
+/// [`shadows_dynamic_key`](Self::shadows_dynamic_key).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "StoredSchema")]
 pub struct CollectionSchema {
@@ -119,6 +125,7 @@ pub struct CollectionSchema {
     vectors: Vec<VectorField>,
     fields: Vec<ScalarField>,
     dynamic_fields: bool,
+    retired_names: BTreeSet<String>,
 }
 
 /// Unvalidated stored form, used only to validate on deserialization.
@@ -130,6 +137,7 @@ struct StoredSchema {
     vectors: Vec<VectorField>,
     fields: Vec<ScalarField>,
     dynamic_fields: bool,
+    retired_names: BTreeSet<String>,
 }
 
 impl TryFrom<StoredSchema> for CollectionSchema {
@@ -143,6 +151,7 @@ impl TryFrom<StoredSchema> for CollectionSchema {
             vectors: stored.vectors,
             fields: stored.fields,
             dynamic_fields: stored.dynamic_fields,
+            retired_names: stored.retired_names,
         };
         schema.normalize_and_validate()?;
         Ok(schema)
@@ -198,6 +207,7 @@ impl CollectionSchema {
             vectors,
             fields,
             dynamic_fields,
+            retired_names: BTreeSet::new(),
         };
         schema.normalize_and_validate()?;
         Ok(schema)
@@ -243,6 +253,41 @@ impl CollectionSchema {
     #[must_use]
     pub fn dynamic_fields(&self) -> bool {
         self.dynamic_fields
+    }
+
+    /// Names that were declared once and then dropped or renamed away, and
+    /// have not been declared again.
+    #[must_use]
+    pub fn retired_names(&self) -> &BTreeSet<String> {
+        &self.retired_names
+    }
+
+    /// Whether `name` is a retired name.
+    #[must_use]
+    pub fn is_retired(&self, name: &str) -> bool {
+        self.retired_names.contains(name)
+    }
+
+    /// Whether a key stored in a row's dynamic `$extra` field is hidden
+    /// from readers of this schema.
+    ///
+    /// This is the read rule of dynamic field shadowing: a `$extra` key is
+    /// visible only if this schema neither declares nor retires that name.
+    /// It is a pure function of the key and the reading schema, so results
+    /// never depend on whether a compaction rewrote the row. An added field
+    /// therefore reads null on rows that stored the name dynamically, and a
+    /// dropped or renamed field's name does not resurface from `$extra`.
+    #[must_use]
+    pub fn shadows_dynamic_key(&self, key: &str) -> bool {
+        self.is_retired(key) || self.field(key).is_some()
+    }
+
+    /// Remove every shadowed key from a dynamic `$extra` object, leaving
+    /// what a reader of this schema may see. The writer uses the same rule
+    /// when it merges a partial update into an old row, so a shadowed value
+    /// is never promoted into a typed field.
+    pub fn retain_visible_dynamic(&self, extra: &mut serde_json::Map<String, serde_json::Value>) {
+        extra.retain(|key, _| !self.shadows_dynamic_key(key));
     }
 
     /// Look up a vector field by name.
@@ -299,6 +344,7 @@ impl CollectionSchema {
         let mut ids = IdAllocator(self.next_field_id);
         let id = ids.next()?;
         let version = self.bumped_version()?;
+        self.retired_names.remove(&spec.name);
         self.fields.push(ScalarField {
             id,
             name: spec.name,
@@ -312,7 +358,8 @@ impl CollectionSchema {
     }
 
     /// Drop a scalar or vector field and return its id. The id is never
-    /// reused, so compaction can reclaim the column later.
+    /// reused, so compaction can reclaim the column later. The name becomes
+    /// retired until a field with that name is added again.
     ///
     /// # Errors
     ///
@@ -343,11 +390,14 @@ impl CollectionSchema {
         self.vectors.retain(|field| field.id != id);
         self.fields.retain(|field| field.id != id);
         self.schema_version = version;
+        self.retired_names.insert(name.to_owned());
         Ok(id)
     }
 
     /// Rename any field, including the primary key, and return its id.
     /// Storage keys columns by [`FieldId`], so a rename touches no data.
+    /// The old name becomes retired, and the new name stops being retired
+    /// because it is declared again.
     ///
     /// # Errors
     ///
@@ -377,6 +427,8 @@ impl CollectionSchema {
             to.clone_into(&mut field.name);
         }
         self.schema_version = version;
+        self.retired_names.remove(to);
+        self.retired_names.insert(from.to_owned());
         Ok(id)
     }
 
@@ -421,6 +473,12 @@ impl CollectionSchema {
                     name: field.name().to_owned(),
                     id: id.0,
                 });
+            }
+        }
+        for name in &self.retired_names {
+            validate_field_name(name)?;
+            if names.contains(name.as_str()) {
+                return Err(SchemaError::RetiredNameDeclared { name: name.clone() });
             }
         }
         Ok(())

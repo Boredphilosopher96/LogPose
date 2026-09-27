@@ -1,5 +1,6 @@
 //! Exact and ANN index sidecars for immutable units.
 
+pub mod graph;
 pub mod kernels;
 pub mod scalar;
 pub mod sq8;

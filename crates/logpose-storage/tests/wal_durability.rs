@@ -26,7 +26,7 @@ fn put(id: &str) -> WriteOperation {
     WriteOperation::Put(PutRecord {
         id: RecordId::new(id),
         vector: vec![1.0, 0.0],
-        metadata: json!({"id": id}),
+        metadata: json!({"key": id}),
     })
 }
 

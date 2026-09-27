@@ -20,7 +20,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use logpose_config::LogPoseConfig;
-use logpose_query::Predicate;
+use logpose_query::FilterExpr;
 use logpose_storage::InspectTarget;
 use logpose_types::CollectionRef;
 use ratatui::{
@@ -381,7 +381,7 @@ fn action_from_scripted_prompts(
                 )?
             };
             let predicate_json = args.predicate_json.clone().or(ui
-                .prompt_optional_string("Predicate JSON path (optional)", Some("predicate.json"))?
+                .prompt_optional_string("FilterExpr JSON path (optional)", Some("predicate.json"))?
                 .map(PathBuf::from));
             let (snapshot_manifest_generation, snapshot_visible_seq_no) = build_snapshot_fields(
                 ui.prompt_optional_parsed(
@@ -1068,7 +1068,7 @@ impl FormState {
                 ),
                 path_field(
                     "predicate_json",
-                    "Predicate JSON path",
+                    "FilterExpr JSON path",
                     "Optional predicate document path.",
                     "predicate.json",
                     false,
@@ -3256,7 +3256,7 @@ fn filter_to_value(filter: &crate::action::QueryFilter) -> String {
     format_filter(filter)
 }
 
-fn predicate_to_value(predicate: &Predicate) -> String {
+fn predicate_to_value(predicate: &FilterExpr) -> String {
     // Same reasoning as `filter_to_value`: format the predicate literal
     // directly so apostrophes and other shell-significant characters
     // survive round-tripping into the TUI form.
@@ -3289,7 +3289,7 @@ fn parse_optional_filters(value: &str) -> anyhow::Result<Vec<crate::action::Quer
     }
 }
 
-fn parse_optional_predicates(value: &str) -> anyhow::Result<Vec<Predicate>> {
+fn parse_optional_predicates(value: &str) -> anyhow::Result<Vec<FilterExpr>> {
     if value.trim().is_empty() {
         Ok(Vec::new())
     } else {

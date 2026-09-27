@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use criterion as _;
 use logpose_catalog::CollectionDescriptor;
 use logpose_query::{
-    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
     query_exact,
 };
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine};
@@ -31,9 +31,9 @@ async fn planner_prunes_units_and_reports_tiny_population_fallback() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,
@@ -75,9 +75,9 @@ async fn planner_uses_hybrid_ann_for_broad_predicates_and_profiles_stages() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "score".to_owned(),
-                operator: PredicateOperator::Gte,
+                operator: FilterOperator::Gte,
                 value: Some(ScalarMetadataValue::Number(1.into())),
             })),
             explain: ExplainMode::Profile,
@@ -182,9 +182,9 @@ async fn planner_keeps_delete_bearing_units_visible_during_predicate_pruning() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,
@@ -216,9 +216,9 @@ async fn planner_keeps_newer_non_matching_versions_visible_during_predicate_prun
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,
@@ -259,9 +259,9 @@ async fn planner_selectivity_ignores_empty_mutable_units() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,
@@ -297,9 +297,9 @@ async fn planner_keeps_units_for_exists_predicates_on_non_scalar_fields() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "details".to_owned(),
-                operator: PredicateOperator::Exists,
+                operator: FilterOperator::Exists,
                 value: None,
             })),
             explain: ExplainMode::Plan,
@@ -346,9 +346,9 @@ async fn planner_treats_sparse_ne_predicates_as_selective() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Ne,
+                operator: FilterOperator::Ne,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,

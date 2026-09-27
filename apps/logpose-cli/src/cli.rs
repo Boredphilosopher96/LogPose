@@ -406,7 +406,7 @@ pub struct InteractiveArgs {
         value_name = "FIELD:OP[:VALUE]",
         help = "Prefill query predicates. Example: kind:eq:keep"
     )]
-    pub where_clauses: Vec<logpose_query::Predicate>,
+    pub where_clauses: Vec<logpose_query::FilterExpr>,
     #[arg(
         long,
         value_name = "PATH",
@@ -757,7 +757,7 @@ pub struct QueryArgs {
         value_name = "FIELD:OP[:VALUE]",
         help = "Add a predicate comparison. Operators: eq, ne, lt, lte, gt, gte, exists, is_null. Example: kind:eq:keep"
     )]
-    pub where_clauses: Vec<logpose_query::Predicate>,
+    pub where_clauses: Vec<logpose_query::FilterExpr>,
     #[arg(
         long,
         value_name = "PATH",

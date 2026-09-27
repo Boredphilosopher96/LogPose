@@ -263,6 +263,30 @@ impl PartialUpdate {
     }
 }
 
+/// One client write in a batch, before it is validated against the
+/// writer's schema and resolved into a full row image.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClientOp {
+    /// Insert or replace a whole record.
+    Upsert(Record),
+    /// Change some fields of an existing record.
+    Update(PartialUpdate),
+    /// Delete a record by primary key.
+    Delete(PrimaryKey),
+}
+
+impl ClientOp {
+    /// The primary key this operation targets.
+    #[must_use]
+    pub fn pk(&self) -> &PrimaryKey {
+        match self {
+            Self::Upsert(record) => &record.pk,
+            Self::Update(update) => &update.pk,
+            Self::Delete(pk) => pk,
+        }
+    }
+}
+
 /// Emit each component as the shortest decimal that reads back as the same
 /// `f32` (so `0.1_f32` becomes `0.1`, not `0.10000000149011612`).
 fn vector_to_json(vector: &[f32]) -> JsonValue {
