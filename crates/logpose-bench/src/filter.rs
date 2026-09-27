@@ -19,9 +19,6 @@ use clap::ValueEnum;
 use logpose_query::{Predicate, PredicateComparison, PredicateOperator, ScalarMetadataValue};
 use serde::Serialize;
 
-/// Maximum number of queries used as anchors for the anti-correlated ranking.
-pub const MAX_ANCHORS: usize = 64;
-
 const STREAM_UNCORRELATED: u64 = 101;
 
 /// How matching rows relate to the query vectors.
@@ -88,22 +85,17 @@ impl Attributes {
     }
 }
 
-/// Rank rows by their best closeness to a set of query anchors, farthest first.
+/// Rank rows by their best closeness to any query, farthest first.
 ///
-/// Anchors are up to [`MAX_ANCHORS`] queries spaced evenly through the query set.
-/// Ties break toward the lower row id so the ranking is deterministic.
+/// Every query counts, so a selective anti-correlated filter keeps only rows
+/// that are far from all of them. Ties break toward the lower row id so the
+/// ranking is deterministic.
 #[must_use]
 pub fn anti_correlated_ranks(dataset: &Dataset) -> Vec<u32> {
-    let queries = dataset.query_count();
-    let anchor_count = queries.min(MAX_ANCHORS);
-    let anchors = (0..anchor_count)
-        .map(|index| dataset.query(index * queries / anchor_count.max(1)))
-        .collect::<Vec<_>>();
     let mut nearness = (0..dataset.len())
         .map(|row| {
-            let best = anchors
-                .iter()
-                .map(|anchor| closeness(dataset.metric, anchor, dataset.row(row)))
+            let best = (0..dataset.query_count())
+                .map(|query| closeness(dataset.metric, dataset.query(query), dataset.row(row)))
                 .fold(f32::NEG_INFINITY, f32::max);
             (best, row)
         })
@@ -295,6 +287,50 @@ mod tests {
         assert!(
             anti < random,
             "anti {anti} should be farther than random {random}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anti_correlated_filter_excludes_rows_near_any_query() -> anyhow::Result<()> {
+        // More queries than the old 64-anchor cap, so every query must count.
+        let dataset = generate_synthetic(
+            &SyntheticSpec {
+                n: 1_000,
+                queries: 100,
+                dims: 8,
+                clusters: 8,
+                query_cluster_fraction: 1.0,
+                spread: 0.3,
+                seed: 9,
+            },
+            Metric::L2,
+        )?;
+        let attributes = Attributes::build(&dataset, 9);
+        let filter = FilterSpec::new(
+            FilterMode::AntiCorrelated,
+            FilterStyle::Equality,
+            0.1,
+            dataset.len(),
+        );
+        let best = |row: usize| {
+            (0..dataset.query_count())
+                .map(|query| closeness(dataset.metric, dataset.query(query), dataset.row(row)))
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        let (matched, rest): (Vec<_>, Vec<_>) =
+            (0..dataset.len()).partition(|row| filter.matches(attributes.anti_correlated[*row]));
+        let nearest_matched = matched
+            .iter()
+            .map(|row| best(*row))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let farthest_rest = rest
+            .iter()
+            .map(|row| best(*row))
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            nearest_matched <= farthest_rest,
+            "a matching row ({nearest_matched}) is closer to some query than a non-matching row ({farthest_rest})"
         );
         Ok(())
     }

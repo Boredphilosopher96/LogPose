@@ -2,7 +2,7 @@
 
 use crate::{
     dataset::{Dataset, Metric},
-    filter::{Attributes, FilterSpec, format_percent},
+    filter::{Attributes, FilterSpec, FilterStyle, format_percent},
     metrics::{IoSample, LatencySummary, MemorySample, percentile, recall_at_k},
     oracle::ground_truth,
     report::{
@@ -102,7 +102,7 @@ pub fn run(
     let attribute_seconds = attribute_started.elapsed().as_secs_f64();
 
     let cases = build_cases(&config, n);
-    let stored = stored_fields(&cases);
+    let stored = stored_fields(&cases)?;
     log(format!(
         "computing exact ground truth for {} cases",
         cases.len()
@@ -216,14 +216,28 @@ pub fn run(
 }
 
 /// One filter per distinct stored field; range filters of a mode share a field.
-fn stored_fields(cases: &[Case]) -> Vec<&FilterSpec> {
+///
+/// Equality fields are named after the rounded selectivity, so two
+/// selectivities that round to the same name but match different row counts
+/// would silently share one set of stored flags. That is rejected.
+fn stored_fields(cases: &[Case]) -> Result<Vec<&FilterSpec>> {
     let mut stored = Vec::<&FilterSpec>::new();
     for filter in cases.iter().filter_map(|case| case.filter.as_ref()) {
-        if !stored.iter().any(|existing| existing.field == filter.field) {
-            stored.push(filter);
+        match stored
+            .iter()
+            .find(|existing| existing.field == filter.field)
+        {
+            None => stored.push(filter),
+            Some(existing) => ensure!(
+                filter.style == FilterStyle::Range || existing.threshold == filter.threshold,
+                "selectivities {} and {} both map to field {}; use values that differ in the first four decimal places of a percent",
+                existing.target_selectivity,
+                filter.target_selectivity,
+                filter.field
+            ),
         }
     }
-    stored
+    Ok(stored)
 }
 
 fn scalars<'a>(
@@ -498,7 +512,7 @@ fn freshness(
 
 #[cfg(test)]
 mod tests {
-    use super::{PrepTimings, build_cases, run};
+    use super::{PrepTimings, build_cases, run, stored_fields};
     use crate::{
         dataset::{Metric, SyntheticSpec, generate_synthetic},
         filter::{FilterMode, FilterStyle},
@@ -520,6 +534,27 @@ mod tests {
             flush: true,
             seed: 1,
         }
+    }
+
+    #[test]
+    fn rejects_selectivities_that_share_an_equality_field() {
+        let config = RunConfig {
+            selectivities: vec![0.000_001_1, 0.000_001_4],
+            filter_modes: vec![FilterMode::Uncorrelated],
+            ..config()
+        };
+        let cases = build_cases(&config, 10_000_000);
+        assert!(stored_fields(&cases).is_err());
+
+        let range = RunConfig {
+            filter_style: FilterStyle::Range,
+            ..config.clone()
+        };
+        let cases = build_cases(&range, 10_000_000);
+        assert_eq!(
+            stored_fields(&cases).map(|fields| fields.len()).ok(),
+            Some(1)
+        );
     }
 
     #[test]
