@@ -12,7 +12,7 @@ pub(crate) fn put(id: &str, vector: Vec<f32>) -> WriteOperation {
     WriteOperation::Put(PutRecord {
         id: RecordId::new(id),
         vector,
-        metadata: json!({"id": id}),
+        metadata: json!({"key": id}),
     })
 }
 
