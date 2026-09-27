@@ -6,50 +6,49 @@ use logpose_query as _;
 use rand as _;
 
 use async_trait::async_trait;
-use crc32fast::hash;
 use logpose_catalog::CollectionDescriptor;
 use logpose_index::{
-    FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
-    HnswIndexSidecar, build_flat_index, build_hnsw_index, read_flat_index, read_hnsw_index,
-    write_flat_index, write_hnsw_index,
+    FlatIndexEntrySource, HnswIndexSidecar, build_flat_index, read_flat_index, read_hnsw_index,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
     CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
-    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, ScalarFieldStats, SeqNo,
-    Snapshot, VisibleRecord, WriteOperation,
+    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, SeqNo, Snapshot,
+    VisibleRecord, WriteOperation,
 };
 use logpose_wal::{
     WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file,
     rotate_active,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs, io,
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread,
 };
-use uuid::Uuid;
 
 mod catalog;
 mod durable_fs;
 mod error;
 mod fs_util;
+mod manifest;
 mod metric;
 mod paths;
 mod root_lock;
+mod segment_v1;
 mod storage_engine;
 #[cfg(test)]
 mod test_support;
 
-use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir, write_file_synced};
+use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir};
 use error::{io_message, json_message};
-use fs_util::{atomic_write, cleanup_dir, cleanup_file, read_json, remove_file_if_exists};
+use fs_util::{atomic_write, cleanup_dir, read_json, remove_file_if_exists};
+use manifest::{Manifest, SegmentMeta, segment_artifact_file_name};
 use metric::storage_metric_compare;
 use root_lock::StorageRootLock;
+use segment_v1::read_segment_file;
 
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
@@ -496,60 +495,6 @@ impl LocalStorageEngine {
         })
     }
 
-    fn load_manifest(
-        &self,
-        descriptor: &CollectionDescriptor,
-        generation_override: Option<u64>,
-    ) -> Result<Manifest> {
-        let generation = match generation_override {
-            Some(generation) => generation,
-            None => self.read_current_generation(descriptor)?,
-        };
-
-        let path = Self::manifest_file_path(descriptor, generation);
-        if !path.exists() {
-            if generation_override.is_some() && generation != 0 {
-                return Err(LogPoseError::Message(format!(
-                    "invalid snapshot: manifest generation {} does not exist",
-                    generation
-                )));
-            }
-            return Ok(Manifest::empty(generation));
-        }
-        read_json(&path)
-    }
-
-    fn read_current_generation(&self, descriptor: &CollectionDescriptor) -> Result<u64> {
-        let path = Self::current_manifest_pointer(descriptor);
-        if !path.exists() {
-            return Ok(0);
-        }
-        let contents = fs::read_to_string(&path)
-            .map_err(|error| io_message("failed to read CURRENT pointer", error))?;
-        contents.trim().parse::<u64>().map_err(|error| {
-            LogPoseError::Message(format!(
-                "failed to parse CURRENT manifest generation: {error}"
-            ))
-        })
-    }
-
-    fn publish_manifest(
-        &self,
-        descriptor: &CollectionDescriptor,
-        manifest: &Manifest,
-    ) -> Result<()> {
-        let manifest_path = Self::manifest_file_path(descriptor, manifest.generation);
-        atomic_write(
-            &manifest_path,
-            serde_json::to_vec_pretty(manifest).map_err(json_message)?,
-        )?;
-        atomic_write(
-            &Self::current_manifest_pointer(descriptor),
-            manifest.generation.to_string().into_bytes(),
-        )?;
-        Ok(())
-    }
-
     fn should_flush(&self, descriptor: &CollectionDescriptor, delta: &[WalRecord]) -> bool {
         if delta.len() >= descriptor.flush_threshold_ops {
             return true;
@@ -878,306 +823,6 @@ impl LocalStorageEngine {
             visible_seq_no: state.visible_seq_no(),
         })
     }
-
-    fn write_segment_file(
-        &self,
-        descriptor: &CollectionDescriptor,
-        records: &[WalRecord],
-    ) -> Result<SegmentMeta> {
-        let segment_id = Uuid::new_v4().to_string();
-        let temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.lps.tmp"));
-        let final_path = descriptor
-            .root_path
-            .join("segments")
-            .join(format!("{segment_id}.lps"));
-        let sidecar_temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.flat.json.tmp"));
-        let sidecar_path = Self::flat_index_file_path(descriptor, &segment_id);
-        let hnsw_temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.hnsw.bin.tmp"));
-        let hnsw_path = Self::hnsw_index_file_path(descriptor, &segment_id);
-
-        let mut ids = Vec::new();
-        let mut vectors = Vec::new();
-        let mut metadata = Vec::new();
-        let mut entries = Vec::new();
-        let mut sidecar_entries = Vec::new();
-        let mut hnsw_entry_sources = Vec::new();
-        let mut put_count = 0usize;
-        let mut delete_count = 0usize;
-        let mut min_seq_no = u64::MAX;
-        let mut max_seq_no = 0u64;
-
-        for record in records {
-            min_seq_no = min_seq_no.min(record.seq_no);
-            max_seq_no = max_seq_no.max(record.seq_no);
-
-            let id_offset = ids.len() as u64;
-            let id_bytes = record.op.id().as_str().as_bytes();
-            ids.extend_from_slice(id_bytes);
-
-            match &record.op {
-                WriteOperation::Put(put) => {
-                    put_count += 1;
-                    let vector_offset = vectors.len() as u64;
-                    for value in &put.vector {
-                        vectors.extend_from_slice(&value.to_le_bytes());
-                    }
-                    let metadata_offset = metadata.len() as u64;
-                    let metadata_bytes = serde_json::to_vec(&put.metadata).map_err(json_message)?;
-                    metadata.extend_from_slice(&metadata_bytes);
-
-                    entries.push(SegmentEntry {
-                        seq_no: record.seq_no,
-                        record_id_offset: id_offset,
-                        record_id_len: id_bytes.len() as u32,
-                        kind: SegmentEntryKind::Put,
-                        vector_offset,
-                        vector_dimensions: put.vector.len() as u32,
-                        metadata_offset,
-                        metadata_len: metadata_bytes.len() as u32,
-                    });
-                    sidecar_entries.push(FlatIndexEntrySource {
-                        is_put: true,
-                        record_id_offset: id_offset,
-                        vector_offset,
-                        metadata_offset,
-                        vector: Some(put.vector.clone()),
-                        metadata: Some(put.metadata.clone()),
-                    });
-                    hnsw_entry_sources.push(Some(HnswIndexEntrySource {
-                        entry_offset_index: entries.len() - 1,
-                        record_id: put.id.clone(),
-                        seq_no: record.seq_no,
-                        vector: put.vector.clone(),
-                        metadata: put.metadata.clone(),
-                    }));
-                }
-                WriteOperation::Delete(_) => {
-                    delete_count += 1;
-                    entries.push(SegmentEntry {
-                        seq_no: record.seq_no,
-                        record_id_offset: id_offset,
-                        record_id_len: id_bytes.len() as u32,
-                        kind: SegmentEntryKind::Delete,
-                        vector_offset: 0,
-                        vector_dimensions: 0,
-                        metadata_offset: 0,
-                        metadata_len: 0,
-                    });
-                    sidecar_entries.push(FlatIndexEntrySource {
-                        is_put: false,
-                        record_id_offset: id_offset,
-                        vector_offset: 0,
-                        metadata_offset: 0,
-                        vector: None,
-                        metadata: None,
-                    });
-                    hnsw_entry_sources.push(None);
-                }
-            }
-        }
-
-        if records.is_empty() {
-            min_seq_no = 0;
-        }
-
-        let header = SegmentHeader {
-            version: 1,
-            dimensions: descriptor.dimensions,
-            entry_count: entries.len(),
-        };
-        let footer = SegmentFooter {
-            payload_checksum: hash(
-                &[ids.as_slice(), vectors.as_slice(), metadata.as_slice()].concat(),
-            ),
-        };
-
-        let header_bytes = serde_json::to_vec(&header).map_err(json_message)?;
-        let entry_bytes = serde_json::to_vec(&entries).map_err(json_message)?;
-        let footer_bytes = serde_json::to_vec(&footer).map_err(json_message)?;
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"LPS1");
-        for len in [
-            header_bytes.len(),
-            entry_bytes.len(),
-            ids.len(),
-            vectors.len(),
-            metadata.len(),
-            footer_bytes.len(),
-        ] {
-            bytes.extend_from_slice(&(len as u64).to_le_bytes());
-        }
-        bytes.extend_from_slice(&header_bytes);
-        bytes.extend_from_slice(&entry_bytes);
-        bytes.extend_from_slice(&ids);
-        bytes.extend_from_slice(&vectors);
-        bytes.extend_from_slice(&metadata);
-        bytes.extend_from_slice(&footer_bytes);
-
-        let flat_index = build_flat_index(segment_id.clone(), &sidecar_entries);
-        let visible_hnsw_entries =
-            visible_hnsw_entries(records, &hnsw_entry_sources, descriptor.dimensions)
-                .map_err(|error| io_message("failed to build hnsw sidecar", error))?;
-        let hnsw_index = build_hnsw_index(
-            segment_id.clone(),
-            descriptor.metric,
-            HnswBuildParams::default(),
-            &visible_hnsw_entries,
-        )
-        .map_err(|error| io_message("failed to build hnsw sidecar", error))?;
-        publish_segment_artifacts(
-            SegmentArtifactPaths {
-                segment_temp_path: &temp_path,
-                segment_path: &final_path,
-                flat_temp_path: &sidecar_temp_path,
-                flat_path: &sidecar_path,
-                hnsw_temp_path: &hnsw_temp_path,
-                hnsw_path: &hnsw_path,
-            },
-            bytes,
-            &flat_index,
-            &hnsw_index,
-        )?;
-
-        let segment_bytes = final_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let flat_bytes = sidecar_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let hnsw_bytes = hnsw_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let artifacts = vec![
-            QueryUnitArtifactStats {
-                kind: "flat_exact".to_owned(),
-                file_name: sidecar_path
-                    .file_name()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("{segment_id}.flat.json")),
-                approx_bytes: flat_bytes,
-            },
-            QueryUnitArtifactStats {
-                kind: "hnsw".to_owned(),
-                file_name: hnsw_path
-                    .file_name()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| format!("{segment_id}.hnsw.bin")),
-                approx_bytes: hnsw_bytes,
-            },
-        ];
-        let component_bytes = segment_component_bytes(&hnsw_index, segment_bytes, flat_bytes);
-
-        let remote = descriptor
-            .remote_blob
-            .as_ref()
-            .map(|config| RemoteArtifact {
-                key: format!(
-                    "{}/collections/{}/segments/{}.lps",
-                    config.prefix, descriptor.collection_id, segment_id
-                ),
-                status: if self.blob_store.is_some() {
-                    RemoteSyncState::PendingUpload
-                } else {
-                    RemoteSyncState::UploadSkipped
-                },
-            });
-
-        Ok(SegmentMeta {
-            segment_id: segment_id.clone(),
-            file_name: final_path
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "segment.lps".to_owned()),
-            min_seq_no,
-            max_seq_no,
-            put_count,
-            delete_count,
-            dimensions: descriptor.dimensions,
-            checksum: footer.payload_checksum,
-            approx_bytes: segment_bytes + flat_bytes + hnsw_bytes,
-            index_kind: hnsw_index.index_kind.as_str().to_owned(),
-            scalar_fields: flat_index.scalar_fields,
-            artifacts,
-            component_bytes,
-            remote,
-        })
-    }
-}
-
-struct SegmentArtifactPaths<'a> {
-    segment_temp_path: &'a Path,
-    segment_path: &'a Path,
-    flat_temp_path: &'a Path,
-    flat_path: &'a Path,
-    hnsw_temp_path: &'a Path,
-    hnsw_path: &'a Path,
-}
-
-fn publish_segment_artifacts(
-    paths: SegmentArtifactPaths<'_>,
-    segment_bytes: Vec<u8>,
-    flat_index: &FlatIndexSidecar,
-    hnsw_index: &HnswIndexSidecar,
-) -> Result<()> {
-    if let Some(parent) = paths.segment_temp_path.parent() {
-        create_dir_all_synced(parent)?;
-    }
-    if let Err(error) = write_file_synced(paths.segment_temp_path, &segment_bytes) {
-        cleanup_file(paths.segment_temp_path);
-        return Err(error);
-    }
-    if let Err(error) = write_flat_index(paths.flat_temp_path, flat_index) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish flat index sidecar", error));
-    }
-    if let Err(error) = write_hnsw_index(paths.hnsw_temp_path, hnsw_index) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish hnsw sidecar", error));
-    }
-    if let Err(error) = fs::rename(paths.segment_temp_path, paths.segment_path) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish segment file", error));
-    }
-    if let Err(error) = fs::rename(paths.flat_temp_path, paths.flat_path) {
-        cleanup_file(paths.segment_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish flat index sidecar", error));
-    }
-    if let Err(error) = fs::rename(paths.hnsw_temp_path, paths.hnsw_path) {
-        cleanup_file(paths.segment_path);
-        cleanup_file(paths.flat_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish hnsw sidecar", error));
-    }
-    // The renames above are durable only once their directories are synced, and the manifest
-    // that references these files must not be published before that.
-    sync_parent_dir(paths.segment_path)?;
-    sync_parent_dir(paths.flat_path)?;
-    if paths.hnsw_path.parent() != paths.flat_path.parent() {
-        sync_parent_dir(paths.hnsw_path)?;
-    }
-    Ok(())
 }
 
 /// Refuse to discard an active WAL that holds records above the checkpoint named by a surviving
@@ -1765,58 +1410,6 @@ impl CollectionState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct Manifest {
-    generation: u64,
-    checkpoint_seq_no: SeqNo,
-    segments: Vec<SegmentMeta>,
-}
-
-impl Manifest {
-    fn empty(generation: u64) -> Self {
-        Self {
-            generation,
-            checkpoint_seq_no: 0,
-            segments: Vec::new(),
-        }
-    }
-
-    fn max_segment_seq_no(&self) -> SeqNo {
-        self.segments
-            .iter()
-            .map(|segment| segment.max_seq_no)
-            .max()
-            .unwrap_or(0)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SegmentMeta {
-    segment_id: String,
-    file_name: String,
-    min_seq_no: SeqNo,
-    max_seq_no: SeqNo,
-    put_count: usize,
-    delete_count: usize,
-    dimensions: usize,
-    checksum: u32,
-    #[serde(default)]
-    approx_bytes: usize,
-    #[serde(default = "default_index_kind")]
-    index_kind: String,
-    #[serde(default)]
-    scalar_fields: BTreeMap<String, ScalarFieldStats>,
-    #[serde(default)]
-    artifacts: Vec<QueryUnitArtifactStats>,
-    #[serde(default)]
-    component_bytes: BTreeMap<String, usize>,
-    remote: Option<RemoteArtifact>,
-}
-
-fn default_index_kind() -> String {
-    "hnsw".to_owned()
-}
-
 impl From<&SegmentMeta> for QueryUnitStats {
     fn from(segment: &SegmentMeta) -> Self {
         Self {
@@ -1833,50 +1426,6 @@ impl From<&SegmentMeta> for QueryUnitStats {
             component_bytes: segment.component_bytes.clone(),
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct RemoteArtifact {
-    key: String,
-    status: RemoteSyncState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RemoteSyncState {
-    PendingUpload,
-    UploadSkipped,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SegmentHeader {
-    version: u16,
-    dimensions: usize,
-    entry_count: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SegmentFooter {
-    payload_checksum: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct SegmentEntry {
-    seq_no: SeqNo,
-    record_id_offset: u64,
-    record_id_len: u32,
-    kind: SegmentEntryKind,
-    vector_offset: u64,
-    vector_dimensions: u32,
-    metadata_offset: u64,
-    metadata_len: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SegmentEntryKind {
-    Put,
-    Delete,
 }
 
 #[derive(Clone, Debug)]
@@ -2056,38 +1605,6 @@ fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
     }
 }
 
-fn visible_hnsw_entries(
-    records: &[WalRecord],
-    entry_sources: &[Option<HnswIndexEntrySource>],
-    dimensions: usize,
-) -> io::Result<Vec<HnswIndexEntrySource>> {
-    let mut seen = BTreeSet::new();
-    let mut visible = Vec::new();
-    for (index, record) in records.iter().enumerate().rev() {
-        let record_id = record.op.id().clone();
-        if !seen.insert(record_id) {
-            continue;
-        }
-        let Some(entry) = entry_sources.get(index).and_then(|entry| entry.clone()) else {
-            continue;
-        };
-        if entry.vector.len() != dimensions {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "stored vector '{}' expected {} dimensions but found {}",
-                    entry.record_id,
-                    dimensions,
-                    entry.vector.len()
-                ),
-            ));
-        }
-        visible.push(entry);
-    }
-    visible.reverse();
-    Ok(visible)
-}
-
 fn segment_component_bytes(
     hnsw_index: &HnswIndexSidecar,
     raw_segment_bytes: usize,
@@ -2127,14 +1644,6 @@ fn segment_component_bytes(
     ])
 }
 
-fn segment_artifact_file_name<'a>(segment: &'a SegmentMeta, kind: &str) -> Option<&'a str> {
-    segment
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.kind == kind)
-        .map(|artifact| artifact.file_name.as_str())
-}
-
 fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, record: WalRecord) {
     let id = record.op.id().clone();
     if resolved.contains_key(&id) {
@@ -2165,121 +1674,6 @@ fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, recor
     }
 }
 
-fn read_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
-    let bytes = fs::read(path).map_err(|error| io_message("failed to read segment file", error))?;
-    if bytes.len() < 4 || &bytes[..4] != b"LPS1" {
-        return Err(LogPoseError::Message(format!(
-            "invalid segment magic in '{}'",
-            path.display()
-        )));
-    }
-
-    let mut offset = 4usize;
-    let read_len = |bytes: &[u8], offset: &mut usize| -> Result<usize> {
-        let slice = checked_slice(bytes, *offset, 8, "segment length header")?;
-        let value = u64::from_le_bytes(
-            slice
-                .try_into()
-                .expect("segment length slice should fit after bounds check"),
-        ) as usize;
-        *offset += 8;
-        Ok(value)
-    };
-    let header_len = read_len(&bytes, &mut offset)?;
-    let entry_len = read_len(&bytes, &mut offset)?;
-    let ids_len = read_len(&bytes, &mut offset)?;
-    let vectors_len = read_len(&bytes, &mut offset)?;
-    let metadata_len = read_len(&bytes, &mut offset)?;
-    let footer_len = read_len(&bytes, &mut offset)?;
-
-    let header: SegmentHeader =
-        serde_json::from_slice(checked_slice(&bytes, offset, header_len, "segment header")?)
-            .map_err(json_message)?;
-    offset += header_len;
-    let entries: Vec<SegmentEntry> = serde_json::from_slice(checked_slice(
-        &bytes,
-        offset,
-        entry_len,
-        "segment entry table",
-    )?)
-    .map_err(json_message)?;
-    offset += entry_len;
-
-    let ids = checked_slice(&bytes, offset, ids_len, "segment id section")?;
-    offset += ids_len;
-    let vectors = checked_slice(&bytes, offset, vectors_len, "segment vector section")?;
-    offset += vectors_len;
-    let metadata = checked_slice(&bytes, offset, metadata_len, "segment metadata section")?;
-    offset += metadata_len;
-    let footer: SegmentFooter =
-        serde_json::from_slice(checked_slice(&bytes, offset, footer_len, "segment footer")?)
-            .map_err(json_message)?;
-
-    let actual_checksum = hash(&[ids, vectors, metadata].concat());
-    if actual_checksum != footer.payload_checksum {
-        return Err(LogPoseError::Message(format!(
-            "checksum mismatch while reading segment '{}': expected {}, got {}",
-            path.display(),
-            footer.payload_checksum,
-            actual_checksum
-        )));
-    }
-
-    let mut records = Vec::with_capacity(header.entry_count);
-    for entry in entries {
-        let id_slice = checked_slice(
-            ids,
-            entry.record_id_offset as usize,
-            entry.record_id_len as usize,
-            "segment record id",
-        )?;
-        let id = RecordId::new(std::str::from_utf8(id_slice).map_err(|error| {
-            LogPoseError::Message(format!("failed to decode record id from segment: {error}"))
-        })?);
-
-        let op = match entry.kind {
-            SegmentEntryKind::Put => {
-                let mut vector = Vec::with_capacity(entry.vector_dimensions as usize);
-                let vector_start = entry.vector_offset as usize;
-                let vector_end = vector_start + entry.vector_dimensions as usize * 4;
-                for chunk in checked_slice(
-                    vectors,
-                    vector_start,
-                    vector_end.saturating_sub(vector_start),
-                    "segment vector payload",
-                )?
-                .chunks_exact(4)
-                {
-                    vector.push(f32::from_le_bytes(
-                        chunk.try_into().expect("vector chunk should be four bytes"),
-                    ));
-                }
-                let metadata_start = entry.metadata_offset as usize;
-                let metadata_end = metadata_start + entry.metadata_len as usize;
-                let metadata_value = serde_json::from_slice(checked_slice(
-                    metadata,
-                    metadata_start,
-                    metadata_end.saturating_sub(metadata_start),
-                    "segment metadata payload",
-                )?)
-                .map_err(json_message)?;
-                WriteOperation::Put(PutRecord {
-                    id,
-                    vector,
-                    metadata: metadata_value,
-                })
-            }
-            SegmentEntryKind::Delete => WriteOperation::Delete(logpose_types::DeleteRecord { id }),
-        };
-
-        records.push(WalRecord {
-            seq_no: entry.seq_no,
-            op,
-        });
-    }
-    Ok(records)
-}
-
 fn approximate_record_bytes(operation: &WriteOperation) -> usize {
     match operation {
         WriteOperation::Put(put) => {
@@ -2292,19 +1686,6 @@ fn approximate_record_bytes(operation: &WriteOperation) -> usize {
         }
         WriteOperation::Delete(delete) => delete.id.as_str().len() + 16,
     }
-}
-
-fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> Result<&'a [u8]> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| LogPoseError::Message(format!("overflow while reading {label}")))?;
-    if end > bytes.len() {
-        return Err(LogPoseError::Message(format!(
-            "truncated segment while reading {label}: need {end} bytes but file has {}",
-            bytes.len()
-        )));
-    }
-    Ok(&bytes[start..end])
 }
 
 /// Test-only fault injection for failures that cannot be provoked through the filesystem when
@@ -2357,214 +1738,9 @@ mod failpoints {
 mod tests {
     use super::*;
     use crate::test_support::{put, unique_temp_dir, visible_ids};
-    use logpose_index::FlatIndexEntrySource;
-    use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
+    use logpose_types::DistanceMetric;
     use rand as _;
-    use serde_json::json;
     use std::fs;
-
-    #[test]
-    fn truncated_segment_returns_error_instead_of_panicking() {
-        let root = unique_temp_dir("storage-truncated-segment");
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
-
-        let segment_path = runtime.block_on(async {
-            let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-            let descriptor = engine
-                .create_collection(CreateCollectionRequest::new(
-                    "broken",
-                    2,
-                    DistanceMetric::Cosine,
-                ))
-                .await
-                .expect("collection should be created");
-
-            engine
-                .write(
-                    "broken",
-                    vec![WriteOperation::Put(PutRecord {
-                        id: RecordId::new("id-1"),
-                        vector: vec![1.0, 1.0],
-                        metadata: json!({"status":"ok"}),
-                    })],
-                )
-                .await
-                .expect("write should succeed");
-            engine.flush("broken").await.expect("flush should succeed");
-
-            let manifest = engine
-                .inspect("broken", InspectTarget::Manifest)
-                .await
-                .expect("inspect should succeed");
-            let segment_file = manifest.payload["segments"][0]["file_name"]
-                .as_str()
-                .expect("segment file should exist");
-            descriptor.root_path.join("segments").join(segment_file)
-        });
-
-        let bytes = fs::read(&segment_path).expect("segment file should exist");
-        fs::write(&segment_path, &bytes[..10]).expect("truncate should succeed");
-
-        let result = std::panic::catch_unwind(|| read_segment_file(&segment_path));
-        assert!(result.is_ok(), "truncated segment should not panic");
-        assert!(result.expect("result should exist").is_err());
-    }
-
-    #[test]
-    fn visible_hnsw_entries_ignore_shadowed_dimension_mismatches() {
-        let records = vec![
-            WalRecord {
-                seq_no: 1,
-                op: WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![9.0],
-                    metadata: json!({"version":1}),
-                }),
-            },
-            WalRecord {
-                seq_no: 2,
-                op: WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"version":2}),
-                }),
-            },
-        ];
-        let entries = vec![
-            Some(HnswIndexEntrySource {
-                entry_offset_index: 0,
-                record_id: RecordId::new("alpha"),
-                seq_no: 1,
-                vector: vec![9.0],
-                metadata: json!({"version":1}),
-            }),
-            Some(HnswIndexEntrySource {
-                entry_offset_index: 1,
-                record_id: RecordId::new("alpha"),
-                seq_no: 2,
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":2}),
-            }),
-        ];
-
-        let visible =
-            visible_hnsw_entries(&records, &entries, 2).expect("latest visible record is valid");
-
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].seq_no, 2);
-        assert_eq!(visible[0].vector, vec![1.0, 0.0]);
-    }
-
-    #[test]
-    fn write_segment_file_rejects_visible_dimension_mismatches() {
-        let root = unique_temp_dir("storage-visible-dimension-mismatch");
-        let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
-
-        let result = runtime.block_on(async {
-            let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-            let descriptor = engine
-                .create_collection(CreateCollectionRequest::new(
-                    "broken",
-                    2,
-                    DistanceMetric::Dot,
-                ))
-                .await
-                .expect("collection should be created");
-
-            engine.write_segment_file(
-                &descriptor,
-                &[WalRecord {
-                    seq_no: 1,
-                    op: WriteOperation::Put(PutRecord {
-                        id: RecordId::new("alpha"),
-                        vector: vec![1.0],
-                        metadata: json!({"kind":"broken"}),
-                    }),
-                }],
-            )
-        });
-
-        let error = result.expect_err("visible dimension mismatch should fail segment build");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to build hnsw sidecar: stored vector 'alpha' expected 2 dimensions but found 1"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn sidecar_publish_failure_cleans_up_published_segment_file() {
-        let root = unique_temp_dir("storage-sidecar-cleanup");
-        let temp_path = root.join("tmp").join("segment.lps.tmp");
-        let final_path = root.join("segments").join("segment.lps");
-        let sidecar_temp_path = root.join("tmp").join("segment.flat.json.tmp");
-        let sidecar_path = root.join("indexes").join("segment.flat.json");
-        let hnsw_temp_path = root.join("tmp").join("segment.hnsw.bin.tmp");
-        let hnsw_path = root.join("indexes").join("segment.hnsw.bin");
-        fs::create_dir_all(final_path.parent().expect("segment parent should exist"))
-            .expect("segment parent should be created");
-        fs::create_dir_all(sidecar_path.parent().expect("index parent should exist"))
-            .expect("index parent should be created");
-        fs::create_dir_all(&sidecar_path).expect("directory should force sidecar publish failure");
-
-        let flat_index = build_flat_index(
-            "segment",
-            &[FlatIndexEntrySource {
-                is_put: true,
-                record_id_offset: 0,
-                vector_offset: 0,
-                metadata_offset: 0,
-                vector: Some(vec![1.0, 0.0]),
-                metadata: Some(json!({"kind":"keep"})),
-            }],
-        );
-        let hnsw_index = build_hnsw_index(
-            "segment",
-            DistanceMetric::Dot,
-            HnswBuildParams::default(),
-            &[HnswIndexEntrySource {
-                entry_offset_index: 0,
-                record_id: RecordId::new("alpha"),
-                seq_no: 1,
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            }],
-        )
-        .expect("hnsw index should build");
-
-        let result = publish_segment_artifacts(
-            SegmentArtifactPaths {
-                segment_temp_path: &temp_path,
-                segment_path: &final_path,
-                flat_temp_path: &sidecar_temp_path,
-                flat_path: &sidecar_path,
-                hnsw_temp_path: &hnsw_temp_path,
-                hnsw_path: &hnsw_path,
-            },
-            b"segment-bytes".to_vec(),
-            &flat_index,
-            &hnsw_index,
-        );
-
-        assert!(result.is_err(), "sidecar publish should fail");
-        assert!(
-            !final_path.exists(),
-            "segment file should be removed after sidecar publish failure"
-        );
-        assert!(
-            !temp_path.exists(),
-            "temporary segment file should be cleaned up after failure"
-        );
-        assert!(
-            !sidecar_temp_path.exists(),
-            "temporary sidecar file should be cleaned up after failure"
-        );
-        assert!(
-            !hnsw_temp_path.exists(),
-            "temporary hnsw file should be cleaned up after failure"
-        );
-    }
 
     #[test]
     fn maintenance_worker_clears_coordinator_on_descriptor_lookup_failure() {
