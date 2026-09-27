@@ -48,6 +48,8 @@ mod filter;
 mod hnsw;
 mod search;
 mod serialize;
+#[cfg(test)]
+mod tests;
 
 pub use distance::{F32Metric, F32Query, F32Vectors, QueryDistance, VectorSource};
 pub use error::GraphError;
