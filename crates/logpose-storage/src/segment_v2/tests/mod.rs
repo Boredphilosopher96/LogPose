@@ -4,6 +4,7 @@
 mod corruption;
 mod fixture;
 mod golden;
+mod hashes;
 mod random;
 mod roundtrip;
 

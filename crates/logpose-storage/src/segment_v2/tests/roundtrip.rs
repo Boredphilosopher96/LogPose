@@ -740,3 +740,61 @@ fn array_of_every_element_type_round_trips() {
     let reader = open_verified(&build(&schema, &rows));
     assert_eq!(rows_of(&reader), rows);
 }
+
+#[test]
+fn find_row_finds_extreme_keys_and_sorted_order_matches_primary_key_order() {
+    let string_keys = [
+        "z",
+        "",
+        "\u{e9}",
+        "a\u{0}",
+        "A",
+        "\u{10ffff}",
+        "a",
+        "\u{ff}",
+        "ab",
+    ]
+    .map(|key| PrimaryKey::String(key.to_owned()));
+    let int_keys = [7, i64::MIN, -1, i64::MAX, 0, 1, i64::MIN + 1].map(PrimaryKey::Int64);
+    let string_absent = ["b", "\u{e8}", "a\u{1}"].map(|key| PrimaryKey::String(key.to_owned()));
+    let int_absent = [2, i64::MAX - 1, -2].map(PrimaryKey::Int64);
+    for (key_type, keys, absent) in [
+        (PrimaryKeyType::String, &string_keys[..], &string_absent[..]),
+        (PrimaryKeyType::Int64, &int_keys[..], &int_absent[..]),
+    ] {
+        let schema = Arc::new(
+            CollectionSchema::new(
+                PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    key_type,
+                },
+                vec![VectorFieldSpec {
+                    name: "v".to_owned(),
+                    dimensions: 1,
+                    metric: DistanceMetric::Dot,
+                }],
+                Vec::new(),
+                false,
+            )
+            .expect("schema"),
+        );
+        let mut builder = SegmentBuilder::new(Arc::clone(&schema), identity()).expect("builder");
+        for key in keys {
+            builder.push_row(1, key).expect("row");
+        }
+        let reader = open_verified(&builder.finish_to_vec().expect("builds").0);
+        let filter = reader.pk_filter().expect("filter");
+        for (row, key) in keys.iter().enumerate() {
+            assert!(filter.may_contain(key), "filter rejects {key:?}");
+            let row = u32::try_from(row).expect("row fits");
+            assert_eq!(reader.find_row(key).expect("lookup"), Some(row), "{key:?}");
+        }
+        for key in absent {
+            assert_eq!(reader.find_row(key).expect("lookup"), None, "{key:?}");
+        }
+        // Byte order of the sorted section is `PrimaryKey`'s order.
+        let mut expected: Vec<u32> = (0..u32::try_from(keys.len()).expect("fits")).collect();
+        expected.sort_by(|left, right| keys[*left as usize].cmp(&keys[*right as usize]));
+        assert_eq!(reader.pk_sorted().expect("sorted").rows(), &expected[..]);
+    }
+}
