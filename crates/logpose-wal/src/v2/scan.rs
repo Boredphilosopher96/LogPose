@@ -138,15 +138,25 @@ pub(super) struct Continuity {
     file_has_data: bool,
     /// Whether the current file had any frame yet.
     file_has_frame: bool,
+    /// Whether a file was started, so the next file must continue it.
+    in_file: bool,
 }
 
 impl Continuity {
     /// Start a new file. Files must continue the sequence exactly where the previous file's data
-    /// ended and the previous file must end on a group boundary.
+    /// ended and the previous file must end on a group boundary. A file followed by another one
+    /// must hold a data frame: rotation never leaves one without, so an older file with none has
+    /// lost the operations between its name and the next file's.
     pub(super) fn start_file(&mut self, first_seq_no: SeqNo) -> Result<(), String> {
         if let Some((group_no, false)) = self.last_frame {
             return Err(format!(
                 "the previous WAL file ends inside fsync group {group_no}"
+            ));
+        }
+        if self.in_file && !self.file_has_data {
+            return Err(format!(
+                "the previous WAL file, named for sequence number {}, holds no data frame, so sequence numbers {}..{first_seq_no} are missing",
+                self.file_first_seq, self.file_first_seq
             ));
         }
         if let Some(last) = self.last_data_seq
@@ -156,6 +166,7 @@ impl Continuity {
                 "file starts at sequence number {first_seq_no} but the previous file ends at {last}"
             ));
         }
+        self.in_file = true;
         self.file_first_seq = first_seq_no;
         self.file_has_data = false;
         self.file_has_frame = false;
@@ -595,6 +606,11 @@ mod tests {
         assert!(continuity.start_file(9).is_ok());
         assert!(continuity.clone().frame(&header(9, 9, 3, true)?).is_err());
         assert!(continuity.frame(&checkpoint(8, 3, true)?).is_ok());
+        // A file followed by another must hold a data frame.
+        let mut empty = Continuity::default();
+        assert!(empty.start_file(1).is_ok());
+        assert!(empty.frame(&checkpoint(0, 0, true)?).is_ok());
+        assert!(empty.start_file(5).is_err());
         // Group numbers wrap.
         let mut wrapping = Continuity::default();
         assert!(wrapping.start_file(1).is_ok());

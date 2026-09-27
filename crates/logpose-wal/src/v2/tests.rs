@@ -859,6 +859,29 @@ fn a_bad_frame_in_an_older_file_is_corruption_even_at_its_end() -> TestResult {
 }
 
 #[test]
+fn an_older_file_that_lost_its_data_frames_is_corruption() -> TestResult {
+    // Cut the first file back to its checkpoint group, or to nothing: its frames are all
+    // well formed, but the operations between its name and the next file's are gone.
+    for keep in [frame_len(0), 0] {
+        let vfs = new_vfs(44);
+        let writer = four_files(vfs.process())?;
+        let files = writer.files();
+        drop(writer);
+        let file = vfs.process().open(&files[0], OpenMode::Append)?;
+        file.set_len(keep)?;
+        file.sync_all()?;
+        let error = recover(vfs.process(), "boot-a", 0)
+            .err()
+            .ok_or("expected an error, not a log with a hole")?;
+        assert!(
+            matches!(&error, WalError::Corrupt { file, .. } if file == &files[1]),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn a_missing_file_in_the_middle_is_corruption() -> TestResult {
     let vfs = new_vfs(27);
     drop(four_files(vfs.process())?);
