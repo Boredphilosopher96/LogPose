@@ -37,8 +37,10 @@ use std::{
 use uuid::Uuid;
 
 mod durable_fs;
+mod root_lock;
 
 use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir, write_file_synced};
+use root_lock::StorageRootLock;
 
 /// Durable storage surface for future engine implementations.
 #[async_trait]
@@ -359,29 +361,39 @@ pub trait BlobStore: Send + Sync {
 }
 
 /// Local filesystem-backed storage engine.
+///
+/// Opening an engine claims exclusive ownership of its storage root for this process by locking
+/// `<root>/LOCK`; the claim is held until the last clone of every engine on that root in this
+/// process is dropped. Engines in the same process share the claim.
 #[derive(Clone)]
 pub struct LocalStorageEngine {
     root: PathBuf,
     blob_store: Option<Arc<dyn BlobStore>>,
+    _root_lock: Arc<StorageRootLock>,
 }
 
 impl LocalStorageEngine {
-    /// Create a local storage engine rooted at the provided path.
-    #[must_use]
-    pub fn new(root: impl AsRef<Path>) -> Self {
-        Self {
-            root: root.as_ref().to_path_buf(),
-            blob_store: None,
-        }
+    /// Open a local storage engine rooted at the provided path.
+    ///
+    /// Creates the root directory if needed and fails if another process holds the root.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Self::with_blob_store(root, None)
     }
 
-    /// Create a local storage engine with an optional blob-store implementation.
-    #[must_use]
-    pub fn with_blob_store(root: impl AsRef<Path>, blob_store: Option<Arc<dyn BlobStore>>) -> Self {
-        Self {
-            root: root.as_ref().to_path_buf(),
+    /// Open a local storage engine with an optional blob-store implementation.
+    ///
+    /// Creates the root directory if needed and fails if another process holds the root.
+    pub fn with_blob_store(
+        root: impl AsRef<Path>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let root_lock = StorageRootLock::acquire(&root)?;
+        Ok(Self {
+            root,
             blob_store,
-        }
+            _root_lock: Arc::new(root_lock),
+        })
     }
 
     fn collections_root(&self) -> PathBuf {
@@ -3078,7 +3090,7 @@ mod tests {
     #[test]
     fn list_databases_bootstraps_the_default_database_descriptor() {
         let root = unique_temp_dir("storage-default-database-bootstrap");
-        let engine = LocalStorageEngine::new(&root);
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
         let databases = engine
             .list_databases()
@@ -3106,7 +3118,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
 
         let segment_path = runtime.block_on(async {
-            let engine = LocalStorageEngine::new(&root);
+            let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
             let descriptor = engine
                 .create_collection(CreateCollectionRequest::new(
                     "broken",
@@ -3198,7 +3210,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
 
         let result = runtime.block_on(async {
-            let engine = LocalStorageEngine::new(&root);
+            let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
             let descriptor = engine
                 .create_collection(CreateCollectionRequest::new(
                     "broken",
@@ -3306,7 +3318,7 @@ mod tests {
     #[test]
     fn maintenance_worker_clears_coordinator_on_descriptor_lookup_failure() {
         let root = unique_temp_dir("storage-maintenance-descriptor-failure");
-        let engine = LocalStorageEngine::new(&root);
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
         let coordinator_key = root.join("collections").join("missing-collection");
 
         {
@@ -3348,10 +3360,42 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn engine_open_fails_while_another_process_holds_the_storage_root() {
+        let root = unique_temp_dir("storage-root-lock");
+        let first = LocalStorageEngine::new(&root).expect("first engine should open");
+        let second = LocalStorageEngine::new(&root).expect("in-process engines share the root");
+        drop(first);
+        drop(second);
+
+        // An independent handle on LOCK is what another process looks like to the OS.
+        let foreign = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("LOCK"))
+            .expect("engine should have created the lock file");
+        foreign
+            .try_lock()
+            .expect("the root should be released once every engine is dropped");
+
+        let error = LocalStorageEngine::new(&root)
+            .err()
+            .expect("engine must not open a root held by another process");
+        assert!(
+            error
+                .to_string()
+                .contains("is already in use by another process"),
+            "unexpected error: {error}"
+        );
+
+        drop(foreign);
+        LocalStorageEngine::new(&root).expect("engine should open after the holder exits");
+    }
+
     #[tokio::test]
     async fn flush_fails_when_pending_rotation_marker_cannot_be_removed() {
         let root = unique_temp_dir("storage-marker-removal-failure");
-        let engine = LocalStorageEngine::new(&root);
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
         let descriptor = engine
             .create_collection(CreateCollectionRequest::new(
                 "documents",
@@ -3398,7 +3442,7 @@ mod tests {
         );
 
         drop(engine);
-        let reopened = LocalStorageEngine::new(&root);
+        let reopened = LocalStorageEngine::new(&root).expect("storage engine should reopen");
         let visible = reopened
             .scan_exact("documents", None)
             .await
@@ -3409,7 +3453,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_refuses_to_truncate_uncheckpointed_records_behind_stale_marker() {
         let root = unique_temp_dir("storage-stale-marker-recovery");
-        let engine = LocalStorageEngine::new(&root);
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
         let descriptor = engine
             .create_collection(CreateCollectionRequest::new(
                 "documents",
@@ -3438,7 +3482,7 @@ mod tests {
             .expect("stale marker should be written");
         drop(engine);
 
-        let reopened = LocalStorageEngine::new(&root);
+        let reopened = LocalStorageEngine::new(&root).expect("storage engine should reopen");
         let error = reopened
             .scan_exact("documents", None)
             .await
@@ -3469,7 +3513,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_truncates_checkpointed_active_wal_behind_pending_marker() {
         let root = unique_temp_dir("storage-pending-marker-checkpointed");
-        let engine = LocalStorageEngine::new(&root);
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
         let descriptor = engine
             .create_collection(CreateCollectionRequest::new(
                 "documents",

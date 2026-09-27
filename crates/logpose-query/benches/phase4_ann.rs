@@ -72,7 +72,8 @@ fn phase4_ann_benchmarks(criterion: &mut Criterion) {
 }
 
 fn build_immutable_ann_fixture(runtime: &Runtime) -> BenchFixture {
-    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-immutable-ann"));
+    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-immutable-ann"))
+        .expect("storage engine should open");
     create_collection(runtime, &engine, "immutable_ann");
     write_records(runtime, &engine, "immutable_ann", 1024, None);
     runtime
@@ -101,7 +102,8 @@ fn build_immutable_ann_fixture(runtime: &Runtime) -> BenchFixture {
 }
 
 fn build_filtered_ann_fixture(runtime: &Runtime) -> BenchFixture {
-    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-filtered-ann"));
+    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-filtered-ann"))
+        .expect("storage engine should open");
     create_collection(runtime, &engine, "filtered_ann");
     write_tail_filtered_records(runtime, &engine, "filtered_ann", 768, "keep");
     runtime
@@ -133,7 +135,8 @@ fn build_filtered_ann_fixture(runtime: &Runtime) -> BenchFixture {
 }
 
 fn build_tiny_fallback_fixture(runtime: &Runtime) -> BenchFixture {
-    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-tiny-fallback"));
+    let engine = LocalStorageEngine::new(unique_temp_dir("phase4-tiny-fallback"))
+        .expect("storage engine should open");
     create_collection(runtime, &engine, "tiny_fallback");
     write_records(runtime, &engine, "tiny_fallback", 8, Some("common"));
     runtime

@@ -75,27 +75,41 @@ enum SharedCatalog {
 
 impl AppState {
     /// Construct shared state from configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`AppState::try_new`] fails. Prefer `try_new` wherever the error can be
+    /// reported, such as server bootstrap.
     #[must_use]
     pub fn new(config: LogPoseConfig) -> Self {
-        config
-            .validate()
-            .expect("invalid runtime configuration for AppState");
+        Self::try_new(config).expect("failed to bootstrap LogPose runtime state")
+    }
+
+    /// Construct shared state from configuration, reporting bootstrap failures.
+    ///
+    /// Opening the storage root claims it exclusively for this process; bootstrap fails if
+    /// another process already serves the same `storage_root`.
+    pub fn try_new(config: LogPoseConfig) -> ServiceResult<Self> {
+        config.validate().map_err(|error| {
+            ServiceError::InvalidArgument(format!(
+                "invalid runtime configuration for AppState: {error}"
+            ))
+        })?;
         let build = BuildInfo::current();
         let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
-            MetadataBackend::Local => Arc::new(LocalStorageEngine::new(&config.storage_root)),
-            MetadataBackend::Etcd => Arc::new(
-                EtcdBackedStorageEngine::new(&config.storage_root, config.metadata.etcd.clone())
-                    .expect("invalid etcd metadata configuration"),
-            ),
+            MetadataBackend::Local => Arc::new(LocalStorageEngine::new(&config.storage_root)?),
+            MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::new(
+                &config.storage_root,
+                config.metadata.etcd.clone(),
+            )?),
         };
         let data = Arc::new(LogPoseDataService::new(storage));
-        let catalog = logpose_service::local_catalog_store(&config.storage_root);
+        let catalog = logpose_service::local_catalog_store(&config.storage_root)?;
         let shared_catalog = match config.metadata.backend {
             MetadataBackend::Local => SharedCatalog::Local,
-            MetadataBackend::Etcd => SharedCatalog::Etcd(
-                EtcdCatalogStore::new(config.metadata.etcd.clone())
-                    .expect("invalid etcd metadata configuration for shared catalog"),
-            ),
+            MetadataBackend::Etcd => {
+                SharedCatalog::Etcd(EtcdCatalogStore::new(config.metadata.etcd.clone())?)
+            }
         };
         let control = Arc::new(LogPoseControlService::new(
             Arc::clone(&data),
@@ -103,16 +117,14 @@ impl AppState {
             config.clone(),
             build.clone(),
         ));
-        control
-            .sync_bootstrap_principals()
-            .expect("failed to persist bootstrap principals");
-        Self {
+        control.sync_bootstrap_principals()?;
+        Ok(Self {
             control,
             data,
             config,
             build,
             shared_catalog,
-        }
+        })
     }
 
     /// Canonical node metadata exposed through operator-visible surfaces.
@@ -952,6 +964,7 @@ mod tests {
             }],
         ));
         local_catalog_store(&state.config.storage_root)
+            .expect("catalog store should open")
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,
@@ -990,6 +1003,7 @@ mod tests {
         );
         let state = AppState::new(config.clone());
         local_catalog_store(&state.config.storage_root)
+            .expect("catalog store should open")
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,

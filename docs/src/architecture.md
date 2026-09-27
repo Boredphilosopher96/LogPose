@@ -35,6 +35,9 @@ LogPose is still a local filesystem engine.
 - a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
 - operator-facing namespaces are database-first: collection identities are `database/collection` outside the default database and just `collection` inside it
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
+- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory; WAL rotation and new segment and index files fsync their directories before the manifest that references them is published
+- one process owns a `storage_root` at a time: opening the storage engine takes an exclusive lock on `storage_root/LOCK` (engines inside one process share it), and a second process fails at startup with an "already in use by another process" error
+- if a `wal/PENDING_ROTATION` marker survives while `active.wal` holds records above the marker's checkpoint, recovery refuses to truncate the WAL and reports an error instead of discarding acknowledged writes
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
 

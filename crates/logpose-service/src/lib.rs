@@ -403,9 +403,10 @@ impl LogPoseDataService {
     }
 
     /// Build a service over the local filesystem-backed engine.
-    #[must_use]
-    pub fn local(root: impl AsRef<Path>) -> Self {
-        Self::new(Arc::new(LocalStorageEngine::new(root)))
+    ///
+    /// Fails if another process holds the storage root.
+    pub fn local(root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::new(Arc::new(LocalStorageEngine::new(root)?)))
     }
 
     /// Create a collection.
@@ -676,9 +677,10 @@ impl LogPoseDataService {
 }
 
 /// Build a filesystem-backed catalog store rooted under the runtime storage directory.
-#[must_use]
-pub fn local_catalog_store(root: impl AsRef<Path>) -> Arc<dyn CatalogStore> {
-    Arc::new(LocalStorageEngine::new(root))
+///
+/// Fails if another process holds the storage root.
+pub fn local_catalog_store(root: impl AsRef<Path>) -> Result<Arc<dyn CatalogStore>> {
+    Ok(Arc::new(LocalStorageEngine::new(root)?))
 }
 
 /// Shared control-plane orchestration over local data-plane services.
@@ -1735,7 +1737,7 @@ mod tests {
         ));
         let control = LogPoseControlService::new(
             data,
-            local_catalog_store(&catalog_root),
+            local_catalog_store(&catalog_root).expect("catalog store should open"),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );
