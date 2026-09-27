@@ -25,20 +25,26 @@ impl CoreRef {
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
         if operations.is_empty() {
-            return Err(LogPoseError::Message(
-                "write batch must include at least one operation".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "operations",
+                "write batch must include at least one operation",
             ));
         }
         handle.ensure_writable()?;
         let descriptor = handle.descriptor();
         let mut seen_ids = BTreeSet::<&RecordId>::new();
-        for operation in &operations {
-            descriptor.validate_operation(operation)?;
+        for (index, operation) in operations.iter().enumerate() {
+            descriptor
+                .validate_operation(operation)
+                .map_err(|error| error.with_field_prefix(&format!("operations[{index}]")))?;
             if !seen_ids.insert(operation.id()) {
-                return Err(LogPoseError::Message(format!(
-                    "write batch includes duplicate record id '{}'",
-                    operation.id()
-                )));
+                return Err(LogPoseError::invalid_field(
+                    format!("operations[{index}].id"),
+                    format!(
+                        "write batch includes duplicate record id '{}'",
+                        operation.id()
+                    ),
+                ));
             }
         }
         drop(seen_ids);

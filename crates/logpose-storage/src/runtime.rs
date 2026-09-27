@@ -83,7 +83,9 @@ fn rayon_pool(name: &'static str, threads: usize) -> Result<rayon::ThreadPool> {
         .num_threads(threads.max(1))
         .thread_name(move |index| format!("{name}-{index}"))
         .build()
-        .map_err(|error| LogPoseError::Message(format!("failed to start the {name} pool: {error}")))
+        .map_err(|error| {
+            LogPoseError::internal(format!("failed to start the {name} pool: {error}"))
+        })
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -115,7 +117,7 @@ impl IoPool {
                 .name(format!("{name}-{index}"))
                 .spawn(move || worker(&receiver))
                 .map_err(|error| {
-                    LogPoseError::Message(format!("failed to start the {name} pool: {error}"))
+                    LogPoseError::internal(format!("failed to start the {name} pool: {error}"))
                 })?;
         }
         Ok(Self {
@@ -232,11 +234,11 @@ pub fn run_cpu<T: Send + 'static>(
 }
 
 fn pool_closed(name: &str) -> LogPoseError {
-    LogPoseError::Message(format!("the {name} pool is shut down"))
+    LogPoseError::unavailable(format!("the {name} pool is shut down"))
 }
 
 fn task_panicked(name: &str) -> LogPoseError {
-    LogPoseError::Message(format!("a task on the {name} pool panicked"))
+    LogPoseError::internal(format!("a task on the {name} pool panicked"))
 }
 
 #[cfg(test)]

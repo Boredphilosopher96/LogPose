@@ -1,15 +1,18 @@
 //! Shared domain types for LogPose.
 
+pub mod error;
 pub mod filter;
 pub mod legacy;
 pub mod record;
 pub mod schema;
 pub mod value;
 
+pub use error::{
+    CorruptionKind, ErrorCode, ErrorDetails, FieldViolation, LogPoseError, ResourceKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::{collections::BTreeMap, fmt};
-use thiserror::Error;
 use uuid::Uuid;
 
 /// Common result type for workspace crates.
@@ -20,32 +23,6 @@ pub const PRODUCT_NAME: &str = "LogPose";
 pub const ANONYMOUS_LOCAL_NODE_NAME: &str = "local";
 /// Built-in database name used until callers provision explicit databases.
 pub const DEFAULT_DATABASE_NAME: &str = "default";
-
-/// Top-level workspace error.
-#[derive(Debug, Error)]
-pub enum LogPoseError {
-    /// Generic bootstrap and configuration errors.
-    #[error("{0}")]
-    Message(String),
-    /// The storage root is already served by another engine, in this process or another one.
-    ///
-    /// Exactly one engine may own a storage root: engines keep collection state resident, so
-    /// two engines on one root would each publish state the other never sees.
-    #[error(
-        "storage root '{}' is already in use by another engine{}; lock file '{}' is held exclusively",
-        .root.display(),
-        .holder_pid.as_ref().map(|pid| format!(" (held by pid {pid})")).unwrap_or_default(),
-        .lock_file.display()
-    )]
-    StorageRootLocked {
-        /// The storage root.
-        root: std::path::PathBuf,
-        /// The lock file inside it.
-        lock_file: std::path::PathBuf,
-        /// Process id recorded in the lock file by the holder, if readable.
-        holder_pid: Option<String>,
-    },
-}
 
 /// Build metadata surfaced by service entrypoints.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,9 +117,10 @@ impl std::str::FromStr for NodeRole {
             "combined" => Ok(Self::Combined),
             "control" => Ok(Self::Control),
             "data" => Ok(Self::Data),
-            other => Err(LogPoseError::Message(format!(
-                "unsupported node role '{other}'"
-            ))),
+            other => Err(LogPoseError::invalid_field(
+                "node_role",
+                format!("unsupported node role '{other}'"),
+            )),
         }
     }
 }
@@ -185,7 +163,7 @@ impl std::str::FromStr for DatabaseId {
     fn from_str(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value)
             .map(Self)
-            .map_err(|error| LogPoseError::Message(error.to_string()))
+            .map_err(|error| LogPoseError::invalid_field("database_id", error.to_string()))
     }
 }
 
@@ -262,24 +240,46 @@ impl CollectionRef {
         validate_collection_ref_segment("collection_name", &self.collection_name)?;
         Ok(())
     }
+
+    /// Parse a lookup key, `collection` (in the default database) or `database/collection`,
+    /// and validate it.
+    pub fn parse(lookup_name: &str) -> Result<Self> {
+        let reference = match lookup_name.trim().split('/').collect::<Vec<_>>().as_slice() {
+            [collection_name] => Self::new_default(*collection_name),
+            [database_name, collection_name] => Self::new(*database_name, *collection_name),
+            _ => {
+                return Err(LogPoseError::invalid_field(
+                    "collection_name",
+                    format!(
+                        "unsupported collection reference '{lookup_name}': expected 'collection' or 'database/collection'"
+                    ),
+                ));
+            }
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
 }
 
 fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not be empty"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not be empty"),
+        ));
     }
     if value.contains('/') {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not contain '/'"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not contain '/'"),
+        ));
     }
     if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not be a relative path component"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not be a relative path component"),
+        ));
     }
     Ok(())
 }
@@ -370,9 +370,10 @@ impl std::str::FromStr for DistanceMetric {
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
             "l2" => Ok(Self::L2),
-            other => Err(LogPoseError::Message(format!(
-                "unsupported distance metric '{other}'"
-            ))),
+            other => Err(LogPoseError::invalid_field(
+                "metric",
+                format!("unsupported distance metric '{other}'"),
+            )),
         }
     }
 }
@@ -430,12 +431,12 @@ impl WriteOperation {
     pub fn validate_dimensions(&self, expected_dimensions: usize) -> Result<()> {
         match self {
             Self::Put(record) if record.vector.len() != expected_dimensions => {
-                Err(LogPoseError::Message(format!(
-                    "record '{}' expected {} dimensions but found {}",
-                    record.id,
-                    expected_dimensions,
-                    record.vector.len()
-                )))
+                Err(LogPoseError::DimensionMismatch {
+                    field: "vector".to_owned(),
+                    record_id: Some(record.id.to_string()),
+                    expected: expected_dimensions,
+                    actual: record.vector.len(),
+                })
             }
             _ => Ok(()),
         }
@@ -707,9 +708,8 @@ impl EtcdMetadataConfig {
     /// Validate etcd-specific configuration invariants.
     pub fn validate(&self) -> Result<()> {
         if self.endpoints.is_empty() {
-            return Err(LogPoseError::Message(
-                "metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'"
-                    .to_owned(),
+            return Err(LogPoseError::invalid_config(
+                "metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'",
             ));
         }
         if self
@@ -717,32 +717,32 @@ impl EtcdMetadataConfig {
             .iter()
             .any(|endpoint| endpoint.trim().is_empty())
         {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.endpoints must not contain blank values".to_owned(),
             ));
         }
         if self.key_prefix.trim().is_empty() {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.key_prefix must not be blank".to_owned(),
             ));
         }
         if self.cluster_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.cluster_name must not be blank".to_owned(),
             ));
         }
         if self.timeout_ms == 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.timeout_ms must be greater than 0".to_owned(),
             ));
         }
         if self.membership_ttl_secs <= 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.membership_ttl_secs must be greater than 0".to_owned(),
             ));
         }
         if self.leadership_ttl_secs <= 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.leadership_ttl_secs must be greater than 0".to_owned(),
             ));
         }

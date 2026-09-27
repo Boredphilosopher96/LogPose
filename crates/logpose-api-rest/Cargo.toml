@@ -14,7 +14,6 @@ logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-core = { path = "../logpose-core" }
 logpose-query = { path = "../logpose-query" }
-logpose-service = { path = "../logpose-service" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true

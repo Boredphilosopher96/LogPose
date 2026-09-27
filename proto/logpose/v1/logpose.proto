@@ -2,6 +2,18 @@ syntax = "proto3";
 
 package logpose.v1;
 
+// Errors
+//
+// A failed RPC returns a status whose code is the canonical LogPose error code, the same
+// name the REST API returns in `code`. The `grpc-status-details-bin` trailer carries a
+// `google.rpc.Status` whose details hold a `google.rpc.ErrorInfo` (a stable `reason` such
+// as `NOT_OWNER`, domain `logpose`, and `metadata` with the error's structured fields such
+// as `owner_node`), a `google.rpc.BadRequest` when the error names request fields such as
+// `operations[2].vector`, and a `google.rpc.RetryInfo` when retrying is expected to help.
+//
+// A retry hint is also sent as the ASCII trailer `retry-after-ms`. Not-owner and not-leader
+// are `UNAVAILABLE`. A request message larger than `limits.max_grpc_message_bytes` is
+// `RESOURCE_EXHAUSTED` with reason `TOO_LARGE`.
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
   rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
@@ -12,6 +24,8 @@ service LogPoseService {
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
   rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
+  // Stream batches of writes into one collection. See BulkWriteCollectionRequest.
+  rpc BulkWriteCollection(stream BulkWriteCollectionRequest) returns (BulkWriteCollectionReply);
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
   rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
@@ -203,6 +217,41 @@ message WriteCollectionRequest {
   string collection_name = 1;
   repeated WriteOperation operations = 2;
   string database_name = 3;
+}
+
+// One batch of a BulkWriteCollection stream.
+//
+// - The first message names the collection; later messages may leave `collection_name` and
+//   `database_name` empty or must repeat the same values.
+// - Each message is one batch, committed atomically exactly like one WriteCollection call.
+//   Batches commit in stream order, one at a time: the server reads the next message only
+//   after the previous batch is committed, so HTTP/2 flow control pushes back on a client
+//   that sends faster than the collection commits.
+// - Each message is checked against `limits.max_grpc_message_bytes` on its own.
+// - If a batch fails, the RPC fails with that batch's error and stops reading. Every earlier
+//   batch is committed; the failed batch and everything after it are not. The error's
+//   `ErrorInfo` metadata reports `failed_batch_index`, `committed_batches`,
+//   `committed_operations`, and `last_committed_seq_no` (when a batch was committed).
+// - If the client cancels or disconnects, the batch being committed (if any) still completes
+//   or fails as a whole, and no later batch is applied.
+message BulkWriteCollectionRequest {
+  string collection_name = 1;
+  string database_name = 2;
+  repeated WriteOperation operations = 3;
+}
+
+// Summary of a fully committed BulkWriteCollection stream.
+message BulkWriteCollectionReply {
+  string database_name = 1;
+  string collection_name = 2;
+  // Batches committed, which is every message in the stream.
+  uint64 committed_batches = 3;
+  // Operations applied across all batches.
+  uint64 applied_ops = 4;
+  // Last sequence number of the last batch.
+  uint64 last_seq_no = 5;
+  // Snapshot that includes every batch.
+  Snapshot snapshot = 6;
 }
 
 message CommitAckReply {

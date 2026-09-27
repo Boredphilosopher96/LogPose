@@ -14,14 +14,14 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, QueryRequest};
-use logpose_service::ServiceError;
+use logpose_service as _;
 use logpose_storage::CreateCollectionRequest;
 use logpose_storage_etcd::{
     EtcdCatalogStore, EtcdCoordinationClient, LeadershipRecord, LeaseKeepAlive, PromotionResult,
 };
 use logpose_types::{
-    CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, MetadataBackend,
-    MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
+    CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, LogPoseError,
+    MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -131,10 +131,7 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(runtime.collections[0].owner_node.as_deref(), Some("node-a"));
     assert_eq!(runtime.collections[0].ownership_epoch, Some(1));
     assert_eq!(runtime.collections[0].route_kind, "recorded");
-    assert!(matches!(
-        stats_error,
-        ServiceError::InvalidArgument(message) if message.contains("not locally served")
-    ));
+    assert!(matches!(stats_error, LogPoseError::NotOwner { .. }));
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -298,7 +295,7 @@ async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
 
     assert!(matches!(
         error,
-        ServiceError::PermissionDenied(message)
+        LogPoseError::PermissionDenied { message }
             if message.contains("not allowed to perform operator actions")
     ));
 
@@ -437,13 +434,13 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
 
     assert!(matches!(
         database_error,
-        ServiceError::InvalidArgument(message)
-            if message.contains("data-only nodes cannot accept control-plane database mutations")
+        LogPoseError::WrongNodeRole { operation, .. }
+            if operation == "control-plane database mutations"
     ));
     assert!(matches!(
         policy_error,
-        ServiceError::InvalidArgument(message)
-            if message.contains("data-only nodes cannot accept control-plane database mutations")
+        LogPoseError::WrongNodeRole { operation, .. }
+            if operation == "control-plane database mutations"
     ));
 
     cleanup_prefix(&endpoints, &key_prefix).await;
@@ -885,18 +882,10 @@ async fn etcd_follower_nodes_reject_control_plane_mutations() {
         .await
         .expect_err("follower should reject shared database mutations");
 
-    assert!(matches!(
-        collection_error,
-        ServiceError::InvalidArgument(message)
-            if message.contains("not the active control-plane leader")
-    ));
+    assert!(matches!(collection_error, LogPoseError::NotLeader { .. }));
     assert!(!follower_status.control_plane_ready);
     assert!(follower_status.data_plane_ready);
-    assert!(matches!(
-        database_error,
-        ServiceError::InvalidArgument(message)
-            if message.contains("not the active control-plane leader")
-    ));
+    assert!(matches!(database_error, LogPoseError::NotLeader { .. }));
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -1026,16 +1015,8 @@ async fn etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves()
             .to_string()
             .contains("not the active control-plane leader")
     );
-    assert!(matches!(
-        app_database_error,
-        ServiceError::InvalidArgument(ref message)
-            if message.contains("not the active control-plane leader")
-    ));
-    assert!(matches!(
-        app_policy_error,
-        ServiceError::InvalidArgument(ref message)
-            if message.contains("not the active control-plane leader")
-    ));
+    assert!(matches!(app_database_error, LogPoseError::NotLeader { .. }));
+    assert!(matches!(app_policy_error, LogPoseError::NotLeader { .. }));
     assert!(
         stale_policy_error
             .to_string()
@@ -1232,11 +1213,11 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
     assert_eq!(follower_status.collections[0].ownership_epoch, Some(2));
     assert_eq!(follower_status.collections[0].route_kind, "local");
     assert!(
-        matches!(owner_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        matches!(owner_error, LogPoseError::NotOwner { .. }),
         "old owner should be fenced by ownership: {owner_error:?}"
     );
     assert!(
-        matches!(owner_stats_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        matches!(owner_stats_error, LogPoseError::NotOwner { .. }),
         "old owner should reject reads after promotion: {owner_stats_error:?}"
     );
 
@@ -1398,19 +1379,19 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         .expect("exact snapshots should remain readable after promotion");
 
     assert!(
-        matches!(query, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        matches!(query, LogPoseError::FailedPrecondition { ref message } if message.contains("cannot safely satisfy read barriers after promotion")),
         "promoted owner should explain the fail-closed read-barrier behavior: {query:?}"
     );
     assert!(
-        matches!(stats, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        matches!(stats, LogPoseError::FailedPrecondition { ref message } if message.contains("cannot safely satisfy read barriers after promotion")),
         "promoted owner should explain the fail-closed stats behavior: {stats:?}"
     );
     assert!(
-        matches!(post_promotion_query, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        matches!(post_promotion_query, LogPoseError::FailedPrecondition { ref message } if message.contains("cannot safely satisfy read barriers after promotion")),
         "promoted owner should reject barriers minted after promotion too: {post_promotion_query:?}"
     );
     assert!(
-        matches!(post_promotion_stats, ServiceError::FailedPrecondition(ref message) if message.contains("cannot safely satisfy read barriers after promotion")),
+        matches!(post_promotion_stats, LogPoseError::FailedPrecondition { ref message } if message.contains("cannot safely satisfy read barriers after promotion")),
         "promoted owner should reject stats barriers minted after promotion too: {post_promotion_stats:?}"
     );
     assert_eq!(exact_snapshot_query.snapshot, post_promotion_ack.snapshot);
@@ -1505,7 +1486,7 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
             .contains("ownership metadata is missing")
     );
     assert!(
-        matches!(stats_error, ServiceError::InvalidArgument(ref message) if message.contains("not locally served")),
+        matches!(stats_error, LogPoseError::NotOwner { .. }),
         "missing owner metadata should fence reads until reconciliation: {stats_error:?}"
     );
 

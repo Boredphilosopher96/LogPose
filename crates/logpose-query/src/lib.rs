@@ -10,7 +10,7 @@ pub use logpose_types::ScalarMetadataValue;
 pub use logpose_types::filter::{FilterComparison, FilterExpr, FilterOperator};
 use logpose_types::{
     AnnSearchRequest, CollectionRef, CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats,
-    RecordId, ScalarFieldStats, Snapshot, VisibleRecord,
+    RecordId, ResourceKind, ScalarFieldStats, Snapshot, VisibleRecord,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -498,8 +498,9 @@ where
     S: StorageEngine + ?Sized,
 {
     match (&request.snapshot, &request.read_barrier) {
-        (Some(_), Some(_)) => Err(QueryError::Storage(LogPoseError::Message(
-            "snapshot and read_barrier cannot be provided together".to_owned(),
+        (Some(_), Some(_)) => Err(QueryError::Storage(LogPoseError::invalid_field(
+            "read_barrier",
+            "snapshot and read_barrier cannot be provided together",
         ))),
         (Some(snapshot), None) => Ok(snapshot.clone()),
         (None, None) => storage.snapshot(collection_name).await.map_err(Into::into),
@@ -508,13 +509,11 @@ where
             if current.satisfies_read_barrier(read_barrier) {
                 Ok(current)
             } else {
-                Err(QueryError::Storage(LogPoseError::Message(format!(
-                    "read barrier generation {}, seq {} is not yet visible; current snapshot is generation {}, seq {}",
-                    read_barrier.manifest_generation,
-                    read_barrier.visible_seq_no,
-                    current.manifest_generation,
-                    current.visible_seq_no
-                ))))
+                Err(QueryError::Storage(LogPoseError::ReadBarrierNotSatisfied {
+                    collection: collection_name.to_owned(),
+                    required_seq_no: read_barrier.visible_seq_no,
+                    visible_seq_no: current.visible_seq_no,
+                }))
             }
         }
     }
@@ -543,22 +542,7 @@ where
 }
 
 fn parse_collection_reference(collection_name: &str) -> Result<CollectionRef> {
-    let reference = match collection_name
-        .trim()
-        .split('/')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [collection_name] => CollectionRef::new_default(*collection_name),
-        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
-        _ => {
-            return Err(QueryError::Storage(LogPoseError::Message(format!(
-                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
-            ))));
-        }
-    };
-    reference.validate().map_err(QueryError::Storage)?;
-    Ok(reference)
+    CollectionRef::parse(collection_name).map_err(QueryError::Storage)
 }
 
 fn ensure_collection_reference_matches_descriptor(
@@ -569,19 +553,45 @@ fn ensure_collection_reference_matches_descriptor(
     if reference.database_name != descriptor.database_name
         || reference.collection_name != descriptor.collection_name
     {
-        return Err(QueryError::Storage(LogPoseError::Message(format!(
-            "collection '{original_name}' does not exist"
-        ))));
+        return Err(QueryError::Storage(LogPoseError::not_found(
+            ResourceKind::Collection,
+            original_name,
+        )));
     }
     Ok(())
 }
 
+/// Report any missing resource on the way to a collection (its database, say) as the
+/// collection the caller named.
 fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPoseError {
     match error {
-        LogPoseError::Message(message) if message.contains("does not exist") => {
-            LogPoseError::Message(format!("collection '{collection_name}' does not exist"))
+        LogPoseError::NotFound { .. } => {
+            LogPoseError::not_found(ResourceKind::Collection, collection_name)
         }
         other => other,
+    }
+}
+
+impl From<QueryError> for LogPoseError {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::RequestVectorDimensionMismatch { expected, actual }
+            | QueryError::VectorDimensionMismatch { expected, actual } => {
+                LogPoseError::DimensionMismatch {
+                    field: "vector".to_owned(),
+                    record_id: None,
+                    expected,
+                    actual,
+                }
+            }
+            QueryError::InvalidPredicate(message) => {
+                LogPoseError::invalid_field("predicate", message)
+            }
+            error @ QueryError::StoredVectorDimensionMismatch { .. } => {
+                LogPoseError::internal(error.to_string())
+            }
+            QueryError::Storage(error) => error,
+        }
     }
 }
 
@@ -1801,8 +1811,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(QueryError::Storage(LogPoseError::Message(message)))
-                if message.contains("does not exist")
+            Err(QueryError::Storage(LogPoseError::NotFound { .. }))
         ));
     }
 
@@ -1980,16 +1989,14 @@ mod tests {
             &self,
             _request: CreateCollectionRequest,
         ) -> logpose_types::Result<CollectionDescriptor> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn open_collection(
             &self,
             _name: &str,
         ) -> logpose_types::Result<CollectionDescriptor> {
-            Err(LogPoseError::Message(
-                "collection 'missing' does not exist".to_owned(),
-            ))
+            Err(LogPoseError::not_found(ResourceKind::Collection, "missing"))
         }
 
         async fn write(
@@ -1997,11 +2004,11 @@ mod tests {
             _collection_name: &str,
             _operations: Vec<WriteOperation>,
         ) -> logpose_types::Result<CommitAck> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn snapshot(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn scan_exact(
@@ -2009,19 +2016,19 @@ mod tests {
             _collection_name: &str,
             _snapshot: Option<Snapshot>,
         ) -> logpose_types::Result<Vec<VisibleRecord>> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn stats_snapshot(
@@ -2029,7 +2036,7 @@ mod tests {
             _collection_name: &str,
             _snapshot: Option<Snapshot>,
         ) -> logpose_types::Result<CollectionStats> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn inspect(
@@ -2037,7 +2044,7 @@ mod tests {
             _collection_name: &str,
             _target: InspectTarget,
         ) -> logpose_types::Result<InspectReport> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
     }
 
@@ -2124,8 +2131,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            QueryError::Storage(LogPoseError::Message(message))
-                if message.contains("read barrier")
+            QueryError::Storage(LogPoseError::ReadBarrierNotSatisfied { .. })
         ));
     }
 
@@ -2177,7 +2183,7 @@ mod tests {
     impl QualifiedReferenceStorage {
         fn record_name(&self, collection_name: &str) -> logpose_types::Result<()> {
             if collection_name != "analytics/profiles" {
-                return Err(LogPoseError::Message(format!(
+                return Err(LogPoseError::internal(format!(
                     "expected qualified collection name 'analytics/profiles', got '{collection_name}'"
                 )));
             }
@@ -2199,7 +2205,7 @@ mod tests {
             &self,
             _request: CreateCollectionRequest,
         ) -> logpose_types::Result<CollectionDescriptor> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
@@ -2218,7 +2224,7 @@ mod tests {
             _collection_name: &str,
             _operations: Vec<WriteOperation>,
         ) -> logpose_types::Result<CommitAck> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
@@ -2244,11 +2250,11 @@ mod tests {
         }
 
         async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
@@ -2309,7 +2315,7 @@ mod tests {
             _collection_name: &str,
             _target: InspectTarget,
         ) -> logpose_types::Result<InspectReport> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
     }
 
@@ -2323,7 +2329,7 @@ mod tests {
             &self,
             _request: CreateCollectionRequest,
         ) -> logpose_types::Result<CollectionDescriptor> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
@@ -2340,7 +2346,7 @@ mod tests {
             _collection_name: &str,
             _operations: Vec<WriteOperation>,
         ) -> logpose_types::Result<CommitAck> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn snapshot(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
@@ -2364,11 +2370,11 @@ mod tests {
         }
 
         async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
@@ -2428,7 +2434,7 @@ mod tests {
             _collection_name: &str,
             _target: InspectTarget,
         ) -> logpose_types::Result<InspectReport> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
     }
 
@@ -2444,7 +2450,7 @@ mod tests {
             &self,
             _request: CreateCollectionRequest,
         ) -> logpose_types::Result<CollectionDescriptor> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
@@ -2461,7 +2467,7 @@ mod tests {
             _collection_name: &str,
             _operations: Vec<WriteOperation>,
         ) -> logpose_types::Result<CommitAck> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn snapshot(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
@@ -2499,11 +2505,11 @@ mod tests {
         }
 
         async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
 
         async fn stats(&self, _collection_name: &str) -> logpose_types::Result<CollectionStats> {
@@ -2576,7 +2582,7 @@ mod tests {
             _collection_name: &str,
             _target: InspectTarget,
         ) -> logpose_types::Result<InspectReport> {
-            Err(LogPoseError::Message("not implemented".to_owned()))
+            Err(LogPoseError::internal("not implemented"))
         }
     }
 }

@@ -2,7 +2,7 @@
 
 use super::format::SectionKind;
 use logpose_types::{
-    LogPoseError,
+    CorruptionKind, LogPoseError,
     record::PrimaryKey,
     schema::{FieldId, FieldType, PrimaryKeyType},
 };
@@ -219,7 +219,14 @@ impl SegmentError {
 
 impl From<SegmentError> for LogPoseError {
     fn from(error: SegmentError) -> Self {
-        LogPoseError::Message(error.to_string())
+        if error.is_corruption() {
+            return LogPoseError::corrupt(CorruptionKind::Segment, error.to_string());
+        }
+        match error {
+            SegmentError::Io(source) => LogPoseError::io("segment I/O failed", source),
+            // Every other variant rejects builder input that the engine produced itself.
+            other => LogPoseError::internal(other.to_string()),
+        }
     }
 }
 

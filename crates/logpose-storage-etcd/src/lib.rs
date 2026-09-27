@@ -16,8 +16,9 @@ use logpose_storage::{
 };
 use logpose_types::{
     AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
-    CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError,
-    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    CommitAck, CorruptionKind, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence,
+    LogPoseError, MaintenanceStatus, RecordId, ResourceKind, Result, Snapshot, VisibleRecord,
+    WriteOperation, error::ROUTING_RETRY_AFTER,
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
 use protoc_bin_vendored as _;
@@ -123,7 +124,7 @@ impl EtcdCatalogStore {
             Ok(existing) => {
                 descriptor.database_id = existing.database_id;
             }
-            Err(error) if error.to_string().contains("does not exist") => {}
+            Err(LogPoseError::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
         descriptor.validate()?;
@@ -143,9 +144,10 @@ impl EtcdCatalogStore {
         let mut client = self.etcd.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
         if !response.succeeded() {
-            return Err(LogPoseError::Message(format!(
-                "node '{leader_node_id}' is not the active control-plane leader"
-            )));
+            return Err(LogPoseError::NotLeader {
+                node: leader_node_id.to_owned(),
+                leader_node: None,
+            });
         }
         Ok(descriptor)
     }
@@ -160,9 +162,10 @@ impl EtcdCatalogStore {
             if database_name == DEFAULT_DATABASE_NAME {
                 return Ok(DatabaseDescriptor::new(DEFAULT_DATABASE_NAME));
             }
-            return Err(LogPoseError::Message(format!(
-                "database '{database_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::Database,
+                database_name,
+            ));
         };
         let descriptor: DatabaseDescriptor =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
@@ -187,7 +190,10 @@ impl EtcdCatalogStore {
         let mut descriptors = Vec::new();
         for kv in response.kvs() {
             let key = std::str::from_utf8(kv.key()).map_err(|error| {
-                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+                LogPoseError::corrupt(
+                    CorruptionKind::Metadata,
+                    format!("failed to decode metadata key as utf-8: {error}"),
+                )
             })?;
             if !key.ends_with("/descriptor") {
                 continue;
@@ -227,9 +233,10 @@ impl EtcdCatalogStore {
         let mut client = self.etcd.client().await?;
         let response = client.get(key, None).await.map_err(etcd_message)?;
         let Some(kv) = response.kvs().first() else {
-            return Err(LogPoseError::Message(format!(
-                "principal '{principal_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::Principal,
+                principal_name,
+            ));
         };
         let principal: Principal =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
@@ -254,7 +261,10 @@ impl EtcdCatalogStore {
         let mut principals = Vec::new();
         for kv in response.kvs() {
             let key = std::str::from_utf8(kv.key()).map_err(|error| {
-                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+                LogPoseError::corrupt(
+                    CorruptionKind::Metadata,
+                    format!("failed to decode metadata key as utf-8: {error}"),
+                )
             })?;
             if !key.ends_with("/descriptor") {
                 continue;
@@ -293,9 +303,10 @@ impl EtcdCatalogStore {
         let mut client = self.etcd.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
         if !response.succeeded() {
-            return Err(LogPoseError::Message(format!(
-                "node '{leader_node_id}' is not the active control-plane leader"
-            )));
+            return Err(LogPoseError::NotLeader {
+                node: leader_node_id.to_owned(),
+                leader_node: None,
+            });
         }
         Ok(policy)
     }
@@ -310,9 +321,10 @@ impl EtcdCatalogStore {
         let mut client = self.etcd.client().await?;
         let response = client.get(key, None).await.map_err(etcd_message)?;
         let Some(kv) = response.kvs().first() else {
-            return Err(LogPoseError::Message(format!(
-                "database access policy '{database_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::DatabasePolicy,
+                database_name,
+            ));
         };
         let policy: DatabaseAccessPolicy =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
@@ -335,7 +347,7 @@ impl StorageEngine for EtcdBackedStorageEngine {
         &self,
         _request: CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
-        Err(LogPoseError::Message(
+        Err(LogPoseError::internal(
             "etcd-backed storage requires create_collection_with_assignment so authoritative metadata is written before local state"
                 .to_owned(),
         ))
@@ -348,17 +360,16 @@ impl StorageEngine for EtcdBackedStorageEngine {
         leader_fence: Option<LeadershipFence>,
     ) -> Result<CollectionDescriptor> {
         let leader_fence = leader_fence.ok_or_else(|| {
-            LogPoseError::Message(
-                "etcd-backed collection creation requires a control-plane leadership fence"
-                    .to_owned(),
+            LogPoseError::internal(
+                "etcd-backed collection creation requires a control-plane leadership fence",
             )
         })?;
         let collection_name = request.lookup_name();
         if self.local.open_collection(&collection_name).await.is_ok() {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}' already exists",
-                collection_name
-            )));
+            return Err(LogPoseError::already_exists(
+                ResourceKind::Collection,
+                collection_name,
+            ));
         }
         let descriptor = self.local.plan_collection_descriptor(&request)?;
         let metadata_revision = match self
@@ -434,10 +445,10 @@ impl StorageEngine for EtcdBackedStorageEngine {
             Some(_) => Err(pending_descriptor_requires_manual_reconciliation_error(
                 &canonical_collection_lookup_name(name),
             )),
-            None => Err(LogPoseError::Message(format!(
-                "collection '{}' has no authoritative descriptor metadata in etcd; reconciliation is required before serving it",
-                canonical_collection_lookup_name(name)
-            ))),
+            None => Err(LogPoseError::not_found(
+                ResourceKind::Collection,
+                canonical_collection_lookup_name(name),
+            )),
         }
     }
 
@@ -451,7 +462,7 @@ impl StorageEngine for EtcdBackedStorageEngine {
     ) -> Result<bool> {
         match self.local.open_collection(&descriptor.lookup_name()).await {
             Ok(local_descriptor) => Ok(local_descriptor.matches_serving_identity(descriptor)),
-            Err(error) if error.to_string().contains("does not exist") => Ok(false),
+            Err(LogPoseError::NotFound { .. }) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -476,10 +487,13 @@ impl StorageEngine for EtcdBackedStorageEngine {
     ) -> Result<CollectionAssignment> {
         match self.etcd.get_assignment(&descriptor.lookup_name()).await {
             Ok(Some(assignment)) => Ok(assignment),
-            Ok(None) => Err(LogPoseError::Message(format!(
-                "collection '{}' has no authoritative assignment metadata in etcd; reconciliation is required before serving it",
-                descriptor.lookup_name()
-            ))),
+            Ok(None) => Err(LogPoseError::ReconciliationRequired {
+                collection: descriptor.lookup_name(),
+                message: format!(
+                    "collection '{}' has no authoritative assignment metadata in etcd; reconciliation is required before serving it",
+                    descriptor.lookup_name()
+                ),
+            }),
             Err(error) => Err(error),
         }
     }
@@ -641,7 +655,7 @@ impl EtcdPlacementStore {
         guard
             .as_ref()
             .cloned()
-            .ok_or_else(|| LogPoseError::Message("etcd client initialization failed".to_owned()))
+            .ok_or_else(|| LogPoseError::internal("etcd client initialization failed"))
     }
 
     fn collections_prefix(&self) -> String {
@@ -791,9 +805,8 @@ impl EtcdPlacementStore {
                 .header()
                 .map(ResponseHeader::revision)
                 .ok_or_else(|| {
-                    LogPoseError::Message(
-                        "etcd txn response missing header revision after collection metadata write"
-                            .to_owned(),
+                    LogPoseError::internal(
+                        "etcd txn response missing header revision after collection metadata write",
                     )
                 })?;
             Ok(CollectionMetadataRevision {
@@ -802,9 +815,10 @@ impl EtcdPlacementStore {
                 owner_mod_revision: revision,
             })
         } else {
-            Err(LogPoseError::Message(format!(
-                "collection '{collection_name}' already has metadata assignment in etcd"
-            )))
+            Err(LogPoseError::already_exists(
+                ResourceKind::CollectionAssignment,
+                collection_name,
+            ))
         }
     }
 
@@ -850,9 +864,12 @@ impl EtcdPlacementStore {
         if response.succeeded() {
             Ok(())
         } else {
-            Err(LogPoseError::Message(format!(
-                "authoritative etcd metadata for collection '{collection_name}' changed before local state could be finalized; manual reconciliation is required"
-            )))
+            Err(LogPoseError::ReconciliationRequired {
+                collection: collection_name.to_owned(),
+                message: format!(
+                    "authoritative etcd metadata for collection '{collection_name}' changed before local state could be finalized; manual reconciliation is required"
+                ),
+            })
         }
     }
 
@@ -911,7 +928,10 @@ impl EtcdPlacementStore {
         let mut descriptors = Vec::new();
         for kv in response.kvs() {
             let key = std::str::from_utf8(kv.key()).map_err(|error| {
-                LogPoseError::Message(format!("failed to decode metadata key as utf-8: {error}"))
+                LogPoseError::corrupt(
+                    CorruptionKind::Metadata,
+                    format!("failed to decode metadata key as utf-8: {error}"),
+                )
             })?;
             if !key.ends_with("/descriptor") {
                 continue;
@@ -958,27 +978,37 @@ impl EtcdPlacementStore {
         if response.succeeded() {
             Ok(())
         } else {
-            Err(LogPoseError::Message(format!(
-                "authoritative etcd metadata for collection '{collection_name}' changed before rollback could remove it; manual reconciliation is required"
-            )))
+            Err(LogPoseError::ReconciliationRequired {
+                collection: collection_name.to_owned(),
+                message: format!(
+                    "authoritative etcd metadata for collection '{collection_name}' changed before rollback could remove it; manual reconciliation is required"
+                ),
+            })
         }
     }
 }
 
 fn json_encode_message(error: serde_json::Error) -> LogPoseError {
-    LogPoseError::Message(format!("failed to encode metadata payload: {error}"))
+    LogPoseError::internal(format!("failed to encode metadata payload: {error}"))
 }
 
 fn json_decode_message(error: serde_json::Error) -> LogPoseError {
-    LogPoseError::Message(format!("failed to decode metadata payload: {error}"))
+    LogPoseError::corrupt(
+        CorruptionKind::Metadata,
+        format!("failed to decode metadata payload: {error}"),
+    )
 }
 
+/// The metadata store could not be reached or refused the operation; retrying may help.
 fn etcd_message(error: etcd_client::Error) -> LogPoseError {
-    LogPoseError::Message(format!("etcd metadata operation failed: {error}"))
+    LogPoseError::Unavailable {
+        message: format!("etcd metadata operation failed: {error}"),
+        retry_after: Some(ROUTING_RETRY_AFTER),
+    }
 }
 
 fn string_message(error: String) -> LogPoseError {
-    LogPoseError::Message(error)
+    LogPoseError::invalid_argument(error)
 }
 
 fn validate_database_name(value: &str) -> Result<()> {
@@ -992,9 +1022,13 @@ fn validate_principal_name(value: &str) -> Result<()> {
 }
 
 fn assignment_conflict(error: &LogPoseError) -> bool {
-    error
-        .to_string()
-        .contains("already has metadata assignment in etcd")
+    matches!(
+        error,
+        LogPoseError::AlreadyExists {
+            resource: ResourceKind::CollectionAssignment,
+            ..
+        }
+    )
 }
 
 fn canonical_collection_lookup_name(collection_name: &str) -> String {
@@ -1026,15 +1060,21 @@ fn matching_assignment_without_local_state(
 }
 
 fn stale_assignment_requires_manual_reconciliation_error(collection_name: &str) -> LogPoseError {
-    LogPoseError::Message(format!(
-        "collection '{collection_name}' has matching assignment metadata in etcd but no local collection state; manual reconciliation is required before recreating it"
-    ))
+    LogPoseError::ReconciliationRequired {
+        collection: collection_name.to_owned(),
+        message: format!(
+            "collection '{collection_name}' has matching assignment metadata in etcd but no local collection state; manual reconciliation is required before recreating it"
+        ),
+    }
 }
 
 fn pending_descriptor_requires_manual_reconciliation_error(collection_name: &str) -> LogPoseError {
-    LogPoseError::Message(format!(
-        "collection '{collection_name}' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it"
-    ))
+    LogPoseError::ReconciliationRequired {
+        collection: collection_name.to_owned(),
+        message: format!(
+            "collection '{collection_name}' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it"
+        ),
+    }
 }
 
 fn rollback_failure_error(
@@ -1042,9 +1082,12 @@ fn rollback_failure_error(
     create_error: &str,
     rollback_error: LogPoseError,
 ) -> LogPoseError {
-    LogPoseError::Message(format!(
-        "{create_error}; rollback of authoritative etcd metadata for collection '{collection_name}' also failed: {rollback_error}"
-    ))
+    LogPoseError::ReconciliationRequired {
+        collection: collection_name.to_owned(),
+        message: format!(
+            "{create_error}; rollback of authoritative etcd metadata for collection '{collection_name}' also failed: {rollback_error}; manual reconciliation is required"
+        ),
+    }
 }
 
 /// Lease-backed membership record registered in etcd.
@@ -1153,7 +1196,7 @@ impl LeaseSession {
                 ttl_secs: response.ttl(),
             }),
             Ok(Some(_)) => Ok(LeaseKeepAlive::Expired),
-            Ok(None) => Err(LogPoseError::Message(format!(
+            Ok(None) => Err(LogPoseError::unavailable(format!(
                 "etcd keep-alive stream for lease '{}' closed",
                 self.keeper.id()
             ))),
@@ -1263,7 +1306,7 @@ impl EtcdCoordinationClient {
             .await
         };
         let outcome = round_trip.unwrap_or_else(|_| {
-            Err(LogPoseError::Message(format!(
+            Err(LogPoseError::unavailable(format!(
                 "etcd keep-alive for lease '{lease_id}' timed out after {}ms",
                 self.store.timeout_ms
             )))
@@ -1456,8 +1499,8 @@ impl EtcdCoordinationClient {
             .header()
             .map(ResponseHeader::revision)
             .ok_or_else(|| {
-                LogPoseError::Message(
-                    "etcd txn response missing header revision after successful put".to_owned(),
+                LogPoseError::internal(
+                    "etcd txn response missing header revision after successful put",
                 )
             })?;
         candidate.mod_revision = revision;
@@ -1486,7 +1529,7 @@ impl EtcdCoordinationClient {
         )
         .await
         .map_err(|_| {
-            KeepAliveAttachError::Failed(LogPoseError::Message(format!(
+            KeepAliveAttachError::Failed(LogPoseError::unavailable(format!(
                 "etcd keep-alive stream for lease '{lease_id}' did not open within {}ms",
                 self.store.timeout_ms
             )))
@@ -1526,7 +1569,7 @@ impl From<KeepAliveAttachError> for LogPoseError {
     fn from(error: KeepAliveAttachError) -> Self {
         match error {
             KeepAliveAttachError::Expired => {
-                LogPoseError::Message("etcd lease expired before keep-alive started".to_owned())
+                LogPoseError::unavailable("etcd lease expired before keep-alive started")
             }
             KeepAliveAttachError::Failed(error) => error,
         }
@@ -1763,9 +1806,7 @@ mod tests {
     #[test]
     fn matching_assignment_without_local_state_requires_manual_reconciliation() {
         let requested = assignment("node-a");
-        let error = LogPoseError::Message(
-            "collection 'documents' already has metadata assignment in etcd".to_owned(),
-        );
+        let error = LogPoseError::already_exists(ResourceKind::CollectionAssignment, "documents");
 
         assert!(matching_assignment_without_local_state(
             &error,
@@ -1785,9 +1826,7 @@ mod tests {
     fn matching_assignment_without_local_state_requires_matching_assignment_payload() {
         let requested = assignment("node-a");
         let different = assignment("node-b");
-        let error = LogPoseError::Message(
-            "collection 'documents' already has metadata assignment in etcd".to_owned(),
-        );
+        let error = LogPoseError::already_exists(ResourceKind::CollectionAssignment, "documents");
 
         assert!(!matching_assignment_without_local_state(
             &error,
@@ -1803,8 +1842,7 @@ mod tests {
     #[test]
     fn matching_assignment_without_local_state_does_not_trigger_for_other_errors() {
         let requested = assignment("node-a");
-        let error =
-            LogPoseError::Message("etcd metadata operation failed: permission denied".to_owned());
+        let error = LogPoseError::unavailable("etcd metadata operation failed: permission denied");
 
         assert!(!matching_assignment_without_local_state(
             &error,
@@ -1836,7 +1874,7 @@ mod tests {
         let error = rollback_failure_error(
             "analytics/documents",
             "local collection bootstrap failed",
-            LogPoseError::Message("etcd metadata operation failed: permission denied".to_owned()),
+            LogPoseError::unavailable("etcd metadata operation failed: permission denied"),
         );
 
         assert!(
