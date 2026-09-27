@@ -160,3 +160,31 @@ pub enum RecordError {
     #[error("a partial update must set at least one field or vector")]
     EmptyUpdate,
 }
+
+impl RecordError {
+    /// The record field or key the error is about, when it names one.
+    #[must_use]
+    pub fn field_name(&self) -> Option<&str> {
+        match self {
+            Self::MissingPrimaryKey { field }
+            | Self::PrimaryKeyType { field, .. }
+            | Self::InvalidPrimaryKey { field, .. }
+            | Self::EmptyPrimaryKey { field }
+            | Self::PrimaryKeyTooLong { field, .. }
+            | Self::MissingVector { field }
+            | Self::UnknownVectorField { field }
+            | Self::VectorNotArray { field, .. }
+            | Self::VectorElementNotNumber { field, .. }
+            | Self::VectorDimensionMismatch { field, .. }
+            | Self::NonFiniteVectorElement { field, .. }
+            | Self::InvalidField { field, .. }
+            | Self::RequiredField { field }
+            | Self::NotAScalarField { field }
+            | Self::UnknownField { field } => Some(field),
+            Self::ReservedKey { key }
+            | Self::ExtraKeyConflict { key }
+            | Self::RetiredKey { key } => Some(key),
+            Self::NotAnObject { .. } | Self::PrimaryKeyMismatch { .. } | Self::EmptyUpdate => None,
+        }
+    }
+}

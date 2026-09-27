@@ -4,31 +4,33 @@ use crate::{
     LocalStorageEngine,
     durable_fs::create_dir_all_synced,
     engine::EngineCore,
-    error::{json_message, string_message},
+    error::{invalid_descriptor, json_message},
     fs_util::{atomic_write, read_json},
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
-use logpose_types::{DEFAULT_DATABASE_NAME, LogPoseError, Result};
+use logpose_types::{CorruptionKind, DEFAULT_DATABASE_NAME, LogPoseError, ResourceKind, Result};
+use serde::de::DeserializeOwned;
+use std::path::Path;
 
 impl EngineCore {
     pub(crate) fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
         if database_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
-                "database name must not be empty".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "database_name",
+                "database name must not be empty",
             ));
         }
         let path = self.database_descriptor_path(database_name);
         if self.exists(&path)? {
-            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-            descriptor.validate()?;
+            read_stored(self, &path, DatabaseDescriptor::validate)?;
             return Ok(());
         }
 
         let descriptor = DatabaseDescriptor::new(database_name);
         descriptor.validate()?;
         let parent = path.parent().ok_or_else(|| {
-            LogPoseError::Message(format!(
+            LogPoseError::internal(format!(
                 "database descriptor path for '{database_name}' is missing a parent directory"
             ))
         })?;
@@ -44,9 +46,7 @@ impl EngineCore {
     fn list_database_descriptors(&self) -> Result<Vec<DatabaseDescriptor>> {
         let mut descriptors = Vec::new();
         for path in self.descriptor_files_under(&self.databases_root())? {
-            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-            descriptor.validate()?;
-            descriptors.push(descriptor);
+            descriptors.push(read_stored(self, &path, DatabaseDescriptor::validate)?);
         }
 
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
@@ -56,10 +56,7 @@ impl EngineCore {
     fn list_principal_descriptors(&self) -> Result<Vec<Principal>> {
         let mut principals = Vec::new();
         for path in self.descriptor_files_under(&self.principals_root())? {
-            let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
-            validate_principal_name(&principal.name)?;
-            principal.validate().map_err(string_message)?;
-            principals.push(principal);
+            principals.push(read_stored(self, &path, validate_principal)?);
         }
 
         principals.sort_by(|left, right| left.name.cmp(&right.name));
@@ -94,14 +91,13 @@ impl CatalogStore for EngineCore {
             self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
         }
         if !self.exists(&path)? {
-            return Err(LogPoseError::Message(format!(
-                "database '{database_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::Database,
+                database_name,
+            ));
         }
 
-        let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-        descriptor.validate()?;
-        Ok(descriptor)
+        read_stored(self, &path, DatabaseDescriptor::validate)
     }
 
     fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
@@ -110,8 +106,7 @@ impl CatalogStore for EngineCore {
     }
 
     fn put_principal(&self, principal: Principal) -> Result<Principal> {
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(string_message)?;
+        validate_principal(&principal)?;
         atomic_write(
             self.vfs.as_ref(),
             &self.principal_descriptor_path(&principal.name),
@@ -124,15 +119,13 @@ impl CatalogStore for EngineCore {
         validate_principal_name(principal_name)?;
         let path = self.principal_descriptor_path(principal_name);
         if !self.exists(&path)? {
-            return Err(LogPoseError::Message(format!(
-                "principal '{principal_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::Principal,
+                principal_name,
+            ));
         }
 
-        let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(string_message)?;
-        Ok(principal)
+        read_stored(self, &path, validate_principal)
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
@@ -143,7 +136,7 @@ impl CatalogStore for EngineCore {
         &self,
         policy: DatabaseAccessPolicy,
     ) -> Result<DatabaseAccessPolicy> {
-        policy.validate().map_err(string_message)?;
+        policy.validate().map_err(invalid_descriptor)?;
         self.ensure_database_descriptor(&policy.database_name)?;
         atomic_write(
             self.vfs.as_ref(),
@@ -157,14 +150,15 @@ impl CatalogStore for EngineCore {
         validate_namespace_segment("database name", database_name)?;
         let path = self.database_policy_path(database_name);
         if !self.exists(&path)? {
-            return Err(LogPoseError::Message(format!(
-                "database access policy '{database_name}' does not exist"
-            )));
+            return Err(LogPoseError::not_found(
+                ResourceKind::DatabasePolicy,
+                database_name,
+            ));
         }
 
-        let policy = read_json::<DatabaseAccessPolicy>(self.vfs.as_ref(), &path)?;
-        policy.validate().map_err(string_message)?;
-        Ok(policy)
+        read_stored(self, &path, |policy: &DatabaseAccessPolicy| {
+            policy.validate().map_err(invalid_descriptor)
+        })
     }
 }
 
@@ -207,21 +201,53 @@ impl CatalogStore for LocalStorageEngine {
     }
 }
 
+/// Read the descriptor stored at `path` and check it with `validate`.
+///
+/// Every descriptor is validated before it is written, so one that fails now is damaged
+/// stored data (`DATA_LOSS`), not a bad request.
+fn read_stored<T>(
+    core: &EngineCore,
+    path: &Path,
+    validate: impl FnOnce(&T) -> Result<()>,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value = read_json::<T>(core.vfs.as_ref(), path)?;
+    validate(&value).map_err(|error| LogPoseError::Corrupt {
+        kind: CorruptionKind::Descriptor,
+        location: Some(path.display().to_string()),
+        message: format!(
+            "stored descriptor '{}' fails validation: {error}",
+            path.display()
+        ),
+    })?;
+    Ok(value)
+}
+
+fn validate_principal(principal: &Principal) -> Result<()> {
+    validate_principal_name(&principal.name)?;
+    principal.validate().map_err(invalid_descriptor)
+}
+
 fn validate_principal_name(value: &str) -> Result<()> {
     let trimmed = value.trim();
     if value.trim().is_empty() {
-        return Err(LogPoseError::Message(
-            "principal name must not be empty".to_owned(),
+        return Err(LogPoseError::invalid_field(
+            "name",
+            "principal name must not be empty",
         ));
     }
     if value.contains('/') {
-        return Err(LogPoseError::Message(
-            "principal name must not contain '/'".to_owned(),
+        return Err(LogPoseError::invalid_field(
+            "name",
+            "principal name must not contain '/'",
         ));
     }
     if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(
-            "principal name must not be a relative path component".to_owned(),
+        return Err(LogPoseError::invalid_field(
+            "name",
+            "principal name must not be a relative path component",
         ));
     }
     Ok(())
@@ -230,17 +256,22 @@ fn validate_principal_name(value: &str) -> Result<()> {
 fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
     if value.trim().is_empty() {
-        return Err(LogPoseError::Message(format!("{label} must not be empty")));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not be empty"),
+        ));
     }
     if value.contains('/') {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not contain '/'"
-        )));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not contain '/'"),
+        ));
     }
     if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not be a relative path component"
-        )));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not be a relative path component"),
+        ));
     }
     Ok(())
 }

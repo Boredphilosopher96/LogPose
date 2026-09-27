@@ -34,6 +34,53 @@ pub struct LogPoseConfig {
     /// Authentication bootstrap configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Request size limits for the REST and gRPC listeners.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// Default for [`LimitsConfig::max_rest_body_bytes`]: 16 MiB.
+pub const DEFAULT_MAX_REST_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default for [`LimitsConfig::max_grpc_message_bytes`]: 16 MiB.
+pub const DEFAULT_MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Request size limits for the API listeners.
+///
+/// A REST body above its limit is rejected with HTTP 413 and a gRPC message above its limit
+/// with `RESOURCE_EXHAUSTED`; both carry a `TOO_LARGE` error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Largest REST request body accepted, in bytes.
+    pub max_rest_body_bytes: usize,
+    /// Largest decoded gRPC request message accepted, in bytes. Each message of a
+    /// `BulkWriteCollection` stream is one batch and is checked on its own.
+    pub max_grpc_message_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_rest_body_bytes: DEFAULT_MAX_REST_BODY_BYTES,
+            max_grpc_message_bytes: DEFAULT_MAX_GRPC_MESSAGE_BYTES,
+        }
+    }
+}
+
+impl LimitsConfig {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("max_rest_body_bytes", self.max_rest_body_bytes),
+            ("max_grpc_message_bytes", self.max_grpc_message_bytes),
+        ] {
+            if value == 0 {
+                return Err(LogPoseError::invalid_config(format!(
+                    "invalid LOGPOSE_CONFIG: limits.{name} must be greater than 0"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Authentication bootstrap and runtime configuration.
@@ -50,20 +97,18 @@ impl AuthConfig {
         let mut seen_principals = BTreeSet::new();
         for (index, token) in self.bootstrap_tokens.iter().enumerate() {
             token.validate().map_err(|message| {
-                LogPoseError::Message(format!(
+                LogPoseError::invalid_config(format!(
                     "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens[{index}] {message}"
                 ))
             })?;
             if !seen_tokens.insert(token.token.clone()) {
-                return Err(LogPoseError::Message(
-                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate token values"
-                        .to_owned(),
+                return Err(LogPoseError::invalid_config(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate token values",
                 ));
             }
             if !seen_principals.insert(token.principal.name.clone()) {
-                return Err(LogPoseError::Message(
-                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate principal names"
-                        .to_owned(),
+                return Err(LogPoseError::invalid_config(
+                    "invalid LOGPOSE_CONFIG: auth.bootstrap_tokens must not contain duplicate principal names",
                 ));
             }
         }
@@ -107,6 +152,7 @@ impl Default for LogPoseConfig {
             storage_root: PathBuf::from(".logpose"),
             metadata: MetadataConfig::default(),
             auth: AuthConfig::default(),
+            limits: LimitsConfig::default(),
         }
     }
 }
@@ -115,27 +161,26 @@ impl LogPoseConfig {
     /// Validate configuration invariants that must hold before runtime bootstrap.
     pub fn validate(&self) -> Result<()> {
         if self.node_name == ANONYMOUS_LOCAL_NODE_NAME {
-            return Err(LogPoseError::Message(format!(
+            return Err(LogPoseError::invalid_config(format!(
                 "invalid LOGPOSE_CONFIG: node_name '{}' is reserved for anonymous local placement metadata",
                 ANONYMOUS_LOCAL_NODE_NAME
             )));
         }
         if self.metadata.backend == MetadataBackend::Etcd {
-            self.metadata.etcd.validate().map_err(|error| match error {
-                LogPoseError::Message(message) => {
-                    LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {message}"))
-                }
-                other => other,
+            self.metadata.etcd.validate().map_err(|error| {
+                LogPoseError::invalid_config(format!("invalid LOGPOSE_CONFIG: {error}"))
             })?;
         }
         self.auth.validate()?;
+        self.limits.validate()?;
         Ok(())
     }
 
     /// Parse configuration from a TOML string.
     pub fn from_toml_str(value: &str) -> Result<Self> {
-        let config: Self = toml::from_str(value)
-            .map_err(|error| LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {error}")))?;
+        let config: Self = toml::from_str(value).map_err(|error| {
+            LogPoseError::invalid_config(format!("invalid LOGPOSE_CONFIG: {error}"))
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -156,6 +201,45 @@ impl LogPoseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_limits_default_to_sixteen_mebibytes_and_parse_from_toml() {
+        assert_eq!(
+            LogPoseConfig::default().limits,
+            LimitsConfig {
+                max_rest_body_bytes: 16 * 1024 * 1024,
+                max_grpc_message_bytes: 16 * 1024 * 1024,
+            }
+        );
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "127.0.0.1"
+rest_port = 8080
+grpc_host = "127.0.0.1"
+grpc_port = 50051
+log_filter = "info"
+storage_root = ".logpose"
+
+[limits]
+max_rest_body_bytes = 1024
+"#,
+        )
+        .expect("limits should parse");
+        assert_eq!(config.limits.max_rest_body_bytes, 1024);
+        assert_eq!(
+            config.limits.max_grpc_message_bytes,
+            DEFAULT_MAX_GRPC_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn rejects_zero_request_limits() {
+        let mut config = LogPoseConfig::default();
+        config.limits.max_grpc_message_bytes = 0;
+        let error = config.validate().expect_err("a zero limit is invalid");
+        assert!(matches!(error, LogPoseError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("limits.max_grpc_message_bytes"));
+    }
 
     #[test]
     fn default_config_includes_storage_root() {

@@ -17,10 +17,12 @@ use logpose_query::{
     ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryPlanKind,
     QueryRequest, ScalarMetadataValue,
 };
-use logpose_service::{LogPoseDataService, ServiceError};
+use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_storage_etcd as _;
-use logpose_types::{DistanceMetric, PutRecord, RecordId, Snapshot, WriteOperation};
+use logpose_types::{
+    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, Snapshot, WriteOperation,
+};
 use rand as _;
 use serde as _;
 use serde_json::{Value, json};
@@ -392,7 +394,7 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
 
     assert!(matches!(
         error,
-        ServiceError::FailedPrecondition(message) if message.contains("read barrier")
+        LogPoseError::ReadBarrierNotSatisfied { .. }
     ));
 }
 
@@ -433,7 +435,7 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
 
     assert!(matches!(
         error,
-        ServiceError::InvalidArgument(message)
+        LogPoseError::InvalidArgument { message, .. }
             if message.contains("snapshot and read_barrier cannot be provided together")
     ));
 }
@@ -521,7 +523,7 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
 
     assert!(matches!(
         error,
-        ServiceError::FailedPrecondition(message) if message.contains("read barrier")
+        LogPoseError::ReadBarrierNotSatisfied { .. }
     ));
 }
 
@@ -571,7 +573,8 @@ async fn service_rejects_impossible_snapshots() {
 
     assert!(matches!(
         error,
-        ServiceError::InvalidArgument(message) if message.contains("invalid snapshot")
+        LogPoseError::InvalidArgument { field: Some(field), message }
+            if field == "snapshot" && message.contains("invalid snapshot")
     ));
 }
 
@@ -626,7 +629,8 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
 
     assert!(matches!(
         error,
-        ServiceError::InvalidArgument(message) if message.contains("invalid snapshot")
+        LogPoseError::InvalidArgument { field: Some(field), message }
+            if field == "snapshot" && message.contains("invalid snapshot")
     ));
 }
 
@@ -1424,7 +1428,10 @@ async fn service_maps_missing_collections_to_not_found() {
         .await
         .expect_err("missing collection should error");
 
-    assert!(matches!(error, ServiceError::NotFound(message) if message.contains("missing")));
+    assert!(matches!(
+        error,
+        LogPoseError::NotFound { resource: ResourceKind::Collection, name } if name.contains("missing")
+    ));
 }
 
 #[tokio::test]
@@ -1463,7 +1470,10 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
             .await
             .expect_err("invalid record should be rejected");
         assert!(
-            matches!(error, ServiceError::InvalidArgument(_)),
+            matches!(
+                error,
+                LogPoseError::InvalidArgument { .. } | LogPoseError::DimensionMismatch { .. }
+            ),
             "{operation:?} should be an invalid argument, got {error:?}"
         );
     }
@@ -1478,7 +1488,7 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
         .await
         .expect_err("too many dimensions should be rejected");
     assert!(
-        matches!(error, ServiceError::InvalidArgument(_)),
+        matches!(error, LogPoseError::InvalidArgument { .. }),
         "too many dimensions should be an invalid argument, got {error:?}"
     );
 }

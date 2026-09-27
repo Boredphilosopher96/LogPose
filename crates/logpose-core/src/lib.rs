@@ -6,14 +6,12 @@ use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
-use logpose_service::{
-    LogPoseControlService, LogPoseDataService, Result as ServiceResult, ServiceError,
-};
+use logpose_service::{LogPoseControlService, LogPoseDataService, Result as ServiceResult};
 use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
-    MetadataBackend, NodeMetadata, NodeRole, Snapshot, WriteOperation,
+    LogPoseError, MetadataBackend, NodeMetadata, NodeRole, Snapshot, WriteOperation,
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -91,7 +89,7 @@ impl AppState {
     /// another process already serves the same `storage_root`.
     pub fn try_new(config: LogPoseConfig) -> ServiceResult<Self> {
         config.validate().map_err(|error| {
-            ServiceError::InvalidArgument(format!(
+            LogPoseError::invalid_config(format!(
                 "invalid runtime configuration for AppState: {error}"
             ))
         })?;
@@ -467,10 +465,12 @@ impl AppState {
         if matches!(principal.access_tier, AccessTier::Operator) {
             Ok(())
         } else {
-            Err(ServiceError::PermissionDenied(format!(
-                "principal '{}' is not allowed to perform operator actions",
-                principal.name
-            )))
+            Err(LogPoseError::PermissionDenied {
+                message: format!(
+                    "principal '{}' is not allowed to perform operator actions",
+                    principal.name
+                ),
+            })
         }
     }
 
@@ -507,7 +507,7 @@ impl AppState {
     ) -> ServiceResult<()> {
         let policy = match self.database_access_policy_shared(database_name).await {
             Ok(policy) => Some(policy),
-            Err(ServiceError::NotFound(_)) => None,
+            Err(LogPoseError::NotFound { .. }) => None,
             Err(error) => return Err(error),
         };
 
@@ -532,10 +532,12 @@ impl AppState {
         let policy = match policy {
             Some(policy) => policy,
             None => {
-                return Err(ServiceError::PermissionDenied(format!(
-                    "principal '{}' is not allowed to access database '{database_name}'",
-                    principal.name
-                )));
+                return Err(LogPoseError::PermissionDenied {
+                    message: format!(
+                        "principal '{}' is not allowed to access database '{database_name}'",
+                        principal.name
+                    ),
+                });
             }
         };
 
@@ -547,10 +549,12 @@ impl AppState {
         if allowed {
             Ok(())
         } else {
-            Err(ServiceError::PermissionDenied(format!(
-                "principal '{}' is not allowed to access database '{database_name}'",
-                principal.name
-            )))
+            Err(LogPoseError::PermissionDenied {
+                message: format!(
+                    "principal '{}' is not allowed to access database '{database_name}'",
+                    principal.name
+                ),
+            })
         }
     }
 
@@ -561,7 +565,9 @@ impl AppState {
 
         let token = auth
             .bearer_token_str()
-            .ok_or_else(|| ServiceError::Unauthenticated("missing bearer token".to_owned()))?;
+            .ok_or_else(|| LogPoseError::Unauthenticated {
+                message: "missing bearer token".to_owned(),
+            })?;
         let bootstrap_principal = self
             .config
             .auth
@@ -569,11 +575,13 @@ impl AppState {
             .iter()
             .find(|entry| constant_time_eq(&entry.token, token))
             .map(|entry| entry.principal.clone())
-            .ok_or_else(|| ServiceError::Unauthenticated("invalid bearer token".to_owned()))?;
+            .ok_or_else(|| LogPoseError::Unauthenticated {
+                message: "invalid bearer token".to_owned(),
+            })?;
 
         match self.principal_shared(&bootstrap_principal.name).await {
             Ok(principal) => Ok(Some(principal)),
-            Err(ServiceError::NotFound(_)) => Ok(Some(bootstrap_principal)),
+            Err(LogPoseError::NotFound { .. }) => Ok(Some(bootstrap_principal)),
             Err(error) => Err(error),
         }
     }
@@ -582,32 +590,32 @@ impl AppState {
         if matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data) {
             Ok(())
         } else {
-            Err(ServiceError::InvalidArgument(format!(
-                "node '{}' is running as '{}' and cannot accept data-plane operations",
-                self.config.node_name, self.config.node_role
-            )))
+            Err(LogPoseError::WrongNodeRole {
+                node: self.config.node_name.clone(),
+                role: self.config.node_role,
+                operation: "data-plane operations".to_owned(),
+            })
         }
     }
 
     fn require_control_plane_database_mutation(&self) -> ServiceResult<()> {
         match self.config.node_role {
-            NodeRole::Data => Err(ServiceError::InvalidArgument(
-                "data-only nodes cannot accept control-plane database mutations".to_owned(),
-            )),
+            NodeRole::Data => Err(LogPoseError::WrongNodeRole {
+                node: self.config.node_name.clone(),
+                role: self.config.node_role,
+                operation: "control-plane database mutations".to_owned(),
+            }),
             NodeRole::Control | NodeRole::Combined => Ok(()),
         }
     }
 
     fn require_control_plane_collection_mutation(&self) -> ServiceResult<()> {
         match self.config.node_role {
-            NodeRole::Data => Err(ServiceError::InvalidArgument(
-                "data-only nodes cannot accept control-plane collection lifecycle mutations"
-                    .to_owned(),
-            )),
-            NodeRole::Control => Err(ServiceError::InvalidArgument(
-                "control-only nodes cannot accept control-plane collection lifecycle mutations without a local data plane"
-                    .to_owned(),
-            )),
+            NodeRole::Data | NodeRole::Control => Err(LogPoseError::WrongNodeRole {
+                node: self.config.node_name.clone(),
+                role: self.config.node_role,
+                operation: "control-plane collection lifecycle mutations".to_owned(),
+            }),
             NodeRole::Combined => Ok(()),
         }
     }
@@ -629,13 +637,11 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| placement.assigned_node.clone());
 
-        Err(ServiceError::InvalidArgument(format!(
-            "collection '{}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
-            placement_identity(&placement),
-            routed_node,
-            placement.assigned_role,
-            self.config.node_name
-        )))
+        Err(LogPoseError::NotOwner {
+            collection: placement_identity(&placement),
+            node: self.config.node_name.clone(),
+            owner_node: Some(routed_node),
+        })
     }
 
     async fn put_database_shared(
@@ -651,7 +657,6 @@ impl AppState {
                 catalog
                     .put_database(descriptor, &leader_fence.node_id, leader_fence.lease_id)
                     .await
-                    .map_err(Into::into)
             }
         }
     }
@@ -659,17 +664,14 @@ impl AppState {
     async fn database_shared(&self, database_name: &str) -> ServiceResult<DatabaseDescriptor> {
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.database(database_name).await,
-            SharedCatalog::Etcd(catalog) => catalog
-                .get_database(database_name)
-                .await
-                .map_err(Into::into),
+            SharedCatalog::Etcd(catalog) => catalog.get_database(database_name).await,
         }
     }
 
     async fn databases_shared(&self) -> ServiceResult<Vec<DatabaseDescriptor>> {
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.databases().await,
-            SharedCatalog::Etcd(catalog) => catalog.list_databases().await.map_err(Into::into),
+            SharedCatalog::Etcd(catalog) => catalog.list_databases().await,
         }
     }
 
@@ -690,7 +692,6 @@ impl AppState {
                         leader_fence.lease_id,
                     )
                     .await
-                    .map_err(Into::into)
             }
         }
     }
@@ -701,20 +702,14 @@ impl AppState {
     ) -> ServiceResult<logpose_auth::DatabaseAccessPolicy> {
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.database_access_policy(database_name).await,
-            SharedCatalog::Etcd(catalog) => catalog
-                .get_database_access_policy(database_name)
-                .await
-                .map_err(Into::into),
+            SharedCatalog::Etcd(catalog) => catalog.get_database_access_policy(database_name).await,
         }
     }
 
     async fn principal_shared(&self, principal_name: &str) -> ServiceResult<Principal> {
         match &self.shared_catalog {
             SharedCatalog::Local => self.control.principal(principal_name).await,
-            SharedCatalog::Etcd(catalog) => catalog
-                .get_principal(principal_name)
-                .await
-                .map_err(Into::into),
+            SharedCatalog::Etcd(catalog) => catalog.get_principal(principal_name).await,
         }
     }
 
@@ -729,7 +724,7 @@ impl AppState {
         }
         match self.database_shared(database_name).await {
             Ok(_) => Ok(()),
-            Err(ServiceError::NotFound(_)) => self
+            Err(LogPoseError::NotFound { .. }) => self
                 .put_database_shared(DatabaseDescriptor::new(database_name))
                 .await
                 .map(|_| ()),
@@ -744,8 +739,8 @@ fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String 
 
 fn required_leadership_fence(fence: Option<LeadershipFence>) -> ServiceResult<LeadershipFence> {
     fence.ok_or_else(|| {
-        ServiceError::Internal(
-            "etcd-backed control-plane mutations require a local leadership fence".to_owned(),
+        LogPoseError::internal(
+            "etcd-backed control-plane mutations require a local leadership fence",
         )
     })
 }
@@ -755,7 +750,7 @@ fn reject_promoted_read_barriers(
     read_barrier: Option<&Snapshot>,
 ) -> ServiceResult<()> {
     if read_barrier.is_some() && placement.ownership_epoch.is_some_and(|epoch| epoch > 1) {
-        return Err(ServiceError::FailedPrecondition(format!(
+        return Err(LogPoseError::failed_precondition(format!(
             "collection '{}' is serving at ownership epoch {} and cannot safely satisfy read barriers after promotion until replica freshness metadata is implemented",
             placement_identity(placement),
             placement.ownership_epoch.unwrap_or_default(),
@@ -778,24 +773,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 fn parse_collection_reference(collection_name: &str) -> ServiceResult<CollectionRef> {
-    let reference = match collection_name
-        .trim()
-        .split('/')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [collection_name] => CollectionRef::new_default(*collection_name),
-        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
-        _ => {
-            return Err(ServiceError::InvalidArgument(format!(
-                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
-            )));
-        }
-    };
-    reference
-        .validate()
-        .map_err(|error| ServiceError::InvalidArgument(error.to_string()))?;
-    Ok(reference)
+    CollectionRef::parse(collection_name)
 }
 
 fn database_role_satisfies(role: &DatabaseRole, permission: DatabasePermission) -> bool {

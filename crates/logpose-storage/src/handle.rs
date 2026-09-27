@@ -4,7 +4,7 @@ use crate::{maintenance::MaintenanceState, version::Version};
 use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    CollectionAssignment, CollectionId, CollectionRef, LogPoseError, Result, SeqNo,
+    CollectionAssignment, CollectionId, CollectionRef, LogPoseError, ResourceKind, Result, SeqNo,
 };
 use logpose_wal::WalWriter;
 use std::{
@@ -138,11 +138,13 @@ impl CollectionHandle {
         if version.visible_seq_no >= min_seq_no {
             return Ok(version);
         }
-        Err(LogPoseError::Message(format!(
-            "read barrier seq {min_seq_no} is not yet visible; collection '{}' is at seq {}",
-            self.meta.descriptor.lookup_name(),
-            version.visible_seq_no
-        )))
+        Err(LogPoseError::ReadBarrierNotSatisfied {
+            collection: self.meta.descriptor.lookup_name(),
+            required_manifest_generation: 0,
+            required_seq_no: min_seq_no,
+            visible_manifest_generation: version.manifest_generation,
+            visible_seq_no: version.visible_seq_no,
+        })
     }
 
     /// Publish `version` as the current state. The caller holds [`CollectionHandle::writer`].
@@ -193,13 +195,14 @@ impl CollectionHandle {
     pub(crate) fn unavailable(&self) -> LogPoseError {
         let name = self.meta.descriptor.lookup_name();
         if self.is_dropped() {
-            return LogPoseError::Message(format!("collection '{name}' does not exist"));
+            return LogPoseError::not_found(ResourceKind::Collection, name);
         }
         match self.poison.get() {
-            Some(reason) => LogPoseError::Message(format!(
-                "collection '{name}' is read-only until it is reopened: {reason}"
-            )),
-            None => LogPoseError::Message(format!("collection '{name}' is unavailable")),
+            Some(reason) => LogPoseError::CollectionPoisoned {
+                collection: name,
+                reason: reason.clone(),
+            },
+            None => LogPoseError::unavailable(format!("collection '{name}' is unavailable")),
         }
     }
 

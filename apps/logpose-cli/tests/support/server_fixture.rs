@@ -105,6 +105,7 @@ impl TestServerFixture {
                 storage_root: storage_root.clone(),
                 metadata: Default::default(),
                 auth: auth.clone(),
+                limits: Default::default(),
             }));
             let mut server = runtime.spawn(async move {
                 let rest_listener = tokio::net::TcpListener::from_std(rest_listener)

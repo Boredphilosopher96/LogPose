@@ -24,7 +24,7 @@ pub mod codec;
 pub mod v2;
 
 use crc32fast::Hasher;
-use logpose_types::{LogPoseError, Result, SeqNo, WriteOperation};
+use logpose_types::{CorruptionKind, LogPoseError, Result, SeqNo, WriteOperation};
 use logpose_vfs::{CrashPoint, OpenMode, Vfs, VfsFile, parent_dir, read_file};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -102,18 +102,18 @@ impl WalBatch {
 
     fn validate(&self) -> Result<()> {
         let Some(first) = self.records.first() else {
-            return Err(LogPoseError::Message(
-                "WAL batch must contain at least one record".to_owned(),
+            return Err(LogPoseError::internal(
+                "WAL batch must contain at least one record",
             ));
         };
         if first.seq_no == 0 {
-            return Err(LogPoseError::Message(
-                "WAL batch sequence numbers must start above zero".to_owned(),
+            return Err(LogPoseError::internal(
+                "WAL batch sequence numbers must start above zero",
             ));
         }
         for pair in self.records.windows(2) {
             if pair[0].seq_no.checked_add(1) != Some(pair[1].seq_no) {
-                return Err(LogPoseError::Message(format!(
+                return Err(LogPoseError::internal(format!(
                     "WAL batch sequence numbers must be contiguous: {} is followed by {}",
                     pair[0].seq_no, pair[1].seq_no
                 )));
@@ -224,7 +224,7 @@ impl WalWriter {
     /// append, so a batch reported as failed is never replayed later.
     pub fn append_batch(&mut self, batch: &WalBatch) -> Result<()> {
         let payload = serde_json::to_vec(batch).map_err(|error| {
-            LogPoseError::Message(format!("failed to serialize WAL batch: {error}"))
+            LogPoseError::internal(format!("failed to serialize WAL batch: {error}"))
         })?;
         let frame = encode_frame(&payload);
 
@@ -253,10 +253,13 @@ impl WalWriter {
             .and_then(|()| self.vfs.crash_point(CrashPoint::WalAfterRollback))
         {
             Ok(()) => io_message(context, error),
-            Err(rollback_error) => LogPoseError::Message(format!(
-                "{context}: {error}; rolling the WAL back to {} bytes also failed: {rollback_error}",
-                self.len
-            )),
+            Err(rollback_error) => LogPoseError::io(
+                format!(
+                    "{context}: {error}; rolling the WAL back to {} bytes also failed",
+                    self.len
+                ),
+                rollback_error,
+            ),
         }
     }
 
@@ -337,22 +340,28 @@ pub fn replay_dir_after_checkpoint(
                 continue;
             }
             if batch.first_seq_no() <= checkpoint_seq_no {
-                return Err(LogPoseError::Message(format!(
-                    "WAL batch {}..={} in {} straddles checkpoint {checkpoint_seq_no}",
-                    batch.first_seq_no(),
-                    batch.last_seq_no(),
-                    entry.display()
-                )));
+                return Err(LogPoseError::corrupt(
+                    CorruptionKind::Wal,
+                    format!(
+                        "WAL batch {}..={} in {} straddles checkpoint {checkpoint_seq_no}",
+                        batch.first_seq_no(),
+                        batch.last_seq_no(),
+                        entry.display()
+                    ),
+                ));
             }
             if let Some(previous) = replayed.last().map(|record: &WalRecord| record.seq_no)
                 && batch.first_seq_no() <= previous
             {
-                return Err(LogPoseError::Message(format!(
-                    "WAL batch {}..={} in {} does not follow sequence number {previous}",
-                    batch.first_seq_no(),
-                    batch.last_seq_no(),
-                    entry.display()
-                )));
+                return Err(LogPoseError::corrupt(
+                    CorruptionKind::Wal,
+                    format!(
+                        "WAL batch {}..={} in {} does not follow sequence number {previous}",
+                        batch.first_seq_no(),
+                        batch.last_seq_no(),
+                        entry.display()
+                    ),
+                ));
             }
             replayed.extend(batch.into_records());
         }
@@ -460,11 +469,15 @@ impl FrameScan<'_> {
         } else {
             ""
         };
-        Err(LogPoseError::Message(format!(
-            "corrupt WAL {}: {detail} at byte offset {}{position}",
-            path.display(),
-            stop.offset
-        )))
+        Err(LogPoseError::Corrupt {
+            kind: CorruptionKind::Wal,
+            location: Some(path.display().to_string()),
+            message: format!(
+                "corrupt WAL {}: {detail} at byte offset {}{position}",
+                path.display(),
+                stop.offset
+            ),
+        })
     }
 }
 
@@ -566,13 +579,20 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
 /// Decode a checksum-valid payload. Failures here are never treated as a torn tail: the
 /// bytes are exactly what was written, so an undecodable batch is a hard error.
 fn decode_batch(path: &Path, payload: &[u8]) -> Result<WalBatch> {
-    let batch = serde_json::from_slice::<WalBatch>(payload).map_err(|error| {
-        LogPoseError::Message(format!(
-            "failed to deserialize WAL batch in {}: {error}",
-            path.display()
-        ))
+    let batch =
+        serde_json::from_slice::<WalBatch>(payload).map_err(|error| LogPoseError::Corrupt {
+            kind: CorruptionKind::Wal,
+            location: Some(path.display().to_string()),
+            message: format!(
+                "failed to deserialize WAL batch in {}: {error}",
+                path.display()
+            ),
+        })?;
+    batch.validate().map_err(|error| LogPoseError::Corrupt {
+        kind: CorruptionKind::Wal,
+        location: Some(path.display().to_string()),
+        message: format!("invalid WAL batch in {}: {error}", path.display()),
     })?;
-    batch.validate()?;
     Ok(batch)
 }
 
@@ -603,7 +623,7 @@ fn rolled_wal_checkpoint_seq_no(file_name: &str) -> Option<SeqNo> {
 }
 
 fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
-    LogPoseError::Message(format!("{context}: {error}"))
+    LogPoseError::io(context, error)
 }
 
 #[cfg(test)]

@@ -56,6 +56,7 @@ tonic = { version = "~0.14", features = ["transport"] }
 tonic-health = "~0.14"
 tonic-prost = "~0.14"
 tonic-reflection = "~0.14"
+tonic-types = "~0.14"
 tower = "~0.5"
 tower-http = { version = "~0.6", features = ["trace"] }
 tracing = "~0.1"

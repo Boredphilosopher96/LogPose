@@ -1,6 +1,6 @@
 //! Typed WAL v2 errors.
 
-use logpose_types::{LogPoseError, SeqNo};
+use logpose_types::{CorruptionKind, LogPoseError, SeqNo};
 use std::{io, path::PathBuf};
 use thiserror::Error;
 
@@ -172,6 +172,43 @@ impl WalError {
 
 impl From<WalError> for LogPoseError {
     fn from(error: WalError) -> Self {
-        LogPoseError::Message(error.to_string())
+        let message = error.to_string();
+        match error {
+            WalError::Corrupt { file, .. }
+            | WalError::UnsupportedFormatVersion { file, .. }
+            | WalError::UnexpectedFile { path: file } => LogPoseError::Corrupt {
+                kind: CorruptionKind::Wal,
+                location: Some(file.display().to_string()),
+                message,
+            },
+            WalError::FenceUnreadable { marker, .. } => LogPoseError::Corrupt {
+                kind: CorruptionKind::Wal,
+                location: Some(marker.display().to_string()),
+                message,
+            },
+            WalError::Io {
+                context,
+                path,
+                source,
+            } => LogPoseError::io(
+                format!("WAL I/O error: {context} '{}'", path.display()),
+                source,
+            ),
+            WalError::WriteFailed { source, .. } => LogPoseError::io(
+                message
+                    .strip_suffix(&format!(": {source}"))
+                    .unwrap_or("WAL write failed")
+                    .to_owned(),
+                source,
+            ),
+            WalError::FrameTooLarge { len, max } => LogPoseError::TooLarge {
+                what: "WAL frame payload".to_owned(),
+                size: u64::try_from(len).ok(),
+                limit: u64::from(max),
+            },
+            WalError::FsyncFailedSameBoot { .. }
+            | WalError::WriterFailed { .. }
+            | WalError::InvalidFrame { .. } => LogPoseError::internal(message),
+        }
     }
 }

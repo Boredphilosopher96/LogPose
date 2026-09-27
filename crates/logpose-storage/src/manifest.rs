@@ -7,7 +7,9 @@ use crate::{
     fs_util::{AtomicWritePoints, atomic_write_with_points, read_json},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats, SeqNo};
+use logpose_types::{
+    CorruptionKind, LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats, SeqNo,
+};
 use logpose_vfs::CrashPoint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -26,10 +28,10 @@ impl EngineCore {
         let path = Self::manifest_file_path(descriptor, generation);
         if !self.exists(&path)? {
             if generation_override.is_some() && generation != 0 {
-                return Err(LogPoseError::Message(format!(
-                    "invalid snapshot: manifest generation {} does not exist",
-                    generation
-                )));
+                return Err(LogPoseError::invalid_field(
+                    "snapshot",
+                    format!("invalid snapshot: manifest generation {generation} does not exist"),
+                ));
             }
             return Ok(Manifest::empty(generation));
         }
@@ -46,9 +48,10 @@ impl EngineCore {
             .trim()
             .parse::<u64>()
             .map_err(|error| {
-                LogPoseError::Message(format!(
-                    "failed to parse CURRENT manifest generation: {error}"
-                ))
+                LogPoseError::corrupt(
+                    CorruptionKind::Manifest,
+                    format!("failed to parse CURRENT manifest generation: {error}"),
+                )
             })
     }
 

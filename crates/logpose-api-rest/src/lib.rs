@@ -1,52 +1,93 @@
 //! REST API surface for LogPose.
 
+mod error;
+
+#[cfg(test)]
+use yaml_rust2 as _;
+
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
-    response::{IntoResponse, Response},
-    routing::{get, post},
+    extract::{DefaultBodyLimit, State},
+    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
+    response::IntoResponse,
+    routing::{MethodRouter, get, post},
 };
+use error::{ApiError, ApiJson, ApiPath, ApiQuery};
+pub use error::{ErrorBody, http_status};
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, FilterExpr, MetadataFilter, QueryRequest, ScalarMetadataValue};
-use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Snapshot, WriteOperation,
+    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, ResourceKind, Snapshot,
+    WriteOperation,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 
-/// Create the versioned REST router.
-pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/metadata", get(metadata))
-        .route("/v1/runtime/status", get(runtime_status))
-        .route("/v1/databases", get(list_databases))
-        .route("/v1/databases/{name}", get(get_database).put(put_database))
-        .route("/v1/collections", post(create_collection))
-        .route(
+/// Every REST route: its path template and the handlers per method.
+///
+/// The router is built from this table, and the API contract test checks it against
+/// `openapi/logpose.v1.yaml` in both directions.
+fn routes() -> Vec<(&'static str, MethodRouter<Arc<AppState>>)> {
+    vec![
+        ("/health", get(health)),
+        ("/v1/metadata", get(metadata)),
+        ("/v1/runtime/status", get(runtime_status)),
+        ("/v1/databases", get(list_databases)),
+        ("/v1/databases/{name}", get(get_database).put(put_database)),
+        (
             "/v1/databases/{name}/policy",
             get(get_database_policy).put(put_database_policy),
-        )
-        .route("/v1/collections/{name}", get(get_collection))
-        .route(
+        ),
+        ("/v1/collections", post(create_collection)),
+        ("/v1/collections/{name}", get(get_collection)),
+        (
             "/v1/collections/{name}/placement",
             get(get_collection_placement),
-        )
-        .route("/v1/collections/{name}/writes", post(write_collection))
-        .route("/v1/collections/{name}/query", post(query_collection))
-        .route("/v1/collections/{name}/stats", get(get_collection_stats))
-        .route("/v1/collections/{name}/flush", post(flush_collection))
-        .route("/v1/collections/{name}/compact", post(compact_collection))
-        .route("/v1/collections/{name}/inspect", get(inspect_collection))
+        ),
+        ("/v1/collections/{name}/writes", post(write_collection)),
+        ("/v1/collections/{name}/query", post(query_collection)),
+        ("/v1/collections/{name}/stats", get(get_collection_stats)),
+        ("/v1/collections/{name}/flush", post(flush_collection)),
+        ("/v1/collections/{name}/compact", post(compact_collection)),
+        ("/v1/collections/{name}/inspect", get(inspect_collection)),
+    ]
+}
+
+/// Path templates of every REST route, as the router registers them.
+#[doc(hidden)]
+#[must_use]
+pub fn route_paths() -> Vec<&'static str> {
+    routes().into_iter().map(|(path, _)| path).collect()
+}
+
+/// Create the versioned REST router.
+///
+/// Request bodies above `limits.max_rest_body_bytes` are rejected with HTTP 413 and a typed
+/// `TOO_LARGE` error; unknown paths, and methods a path does not serve, get a typed 404.
+pub fn router(state: Arc<AppState>) -> Router {
+    let body_limit = state.config.limits.max_rest_body_bytes;
+    routes()
+        .into_iter()
+        .fold(Router::new(), |router, (path, handlers)| {
+            router.route(path, handlers)
+        })
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(route_not_found)
         .with_state(state)
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn route_not_found(method: Method, uri: Uri) -> ApiError {
+    ApiError(LogPoseError::not_found(
+        ResourceKind::Route,
+        format!("{method} {}", uri.path()),
+    ))
 }
 
 /// Serve the REST API until shutdown.
@@ -92,9 +133,9 @@ async fn runtime_status(
 
 async fn put_database(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    Json(descriptor): Json<DatabaseDescriptor>,
+    ApiJson(descriptor): ApiJson<DatabaseDescriptor>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     validate_database_scope(&descriptor, &name)?;
@@ -103,7 +144,7 @@ async fn put_database(
 
 async fn get_database(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -121,7 +162,7 @@ async fn list_databases(
 async fn create_collection(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<CreateCollectionBody>,
+    ApiJson(request): ApiJson<CreateCollectionBody>,
 ) -> Result<(StatusCode, Json<logpose_catalog::CollectionDescriptor>), ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let descriptor = state
@@ -140,9 +181,9 @@ async fn create_collection(
 
 async fn put_database_policy(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    Json(policy): Json<DatabaseAccessPolicy>,
+    ApiJson(policy): ApiJson<DatabaseAccessPolicy>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     validate_policy_scope(&policy, &name)?;
@@ -155,7 +196,7 @@ async fn put_database_policy(
 
 async fn get_database_policy(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -166,8 +207,8 @@ async fn get_database_policy(
 
 async fn get_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(namespace): Query<NamespaceQuery>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -181,8 +222,8 @@ async fn get_collection(
 
 async fn get_collection_placement(
     headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(namespace): Query<NamespaceQuery>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -196,15 +237,16 @@ async fn get_collection_placement(
 
 async fn write_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<WriteCollectionBody>,
+    ApiJson(request): ApiJson<WriteCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    for operation in &request.operations {
+    for (index, operation) in request.operations.iter().enumerate() {
         if operation.id().as_str().is_empty() {
-            return Err(ApiError(ServiceError::InvalidArgument(
-                "write operation record id must not be empty".to_owned(),
+            return Err(ApiError(LogPoseError::invalid_field(
+                format!("operations[{index}].id"),
+                "write operation record id must not be empty",
             )));
         }
     }
@@ -221,14 +263,15 @@ async fn write_collection(
 
 async fn query_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<QueryCollectionBody>,
+    ApiJson(request): ApiJson<QueryCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     if request.top_k == 0 {
-        return Err(ApiError(ServiceError::InvalidArgument(
-            "top_k must be greater than 0".to_owned(),
+        return Err(ApiError(LogPoseError::invalid_field(
+            "top_k",
+            "top_k must be greater than 0",
         )));
     }
 
@@ -237,11 +280,13 @@ async fn query_collection(
         .filters
         .into_iter()
         .map(|(field, value)| {
+            let field_name = field.clone();
             ScalarMetadataValue::from_json(&value)
                 .map(|value| MetadataFilter { field, value })
                 .ok_or_else(|| {
-                    ApiError(ServiceError::InvalidArgument(
-                        "query filters must contain only scalar JSON values".to_owned(),
+                    ApiError(LogPoseError::invalid_field(
+                        format!("filters.{field_name}"),
+                        "query filters must contain only scalar JSON values",
                     ))
                 })
         })
@@ -268,8 +313,8 @@ async fn query_collection(
 
 async fn get_collection_stats(
     headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(params): Query<CollectionStatsQuery>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(params): ApiQuery<CollectionStatsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -294,8 +339,8 @@ async fn get_collection_stats(
 
 async fn flush_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(namespace): Query<NamespaceQuery>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -308,8 +353,8 @@ async fn flush_collection(
 
 async fn compact_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
-    Query(namespace): Query<NamespaceQuery>,
+    ApiPath(name): ApiPath<String>,
+    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -322,9 +367,9 @@ async fn compact_collection(
 
 async fn inspect_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<InspectCollectionParams>,
+    ApiQuery(params): ApiQuery<InspectCollectionParams>,
 ) -> Result<Json<CollectionScopedResponse<logpose_storage::InspectReport>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let (target, namespace) = inspect_target_from_params(params)?;
@@ -395,10 +440,13 @@ fn validate_policy_scope(
     database_name: &str,
 ) -> Result<(), ApiError> {
     if policy.database_name != database_name {
-        return Err(ApiError(ServiceError::InvalidArgument(format!(
-            "database policy database_name '{}' does not match request database '{}'",
-            policy.database_name, database_name
-        ))));
+        return Err(ApiError(LogPoseError::invalid_field(
+            "database_name",
+            format!(
+                "database policy database_name '{}' does not match request database '{}'",
+                policy.database_name, database_name
+            ),
+        )));
     }
     Ok(())
 }
@@ -408,10 +456,13 @@ fn validate_database_scope(
     database_name: &str,
 ) -> Result<(), ApiError> {
     if descriptor.name != database_name {
-        return Err(ApiError(ServiceError::InvalidArgument(format!(
-            "database descriptor name '{}' does not match request database '{}'",
-            descriptor.name, database_name
-        ))));
+        return Err(ApiError(LogPoseError::invalid_field(
+            "name",
+            format!(
+                "database descriptor name '{}' does not match request database '{}'",
+                descriptor.name, database_name
+            ),
+        )));
     }
     Ok(())
 }
@@ -489,49 +540,26 @@ impl<T> CollectionScopedResponse<T> {
     }
 }
 
-#[derive(Debug)]
-struct ApiError(ServiceError);
-
-impl From<ServiceError> for ApiError {
-    fn from(error: ServiceError) -> Self {
-        Self(error)
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self.0 {
-            ServiceError::AlreadyExists(message) => (StatusCode::CONFLICT, message),
-            ServiceError::NotFound(message) => (StatusCode::NOT_FOUND, message),
-            ServiceError::InvalidArgument(message) => (StatusCode::BAD_REQUEST, message),
-            ServiceError::FailedPrecondition(message) => (StatusCode::PRECONDITION_FAILED, message),
-            ServiceError::Unauthenticated(message) => (StatusCode::UNAUTHORIZED, message),
-            ServiceError::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
-            ServiceError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
-        };
-        (status, Json(json!({ "error": message }))).into_response()
-    }
-}
-
 fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiError> {
     let value = match headers.get(AUTHORIZATION) {
         Some(value) => value,
         None => return Ok(RequestAuth::default()),
     };
-    let value = value.to_str().map_err(|_| {
-        ApiError(ServiceError::Unauthenticated(
-            "authorization header must be valid ASCII".to_owned(),
-        ))
-    })?;
-    let (scheme, token) = value.split_once(' ').ok_or_else(|| {
-        ApiError(ServiceError::Unauthenticated(
-            "authorization header must use the Bearer scheme".to_owned(),
-        ))
-    })?;
+    let unauthenticated = |message: &str| {
+        ApiError(LogPoseError::Unauthenticated {
+            message: message.to_owned(),
+        })
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| unauthenticated("authorization header must be valid ASCII"))?;
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| unauthenticated("authorization header must use the Bearer scheme"))?;
     if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
-        return Err(ApiError(ServiceError::Unauthenticated(
-            "authorization header must use the Bearer scheme".to_owned(),
-        )));
+        return Err(unauthenticated(
+            "authorization header must use the Bearer scheme",
+        ));
     }
     Ok(RequestAuth::bearer_token(token.trim()))
 }
@@ -550,14 +578,16 @@ fn inspect_target_from_params(
             .filter(|segment_id| !segment_id.is_empty())
             .map(InspectTarget::Segment)
             .ok_or_else(|| {
-                ApiError(ServiceError::InvalidArgument(
-                    "inspect target 'segment' requires segment_id".to_owned(),
+                ApiError(LogPoseError::invalid_field(
+                    "segment_id",
+                    "inspect target 'segment' requires segment_id",
                 ))
             }),
         "maintenance" => Ok(InspectTarget::Maintenance),
-        other => Err(ApiError(ServiceError::InvalidArgument(format!(
-            "unsupported inspect target '{other}'"
-        )))),
+        other => Err(ApiError(LogPoseError::invalid_field(
+            "target",
+            format!("unsupported inspect target '{other}'"),
+        ))),
     }?;
     Ok((target, namespace))
 }
@@ -586,9 +616,14 @@ fn snapshot_from_query_pair(
             visible_seq_no,
         })),
         (None, None) => Ok(None),
-        _ => Err(ApiError(ServiceError::InvalidArgument(format!(
-            "{manifest_field} and {visible_seq_field} must be provided together"
-        )))),
+        _ => Err(ApiError(LogPoseError::invalid_field(
+            if manifest_generation.is_none() {
+                manifest_field
+            } else {
+                visible_seq_field
+            },
+            format!("{manifest_field} and {visible_seq_field} must be provided together"),
+        ))),
     }
 }
 
@@ -611,8 +646,9 @@ fn read_constraints_from_query_pairs(
         "read_barrier_visible_seq_no",
     )?;
     if snapshot.is_some() && read_barrier.is_some() {
-        return Err(ApiError(ServiceError::InvalidArgument(
-            "snapshot and read_barrier cannot be provided together".to_owned(),
+        return Err(ApiError(LogPoseError::invalid_field(
+            "read_barrier_manifest_generation",
+            "snapshot and read_barrier cannot be provided together",
         )));
     }
     Ok((snapshot, read_barrier))
@@ -757,13 +793,12 @@ mod tests {
             "snapshot_visible_seq_no",
         )
         .expect_err("partial snapshot pair should fail");
-        assert_eq!(
+        assert!(matches!(
             error.0,
-            ServiceError::InvalidArgument(
-                "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
-                    .to_owned(),
-            )
-        );
+            LogPoseError::InvalidArgument { field: Some(field), message }
+                if field == "snapshot_visible_seq_no"
+                    && message == "snapshot_manifest_generation and snapshot_visible_seq_no must be provided together"
+        ));
     }
 
     #[test]
@@ -773,7 +808,7 @@ mod tests {
 
         assert!(matches!(
             error.0,
-            ServiceError::InvalidArgument(message)
+            LogPoseError::InvalidArgument { message, .. }
                 if message == "snapshot and read_barrier cannot be provided together"
         ));
     }
@@ -783,13 +818,12 @@ mod tests {
         let error = read_constraints_from_query_pairs(None, None, Some(7), None)
             .expect_err("partial read barrier pair should fail");
 
-        assert_eq!(
+        assert!(matches!(
             error.0,
-            ServiceError::InvalidArgument(
-                "read_barrier_manifest_generation and read_barrier_visible_seq_no must be provided together"
-                    .to_owned(),
-            )
-        );
+            LogPoseError::InvalidArgument { field: Some(field), message }
+                if field == "read_barrier_visible_seq_no"
+                    && message == "read_barrier_manifest_generation and read_barrier_visible_seq_no must be provided together"
+        ));
     }
 
     #[tokio::test]
@@ -807,6 +841,253 @@ mod tests {
             .expect("router should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn request_bodies_above_the_limit_are_rejected_with_a_typed_413() {
+        let mut config = test_config("rest-body-limit");
+        config.limits.max_rest_body_bytes = 256;
+        let app = router(Arc::new(AppState::new(config)));
+        let body = json!({
+            "name": "documents",
+            "dimensions": 2,
+            "metric": "dot",
+            "padding": "x".repeat(512),
+        })
+        .to_string();
+        let size = body.len();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .header("content-length", size)
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
+        assert_eq!(body["details"]["reason"], "TOO_LARGE");
+        assert_eq!(body["details"]["metadata"]["limit_bytes"], "256");
+        assert_eq!(body["details"]["metadata"]["size_bytes"], size.to_string());
+
+        // A body under the limit is accepted.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_and_query_strings_are_typed_invalid_arguments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-malformed"))));
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats?snapshot_visible_seq_no=abc")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn read_barriers_ahead_only_in_manifest_generation_name_the_generation() {
+        let app = router(Arc::new(AppState::new(test_config(
+            "rest-barrier-generation",
+        ))));
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        // Sequence 0 is visible; manifest generation 9 is not.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats?read_barrier_manifest_generation=9&read_barrier_visible_seq_no=0")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.headers().get("retry-after").is_none());
+        let body = json_body(response).await;
+        assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
+        let metadata = &body["details"]["metadata"];
+        assert_eq!(metadata["required_manifest_generation"], "9");
+        assert_eq!(metadata["visible_manifest_generation"], "0");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("manifest generation 9")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_return_a_typed_not_found() {
+        let app = router(Arc::new(AppState::new(test_config("rest-unknown-route"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/nothing")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(body["details"]["metadata"]["resource_type"], "route");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            "GET /v2/nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn unserved_methods_on_known_paths_return_a_typed_not_found() {
+        let app = router(Arc::new(AppState::new(test_config("rest-unserved-method"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/collections/documents")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(body["details"]["metadata"]["resource_type"], "route");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            "DELETE /v1/collections/documents"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_path_parameters_are_typed_invalid_arguments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-bad-path"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/%FF")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn write_validation_errors_name_the_offending_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-field-path"))));
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {"op": "put", "id": "a", "vector": [1.0, 0.0], "metadata": {}},
+                                {"op": "put", "id": "b", "vector": [1.0], "metadata": {}}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(write).await;
+        assert_eq!(body["details"]["reason"], "DIMENSION_MISMATCH");
+        assert_eq!(
+            body["details"]["field_violations"][0]["field"],
+            "operations[1].vector"
+        );
+        assert_eq!(body["details"]["metadata"]["record_id"], "b");
     }
 
     #[tokio::test]
@@ -1338,7 +1619,13 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(unsatisfied.status(), StatusCode::PRECONDITION_FAILED);
+        // Waiting never satisfies a barrier on one node, so there is no retry hint.
+        assert_eq!(unsatisfied.status(), StatusCode::CONFLICT);
+        assert!(unsatisfied.headers().get("retry-after").is_none());
+        let body = json_body(unsatisfied).await;
+        assert_eq!(body["code"], "FAILED_PRECONDITION");
+        assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
+        assert!(body["details"].get("retry_after_ms").is_none());
     }
 
     #[tokio::test]
@@ -1758,12 +2045,13 @@ mod tests {
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = json_body(response).await;
-        assert!(body["error"].as_str().is_some_and(|message| {
-            message.contains(
-                "data-only nodes cannot accept control-plane collection lifecycle mutations",
-            )
+        assert_eq!(body["code"], "FAILED_PRECONDITION");
+        assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
+        assert_eq!(body["details"]["metadata"]["node_role"], "data");
+        assert!(body["message"].as_str().is_some_and(|message| {
+            message.contains("cannot accept control-plane collection lifecycle mutations")
         }));
     }
 
@@ -1793,13 +2081,10 @@ mod tests {
             .await
             .expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = json_body(response).await;
-        assert!(
-            body["error"]
-                .as_str()
-                .is_some_and(|message| message.contains("without a local data plane"))
-        );
+        assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
+        assert_eq!(body["details"]["metadata"]["node_role"], "control");
     }
 
     #[tokio::test]
@@ -1930,12 +2215,12 @@ mod tests {
         for (operation, response) in responses {
             assert_eq!(
                 response.status(),
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
                 "{operation} should be rejected on control-only nodes"
             );
             let body = json_body(response).await;
             assert!(
-                body["error"]
+                body["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("data-plane operations")),
                 "{operation} should explain the role mismatch"
@@ -2071,12 +2356,22 @@ mod tests {
         for (operation, response) in responses {
             assert_eq!(
                 response.status(),
-                StatusCode::BAD_REQUEST,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "{operation} should be rejected for recorded remote assignments"
             );
+            assert_eq!(
+                response.headers()["retry-after"],
+                "1",
+                "{operation} should carry a retry hint"
+            );
             let body = json_body(response).await;
+            assert_eq!(body["details"]["reason"], "NOT_OWNER", "{operation}");
             assert!(
-                body["error"]
+                body["details"]["metadata"]["owner_node"].is_string(),
+                "{operation} should name the owner"
+            );
+            assert!(
+                body["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("not locally served")),
                 "{operation} should explain the recorded placement mismatch"
@@ -2146,7 +2441,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = json_body(response).await;
         assert!(
-            body["error"]
+            body["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("dimensions must be greater than 0"))
         );
@@ -2642,7 +2937,7 @@ mod tests {
         assert_eq!(query.status(), StatusCode::BAD_REQUEST);
         let body = json_body(query).await;
         assert!(
-            body["error"]
+            body["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("top_k must be greater than 0"))
         );
@@ -2700,7 +2995,7 @@ mod tests {
 
         assert_eq!(write.status(), StatusCode::BAD_REQUEST);
         let body = json_body(write).await;
-        assert!(body["error"].as_str().is_some_and(|message| {
+        assert!(body["message"].as_str().is_some_and(|message| {
             message.contains("write operation record id must not be empty")
         }));
     }
@@ -2755,7 +3050,7 @@ mod tests {
 
         assert_eq!(write.status(), StatusCode::BAD_REQUEST);
         let body = json_body(write).await;
-        assert!(body["error"].as_str().is_some_and(|message| {
+        assert!(body["message"].as_str().is_some_and(|message| {
             message.contains("write operation record id must not be empty")
         }));
     }
@@ -2815,10 +3110,11 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(data_error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(data_error.status(), StatusCode::CONFLICT);
         let data_error_body = json_body(data_error).await;
-        assert!(data_error_body["error"].as_str().is_some_and(|message| {
-            message.contains("data-only nodes cannot accept control-plane database mutations")
+        assert_eq!(data_error_body["details"]["reason"], "WRONG_NODE_ROLE");
+        assert!(data_error_body["message"].as_str().is_some_and(|message| {
+            message.contains("cannot accept control-plane database mutations")
         }));
     }
 

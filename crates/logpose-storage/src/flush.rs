@@ -142,7 +142,7 @@ mod tests {
         assert!(
             refused
                 .to_string()
-                .contains("read-only until it is reopened"),
+                .contains("read-only until the engine is reopened"),
             "unexpected error: {refused}"
         );
         let visible = engine

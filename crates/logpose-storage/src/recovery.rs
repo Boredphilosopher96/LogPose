@@ -13,7 +13,7 @@ use crate::{
     version::{DeltaLog, Version},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionRef, LogPoseError, Result, SeqNo, Snapshot};
+use logpose_types::{CollectionRef, CorruptionKind, LogPoseError, Result, SeqNo, Snapshot};
 use logpose_vfs::Vfs;
 use logpose_wal::{
     WalBatch, WalFileKind, WalWriter, replay_dir_after_checkpoint, replay_file, rotate_active,
@@ -29,7 +29,7 @@ pub(crate) enum RecoveredCollection {
         reference: CollectionRef,
         /// The descriptor, when it is valid.
         descriptor: Option<Box<CollectionDescriptor>>,
-        error: String,
+        error: LogPoseError,
     },
     /// The descriptor cannot be parsed, so the collection is not even known by name.
     Unreadable { error: String },
@@ -59,7 +59,13 @@ impl EngineCore {
             return RecoveredCollection::Failed {
                 reference,
                 descriptor: None,
-                error: error.to_string(),
+                error: LogPoseError::corrupt(
+                    CorruptionKind::Descriptor,
+                    format!(
+                        "collection descriptor in '{}' is invalid: {error}",
+                        dir.display()
+                    ),
+                ),
             };
         }
         match self.open_collection(descriptor.clone()) {
@@ -67,7 +73,7 @@ impl EngineCore {
             Err(error) => RecoveredCollection::Failed {
                 reference,
                 descriptor: Some(Box::new(descriptor)),
-                error: error.to_string(),
+                error,
             },
         }
     }
@@ -216,9 +222,10 @@ impl EngineCore {
             .trim()
             .parse::<u64>()
             .map_err(|error| {
-                LogPoseError::Message(format!(
-                    "failed to parse pending WAL rotation marker: {error}"
-                ))
+                LogPoseError::corrupt(
+                    CorruptionKind::Wal,
+                    format!("failed to parse pending WAL rotation marker: {error}"),
+                )
             })?;
 
         if pending_checkpoint != manifest.checkpoint_seq_no {
@@ -269,14 +276,17 @@ fn ensure_active_wal_is_checkpointed(
     if max_seq_no <= checkpoint_seq_no {
         return Ok(());
     }
-    Err(LogPoseError::Message(format!(
-        "refusing to truncate '{}': pending WAL rotation marker '{}' names checkpoint {checkpoint_seq_no}, \
+    Err(LogPoseError::corrupt(
+        CorruptionKind::Wal,
+        format!(
+            "refusing to truncate '{}': pending WAL rotation marker '{}' names checkpoint {checkpoint_seq_no}, \
          but the active WAL holds records up to seq {max_seq_no} that are not checkpointed; \
          these are acknowledged writes, so recovery stopped instead of discarding them. \
          If the manifest checkpoint is correct, remove the marker to replay them",
-        active_wal_path.display(),
-        marker_path.display(),
-    )))
+            active_wal_path.display(),
+            marker_path.display(),
+        ),
+    ))
 }
 
 #[cfg(test)]

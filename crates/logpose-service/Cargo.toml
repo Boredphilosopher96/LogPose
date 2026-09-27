@@ -16,7 +16,6 @@ logpose-query = { path = "../logpose-query" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-storage-etcd = { path = "../logpose-storage-etcd" }
 logpose-types = { path = "../logpose-types" }
-thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
@@ -30,6 +29,7 @@ logpose-core = { path = "../logpose-core" }
 rand = "~0.10"
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tower.workspace = true
