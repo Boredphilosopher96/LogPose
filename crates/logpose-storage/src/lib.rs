@@ -20,15 +20,13 @@ use logpose_types::{
     LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
     RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
-use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
+use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file, rotate_active};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs::{self, File},
-    io,
-    io::Write,
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -37,6 +35,10 @@ use std::{
     thread,
 };
 use uuid::Uuid;
+
+mod durable_fs;
+
+use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir, write_file_synced};
 
 /// Durable storage surface for future engine implementations.
 #[async_trait]
@@ -495,8 +497,7 @@ impl LocalStorageEngine {
         descriptor: CollectionDescriptor,
         assignment: Option<&CollectionAssignment>,
     ) -> Result<CollectionDescriptor> {
-        fs::create_dir_all(self.collections_root())
-            .map_err(|error| io_message("failed to create collections root", error))?;
+        create_dir_all_synced(&self.collections_root())?;
         if self
             .find_collection_descriptor_ref(&descriptor.collection_ref())
             .is_ok()
@@ -518,6 +519,7 @@ impl LocalStorageEngine {
             self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
             let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
             wal_writer.truncate()?;
+            sync_parent_dir(&Self::active_wal_path(&descriptor))?;
             atomic_write(
                 &Self::descriptor_path(&descriptor),
                 serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
@@ -587,8 +589,7 @@ impl LocalStorageEngine {
                 "database descriptor path for '{database_name}' is missing a parent directory"
             ))
         })?;
-        fs::create_dir_all(parent)
-            .map_err(|error| io_message("failed to create databases root", error))?;
+        create_dir_all_synced(parent)?;
         atomic_write(
             &path,
             serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
@@ -749,22 +750,35 @@ impl LocalStorageEngine {
             })?;
 
         if pending_checkpoint == manifest.checkpoint_seq_no {
-            let mut wal_writer = WalWriter::open(Self::active_wal_path(descriptor))?;
+            let active_wal_path = Self::active_wal_path(descriptor);
+            ensure_active_wal_is_checkpointed(&active_wal_path, &marker_path, pending_checkpoint)?;
+            let mut wal_writer = WalWriter::open(&active_wal_path)?;
             wal_writer.truncate()?;
-            remove_file_if_exists(&marker_path, "failed to clear pending WAL rotation marker")?;
+            Self::clear_pending_rotation_marker(descriptor)?;
             return Ok(true);
         }
 
         Ok(false)
     }
 
+    /// Remove the pending-rotation marker and make the removal durable.
+    fn clear_pending_rotation_marker(descriptor: &CollectionDescriptor) -> Result<()> {
+        let marker_path = Self::pending_rotation_file_path(descriptor);
+        #[cfg(test)]
+        failpoints::check_marker_removal(&marker_path)?;
+        remove_file_if_exists(&marker_path, "failed to clear pending WAL rotation marker")?;
+        sync_parent_dir(&marker_path)
+    }
+
     fn create_collection_directories(&self, descriptor: &CollectionDescriptor) -> Result<()> {
+        create_dir_all_synced(&descriptor.root_path)?;
         fs::create_dir_all(descriptor.root_path.join("manifests"))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("wal")))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("segments")))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("indexes")))
             .and_then(|_| fs::create_dir_all(descriptor.root_path.join("tmp")))
-            .map_err(|error| io_message("failed to create collection directories", error))
+            .map_err(|error| io_message("failed to create collection directories", error))?;
+        sync_dir(&descriptor.root_path)
     }
 
     fn find_collection_descriptor(&self, name: &str) -> Result<CollectionDescriptor> {
@@ -1270,7 +1284,9 @@ impl LocalStorageEngine {
             .join("wal")
             .join(format!("{checkpoint_seq_no:020}.wal"));
         rotate_active(Self::active_wal_path(&state.descriptor), rolled_path)?;
-        cleanup_file(&Self::pending_rotation_file_path(&state.descriptor));
+        // A surviving marker makes the next load treat `active.wal` as checkpointed, so the
+        // flush must not report success unless the marker is durably gone.
+        Self::clear_pending_rotation_marker(&state.descriptor)?;
 
         Ok(Snapshot {
             manifest_generation: next_manifest.generation,
@@ -1573,7 +1589,13 @@ fn publish_segment_artifacts(
     flat_index: &FlatIndexSidecar,
     hnsw_index: &HnswIndexSidecar,
 ) -> Result<()> {
-    atomic_write(paths.segment_temp_path, segment_bytes)?;
+    if let Some(parent) = paths.segment_temp_path.parent() {
+        create_dir_all_synced(parent)?;
+    }
+    if let Err(error) = write_file_synced(paths.segment_temp_path, &segment_bytes) {
+        cleanup_file(paths.segment_temp_path);
+        return Err(error);
+    }
     if let Err(error) = write_flat_index(paths.flat_temp_path, flat_index) {
         cleanup_file(paths.segment_temp_path);
         cleanup_file(paths.flat_temp_path);
@@ -1605,7 +1627,47 @@ fn publish_segment_artifacts(
         cleanup_file(paths.hnsw_temp_path);
         return Err(io_message("failed to publish hnsw sidecar", error));
     }
+    // The renames above are durable only once their directories are synced, and the manifest
+    // that references these files must not be published before that.
+    sync_parent_dir(paths.segment_path)?;
+    sync_parent_dir(paths.flat_path)?;
+    if paths.hnsw_path.parent() != paths.flat_path.parent() {
+        sync_parent_dir(paths.hnsw_path)?;
+    }
     Ok(())
+}
+
+/// Refuse to discard an active WAL that holds records above the checkpoint named by a surviving
+/// `PENDING_ROTATION` marker.
+///
+/// The rotation protocol never appends to `active.wal` while the marker is live, so such records
+/// can only be acknowledged writes that followed a flush whose marker removal was lost. They are
+/// not in any segment, so truncating would silently drop them.
+///
+/// An active WAL that cannot be decoded at all is left to the truncation path: by the same
+/// protocol its contents are the already-checkpointed tail of the flush that wrote the marker.
+fn ensure_active_wal_is_checkpointed(
+    active_wal_path: &Path,
+    marker_path: &Path,
+    checkpoint_seq_no: SeqNo,
+) -> Result<()> {
+    let Ok(records) = replay_file(active_wal_path) else {
+        return Ok(());
+    };
+    let Some(max_seq_no) = records.iter().map(|record| record.seq_no).max() else {
+        return Ok(());
+    };
+    if max_seq_no <= checkpoint_seq_no {
+        return Ok(());
+    }
+    Err(LogPoseError::Message(format!(
+        "refusing to truncate '{}': pending WAL rotation marker '{}' names checkpoint {checkpoint_seq_no}, \
+         but the active WAL holds records up to seq {max_seq_no} that are not checkpointed; \
+         these are acknowledged writes, so recovery stopped instead of discarding them. \
+         If the manifest checkpoint is correct, remove the marker to replay them",
+        active_wal_path.display(),
+        marker_path.display(),
+    )))
 }
 
 fn cleanup_file(path: &Path) {
@@ -2863,10 +2925,13 @@ where
     serde_json::from_slice(&bytes).map_err(json_message)
 }
 
+/// Durably replace `path` with `bytes`: write a temp file, fsync it, rename it into place, and
+/// fsync the parent directory so the rename survives power loss.
 fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| io_message("failed to create parent directory", error))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all_synced(parent)?;
     }
     static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let temp_path = path.with_file_name(format!(
@@ -2877,13 +2942,15 @@ fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
         std::process::id(),
         ATOMIC_WRITE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
     ));
-    let mut file = File::create(&temp_path)
-        .map_err(|error| io_message("failed to create temp file", error))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| io_message("failed to write temp file", error))?;
-    fs::rename(&temp_path, path)
-        .map_err(|error| io_message("failed to atomically rename file", error))
+    if let Err(error) = write_file_synced(&temp_path, &bytes) {
+        cleanup_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp_path, path) {
+        cleanup_file(&temp_path);
+        return Err(io_message("failed to atomically rename file", error));
+    }
+    sync_parent_dir(path)
 }
 
 fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> Result<&'a [u8]> {
@@ -2947,6 +3014,52 @@ fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Test-only fault injection for failures that cannot be provoked through the filesystem when
+/// tests run with elevated privileges.
+#[cfg(test)]
+mod failpoints {
+    use logpose_types::{LogPoseError, Result};
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+        sync::{Mutex, OnceLock, PoisonError},
+    };
+
+    fn failing_marker_removals() -> &'static Mutex<BTreeSet<PathBuf>> {
+        static PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+        PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+    }
+
+    /// Make every removal of `marker_path` fail until [`clear_marker_removal_failure`] runs.
+    pub(crate) fn fail_marker_removal(marker_path: &Path) {
+        failing_marker_removals()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(marker_path.to_path_buf());
+    }
+
+    pub(crate) fn clear_marker_removal_failure(marker_path: &Path) {
+        failing_marker_removals()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(marker_path);
+    }
+
+    pub(crate) fn check_marker_removal(marker_path: &Path) -> Result<()> {
+        if failing_marker_removals()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(marker_path)
+        {
+            return Err(LogPoseError::Message(format!(
+                "failed to clear pending WAL rotation marker '{}': injected failure",
+                marker_path.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3217,6 +3330,183 @@ mod tests {
         assert!(
             !coordinator.contains_key(&coordinator_key),
             "descriptor lookup failure should clear runtime coordinator state"
+        );
+    }
+
+    fn put(id: &str, vector: Vec<f32>) -> WriteOperation {
+        WriteOperation::Put(PutRecord {
+            id: RecordId::new(id),
+            vector,
+            metadata: json!({"id": id}),
+        })
+    }
+
+    fn visible_ids(records: &[VisibleRecord]) -> Vec<String> {
+        records
+            .iter()
+            .map(|record| record.id.as_str().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn flush_fails_when_pending_rotation_marker_cannot_be_removed() {
+        let root = unique_temp_dir("storage-marker-removal-failure");
+        let engine = LocalStorageEngine::new(&root);
+        let descriptor = engine
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        engine
+            .write("documents", vec![put("alpha", vec![1.0, 0.0])])
+            .await
+            .expect("write should succeed");
+
+        let marker_path = LocalStorageEngine::pending_rotation_file_path(&descriptor);
+        failpoints::fail_marker_removal(&marker_path);
+        let error = engine
+            .flush("documents")
+            .await
+            .expect_err("flush must not report success while the rotation marker survives");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to clear pending WAL rotation marker"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            marker_path.exists(),
+            "marker should survive the failed removal"
+        );
+
+        engine
+            .write("documents", vec![put("beta", vec![0.0, 1.0])])
+            .await
+            .expect_err("writes must be refused while the stale marker cannot be cleared");
+
+        failpoints::clear_marker_removal_failure(&marker_path);
+        engine
+            .write("documents", vec![put("beta", vec![0.0, 1.0])])
+            .await
+            .expect("write should succeed once recovery clears the marker");
+        assert!(
+            !marker_path.exists(),
+            "recovery should clear the checkpointed marker"
+        );
+
+        drop(engine);
+        let reopened = LocalStorageEngine::new(&root);
+        let visible = reopened
+            .scan_exact("documents", None)
+            .await
+            .expect("scan should succeed after reopen");
+        assert_eq!(visible_ids(&visible), vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_to_truncate_uncheckpointed_records_behind_stale_marker() {
+        let root = unique_temp_dir("storage-stale-marker-recovery");
+        let engine = LocalStorageEngine::new(&root);
+        let descriptor = engine
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        engine
+            .write("documents", vec![put("alpha", vec![1.0, 0.0])])
+            .await
+            .expect("first write should succeed");
+        let flushed = engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+        let acked = engine
+            .write("documents", vec![put("beta", vec![0.0, 1.0])])
+            .await
+            .expect("post-flush write should be acknowledged");
+        assert!(acked.last_seq_no > flushed.visible_seq_no);
+
+        // Simulate a flush whose marker removal was lost before the write above was acknowledged.
+        let marker_path = LocalStorageEngine::pending_rotation_file_path(&descriptor);
+        fs::write(&marker_path, flushed.visible_seq_no.to_string())
+            .expect("stale marker should be written");
+        drop(engine);
+
+        let reopened = LocalStorageEngine::new(&root);
+        let error = reopened
+            .scan_exact("documents", None)
+            .await
+            .expect_err("recovery must not discard acknowledged writes");
+        assert!(
+            error.to_string().contains("refusing to truncate"),
+            "unexpected error: {error}"
+        );
+        let active_wal = replay_file(LocalStorageEngine::active_wal_path(&descriptor))
+            .expect("active wal should stay readable");
+        assert_eq!(
+            active_wal
+                .iter()
+                .map(|record| record.seq_no)
+                .collect::<Vec<_>>(),
+            vec![acked.last_seq_no],
+            "the acknowledged write must remain in the active wal"
+        );
+
+        fs::remove_file(&marker_path).expect("operator removes the stale marker");
+        let visible = reopened
+            .scan_exact("documents", None)
+            .await
+            .expect("scan should succeed once the stale marker is gone");
+        assert_eq!(visible_ids(&visible), vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_truncates_checkpointed_active_wal_behind_pending_marker() {
+        let root = unique_temp_dir("storage-pending-marker-checkpointed");
+        let engine = LocalStorageEngine::new(&root);
+        let descriptor = engine
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        engine
+            .write("documents", vec![put("alpha", vec![1.0, 0.0])])
+            .await
+            .expect("write should succeed");
+        let active_path = LocalStorageEngine::active_wal_path(&descriptor);
+        let unrotated = fs::read(&active_path).expect("active wal should be readable");
+        let flushed = engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+
+        // Simulate a crash after the manifest was published but before the WAL was rotated.
+        fs::write(&active_path, unrotated).expect("active wal should be restored");
+        let marker_path = LocalStorageEngine::pending_rotation_file_path(&descriptor);
+        fs::write(&marker_path, flushed.visible_seq_no.to_string())
+            .expect("marker should be written");
+
+        let stats = engine
+            .stats("documents")
+            .await
+            .expect("checkpointed active wal should be discarded");
+        assert_eq!(stats.live_record_count, 1);
+        assert_eq!(stats.mutable_op_count, 0);
+        assert!(!marker_path.exists(), "marker should be cleared");
+        assert!(
+            replay_file(&active_path)
+                .expect("active wal should be readable")
+                .is_empty(),
+            "checkpointed records should be truncated"
         );
     }
 
