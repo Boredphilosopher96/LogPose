@@ -1388,6 +1388,7 @@ dependencies = [
  "logpose-catalog",
  "logpose-storage",
  "logpose-types",
+ "protoc-bin-vendored",
  "serde",
  "serde_json",
  "tokio",

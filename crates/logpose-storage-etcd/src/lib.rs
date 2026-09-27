@@ -19,6 +19,8 @@ use logpose_types::{
     CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError,
     MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
+// Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
+use protoc_bin_vendored as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
