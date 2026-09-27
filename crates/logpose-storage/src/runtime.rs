@@ -5,6 +5,7 @@
 //! work on the `query` pool, and long-running flush and compaction CPU work on the smaller
 //! `maintenance` pool so that it cannot starve queries.
 
+use crate::cache::{LoadExecutor, LoadJob};
 use logpose_types::{LogPoseError, Result};
 use std::{
     fmt,
@@ -196,6 +197,14 @@ impl fmt::Debug for IoPool {
     }
 }
 
+/// Buffer cache misses run on the I/O pool. A job the pool cannot accept (it has shut down) is
+/// dropped, which fails the load with `SegmentError::LoadAborted` for every waiter.
+impl LoadExecutor for IoPool {
+    fn execute(&self, job: LoadJob) {
+        let _ = IoPool::execute(self, move || job.run());
+    }
+}
+
 fn worker(receiver: &Mutex<Receiver<Job>>) {
     loop {
         // The guard is dropped at the end of this statement, before the job runs.
@@ -348,6 +357,85 @@ mod tests {
             .await
             .expect_err("a panic should be reported");
         assert!(error.to_string().contains("panicked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn io_pool_runs_buffer_cache_misses() {
+        use crate::cache::{
+            AlignedBytes, ArtifactClass, BufferCache, CacheConfig, CacheKey, CacheMode, Fetched,
+            FileId,
+        };
+        let pool = IoPool::new("test-io", 2, 8).expect("pool should start");
+        let cache = BufferCache::new(CacheConfig::with_budget(1 << 20));
+        let key = CacheKey::section(FileId::next(), 0);
+        let caller = thread::current().id();
+        let (bytes, fetched) = cache
+            .get_or_load(
+                key,
+                ArtifactClass::PkIndex,
+                CacheMode::Normal,
+                &pool,
+                move || {
+                    assert_ne!(thread::current().id(), caller, "the miss runs on the pool");
+                    Ok(AlignedBytes::copy_from(b"section"))
+                },
+            )
+            .await
+            .expect("load succeeds");
+        assert_eq!(&**bytes, b"section");
+        assert!(matches!(fetched, Fetched::Loaded { .. }));
+        assert!(cache.residency(&key));
+    }
+
+    /// An I/O thread that needs a unit whose miss is queued behind it on its own pool (here the
+    /// only thread, with the bounded queue full) runs the queued load itself instead of waiting
+    /// for a thread that will never come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_io_thread_runs_a_cache_load_queued_behind_it() {
+        use crate::cache::{
+            AlignedBytes, ArtifactClass, BufferCache, CacheConfig, CacheKey, CacheMode, Fetched,
+            FileId,
+        };
+        let pool = IoPool::new("test-io", 1, 1).expect("pool should start");
+        let cache = BufferCache::new(CacheConfig::with_budget(1 << 20));
+        let key = CacheKey::section(FileId::next(), 0);
+        let (started, started_receiver) = mpsc::channel();
+        let (go, go_receiver) = mpsc::channel::<()>();
+        let blocking = tokio::spawn(pool.run({
+            let cache = cache.clone();
+            move || {
+                started.send(()).expect("test is waiting");
+                go_receiver.recv().expect("test signals");
+                cache.get_or_load_blocking(key, ArtifactClass::PkIndex, CacheMode::Normal, || {
+                    Ok(AlignedBytes::copy_from(b"inline"))
+                })
+            }
+        }));
+        started_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocking job occupies the only I/O thread");
+        let fetch = cache.get_or_load(
+            key,
+            ArtifactClass::PkIndex,
+            CacheMode::Normal,
+            &pool,
+            || Ok(AlignedBytes::copy_from(b"queued")),
+        );
+        go.send(()).expect("job is waiting");
+        let (bytes, fetched) = tokio::time::timeout(Duration::from_secs(10), blocking)
+            .await
+            .expect("the I/O thread must not wait for a job queued behind it")
+            .expect("task should join")
+            .expect("job should run")
+            .expect("load succeeds");
+        assert_eq!(&**bytes, b"queued", "it ran the queued loader");
+        assert_eq!(fetched, Fetched::Waited);
+        let (bytes, fetched) = tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("the async caller is woken")
+            .expect("load succeeds");
+        assert_eq!(&**bytes, b"queued");
+        assert!(matches!(fetched, Fetched::Loaded { .. }));
     }
 
     #[test]
