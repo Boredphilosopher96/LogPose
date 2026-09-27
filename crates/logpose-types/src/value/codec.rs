@@ -74,6 +74,14 @@ const JSON_OBJECT: u8 = 0x18;
 /// Longest LEB128 encoding of a `u64`.
 const MAX_VARINT_BYTES: usize = 10;
 
+/// Most array elements reserved up front from a declared count. A count is
+/// only bounded by the remaining input, and every nesting level reserves
+/// its own buffer before its first element is read, so without this cap
+/// 128 nested arrays that each declare about `n` elements would reserve
+/// about `128 * 32 * n` bytes from an `n`-byte input. Larger arrays grow as
+/// their elements are actually decoded.
+const MAX_PREALLOCATED_ITEMS: usize = 1024;
+
 /// Reasons a value cannot be encoded, or bytes cannot be decoded.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum CodecError {
@@ -514,7 +522,7 @@ impl<'a> Reader<'a> {
 
     fn array(&mut self, element: ElementType, depth: usize) -> Result<Value, CodecError> {
         let count = self.len()?;
-        let mut items = Vec::with_capacity(count);
+        let mut items = Vec::with_capacity(count.min(MAX_PREALLOCATED_ITEMS));
         for _ in 0..count {
             let offset = self.pos;
             let item = self.value(element.into(), depth + 1)?;
@@ -552,7 +560,7 @@ impl<'a> Reader<'a> {
             JSON_STRING => Ok(JsonValue::String(self.string()?)),
             JSON_ARRAY => {
                 let count = self.len()?;
-                let mut items = Vec::with_capacity(count);
+                let mut items = Vec::with_capacity(count.min(MAX_PREALLOCATED_ITEMS));
                 for _ in 0..count {
                     items.push(self.json(depth + 1)?);
                 }
