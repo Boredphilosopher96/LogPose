@@ -20,7 +20,10 @@ use logpose_types::{
     LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
     RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
-use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file, rotate_active};
+use logpose_wal::{
+    ACTIVE_WAL_FILE_NAME, WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint,
+    replay_file, rotate_active,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -427,7 +430,7 @@ impl LocalStorageEngine {
     }
 
     fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join("active.wal")
+        descriptor.root_path.join("wal").join(ACTIVE_WAL_FILE_NAME)
     }
 
     fn rolled_wal_path(descriptor: &CollectionDescriptor, checkpoint_seq_no: SeqNo) -> PathBuf {
@@ -699,7 +702,6 @@ impl LocalStorageEngine {
             manifest.checkpoint_seq_no,
         )?
         .into_iter()
-        .filter(|record| record.seq_no > manifest.checkpoint_seq_no)
         .chain(promoted_delta)
         .collect::<Vec<_>>();
         let mut delta = delta;
@@ -1656,17 +1658,16 @@ fn publish_segment_artifacts(
 /// can only be acknowledged writes that followed a flush whose marker removal was lost. They are
 /// not in any segment, so truncating would silently drop them.
 ///
-/// An active WAL that cannot be decoded at all is left to the truncation path: by the same
-/// protocol its contents are the already-checkpointed tail of the flush that wrote the marker.
+/// A torn tail is ignored by the active-WAL reader, so a crash mid-append never blocks
+/// recovery. Any other defect is an error: truncating an undecodable WAL could discard exactly
+/// the records this check exists to protect, and opening it for truncation fails the same way.
 fn ensure_active_wal_is_checkpointed(
     active_wal_path: &Path,
     marker_path: &Path,
     checkpoint_seq_no: SeqNo,
 ) -> Result<()> {
-    let Ok(records) = replay_file(active_wal_path) else {
-        return Ok(());
-    };
-    let Some(max_seq_no) = records.iter().map(|record| record.seq_no).max() else {
+    let batches = replay_file(active_wal_path, WalFileKind::Active)?;
+    let Some(max_seq_no) = batches.iter().map(WalBatch::last_seq_no).max() else {
         return Ok(());
     };
     if max_seq_no <= checkpoint_seq_no {
@@ -1883,17 +1884,20 @@ impl StorageEngine for LocalStorageEngine {
             }
         }
 
+        // The whole batch is one WAL frame with one fsync, so replay sees all of it or none.
+        let applied_ops = operations.len();
+        let batch = WalBatch::new(
+            operations
+                .into_iter()
+                .zip(existing_max + 1..)
+                .map(|(op, seq_no)| WalRecord { seq_no, op })
+                .collect(),
+        )?;
+        let last_seq_no = batch.last_seq_no();
         let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
-        let mut last_seq_no = existing_max;
+        wal_writer.append_batch(&batch)?;
         let mut delta_after_write = state.delta.clone();
-        for operation in &operations {
-            last_seq_no += 1;
-            wal_writer.append(last_seq_no, operation)?;
-            delta_after_write.push(WalRecord {
-                seq_no: last_seq_no,
-                op: operation.clone(),
-            });
-        }
+        delta_after_write.extend(batch.into_records());
 
         if self.should_flush(&state.descriptor, &delta_after_write) {
             self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Flush])?;
@@ -1903,7 +1907,7 @@ impl StorageEngine for LocalStorageEngine {
 
         Ok(CommitAck {
             last_seq_no,
-            applied_ops: operations.len(),
+            applied_ops,
             snapshot: Snapshot {
                 manifest_generation: state.manifest.generation,
                 visible_seq_no: last_seq_no,
@@ -3491,11 +3495,15 @@ mod tests {
             error.to_string().contains("refusing to truncate"),
             "unexpected error: {error}"
         );
-        let active_wal = replay_file(LocalStorageEngine::active_wal_path(&descriptor))
-            .expect("active wal should stay readable");
+        let active_wal = replay_file(
+            LocalStorageEngine::active_wal_path(&descriptor),
+            WalFileKind::Active,
+        )
+        .expect("active wal should stay readable");
         assert_eq!(
             active_wal
                 .iter()
+                .flat_map(WalBatch::records)
                 .map(|record| record.seq_no)
                 .collect::<Vec<_>>(),
             vec![acked.last_seq_no],
@@ -3547,10 +3555,58 @@ mod tests {
         assert_eq!(stats.mutable_op_count, 0);
         assert!(!marker_path.exists(), "marker should be cleared");
         assert!(
-            replay_file(&active_path)
+            replay_file(&active_path, WalFileKind::Active)
                 .expect("active wal should be readable")
                 .is_empty(),
             "checkpointed records should be truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_truncates_checkpointed_active_wal_with_torn_tail_behind_pending_marker() {
+        let root = unique_temp_dir("storage-pending-marker-torn-tail");
+        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+        let descriptor = engine
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        engine
+            .write("documents", vec![put("alpha", vec![1.0, 0.0])])
+            .await
+            .expect("write should succeed");
+        let active_path = LocalStorageEngine::active_wal_path(&descriptor);
+        let mut unrotated = fs::read(&active_path).expect("active wal should be readable");
+        let flushed = engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+
+        // Crash after the manifest was published but before rotation, with a torn frame left
+        // by an append that was never acknowledged.
+        let torn_frame = unrotated[..unrotated.len() / 2].to_vec();
+        unrotated.extend_from_slice(&torn_frame);
+        fs::write(&active_path, unrotated).expect("active wal should be restored");
+        let marker_path = LocalStorageEngine::pending_rotation_file_path(&descriptor);
+        fs::write(&marker_path, flushed.visible_seq_no.to_string())
+            .expect("marker should be written");
+
+        let stats = engine
+            .stats("documents")
+            .await
+            .expect("a torn tail must not block recovery of a checkpointed active wal");
+        assert_eq!(stats.live_record_count, 1);
+        assert_eq!(stats.mutable_op_count, 0);
+        assert!(!marker_path.exists(), "marker should be cleared");
+        assert_eq!(
+            fs::metadata(&active_path)
+                .expect("active wal should exist")
+                .len(),
+            0,
+            "the checkpointed records and the torn tail should be truncated"
         );
     }
 
