@@ -484,14 +484,15 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::ScanSnapshot { snapshot_index } => {
-                let entry = snapshots.get(snapshot_index).cloned().unwrap_or_else(|| {
+                if snapshot_index >= snapshots.len() {
                     panic_with_context(
                         seed,
                         &trace,
                         format!("missing snapshot index {snapshot_index}"),
-                    )
-                });
-                assert_snapshot_reads(&engine, &model, &entry, seed, &trace).await;
+                    );
+                }
+                assert_snapshot_reads(&engine, &model, &snapshots, snapshot_index, seed, &trace)
+                    .await;
             }
             StorageAction::Flush => {
                 let snapshot = engine.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
@@ -602,7 +603,9 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 // generation is current, and is expired otherwise: pins end with the process.
                 for entry in &mut snapshots {
                     entry.token = None;
-                    assert_snapshot_reads(&engine, &model, entry, seed, &trace).await;
+                }
+                for index in 0..snapshots.len() {
+                    assert_snapshot_reads(&engine, &model, &snapshots, index, seed, &trace).await;
                 }
             }
         }
@@ -619,16 +622,24 @@ struct PinnedSnapshot {
 /// Most snapshots the harness keeps pinned at once.
 const MAX_PINNED: usize = 16;
 
-/// A pinned snapshot, or one of the current generation, reads exactly the state it named; any
-/// other is expired.
+/// A snapshot reads exactly the state it named while its generation is current or a pinned
+/// version of its generation covers it (its own token, or a later pin taken before the next
+/// flush or compaction); any other is expired.
 async fn assert_snapshot_reads(
     engine: &LocalStorageEngine,
     model: &ExpectedModel,
-    entry: &PinnedSnapshot,
+    snapshots: &[PinnedSnapshot],
+    index: usize,
     seed: u64,
     trace: &[StorageAction],
 ) {
+    let entry = &snapshots[index];
     let snapshot = &entry.snapshot;
+    let covered = snapshots.iter().any(|other| {
+        other.token.is_some()
+            && other.snapshot.manifest_generation == snapshot.manifest_generation
+            && other.snapshot.visible_seq_no >= snapshot.visible_seq_no
+    });
     if let Some(token) = &entry.token {
         let actual = engine
             .scan_exact_at_token(COLLECTION_NAME, token.clone())
@@ -639,7 +650,7 @@ async fn assert_snapshot_reads(
         let expected = model.expected_visible(snapshot.visible_seq_no);
         assert_eq_with_context(seed, trace, "token scan mismatch", &expected, &actual);
     }
-    if entry.token.is_some() || snapshot.manifest_generation == model.manifest_generation {
+    if covered || snapshot.manifest_generation == model.manifest_generation {
         assert_scan_matches_snapshot(engine, model, snapshot, seed, trace).await;
         assert_exact_queries_match_snapshot(engine, model, snapshot, seed, trace).await;
         assert_stats_match(engine, model, Some(snapshot.clone()), seed, trace).await;

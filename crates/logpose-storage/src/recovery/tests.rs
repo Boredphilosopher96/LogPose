@@ -166,7 +166,8 @@ fn a_crash_at_every_op_of_a_flush_recovers_the_same_rows_without_orphans() {
             engine
                 .core()
                 .flush_collection(&handle)
-                .unwrap_or_else(|error| panic!("{context}: flush after recovery: {error}"));
+                .map_err(|error| format!("{context}: {error}"))
+                .expect("a flush after recovery succeeds");
             assert_eq!(rows(&engine).len(), 3, "{context}");
         }
     }

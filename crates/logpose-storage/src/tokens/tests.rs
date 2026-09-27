@@ -113,19 +113,17 @@ fn a_token_round_trips_through_its_text_and_rejects_tampering() {
 
 #[test]
 fn base64url_matches_the_rfc_4648_vectors() {
-    for (plain, encoded) in [
-        (&b""[..], ""),
-        (b"f", "Zg"),
-        (b"fo", "Zm8"),
-        (b"foo", "Zm9v"),
-        (b"foob", "Zm9vYg"),
-        (b"fooba", "Zm9vYmE"),
-        (b"foobar", "Zm9vYmFy"),
-        (&[0xfb, 0xff], "-_8"),
-    ] {
+    // RFC 4648 section 10: the prefixes of "foobar".
+    let foobar = b"foobar";
+    let encodings = ["", "Zg", "Zm8", "Zm9v", "Zm9vYg", "Zm9vYmE", "Zm9vYmFy"];
+    for (len, encoded) in encodings.into_iter().enumerate() {
+        let plain = &foobar[..len];
         assert_eq!(base64url_encode(plain), encoded);
         assert_eq!(base64url_decode(encoded).as_deref(), Some(plain));
     }
+    // The URL-safe alphabet.
+    assert_eq!(base64url_encode(&[0xfb, 0xff]), "-_8");
+    assert_eq!(base64url_decode("-_8").as_deref(), Some(&[0xfb, 0xff][..]));
     assert_eq!(base64url_decode("Zh"), None, "non-canonical trailing bits");
     assert_eq!(base64url_decode("Z"), None);
 }

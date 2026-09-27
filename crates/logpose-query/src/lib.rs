@@ -234,7 +234,7 @@ const IMPLICIT_SNAPSHOT_ATTEMPTS: usize = 3;
 /// A query without an explicit snapshot reads the snapshot current when it starts. Storage
 /// retains an unpinned snapshot only while its manifest generation is current, so if a flush or
 /// compaction publishes between the query's storage calls, the query restarts on the new
-/// snapshot (at most [`IMPLICIT_SNAPSHOT_ATTEMPTS`] times). A query with an explicit snapshot
+/// snapshot (at most three attempts in all). A query with an explicit snapshot
 /// fails with [`LogPoseError::SnapshotExpired`] instead: its caller asked for that state.
 pub async fn query_exact<S>(storage: &S, request: QueryRequest) -> Result<QueryResponse>
 where

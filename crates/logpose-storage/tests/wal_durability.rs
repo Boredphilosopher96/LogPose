@@ -287,8 +287,8 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .collect::<Vec<_>>();
     assert_eq!(seq_nos, vec![json!(4), json!(5)]);
 
-    // The snapshot taken before the flush still replays the rolled batch whole.
-    let old = reopened
+    // The first flush's snapshot is gone after the reopen: tokens do not survive a restart.
+    let error = reopened
         .scan_exact(
             "documents",
             Some(logpose_types::Snapshot {
@@ -297,14 +297,24 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
             }),
         )
         .await
-        .expect("pre-flush snapshot should scan");
-    assert_eq!(old.len(), 3);
+        .expect_err("an unpinned older generation is not retained");
+    assert!(
+        matches!(error, logpose_types::LogPoseError::SnapshotExpired { .. }),
+        "{error}"
+    );
 
+    // A snapshot pinned before the second flush still reads both batches whole.
+    let (token, _) = reopened.pin_snapshot("documents").expect("pin");
     let flushed = reopened
         .flush("documents")
         .await
         .expect("second flush should succeed");
     assert_eq!(flushed.visible_seq_no, 5);
+    let old = reopened
+        .scan_exact_at_token("documents", token)
+        .await
+        .expect("the pinned snapshot should scan");
+    assert_eq!(old.len(), 5);
     drop(reopened);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
@@ -321,7 +331,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
 }
 
 #[tokio::test]
-async fn a_flush_after_a_torn_tail_leaves_a_clean_older_wal_file() {
+async fn a_flush_after_a_torn_tail_rotates_then_deletes_the_repaired_file() {
     let root = support::unique_temp_dir("storage-wal-torn-flush");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
@@ -336,29 +346,27 @@ async fn a_flush_after_a_torn_tail_leaves_a_clean_older_wal_file() {
 
     drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    // Recovery repaired the tail: the file keeps exactly the committed groups.
+    let repaired = fs::read(&active).expect("the active wal should exist");
+    assert_eq!(repaired, bytes[..bytes.len() - b"torn".len()]);
+    let (token, _) = reopened.pin_snapshot("documents").expect("pin");
+
     let flushed = reopened
         .flush("documents")
         .await
         .expect("flush should succeed");
     assert_eq!(flushed.visible_seq_no, 2);
 
-    // Recovery repaired the tail, and the flush rotated to a new file named for the next
-    // sequence number, so the old file keeps exactly the committed groups.
-    let old_bytes = fs::read(&active).expect("old wal file should exist");
-    assert_eq!(old_bytes, bytes[..bytes.len() - b"torn".len()]);
+    // The flush rotated to a new file named for the next sequence number, and deleted the old
+    // one once the manifest that checkpoints it was durable.
     let rotated = active.with_file_name(format!("{:020}.wal", flushed.visible_seq_no + 1));
     assert!(rotated.exists(), "the flush rotated the WAL");
+    assert!(!active.exists(), "the checkpointed file is deleted");
 
-    // Older snapshots replay the old file strictly, which only works if it is clean.
+    // The pre-flush state is read from the pinned version, never from the WAL.
     let old = reopened
-        .scan_exact(
-            "documents",
-            Some(logpose_types::Snapshot {
-                manifest_generation: flushed.manifest_generation - 1,
-                visible_seq_no: 2,
-            }),
-        )
+        .scan_exact_at_token("documents", token)
         .await
-        .expect("pre-flush snapshot should scan");
+        .expect("the pinned snapshot should scan");
     assert_eq!(old.len(), 2);
 }

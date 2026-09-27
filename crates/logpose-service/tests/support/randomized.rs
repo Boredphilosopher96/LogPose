@@ -436,18 +436,33 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                         format!("missing snapshot index {snapshot_index}"),
                     )
                 });
-                assert_query_parity(
-                    &state,
-                    &rest,
-                    &grpc,
-                    &model,
-                    Some(snapshot),
-                    vector_index,
-                    keep_only,
-                    seed,
-                    &trace,
-                )
-                .await;
+                // The service pins nothing, so a snapshot stays exact only while its manifest
+                // generation is current.
+                if snapshot.manifest_generation == model.manifest_generation {
+                    assert_query_parity(
+                        &state,
+                        &rest,
+                        &grpc,
+                        &model,
+                        Some(snapshot),
+                        vector_index,
+                        keep_only,
+                        seed,
+                        &trace,
+                    )
+                    .await;
+                } else {
+                    assert_snapshot_expired_everywhere(
+                        &state,
+                        &rest,
+                        &grpc,
+                        snapshot,
+                        vector_index,
+                        seed,
+                        &trace,
+                    )
+                    .await;
+                }
             }
             ServiceAction::Flush => {
                 let snapshot = state.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
@@ -581,6 +596,106 @@ fn generate_put_batch(rng: &mut StdRng) -> Vec<TestRecord> {
             }
         })
         .collect()
+}
+
+/// A snapshot of a superseded generation fails the same way on the service, REST, and gRPC,
+/// for queries and for stats.
+async fn assert_snapshot_expired_everywhere(
+    state: &AppState,
+    rest: &axum::Router,
+    grpc: &GrpcLogPoseService,
+    snapshot: Snapshot,
+    vector_index: usize,
+    seed: u64,
+    trace: &[ServiceAction],
+) {
+    let expired = |message: &str| message.contains("no longer available");
+    let vector = EXACT_QUERY_VECTORS[vector_index].to_vec();
+    let request = QueryRequest {
+        collection_name: COLLECTION_NAME.to_owned(),
+        vector: vector.clone(),
+        top_k: EXACT_QUERY_TOP_K,
+        snapshot: Some(snapshot.clone()),
+        read_barrier: None,
+        filters: Vec::new(),
+        predicate: None,
+        explain: ExplainMode::None,
+    };
+    let error = state.query(request).await.err().unwrap_or_else(|| {
+        panic_with_context(seed, trace, "a superseded snapshot was queried".to_owned())
+    });
+    assert!(
+        expired(&error.to_string()),
+        "seed={seed} trace={trace:?}: {error}"
+    );
+    let error = state
+        .stats_at_snapshot(COLLECTION_NAME, Some(snapshot.clone()))
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            panic_with_context(seed, trace, "stats of a superseded snapshot".to_owned())
+        });
+    assert!(
+        expired(&error.to_string()),
+        "seed={seed} trace={trace:?}: {error}"
+    );
+
+    let response = rest
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/collections/{COLLECTION_NAME}/query"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "vector": vector,
+                        "top_k": EXACT_QUERY_TOP_K,
+                        "snapshot": snapshot,
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("rest query should respond");
+    assert!(
+        response.status().is_client_error(),
+        "seed={seed} trace={trace:?}: REST status {}",
+        response.status()
+    );
+    let body = json_body(response).await.to_string();
+    assert!(expired(&body), "seed={seed} trace={trace:?}: {body}");
+
+    let status = grpc
+        .query_collection(Request::new(proto::QueryCollectionRequest {
+            collection_name: COLLECTION_NAME.to_owned(),
+            vector,
+            top_k: EXACT_QUERY_TOP_K as u64,
+            snapshot: Some(proto::Snapshot {
+                manifest_generation: snapshot.manifest_generation,
+                visible_seq_no: snapshot.visible_seq_no,
+            }),
+            read_barrier: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: proto::ExplainMode::None as i32,
+            database_name: DEFAULT_DATABASE_NAME.to_owned(),
+        }))
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            panic_with_context(seed, trace, "gRPC queried a superseded snapshot".to_owned())
+        });
+    assert_eq!(
+        status.code(),
+        tonic::Code::FailedPrecondition,
+        "seed={seed} trace={trace:?}: {status}"
+    );
+    assert!(
+        expired(status.message()),
+        "seed={seed} trace={trace:?}: {status}"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

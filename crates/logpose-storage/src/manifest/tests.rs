@@ -240,9 +240,11 @@ fn a_crash_at_every_op_of_a_publish_leaves_a_complete_old_or_new_manifest() {
                 vfs.crash();
                 let context = format!("tear {tear:?}, seed {seed}, crash after {k} ops");
                 let current = read_current(vfs.as_ref(), Path::new(DIR))
-                    .unwrap_or_else(|error| panic!("{context}: CURRENT unreadable: {error}"));
+                    .map_err(|error| format!("{context}: {error}"))
+                    .expect("CURRENT is readable");
                 let loaded = load_manifest(vfs.as_ref(), Path::new(DIR), current)
-                    .unwrap_or_else(|error| panic!("{context}: manifest unreadable: {error}"));
+                    .map_err(|error| format!("{context}: {error}"))
+                    .expect("the named manifest loads");
                 assert_eq!(loaded, manifest(current), "{context}");
                 match result {
                     Ok(()) => assert_eq!(current, 1, "{context}: a durable publish is named"),
