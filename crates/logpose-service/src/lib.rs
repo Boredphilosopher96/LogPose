@@ -35,7 +35,8 @@ use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
 use logpose_storage_etcd::{
-    EtcdCoordinationClient, LeadershipLease, LeadershipRecord, MembershipRecord, ShardOwnership,
+    EtcdCoordinationClient, LeadershipLease, LeadershipRecord, LeaseKeepAlive, MembershipRecord,
+    ShardOwnership,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
@@ -163,6 +164,13 @@ fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
     Duration::from_secs((ttl_secs / 3).max(1))
 }
 
+/// Drive etcd membership and controller leadership for this node.
+///
+/// Each tick refreshes the leases the node holds, drops any claim etcd no
+/// longer backs (a dead lease, or a membership or leader key that is missing
+/// or owned by someone else), and re-acquires what is missing in the same
+/// tick. Losing membership also gives up leadership, because a node that is
+/// not a registered member must not lead.
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
     snapshot: Arc<RwLock<CoordinationStatus>>,
@@ -171,11 +179,11 @@ async fn run_coordination_loop(
     node_role: NodeRole,
     tick: Duration,
 ) {
-    let mut membership_lease_id = None;
+    let campaigns = matches!(node_role, NodeRole::Combined | NodeRole::Control);
+    let mut membership_lease_id: Option<i64> = None;
     let mut leadership_lease: Option<LeadershipLease> = None;
     let mut ticker = interval(tick);
     loop {
-        let mut pending_error = None;
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -183,62 +191,95 @@ async fn run_coordination_loop(
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        let mut pending_error = None;
 
-        if let Some(lease_id) = membership_lease_id
-            && let Err(error) = client.keep_alive(lease_id).await
-        {
-            note_coordination_error(&mut pending_error, error.to_string());
-        }
-
-        if membership_lease_id.is_none() {
-            match client.register_membership(&node_name, node_role).await {
-                Ok(lease) => {
-                    membership_lease_id = Some(lease.lease_id);
-                    clear_coordination_error(&snapshot).await;
-                }
-                Err(error) => {
-                    record_coordination_error(&snapshot, error.to_string()).await;
-                    continue;
-                }
+        if let Some(lease_id) = membership_lease_id {
+            match client.keep_alive(lease_id).await {
+                Ok(LeaseKeepAlive::Alive { .. }) => {}
+                Ok(LeaseKeepAlive::Expired) => membership_lease_id = None,
+                Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
             }
         }
-
-        if let Some(lease) = &leadership_lease
-            && let Err(error) = client.keep_alive(lease.lease_id).await
-        {
-            note_coordination_error(&mut pending_error, error.to_string());
-        }
-
-        if leadership_lease.is_none() && matches!(node_role, NodeRole::Combined | NodeRole::Control)
-        {
-            match client.try_acquire_leadership(&node_name).await {
-                Ok(lease) => {
-                    leadership_lease = lease;
-                    clear_coordination_error(&snapshot).await;
-                }
+        if let Some(lease) = &leadership_lease {
+            match client.keep_alive(lease.lease_id).await {
+                Ok(LeaseKeepAlive::Alive { .. }) => {}
+                Ok(LeaseKeepAlive::Expired) => leadership_lease = None,
                 Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
             }
         }
 
-        let members = client.list_membership().await;
-        let leader = client.current_leader().await;
-        if let Ok(member_records) = &members
-            && membership_lease_id.is_some()
-            && !member_records
-                .iter()
-                .any(|member| member.node_id == node_name)
+        let mut members = client.list_membership().await;
+        let mut leader = client.current_leader().await;
+        let mut dropped_leases = Vec::new();
+        if membership_lease_id.is_some()
+            && members
+                .as_ref()
+                .is_ok_and(|records| !lists_member(records, &node_name))
         {
-            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
-            revoke_tracked_membership_lease(&client, &mut membership_lease_id).await;
+            dropped_leases.extend(membership_lease_id.take());
         }
-        if let Ok(Some(leader_record)) = &leader
-            && leadership_lease.is_some()
-            && (leader_record.node_id != node_name
-                || Some(leader_record.lease_id)
-                    != leadership_lease.as_ref().map(|lease| lease.lease_id))
+        if membership_lease_id.is_none() {
+            dropped_leases.extend(leadership_lease.take().map(|lease| lease.lease_id));
+        }
+        if let Some(lease) = &leadership_lease
+            && leader
+                .as_ref()
+                .is_ok_and(|record| !holds_leadership(record.as_ref(), lease))
         {
-            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
+            dropped_leases.extend(leadership_lease.take().map(|lease| lease.lease_id));
         }
+        // Stop advertising lost claims before the revoke round trips, so
+        // request gates never see a claim this tick already knows is gone.
+        demote_lost_claims(
+            &snapshot,
+            &node_name,
+            membership_lease_id,
+            leadership_lease.as_ref(),
+        );
+        for lease_id in &dropped_leases {
+            let _ = client.revoke_lease(*lease_id).await;
+        }
+        // Revoking a lease deletes the keys attached to it, so a leader key
+        // read before the revoke that named one of those leases is now vacant.
+        if leader.as_ref().is_ok_and(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| dropped_leases.contains(&record.lease_id))
+        }) {
+            leader = Ok(None);
+        }
+
+        let mut acquired = false;
+        if membership_lease_id.is_none() {
+            match client.register_membership(&node_name, node_role).await {
+                Ok(lease) => {
+                    membership_lease_id = Some(lease.lease_id);
+                    acquired = true;
+                }
+                Err(error) => {
+                    record_coordination_error(&snapshot, error.to_string());
+                    continue;
+                }
+            }
+        }
+        // Any live leader key makes the campaign transaction fail, including
+        // one left by this node's previous process, so only campaign when the
+        // key is vacant or unreadable instead of granting a lease every tick.
+        if campaigns && leadership_lease.is_none() && !matches!(leader, Ok(Some(_))) {
+            match client.try_acquire_leadership(&node_name).await {
+                Ok(Some(lease)) => {
+                    leadership_lease = Some(lease);
+                    acquired = true;
+                }
+                Ok(None) => {}
+                Err(error) => note_coordination_error(&mut pending_error, error.to_string()),
+            }
+        }
+        if acquired {
+            members = client.list_membership().await;
+            leader = client.current_leader().await;
+        }
+
         reconcile_coordination_snapshot(
             &snapshot,
             &node_name,
@@ -258,21 +299,38 @@ async fn run_coordination_loop(
     }
 }
 
-async fn revoke_tracked_leadership_lease(
-    client: &EtcdCoordinationClient,
-    leadership_lease: &mut Option<LeadershipLease>,
-) {
-    if let Some(lease) = leadership_lease.take() {
-        let _ = client.revoke_lease(lease.lease_id).await;
-    }
+fn lists_member(members: &[MembershipRecord], node_name: &str) -> bool {
+    members.iter().any(|member| member.node_id == node_name)
 }
 
-async fn revoke_tracked_membership_lease(
-    client: &EtcdCoordinationClient,
-    membership_lease_id: &mut Option<i64>,
+/// Whether the visible leader key is backed by the lease this node holds.
+fn holds_leadership(leader: Option<&LeadershipRecord>, lease: &LeadershipLease) -> bool {
+    leader
+        .is_some_and(|record| record.node_id == lease.node_id && record.lease_id == lease.lease_id)
+}
+
+/// Clear snapshot claims this tick found lost, before revoking them or
+/// re-acquiring replacements, so request gates stop trusting them immediately.
+fn demote_lost_claims(
+    snapshot: &RwLock<CoordinationStatus>,
+    node_name: &str,
+    membership_lease_id: Option<i64>,
+    leadership_lease: Option<&LeadershipLease>,
 ) {
-    if let Some(lease_id) = membership_lease_id.take() {
-        let _ = client.revoke_lease(lease_id).await;
+    let mut current = coordination_write(snapshot);
+    if membership_lease_id.is_none() {
+        current.membership_registered = false;
+        current.membership_lease_id = None;
+        current
+            .registered_members
+            .retain(|member| member != node_name);
+    }
+    if membership_lease_id.is_none() || leadership_lease.is_none() {
+        current.is_local_leader = false;
+        current.leadership_lease_id = None;
+        if current.leader_node.as_deref() == Some(node_name) {
+            current.leader_node = None;
+        }
     }
 }
 
@@ -347,7 +405,7 @@ fn reconcile_coordination_last_error(
     }
 }
 
-async fn record_coordination_error(snapshot: &RwLock<CoordinationStatus>, error: String) {
+fn record_coordination_error(snapshot: &RwLock<CoordinationStatus>, error: String) {
     let mut current = coordination_write(snapshot);
     current.last_error = Some(error);
     current.membership_registered = false;
@@ -356,10 +414,6 @@ async fn record_coordination_error(snapshot: &RwLock<CoordinationStatus>, error:
     current.leader_node = None;
     current.is_local_leader = false;
     current.leadership_lease_id = None;
-}
-
-async fn clear_coordination_error(snapshot: &RwLock<CoordinationStatus>) {
-    coordination_write(snapshot).last_error = None;
 }
 
 fn coordination_read(
@@ -1474,6 +1528,47 @@ mod tests {
             current.last_error.as_deref(),
             Some("membership keep-alive failed")
         );
+    }
+
+    #[test]
+    fn demote_lost_claims_clears_local_leadership_before_recampaigning() {
+        let leading = CoordinationStatus {
+            cluster_name: "default".to_owned(),
+            membership_registered: true,
+            membership_lease_id: Some(11),
+            registered_members: vec!["node-a".to_owned(), "node-b".to_owned()],
+            leader_node: Some("node-a".to_owned()),
+            is_local_leader: true,
+            leadership_lease_id: Some(22),
+            last_error: None,
+        };
+        let lease = LeadershipLease {
+            node_id: "node-a".to_owned(),
+            lease_id: 22,
+            key: "/leaders/node-a".to_owned(),
+        };
+
+        let snapshot = RwLock::new(leading.clone());
+        demote_lost_claims(&snapshot, "node-a", Some(11), Some(&lease));
+        assert_eq!(*coordination_read(&snapshot), leading);
+
+        let snapshot = RwLock::new(leading.clone());
+        demote_lost_claims(&snapshot, "node-a", Some(11), None);
+        let current = coordination_read(&snapshot).clone();
+        assert!(current.membership_registered);
+        assert_eq!(current.membership_lease_id, Some(11));
+        assert!(!current.is_local_leader);
+        assert_eq!(current.leadership_lease_id, None);
+        assert_eq!(current.leader_node, None);
+
+        let snapshot = RwLock::new(leading);
+        demote_lost_claims(&snapshot, "node-a", None, Some(&lease));
+        let current = coordination_read(&snapshot).clone();
+        assert!(!current.membership_registered);
+        assert_eq!(current.membership_lease_id, None);
+        assert_eq!(current.registered_members, vec!["node-b".to_owned()]);
+        assert!(!current.is_local_leader);
+        assert_eq!(current.leadership_lease_id, None);
     }
 
     #[tokio::test]
