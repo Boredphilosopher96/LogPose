@@ -261,6 +261,43 @@ fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
 }
 
 #[test]
+fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
+    let root = unique_temp_dir("engine-drop-rename-fails");
+    let engine = open(&root).expect("engine should open");
+    let handle = create(&engine, "documents");
+    write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+
+    // A non-empty directory in the way makes the retiring rename fail before anything changed.
+    let mut blocker = handle.meta().dir.clone().into_os_string();
+    blocker.push(DROPPED_DIR_SUFFIX);
+    let blocker = PathBuf::from(blocker);
+    fs::create_dir_all(blocker.join("in-the-way")).expect("blocker should be created");
+    engine
+        .drop_collection(&reference("documents"))
+        .expect_err("the rename fails");
+
+    assert!(
+        !handle.is_dropped(),
+        "a drop that changed nothing is undone"
+    );
+    let served = engine
+        .collection(&reference("documents"))
+        .expect("the collection is still served");
+    assert!(Arc::ptr_eq(&served, &handle));
+    write(&engine, &handle, vec![put("beta", vec![0.0, 1.0])]);
+    assert_eq!(handle.visible_seq_no(), 2);
+
+    fs::remove_dir_all(&blocker).expect("blocker should be removed");
+    drop((handle, served));
+    drop(engine);
+    let engine = open(&root).expect("engine should reopen");
+    let recovered = engine
+        .collection(&reference("documents"))
+        .expect("the collection survives");
+    assert_eq!(recovered.visible_seq_no(), 2);
+}
+
+#[test]
 fn open_removes_retired_and_unfinished_collection_directories() {
     let root = unique_temp_dir("engine-abandoned-dirs");
     let engine = open(&root).expect("engine should open");

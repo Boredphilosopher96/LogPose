@@ -230,6 +230,11 @@ impl CollectionHandle {
         self.state.store(STATE_DROPPED, Ordering::Release);
     }
 
+    /// Undo [`CollectionHandle::mark_dropped`] after a drop that changed nothing on disk.
+    pub(crate) fn mark_open(&self) {
+        self.state.store(STATE_OPEN, Ordering::Release);
+    }
+
     /// Whether the collection was dropped. A dropped handle refuses every call.
     #[must_use]
     pub fn is_dropped(&self) -> bool {

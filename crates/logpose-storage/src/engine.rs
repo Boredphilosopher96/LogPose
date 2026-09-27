@@ -500,7 +500,9 @@ impl CoreRef {
         let result = match &slot {
             Some(CollectionSlot::Open(handle)) => self.retire_open_collection(handle),
             Some(CollectionSlot::Failed(failed)) => match &failed.descriptor {
-                Some(descriptor) => self.retire_collection_dir(&descriptor.root_path),
+                Some(descriptor) => self
+                    .retire_collection_dir(&descriptor.root_path)
+                    .map_err(|failure| failure.error),
                 None => Err(LogPoseError::Message(format!(
                     "collection '{}/{}' has an unreadable descriptor and cannot be dropped: {}",
                     reference.database_name, reference.collection_name, failed.error
@@ -515,9 +517,9 @@ impl CoreRef {
                 Ok(())
             }
             Err(error) => {
-                // The directory was not retired, so the collection still exists. An open handle
-                // was already refused new calls; it stays registered so the error is visible and
-                // a reopen recovers it.
+                // The drop did not commit, so the collection still exists. If its directory was
+                // not renamed, an open handle serves again; otherwise the rename's durability is
+                // unknown, the handle keeps refusing calls, and a reopen settles the outcome.
                 if let Some(slot) = slot {
                     collections.insert(reference.clone(), slot);
                 }
@@ -538,19 +540,33 @@ impl CoreRef {
         let mut writer = handle.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.wal = None;
         self.retire_collection_dir(&handle.meta().dir)
+            .map_err(|failure| {
+                if !failure.renamed {
+                    // Nothing on disk changed, so the collection serves again; the next write
+                    // reopens its WAL.
+                    handle.mark_open();
+                }
+                failure.error
+            })
     }
 
     /// Durably rename `dir` to `<dir>.dropped`, which commits the drop, then remove it. A crash
     /// after the rename leaves a `*.dropped` directory that the next open removes.
-    fn retire_collection_dir(&self, dir: &Path) -> Result<()> {
+    fn retire_collection_dir(&self, dir: &Path) -> std::result::Result<(), RetireFailure> {
         let parent = logpose_vfs::parent_dir(dir);
         let mut retired = dir.as_os_str().to_owned();
         retired.push(DROPPED_DIR_SUFFIX);
         let retired = PathBuf::from(retired);
         self.vfs
             .rename(dir, &retired)
-            .map_err(|error| io_message("failed to retire the collection directory", error))?;
-        sync_dir(self.vfs.as_ref(), parent)?;
+            .map_err(|error| RetireFailure {
+                renamed: false,
+                error: io_message("failed to retire the collection directory", error),
+            })?;
+        sync_dir(self.vfs.as_ref(), parent).map_err(|error| RetireFailure {
+            renamed: true,
+            error,
+        })?;
         // The drop is committed. Failing to remove the files only delays their cleanup to the
         // next open.
         if self.vfs.remove_dir_all(&retired).is_ok() {
@@ -558,6 +574,13 @@ impl CoreRef {
         }
         Ok(())
     }
+}
+
+/// Why a collection directory could not be retired.
+struct RetireFailure {
+    /// Whether the rename happened in the live namespace (its durability is then unknown).
+    renamed: bool,
+    error: LogPoseError,
 }
 
 /// A reference to the engine state held by an engine task (an I/O pool job, a maintenance job).

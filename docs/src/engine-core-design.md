@@ -677,7 +677,7 @@ PR 3 builds the engine shell over the v1 state. Where it differs from the sketch
   3. Rename the directory to `<dir>.dropped` and sync the parent directory. This is the commit point.
   4. Remove the directory.
 
-  A pinned `Version` stays readable from memory, but a read that needs a segment file of the dropped collection fails. Drop is not yet exposed through `StorageEngine` or the APIs.
+  If the rename fails, nothing changed on disk and the handle serves again. If the rename happened but its directory sync failed, the outcome is unknown until a reopen: the handle keeps refusing calls. A pinned `Version` stays readable from memory, but a read that needs a segment file of the dropped collection fails. Drop is not yet exposed through `StorageEngine` or the APIs.
 - **`Version` over v1 state.** A `Version` holds the v1 `Arc<Manifest>` plus a `DeltaLog`. The `DeltaLog` is a persistent append-only log of committed WAL batches: sealed chunks of 64 batches plus one open chunk. Publishing a batch copies at most 64 pointers plus one pointer per sealed chunk, and never clones a record. `VersionCounters` maintains `segment_count`, `memtable_rows`, and `memtable_bytes` incrementally, so the flush trigger is O(1). `total_rows` and `deleted_rows` need deletion vectors and come with PR 10. `Version::check_invariants` checks I3, delta contiguity, and I13 for these counters.
 - **`imbl` is not allowed.** `imbl` is MPL-2.0, and `deny.toml` allows only MIT, Apache-2.0, BSD-3-Clause, Unicode-3.0, and Zlib. PR 10 (`DeletionMap`, memtable indexes) must choose a permissively licensed persistent map, write a crate-local one, or get an explicit license decision.
 - **Writer stand-in.** PR 5 replaces two per-handle mutexes, which stand in for the writer task until then:
