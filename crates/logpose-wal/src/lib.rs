@@ -159,17 +159,23 @@ impl WalWriter {
     /// after garbage. A defect with any valid frame after it is not a torn tail; that is
     /// reported as an error instead of discarding acknowledged batches.
     ///
-    /// Creating the file (or its parent directory) is not durable until the caller syncs the
-    /// directory that holds it.
+    /// A newly created file is made durable by syncing its directory before this returns. A
+    /// newly created parent directory is not; the caller owns the layout above the WAL file.
     pub fn open(vfs: Arc<dyn Vfs>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         vfs.create_dir_all(parent_dir(&path))
             .map_err(|error| io_message("failed to create WAL parent directory", error))?;
         let file = match vfs.open(&path, OpenMode::Append) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vfs
-                .open(&path, OpenMode::CreateNew)
-                .map_err(|error| io_message("failed to create WAL file", error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file = vfs
+                    .open(&path, OpenMode::CreateNew)
+                    .map_err(|error| io_message("failed to create WAL file", error))?;
+                // An acknowledged append to a file whose name is not durable could vanish with
+                // the file, so a created WAL is made durable before it is used.
+                sync_parent_dir(vfs.as_ref(), &path)?;
+                file
+            }
             Err(error) => return Err(io_message("failed to open WAL file", error)),
         };
 
