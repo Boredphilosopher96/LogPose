@@ -244,10 +244,8 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("write should succeed");
 
-    let before_delete = engine
-        .snapshot("profiles")
-        .await
-        .expect("snapshot should succeed");
+    // Pin the state before the delete: the flush below supersedes its manifest generation.
+    let (_token, before_delete) = engine.pin_snapshot("profiles").expect("pin should succeed");
 
     engine
         .write(
@@ -263,24 +261,19 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("flush should succeed");
 
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    let historical = query_exact(
-        &reopened,
-        QueryRequest {
-            collection_name: "profiles".to_owned(),
-            vector: vec![0.0, 0.0],
-            top_k: 2,
-            snapshot: Some(before_delete),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-        },
-    )
-    .await
-    .expect("historical query should succeed");
+    let historical_request = QueryRequest {
+        collection_name: "profiles".to_owned(),
+        vector: vec![0.0, 0.0],
+        top_k: 2,
+        snapshot: Some(before_delete),
+        read_barrier: None,
+        filters: Vec::new(),
+        predicate: None,
+        explain: logpose_query::ExplainMode::None,
+    };
+    let historical = query_exact(&engine, historical_request.clone())
+        .await
+        .expect("a pinned historical query should succeed");
     assert_eq!(
         historical
             .matches
@@ -288,6 +281,20 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             .map(|candidate| candidate.id.as_str())
             .collect::<Vec<_>>(),
         vec!["alpha", "beta"]
+    );
+
+    // Pins end with the process: after a reopen the old generation is gone.
+    drop(engine);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let expired = query_exact(&reopened, historical_request)
+        .await
+        .expect_err("an unpinned historical snapshot expires");
+    assert!(
+        matches!(
+            expired,
+            QueryError::Storage(logpose_types::LogPoseError::SnapshotExpired { .. })
+        ),
+        "{expired}"
     );
 
     reopened
