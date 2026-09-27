@@ -1,6 +1,11 @@
 //! Exact and ANN index sidecars for immutable units.
 
+pub mod kernels;
 pub mod scalar;
+pub mod sq8;
+
+#[cfg(test)]
+use criterion as _;
 
 use logpose_types::{DistanceMetric, RecordId, ScalarFieldStats, ScalarMetadataValue, SeqNo};
 use serde::{Deserialize, Serialize};
@@ -112,7 +117,7 @@ pub fn build_flat_index(
 
         if entry.is_put {
             put_count += 1;
-            vector_norms.push(entry.vector.as_ref().map(|vector| vector_norm(vector)));
+            vector_norms.push(entry.vector.as_deref().map(kernels::norm));
             if let Some(metadata) = &entry.metadata {
                 update_scalar_field_stats(&mut scalar_fields, metadata);
             }
@@ -1076,34 +1081,17 @@ fn metric_value(metric: DistanceMetric, query: &[f32], candidate: &[f32]) -> io:
     }
 
     Ok(match metric {
-        DistanceMetric::Dot => query
-            .iter()
-            .zip(candidate)
-            .map(|(lhs, rhs)| lhs * rhs)
-            .sum(),
+        DistanceMetric::Dot => kernels::dot(query, candidate),
         DistanceMetric::Cosine => {
-            let dot: f32 = query
-                .iter()
-                .zip(candidate)
-                .map(|(lhs, rhs)| lhs * rhs)
-                .sum();
-            let query_norm = vector_norm(query);
-            let candidate_norm = vector_norm(candidate);
+            let query_norm = kernels::norm(query);
+            let candidate_norm = kernels::norm(candidate);
             if query_norm == 0.0 || candidate_norm == 0.0 {
                 0.0
             } else {
-                dot / (query_norm * candidate_norm)
+                kernels::dot(query, candidate) / (query_norm * candidate_norm)
             }
         }
-        DistanceMetric::L2 => query
-            .iter()
-            .zip(candidate)
-            .map(|(lhs, rhs)| {
-                let delta = lhs - rhs;
-                delta * delta
-            })
-            .sum::<f32>()
-            .sqrt(),
+        DistanceMetric::L2 => kernels::l2_squared(query, candidate).sqrt(),
     })
 }
 
@@ -1216,10 +1204,6 @@ fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> io::Result
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "truncated hnsw payload"))?;
     *cursor = end;
     Ok(slice)
-}
-
-fn vector_norm(vector: &[f32]) -> f32 {
-    vector.iter().map(|value| value * value).sum::<f32>().sqrt()
 }
 
 fn update_scalar_field_stats(
@@ -1938,6 +1922,28 @@ mod tests {
             }
         }
         seen.len()
+    }
+
+    #[test]
+    fn metric_values_keep_cosine_dot_and_l2_semantics() -> io::Result<()> {
+        let query = [3.0, 4.0, 0.0];
+        let candidate = [4.0, 0.0, 3.0];
+        assert_eq!(metric_value(DistanceMetric::Dot, &query, &candidate)?, 12.0);
+        assert_eq!(
+            metric_value(DistanceMetric::Cosine, &query, &candidate)?,
+            12.0 / 25.0
+        );
+        // L2 reports the Euclidean distance, not its square.
+        assert_eq!(
+            metric_value(DistanceMetric::L2, &query, &candidate)?,
+            26.0_f32.sqrt()
+        );
+        assert_eq!(
+            metric_value(DistanceMetric::Cosine, &query, &[0.0; 3])?,
+            0.0
+        );
+        assert!(metric_value(DistanceMetric::Dot, &query, &[1.0]).is_err());
+        Ok(())
     }
 
     fn temp_file_path(name: &str) -> std::path::PathBuf {

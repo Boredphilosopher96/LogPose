@@ -7,6 +7,7 @@ use logpose_index::scalar::{
     ScalarIndexBuilder, ScalarKey, SortedIndex,
 };
 use logpose_types as _;
+use pulp as _;
 use roaring as _;
 use serde as _;
 use serde_json as _;

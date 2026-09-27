@@ -5,6 +5,7 @@ members = [
     "crates/logpose-api-grpc",
     "crates/logpose-api-rest",
     "crates/logpose-auth",
+    "crates/logpose-bench",
     "crates/logpose-catalog",
     "crates/logpose-client",
     "crates/logpose-config",
@@ -41,6 +42,7 @@ axum = "~0.8"
 clap = { version = "~4.6", features = ["derive", "env"] }
 http = "~1.4"
 prost = "~0.14"
+pulp = { version = "~0.22", features = ["x86-v4"] }
 roaring = "~0.11"
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
