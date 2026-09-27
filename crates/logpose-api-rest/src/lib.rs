@@ -7,12 +7,12 @@ use yaml_rust2 as _;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
     response::IntoResponse,
     routing::{MethodRouter, get, post},
 };
-use error::{ApiError, ApiJson, ApiQuery};
+use error::{ApiError, ApiJson, ApiPath, ApiQuery};
 pub use error::{ErrorBody, http_status};
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
@@ -68,7 +68,7 @@ pub fn route_paths() -> Vec<&'static str> {
 /// Create the versioned REST router.
 ///
 /// Request bodies above `limits.max_rest_body_bytes` are rejected with HTTP 413 and a typed
-/// `TOO_LARGE` error; unknown paths get a typed 404.
+/// `TOO_LARGE` error; unknown paths, and methods a path does not serve, get a typed 404.
 pub fn router(state: Arc<AppState>) -> Router {
     let body_limit = state.config.limits.max_rest_body_bytes;
     routes()
@@ -77,6 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             router.route(path, handlers)
         })
         .fallback(route_not_found)
+        .method_not_allowed_fallback(route_not_found)
         .with_state(state)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
@@ -132,7 +133,7 @@ async fn runtime_status(
 
 async fn put_database(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
     ApiJson(descriptor): ApiJson<DatabaseDescriptor>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
@@ -143,7 +144,7 @@ async fn put_database(
 
 async fn get_database(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -180,7 +181,7 @@ async fn create_collection(
 
 async fn put_database_policy(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
     ApiJson(policy): ApiJson<DatabaseAccessPolicy>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
@@ -195,7 +196,7 @@ async fn put_database_policy(
 
 async fn get_database_policy(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
@@ -206,7 +207,7 @@ async fn get_database_policy(
 
 async fn get_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
@@ -221,7 +222,7 @@ async fn get_collection(
 
 async fn get_collection_placement(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
@@ -236,7 +237,7 @@ async fn get_collection_placement(
 
 async fn write_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
     ApiJson(request): ApiJson<WriteCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::CommitAck>>, ApiError> {
@@ -262,7 +263,7 @@ async fn write_collection(
 
 async fn query_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
     ApiJson(request): ApiJson<QueryCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
@@ -312,7 +313,7 @@ async fn query_collection(
 
 async fn get_collection_stats(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     ApiQuery(params): ApiQuery<CollectionStatsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
@@ -338,7 +339,7 @@ async fn get_collection_stats(
 
 async fn flush_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
@@ -352,7 +353,7 @@ async fn flush_collection(
 
 async fn compact_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     ApiQuery(namespace): ApiQuery<NamespaceQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
@@ -366,7 +367,7 @@ async fn compact_collection(
 
 async fn inspect_collection(
     headers: HeaderMap,
-    Path(name): Path<String>,
+    ApiPath(name): ApiPath<String>,
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<InspectCollectionParams>,
 ) -> Result<Json<CollectionScopedResponse<logpose_storage::InspectReport>>, ApiError> {
@@ -994,6 +995,49 @@ mod tests {
             body["details"]["metadata"]["resource_name"],
             "GET /v2/nothing"
         );
+    }
+
+    #[tokio::test]
+    async fn unserved_methods_on_known_paths_return_a_typed_not_found() {
+        let app = router(Arc::new(AppState::new(test_config("rest-unserved-method"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/collections/documents")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(body["details"]["metadata"]["resource_type"], "route");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            "DELETE /v1/collections/documents"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecodable_path_parameters_are_typed_invalid_arguments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-bad-path"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/%FF")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
     }
 
     #[tokio::test]

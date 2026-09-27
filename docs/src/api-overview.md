@@ -96,7 +96,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | Code                  | HTTP  | gRPC                  | Meaning                                                          |
 |-----------------------|-------|-----------------------|------------------------------------------------------------------|
 | `INVALID_ARGUMENT`    | `400` | `INVALID_ARGUMENT`    | The request is malformed or fails validation                     |
-| `NOT_FOUND`           | `404` | `NOT_FOUND`           | A named resource or route does not exist                         |
+| `NOT_FOUND`           | `404` | `NOT_FOUND`           | A named resource, or a route (path and method), does not exist   |
 | `ALREADY_EXISTS`      | `409` | `ALREADY_EXISTS`      | A resource the request creates already exists                    |
 | `FAILED_PRECONDITION` | `409` | `FAILED_PRECONDITION` | The node or collection is not in the state the request needs     |
 | `UNAUTHENTICATED`     | `401` | `UNAUTHENTICATED`     | Missing or invalid bearer token                                  |

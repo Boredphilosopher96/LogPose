@@ -430,8 +430,8 @@ async fn rest_router_serves_exactly_the_documented_routes_and_methods() {
                 .expect("body should read")
                 .to_bytes();
             let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-            let route_missing =
-                status == 405 || body["details"]["metadata"]["resource_type"] == "route";
+            // An unserved method on a known path is a typed route 404 too, never a bare 405.
+            let route_missing = body["details"]["metadata"]["resource_type"] == "route";
             if documented && route_missing {
                 problems.push(format!("{method} {path} is documented but not routed"));
             }

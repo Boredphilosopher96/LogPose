@@ -4,7 +4,7 @@
 
 use axum::{
     Json,
-    extract::{FromRequest, FromRequestParts, Query, Request},
+    extract::{FromRequest, FromRequestParts, Path, Query, Request},
     http::{HeaderValue, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
@@ -138,6 +138,25 @@ where
         Query::<T>::from_request_parts(parts, state)
             .await
             .map(|Query(value)| Self(value))
+            .map_err(|rejection| ApiError(LogPoseError::invalid_argument(rejection.body_text())))
+    }
+}
+
+/// A path-parameter extractor whose rejections, such as a segment that is not valid UTF-8,
+/// are `INVALID_ARGUMENT` errors.
+pub(crate) struct ApiPath<T>(pub(crate) T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
             .map_err(|rejection| ApiError(LogPoseError::invalid_argument(rejection.body_text())))
     }
 }
