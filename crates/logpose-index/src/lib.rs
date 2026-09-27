@@ -629,7 +629,7 @@ pub fn search_hnsw(
     }
     let mut ef = sidecar.params.ef_search.max(top_k);
     let mut stats;
-    let mut candidates = Vec::with_capacity(top_k);
+    let mut candidates = Vec::with_capacity(top_k.min(sidecar.nodes.len()));
     loop {
         let (scored, visited_nodes) = search_layer(sidecar, query, 0, &[entry], ef, None)?;
         stats = HnswSearchStats {
@@ -900,7 +900,8 @@ fn search_layer(
     exclude_index: Option<usize>,
 ) -> io::Result<(Vec<ScoredNode>, usize)> {
     let metric = sidecar.metric;
-    let ef = ef.max(1);
+    // A layer never yields more than every node, and the clamp keeps `ef + 1` from overflowing.
+    let ef = ef.clamp(1, sidecar.nodes.len().max(1));
     let mut visited = HashSet::new();
     // Max-heap: the best unexpanded candidate is on top.
     let mut candidates = BinaryHeap::<ScoredNode>::new();
@@ -945,8 +946,7 @@ fn search_layer(
                 neighbor,
                 metric_value(metric, query, &sidecar.nodes[neighbor].record.vector)?,
             );
-            if results.len() < ef || results.peek().is_some_and(|Reverse(worst)| scored > *worst)
-            {
+            if results.len() < ef || results.peek().is_some_and(|Reverse(worst)| scored > *worst) {
                 candidates.push(scored);
                 results.push(Reverse(scored));
                 if results.len() > ef {
@@ -1707,6 +1707,23 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_hnsw_saturating_top_k_returns_every_node() {
+        let entries = clustered_entries(&mut TestRng::new(5), 30, 3, 4, 5.0);
+        let index = build_hnsw_index(
+            "segment-huge-top-k",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+
+        let result =
+            search_hnsw(&index, &entries[0].vector, usize::MAX, None).expect("search should work");
+        assert_eq!(result.candidates.len(), entries.len());
+        assert_eq!(result.candidates[0].entry_offset_index, 0);
     }
 
     #[test]

@@ -440,6 +440,7 @@ impl StorageEngine for LocalStorageEngine {
                             "node_count": hnsw.nodes.len(),
                             "params": {
                                 "max_neighbors": hnsw.params.max_neighbors,
+                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
                                 "ef_construction": hnsw.params.ef_construction,
                                 "ef_search": hnsw.params.ef_search,
                             },
