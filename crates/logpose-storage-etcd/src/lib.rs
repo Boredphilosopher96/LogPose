@@ -19,6 +19,8 @@ use logpose_types::{
     CommitAck, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError,
     MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
+// Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
+use protoc_bin_vendored as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
@@ -75,7 +77,7 @@ impl EtcdBackedStorageEngine {
     pub fn new(root: impl AsRef<Path>, config: EtcdMetadataConfig) -> Result<Self> {
         let etcd = EtcdPlacementStore::new(config)?;
         Ok(Self {
-            local: Arc::new(LocalStorageEngine::new(root)),
+            local: Arc::new(LocalStorageEngine::new(root)?),
             etcd,
         })
     }
@@ -1772,7 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn authoritative_assignment_reads_fail_closed_when_etcd_is_unreachable() {
         let root = unique_temp_dir("fail-closed-assignment");
-        let local = LocalStorageEngine::new(&root);
+        let local = LocalStorageEngine::new(&root).expect("storage engine should open");
         let descriptor = local
             .create_collection(CreateCollectionRequest::new(
                 "documents",

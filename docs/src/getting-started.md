@@ -1,6 +1,6 @@
 # Getting Started
 
-Install Rust `1.94.1`, ensure `protoc` / `protobuf-compiler` is available on `PATH`, start a local etcd endpoint on `http://127.0.0.1:2379` for the full test suite, and run:
+Install Rust `1.94.1` and run the commands below. No system `protoc` is needed; the build uses the vendored `protoc-bin-vendored` binary through `scripts/protoc.sh`. etcd is optional: the etcd integration tests run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` is set, for example to `http://127.0.0.1:2379`.
 
 ```bash
 cargo metadata --format-version 1 > /dev/null

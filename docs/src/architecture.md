@@ -31,10 +31,16 @@ The control-plane and data-plane split is real, but it is still in-process rathe
 LogPose is still a local filesystem engine.
 
 - mutable writes land in WAL-backed local state under `storage_root`
+- each write batch is one CRC-framed WAL frame committed with one fsync, so recovery replays a batch entirely or not at all
+- a torn tail left on `wal/active.wal` by a crash is ignored by readers and truncated (with a warning log) before the next append; a defect with any valid frame after it, any defect in a rolled WAL file, and a reused sequence number are reported as errors instead
+- a failed append or fsync truncates `wal/active.wal` back to its last synced frame, so a batch reported as failed never replays
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
 - a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
 - operator-facing namespaces are database-first: collection identities are `database/collection` outside the default database and just `collection` inside it
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
+- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory; new segment and index files fsync their directories before the manifest that references them is published, and WAL rotation fsyncs `wal/` before the `PENDING_ROTATION` marker is cleared
+- one process owns a `storage_root` at a time: opening the storage engine takes an exclusive lock on `storage_root/LOCK` (engines inside one process share it), and a second process fails at startup with an "already in use by another process" error
+- if a `wal/PENDING_ROTATION` marker survives while `active.wal` holds records above the marker's checkpoint, recovery refuses to truncate the WAL and reports an error instead of discarding acknowledged writes
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
 

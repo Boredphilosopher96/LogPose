@@ -36,4 +36,4 @@ jobs:
           config_file: .yamllint.yml
 
       - name: Typos
-        run: cargo install typos-cli --locked && typos
+        run: cargo install typos-cli --locked --version 1.49.0 && typos

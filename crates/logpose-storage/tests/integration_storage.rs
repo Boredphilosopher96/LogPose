@@ -36,7 +36,7 @@ use std::os::unix::fs::PermissionsExt;
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
     let root = support::unique_temp_dir("storage-write-scan");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -93,7 +93,7 @@ async fn create_write_scan_and_delete_records() {
 #[tokio::test]
 async fn create_collection_persists_default_database_descriptor() {
     let root = support::unique_temp_dir("storage-default-database");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -121,7 +121,7 @@ async fn create_collection_persists_default_database_descriptor() {
 #[test]
 fn catalog_store_round_trips_databases_principals_and_policies() {
     let root = support::unique_temp_dir("storage-catalog-round-trip");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -210,7 +210,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
         policy
     );
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(
         reopened
             .get_database("analytics")
@@ -234,7 +234,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
 #[test]
 fn catalog_store_overwrites_database_policy_by_database_name() {
     let root = support::unique_temp_dir("storage-catalog-database-isolation");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -282,7 +282,7 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
 #[test]
 fn put_database_preserves_stable_database_identity_on_replace() {
     let root = support::unique_temp_dir("storage-database-idempotence");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let first = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -298,7 +298,7 @@ fn put_database_preserves_stable_database_identity_on_replace() {
 #[tokio::test]
 async fn duplicate_collection_names_can_exist_in_different_databases() {
     let root = support::unique_temp_dir("storage-namespace-duplicates");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let default_descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -347,7 +347,7 @@ async fn duplicate_collection_names_can_exist_in_different_databases() {
 #[tokio::test]
 async fn create_collection_allows_duplicate_names_in_distinct_databases() {
     let root = support::unique_temp_dir("storage-duplicate-collection-namespaces");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let left = engine
         .create_collection(CreateCollectionRequest::in_database(
@@ -391,7 +391,7 @@ async fn create_collection_allows_duplicate_names_in_distinct_databases() {
 #[tokio::test]
 async fn create_collection_rejects_reserved_namespace_separator() {
     let root = support::unique_temp_dir("storage-reserved-separator");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let error = engine
         .create_collection(CreateCollectionRequest::in_database(
@@ -410,7 +410,7 @@ async fn create_collection_rejects_reserved_namespace_separator() {
 #[tokio::test]
 async fn open_collection_resolves_database_collection_tuple() {
     let root = support::unique_temp_dir("storage-open-collection-namespace");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let default_descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -462,7 +462,7 @@ async fn open_collection_resolves_database_collection_tuple() {
 #[tokio::test]
 async fn flush_persists_visible_records_for_reopen() {
     let root = support::unique_temp_dir("storage-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -490,7 +490,7 @@ async fn flush_persists_visible_records_for_reopen() {
         .await
         .expect("flush should succeed");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
         .await
@@ -548,7 +548,7 @@ async fn flush_persists_visible_records_for_reopen() {
 #[tokio::test]
 async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta() {
     let root = support::unique_temp_dir("storage-reopen-post-checkpoint-delta");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -586,7 +586,7 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
         .await
         .expect("second write should succeed");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
         .await
@@ -607,7 +607,7 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
 #[tokio::test]
 async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
     let root = support::unique_temp_dir("storage-checkpointed-wal-corruption");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -641,7 +641,7 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
     fs::write(&rolled_wal_path, b"corrupt checkpointed wal")
         .expect("corrupted rolled wal should be written");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
         .await
@@ -661,7 +661,7 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
 #[tokio::test]
 async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
     let root = support::unique_temp_dir("storage-active-wal-crash-window");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -699,7 +699,7 @@ async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
     )
     .expect("active wal should be repopulated");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
         .await
@@ -712,7 +712,7 @@ async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
 #[tokio::test]
 async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending() {
     let root = support::unique_temp_dir("storage-pending-rotation-active-wal");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -754,7 +754,7 @@ async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending(
     )
     .expect("pending rotation marker should be written");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
         .await
@@ -799,7 +799,7 @@ async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending(
 #[tokio::test]
 async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_survives() {
     let root = support::unique_temp_dir("storage-pending-rotation-rotated-wal");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -836,7 +836,7 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
     )
     .expect("pending rotation marker should be recreated");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let old_snapshot_stats = reopened
         .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
         .await
@@ -855,7 +855,7 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
 #[tokio::test]
 async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation_recovery() {
     let root = support::unique_temp_dir("storage-pending-rotation-compaction-history");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -928,7 +928,7 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
     )
     .expect("pending rotation marker should be recreated");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let old_snapshot_stats = reopened
         .stats_snapshot("documents", Some(old_snapshot.clone()))
         .await
@@ -954,7 +954,7 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
 #[tokio::test]
 async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
     let root = support::unique_temp_dir("storage-pending-rotation-marker-perms");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1007,7 +1007,7 @@ async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
         return;
     }
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let result = reopened.stats("documents").await;
 
     fs::set_permissions(&wal_dir, fs::Permissions::from_mode(original_mode))
@@ -1023,7 +1023,7 @@ async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
 #[tokio::test]
 async fn compact_merges_segments_and_preserves_latest_versions() {
     let root = support::unique_temp_dir("storage-compact");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1109,7 +1109,7 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
 #[tokio::test]
 async fn inspect_reports_manifest_wal_and_segment_targets() {
     let root = support::unique_temp_dir("storage-inspect");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1257,7 +1257,7 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
 #[tokio::test]
 async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     let root = support::unique_temp_dir("storage-background-maintenance");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1319,7 +1319,7 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
 #[tokio::test]
 async fn background_maintenance_preserves_namespace_for_duplicate_collection_names() {
     let root = support::unique_temp_dir("storage-background-maintenance-namespace");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1376,7 +1376,7 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
 #[tokio::test]
 async fn ann_queries_surface_corrupted_hnsw_sidecars() {
     let root = support::unique_temp_dir("storage-hnsw-corruption");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1455,7 +1455,7 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
 #[tokio::test]
 async fn ann_search_selected_enforces_a_global_candidate_budget() {
     let root = support::unique_temp_dir("storage-ann-budget");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1545,7 +1545,7 @@ async fn ann_search_selected_enforces_a_global_candidate_budget() {
 #[tokio::test]
 async fn manual_flush_and_background_maintenance_do_not_race() {
     let root = support::unique_temp_dir("storage-manual-background-race");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1602,7 +1602,7 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
 #[tokio::test]
 async fn background_maintenance_handles_inflight_writes_without_losing_visibility() {
     let root = support::unique_temp_dir("storage-follow-up-background-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1626,8 +1626,11 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
         .await
         .expect("first write should succeed");
 
+    // Under load the first flush can start and finish between two polls, so a
+    // completed run also counts; waiting for `in_progress` alone can miss it.
     wait_for_condition(&engine, "events", |stats| {
         stats.maintenance.in_progress.as_deref() == Some("flush")
+            || stats.maintenance.completed_runs >= 1
     })
     .await;
 
@@ -1660,7 +1663,7 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
 #[tokio::test]
 async fn reopening_resumes_persisted_background_maintenance() {
     let root = support::unique_temp_dir("storage-resume-background-maintenance");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1696,7 +1699,7 @@ async fn reopening_resumes_persisted_background_maintenance() {
     )
     .expect("maintenance status should be updated");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     reopened
         .open_collection("events")
         .await
@@ -1715,7 +1718,7 @@ async fn reopening_resumes_persisted_background_maintenance() {
 #[tokio::test]
 async fn rejects_impossible_snapshots() {
     let root = support::unique_temp_dir("storage-invalid-snapshot");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1759,7 +1762,7 @@ async fn rejects_impossible_snapshots() {
 #[tokio::test]
 async fn rejects_snapshots_below_manifest_checkpoint() {
     let root = support::unique_temp_dir("storage-below-checkpoint-snapshot");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1805,7 +1808,7 @@ async fn rejects_snapshots_below_manifest_checkpoint() {
 #[tokio::test]
 async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     let root = support::unique_temp_dir("storage-invalid-thresholds");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1829,7 +1832,7 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     )
     .expect("descriptor should be rewritten");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let error = reopened
         .open_collection("events")
         .await
@@ -1840,7 +1843,7 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
 #[tokio::test]
 async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
     let root = support::unique_temp_dir("storage-empty-immutable-selection");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1877,7 +1880,7 @@ async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
 #[tokio::test]
 async fn old_snapshot_remains_readable_after_flush() {
     let root = support::unique_temp_dir("storage-snapshot-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
@@ -1929,7 +1932,7 @@ async fn old_snapshot_remains_readable_after_flush() {
 #[tokio::test]
 async fn duplicate_id_batch_rejects_without_committing_anything() {
     let root = support::unique_temp_dir("storage-duplicate-batch");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -1970,7 +1973,7 @@ async fn duplicate_id_batch_rejects_without_committing_anything() {
 #[tokio::test]
 async fn dimension_error_batch_rejects_without_committing_anything() {
     let root = support::unique_temp_dir("storage-dimension-batch");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -2033,7 +2036,10 @@ async fn wait_for_condition<F>(engine: &LocalStorageEngine, collection_name: &st
 where
     F: Fn(&logpose_types::CollectionStats) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous because each poll replays the WAL and can block behind a flush,
+    // which takes seconds for large vectors on a loaded machine. Passing tests
+    // return as soon as the predicate holds.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats = engine
             .stats(collection_name)

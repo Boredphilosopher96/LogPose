@@ -8,13 +8,21 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["protoc-bin-vendored"]
+
 [dependencies]
 async-trait.workspace = true
-etcd-client = "0.14"
+etcd-client = "0.20"
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
+# Not used in code. etcd-client's build script runs protoc through
+# scripts/protoc.sh, which finds this crate's binary in the Cargo registry.
+# Depending on it here makes Cargo download it before that build script runs,
+# even when this crate is built on its own with an empty registry.
+protoc-bin-vendored = "~3.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
