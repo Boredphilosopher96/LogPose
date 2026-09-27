@@ -7,7 +7,8 @@
 # takes precedence over the config. Resolution order:
 #
 # 1. the protoc-bin-vendored binary for this host from the Cargo registry,
-#    which the workspace already downloads for `logpose-api-grpc`
+#    which the workspace already downloads for `logpose-api-grpc`, preferring
+#    the version pinned in `Cargo.lock`
 # 2. `protoc` on `PATH`
 set -eu
 
@@ -23,12 +24,36 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 if [ -n "${platform}" ]; then
+  crate="protoc-bin-vendored-${platform}"
+  registry_src="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+
+  # Prefer the version pinned in Cargo.lock so the choice is deterministic
+  # when the registry holds several versions or several index directories.
+  lockfile="$(dirname -- "$0")/../Cargo.lock"
+  locked=""
+  if [ -f "${lockfile}" ]; then
+    locked="$(awk -v name="${crate}" '
+      $0 == "name = \"" name "\"" { found = 1; next }
+      found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+    ' "${lockfile}")"
+  fi
+
   vendored=""
-  for candidate in "${CARGO_HOME:-${HOME}/.cargo}"/registry/src/*/protoc-bin-vendored-"${platform}"-*/bin/protoc; do
-    if [ -x "${candidate}" ]; then
-      vendored="${candidate}"
-    fi
-  done
+  if [ -n "${locked}" ]; then
+    for candidate in "${registry_src}"/*/"${crate}-${locked}"/bin/protoc; do
+      if [ -x "${candidate}" ]; then
+        vendored="${candidate}"
+        break
+      fi
+    done
+  fi
+  if [ -z "${vendored}" ]; then
+    for candidate in "${registry_src}"/*/"${crate}"-*/bin/protoc; do
+      if [ -x "${candidate}" ]; then
+        vendored="${candidate}"
+      fi
+    done
+  fi
   if [ -n "${vendored}" ]; then
     exec "${vendored}" "$@"
   fi
