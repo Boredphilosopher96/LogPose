@@ -1,6 +1,7 @@
 //! Exact and ANN index sidecars for immutable units.
 
 pub mod graph;
+pub mod scalar;
 
 use logpose_types::{DistanceMetric, RecordId, ScalarFieldStats, ScalarMetadataValue, SeqNo};
 use serde::{Deserialize, Serialize};
