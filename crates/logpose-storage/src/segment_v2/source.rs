@@ -7,7 +7,8 @@
 //! validated file length before it allocates a buffer, so a source never
 //! sees a request that the file cannot satisfy.
 
-use std::{fs::File, io, path::Path, sync::Arc};
+use logpose_vfs::VfsFile;
+use std::{fmt, fs::File, io, path::Path, sync::Arc};
 
 /// Positioned, read-only access to an immutable segment file.
 ///
@@ -139,5 +140,26 @@ impl SectionSource for FileSource {
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, offset)
+    }
+}
+
+/// A segment file opened through the engine's [`Vfs`](logpose_vfs::Vfs).
+/// Cheap to clone, so async fetches can move it into a loader.
+#[derive(Clone)]
+pub struct VfsSource(pub Arc<dyn VfsFile>);
+
+impl SectionSource for VfsSource {
+    fn len(&self) -> io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.0.read_exact_at(buf, offset)
+    }
+}
+
+impl fmt::Debug for VfsSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("VfsSource").finish_non_exhaustive()
     }
 }

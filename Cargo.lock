@@ -1454,6 +1454,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bytemuck",
  "crc32c",
  "crc32fast",
  "logpose-auth",

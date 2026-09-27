@@ -26,7 +26,10 @@
 //!
 //! [`SegmentReader`] reads through a [`SectionSource`] (a positioned-read
 //! file abstraction), opens with two small reads at the ends of the file,
-//! and verifies each section only when it is loaded.
+//! and verifies each section only when it is loaded. With a
+//! [`BufferCache`](crate::cache::BufferCache) attached, every lazy load is a
+//! [`SegmentUnit`] that goes through the cache: whole sections, `VectorF32`
+//! prefixes and pages, and `DynamicJson` block indexes and blocks.
 
 pub mod builder;
 pub mod column;
@@ -38,6 +41,7 @@ pub mod pk;
 pub mod reader;
 pub mod source;
 pub mod stats;
+mod unit;
 pub mod vector;
 
 #[cfg(test)]
@@ -53,6 +57,7 @@ pub use error::{Region, SegmentError};
 pub use format::{FORMAT_VERSION, Footer, NO_FIELD, SectionEntry, SectionKind, SegmentHeader};
 pub use pk::{PkColumn, PkFilter, PkSorted, canonical_pk_hash};
 pub use reader::{DynamicHandle, SegmentReader, SegmentRow, VectorHandle};
-pub use source::{FileSource, MemorySource, SectionSource};
+pub use source::{FileSource, MemorySource, SectionSource, VfsSource};
 pub use stats::{FieldStats, HistogramBucket, SegmentStats, StatValue};
+pub use unit::{SegmentUnit, class_of};
 pub use vector::{VectorPrefix, page_rows_for};

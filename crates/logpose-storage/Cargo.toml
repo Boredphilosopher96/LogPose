@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 arc-swap = "1.7"
 async-trait.workspace = true
+bytemuck = "1.25"
 crc32c = "0.6"
 crc32fast = "1.4"
 logpose-auth = { path = "../logpose-auth" }

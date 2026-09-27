@@ -1,6 +1,7 @@
 //! Tests for segment v2: round trips, corruption, allocation bounds, and the
 //! golden file.
 
+mod cached;
 mod corruption;
 mod fixture;
 mod golden;
