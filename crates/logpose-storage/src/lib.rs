@@ -7,14 +7,11 @@ use rand as _;
 
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
-use logpose_index::{
-    FlatIndexEntrySource, HnswIndexSidecar, build_flat_index, read_flat_index, read_hnsw_index,
-};
+use logpose_index::{read_flat_index, read_hnsw_index};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
     CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
-    PutRecord, QueryUnitArtifactStats, QueryUnitStats, RecordId, Result, SeqNo, Snapshot,
-    VisibleRecord, WriteOperation,
+    PutRecord, RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{
     WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file,
@@ -36,8 +33,11 @@ mod fs_util;
 mod manifest;
 mod metric;
 mod paths;
+mod resolve;
 mod root_lock;
 mod segment_v1;
+mod state;
+mod stats;
 mod storage_engine;
 #[cfg(test)]
 mod test_support;
@@ -45,10 +45,13 @@ mod test_support;
 use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir};
 use error::{io_message, json_message};
 use fs_util::{atomic_write, cleanup_dir, read_json, remove_file_if_exists};
-use manifest::{Manifest, SegmentMeta, segment_artifact_file_name};
+use manifest::{Manifest, segment_artifact_file_name};
 use metric::storage_metric_compare;
+use resolve::{ResolvedState, resolve_latest_from_segments, resolve_latest_state_for_ids_selected};
 use root_lock::StorageRootLock;
 use segment_v1::read_segment_file;
+use state::{CollectionState, resolve_snapshot};
+use stats::approximate_record_bytes;
 
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
@@ -452,47 +455,6 @@ impl LocalStorageEngine {
         } else {
             CollectionRef::new_default(name)
         }
-    }
-
-    fn collection_stats_from_state(
-        &self,
-        state: CollectionState,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        let effective_snapshot = resolve_snapshot(&state, snapshot)?;
-        let resolved =
-            resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
-        let mut live_record_count = 0usize;
-        let mut deleted_record_count = 0usize;
-        for value in resolved.values() {
-            match value {
-                ResolvedState::Visible(_) => live_record_count += 1,
-                ResolvedState::Deleted { .. } => deleted_record_count += 1,
-            }
-        }
-        let maintenance = self.load_maintenance_status(&state.descriptor)?;
-        let delta_records = state
-            .delta
-            .iter()
-            .filter(|record| record.seq_no <= effective_snapshot.visible_seq_no)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut query_units = vec![mutable_query_unit(&delta_records)];
-        query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
-
-        Ok(CollectionStats {
-            collection_id: state.descriptor.collection_id.clone(),
-            database_name: state.descriptor.database_name.clone(),
-            collection_name: state.descriptor.name.clone(),
-            manifest_generation: effective_snapshot.manifest_generation,
-            visible_seq_no: effective_snapshot.visible_seq_no,
-            mutable_op_count: delta_records.len(),
-            segment_count: state.manifest.segments.len(),
-            live_record_count,
-            deleted_record_count,
-            maintenance,
-            query_units,
-        })
     }
 
     fn should_flush(&self, descriptor: &CollectionDescriptor, delta: &[WalRecord]) -> bool {
@@ -1244,45 +1206,6 @@ impl StorageEngine for LocalStorageEngine {
     }
 }
 
-impl LocalStorageEngine {
-    fn scan_exact_internal(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        include_mutable: bool,
-        immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let state = self.load_collection_state(
-            collection_name,
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        let snapshot = resolve_snapshot(&state, snapshot)?;
-
-        let resolved = resolve_latest_state_selected(
-            &state,
-            snapshot.visible_seq_no,
-            include_mutable,
-            immutable_unit_ids,
-        )?;
-        let mut records = resolved
-            .into_values()
-            .filter_map(|state| match state {
-                ResolvedState::Visible(record) => Some(record),
-                ResolvedState::Deleted { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(records)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CollectionState {
-    descriptor: CollectionDescriptor,
-    manifest: Manifest,
-    delta: Vec<WalRecord>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MaintenanceOperation {
     Flush,
@@ -1304,36 +1227,6 @@ impl MaintenanceOperation {
             _ => None,
         }
     }
-}
-
-fn resolve_snapshot(state: &CollectionState, snapshot: Option<Snapshot>) -> Result<Snapshot> {
-    let snapshot = snapshot.unwrap_or(Snapshot {
-        manifest_generation: state.manifest.generation,
-        visible_seq_no: state.visible_seq_no(),
-    });
-
-    if snapshot.manifest_generation != state.manifest.generation {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: manifest generation {} is unavailable",
-            snapshot.manifest_generation
-        )));
-    }
-
-    let max_visible = state.visible_seq_no();
-    if snapshot.visible_seq_no > max_visible {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: visible sequence {} exceeds maximum {} for manifest generation {}",
-            snapshot.visible_seq_no, max_visible, snapshot.manifest_generation
-        )));
-    }
-    if snapshot.visible_seq_no < state.manifest.checkpoint_seq_no {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: visible sequence {} is below checkpoint {} for manifest generation {}",
-            snapshot.visible_seq_no, state.manifest.checkpoint_seq_no, snapshot.manifest_generation
-        )));
-    }
-
-    Ok(snapshot)
 }
 
 #[derive(Default)]
@@ -1398,294 +1291,6 @@ fn maintenance_status_lock(path: &Path) -> Arc<Mutex<()>> {
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
-}
-
-impl CollectionState {
-    fn visible_seq_no(&self) -> SeqNo {
-        self.delta.last().map(|record| record.seq_no).unwrap_or(
-            self.manifest
-                .checkpoint_seq_no
-                .max(self.manifest.max_segment_seq_no()),
-        )
-    }
-}
-
-impl From<&SegmentMeta> for QueryUnitStats {
-    fn from(segment: &SegmentMeta) -> Self {
-        Self {
-            unit_id: segment.segment_id.clone(),
-            tier: "immutable".to_owned(),
-            index_kind: segment.index_kind.clone(),
-            min_seq_no: segment.min_seq_no,
-            max_seq_no: segment.max_seq_no,
-            put_count: segment.put_count,
-            delete_count: segment.delete_count,
-            approx_bytes: segment.approx_bytes,
-            scalar_fields: segment.scalar_fields.clone(),
-            artifact_stats: segment.artifacts.clone(),
-            component_bytes: segment.component_bytes.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum ResolvedState {
-    Visible(VisibleRecord),
-    Deleted { id: RecordId, seq_no: SeqNo },
-}
-
-fn resolve_latest_state_selected(
-    state: &CollectionState,
-    visible_seq_no: SeqNo,
-    include_mutable: bool,
-    immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
-) -> Result<BTreeMap<RecordId, ResolvedState>> {
-    let mut resolved = BTreeMap::new();
-
-    if include_mutable {
-        for record in state
-            .delta
-            .iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no)
-        {
-            apply_resolved_record(&mut resolved, record.clone());
-        }
-    }
-
-    for segment in state.manifest.segments.iter().rev().filter(|segment| {
-        immutable_unit_ids
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&segment.segment_id))
-    }) {
-        let records = read_segment_file(
-            &state
-                .descriptor
-                .root_path
-                .join("segments")
-                .join(&segment.file_name),
-        )?;
-        for record in records
-            .into_iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no)
-        {
-            apply_resolved_record(&mut resolved, record);
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn resolve_latest_from_segments(
-    descriptor: &CollectionDescriptor,
-    manifest: &Manifest,
-) -> Result<BTreeMap<RecordId, ResolvedState>> {
-    let mut resolved = BTreeMap::new();
-    for segment in manifest.segments.iter().rev() {
-        let records = read_segment_file(
-            &descriptor
-                .root_path
-                .join("segments")
-                .join(&segment.file_name),
-        )?;
-        for record in records.into_iter().rev() {
-            apply_resolved_record(&mut resolved, record);
-        }
-    }
-    Ok(resolved)
-}
-
-fn resolve_latest_state_for_ids_selected(
-    state: &CollectionState,
-    visible_seq_no: SeqNo,
-    wanted_ids: &BTreeSet<RecordId>,
-    include_mutable: bool,
-    immutable_unit_ids: Option<BTreeSet<String>>,
-) -> Result<BTreeMap<RecordId, ResolvedState>> {
-    let mut resolved = BTreeMap::new();
-
-    if include_mutable {
-        for record in state
-            .delta
-            .iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no)
-        {
-            if wanted_ids.contains(record.op.id()) {
-                apply_resolved_record(&mut resolved, record.clone());
-            }
-            if resolved.len() == wanted_ids.len() {
-                return Ok(resolved);
-            }
-        }
-    }
-
-    for segment in state.manifest.segments.iter().rev().filter(|segment| {
-        immutable_unit_ids
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&segment.segment_id))
-    }) {
-        let records = read_segment_file(
-            &state
-                .descriptor
-                .root_path
-                .join("segments")
-                .join(&segment.file_name),
-        )?;
-        for record in records
-            .into_iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no && wanted_ids.contains(record.op.id()))
-        {
-            apply_resolved_record(&mut resolved, record);
-        }
-        if resolved.len() == wanted_ids.len() {
-            return Ok(resolved);
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
-    let sidecar = build_flat_index(
-        "mutable-delta",
-        &delta
-            .iter()
-            .map(|record| match &record.op {
-                WriteOperation::Put(put) => FlatIndexEntrySource {
-                    is_put: true,
-                    record_id_offset: 0,
-                    vector_offset: 0,
-                    metadata_offset: 0,
-                    vector: Some(put.vector.clone()),
-                    metadata: Some(put.metadata.clone()),
-                },
-                WriteOperation::Delete(_) => FlatIndexEntrySource {
-                    is_put: false,
-                    record_id_offset: 0,
-                    vector_offset: 0,
-                    metadata_offset: 0,
-                    vector: None,
-                    metadata: None,
-                },
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    QueryUnitStats {
-        unit_id: "mutable-delta".to_owned(),
-        tier: "mutable".to_owned(),
-        index_kind: "raw".to_owned(),
-        min_seq_no: delta.first().map(|record| record.seq_no).unwrap_or(0),
-        max_seq_no: delta.last().map(|record| record.seq_no).unwrap_or(0),
-        put_count: sidecar.put_count,
-        delete_count: sidecar.delete_count,
-        approx_bytes: delta
-            .iter()
-            .map(|record| approximate_record_bytes(&record.op))
-            .sum(),
-        scalar_fields: sidecar.scalar_fields,
-        artifact_stats: vec![QueryUnitArtifactStats {
-            kind: "mutable_delta".to_owned(),
-            file_name: String::new(),
-            approx_bytes: delta
-                .iter()
-                .map(|record| approximate_record_bytes(&record.op))
-                .sum(),
-        }],
-        component_bytes: BTreeMap::from([(
-            "mutable_delta".to_owned(),
-            delta
-                .iter()
-                .map(|record| approximate_record_bytes(&record.op))
-                .sum(),
-        )]),
-    }
-}
-
-fn segment_component_bytes(
-    hnsw_index: &HnswIndexSidecar,
-    raw_segment_bytes: usize,
-    flat_bytes: usize,
-) -> BTreeMap<String, usize> {
-    let ann_vectors = hnsw_index
-        .nodes
-        .iter()
-        .map(|node| node.record.vector.len() * std::mem::size_of::<f32>())
-        .sum::<usize>();
-    let ann_metadata = hnsw_index
-        .nodes
-        .iter()
-        .map(|node| node.record.metadata.to_string().len())
-        .sum::<usize>();
-    let ann_graph = hnsw_index
-        .nodes
-        .iter()
-        .map(|node| {
-            std::mem::size_of::<u32>()
-                + std::mem::size_of::<u8>()
-                + node.neighbors_by_level.len() * std::mem::size_of::<u32>()
-                + node
-                    .neighbors_by_level
-                    .iter()
-                    .map(|neighbors| neighbors.len() * std::mem::size_of::<u32>())
-                    .sum::<usize>()
-        })
-        .sum::<usize>();
-
-    BTreeMap::from([
-        ("raw_segment".to_owned(), raw_segment_bytes),
-        ("exact_flat".to_owned(), flat_bytes),
-        ("ann_graph".to_owned(), ann_graph),
-        ("ann_vectors".to_owned(), ann_vectors),
-        ("ann_metadata".to_owned(), ann_metadata),
-    ])
-}
-
-fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, record: WalRecord) {
-    let id = record.op.id().clone();
-    if resolved.contains_key(&id) {
-        return;
-    }
-
-    match record.op {
-        WriteOperation::Put(put) => {
-            resolved.insert(
-                id,
-                ResolvedState::Visible(VisibleRecord {
-                    id: put.id,
-                    vector: put.vector,
-                    metadata: put.metadata,
-                    seq_no: record.seq_no,
-                }),
-            );
-        }
-        WriteOperation::Delete(delete) => {
-            resolved.insert(
-                id,
-                ResolvedState::Deleted {
-                    id: delete.id,
-                    seq_no: record.seq_no,
-                },
-            );
-        }
-    }
-}
-
-fn approximate_record_bytes(operation: &WriteOperation) -> usize {
-    match operation {
-        WriteOperation::Put(put) => {
-            put.id.as_str().len()
-                + put.vector.len() * std::mem::size_of::<f32>()
-                + serde_json::to_vec(&put.metadata)
-                    .map(|value| value.len())
-                    .unwrap_or(0)
-                + 32
-        }
-        WriteOperation::Delete(delete) => delete.id.as_str().len() + 16,
-    }
 }
 
 /// Test-only fault injection for failures that cannot be provoked through the filesystem when

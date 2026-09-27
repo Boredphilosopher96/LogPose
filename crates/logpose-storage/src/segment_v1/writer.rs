@@ -7,7 +7,7 @@ use crate::{
     error::{io_message, json_message},
     fs_util::cleanup_file,
     manifest::{RemoteArtifact, RemoteSyncState, SegmentMeta},
-    segment_component_bytes,
+    stats::segment_component_bytes,
 };
 use crc32fast::hash;
 use logpose_catalog::CollectionDescriptor;
