@@ -20,7 +20,10 @@ use logpose_types::{
     LogPoseError, MaintenanceStatus, NodeRole, PutRecord, QueryUnitArtifactStats, QueryUnitStats,
     RecordId, Result, ScalarFieldStats, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
-use logpose_wal::{WalRecord, WalWriter, replay_dir_after_checkpoint, rotate_active};
+use logpose_wal::{
+    ACTIVE_WAL_FILE_NAME, WalBatch, WalRecord, WalWriter, replay_dir_after_checkpoint,
+    rotate_active,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -413,7 +416,7 @@ impl LocalStorageEngine {
     }
 
     fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join("active.wal")
+        descriptor.root_path.join("wal").join(ACTIVE_WAL_FILE_NAME)
     }
 
     fn rolled_wal_path(descriptor: &CollectionDescriptor, checkpoint_seq_no: SeqNo) -> PathBuf {
@@ -686,7 +689,6 @@ impl LocalStorageEngine {
             manifest.checkpoint_seq_no,
         )?
         .into_iter()
-        .filter(|record| record.seq_no > manifest.checkpoint_seq_no)
         .chain(promoted_delta)
         .collect::<Vec<_>>();
         let mut delta = delta;
@@ -1809,17 +1811,20 @@ impl StorageEngine for LocalStorageEngine {
             }
         }
 
+        // The whole batch is one WAL frame with one fsync, so replay sees all of it or none.
+        let applied_ops = operations.len();
+        let batch = WalBatch::new(
+            operations
+                .into_iter()
+                .zip(existing_max + 1..)
+                .map(|(op, seq_no)| WalRecord { seq_no, op })
+                .collect(),
+        )?;
+        let last_seq_no = batch.last_seq_no();
         let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
-        let mut last_seq_no = existing_max;
+        wal_writer.append_batch(&batch)?;
         let mut delta_after_write = state.delta.clone();
-        for operation in &operations {
-            last_seq_no += 1;
-            wal_writer.append(last_seq_no, operation)?;
-            delta_after_write.push(WalRecord {
-                seq_no: last_seq_no,
-                op: operation.clone(),
-            });
-        }
+        delta_after_write.extend(batch.into_records());
 
         if self.should_flush(&state.descriptor, &delta_after_write) {
             self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Flush])?;
@@ -1829,7 +1834,7 @@ impl StorageEngine for LocalStorageEngine {
 
         Ok(CommitAck {
             last_seq_no,
-            applied_ops: operations.len(),
+            applied_ops,
             snapshot: Snapshot {
                 manifest_generation: state.manifest.generation,
                 visible_seq_no: last_seq_no,
