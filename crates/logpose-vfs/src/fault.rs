@@ -11,14 +11,22 @@
 //!   kernel writing back dirty pages out of order can; pages that were not written read as zeros.
 //! - **Truncation is volatile too.** A `set_len` that was not followed by a sync may or may not
 //!   survive a crash (except under [`TearMode::DropUnsynced`], where it never does).
-//! - **fsync can fail.** A failed sync returns EIO and, like Linux, leaves the unsynced suffix in
-//!   an undefined state: it is randomly kept or dropped at crash, and a later successful sync does
-//!   not make the lost part durable (it reads back as zeros after a crash).
+//! - **fsync can fail.** A failed sync returns EIO. Like Linux writeback, it may already have
+//!   written part of the unsynced suffix (a random prefix; never under
+//!   [`TearMode::DropUnsynced`]), so data whose sync failed can still be on disk after a crash.
+//!   The rest is left undefined: it is randomly kept or dropped at crash, and a later successful
+//!   sync does not make it durable (it reads back as zeros after a crash), because the kernel
+//!   marked those pages clean.
 //! - **Namespace changes are volatile until the directory is synced.** Create, rename and remove
 //!   edit the live namespace; only `sync_dir` makes a directory's entry set durable. On crash,
-//!   each directory reverts to its durable entry set, so a renamed file may appear under its old
-//!   name, a newly created file may vanish, and a removed file may come back. A directory whose
-//!   own entry set was never synced comes back empty.
+//!   each directory keeps its durable entry set plus a prefix of the changes made to it since,
+//!   in order, as a journaling filesystem that commits metadata in the background can: nothing
+//!   under [`TearMode::DropUnsynced`], a random prefix otherwise. So a renamed file may appear
+//!   under its old name, a newly created file may vanish, a removed file may come back, and an
+//!   unsynced change may also survive. A rename within one directory is atomic; a rename across
+//!   directories is two independent changes, so the file may end up under both names or none.
+//!   A directory whose own entry set was never synced keeps only the persisted prefix of its
+//!   changes.
 //! - **Crash halts the process.** After a crash triggers, every call returns an
 //!   [`io::ErrorKind::Other`] error with a [`Crashed`](crate::Crashed) payload until the test calls
 //!   [`FaultVfs::crash`] to compute the post-crash state. Handles from [`FaultVfs::process`] and
@@ -63,9 +71,14 @@ pub struct FaultPlan {
 }
 
 /// How a crash treats bytes written since a file's last successful sync.
+///
+/// Every mode except [`DropUnsynced`](Self::DropUnsynced) also persists a random prefix of each
+/// directory's unsynced entry changes, and lets a failed sync write back part of the data.
+/// Random cut points favor the extremes (nothing or everything survives), where durability
+/// bugs hide.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum TearMode {
-    /// Drop all unsynced bytes and unsynced truncations.
+    /// Drop all unsynced bytes, truncations and directory changes.
     #[default]
     DropUnsynced,
     /// Keep a random prefix of the unsynced suffix of each file.
@@ -93,7 +106,7 @@ pub struct CrashReport {
     pub triggered_at: Option<CrashPoint>,
     /// Files whose content after the crash differs from what readers saw before it.
     pub files: Vec<TornFile>,
-    /// Directories whose entry set reverted to the last synced one.
+    /// Directories whose entry set after the crash differs from the one readers saw before it.
     pub reverted_dirs: Vec<PathBuf>,
 }
 
@@ -142,6 +155,7 @@ impl FaultVfs {
                 inodes: BTreeMap::new(),
                 durable_dirs: dirs.clone(),
                 dirs,
+                unsynced_changes: BTreeMap::new(),
                 locks: BTreeMap::new(),
             })),
             pinned_boot: None,
@@ -265,7 +279,7 @@ impl Vfs for FaultVfs {
                 world.begin_mutation(self.pinned_boot)?;
                 let ino = world.allocate_id();
                 world.inodes.insert(ino, Inode::default());
-                world.namespace_mut(parent)?.insert(name, Node::File(ino));
+                world.change_namespace(parent, vec![(name, Some(Node::File(ino)))])?;
                 ino
             }
         };
@@ -302,9 +316,7 @@ impl Vfs for FaultVfs {
         for name in &components[index..] {
             let child = world.allocate_id();
             world.dirs.insert(child, Namespace::new());
-            world
-                .namespace_mut(dir)?
-                .insert(name.clone(), Node::Dir(child));
+            world.change_namespace(dir, vec![(name.clone(), Some(Node::Dir(child)))])?;
             dir = child;
         }
         Ok(())
@@ -357,11 +369,15 @@ impl Vfs for FaultVfs {
             return Ok(());
         }
         world.begin_mutation(self.pinned_boot)?;
-        world.namespace_mut(from_parent)?.remove(&from_name);
-        world
-            .namespace_mut(to_parent)?
-            .insert(to_name, Node::File(ino));
-        Ok(())
+        if from_parent == to_parent {
+            world.change_namespace(
+                from_parent,
+                vec![(from_name, None), (to_name, Some(Node::File(ino)))],
+            )
+        } else {
+            world.change_namespace(from_parent, vec![(from_name, None)])?;
+            world.change_namespace(to_parent, vec![(to_name, Some(Node::File(ino)))])
+        }
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -370,8 +386,7 @@ impl Vfs for FaultVfs {
         match world.entry(parent, &name)? {
             Some(Node::File(_)) => {
                 world.begin_mutation(self.pinned_boot)?;
-                world.namespace_mut(parent)?.remove(&name);
-                Ok(())
+                world.change_namespace(parent, vec![(name, None)])
             }
             Some(Node::Dir(_)) => Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
@@ -387,8 +402,7 @@ impl Vfs for FaultVfs {
         match world.entry(parent, &name)? {
             Some(Node::Dir(_)) => {
                 world.begin_mutation(self.pinned_boot)?;
-                world.namespace_mut(parent)?.remove(&name);
-                Ok(())
+                world.change_namespace(parent, vec![(name, None)])
             }
             Some(Node::File(_)) => Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -409,6 +423,7 @@ impl Vfs for FaultVfs {
         }
         let namespace = world.namespace(dir)?.clone();
         world.durable_dirs.insert(dir, namespace);
+        world.unsynced_changes.remove(&dir);
         Ok(())
     }
 
@@ -475,13 +490,18 @@ impl FaultFile {
         world.begin_mutation(Some(self.boot))?;
         let index = world.file_syncs;
         world.file_syncs += 1;
-        let fail = world.plan.fail_sync == Some(index);
-        let inode = world.inode_mut(self.ino)?;
-        if fail {
-            inode.poison_unsynced();
+        if world.plan.fail_sync == Some(index) {
+            // Writeback may have reached the disk for part of the data before the error.
+            let written = if world.plan.tear == TearMode::DropUnsynced {
+                0
+            } else {
+                let unsynced = world.inode(self.ino)?.unsynced_len();
+                world.rng.cut(unsynced)
+            };
+            world.inode_mut(self.ino)?.fail_sync(written);
             return Err(io::Error::from_raw_os_error(EIO));
         }
-        inode.sync();
+        world.inode_mut(self.ino)?.sync();
         Ok(())
     }
 }
@@ -580,6 +600,23 @@ impl Drop for FaultLock {
 
 type Namespace = BTreeMap<String, Node>;
 
+/// One namespace operation on one directory, applied atomically: each name is set to the node
+/// or, for `None`, removed.
+type NamespaceChange = Vec<(String, Option<Node>)>;
+
+fn apply_change(namespace: &mut Namespace, change: &NamespaceChange) {
+    for (name, node) in change {
+        match node {
+            Some(node) => {
+                namespace.insert(name.clone(), *node);
+            }
+            None => {
+                namespace.remove(name);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Node {
     File(u64),
@@ -610,16 +647,43 @@ impl Inode {
         }
     }
 
-    fn sync(&mut self) {
-        let mut durable = self.current.clone();
-        for &(start, end) in &self.poisoned {
-            let end = end.min(durable.len());
-            if start < end {
-                durable[start..end].fill(0);
+    /// The bytes a writeback of `current[start..end]` puts on disk: zeros where an earlier failed
+    /// sync already dropped the data.
+    fn written_back(&self, start: usize, end: usize) -> Vec<u8> {
+        let mut bytes = self.current[start..end].to_vec();
+        for &(poison_start, poison_end) in &self.poisoned {
+            let from = poison_start.max(start);
+            let to = poison_end.min(end);
+            if from < to {
+                bytes[from - start..to - start].fill(0);
             }
         }
-        self.durable = durable;
+        bytes
+    }
+
+    fn sync(&mut self) {
+        self.durable = self.written_back(0, self.current.len());
         self.stable_len = self.current.len();
+    }
+
+    /// Bytes written since the last successful sync.
+    fn unsynced_len(&self) -> usize {
+        self.current.len() - self.stable_len
+    }
+
+    /// A sync failed after writing back the first `written` unsynced bytes and the size that
+    /// covers them: those are on disk now, and the rest of the unsynced suffix is poisoned.
+    fn fail_sync(&mut self, written: usize) {
+        if written > 0 {
+            let start = self.stable_len;
+            let end = start + written;
+            let mut durable = self.durable.clone();
+            durable.resize(start, 0);
+            durable.extend_from_slice(&self.written_back(start, end));
+            self.durable = durable;
+            self.stable_len = end;
+        }
+        self.poison_unsynced();
     }
 
     fn poison_unsynced(&mut self) {
@@ -651,6 +715,8 @@ struct World {
     dirs: BTreeMap<u64, Namespace>,
     /// Namespaces as of each directory's last `sync_dir`.
     durable_dirs: BTreeMap<u64, Namespace>,
+    /// Changes made to each directory since its last `sync_dir`, oldest first.
+    unsynced_changes: BTreeMap<u64, Vec<NamespaceChange>>,
     locks: BTreeMap<PathBuf, u64>,
 }
 
@@ -689,10 +755,15 @@ impl World {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "directory was removed"))
     }
 
-    fn namespace_mut(&mut self, dir: u64) -> io::Result<&mut Namespace> {
-        self.dirs
+    /// Apply `change` to the live namespace of `dir` and log it as unsynced.
+    fn change_namespace(&mut self, dir: u64, change: NamespaceChange) -> io::Result<()> {
+        let namespace = self
+            .dirs
             .get_mut(&dir)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "directory was removed"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "directory was removed"))?;
+        apply_change(namespace, &change);
+        self.unsynced_changes.entry(dir).or_default().push(change);
+        Ok(())
     }
 
     fn inode(&self, ino: u64) -> io::Result<&Inode> {
@@ -763,12 +834,27 @@ impl World {
             ..CrashReport::default()
         };
 
-        // Rebuild the namespace from the durable entry sets reachable from the root.
+        // Rebuild the namespace from the durable entry sets reachable from the root, each plus
+        // the prefix of its unsynced changes that reached the journal.
+        let keep_changes = self.plan.tear != TearMode::DropUnsynced;
+        let mut unsynced_changes = std::mem::take(&mut self.unsynced_changes);
         let mut recovered_dirs = BTreeMap::new();
         let mut reachable_files = BTreeMap::<u64, PathBuf>::new();
         let mut pending = vec![(ROOT_DIR, PathBuf::from("/"))];
         while let Some((dir, path)) = pending.pop() {
-            let entries = self.durable_dirs.get(&dir).cloned().unwrap_or_default();
+            if recovered_dirs.contains_key(&dir) {
+                continue;
+            }
+            let mut entries = self.durable_dirs.get(&dir).cloned().unwrap_or_default();
+            let changes = unsynced_changes.remove(&dir).unwrap_or_default();
+            let persisted = if keep_changes {
+                self.rng.cut(changes.len())
+            } else {
+                0
+            };
+            for change in &changes[..persisted] {
+                apply_change(&mut entries, change);
+            }
             if self.dirs.get(&dir) != Some(&entries) {
                 report.reverted_dirs.push(path.clone());
             }
@@ -879,6 +965,16 @@ impl SplitMix64 {
         self.next_u64() & 1 == 1
     }
 
+    /// A cut point in `0..=max`: how much of something unsynced survives. Half the time it is an
+    /// extreme (none or all), the outcomes most likely to expose a missing sync.
+    fn cut(&mut self, max: usize) -> usize {
+        match self.next_u64() % 4 {
+            0 => 0,
+            1 => max,
+            _ => self.up_to(max),
+        }
+    }
+
     /// Content of `inode` after a crash under `tear`.
     fn recover_contents(&mut self, inode: &Inode, tear: TearMode) -> Vec<u8> {
         if tear == TearMode::DropUnsynced {
@@ -894,11 +990,11 @@ impl SplitMix64 {
         match tear {
             TearMode::DropUnsynced => {}
             TearMode::KeepRandomPrefix => {
-                let keep = self.up_to(suffix.len());
+                let keep = self.cut(suffix.len());
                 recovered.extend_from_slice(&suffix[..keep]);
             }
             TearMode::TornGarbage => {
-                let keep = self.up_to(suffix.len());
+                let keep = self.cut(suffix.len());
                 recovered.extend_from_slice(&suffix[..keep]);
                 if keep > 0 {
                     let end = stable + keep;
@@ -1009,6 +1105,49 @@ mod tests {
         assert_eq!(
             read_file(vfs.as_ref(), Path::new("/db/old")).expect("read"),
             b"new"
+        );
+    }
+
+    #[test]
+    fn unsynced_directory_changes_survive_as_an_ordered_prefix() {
+        let prefixes: [&[&str]; 5] = [
+            &["old"],
+            &["a", "old"],
+            &["b", "old"],
+            &["b", "c", "old"],
+            &["b", "c"],
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let vfs = FaultVfs::new(seed);
+            vfs.create_dir_all(Path::new("/db")).expect("mkdir");
+            vfs.sync_dir(Path::new("/")).expect("sync root");
+            write_synced(vfs.as_ref(), Path::new("/db/old"), b"old");
+            vfs.sync_dir(Path::new("/db")).expect("sync dir");
+
+            write_synced(vfs.as_ref(), Path::new("/db/a"), b"a");
+            vfs.rename(Path::new("/db/a"), Path::new("/db/b"))
+                .expect("rename");
+            write_synced(vfs.as_ref(), Path::new("/db/c"), b"c");
+            vfs.remove_file(Path::new("/db/old")).expect("remove");
+            vfs.set_plan(FaultPlan {
+                tear: TearMode::KeepRandomPrefix,
+                ..FaultPlan::default()
+            });
+            vfs.crash();
+
+            let state = names(vfs.as_ref(), "/db");
+            let state = state.iter().map(String::as_str).collect::<Vec<_>>();
+            assert!(
+                prefixes.contains(&state.as_slice()),
+                "seed {seed}: {state:?} is not an ordered prefix of the changes"
+            );
+            seen.insert(state.join(","));
+        }
+        assert_eq!(
+            seen.len(),
+            prefixes.len(),
+            "every prefix, including all changes, should be reachable: {seen:?}"
         );
     }
 
@@ -1161,23 +1300,64 @@ mod tests {
 
     #[test]
     fn rollback_after_failed_sync_makes_the_file_consistent_again() {
-        let vfs = FaultVfs::new(7);
-        let path = Path::new("/f");
-        write_synced(vfs.as_ref(), path, b"aaaa");
-        vfs.sync_dir(Path::new("/")).expect("sync root");
-        vfs.set_plan(FaultPlan {
-            fail_sync: Some(1),
-            ..FaultPlan::default()
-        });
-        let file = vfs.open(path, OpenMode::Append).expect("open");
-        file.append(&[io::IoSlice::new(b"bbbb")]).expect("append");
-        file.sync_data().expect_err("sync fails");
-        file.set_len(4).expect("roll back");
-        file.sync_all().expect("sync rollback");
-        file.append(&[io::IoSlice::new(b"cccc")]).expect("append");
-        file.sync_data().expect("sync");
-        vfs.crash();
-        assert_eq!(read_file(vfs.as_ref(), path).expect("read"), b"aaaacccc");
+        for tear in TearMode::ALL {
+            for seed in 0..16 {
+                let vfs = FaultVfs::new(seed);
+                let path = Path::new("/f");
+                write_synced(vfs.as_ref(), path, b"aaaa");
+                vfs.sync_dir(Path::new("/")).expect("sync root");
+                vfs.set_plan(FaultPlan {
+                    fail_sync: Some(1),
+                    tear,
+                    ..FaultPlan::default()
+                });
+                let file = vfs.open(path, OpenMode::Append).expect("open");
+                file.append(&[io::IoSlice::new(b"bbbb")]).expect("append");
+                file.sync_data().expect_err("sync fails");
+                file.set_len(4).expect("roll back");
+                file.sync_all().expect("sync rollback");
+                file.append(&[io::IoSlice::new(b"cccc")]).expect("append");
+                file.sync_data().expect("sync");
+                vfs.crash();
+                assert_eq!(
+                    read_file(vfs.as_ref(), path).expect("read"),
+                    b"aaaacccc",
+                    "{tear:?} seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_may_have_written_its_data_so_an_unsynced_rollback_can_lose() {
+        let mut resurrected = false;
+        for seed in 0..32 {
+            let vfs = FaultVfs::new(seed);
+            let path = Path::new("/f");
+            write_synced(vfs.as_ref(), path, b"aaaa");
+            vfs.sync_dir(Path::new("/")).expect("sync root");
+            vfs.set_plan(FaultPlan {
+                fail_sync: Some(1),
+                tear: TearMode::KeepRandomPrefix,
+                ..FaultPlan::default()
+            });
+            let file = vfs.open(path, OpenMode::Append).expect("open");
+            file.append(&[io::IoSlice::new(b"bbbb")]).expect("append");
+            file.sync_data().expect_err("sync fails");
+            file.set_len(4).expect("roll back without a sync");
+            vfs.crash();
+
+            let recovered = read_file(vfs.as_ref(), path).expect("read");
+            assert!(
+                b"aaaabbbb".starts_with(&recovered) && recovered.len() >= 4,
+                "seed {seed}: {recovered:?}"
+            );
+            resurrected |= recovered == b"aaaabbbb";
+        }
+        assert!(
+            resurrected,
+            "data whose sync failed must be able to reappear when the rollback is not synced"
+        );
     }
 
     #[test]
