@@ -1485,6 +1485,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "logpose-vfs"
+version = "0.1.0"
+
+[[package]]
 name = "logpose-wal"
 version = "0.1.0"
 dependencies = [
