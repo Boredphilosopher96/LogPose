@@ -24,7 +24,7 @@ use std::{
     io::IoSlice,
     path::Path,
     pin::pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Wake, Waker},
     thread,
     time::Duration,
@@ -52,11 +52,27 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-struct SpawnExecutor;
+/// Runs each job on a new thread. `join` waits for them: a job thread holds
+/// its flight (whose result pins the bytes) until it returns, a moment
+/// after its waiters wake, so tests that assert on eviction join first.
+#[derive(Default)]
+struct SpawnExecutor {
+    threads: Mutex<Vec<thread::JoinHandle<()>>>,
+}
 
 impl LoadExecutor for SpawnExecutor {
     fn execute(&self, job: LoadJob) {
-        thread::spawn(move || job.run());
+        let thread = thread::spawn(move || job.run());
+        self.threads.lock().expect("threads").push(thread);
+    }
+}
+
+impl SpawnExecutor {
+    fn join(&self) {
+        let threads = std::mem::take(&mut *self.threads.lock().expect("threads"));
+        for thread in threads {
+            thread.join().expect("job thread");
+        }
     }
 }
 
@@ -373,12 +389,13 @@ fn async_fetches_pin_units_for_the_compute_stage() {
     let reader = SegmentReader::open(MemorySource::new(bytes))
         .expect("opens")
         .with_cache(&cache);
+    let executor = SpawnExecutor::default();
     let mut pins = PinSet::new();
     let mut report = FetchReport::default();
 
     // Stage 1: the prefix.
     let prefix = reader.vector_prefix_unit(field).expect("prefix");
-    let (bytes, fetched) = block_on(reader.fetch(&prefix, &SpawnExecutor)).expect("prefix");
+    let (bytes, fetched) = block_on(reader.fetch(&prefix, &executor)).expect("prefix");
     report.record(prefix.class(), fetched);
     let handle = reader.vector_handle(&prefix, &bytes).expect("decodes");
     pins.insert(reader.unit_key(&prefix).expect("key"), bytes);
@@ -390,7 +407,7 @@ fn async_fetches_pin_units_for_the_compute_stage() {
         .collect();
     let fetches: Vec<_> = units
         .iter()
-        .map(|unit| reader.fetch(unit, &SpawnExecutor))
+        .map(|unit| reader.fetch(unit, &executor))
         .collect();
     for (unit, fetch) in units.iter().zip(fetches) {
         let (bytes, fetched) = block_on(fetch).expect("page");
@@ -411,6 +428,7 @@ fn async_fetches_pin_units_for_the_compute_stage() {
     assert_eq!(floats[0], 48.0, "page 3 starts at row 48");
     drop(pins);
     drop(handle);
+    executor.join();
     cache.trim();
     assert_eq!(cache.stats().entries, 0);
 
@@ -439,7 +457,7 @@ fn warm_up_loads_the_hot_sections_of_a_segment() {
     )));
     // SQ8, three pk sections, stats, and the inverted index.
     assert_eq!(items.len(), 6);
-    let report = block_on(cache.warm_up(items, &SpawnExecutor));
+    let report = block_on(cache.warm_up(items, &SpawnExecutor::default()));
     assert_eq!(report.loaded, 6);
     let misses = cache.stats().misses;
     reader.pk_column().expect("pk");

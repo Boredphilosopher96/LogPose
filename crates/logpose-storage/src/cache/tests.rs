@@ -82,12 +82,27 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Runs each job on a new thread.
-struct SpawnExecutor;
+/// Runs each job on a new thread. `join` waits for them: a job thread holds
+/// its flight (whose result pins the bytes) until it returns, a moment
+/// after its waiters wake, so tests that assert on eviction join first.
+#[derive(Default)]
+struct SpawnExecutor {
+    threads: Mutex<Vec<thread::JoinHandle<()>>>,
+}
 
 impl LoadExecutor for SpawnExecutor {
     fn execute(&self, job: LoadJob) {
-        thread::spawn(move || job.run());
+        let thread = thread::spawn(move || job.run());
+        self.threads.lock().expect("threads").push(thread);
+    }
+}
+
+impl SpawnExecutor {
+    fn join(&self) {
+        let threads = std::mem::take(&mut *self.threads.lock().expect("threads"));
+        for thread in threads {
+            thread.join().expect("job thread");
+        }
     }
 }
 
@@ -364,7 +379,7 @@ async fn concurrent_async_misses_share_one_read() {
                 key(file, 1),
                 ArtifactClass::PkIndex,
                 CacheMode::Normal,
-                &SpawnExecutor,
+                &SpawnExecutor::default(),
                 move || {
                     reads.fetch_add(1, Ordering::SeqCst);
                     while !open.load(Ordering::SeqCst) {
@@ -584,7 +599,7 @@ fn bypass_reads_use_resident_entries_but_never_insert() {
         key(file, 0),
         ArtifactClass::ScalarColumns,
         CacheMode::Bypass,
-        &SpawnExecutor,
+        &SpawnExecutor::default(),
         || Ok(bytes(UNIT, 1)),
     ))
     .expect("load");
@@ -776,7 +791,7 @@ fn warm_up_keeps_at_most_two_loads_in_flight_and_survives_failures() {
             }
         })
         .collect();
-    let report = block_on(cache.warm_up(items, &SpawnExecutor));
+    let report = block_on(cache.warm_up(items, &SpawnExecutor::default()));
     assert_eq!(report.loaded, 9);
     assert_eq!(report.failed, 3);
     assert!((1..=2).contains(&peak.load(Ordering::SeqCst)));
@@ -867,9 +882,15 @@ fn stress_stays_within_budget_beyond_pins_and_never_deadlocks() {
             samples
         })
     };
+    let executor = Arc::new(SpawnExecutor::default());
     let (done, finished) = mpsc::channel::<u64>();
     for thread_index in 0..THREADS {
-        let (cache, reads, done) = (cache.clone(), Arc::clone(&reads), done.clone());
+        let (cache, reads, done, executor) = (
+            cache.clone(),
+            Arc::clone(&reads),
+            done.clone(),
+            Arc::clone(&executor),
+        );
         thread::spawn(move || {
             let mut rng = SplitMix(thread_index * 7919 + 1);
             let mut pins: Vec<(CacheKey, Arc<AlignedBytes>)> = Vec::new();
@@ -892,7 +913,7 @@ fn stress_stays_within_budget_beyond_pins_and_never_deadlocks() {
                 let result = if thread_index < BLOCKING_THREADS {
                     cache.get_or_load_blocking(key, class, CacheMode::Normal, load)
                 } else {
-                    block_on(cache.get_or_load(key, class, CacheMode::Normal, &SpawnExecutor, load))
+                    block_on(cache.get_or_load(key, class, CacheMode::Normal, &*executor, load))
                 };
                 if let Ok((bytes, _)) = result {
                     assert_eq!(bytes.len(), len, "a key always maps to its own bytes");
@@ -919,6 +940,7 @@ fn stress_stays_within_budget_beyond_pins_and_never_deadlocks() {
     }
     stop.store(true, Ordering::Relaxed);
     let samples = checker.join().expect("the budget invariant held");
+    executor.join();
     assert!(samples > 0);
 
     // Quiescent: nothing is pinned, so a trim reaches the budget, and the
