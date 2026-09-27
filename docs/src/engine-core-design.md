@@ -322,6 +322,15 @@ impl FaultVfs {
 
 Tests enumerate crashes two ways: by name (`crash_at`) for documented steps, and exhaustively by count (`crash_after_ops = k` for every `k` from 0 to the op count of a clean run), which catches steps nobody named.
 
+As implemented in PR 2, the crate differs from the sketch above in small ways that tests rely on:
+
+- **Process handles.** `FaultVfs::process()` returns an `Arc<dyn Vfs>` bound to the current boot. After `crash()`, that handle and every file opened through it fail forever, so a thread left over from the crashed engine cannot write into the rebooted state. Each engine open takes a new process handle; the root-lock registry is keyed by `Vfs` identity, so engines on one handle share the root claim and a second process handle cannot take it.
+- **Per-boot counters.** `crash()` resets the plan to `FaultPlan::default()` and the counters to zero, so `crash_after_ops`, `fail_sync` (file syncs) and the added `fail_sync_dir` (directory syncs) are zero-based indexes since the last reboot. `mutating_ops()`, `file_syncs()` and `crash_points_hit()` expose them.
+- **Truncation is volatile.** An unsynced `set_len` may or may not survive a crash (never under `DropUnsynced`). A directory whose entry set was never synced comes back empty.
+- **No `rand`.** `FaultVfs` uses a local SplitMix64 generator, so `logpose-vfs` has no dependencies and a recorded seed replays identically across dependency upgrades.
+- **Helpers.** `exists`, `read_file` and `parent_dir` are free functions over `&dyn Vfs`; `std_vfs()` is the shared `StdVfs` handle the convenience constructors use. `StdVfs::append` joins multiple slices into one `write_all`, because `write_all_vectored` is not stable.
+- **Legacy crash points.** Until the engine rewrite lands, the v1 engine reports the points it has: the WAL points in `WalWriter` and `rotate_active`, `RecoveryAfterTailRepair` in `WalWriter::open`, the manifest and `CURRENT` points in the manifest publish, `FlushAfterSegmentSync` and `FlushAfterSegmentsDirSync` in a flush's segment publish, and `CompactionAfterOutputSync` in a compaction's. `FlushAfterDvSync`, `CompactionAfterDvSync`, `GcAfterRemove` and `RecoveryAfterOrphanCleanup` have no v1 step and are first reported by PRs 6, 10 and 11.
+
 ## Engine, CollectionHandle and Version
 
 ### Engine Structs

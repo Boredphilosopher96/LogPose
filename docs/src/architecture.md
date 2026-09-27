@@ -40,7 +40,9 @@ LogPose is still a local filesystem engine.
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
 - every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory; new segment and index files fsync their directories before the manifest that references them is published, and WAL rotation fsyncs `wal/` before the `PENDING_ROTATION` marker is cleared
 - one process owns a `storage_root` at a time: opening the storage engine takes an exclusive lock on `storage_root/LOCK` (engines inside one process share it), and a second process fails at startup with an "already in use by another process" error
-- if a `wal/PENDING_ROTATION` marker survives while `active.wal` holds records above the marker's checkpoint, recovery refuses to truncate the WAL and reports an error instead of discarding acknowledged writes
+- if a flush published its manifest but crashed before rotating the WAL, recovery finishes the rotation (rolling `active.wal` to `<checkpoint>.wal`, so snapshots of older manifest generations still replay those records) and clears the `wal/PENDING_ROTATION` marker
+- if a `wal/PENDING_ROTATION` marker survives while `active.wal` holds records above the marker's checkpoint, recovery leaves the WAL untouched and reports an error instead of discarding acknowledged writes
+- all storage and WAL file I/O goes through the `Vfs` trait in `crates/logpose-vfs`: `StdVfs` in production, and `FaultVfs`, an in-memory filesystem that models lost unsynced data, torn writes, failed fsyncs and volatile directory entries, in crash tests
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
 
