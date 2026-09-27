@@ -435,3 +435,102 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
         assert!(seen <= acked);
     }
 }
+
+/// Compaction builds its output holding only the maintenance slot, so writes land while it
+/// runs. Its publication must keep every one of them (no lost update) without duplicating or
+/// reordering sequence numbers.
+#[test]
+fn compaction_keeps_every_write_that_lands_while_it_builds() {
+    let root = unique_temp_dir("engine-compaction-vs-writes");
+    let engine = open(&root).expect("engine should open");
+    let handle = create(&engine, "documents");
+    let core = engine.core();
+    for index in 0..3 {
+        write(
+            &engine,
+            &handle,
+            vec![put(&format!("seed-{index}"), vec![1.0, 0.0])],
+        );
+        core.flush_collection(&handle)
+            .expect("flush should succeed");
+    }
+
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let engine = engine.clone();
+        let handle = Arc::clone(&handle);
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let core = engine.core();
+            let mut acked = Vec::new();
+            let mut index = 0;
+            while !done.load(Ordering::Acquire) || acked.len() < 50 {
+                let id = format!("write-{index}");
+                let ack = core
+                    .write(&handle, vec![put(&id, vec![0.0, 1.0])])
+                    .expect("write should succeed");
+                assert!(
+                    handle.current().visible_seq_no >= ack.last_seq_no,
+                    "an acknowledged write is visible (I1)"
+                );
+                acked.push((id, ack.last_seq_no));
+                index += 1;
+            }
+            acked
+        })
+    };
+
+    let mut last_seen = handle.visible_seq_no();
+    for _ in 0..6 {
+        // Flush adds a segment while holding the writer slot; compaction then runs while
+        // writes continue.
+        core.flush_collection(&handle)
+            .expect("flush should succeed");
+        core.compact_collection(&handle)
+            .expect("compaction should succeed");
+        let version = handle.current();
+        version
+            .check_invariants()
+            .expect("the version compaction published is consistent");
+        assert!(
+            version.visible_seq_no >= last_seen,
+            "visibility never regresses"
+        );
+        last_seen = version.visible_seq_no;
+    }
+    done.store(true, Ordering::Release);
+    let acked = writer.join().expect("writer should join");
+
+    let check = |engine: &Engine, context: &str| {
+        let handle = engine
+            .collection(&reference("documents"))
+            .expect("collection should be open");
+        let version = handle.current();
+        version.check_invariants().expect("invariants should hold");
+        let last = acked.last().map_or(0, |(_, seq_no)| *seq_no);
+        assert_eq!(
+            version.visible_seq_no, last,
+            "{context}: every ack is visible"
+        );
+        let visible = engine
+            .core()
+            .scan_exact_internal(&handle, None, true, None)
+            .expect("scan should succeed")
+            .into_iter()
+            .map(|record| (record.id.as_str().to_owned(), record.seq_no))
+            .collect::<BTreeMap<_, _>>();
+        for (id, seq_no) in &acked {
+            assert_eq!(
+                visible.get(id),
+                Some(seq_no),
+                "{context}: acknowledged write '{id}' is visible at its own seq"
+            );
+        }
+        assert_eq!(visible.len(), acked.len() + 3, "{context}: nothing is lost");
+    };
+    check(&engine, "in memory");
+    drop((handle, core));
+    drop(engine);
+    let engine = open(&root).expect("engine should reopen");
+    check(&engine, "after reopen");
+}
