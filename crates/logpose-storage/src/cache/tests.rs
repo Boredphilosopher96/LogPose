@@ -1054,3 +1054,146 @@ fn floors_that_exceed_the_budget_still_evict() {
     assert!(cache.used() <= cache.budget());
     assert_eq!(cache.stats().overcommits, 0);
 }
+
+/// The internal state agrees with itself: per-class usage is the sum of the
+/// resident entries' charges, and every resident entry sits in its class's
+/// ring exactly once (an entry missing from its ring could never be
+/// evicted).
+fn assert_consistent(cache: &BufferCache) {
+    let inner = &cache.inner;
+    let mut charges = [0_u64; ArtifactClass::COUNT];
+    let mut resident = std::collections::HashMap::new();
+    for shard in inner.shards.iter() {
+        for (key, entry) in &super::lock(shard).entries {
+            assert_eq!(*key, entry.key);
+            assert_eq!(entry.charge, charge_for(entry.bytes.len()));
+            charges[entry.class.index()] += entry.charge;
+            resident.insert(*key, entry.class);
+        }
+    }
+    let used: [u64; ArtifactClass::COUNT] = cache.stats().used;
+    assert_eq!(used, charges, "per-class usage equals the resident charges");
+    let mut in_rings = std::collections::HashMap::new();
+    for class in ArtifactClass::ALL {
+        for slot in super::lock(&inner.clocks[class.index()]).iter() {
+            if let Some(entry) = slot.upgrade() {
+                assert_eq!(entry.class, class, "an entry sits in its class's ring");
+                *in_rings.entry(entry.key).or_insert(0) += 1;
+            }
+        }
+    }
+    for key in resident.keys() {
+        assert_eq!(
+            in_rings.get(key),
+            Some(&1),
+            "{key:?} is in its ring exactly once"
+        );
+    }
+}
+
+#[test]
+fn stress_with_bypass_budget_changes_and_invalidation_keeps_exact_accounting() {
+    const BLOCKING_THREADS: u64 = 5;
+    const ASYNC_THREADS: u64 = 3;
+    const THREADS: u64 = BLOCKING_THREADS + ASYNC_THREADS;
+    const OPS: u64 = 2_500;
+    const KEYS: u32 = 64;
+    const MAX_PINS: usize = 3;
+    let files: [FileId; 3] = std::array::from_fn(|_| FileId::next());
+    let size_of = |section: u32| 64 + (section as usize % 5) * 700;
+    let class_of = |section: u32| ArtifactClass::ALL[section as usize % ArtifactClass::COUNT];
+    let max_charge = charge_for(size_of(4));
+    let budgets = [0, 4 * max_charge, 10 * max_charge, 40 * max_charge];
+    let cache = BufferCache::new(CacheConfig {
+        budget: budgets[2],
+        floors: [0.0, 0.0, 0.05, 0.1, 0.05, 0.1],
+    });
+    let slack = THREADS * (MAX_PINS as u64 + 2) * max_charge;
+    let stop = Arc::new(AtomicBool::new(false));
+    let checker = {
+        let (cache, stop) = (cache.clone(), Arc::clone(&stop));
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // A budget change can be mid-eviction; allow the largest.
+                let used = cache.used();
+                assert!(
+                    used <= budgets[3] + slack,
+                    "used {used} exceeds every budget plus pinned slack"
+                );
+                thread::yield_now();
+            }
+        })
+    };
+    let executor = Arc::new(SpawnExecutor::default());
+    let workers: Vec<_> = (0..THREADS)
+        .map(|thread_index| {
+            let (cache, executor) = (cache.clone(), Arc::clone(&executor));
+            thread::spawn(move || {
+                let mut rng = SplitMix(thread_index * 104_729 + 17);
+                let mut pins: Vec<Arc<AlignedBytes>> = Vec::new();
+                for _ in 0..OPS {
+                    let section = u32::try_from(rng.below(u64::from(KEYS))).unwrap_or(0);
+                    let file = files[usize::try_from(rng.below(3)).unwrap_or(0)];
+                    let key = key(file, section);
+                    let len = size_of(section);
+                    let fill =
+                        u8::try_from((file.get() * 31 + u64::from(section)) % 251).unwrap_or(0);
+                    let fail = rng.below(40) == 0;
+                    let mode = if rng.below(5) == 0 {
+                        CacheMode::Bypass
+                    } else {
+                        CacheMode::Normal
+                    };
+                    let load = move || {
+                        if fail {
+                            Err(io_error())
+                        } else {
+                            Ok(bytes(len, fill))
+                        }
+                    };
+                    let result = if thread_index < BLOCKING_THREADS {
+                        cache.get_or_load_blocking(key, class_of(section), mode, load)
+                    } else {
+                        block_on(cache.get_or_load(key, class_of(section), mode, &*executor, load))
+                    };
+                    if let Ok((bytes, _)) = result {
+                        assert_eq!(bytes.len(), len, "a key always maps to its own bytes");
+                        assert!(bytes.iter().all(|byte| *byte == fill), "and to its content");
+                        if rng.below(3) == 0 {
+                            pins.push(bytes);
+                        }
+                    }
+                    while pins.len() > MAX_PINS {
+                        pins.swap_remove(0);
+                    }
+                    match rng.below(200) {
+                        0 => {
+                            cache
+                                .invalidate_file(files[usize::try_from(rng.below(3)).unwrap_or(0)]);
+                        }
+                        1 => cache.set_budget(budgets[usize::try_from(rng.below(4)).unwrap_or(0)]),
+                        2 => cache.trim(),
+                        _ => {}
+                    }
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker
+            .join()
+            .expect("worker finishes without a failed assertion");
+    }
+    stop.store(true, Ordering::Relaxed);
+    checker.join().expect("the budget invariant held");
+    executor.join();
+
+    assert_consistent(&cache);
+    for budget in budgets.into_iter().rev() {
+        cache.set_budget(budget);
+        assert!(cache.used() <= budget, "nothing is pinned once quiescent");
+        assert_consistent(&cache);
+    }
+    assert_eq!(cache.used(), 0);
+    assert_eq!(cache.stats().entries, 0);
+}
