@@ -5,7 +5,7 @@ use crate::{
     error::json_message,
     fs_util::{atomic_write, read_json},
     stats::approximate_record_bytes,
-    wal_rotation_lock,
+    wal_rotation::wal_rotation_lock,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{MaintenanceStatus, Result, Snapshot};
