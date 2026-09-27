@@ -325,7 +325,7 @@ Tests enumerate crashes two ways: by name (`crash_at`) for documented steps, and
 
 As implemented in PR 2, the crate differs from the sketch above in small ways that tests rely on:
 
-- **Process handles.** `FaultVfs::process()` returns an `Arc<dyn Vfs>` bound to the current boot. After `crash()`, that handle and every file opened through it fail forever, so a thread left over from the crashed engine cannot write into the rebooted state. Each engine open takes a new process handle; the root-lock registry is keyed by `Vfs` identity, so engines on one handle share the root claim and a second process handle cannot take it.
+- **Process handles.** `FaultVfs::process()` returns an `Arc<dyn Vfs>` bound to the current boot. After `crash()`, that handle and every file opened through it fail forever, so a thread left over from the crashed engine cannot write into the rebooted state. Each engine open takes a new process handle. (PR 2 shared the root lock between engines on one handle through a registry keyed by `Vfs` identity; PR 3 deleted the registry, and a second engine on any handle now fails to open.)
 - **Per-boot counters.** `crash()` resets the plan to `FaultPlan::default()` and the counters to zero, so `crash_after_ops`, `fail_sync` (file syncs) and the added `fail_sync_dir` (directory syncs) are zero-based indexes since the last reboot. `mutating_ops()`, `file_syncs()` and `crash_points_hit()` expose them.
 - **Truncation is volatile.** An unsynced `set_len` may or may not survive a crash (never under `DropUnsynced`).
 - **Unsynced directory changes persist as an ordered prefix.** A journaling filesystem commits metadata in the background, so a crash can keep some unsynced creates, renames and removes, not only none. On crash each directory keeps its synced entry set plus a random prefix of the changes made to it since (none under `DropUnsynced`). A rename within one directory is one atomic change; a rename across directories is two independent ones.
@@ -647,6 +647,61 @@ pub fn run_cpu<T: Send + 'static>(
 ```
 
 A dedicated `IoPool` rather than `tokio::task::spawn_blocking`, because `spawn_blocking` has a 512-thread default shared with everything else and gives no queue-depth metric. Queries follow a staged pattern (fetch on `IoPool`, then compute on rayon), described in [Read Path](#read-path).
+
+### Implementation Notes (PR 3)
+
+PR 3 builds the engine shell over the v1 state. Where it differs from the sketches above, this list is the current contract for later PRs.
+
+- **Public surface.** `logpose_storage` exports `Engine`, `EngineConfig`, `CollectionHandle`, `CollectionMeta`, `Version`, `VersionId`, `VersionCounters`, `Runtime`, `RuntimeConfig`, `IoPool`, and `run_cpu`. `LocalStorageEngine` is a thin `StorageEngine` adapter over an `Engine` (`from_engine`, `engine()`). `EtcdBackedStorageEngine::with_local` and `AppState` share one engine between the data plane and the catalog.
+- **One engine per root, in-process too.** The PR 2 in-process root-lock registry is deleted. `Engine::open` holds its `VfsLock` directly, and a second engine on the same root fails with the new typed `LogPoseError::StorageRootLocked`, even in the same process. Two engines would each keep resident state that the other never sees. Callers share an engine by cloning it. Tests that reopened a root while an older handle was alive now drop the old one first. Tests that changed files under a live engine now drop it, change the files, and reopen.
+- **Shutdown.** Dropping the last `Engine` clone sets a shutdown flag. It then blocks until every engine task has finished, and only after that releases the root lock. An engine task is an I/O-pool closure or a maintenance job, and each holds a tracked `CoreRef`. So no task touches the root after the drop returns, and an immediate reopen always succeeds. Queued maintenance that has not started stays pending in `maintenance.json` and resumes on the next open. There is no `CancellationToken` and no `tokio-util` dependency.
+- **Collection map.** The map is `RwLock<BTreeMap<CollectionRef, CollectionSlot>>`, because `CollectionRef` is `Ord` but not `Hash`. A slot is one of four states:
+  - `Creating` reserves the name, so concurrent creates of one name have exactly one winner, and the files are written outside the lock.
+  - `Dropping` holds the name while a drop is in progress.
+  - `Open(Arc<CollectionHandle>)` is a served collection.
+  - `Failed` holds a recovery error. Every call on the collection returns it, and the engine still opens.
+
+  The `find_collection_descriptor` and `list_collection_descriptors` directory scans are deleted, so a lookup is a map lookup. A directory whose descriptor cannot be parsed cannot be registered by name, so `list_collections` fails, as it did before.
+- **Recovery at open.** Collections are recovered at open, not on first use, in parallel on the I/O pool. Open first removes `*.dropped` directories and directories without `descriptor.json` (step 3 of [Recovery on Open](#recovery-on-open)). Then each collection runs these steps:
+  1. Finish an interrupted v1 WAL rotation.
+  2. Load the manifest and replay the WAL delta.
+  3. Open the active WAL, repairing its tail.
+  4. Build `Version` 1.
+
+  The descriptor's `root_path` is replaced by the directory it was found in, so a moved root or a copied collection uses its own files. WAL tail repair (`RecoveryAfterTailRepair`) now happens at open, not on the first write.
+
+  Persisted pending maintenance does not start at open. It resumes on the collection's first data-plane access through `StorageEngine` (a read, write, stats, inspect, flush, or compact) or on an explicit `recover_maintenance_descriptor`. Metadata and status reads never start it. This keeps the v1 behavior that a node which only reports status for a collection, such as a control-only node, never runs that collection's jobs. Placement-aware scheduling replaces this rule later.
+- **Drop.** `Engine::drop_collection` runs these steps:
+  1. Mark the handle dropped, so new calls fail with "does not exist".
+  2. Wait for the collection's maintenance slot and writer slot.
+  3. Rename the directory to `<dir>.dropped` and sync the parent directory. This is the commit point.
+  4. Remove the directory.
+
+  A pinned `Version` stays readable from memory, but a read that needs a segment file of the dropped collection fails. Drop is not yet exposed through `StorageEngine` or the APIs.
+- **`Version` over v1 state.** A `Version` holds the v1 `Arc<Manifest>` plus a `DeltaLog`. The `DeltaLog` is a persistent append-only log of committed WAL batches: sealed chunks of 64 batches plus one open chunk. Publishing a batch copies at most 64 pointers plus one pointer per sealed chunk, and never clones a record. `VersionCounters` maintains `segment_count`, `memtable_rows`, and `memtable_bytes` incrementally, so the flush trigger is O(1). `total_rows` and `deleted_rows` need deletion vectors and come with PR 10. `Version::check_invariants` checks I3, delta contiguity, and I13 for these counters.
+- **`imbl` is not allowed.** `imbl` is MPL-2.0, and `deny.toml` allows only MIT, Apache-2.0, BSD-3-Clause, Unicode-3.0, and Zlib. PR 10 (`DeletionMap`, memtable indexes) must choose a permissively licensed persistent map, write a crate-local one, or get an explicit license decision.
+- **Writer stand-in.** PR 5 replaces two per-handle mutexes, which stand in for the writer task until then:
+  - `writer: Mutex<WriterSlot>` owns the open active `WalWriter`. It serializes WAL appends, flush, reload-after-failure, and every `current.store`.
+  - `maintenance: Mutex<()>` serializes flush and compaction, and is always taken before `writer`.
+
+  Both are held across blocking I/O, but only on I/O-pool or job threads, never on a tokio worker and never across `.await`. This is a transitional exception to rules 3 and 4 of [Memory Ordering and Locking Rules](#memory-ordering-and-locking-rules). They replace the deleted process-global `wal_rotation_locks`, `maintenance_operation_locks`, `maintenance_status_locks`, and `maintenance_coordinator`. The maintenance queue and its status now live on the handle, and reads of the status need no file access.
+- **Publication.** Only the holder of the writer slot publishes: `current.store`, then `visible.send_replace`, then the acknowledgement (I1). Compaction builds its output holding only the maintenance slot. It takes the writer slot just to publish the latest version with the new manifest, so writes continue while it runs.
+- **Failures.**
+  - A failed WAL append closes the cached `WalWriter`, and the next write reopens it with tail repair, as v1 did. PR 5 replaces this with poisoning.
+  - A flush or compaction that fails after it may have changed durable state reloads the collection from disk under the writer slot and publishes the result.
+  - If that reload also fails, the handle is poisoned ("read-only until it is reopened"). Writes and maintenance are refused, and reads keep serving the last `Version`. The only way to reopen a single collection is to reopen the engine.
+- **Pools.** `Runtime { io, query, maintenance }` is as sketched.
+  - `IoPool` is `std::sync::mpsc` feeding N threads, with a tokio `Semaphore` bounding queued plus running `run` jobs (default depth 1024). `in_flight()` is the queue-depth metric, and a panicking job is reported as an error.
+  - Every `StorageEngine` method runs its blocking work (reads, writes, create) on the `IoPool`, so no blocking I/O runs on a tokio worker.
+  - v1 flush and compaction interleave HNSW builds with blocking I/O. They would hog the I/O pool, and a blocked rayon worker can deadlock work stealing, so they run on neither. Instead they run on a separate `jobs` pool of `maintenance_threads` blocking threads, with at most one job loop per collection.
+  - The rayon `query` and `maintenance` pools exist, with `Engine::run_query` and `run_cpu`, but nothing uses them yet. Flush and compaction CPU moves to `maintenance` once flush is staged (PR 10), search moves to `query` (PR 12), and the `jobs` pool is deleted then.
+- **Historical snapshots.** Reads of the current manifest generation use the resident `Version` and read no metadata files. A `Snapshot` naming an older generation still loads that manifest and replays the WAL from disk, until PR 6 replaces historical reads with tokens.
+- **Read barrier.** `CollectionHandle::wait_visible(min_seq_no, timeout)` waits on the `watch` channel. The service still compares snapshots itself.
+- **Deferred.**
+  - PR 5: group commit, the writer task, and poisoning on fsync failure.
+  - PR 6: manifest v2, id burning, GC, snapshot tokens, and the recovery durability barrier.
+  - Later PRs: `Clock`, `BufferCache`, scheduler priorities, and `RowSetResolver` injection.
+  - PR 10: `stats` still resolves every segment, which is O(data), until deletion-vector counters exist.
 
 ## WAL v2
 
