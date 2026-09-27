@@ -1,0 +1,805 @@
+{
+  "schema_version": 1,
+  "harness": {
+    "name": "logpose-bench",
+    "version": "0.1.0",
+    "build_profile": "release"
+  },
+  "label": "phase0-current-engine",
+  "started_at_unix": 1790530233,
+  "total_seconds": 514.483061248,
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.18.44-fc-v37",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "logical_cpus": 4,
+    "total_memory_bytes": 16877547520,
+    "git_commit": "ddc338074571c9104ef296b489c261f7bce89066",
+    "git_dirty": false
+  },
+  "target": {
+    "name": "logpose-local-engine",
+    "stats_after_ingest": {
+      "live_record_count": 20000,
+      "maintenance_completed_runs": 2,
+      "manifest_generation": 2,
+      "mutable_op_count": 0,
+      "on_disk_bytes": 67010079,
+      "query_units": 3,
+      "segment_count": 2
+    },
+    "stats_final": {
+      "live_record_count": 20020,
+      "maintenance_completed_runs": 2,
+      "manifest_generation": 2,
+      "mutable_op_count": 20,
+      "on_disk_bytes": 67039996,
+      "query_units": 3,
+      "segment_count": 2
+    }
+  },
+  "config": {
+    "preset": "small",
+    "k": 10,
+    "batch_size": 1000,
+    "selectivities": [
+      0.001,
+      0.01,
+      0.1,
+      0.5,
+      0.99
+    ],
+    "filter_modes": [
+      "uncorrelated",
+      "anti_correlated"
+    ],
+    "filter_style": "equality",
+    "threads": 4,
+    "warmup": 5,
+    "freshness_probes": 20,
+    "flush": true,
+    "seed": 42
+  },
+  "dataset": {
+    "source": {
+      "kind": "synthetic",
+      "n": 20000,
+      "queries": 100,
+      "dims": 128,
+      "clusters": 32,
+      "query_cluster_fraction": 0.25,
+      "spread": 1.0,
+      "seed": 42
+    },
+    "n": 20000,
+    "queries": 100,
+    "dims": 128,
+    "metric": "l2",
+    "load_seconds": 0.12703573,
+    "attribute_seconds": 0.321807438,
+    "oracle_seconds": 1.855048312,
+    "oracle_vs_reference_recall": null
+  },
+  "ingest": {
+    "rows": 20000,
+    "batch_size": 1000,
+    "batches": 20,
+    "seconds": 6.142149459,
+    "rows_per_sec": 3256.189080631097,
+    "batch_latency": {
+      "count": 20,
+      "mean_ms": 307.10747295,
+      "min_ms": 25.547660999999998,
+      "p50_ms": 125.441211,
+      "p95_ms": 239.231474,
+      "p99_ms": 3691.2842069999997,
+      "max_ms": 3691.2842069999997
+    },
+    "flush_seconds": 6.110656997
+  },
+  "freshness": {
+    "probes": 20,
+    "visible": 20,
+    "write_ack": {
+      "count": 20,
+      "mean_ms": 8.24383455,
+      "min_ms": 0.713239,
+      "p50_ms": 4.907264,
+      "p95_ms": 30.053576,
+      "p99_ms": 58.718421,
+      "max_ms": 58.718421
+    },
+    "ack_to_visible": {
+      "count": 20,
+      "mean_ms": 276.1879064,
+      "min_ms": 207.667661,
+      "p50_ms": 269.453358,
+      "p95_ms": 348.209179,
+      "p99_ms": 354.956689,
+      "max_ms": 354.956689
+    },
+    "write_to_visible": {
+      "count": 20,
+      "mean_ms": 284.43174095,
+      "min_ms": 211.000271,
+      "p50_ms": 277.28811399999995,
+      "p95_ms": 362.564783,
+      "p99_ms": 406.9276,
+      "max_ms": 406.9276
+    },
+    "mean_searches_until_visible": 1.0
+  },
+  "cases": [
+    {
+      "name": "unfiltered",
+      "filter": null,
+      "k": 10,
+      "queries": 100,
+      "qps": 3.15027764768855,
+      "latency": {
+        "count": 100,
+        "mean_ms": 317.40332177000005,
+        "min_ms": 248.503644,
+        "p50_ms": 312.2796,
+        "p95_ms": 385.994213,
+        "p99_ms": 496.607295,
+        "max_ms": 552.0035720000001
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 4.104055765113878,
+        "latency": {
+          "count": 100,
+          "mean_ms": 945.7654213399999,
+          "min_ms": 261.19088800000003,
+          "p50_ms": 960.557548,
+          "p95_ms": 1230.617662,
+          "p99_ms": 1474.4516509999999,
+          "max_ms": 1676.784375
+        }
+      },
+      "recall": {
+        "mean": 0.05500000000000001,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 49226805.23,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "vector_first_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 100401152,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "uncorr-0.1%",
+      "filter": {
+        "mode": "uncorrelated",
+        "style": "equality",
+        "field": "uncorr_0_1pct",
+        "target_selectivity": 0.001,
+        "actual_selectivity": 0.001,
+        "matching_rows": 20,
+        "predicate": {
+          "kind": "comparison",
+          "field": "uncorr_0_1pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 4.3769226502380985,
+      "latency": {
+        "count": 100,
+        "mean_ms": 228.46761486,
+        "min_ms": 198.04316899999998,
+        "p50_ms": 219.592432,
+        "p95_ms": 276.64191500000004,
+        "p99_ms": 316.363129,
+        "max_ms": 380.340815
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 8.40703007426246,
+        "latency": {
+          "count": 100,
+          "mean_ms": 463.29565783000004,
+          "min_ms": 203.287846,
+          "p50_ms": 451.058319,
+          "p95_ms": 785.074166,
+          "p99_ms": 806.0063250000001,
+          "max_ms": 899.759445
+        }
+      },
+      "recall": {
+        "mean": 0.03900000000000002,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 100
+      },
+      "io_per_query": {
+        "rchar": 40821180.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 123215872,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "uncorr-1%",
+      "filter": {
+        "mode": "uncorrelated",
+        "style": "equality",
+        "field": "uncorr_1pct",
+        "target_selectivity": 0.01,
+        "actual_selectivity": 0.01,
+        "matching_rows": 200,
+        "predicate": {
+          "kind": "comparison",
+          "field": "uncorr_1pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 3.7863947005796366,
+      "latency": {
+        "count": 100,
+        "mean_ms": 264.0996435100001,
+        "min_ms": 243.337715,
+        "p50_ms": 257.369954,
+        "p95_ms": 306.498719,
+        "p99_ms": 318.341944,
+        "max_ms": 357.005341
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 9.975397568245603,
+        "latency": {
+          "count": 100,
+          "mean_ms": 384.60494873999994,
+          "min_ms": 247.23291,
+          "p50_ms": 363.782553,
+          "p95_ms": 554.118377,
+          "p99_ms": 600.7356120000001,
+          "max_ms": 628.048142
+        }
+      },
+      "recall": {
+        "mean": 0.015000000000000003,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 100
+      },
+      "io_per_query": {
+        "rchar": 49226805.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 124370944,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "uncorr-10%",
+      "filter": {
+        "mode": "uncorrelated",
+        "style": "equality",
+        "field": "uncorr_10pct",
+        "target_selectivity": 0.1,
+        "actual_selectivity": 0.1,
+        "matching_rows": 2000,
+        "predicate": {
+          "kind": "comparison",
+          "field": "uncorr_10pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 3.7750843084614374,
+      "latency": {
+        "count": 100,
+        "mean_ms": 264.89080186,
+        "min_ms": 244.177125,
+        "p50_ms": 258.413433,
+        "p95_ms": 305.684489,
+        "p99_ms": 323.874539,
+        "max_ms": 335.937171
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 13.156724714506687,
+        "latency": {
+          "count": 100,
+          "mean_ms": 299.39390969,
+          "min_ms": 250.26701400000002,
+          "p50_ms": 283.109575,
+          "p95_ms": 401.88412800000003,
+          "p99_ms": 494.858878,
+          "max_ms": 513.5224929999999
+        }
+      },
+      "recall": {
+        "mean": 0.04699999999999999,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 49226805.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 128364544,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "uncorr-50%",
+      "filter": {
+        "mode": "uncorrelated",
+        "style": "equality",
+        "field": "uncorr_50pct",
+        "target_selectivity": 0.5,
+        "actual_selectivity": 0.5,
+        "matching_rows": 10000,
+        "predicate": {
+          "kind": "comparison",
+          "field": "uncorr_50pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 3.473989379945611,
+      "latency": {
+        "count": 100,
+        "mean_ms": 287.84543321000007,
+        "min_ms": 244.80542599999998,
+        "p50_ms": 282.601377,
+        "p95_ms": 346.35537100000005,
+        "p99_ms": 374.495817,
+        "max_ms": 427.350265
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 3.7712532157913636,
+        "latency": {
+          "count": 100,
+          "mean_ms": 1053.7909771100008,
+          "min_ms": 593.6833310000001,
+          "p50_ms": 1055.9240519999998,
+          "p95_ms": 1247.234396,
+          "p99_ms": 1272.0656960000001,
+          "max_ms": 1307.933216
+        }
+      },
+      "recall": {
+        "mean": 0.061000000000000006,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 49226805.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "vector_first_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 123736064,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "uncorr-99%",
+      "filter": {
+        "mode": "uncorrelated",
+        "style": "equality",
+        "field": "uncorr_99pct",
+        "target_selectivity": 0.99,
+        "actual_selectivity": 0.99,
+        "matching_rows": 19800,
+        "predicate": {
+          "kind": "comparison",
+          "field": "uncorr_99pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 3.375871995517827,
+      "latency": {
+        "count": 100,
+        "mean_ms": 296.2148376900001,
+        "min_ms": 245.341246,
+        "p50_ms": 287.039037,
+        "p95_ms": 363.352338,
+        "p99_ms": 390.707545,
+        "max_ms": 435.13732500000003
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 3.6780912703245754,
+        "latency": {
+          "count": 100,
+          "mean_ms": 1077.5593178100003,
+          "min_ms": 465.529963,
+          "p50_ms": 1075.422269,
+          "p95_ms": 1420.832494,
+          "p99_ms": 1489.140091,
+          "max_ms": 1617.566493
+        }
+      },
+      "recall": {
+        "mean": 0.057,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 49226805.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "vector_first_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 136450048,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "anti-0.1%",
+      "filter": {
+        "mode": "anti_correlated",
+        "style": "equality",
+        "field": "anti_0_1pct",
+        "target_selectivity": 0.001,
+        "actual_selectivity": 0.001,
+        "matching_rows": 20,
+        "predicate": {
+          "kind": "comparison",
+          "field": "anti_0_1pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 5.273932761428768,
+      "latency": {
+        "count": 100,
+        "mean_ms": 189.61013668000004,
+        "min_ms": 160.092056,
+        "p50_ms": 187.493662,
+        "p95_ms": 215.484442,
+        "p99_ms": 244.60874299999998,
+        "max_ms": 246.794435
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 7.202158106625842,
+        "latency": {
+          "count": 100,
+          "mean_ms": 542.6203834699999,
+          "min_ms": 207.305254,
+          "p50_ms": 550.078595,
+          "p95_ms": 670.5909829999999,
+          "p99_ms": 795.5819210000001,
+          "max_ms": 842.563649
+        }
+      },
+      "recall": {
+        "mean": 0.0,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 100
+      },
+      "io_per_query": {
+        "rchar": 32384599.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 123207680,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "anti-1%",
+      "filter": {
+        "mode": "anti_correlated",
+        "style": "equality",
+        "field": "anti_1pct",
+        "target_selectivity": 0.01,
+        "actual_selectivity": 0.01,
+        "matching_rows": 200,
+        "predicate": {
+          "kind": "comparison",
+          "field": "anti_1pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 4.254395562746568,
+      "latency": {
+        "count": 100,
+        "mean_ms": 235.04729004000012,
+        "min_ms": 204.821942,
+        "p50_ms": 226.578426,
+        "p95_ms": 289.105028,
+        "p99_ms": 304.95230000000004,
+        "max_ms": 307.92330699999997
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 7.373920446976465,
+        "latency": {
+          "count": 100,
+          "mean_ms": 504.21058757,
+          "min_ms": 212.729745,
+          "p50_ms": 490.638992,
+          "p95_ms": 830.7583079999999,
+          "p99_ms": 885.4166700000001,
+          "max_ms": 904.946672
+        }
+      },
+      "recall": {
+        "mean": 0.03600000000000001,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 100
+      },
+      "io_per_query": {
+        "rchar": 40821180.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 125693952,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "anti-10%",
+      "filter": {
+        "mode": "anti_correlated",
+        "style": "equality",
+        "field": "anti_10pct",
+        "target_selectivity": 0.1,
+        "actual_selectivity": 0.1,
+        "matching_rows": 2000,
+        "predicate": {
+          "kind": "comparison",
+          "field": "anti_10pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 4.132445818959141,
+      "latency": {
+        "count": 100,
+        "mean_ms": 241.9828436100001,
+        "min_ms": 205.94762599999999,
+        "p50_ms": 233.613102,
+        "p95_ms": 293.482208,
+        "p99_ms": 337.36560399999996,
+        "max_ms": 438.910892
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 7.618210057071981,
+        "latency": {
+          "count": 100,
+          "mean_ms": 508.09474742,
+          "min_ms": 206.022729,
+          "p50_ms": 467.730815,
+          "p95_ms": 748.240497,
+          "p99_ms": 791.7255210000001,
+          "max_ms": 853.141558
+        }
+      },
+      "recall": {
+        "mean": 0.03300000000000001,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 40821180.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "cooperative_filtered_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 132939776,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "anti-50%",
+      "filter": {
+        "mode": "anti_correlated",
+        "style": "equality",
+        "field": "anti_50pct",
+        "target_selectivity": 0.5,
+        "actual_selectivity": 0.5,
+        "matching_rows": 10000,
+        "predicate": {
+          "kind": "comparison",
+          "field": "anti_50pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 4.224065195290068,
+      "latency": {
+        "count": 100,
+        "mean_ms": 236.73373797999983,
+        "min_ms": 202.730252,
+        "p50_ms": 233.336968,
+        "p95_ms": 281.221165,
+        "p99_ms": 291.383055,
+        "max_ms": 292.35101299999997
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 4.569836101475093,
+        "latency": {
+          "count": 100,
+          "mean_ms": 868.3808854200003,
+          "min_ms": 584.32889,
+          "p50_ms": 874.541655,
+          "p95_ms": 1001.355755,
+          "p99_ms": 1010.8887929999999,
+          "max_ms": 1014.0452170000001
+        }
+      },
+      "recall": {
+        "mean": 0.019000000000000006,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 40821180.26,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "vector_first_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 127574016,
+        "vm_hwm_bytes": 272822272
+      }
+    },
+    {
+      "name": "anti-99%",
+      "filter": {
+        "mode": "anti_correlated",
+        "style": "equality",
+        "field": "anti_99pct",
+        "target_selectivity": 0.99,
+        "actual_selectivity": 0.99,
+        "matching_rows": 19800,
+        "predicate": {
+          "kind": "comparison",
+          "field": "anti_99pct",
+          "operator": "eq",
+          "value": 1
+        }
+      },
+      "k": 10,
+      "queries": 100,
+      "qps": 3.5743934869119878,
+      "latency": {
+        "count": 100,
+        "mean_ms": 279.76265487999996,
+        "min_ms": 247.276121,
+        "p50_ms": 277.509325,
+        "p95_ms": 316.71813399999996,
+        "p99_ms": 330.698607,
+        "max_ms": 340.053299
+      },
+      "concurrent": {
+        "threads": 4,
+        "queries": 100,
+        "qps": 3.9001443757785115,
+        "latency": {
+          "count": 100,
+          "mean_ms": 1012.8121191699995,
+          "min_ms": 311.912896,
+          "p50_ms": 1052.865536,
+          "p95_ms": 1309.705886,
+          "p99_ms": 1334.97154,
+          "max_ms": 1342.609524
+        }
+      },
+      "recall": {
+        "mean": 0.063,
+        "min": 0.0,
+        "p5": 0.0,
+        "short_results": 0
+      },
+      "io_per_query": {
+        "rchar": 49226805.27,
+        "read_bytes": 0.0
+      },
+      "plans": {
+        "vector_first_ann": 100
+      },
+      "memory_after": {
+        "vm_rss_bytes": 132034560,
+        "vm_hwm_bytes": 272822272
+      }
+    }
+  ],
+  "memory": {
+    "before_target": {
+      "vm_rss_bytes": 15544320,
+      "vm_hwm_bytes": 15597568
+    },
+    "after_ingest": {
+      "vm_rss_bytes": 76718080,
+      "vm_hwm_bytes": 185720832
+    },
+    "after_flush": {
+      "vm_rss_bytes": 114851840,
+      "vm_hwm_bytes": 223821824
+    },
+    "end": {
+      "vm_rss_bytes": 132034560,
+      "vm_hwm_bytes": 272822272
+    }
+  },
+  "notes": [
+    "memory is the harness process; for an in-process target it includes the dataset and oracle (see memory.before_target)",
+    "io_per_query.rchar counts bytes returned by read syscalls, including page-cache hits; read_bytes counts only device reads and is near zero when the working set is cached",
+    "recall is measured against a brute-force oracle computed in the harness; ties at the k-th distance may count as misses"
+  ]
+}
