@@ -9,7 +9,7 @@ use crate::{
     durable_fs::path_exists,
     engine::{CoreRef, EngineCore},
     error::json_message,
-    fs_util::{atomic_write, read_json},
+    fs_util::{atomic_write_in_existing_dir, read_json},
     handle::CollectionHandle,
     version::Version,
 };
@@ -116,12 +116,14 @@ impl EngineCore {
         read_json(self.vfs.as_ref(), &path)
     }
 
+    /// Persist `status`. The collection directory must exist: a job or a write that races a
+    /// drop must not recreate the retired directory.
     pub(crate) fn persist_maintenance_status(
         &self,
         descriptor: &CollectionDescriptor,
         status: &MaintenanceStatus,
     ) -> Result<()> {
-        atomic_write(
+        atomic_write_in_existing_dir(
             self.vfs.as_ref(),
             &Self::maintenance_file_path(descriptor),
             serde_json::to_vec_pretty(status).map_err(json_message)?,
@@ -306,6 +308,52 @@ impl CoreRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        CreateCollectionRequest, Engine, EngineConfig,
+        test_support::{put, unique_temp_dir},
+    };
+    use logpose_types::{CollectionRef, DistanceMetric};
+    use logpose_vfs::std_vfs;
+
+    /// A write or job that checked the collection just before a concurrent drop still persists
+    /// its status afterwards; that must not recreate the retired directory.
+    #[test]
+    fn a_status_persisted_after_a_drop_does_not_recreate_the_directory() {
+        let root = unique_temp_dir("maintenance-after-drop");
+        let engine =
+            Engine::open(std_vfs(), &root, EngineConfig::default()).expect("engine should open");
+        let descriptor = engine
+            .core()
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
+                "events",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .expect("descriptor should plan");
+        let handle = engine
+            .create_collection(descriptor, None)
+            .expect("collection should be created");
+        engine
+            .core()
+            .write(&handle, vec![put("alpha", vec![1.0, 0.0])])
+            .expect("write should succeed");
+        engine
+            .drop_collection(&CollectionRef::new_default("events"))
+            .expect("drop should succeed");
+
+        let status = MaintenanceStatus {
+            pending: vec!["flush".to_owned()],
+            ..MaintenanceStatus::default()
+        };
+        engine
+            .core()
+            .persist_maintenance_status(handle.descriptor(), &status)
+            .expect_err("the retired directory is gone");
+        assert!(
+            !handle.meta().dir.exists(),
+            "persisting a status must not resurrect a dropped collection's directory"
+        );
+    }
 
     #[test]
     fn recovered_state_resumes_the_interrupted_job_first() {
