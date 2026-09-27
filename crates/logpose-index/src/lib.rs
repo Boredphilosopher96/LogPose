@@ -14,13 +14,10 @@ use serde_json::Value;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashSet},
-    fs,
     hash::{DefaultHasher, Hash, Hasher},
     io,
     path::Path,
 };
-
-mod durable;
 
 /// Index family available for a queryable unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,23 +138,11 @@ pub fn build_flat_index(
     }
 }
 
-/// Durably persist a flat exact sidecar to disk.
-///
-/// The write is atomic: readers see either the previous file or the complete new one, and the
-/// contents and directory entry are fsynced before this returns.
-pub fn write_flat_index(path: &Path, sidecar: &FlatIndexSidecar) -> io::Result<()> {
-    durable::write_atomic(path, &encode_flat_index(sidecar)?)
-}
-
-/// Serialize a flat exact sidecar to the bytes [`write_flat_index`] persists.
+/// Serialize a flat exact sidecar. This crate does no I/O: `logpose-storage` writes the bytes
+/// through its `Vfs`.
 pub fn encode_flat_index(sidecar: &FlatIndexSidecar) -> io::Result<Vec<u8>> {
     serde_json::to_vec_pretty(sidecar)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
-}
-
-/// Load a flat exact sidecar from disk.
-pub fn read_flat_index(path: &Path) -> io::Result<FlatIndexSidecar> {
-    decode_flat_index(&fs::read(path)?)
 }
 
 /// Deserialize a flat exact sidecar from the bytes [`encode_flat_index`] produced.
@@ -342,15 +327,8 @@ pub fn build_hnsw_index(
     Ok(index)
 }
 
-/// Durably persist an HNSW sidecar to disk as a binary artifact.
-///
-/// The write is atomic: readers see either the previous file or the complete new one, and the
-/// contents and directory entry are fsynced before this returns.
-pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<()> {
-    durable::write_atomic(path, &encode_hnsw_index(sidecar)?)
-}
-
-/// Serialize an HNSW sidecar to the binary bytes [`write_hnsw_index`] persists.
+/// Serialize an HNSW sidecar to its binary format. This crate does no I/O: `logpose-storage`
+/// writes the bytes through its `Vfs`.
 pub fn encode_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(HNSW_MAGIC);
@@ -393,11 +371,6 @@ pub fn encode_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<Vec<u8>> {
         }
     }
     Ok(bytes)
-}
-
-/// Load an HNSW sidecar from disk.
-pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
-    decode_hnsw_index(fs::read(path)?, path)
 }
 
 /// Deserialize an HNSW sidecar from the bytes [`encode_hnsw_index`] produced. `path` names the
@@ -1205,10 +1178,11 @@ mod tests {
     use super::*;
     use logpose_types::{DistanceMetric, RecordId};
     use serde_json::json;
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+
+    /// Encode and decode `index`, as a sidecar write followed by a read does.
+    fn round_trip_hnsw(index: &HnswIndexSidecar) -> io::Result<HnswIndexSidecar> {
+        decode_hnsw_index(encode_hnsw_index(index)?, Path::new("test.hnsw.bin"))
+    }
 
     #[test]
     fn build_flat_index_tracks_norms_offsets_and_scalar_stats() {
@@ -1252,7 +1226,6 @@ mod tests {
 
     #[test]
     fn hnsw_round_trip_preserves_top_candidates() {
-        let path = temp_file_path("hnsw-round-trip.bin");
         let index = build_hnsw_index(
             "segment-2",
             DistanceMetric::Dot,
@@ -1283,8 +1256,7 @@ mod tests {
         )
         .expect("index should build");
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let restored = read_hnsw_index(&path).expect("index should read");
+        let restored = round_trip_hnsw(&index).expect("index should round-trip");
 
         let original = search_hnsw(&index, &[1.0, 0.0], 2, None).expect("search should succeed");
         let round_trip =
@@ -1310,8 +1282,6 @@ mod tests {
                 .map(|candidate| candidate.record_id.as_str())
                 .collect::<Vec<_>>()
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1434,19 +1404,14 @@ mod tests {
     }
 
     #[test]
-    fn read_hnsw_index_rejects_truncated_payload() {
-        let path = temp_file_path("hnsw-truncated.bin");
-        fs::write(&path, b"LPH1").expect("truncated payload should write");
-
-        let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
+    fn decode_hnsw_index_rejects_truncated_payload() {
+        let error = decode_hnsw_index(b"LPH1".to_vec(), Path::new("truncated.hnsw.bin"))
+            .expect_err("truncated payload should fail");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_out_of_range_entry_points() {
-        let path = temp_file_path("hnsw-invalid-entry-point.bin");
+    fn decode_hnsw_index_rejects_out_of_range_entry_points() {
         let mut index = build_hnsw_index(
             "segment-invalid-entry",
             DistanceMetric::Dot,
@@ -1462,16 +1427,12 @@ mod tests {
         .expect("index should build");
         index.entry_point = Some(9);
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("invalid entry point should fail");
+        let error = round_trip_hnsw(&index).expect_err("invalid entry point should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_unsupported_version() {
-        let path = temp_file_path("hnsw-unsupported-version.bin");
+    fn decode_hnsw_index_rejects_unsupported_version() {
         let mut index = build_hnsw_index(
             "segment-unsupported-version",
             DistanceMetric::Dot,
@@ -1487,20 +1448,16 @@ mod tests {
         .expect("index should build");
         index.version = HNSW_VERSION + 1;
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("unsupported version should fail");
+        let error = round_trip_hnsw(&index).expect_err("unsupported version should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("unsupported hnsw version"),
             "unexpected error: {error}"
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_missing_entry_point_for_non_empty_graph() {
-        let path = temp_file_path("hnsw-missing-entry-point.bin");
+    fn decode_hnsw_index_rejects_missing_entry_point_for_non_empty_graph() {
         let mut index = build_hnsw_index(
             "segment-missing-entry",
             DistanceMetric::Dot,
@@ -1516,16 +1473,12 @@ mod tests {
         .expect("index should build");
         index.entry_point = None;
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("missing entry point should fail");
+        let error = round_trip_hnsw(&index).expect_err("missing entry point should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_trailing_bytes() {
-        let path = temp_file_path("hnsw-trailing-bytes.bin");
+    fn decode_hnsw_index_rejects_trailing_bytes() {
         let index = build_hnsw_index(
             "segment-trailing-bytes",
             DistanceMetric::Dot,
@@ -1540,24 +1493,20 @@ mod tests {
         )
         .expect("index should build");
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let mut bytes = fs::read(&path).expect("serialized sidecar should read");
+        let mut bytes = encode_hnsw_index(&index).expect("index should encode");
         bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        fs::write(&path, bytes).expect("trailing bytes should write");
 
-        let error = read_hnsw_index(&path).expect_err("trailing bytes should fail");
+        let error = decode_hnsw_index(bytes, Path::new("trailing.hnsw.bin"))
+            .expect_err("trailing bytes should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("unexpected trailing bytes"),
             "unexpected error: {error}"
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_out_of_range_neighbor_references() {
-        let path = temp_file_path("hnsw-invalid-neighbor.bin");
+    fn decode_hnsw_index_rejects_out_of_range_neighbor_references() {
         let mut index = build_hnsw_index(
             "segment-invalid-neighbor",
             DistanceMetric::Dot,
@@ -1582,11 +1531,8 @@ mod tests {
         .expect("index should build");
         index.nodes[0].neighbors_by_level[0].push(99);
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("invalid neighbor should fail");
+        let error = round_trip_hnsw(&index).expect_err("invalid neighbor should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1609,13 +1555,5 @@ mod tests {
         );
         assert!(metric_value(DistanceMetric::Dot, &query, &[1.0]).is_err());
         Ok(())
-    }
-
-    fn temp_file_path(name: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir().join(format!("logpose-{unique}-{name}"))
     }
 }
