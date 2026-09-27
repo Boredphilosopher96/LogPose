@@ -8,9 +8,11 @@ use logpose_index::{
 };
 use logpose_types as _;
 use pulp as _;
+use roaring as _;
 use serde as _;
 use serde_json as _;
 use std::time::Duration;
+use thiserror as _;
 
 const DIMS: [usize; 3] = [128, 768, 1536];
 /// Rows per batched call: large enough to amortize dispatch, small enough to

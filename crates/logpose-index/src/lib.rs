@@ -1,6 +1,7 @@
 //! Exact and ANN index sidecars for immutable units.
 
 pub mod kernels;
+pub mod scalar;
 pub mod sq8;
 
 #[cfg(test)]
