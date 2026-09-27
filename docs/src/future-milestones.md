@@ -1,21 +1,22 @@
 # Future Milestones
 
-This section now tracks only the major capabilities that are still missing from LogPose.
+The [Engine V2 Plan](./engine-v2-plan.md) supersedes the original phase roadmap. It holds the current audit, the design decisions, and the phase order. Start there to decide what to work on next.
 
-It is meant to be used alongside:
+The original phase roadmap is not complete in any production sense. Every phase has a code path and tests, but most of those paths are not engineered beyond test-fixture scale. The main gaps, from the engine-v2 audit:
+
+- the storage engine is stateless per call: every operation reloads the descriptor and manifest and replays the unflushed WAL, so queries and writes do O(collection size) metadata work
+- durability has known holes, including a torn WAL tail that is never truncated, missing directory and sidecar fsyncs, write batches without a commit record, and no exclusive lock on a storage root
+- there are no scalar indexes; every predicate walks JSON per record
+- filtered ANN post-filters and restarts with a larger `ef`, HNSW parameters are fixed and minimal, and distance kernels are scalar
+- file I/O is blocking inside async code
+- distribution fences metadata but not data: the etcd epoch never reaches storage, nothing is replicated, and failover drills copy directories by hand
+- there is no benchmark baseline to measure any of this against
+
+This page and the milestone chapters below remain as longer-range design notes. Where they disagree with the engine-v2 plan, the plan wins. They are meant to be read alongside:
 
 - [Architecture](./architecture.md) for the current workspace structure
 - [Better Vector DB Architecture](./better-vector-db.md) for the target system shape
 - [Testing](./testing.md) for the long-term testing ladder
-
-The original phase roadmap is complete. LogPose already has:
-
-- local filesystem durability with WAL, manifests, immutable segments, and maintenance recovery
-- planner-led exact, ANN, and hybrid query execution
-- operator-visible runtime status, placement diagnostics, stats, and inspect surfaces
-- layered integration, randomized, process-boundary, and deterministic service-boundary testing
-
-What remains is the next layer of system work: turning those local contracts into resilient multi-node behavior, broadening the vector operator family, deepening the testing model, and adding the missing product surfaces around storage and operations.
 
 ## Remaining Milestone Map
 
@@ -52,7 +53,7 @@ Some missing work does not need its own chapter yet because it is part of the mi
 
 Use the roadmap in two passes:
 
-- start on this page to decide where a proposal fits in the overall program
-- then use the matching milestone page to understand the intended component changes, research direction, testing strategy, and exit criteria
+- start with the [Engine V2 Plan](./engine-v2-plan.md) to decide where a proposal fits in the phase order
+- then use the matching milestone page here for longer-range component, research, and testing notes
 
 If future design work changes the end-state architecture, update [Better Vector DB Architecture](./better-vector-db.md) first, then realign these milestones to match.

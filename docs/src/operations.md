@@ -80,3 +80,11 @@ the etcd metadata path is enabled are not auto-backfilled from local
 `placement.json` files; migrate them by recreating them through the control
 plane or by explicitly backfilling metadata before flipping an existing storage
 root to the etcd backend.
+
+The coordination loop runs every third of the shorter TTL. Each tick it
+refreshes the membership and leadership leases and checks that etcd still holds
+the matching member and leader keys. If a lease has expired or been revoked, or
+its key is missing, the node reports the claim as lost at once, then registers
+or campaigns again in the same tick. Losing membership also gives up
+leadership, so a node that is not a registered member never keeps leading.
+`timeout_ms` also bounds each keep-alive round trip.
