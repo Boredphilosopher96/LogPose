@@ -34,7 +34,11 @@
 //! [`FilterStrategy::Admit`] walks the whole graph and admits only matching
 //! rows into the results, and [`FilterStrategy::Acorn`] walks only matching
 //! rows, bridging gaps through two-hop neighborhoods (ACORN-1 style). Exact
-//! brute force over a filter is the caller's job.
+//! brute force over a filter is the caller's job, and
+//! [`FilterStrategy::suggest`] returns [`FilterPlan::ExactScan`] when few
+//! enough rows match that it is the cheaper choice. Neither walk is exact:
+//! filters whose rows lie far from the query (anti-correlated) cost recall
+//! at a fixed `ef`, which widening the cursor recovers.
 //!
 //! # Persistence
 //!
@@ -53,6 +57,6 @@ mod tests;
 
 pub use distance::{F32Metric, F32Query, F32Vectors, QueryDistance, VectorSource};
 pub use error::GraphError;
-pub use filter::{AllRows, FilterStrategy, RowBitset, RowFilter};
+pub use filter::{AllRows, FilterPlan, FilterStrategy, RowBitset, RowFilter};
 pub use hnsw::{DEFAULT_EF_CONSTRUCTION, DEFAULT_M, HnswGraph, HnswParams, MAX_M};
 pub use search::{Neighbor, SearchCursor, SearchOutput, SearchScratch, SearchStats, SearchStatus};

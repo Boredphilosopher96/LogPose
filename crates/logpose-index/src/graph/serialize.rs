@@ -8,6 +8,14 @@ const VERSION: u16 = 1;
 const HEADER_LEN: usize = 40;
 const CRC_LEN: usize = 4;
 const NO_ENTRY: u32 = u32::MAX;
+/// In-memory graphs up to this size load regardless of the input size.
+const DECODE_FLOOR_BYTES: usize = 64 << 20;
+/// Beyond [`DECODE_FLOOR_BYTES`], the loaded graph may take at most this
+/// many times the serialized size. Fixed-size link slots make an edgeless
+/// graph cost `4 * (2M + 1)` bytes per row in memory against 3 bytes on
+/// disk, so without a bound a forged input could demand thousands of times
+/// its size; real graphs sit well below 20x at any `M`.
+const MAX_DECODE_AMPLIFICATION: usize = 64;
 
 impl HnswGraph {
     /// Serializes the graph into a versioned, checksummed layout.
@@ -38,7 +46,9 @@ impl HnswGraph {
     /// Loading verifies the checksum first, then every structural invariant:
     /// parameter ranges, level bounds, the entry point, per-level row counts,
     /// degree caps, neighbor ranges and levels, no self links, and no trailing
-    /// bytes. Malformed input yields a [`GraphError`], never a panic.
+    /// bytes. Malformed input yields a [`GraphError`], never a panic, and
+    /// input whose in-memory layout would exceed 64 times its size (beyond a
+    /// 64 MiB floor) is refused with [`GraphError::TooLarge`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let levels = self.levels();
         let mut bytes = Vec::with_capacity(HEADER_LEN + levels.len() * 4 + CRC_LEN);
@@ -159,6 +169,7 @@ fn decode_body(reader: &mut Reader<'_>) -> Result<HnswGraph, GraphError> {
         None => return Err(corrupt("entry point is out of range")),
     }
 
+    check_decoded_size(&params, levels, reader.bytes.len())?;
     let mut graph = HnswGraph::with_capacity(params, rows as usize)?;
     for &level in levels {
         graph.push_node(level)?;
@@ -169,6 +180,29 @@ fn decode_body(reader: &mut Reader<'_>) -> Result<HnswGraph, GraphError> {
     reader.finish()?;
     graph.set_entry(Some(entry), max_level);
     Ok(graph)
+}
+
+/// Refuses inputs whose fixed-slot in-memory layout would dwarf them.
+fn check_decoded_size(params: &HnswParams, levels: &[u8], input: usize) -> Result<(), GraphError> {
+    let upper_slots: usize = levels.iter().map(|level| usize::from(*level)).sum();
+    let words = levels
+        .len()
+        .checked_mul(params.max_links(0) + 1)
+        .and_then(|layer0| {
+            upper_slots
+                .checked_mul(params.m + 1)
+                .and_then(|upper| layer0.checked_add(upper))
+        })
+        .ok_or(GraphError::TooLarge)?;
+    let bytes = words
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(levels.len() * 5))
+        .ok_or(GraphError::TooLarge)?;
+    let limit = DECODE_FLOOR_BYTES.max(input.saturating_mul(MAX_DECODE_AMPLIFICATION));
+    if bytes > limit {
+        return Err(GraphError::TooLarge);
+    }
+    Ok(())
 }
 
 fn decode_level(

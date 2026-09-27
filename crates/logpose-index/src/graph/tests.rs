@@ -1,14 +1,16 @@
 //! Tests for the row-id HNSW graph.
 
-use std::collections::{HashSet, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::build::select_neighbors;
 use super::search::Scored;
 use super::{
-    AllRows, F32Metric, F32Vectors, FilterStrategy, GraphError, HnswGraph, HnswParams, Neighbor,
-    RowBitset, RowFilter, SearchScratch, SearchStatus, VectorSource,
+    AllRows, F32Metric, F32Query, F32Vectors, FilterPlan, FilterStrategy, GraphError, HnswGraph,
+    HnswParams, Neighbor, QueryDistance, RowBitset, RowFilter, SearchScratch, SearchStatus,
+    VectorSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -463,6 +465,88 @@ fn parallel_build_is_valid_connected_and_accurate() {
 }
 
 #[test]
+fn parallel_builds_under_contention_keep_every_invariant() {
+    // Small M and ef make neighbor lists overflow constantly, so reverse-link
+    // pruning races with lock-free readers on nearly every insert. A fifth of
+    // the rows duplicate another row, which stresses heuristic ties. In debug
+    // builds every lock-free read also asserts that it saw only in-range,
+    // non-self row ids.
+    let base = clustered(2_000, 8, 6, 0, 91);
+    let mut values = Vec::with_capacity(2_400 * 8);
+    for row in 0..base.vectors.len() as u32 {
+        values.extend_from_slice(base.vectors.row(row));
+        if row % 5 == 0 {
+            values.extend_from_slice(base.vectors.row(row / 2));
+        }
+    }
+    let data = F32Vectors::new(8, values, F32Metric::L2Squared).expect("vectors");
+    let rows = data.len();
+    for threads in [2, 4, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool");
+        for round in 0..6_u64 {
+            let params = params(4 + 2 * (round as usize % 3), 24, round);
+            let graph = pool
+                .install(|| HnswGraph::build_parallel(&data, params))
+                .expect("parallel build");
+            assert_eq!(graph.len(), rows);
+            assert_valid(&graph);
+            // HNSW does not guarantee connectivity at tiny M even when built
+            // sequentially (pruning can drop a row's last in-link), so the
+            // bound here is loose; the default-parameter fixture asserts full
+            // layer-0 reachability.
+            let label = format!("{threads} threads, round {round}");
+            assert!(orphans(&graph) * 200 <= rows, "{label}: too many orphans");
+            assert!(
+                (rows - union_reachable(&graph)) * 200 <= rows,
+                "{label}: too many unreachable rows"
+            );
+            let loaded = HnswGraph::from_bytes(&graph.to_bytes()).expect("round trip");
+            assert_eq!(loaded, graph);
+        }
+    }
+}
+
+/// Rows reachable from the entry point over the links of every layer.
+fn union_reachable(graph: &HnswGraph) -> usize {
+    let Some(entry) = graph.entry_point() else {
+        return 0;
+    };
+    let mut seen = HashSet::from([entry]);
+    let mut queue = VecDeque::from([entry]);
+    while let Some(row) = queue.pop_front() {
+        for level in 0..=graph.level(row).unwrap_or(0) {
+            for &neighbor in graph.neighbors(row, level) {
+                if seen.insert(neighbor) {
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+    }
+    seen.len()
+}
+
+/// Rows other than the entry point that no link on any layer points to.
+/// Searches can never return them.
+fn orphans(graph: &HnswGraph) -> usize {
+    let mut linked = vec![false; graph.len()];
+    for row in 0..graph.len() as u32 {
+        for level in 0..=graph.level(row).unwrap_or(0) {
+            for &neighbor in graph.neighbors(row, level) {
+                linked[neighbor as usize] = true;
+            }
+        }
+    }
+    linked
+        .iter()
+        .enumerate()
+        .filter(|(row, linked)| !**linked && graph.entry_point() != Some(*row as u32))
+        .count()
+}
+
+#[test]
 fn incremental_insert_extends_a_graph() {
     let data = clustered(2_000, 16, 16, 50, 31);
     let params = params(12, 96, 77);
@@ -614,20 +698,27 @@ fn deleted_rows_are_excluded_through_the_filter() {
 }
 
 #[test]
-fn suggest_picks_acorn_for_selective_filters() {
-    let sparse = random_filter(1_000, 0.05, 1);
-    let dense = random_filter(1_000, 0.8, 1);
+fn suggest_scans_small_filters_and_walks_large_ones() {
+    let rows = 100_000;
+    let tiny = random_filter(rows, 0.01, 1);
+    let sparse = random_filter(rows, 0.05, 1);
+    let dense = random_filter(rows, 0.8, 1);
+    assert_eq!(FilterStrategy::suggest(&tiny, rows), FilterPlan::ExactScan);
     assert_eq!(
-        FilterStrategy::suggest(&sparse, 1_000),
-        FilterStrategy::acorn()
+        FilterStrategy::suggest(&random_filter(1_000, 0.9, 1), 1_000),
+        FilterPlan::ExactScan
     );
     assert_eq!(
-        FilterStrategy::suggest(&dense, 1_000),
-        FilterStrategy::Admit
+        FilterStrategy::suggest(&sparse, rows),
+        FilterPlan::Graph(FilterStrategy::acorn())
     );
     assert_eq!(
-        FilterStrategy::suggest(&|row: u32| row.is_multiple_of(2), 1_000),
-        FilterStrategy::Admit
+        FilterStrategy::suggest(&dense, rows),
+        FilterPlan::Graph(FilterStrategy::Admit)
+    );
+    assert_eq!(
+        FilterStrategy::suggest(&|row: u32| row.is_multiple_of(2), rows),
+        FilterPlan::Graph(FilterStrategy::Admit)
     );
 }
 
@@ -723,6 +814,107 @@ fn fewer_than_k_results_are_distinguished_from_exhaustion() {
     assert!(cursor.is_exhausted());
     assert_eq!(all.neighbors.len(), 500);
     assert_eq!(all.status, SearchStatus::Exhausted);
+}
+
+/// Counts query-to-row distance evaluations while `recording` is set.
+struct CountingQuery<'a> {
+    inner: F32Query<'a>,
+    recording: Cell<bool>,
+    counts: RefCell<HashMap<u32, u32>>,
+}
+
+impl QueryDistance for CountingQuery<'_> {
+    fn distance(&self, row: u32) -> f32 {
+        if self.recording.get() {
+            *self.counts.borrow_mut().entry(row).or_default() += 1;
+        }
+        self.inner.distance(row)
+    }
+}
+
+#[test]
+fn cursor_extensions_never_re_evaluate_rows_and_only_improve() {
+    let fixture = fixture();
+    let rows = fixture.graph.len();
+    let mut rng = TestRng(0xc0de);
+    let mut scratch = SearchScratch::new();
+    let (mut resumed_recall, mut fresh_recall, mut runs) = (0.0, 0.0, 0.0);
+    for (index, query) in fixture.data.queries.iter().enumerate().take(40) {
+        let cases = [
+            (FilterStrategy::Admit, RowBitset::full(rows)),
+            (
+                FilterStrategy::Admit,
+                random_filter(rows, 0.3, index as u64),
+            ),
+            (
+                FilterStrategy::acorn(),
+                random_filter(rows, 0.05, index as u64),
+            ),
+            (
+                FilterStrategy::Acorn {
+                    candidate_budget: Some(1 + rng.below(8)),
+                },
+                random_filter(rows, 0.02, index as u64),
+            ),
+            (
+                FilterStrategy::acorn(),
+                anti_correlated_filter(&fixture.data, query, 0.1),
+            ),
+        ];
+        for (strategy, filter) in cases {
+            let counting = CountingQuery {
+                inner: fixture.data.vectors.query(query).expect("query"),
+                recording: Cell::new(false),
+                counts: RefCell::new(HashMap::new()),
+            };
+            let mut schedule: Vec<usize> =
+                (0..1 + rng.below(5)).map(|_| 1 + rng.below(160)).collect();
+            schedule.sort_unstable();
+            let last_ef = schedule.last().copied().unwrap_or(1).max(10);
+            schedule.push(last_ef);
+            let mut cursor = fixture
+                .graph
+                .cursor(&counting, &filter, strategy, &mut scratch);
+            // Upper-layer descent may evaluate a row that layer 0 revisits;
+            // from here on, every row is evaluated at most once.
+            counting.recording.set(true);
+            let mut previous: Vec<Neighbor> = Vec::new();
+            for &ef in &schedule {
+                let output = cursor.advance(ef).output(10);
+                assert!(output.neighbors.iter().all(|hit| filter.contains(hit.row)));
+                assert!(output.neighbors.len() >= previous.len());
+                for (old, new) in previous.iter().zip(&output.neighbors) {
+                    assert!(new.distance <= old.distance, "rank got worse after ef {ef}");
+                }
+                previous = output.neighbors;
+            }
+            let evaluated = cursor.stats().visited;
+            let counts = counting.counts.borrow();
+            assert!(
+                counts.values().all(|count| *count == 1),
+                "a row was evaluated twice across cursor extensions"
+            );
+            assert!(counts.len() as u64 <= evaluated);
+            let truth = brute_force(&fixture.data.vectors, query, 10, &filter);
+            let fresh = fixture.graph.search_filtered(
+                &counting.inner,
+                &filter,
+                strategy,
+                10,
+                last_ef,
+                &mut scratch,
+            );
+            resumed_recall += recall(&previous, &truth);
+            fresh_recall += recall(&fresh.neighbors, &truth);
+            runs += 1.0;
+        }
+    }
+    eprintln!(
+        "cursor vs fresh search at the final ef: recall {:.4} vs {:.4}",
+        resumed_recall / runs,
+        fresh_recall / runs
+    );
+    assert!(resumed_recall / runs + 0.02 >= fresh_recall / runs);
 }
 
 #[test]
@@ -882,6 +1074,114 @@ fn deserialization_rejects_every_single_byte_corruption() {
     let mut extended = bytes.clone();
     extended.push(0);
     assert!(HnswGraph::from_bytes(&extended).is_err());
+}
+
+/// A structurally valid serialized graph with no edges, built by hand.
+fn forged_graph(m: u32, levels: &[u8]) -> Vec<u8> {
+    let max_level = levels.iter().copied().max().unwrap_or(0);
+    let entry = levels
+        .iter()
+        .position(|level| *level == max_level)
+        .map_or(u32::MAX, |row| row as u32);
+    let mut bytes = b"LPHNSWG\0".to_vec();
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&m.to_le_bytes());
+    bytes.extend_from_slice(&64_u32.to_le_bytes());
+    bytes.extend_from_slice(&0_u64.to_le_bytes());
+    bytes.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+    bytes.push(max_level);
+    bytes.extend_from_slice(&[0; 3]);
+    bytes.extend_from_slice(&entry.to_le_bytes());
+    bytes.extend_from_slice(levels);
+    if !levels.is_empty() {
+        for level in 0..=max_level {
+            let rows = levels.iter().filter(|l| **l >= level).count();
+            bytes.extend_from_slice(&(rows as u32).to_le_bytes());
+            bytes.extend_from_slice(&0_u64.to_le_bytes());
+            bytes.resize(bytes.len() + 2 * rows, 0);
+        }
+    }
+    bytes.extend_from_slice(&[0; 4]);
+    reseal(&mut bytes);
+    bytes
+}
+
+#[test]
+fn deserialization_bounds_memory_by_input_size() {
+    // Fixed-size link slots make an edgeless graph with a large M cost about
+    // 8 KiB per row in memory but only 3 bytes per row on disk. The loader
+    // must refuse such inputs rather than allocate thousands of times their
+    // size.
+    let bomb = forged_graph(1024, &vec![0; 50_000]);
+    assert!(matches!(
+        HnswGraph::from_bytes(&bomb),
+        Err(GraphError::TooLarge)
+    ));
+    let tall = forged_graph(1024, &[vec![0; 4_000], vec![200; 4_000]].concat());
+    assert!(matches!(
+        HnswGraph::from_bytes(&tall),
+        Err(GraphError::TooLarge)
+    ));
+
+    // Small edgeless graphs stay loadable.
+    let small = forged_graph(1024, &[0, 3, 1, 0]);
+    let graph = HnswGraph::from_bytes(&small).expect("small forged graph");
+    assert_eq!(graph.len(), 4);
+    assert_eq!(graph.entry_point(), Some(1));
+    let default_m = forged_graph(16, &vec![0; 50_000]);
+    assert!(HnswGraph::from_bytes(&default_m).is_ok());
+}
+
+#[test]
+fn deserialization_survives_random_and_resealed_inputs() {
+    let (data, graph) = small_graph();
+    let valid = graph.to_bytes();
+    let mut rng = TestRng(0x5eed);
+    let mut scratch = SearchScratch::new();
+    let distance = data.vectors.query(&data.queries[0]).expect("query");
+    let mut check = |bytes: &[u8]| {
+        if let Ok(loaded) = HnswGraph::from_bytes(bytes) {
+            assert_valid_bounds(&loaded);
+            assert!(loaded.memory_bytes() <= (64 << 20).max(64 * bytes.len()));
+            if loaded.len() <= data.vectors.len() {
+                let _ = loaded.search(&distance, 5, 16, &mut scratch);
+            }
+        }
+    };
+    // Every prefix, resealed so that it reaches the structural checks.
+    for len in 0..valid.len() {
+        let mut prefix = valid[..len].to_vec();
+        prefix.extend_from_slice(&[0; 4]);
+        reseal(&mut prefix);
+        check(&prefix);
+        check(&valid[..len]);
+    }
+    for _ in 0..4_000 {
+        let len = rng.below(1_024);
+        let mut bytes: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        match rng.below(4) {
+            0 => {}
+            1 => {
+                // Valid header prefix, random body.
+                let keep = rng.below(valid.len().min(64)).min(bytes.len());
+                bytes[..keep].copy_from_slice(&valid[..keep]);
+                if bytes.len() >= 4 {
+                    reseal(&mut bytes);
+                }
+            }
+            _ => {
+                // Valid graph with extreme values written over header fields.
+                bytes = valid.clone();
+                let field = [12, 16, 28, 32, 36][rng.below(5)];
+                let value =
+                    [0, 1, 2, 255, 1_024, 1_025, u32::MAX, rng.next_u64() as u32][rng.below(8)];
+                bytes[field..field + 4].copy_from_slice(&value.to_le_bytes());
+                reseal(&mut bytes);
+            }
+        }
+        check(&bytes);
+    }
 }
 
 #[test]
@@ -1141,6 +1441,108 @@ fn release_parallel_build_scaling() {
         eprintln!(
             "  reference scan, {threads} threads: {:.2}s ({total:.0})",
             started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// Calibration data for the filtered-search planner (design PR 12, plan
+/// Phase 5). Anti-correlated filters keep the rows of the clusters farthest
+/// from the query, so the filtered nearest neighbors sit in regions the
+/// unfiltered walk never approaches, and layer 0 of a graph over separated
+/// blobs barely links those regions. Measured on 50000x32, 256 clusters,
+/// spread 0.25, 200 queries, k = 10, parallel build with default params
+/// (review of PR 59; recall@10 and distance computations per query):
+///
+/// ```text
+///                     ef   acorn            admit
+/// random 1%           64   0.985 /   746    1.000 / 21704
+/// random 10%          64   1.000 /   726    1.000 /  3640
+/// anti-correlated 1%  64   0.999 / 15948    0.999 / 49964
+/// anti-correlated 10% 64   0.857 /  2555    0.905 / 45930
+/// anti-correlated 10% 128  0.947 /  3712    0.963 / 46982
+/// anti-correlated 10% 256  0.986 /  5576    0.991 / 47936
+/// anti-correlated 50% 64   0.543 /  1842    0.789 / 25593
+/// anti-correlated 50% 256  0.874 /  4786    0.940 / 30712
+/// ```
+///
+/// At 100k rows (`release_filtered_recall_and_qps`) anti-correlated 10% at
+/// ef 64 gave 0.645 (acorn) and 0.717 (admit), and 50% gave 0.369 and
+/// 0.576. Things that did not help at ef 64: seeding layer 0 from a
+/// filtered beam on layer 1 (32 or 64 wide, admit or ACORN walk; 0.69 to
+/// 0.81), and bridging dead ends even when the results are full (0.894 at
+/// 13 times the distance work). Growing `ef` through the cursor does help,
+/// and an exact scan over `B` is far cheaper whenever `|B|` is a few
+/// thousand rows or less.
+#[test]
+#[ignore = "release benchmark"]
+fn release_anti_correlated_calibration() {
+    let rows = 50_000;
+    let data = clustered_with_spread(rows, 32, 256, 200, 0.25, 23);
+    let graph = HnswGraph::build_parallel(&data.vectors, HnswParams::default()).expect("build");
+    let fixture = Fixture { data, graph };
+    let strategies = [
+        ("acorn", FilterStrategy::acorn()),
+        ("admit", FilterStrategy::Admit),
+    ];
+    let report = |label: &str, work: &Workload, efs: &[usize]| {
+        for &ef in efs {
+            for (name, strategy) in strategies {
+                let run = run_filtered(&fixture, work, strategy, 10, ef);
+                eprintln!(
+                    "{label}: {name} ef={ef:>3} recall@10 {:.4}, {:>7.0} dist/query, \
+                     {:>6.0} QPS",
+                    run.recall, run.distance_computations, run.qps
+                );
+            }
+        }
+    };
+    for selectivity in [0.01, 0.1] {
+        let work = workload(&fixture, 10, |index, _| {
+            random_filter(rows, selectivity, 9_000 + index as u64)
+        });
+        report(&format!("random {selectivity:>4}"), &work, &[64]);
+    }
+    for selectivity in [0.01, 0.1, 0.5] {
+        let work = workload(&fixture, 10, |_, query| {
+            anti_correlated_filter(&fixture.data, query, selectivity)
+        });
+        report(
+            &format!("anti-correlated {selectivity:>4}"),
+            &work,
+            &[64, 128, 256],
+        );
+    }
+}
+
+/// Exact duplicates are a known HNSW weakness: when a row's list is full of
+/// zero-distance copies, the heuristic keeps them all and later copies lose
+/// every in-link. Measured on 32-dimensional clustered data with default
+/// params (review of PR 59): 5000 distinct x 4 copies and 1000 x 20 leave
+/// no orphans, but 200 x 100 leaves 11976 of 20000 rows orphaned when built
+/// sequentially and 6597 when built in parallel, and those rows can never
+/// be returned. Callers with heavily repeated vectors should deduplicate
+/// before building.
+#[test]
+#[ignore = "release benchmark"]
+fn release_duplicate_heavy_connectivity() {
+    for (distinct, copies) in [(5_000_usize, 4_usize), (1_000, 20), (200, 100)] {
+        let base = clustered(distinct, 32, 64, 0, 7);
+        let mut values = Vec::with_capacity(distinct * copies * 32);
+        for _ in 0..copies {
+            for row in 0..distinct as u32 {
+                values.extend_from_slice(base.vectors.row(row));
+            }
+        }
+        let data = F32Vectors::new(32, values, F32Metric::L2Squared).expect("vectors");
+        let sequential = HnswGraph::build(&data, HnswParams::default()).expect("build");
+        let parallel = HnswGraph::build_parallel(&data, HnswParams::default()).expect("build");
+        eprintln!(
+            "{distinct} distinct x {copies} copies: orphans sequential {}, parallel {}; \
+             unreachable sequential {}, parallel {}",
+            orphans(&sequential),
+            orphans(&parallel),
+            sequential.len() - union_reachable(&sequential),
+            parallel.len() - union_reachable(&parallel)
         );
     }
 }

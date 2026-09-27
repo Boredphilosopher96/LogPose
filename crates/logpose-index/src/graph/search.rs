@@ -698,3 +698,33 @@ impl HnswGraph {
         SearchCursor::start(self, query, filter, strategy, scratch)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::VisitedSet;
+
+    #[test]
+    fn visited_generation_wraparound_clears_old_stamps() {
+        let mut visited = VisitedSet::default();
+        visited.reset(4);
+        assert!(visited.insert(1));
+        // Jump to the last generation, stamp a row, then wrap.
+        visited.generation = u32::MAX - 1;
+        visited.reset(4);
+        assert_eq!(visited.generation, u32::MAX);
+        assert!(visited.insert(2));
+        assert!(!visited.insert(2));
+        visited.reset(4);
+        assert_eq!(visited.generation, 1);
+        // Neither the row stamped with u32::MAX nor a stale stamp equal to
+        // the restarted generation may read as visited.
+        assert!(visited.stamps.iter().all(|stamp| *stamp == 0));
+        for row in 0..4 {
+            assert!(!visited.contains(row));
+            assert!(visited.insert(row));
+        }
+        // Rows beyond the reset range always count as visited.
+        assert!(!visited.insert(4));
+        assert!(visited.contains(4));
+    }
+}

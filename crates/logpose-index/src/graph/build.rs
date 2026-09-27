@@ -278,6 +278,13 @@ impl SharedLinks {
                     .map(|link| link.load(Ordering::Relaxed)),
             );
         }
+        // A read racing a write may mix old and new links, but every value
+        // ever stored in a slot is a valid row id other than the slot's own.
+        debug_assert!(
+            out.iter()
+                .all(|link| (*link as usize) < self.locks.len() && *link != row),
+            "lock-free read of row {row} level {level} saw an invalid link"
+        );
     }
 
     fn freeze(self) -> HnswGraph {

@@ -122,11 +122,19 @@ impl RowFilter for RowBitset {
 }
 
 /// How a filtered search treats rows that fail the filter.
+///
+/// Neither strategy is exact. Both lose recall when the matching rows sit
+/// far from the query in regions the graph barely links (anti-correlated
+/// filters): on 50k clustered rows with 10 percent of rows matching,
+/// recall@10 at `ef = 64` fell to about 0.86 (ACORN) and 0.90 (admit),
+/// recovering to 0.99 at `ef = 256`. Use [`Self::suggest`], which sends
+/// small filters to an exact scan, and widen a [`crate::graph::SearchCursor`]
+/// when a result must be trusted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FilterStrategy {
     /// Walk the full graph, using non-matching rows for navigation but
     /// admitting only matching rows into the results. Best when most rows
-    /// match.
+    /// match; its cost grows as the filter gets more selective.
     #[default]
     Admit,
     /// ACORN-1 style walk for selective filters: expand only matching rows,
@@ -141,11 +149,31 @@ pub enum FilterStrategy {
     },
 }
 
+/// What [`FilterStrategy::suggest`] recommends for one filtered search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterPlan {
+    /// Score every matching row directly. Few enough rows match that this
+    /// costs less than any graph walk, and it is exact. The graph does not
+    /// do this; the caller scans its filter.
+    ExactScan,
+    /// Walk the graph with this strategy.
+    Graph(FilterStrategy),
+}
+
 impl FilterStrategy {
     /// Selectivity (`matching / total`) below which [`Self::suggest`] picks
-    /// [`FilterStrategy::Acorn`]. Provisional; the benchmark harness
-    /// calibrates it together with the exact-scan threshold.
+    /// [`FilterStrategy::Acorn`] over [`FilterStrategy::Admit`].
+    /// Provisional; the planner's benchmark harness (design PR 12, plan
+    /// Phase 5) calibrates it together with
+    /// [`Self::EXACT_SCAN_MAX_MATCHES`].
     pub const ACORN_SELECTIVITY_THRESHOLD: f64 = 0.3;
+
+    /// Matching-row count at or below which [`Self::suggest`] picks
+    /// [`FilterPlan::ExactScan`]. Provisional. At 50k to 100k rows a graph
+    /// walk over a filter of a few thousand rows computes as many distances
+    /// as scanning them all (and tens of times more for 0.1 percent or
+    /// anti-correlated filters), without being exact.
+    pub const EXACT_SCAN_MAX_MATCHES: usize = 2_048;
 
     /// ACORN with the default candidate budget.
     pub const fn acorn() -> Self {
@@ -154,19 +182,23 @@ impl FilterStrategy {
         }
     }
 
-    /// Picks a strategy from the filter's cardinality hint over `rows` rows.
-    /// Without a hint it returns [`FilterStrategy::Admit`].
-    pub fn suggest<F: RowFilter + ?Sized>(filter: &F, rows: usize) -> Self {
-        match filter.cardinality_hint() {
-            Some(count) if rows > 0 => {
-                let selectivity = count as f64 / rows as f64;
-                if selectivity < Self::ACORN_SELECTIVITY_THRESHOLD {
-                    Self::acorn()
-                } else {
-                    Self::Admit
-                }
-            }
-            _ => Self::Admit,
+    /// Picks a plan from the filter's cardinality hint over `rows` rows: an
+    /// exact scan for at most [`Self::EXACT_SCAN_MAX_MATCHES`] matches,
+    /// [`FilterStrategy::Acorn`] below [`Self::ACORN_SELECTIVITY_THRESHOLD`],
+    /// and [`FilterStrategy::Admit`] otherwise. Without a hint it walks with
+    /// [`FilterStrategy::Admit`].
+    pub fn suggest<F: RowFilter + ?Sized>(filter: &F, rows: usize) -> FilterPlan {
+        let Some(count) = filter.cardinality_hint() else {
+            return FilterPlan::Graph(Self::Admit);
+        };
+        if count <= Self::EXACT_SCAN_MAX_MATCHES || rows == 0 {
+            return FilterPlan::ExactScan;
+        }
+        let selectivity = count as f64 / rows as f64;
+        if selectivity < Self::ACORN_SELECTIVITY_THRESHOLD {
+            FilterPlan::Graph(Self::acorn())
+        } else {
+            FilterPlan::Graph(Self::Admit)
         }
     }
 }
