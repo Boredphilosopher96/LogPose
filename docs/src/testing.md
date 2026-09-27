@@ -145,6 +145,25 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 - deeper restart and recovery orchestration tests across metadata, storage, and remote serving boundaries
 - fault-injection around disk, transport, and background maintenance behavior once those seams are explicit
 
+## Benchmark Harness
+
+`crates/logpose-bench` is the scoreboard for engine work. It drives a pluggable `BenchTarget` (today the in-process `LocalStorageEngine` with the `query_exact` planner) through bulk ingest, flush, unfiltered and filtered top-k search, and write-to-searchable probes, and it scores every answer against a brute-force oracle computed in the harness.
+
+- datasets: a seeded clustered Gaussian generator, or SIFT-format `.fvecs` files with optional `.ivecs` ground truth to validate the oracle
+- filters: exact selectivities (0.1, 1, 10, 50, and 99 percent by default), uncorrelated or anti-correlated with the queries, expressed with the `Predicate` AST as equality flags (default) or ranges
+- metrics: ingest rows per second, write-to-searchable latency, single-client and multi-thread QPS, p50, p95, and p99 latency, recall@k, resident memory, and bytes read per query
+
+Run it from the workspace root, always in release mode:
+
+```bash
+cargo run --release -p logpose-bench -- --preset smoke
+cargo run --release -p logpose-bench -- --preset small --threads 4 --output target/logpose-bench/small.json
+cargo run --release -p logpose-bench -- --base-fvecs sift_base.fvecs --query-fvecs sift_query.fvecs --ground-truth-ivecs sift_groundtruth.ivecs --queries 1000
+cargo run --release -p logpose-bench -- --help
+```
+
+The JSON report records the machine, configuration, and per-case results. Committed baselines live in `benches/baselines/`; see its README for how to reproduce them. Compare new engine work against the latest baseline at the same preset and seed.
+
 ## Non-Negotiable Harness Rules
 
 Every new generative, fuzzing, or simulation harness in LogPose should satisfy these rules:

@@ -1,0 +1,21 @@
+[package]
+name = "logpose-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Benchmark harness that scores LogPose engines on ingest, freshness, latency, recall, memory, and I/O."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+logpose-query = { path = "../logpose-query" }
+logpose-storage = { path = "../logpose-storage" }
+logpose-types = { path = "../logpose-types" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

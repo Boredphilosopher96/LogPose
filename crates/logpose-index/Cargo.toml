@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 crc32fast = "1.4"
 logpose-types = { path = "../logpose-types" }
+pulp.workspace = true
 rayon.workspace = true
 roaring.workspace = true
 serde.workspace = true
@@ -19,6 +20,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
+
+[[bench]]
+name = "kernels"
+harness = false
 
 [[bench]]
 name = "scalar_range"

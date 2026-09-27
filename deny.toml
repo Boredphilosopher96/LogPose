@@ -6,3 +6,9 @@ allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
 
 [advisories]
 version = 2
+ignore = [
+  # paste is archived upstream but has no known vulnerability. It is a
+  # compile-time proc-macro that pulp 0.22 (the SIMD kernels in
+  # logpose-index) depends on, and no pulp release drops it yet.
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time proc-macro required by pulp 0.22; no vulnerability" },
+]
