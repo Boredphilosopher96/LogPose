@@ -1419,6 +1419,7 @@ dependencies = [
  "logpose-types",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
