@@ -6,7 +6,7 @@ Numbers are only comparable on similar hardware. Each report's `machine` block s
 
 ## phase0-current-engine.json
 
-The pre-rewrite engine (`LocalStorageEngine` plus the `query_exact` planner), measured before Phase 1 of the engine v2 plan.
+The pre-rewrite engine (`LocalStorageEngine` plus the `query_exact` planner), measured before Phase 1 of the engine v2 plan and after the legacy HNSW recall fix.
 
 Reproduce it from the workspace root:
 
@@ -21,45 +21,46 @@ The run uses 20,000 synthetic vectors of 128 dimensions in 32 Gaussian clusters,
 
 The small preset uses 200 queries. This baseline uses 100 to keep the run short, because every query reloads collection state from disk.
 
-The recorded run took 8.6 minutes on a 4-vCPU Xeon VM with 16 GB of RAM, on a clean tree at the commit in the report. It measures the engine as of the WAL-batch and storage-durability changes on main (#49, #54). Headline results:
+The recorded run took 8.6 minutes on a 4-vCPU Xeon VM with 16 GB of RAM, on a clean tree at the commit in the report. It measures the engine after the legacy HNSW recall fix. The "Before the HNSW fix" column is the previous committed run of this baseline (commit `ddc3380`, same machine type, same flags), which measured the engine as of the WAL-batch and storage-durability changes on main (#49, #54). Headline results:
 
-| Metric | Result |
-| --- | --- |
-| Ingest | 3,256 rows/s (batch p50 125 ms, p99 3.7 s) |
-| Flush (explicit, after waiting for automatic flushes) | 6.1 s, leaving 2 segments of 10,000 rows and 67 MB on disk |
-| Write-to-searchable p50 | 277 ms (always visible on the first search; the cost is one query) |
-| Unfiltered search | 3.2 QPS, p50 312 ms, p99 497 ms, recall@10 0.055 |
-| Filtered search | 3.4 to 5.3 QPS, recall@10 between 0.00 and 0.06 at every selectivity |
-| 4-thread QPS | 3.7 to 13.2; only selective filtered cases gain from extra clients |
-| Bytes read per query (`rchar`) | 31 to 49 MB, about 45 to 75 percent of the on-disk collection |
-| Peak RSS | 260 MB, of which 15 MB was resident before the engine opened (dataset, oracle, harness) |
+| Metric | Result | Before the HNSW fix |
+| --- | --- | --- |
+| Ingest | 2,990 rows/s (batch p50 99 ms, p99 4.8 s) | 3,256 rows/s (batch p50 125 ms, p99 3.7 s) |
+| Flush (explicit, after waiting for automatic flushes) | 5.9 s, leaving 2 segments of 10,000 rows and 68 MB on disk | 6.1 s, 2 segments, 67 MB |
+| Write-to-searchable p50 | 265 ms (always visible on the first search; the cost is one query) | 277 ms |
+| Unfiltered search | 3.8 QPS, p50 255 ms, p99 310 ms, recall@10 1.000 | 3.2 QPS, p50 312 ms, p99 497 ms, recall@10 0.055 |
+| Filtered search | 2.6 to 3.8 QPS, recall@10 between 0.992 and 1.000 at every selectivity, never short of k | 3.4 to 5.3 QPS, recall@10 between 0.00 and 0.06, selective filters short of k on every query |
+| 4-thread QPS | 6.1 to 10.6 | 3.7 to 13.2 |
+| Bytes read per query (`rchar`) | 50 MB, about 74 percent of the on-disk collection | 31 to 49 MB |
+| Peak RSS | 260 MB, of which 15 MB was resident before the engine opened (dataset, oracle, harness) | 260 MB |
 
 What the baseline shows:
 
-- ANN recall collapses on clustered data. After the flush every query takes an HNSW plan (`vector_first_ann` or `cooperative_filtered_ann`) and returns almost none of the true neighbors. Selective filters (0.1 and 1 percent) also return fewer than k rows for every query. The exact path agrees with the oracle exactly; the harness tests check this.
+- ANN recall now matches the oracle on clustered data. After the flush every query takes an HNSW plan (`vector_first_ann` or `cooperative_filtered_ann`) and returns the true neighbors; the one miss is a single anti-correlated 50 percent query at 0.8. The exact path agrees with the oracle exactly; the harness tests check this.
+- Selective filters (0.1 and 1 percent) are the slowest cases, at about 2.6 QPS. Filtered ANN still post-filters and restarts with a doubled `ef` until k rows survive, and a connected graph now lets those restarts walk most of each segment. Before the fix they were faster only because the search was trapped in one cluster and gave up short of k.
 - Every query reads most of the collection from disk, whatever the plan or filter.
 - Extra client threads add little throughput.
 - Range predicates (`--filter-style range`) always get a fixed 0.6 selectivity estimate from the planner, so selective range filters get `vector_first_ann` with post-filtering. That is why equality flags are the default style.
 
-### Why ANN Recall Collapses
+### Why ANN Recall Used To Collapse
 
-The harness is not the cause. The same collapse reproduces without it, both with `build_hnsw_index` and `search_hnsw` called directly and end to end through `query_exact`. The legacy HNSW graph in `crates/logpose-index/src/lib.rs` splits clustered data into one island per cluster, so a search can only reach the cluster that holds the segment's entry point. Three construction choices cause it:
+Before the fix, the legacy HNSW graph in `crates/logpose-index/src/lib.rs` split clustered data into one island per cluster, so a search could only reach the cluster that held the segment's entry point. Recall@10 was 0.055 unfiltered and at most 0.06 filtered. Three construction choices caused it:
 
-- Levels come from counting trailing zero bits of a hash, capped at 4 (`deterministic_level`, `MAX_HNSW_LEVEL`). That gives each level half the nodes of the one below, instead of the usual 1/M, so the top layer holds 1/16 of the segment. For a 10,000-row segment that is about 20 nodes per cluster, far more than M, so even the top layer has no edges between clusters.
-- Neighbor selection keeps the M closest candidates, with no diversity heuristic (`select_best_neighbors`, `trimmed_neighbors`). Once a cluster has more than M members, pruning drops every edge that leaves it.
-- Layer 0 keeps M = 8 neighbors (`HnswBuildParams::default`) instead of the usual 2M.
+- Levels came from counting trailing zero bits of a hash, capped at 4. That gave each level half the nodes of the one below, instead of the usual 1/M, so the top layer held 1/16 of the segment. For a 10,000-row segment that is about 20 nodes per cluster, far more than M, so even the top layer had no edges between clusters.
+- Neighbor selection kept the M closest candidates, with no diversity heuristic. Once a cluster had more than M members, pruning dropped every edge that left it.
+- Layer 0 kept M = 8 neighbors instead of the usual 2M.
 
 Evidence at one bench-shaped segment (6,700 rows of 128 dimensions, 32 clusters, spread 1.0, 60 candidates):
 
 | Graph construction | Recall@10 | Nodes reachable from the entry point on layer 0 |
 | --- | --- | --- |
-| Current | 0.07 | 152 of 6,700 (one cluster averages 209) |
+| Old builder | 0.07 | 152 of 6,700 (one cluster averages 209) |
 | Levels at 1/M only | 0.43 | 168 |
 | Layer 0 at 2M only | 0.48 | 6,574 |
 | Selection heuristic only | 0.44 | 5,386 |
-| All three, M and `ef_construction` unchanged | 0.88 | 6,576 |
+| All three, M = 8 and `ef_construction` = 32 | 0.88 | 6,576 |
 
-At 10,000 rows per segment, which is what this baseline has, the current graph drops to 0.03. End to end at 3,000 rows in 3 segments, the three changes raise engine recall from 0.49 to 1.00 unfiltered and from 0.40 to 1.00 filtered. So the multi-segment merge, the re-resolution of candidates to their latest visible version, and the rerank all preserve whatever the graph returns. No single contained change reaches high recall. The fix is standard HNSW construction, which the HNSW v2 work in the engine v2 plan replaces wholesale, so the legacy index is left as is.
+No single change reaches high recall. The fix applies all three: levels are drawn from the same deterministic hash but mapped to a geometric distribution with `mL = 1 / ln(M)`, layer 0 holds up to 2M neighbors, and both linking and pruning use the diversity heuristic with pruned connections kept (Malkov and Yashunin, Algorithm 4). The defaults also rose to M = 16, `ef_construction` = 128, and `ef_search` = 64. The heuristic also treats an exact copy of an already kept neighbor as redundant and breaks distance ties toward the newer node, so bursts of identical vectors stay reachable instead of forming islands. The sidecar version moved to 2. The reader rejects sidecars written by the old builder, and ANN queries score those segments exactly instead of failing, until a compaction that merges them writes current sidecars. The HNSW v2 work in the engine v2 plan still replaces this index wholesale.
 
 ## Reading The Numbers
 

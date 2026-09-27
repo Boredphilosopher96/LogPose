@@ -5,8 +5,8 @@ use crate::{
     durable_fs::{path_exists, read_file},
     error::{io_message, json_message},
     maintenance::MaintenanceOperation,
-    manifest::segment_artifact_file_name,
-    metric::storage_metric_compare,
+    manifest::{SegmentMeta, segment_artifact_file_name},
+    metric::{storage_metric_compare, storage_metric_value},
     resolve::{ResolvedState, resolve_latest_state_for_ids_selected},
     root_lock::StorageRootLock,
     segment_v1::read_segment_file,
@@ -15,11 +15,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
-use logpose_index::{FlatIndexSidecar, HnswIndexSidecar, decode_flat_index, decode_hnsw_index};
+use logpose_index::{
+    FlatIndexSidecar, HnswIndexSidecar, decode_flat_index, decode_hnsw_index,
+    is_unsupported_hnsw_version,
+};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
-    CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
-    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus,
+    NodeRole, RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{Vfs, std_vfs};
 use logpose_wal::{WalBatch, WalRecord, WalWriter};
@@ -29,6 +32,51 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Score a segment's records exactly, standing in for its HNSW sidecar when that cannot be read.
+///
+/// The candidates match what the sidecar would hold: the latest record per id in the segment,
+/// when it is a put visible at `visible_seq_no` and admitted by `filter`, best `budget` first.
+fn exact_segment_candidates(
+    vfs: &dyn Vfs,
+    collection_root: &Path,
+    segment: &SegmentMeta,
+    metric: DistanceMetric,
+    query: &[f32],
+    visible_seq_no: SeqNo,
+    budget: usize,
+    filter: Option<&(dyn for<'a> Fn(&'a Value) -> bool + Send + Sync)>,
+) -> Result<Vec<AnnCandidate>> {
+    let records = read_segment_file(
+        vfs,
+        &collection_root.join("segments").join(&segment.file_name),
+    )?;
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for record in records.iter().rev() {
+        if !seen.insert(record.op.id()) {
+            continue;
+        }
+        let WriteOperation::Put(put) = &record.op else {
+            continue;
+        };
+        if record.seq_no > visible_seq_no || filter.is_some_and(|filter| !filter(&put.metadata)) {
+            continue;
+        }
+        candidates.push(AnnCandidate {
+            unit_id: segment.segment_id.clone(),
+            record_id: put.id.clone(),
+            seq_no: record.seq_no,
+            value: storage_metric_value(metric, query, &put.vector)?,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        storage_metric_compare(metric, right.value, left.value)
+            .then(left.record_id.cmp(&right.record_id))
+    });
+    candidates.truncate(budget);
+    Ok(candidates)
+}
 
 /// Local filesystem-backed storage engine.
 ///
@@ -98,6 +146,21 @@ impl LocalStorageEngine {
         let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
         decode_hnsw_index(bytes, path)
             .map_err(|error| io_message("failed to read hnsw sidecar", error))
+    }
+
+    /// Read an HNSW sidecar the ANN path can traverse. `Ok(None)` means the sidecar has a graph
+    /// layout this build does not read; the segment's records are still readable, so the caller
+    /// scores them exactly instead of failing the query.
+    pub(crate) fn read_current_hnsw_sidecar(
+        &self,
+        path: &Path,
+    ) -> Result<Option<HnswIndexSidecar>> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
+        match decode_hnsw_index(bytes, path) {
+            Ok(hnsw) => Ok(Some(hnsw)),
+            Err(error) if is_unsupported_hnsw_version(&error) => Ok(None),
+            Err(error) => Err(io_message("failed to read hnsw sidecar", error)),
+        }
     }
 
     pub(crate) fn read_flat_sidecar(&self, path: &Path) -> Result<FlatIndexSidecar> {
@@ -292,15 +355,14 @@ impl StorageEngine for LocalStorageEngine {
                     ))
                 })?,
             );
-            let hnsw = self.read_hnsw_sidecar(&hnsw_path)?;
-            let search = logpose_index::search_hnsw(
-                &hnsw,
-                &request.vector,
-                request_budget,
-                filter.as_deref(),
-            )
-            .map_err(|error| io_message("failed to search hnsw sidecar", error))?;
-            for candidate in search
+            let segment_candidates = match self.read_current_hnsw_sidecar(&hnsw_path)? {
+                Some(hnsw) => logpose_index::search_hnsw(
+                    &hnsw,
+                    &request.vector,
+                    request_budget,
+                    filter.as_deref(),
+                )
+                .map_err(|error| io_message("failed to search hnsw sidecar", error))?
                 .candidates
                 .into_iter()
                 .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
@@ -310,7 +372,22 @@ impl StorageEngine for LocalStorageEngine {
                     seq_no: candidate.seq_no,
                     value: candidate.value,
                 })
-            {
+                .collect::<Vec<_>>(),
+                // A sidecar from an older graph layout cannot be traversed, but the segment's
+                // records are still readable: score them exactly rather than fail the query.
+                // A compaction that merges the segment writes a current sidecar.
+                None => exact_segment_candidates(
+                    self.vfs.as_ref(),
+                    &state.descriptor.root_path,
+                    segment,
+                    metric,
+                    &request.vector,
+                    snapshot.visible_seq_no,
+                    request_budget,
+                    filter.as_deref(),
+                )?,
+            };
+            for candidate in segment_candidates {
                 match candidates_by_record_id.entry(candidate.record_id.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(candidate);
@@ -486,6 +563,7 @@ impl StorageEngine for LocalStorageEngine {
                             "node_count": hnsw.nodes.len(),
                             "params": {
                                 "max_neighbors": hnsw.params.max_neighbors,
+                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
                                 "ef_construction": hnsw.params.ef_construction,
                                 "ef_search": hnsw.params.ef_search,
                             },
