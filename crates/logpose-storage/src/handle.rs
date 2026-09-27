@@ -257,7 +257,14 @@ mod tests {
     };
     use logpose_types::DistanceMetric;
     use logpose_vfs::std_vfs;
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
 
     #[tokio::test]
     async fn wait_visible_returns_once_a_write_reaches_the_barrier() {
@@ -305,5 +312,55 @@ mod tests {
             .wait_visible(1, Duration::ZERO)
             .await
             .expect("a met barrier returns at once");
+    }
+
+    /// `wait_visible` trusts that a notified `visible_seq_no` is already published: the watch
+    /// channel must never run ahead of `current`.
+    #[test]
+    fn the_visible_watch_never_runs_ahead_of_the_published_version() {
+        let root = unique_temp_dir("handle-watch-order");
+        let engine =
+            Engine::open(std_vfs(), &root, EngineConfig::default()).expect("engine should open");
+        let descriptor = engine
+            .core()
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .expect("descriptor should plan");
+        let handle = engine
+            .create_collection(descriptor, None)
+            .expect("collection should be created");
+        let done = Arc::new(AtomicBool::new(false));
+        let readers = (0..4)
+            .map(|_| {
+                let handle = Arc::clone(&handle);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    let mut checks = 0_u64;
+                    while !done.load(Ordering::Acquire) {
+                        let notified = *handle.visible.borrow();
+                        let published = handle.current().visible_seq_no;
+                        assert!(
+                            published >= notified,
+                            "watch announced seq {notified} before version at {published} was \
+                             published"
+                        );
+                        checks += 1;
+                    }
+                    checks
+                })
+            })
+            .collect::<Vec<_>>();
+        let core = engine.core();
+        for index in 0..1000 {
+            core.write(&handle, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
+                .expect("write should succeed");
+        }
+        done.store(true, Ordering::Release);
+        for reader in readers {
+            assert!(reader.join().expect("reader should join") > 0);
+        }
     }
 }
