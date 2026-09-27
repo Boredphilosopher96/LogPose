@@ -1,6 +1,10 @@
 //! Write-ahead log interfaces.
 //!
-//! A WAL file is a sequence of frames. Each frame holds exactly one [`WalBatch`], so a
+//! The [`v2`] module is the WAL v2 frame layer (group commit, rollback, rotation and tail
+//! repair over opaque payloads) and [`codec`] holds the WAL v2 payload types. The rest of this
+//! file is the version 1 WAL the engine still uses until the writer moves to [`v2`].
+//!
+//! A version 1 WAL file is a sequence of frames. Each frame holds exactly one [`WalBatch`], so a
 //! write batch is committed with a single append and a single fsync, and replay applies
 //! it all or nothing:
 //!
@@ -17,6 +21,7 @@
 //! [`WalWriter::open`] truncates it before appending. Rolled WAL files are strict.
 
 pub mod codec;
+pub mod v2;
 
 use crc32fast::Hasher;
 use logpose_types::{LogPoseError, Result, SeqNo, WriteOperation};
