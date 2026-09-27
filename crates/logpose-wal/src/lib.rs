@@ -20,11 +20,12 @@ pub mod codec;
 
 use crc32fast::Hasher;
 use logpose_types::{LogPoseError, Result, SeqNo, WriteOperation};
+use logpose_vfs::{CrashPoint, OpenMode, Vfs, VfsFile, parent_dir, read_file};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::IoSlice,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// File name of the WAL that receives appends. Every other `*.wal` file is rolled.
@@ -143,7 +144,8 @@ impl WalFileKind {
 
 /// Append-only writer for an active WAL file.
 pub struct WalWriter {
-    file: File,
+    vfs: Arc<dyn Vfs>,
+    file: Arc<dyn VfsFile>,
     path: PathBuf,
     /// Length of the fully valid, synced frame prefix. A failed append rolls back to it.
     len: u64,
@@ -156,21 +158,28 @@ impl WalWriter {
     /// truncated and synced before the writer is returned, so the next append never lands
     /// after garbage. A defect with any valid frame after it is not a torn tail; that is
     /// reported as an error instead of discarding acknowledged batches.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    ///
+    /// A newly created file is made durable by syncing its directory before this returns. A
+    /// newly created parent directory is not; the caller owns the layout above the WAL file.
+    pub fn open(vfs: Arc<dyn Vfs>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_message("failed to create WAL parent directory", error))?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| io_message("failed to open WAL file", error))?;
+        vfs.create_dir_all(parent_dir(&path))
+            .map_err(|error| io_message("failed to create WAL parent directory", error))?;
+        let file = match vfs.open(&path, OpenMode::Append) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file = vfs
+                    .open(&path, OpenMode::CreateNew)
+                    .map_err(|error| io_message("failed to create WAL file", error))?;
+                // An acknowledged append to a file whose name is not durable could vanish with
+                // the file, so a created WAL is made durable before it is used.
+                sync_parent_dir(vfs.as_ref(), &path)?;
+                file
+            }
+            Err(error) => return Err(io_message("failed to open WAL file", error)),
+        };
 
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        let bytes = read_whole(file.as_ref())
             .map_err(|error| io_message("failed to read WAL file", error))?;
         let scan = scan_frames(&bytes);
         let valid_len = scan.accepted_len(&path, WalFileKind::Active)?;
@@ -179,6 +188,8 @@ impl WalWriter {
                 .map_err(|error| io_message("failed to truncate torn WAL tail", error))?;
             file.sync_all()
                 .map_err(|error| io_message("failed to fsync repaired WAL", error))?;
+            vfs.crash_point(CrashPoint::RecoveryAfterTailRepair)
+                .map_err(|error| io_message("WAL tail repair interrupted", error))?;
             tracing::warn!(
                 path = %path.display(),
                 valid_bytes = valid_len,
@@ -189,6 +200,7 @@ impl WalWriter {
         }
 
         Ok(Self {
+            vfs,
             file,
             path,
             len: valid_len as u64,
@@ -211,13 +223,19 @@ impl WalWriter {
         })?;
         let frame = encode_frame(&payload);
 
-        if let Err(error) = self.file.write_all(&frame) {
+        if let Err(error) = self.file.append(&[IoSlice::new(&frame)]) {
             return Err(self.roll_back_failed_append("failed to append WAL frame", error));
         }
+        self.vfs
+            .crash_point(CrashPoint::WalAfterAppend)
+            .map_err(|error| io_message("WAL append interrupted", error))?;
         if let Err(error) = self.file.sync_data() {
             return Err(self.roll_back_failed_append("failed to fsync WAL data", error));
         }
         self.len += frame.len() as u64;
+        self.vfs
+            .crash_point(CrashPoint::WalAfterSync)
+            .map_err(|error| io_message("WAL append interrupted after its fsync", error))?;
 
         Ok(())
     }
@@ -227,6 +245,7 @@ impl WalWriter {
             .file
             .set_len(self.len)
             .and_then(|()| self.file.sync_all())
+            .and_then(|()| self.vfs.crash_point(CrashPoint::WalAfterRollback))
         {
             Ok(()) => io_message(context, error),
             Err(rollback_error) => LogPoseError::Message(format!(
@@ -242,9 +261,6 @@ impl WalWriter {
             .set_len(0)
             .map_err(|error| io_message("failed to truncate WAL", error))?;
         self.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| io_message("failed to rewind WAL", error))?;
-        self.file
             .sync_all()
             .map_err(|error| io_message("failed to fsync truncated WAL", error))?;
         self.len = 0;
@@ -255,9 +271,13 @@ impl WalWriter {
 /// Replay the batches of a single WAL file.
 ///
 /// A missing file replays as empty. See [`WalFileKind`] for how an invalid tail is treated.
-pub fn replay_file(path: impl AsRef<Path>, kind: WalFileKind) -> Result<Vec<WalBatch>> {
+pub fn replay_file(
+    vfs: &dyn Vfs,
+    path: impl AsRef<Path>,
+    kind: WalFileKind,
+) -> Result<Vec<WalBatch>> {
     let path = path.as_ref();
-    let bytes = match fs::read(path) {
+    let bytes = match read_file(vfs, path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(io_message("failed to read WAL file", error)),
@@ -272,8 +292,8 @@ pub fn replay_file(path: impl AsRef<Path>, kind: WalFileKind) -> Result<Vec<WalB
 }
 
 /// Replay all WAL files in a directory, processing rolled files before the active file.
-pub fn replay_dir(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
-    replay_dir_after_checkpoint(path, 0)
+pub fn replay_dir(vfs: &dyn Vfs, path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
+    replay_dir_after_checkpoint(vfs, path, 0)
 }
 
 /// Replay the records above the manifest checkpoint from every relevant WAL file.
@@ -283,17 +303,21 @@ pub fn replay_dir(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
 /// does not start above the previous replayed batch means a sequence number was written
 /// twice. Both are invariant violations and are reported as errors.
 pub fn replay_dir_after_checkpoint(
+    vfs: &dyn Vfs,
     path: impl AsRef<Path>,
     checkpoint_seq_no: SeqNo,
 ) -> Result<Vec<WalRecord>> {
     let path = path.as_ref();
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+    let listed = match vfs.list(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_message("failed to list WAL directory", error)),
+    };
 
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| io_message("failed to list WAL directory", error))?
-        .filter_map(|entry| entry.ok().map(|value| value.path()))
+    let mut entries = listed
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| path.join(entry.name))
         .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
         .collect::<Vec<_>>();
 
@@ -303,7 +327,7 @@ pub fn replay_dir_after_checkpoint(
 
     let mut replayed = Vec::new();
     for entry in entries {
-        for batch in replay_file(&entry, WalFileKind::from_path(&entry))? {
+        for batch in replay_file(vfs, &entry, WalFileKind::from_path(&entry))? {
             if batch.last_seq_no() <= checkpoint_seq_no {
                 continue;
             }
@@ -334,50 +358,50 @@ pub fn replay_dir_after_checkpoint(
 /// Rotate the active WAL to a rolled filename and create a new empty active file.
 ///
 /// A torn tail on the active WAL is repaired before the rename, so rolled files only
-/// ever contain fully valid frames.
-pub fn rotate_active(active_path: impl AsRef<Path>, rolled_path: impl AsRef<Path>) -> Result<()> {
+/// ever contain fully valid frames. The rename and the new active file are made durable by
+/// syncing their directories before this returns.
+pub fn rotate_active(
+    vfs: &Arc<dyn Vfs>,
+    active_path: impl AsRef<Path>,
+    rolled_path: impl AsRef<Path>,
+) -> Result<()> {
     let active_path = active_path.as_ref();
     let rolled_path = rolled_path.as_ref();
-    if let Some(parent) = rolled_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| io_message("failed to create WAL rotation directory", error))?;
-    }
+    vfs.create_dir_all(parent_dir(rolled_path))
+        .map_err(|error| io_message("failed to create WAL rotation directory", error))?;
 
-    if active_path.exists() {
-        drop(WalWriter::open(active_path)?);
-        fs::rename(active_path, rolled_path)
+    let active_exists = logpose_vfs::exists(vfs.as_ref(), active_path)
+        .map_err(|error| io_message("failed to look up active WAL", error))?;
+    if active_exists {
+        drop(WalWriter::open(Arc::clone(vfs), active_path)?);
+        vfs.rename(active_path, rolled_path)
             .map_err(|error| io_message("failed to rotate active WAL", error))?;
     }
 
-    let mut writer = WalWriter::open(active_path)?;
+    let mut writer = WalWriter::open(Arc::clone(vfs), active_path)?;
     writer.truncate()?;
     // The rename and the new active file exist only in the directory until it is fsynced.
-    sync_parent_dir(active_path)?;
-    if rolled_path.parent() != active_path.parent() {
-        sync_parent_dir(rolled_path)?;
+    sync_parent_dir(vfs.as_ref(), active_path)?;
+    if parent_dir(rolled_path) != parent_dir(active_path) {
+        sync_parent_dir(vfs.as_ref(), rolled_path)?;
     }
-    Ok(())
+    vfs.crash_point(CrashPoint::WalAfterRotateCreate)
+        .map_err(|error| io_message("WAL rotation interrupted", error))
 }
 
 /// Fsync the directory containing `path` so entries created or renamed in it survive power loss.
-///
-/// Directory fsync is only available through `std` on unix; elsewhere it is a no-op.
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    #[cfg(unix)]
-    {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| io_message("failed to fsync WAL directory", error))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
-        Ok(())
-    }
+fn sync_parent_dir(vfs: &dyn Vfs, path: &Path) -> Result<()> {
+    vfs.sync_dir(parent_dir(path))
+        .map_err(|error| io_message("failed to fsync WAL directory", error))
+}
+
+fn read_whole(file: &dyn VfsFile) -> std::io::Result<Vec<u8>> {
+    let len = usize::try_from(file.len()?).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL file is too large")
+    })?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact_at(&mut bytes, 0)?;
+    Ok(bytes)
 }
 
 /// Why a frame scan stopped before the end of the file.
@@ -581,6 +605,7 @@ fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
 mod tests {
     use super::*;
     use logpose_types::{DeleteRecord, PutRecord, RecordId, WriteOperation};
+    use logpose_vfs::{StdVfs, std_vfs};
     use serde_json::json;
     use std::{
         fs,
@@ -604,7 +629,7 @@ mod tests {
     }
 
     fn append(path: &Path, records: Vec<WalRecord>) {
-        let mut writer = WalWriter::open(path).expect("writer should open");
+        let mut writer = WalWriter::open(std_vfs(), path).expect("writer should open");
         writer
             .append_batch(&batch(records))
             .expect("append should succeed");
@@ -628,7 +653,7 @@ mod tests {
         let dir = unique_temp_dir("wal-replay-order");
         let path = dir.join(ACTIVE_WAL_FILE_NAME);
 
-        let mut writer = WalWriter::open(&path).expect("writer should open");
+        let mut writer = WalWriter::open(std_vfs(), &path).expect("writer should open");
         writer
             .append_batch(&batch(vec![put(1, "alpha")]))
             .expect("append should succeed");
@@ -641,7 +666,8 @@ mod tests {
             }]))
             .expect("append should succeed");
 
-        let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1], vec![2]]);
     }
 
@@ -654,7 +680,8 @@ mod tests {
 
         let scan_bytes = fs::read(&path).expect("wal file should exist");
         assert_eq!(scan_frames(&scan_bytes).payloads.len(), 1);
-        let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1, 2, 3]]);
         assert_eq!(replayed[0].first_seq_no(), 1);
         assert_eq!(replayed[0].last_seq_no(), 3);
@@ -680,7 +707,8 @@ mod tests {
 
         for cut in (committed_len as usize + 1)..full.len() {
             fs::write(&path, &full[..cut]).expect("truncate should succeed");
-            let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+            let replayed =
+                replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
             assert_eq!(seq_nos(&replayed), vec![vec![1]], "cut at byte {cut}");
         }
     }
@@ -697,7 +725,8 @@ mod tests {
         bytes[last] ^= 0xFF;
         fs::write(&path, bytes).expect("corruption write should succeed");
 
-        let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1]]);
     }
 
@@ -712,7 +741,8 @@ mod tests {
         bytes[last] ^= 0xFF;
         fs::write(&path, bytes).expect("corruption write should succeed");
 
-        let error = replay_file(&path, WalFileKind::Rolled).expect_err("mismatch should fail");
+        let error =
+            replay_file(&StdVfs, &path, WalFileKind::Rolled).expect_err("mismatch should fail");
         assert!(error.to_string().contains("checksum"), "{error}");
     }
 
@@ -723,7 +753,8 @@ mod tests {
         append(&path, vec![put(1, "alpha")]);
         append_garbage(&path, b"garbage after a valid frame");
 
-        let error = replay_file(&path, WalFileKind::Rolled).expect_err("garbage should fail");
+        let error =
+            replay_file(&StdVfs, &path, WalFileKind::Rolled).expect_err("garbage should fail");
         assert!(error.to_string().contains("magic"), "{error}");
     }
 
@@ -739,14 +770,14 @@ mod tests {
         bytes[first_len - 1] ^= 0xFF;
         fs::write(&path, &bytes).expect("corruption write should succeed");
 
-        let replay_error =
-            replay_file(&path, WalFileKind::Active).expect_err("mid-log corruption should fail");
+        let replay_error = replay_file(&StdVfs, &path, WalFileKind::Active)
+            .expect_err("mid-log corruption should fail");
         assert!(
             replay_error
                 .to_string()
                 .contains("before later valid frames")
         );
-        let open_error = WalWriter::open(&path)
+        let open_error = WalWriter::open(std_vfs(), &path)
             .err()
             .expect("writer must not discard acknowledged frames");
         assert!(open_error.to_string().contains("checksum mismatch"));
@@ -771,7 +802,7 @@ mod tests {
     }
 
     fn assert_refuses_to_discard_later_frames(path: &Path, bytes: &[u8]) {
-        let replay_error = replay_file(path, WalFileKind::Active)
+        let replay_error = replay_file(&StdVfs, path, WalFileKind::Active)
             .expect_err("replay must not silently drop acknowledged frames");
         assert!(
             replay_error
@@ -780,7 +811,7 @@ mod tests {
             "{replay_error}"
         );
         assert!(
-            WalWriter::open(path).is_err(),
+            WalWriter::open(std_vfs(), path).is_err(),
             "writer must not truncate acknowledged frames"
         );
         assert_eq!(
@@ -830,7 +861,7 @@ mod tests {
         let bytes = fs::read(&path).expect("wal file should exist");
         fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncation should succeed");
 
-        let error = replay_file(&path, WalFileKind::Rolled)
+        let error = replay_file(&StdVfs, &path, WalFileKind::Rolled)
             .expect_err("rotation only rolls repaired files, so a torn rolled file is corrupt");
         assert!(error.to_string().contains("truncated frame"), "{error}");
     }
@@ -842,11 +873,11 @@ mod tests {
         append(&path, vec![put(1, "a")]);
         let committed = fs::read(&path).expect("wal file should exist");
 
-        let mut writer = WalWriter::open(&path).expect("writer should open");
+        let mut writer = WalWriter::open(std_vfs(), &path).expect("writer should open");
         // Stand in for a frame whose write succeeded but whose fsync then failed.
         writer
             .file
-            .write_all(&encode_frame(b"{\"records\":[]}"))
+            .append(&[IoSlice::new(&encode_frame(b"{\"records\":[]}"))])
             .expect("write should succeed");
         let error = writer
             .roll_back_failed_append("failed to fsync WAL data", std::io::Error::other("EIO"));
@@ -859,7 +890,8 @@ mod tests {
         writer
             .append_batch(&batch(vec![put(2, "b")]))
             .expect("append after rollback should succeed");
-        let replayed = replay_file(&path, WalFileKind::Rolled).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Rolled).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1], vec![2]]);
     }
 
@@ -870,7 +902,7 @@ mod tests {
         append(&active_path, vec![put(1, "a"), put(2, "b")]);
         append(&active_path, vec![put(2, "again")]);
 
-        let error = replay_dir(&dir).expect_err("a reused sequence number should fail");
+        let error = replay_dir(&StdVfs, &dir).expect_err("a reused sequence number should fail");
         assert!(
             error
                 .to_string()
@@ -887,10 +919,11 @@ mod tests {
         let valid_len = fs::metadata(&path).expect("metadata").len();
         append_garbage(&path, b"\0\0\0\0garbage from a torn write");
 
-        drop(WalWriter::open(&path).expect("writer should open"));
+        drop(WalWriter::open(std_vfs(), &path).expect("writer should open"));
 
         assert_eq!(fs::metadata(&path).expect("metadata").len(), valid_len);
-        let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1, 2]]);
     }
 
@@ -913,7 +946,8 @@ mod tests {
         append(&path, vec![put(3, "c")]);
         append(&path, vec![put(4, "d"), put(5, "e")]);
 
-        let replayed = replay_file(&path, WalFileKind::Active).expect("replay should succeed");
+        let replayed =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect("replay should succeed");
         assert_eq!(seq_nos(&replayed), vec![vec![1, 2], vec![3], vec![4, 5]]);
         let ids = replayed
             .iter()
@@ -921,7 +955,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["a", "b", "c", "d", "e"]);
         assert_eq!(
-            replay_file(&path, WalFileKind::Rolled)
+            replay_file(&StdVfs, &path, WalFileKind::Rolled)
                 .expect("a repaired file is valid under strict replay")
                 .len(),
             3
@@ -934,7 +968,7 @@ mod tests {
         let path = dir.join(ACTIVE_WAL_FILE_NAME);
         fs::write(&path, b"not a wal").expect("garbage should be written");
 
-        drop(WalWriter::open(&path).expect("writer should open"));
+        drop(WalWriter::open(std_vfs(), &path).expect("writer should open"));
         assert_eq!(fs::metadata(&path).expect("metadata").len(), 0);
     }
 
@@ -958,13 +992,14 @@ mod tests {
         let rolled_path = dir.join("00000000000000000001.wal");
 
         append(&active_path, vec![put(1, "alpha")]);
-        rotate_active(&active_path, &rolled_path).expect("rotation should succeed");
+        rotate_active(&std_vfs(), &active_path, &rolled_path).expect("rotation should succeed");
 
         fs::write(&rolled_path, b"checkpointed garbage").expect("corruption should be written");
 
         append(&active_path, vec![put(2, "beta")]);
 
-        let replayed = replay_dir_after_checkpoint(&dir, 1).expect("replay should succeed");
+        let replayed =
+            replay_dir_after_checkpoint(&StdVfs, &dir, 1).expect("replay should succeed");
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].seq_no, 2);
         assert_eq!(replayed[0].op.id().as_str(), "beta");
@@ -977,7 +1012,8 @@ mod tests {
         append(&active_path, vec![put(1, "a"), put(2, "b")]);
         append(&active_path, vec![put(3, "c"), put(4, "d")]);
 
-        let replayed = replay_dir_after_checkpoint(&dir, 2).expect("replay should succeed");
+        let replayed =
+            replay_dir_after_checkpoint(&StdVfs, &dir, 2).expect("replay should succeed");
         assert_eq!(
             replayed
                 .iter()
@@ -985,7 +1021,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
-        let all = replay_dir(&dir).expect("replay should succeed");
+        let all = replay_dir(&StdVfs, &dir).expect("replay should succeed");
         assert_eq!(all.len(), 4);
     }
 
@@ -995,7 +1031,8 @@ mod tests {
         let active_path = dir.join(ACTIVE_WAL_FILE_NAME);
         append(&active_path, vec![put(1, "a"), put(2, "b"), put(3, "c")]);
 
-        let error = replay_dir_after_checkpoint(&dir, 2).expect_err("straddling batch should fail");
+        let error = replay_dir_after_checkpoint(&StdVfs, &dir, 2)
+            .expect_err("straddling batch should fail");
         assert!(
             error.to_string().contains("straddles checkpoint 2"),
             "{error}"
@@ -1010,10 +1047,10 @@ mod tests {
         append(&active_path, vec![put(1, "a"), put(2, "b")]);
         append_garbage(&active_path, b"torn");
 
-        rotate_active(&active_path, &rolled_path).expect("rotation should succeed");
+        rotate_active(&std_vfs(), &active_path, &rolled_path).expect("rotation should succeed");
 
-        let rolled =
-            replay_file(&rolled_path, WalFileKind::Rolled).expect("rolled file should be clean");
+        let rolled = replay_file(&StdVfs, &rolled_path, WalFileKind::Rolled)
+            .expect("rolled file should be clean");
         assert_eq!(seq_nos(&rolled), vec![vec![1, 2]]);
         assert_eq!(fs::metadata(&active_path).expect("metadata").len(), 0);
     }
@@ -1024,9 +1061,10 @@ mod tests {
         let path = dir.join(ACTIVE_WAL_FILE_NAME);
         fs::write(&path, encode_frame(b"{\"records\":[]}")).expect("frame should be written");
 
-        let error = replay_file(&path, WalFileKind::Active).expect_err("empty batch is invalid");
+        let error =
+            replay_file(&StdVfs, &path, WalFileKind::Active).expect_err("empty batch is invalid");
         assert!(error.to_string().contains("at least one record"), "{error}");
-        drop(WalWriter::open(&path).expect("writer should open"));
+        drop(WalWriter::open(std_vfs(), &path).expect("writer should open"));
         assert!(
             fs::metadata(&path).expect("metadata").len() > 0,
             "checksum-valid frames are never truncated"
@@ -1041,5 +1079,242 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
+    }
+
+    mod crash {
+        use super::*;
+        use logpose_vfs::{FaultPlan, FaultVfs, TearMode, is_crashed};
+
+        const WAL_DIR: &str = "/wal";
+
+        fn active_path() -> PathBuf {
+            Path::new(WAL_DIR).join(ACTIVE_WAL_FILE_NAME)
+        }
+
+        /// A filesystem with a durable, empty active WAL.
+        fn fresh_vfs(seed: u64) -> Arc<FaultVfs> {
+            let vfs = FaultVfs::new(seed);
+            let process = vfs.process();
+            drop(WalWriter::open(Arc::clone(&process), active_path()).expect("writer should open"));
+            process.sync_dir(Path::new("/")).expect("root sync");
+            process.sync_dir(Path::new(WAL_DIR)).expect("wal dir sync");
+            vfs
+        }
+
+        /// Batches of different sizes so torn frames land at different offsets.
+        fn scenario_batches() -> Vec<WalBatch> {
+            vec![
+                batch(vec![put(1, "a")]),
+                batch(vec![put(2, "b"), put(3, "c"), put(4, "d")]),
+                batch(vec![put(5, &"e".repeat(5000))]),
+                batch(vec![put(6, "f")]),
+            ]
+        }
+
+        /// Append every batch, stopping at the first failure. Returns how many were acknowledged.
+        fn append_until_failure(vfs: Arc<dyn Vfs>, batches: &[WalBatch]) -> usize {
+            let Ok(mut writer) = WalWriter::open(vfs, active_path()) else {
+                return 0;
+            };
+            batches
+                .iter()
+                .take_while(|batch| writer.append_batch(batch).is_ok())
+                .count()
+        }
+
+        fn replayed_seq_nos(vfs: &dyn Vfs) -> Vec<Vec<SeqNo>> {
+            seq_nos(
+                &replay_file(vfs, active_path(), WalFileKind::Active)
+                    .expect("recovered WAL should replay"),
+            )
+        }
+
+        #[test]
+        #[allow(clippy::panic)]
+        fn acknowledged_batches_survive_a_crash_at_every_operation() {
+            let batches = scenario_batches();
+            let expected = seq_nos(&batches);
+
+            let clean = fresh_vfs(0);
+            assert_eq!(
+                append_until_failure(clean.process(), &batches),
+                batches.len()
+            );
+            let total_ops = clean.mutating_ops();
+
+            for tear in TearMode::ALL {
+                for crash_after_ops in 0..=total_ops {
+                    let seed = crash_after_ops * 31 + tear as u64;
+                    let vfs = fresh_vfs(seed);
+                    vfs.set_plan(FaultPlan {
+                        crash_after_ops: Some(crash_after_ops),
+                        tear,
+                        ..FaultPlan::default()
+                    });
+                    let acked = append_until_failure(vfs.process(), &batches);
+                    vfs.crash();
+
+                    let context = format!("tear={tear:?} crash_after_ops={crash_after_ops}");
+                    let recovered = replayed_seq_nos(vfs.process().as_ref());
+                    assert!(
+                        recovered.len() >= acked && recovered.len() <= acked + 1,
+                        "{context}: acked {acked} batches but recovered {recovered:?}"
+                    );
+                    assert_eq!(recovered, expected[..recovered.len()], "{context}");
+
+                    // Reopening repairs any torn tail, and the log keeps accepting batches.
+                    let process = vfs.process();
+                    let mut writer = WalWriter::open(Arc::clone(&process), active_path())
+                        .unwrap_or_else(|error| panic!("{context}: reopen failed: {error}"));
+                    let next = recovered
+                        .last()
+                        .and_then(|last| last.last())
+                        .map_or(1, |seq| seq + 1);
+                    writer
+                        .append_batch(&batch(vec![put(next, "after")]))
+                        .unwrap_or_else(|error| panic!("{context}: append failed: {error}"));
+                    let mut with_next = recovered.clone();
+                    with_next.push(vec![next]);
+                    assert_eq!(
+                        seq_nos(
+                            &replay_file(process.as_ref(), active_path(), WalFileKind::Rolled)
+                                .expect("a repaired WAL is valid under strict replay")
+                        ),
+                        with_next,
+                        "{context}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn failed_fsync_rolls_back_and_the_batch_never_reappears() {
+            let vfs = fresh_vfs(7);
+            let process = vfs.process();
+            let mut writer =
+                WalWriter::open(Arc::clone(&process), active_path()).expect("writer should open");
+            writer
+                .append_batch(&batch(vec![put(1, "a")]))
+                .expect("first append should succeed");
+            // The first append used file sync 0; fail the next one.
+            vfs.set_plan(FaultPlan {
+                fail_sync: Some(1),
+                tear: TearMode::KeepRandomPrefix,
+                ..FaultPlan::default()
+            });
+            let error = writer
+                .append_batch(&batch(vec![put(2, "lost")]))
+                .expect_err("the fsync failure should fail the append");
+            assert!(
+                error.to_string().contains("failed to fsync WAL data"),
+                "{error}"
+            );
+            assert_eq!(
+                vfs.crash_points_hit().last(),
+                Some(&CrashPoint::WalAfterRollback)
+            );
+            writer
+                .append_batch(&batch(vec![put(2, "b")]))
+                .expect("append after rollback should succeed");
+
+            vfs.crash();
+            let recovered = replay_file(vfs.process().as_ref(), active_path(), WalFileKind::Rolled)
+                .expect("rolled-back WAL should be strictly valid");
+            let ids = recovered
+                .iter()
+                .flat_map(|batch| batch.records().iter().map(|record| record.op.id().as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["a", "b"]);
+        }
+
+        #[test]
+        fn named_crash_points_in_append_and_rotation() {
+            // Crash after the append but before its fsync: the batch was never acknowledged
+            // and, with unsynced data dropped, is gone.
+            let vfs = fresh_vfs(1);
+            vfs.set_plan(FaultPlan {
+                crash_at: Some(CrashPoint::WalAfterAppend),
+                ..FaultPlan::default()
+            });
+            assert_eq!(append_until_failure(vfs.process(), &scenario_batches()), 0);
+            assert_eq!(vfs.crash().triggered_at, Some(CrashPoint::WalAfterAppend));
+            assert!(replayed_seq_nos(vfs.process().as_ref()).is_empty());
+
+            // Crash after the fsync: unacknowledged, but durable.
+            let vfs = fresh_vfs(2);
+            vfs.set_plan(FaultPlan {
+                crash_at: Some(CrashPoint::WalAfterSync),
+                ..FaultPlan::default()
+            });
+            assert_eq!(append_until_failure(vfs.process(), &scenario_batches()), 0);
+            vfs.crash();
+            assert_eq!(replayed_seq_nos(vfs.process().as_ref()), vec![vec![1]]);
+
+            // Crash right after rotation: both the rolled file and the new active file are
+            // durable, and the rolled file is strictly valid.
+            let vfs = fresh_vfs(3);
+            assert_eq!(
+                append_until_failure(vfs.process(), &scenario_batches()[..2]),
+                2
+            );
+            vfs.set_plan(FaultPlan {
+                crash_at: Some(CrashPoint::WalAfterRotateCreate),
+                ..FaultPlan::default()
+            });
+            let rolled = Path::new(WAL_DIR).join("00000000000000000004.wal");
+            let error = rotate_active(&vfs.process(), active_path(), &rolled)
+                .expect_err("rotation should crash at its crash point");
+            assert!(error.to_string().contains("interrupted"), "{error}");
+            vfs.crash();
+            let process = vfs.process();
+            assert_eq!(
+                seq_nos(
+                    &replay_file(process.as_ref(), &rolled, WalFileKind::Rolled)
+                        .expect("rolled file should be durable and valid")
+                ),
+                vec![vec![1], vec![2, 3, 4]]
+            );
+            assert!(replayed_seq_nos(process.as_ref()).is_empty());
+        }
+
+        #[test]
+        fn crash_after_tail_repair_keeps_the_repair() {
+            let vfs = fresh_vfs(4);
+            assert_eq!(
+                append_until_failure(vfs.process(), &scenario_batches()[..1]),
+                1
+            );
+            let process = vfs.process();
+            let file = process
+                .open(&active_path(), OpenMode::Append)
+                .expect("active WAL should open");
+            file.append(&[IoSlice::new(b"torn frame bytes")])
+                .expect("garbage append should succeed");
+            file.sync_data().expect("garbage sync should succeed");
+
+            vfs.set_plan(FaultPlan {
+                crash_at: Some(CrashPoint::RecoveryAfterTailRepair),
+                ..FaultPlan::default()
+            });
+            let error = WalWriter::open(Arc::clone(&process), active_path())
+                .err()
+                .expect("open should crash after repairing the tail");
+            assert!(
+                error.to_string().contains("tail repair interrupted"),
+                "{error}"
+            );
+            assert!(
+                is_crashed(&process.list(Path::new("/")).expect_err("process is halted")),
+                "every later call fails"
+            );
+            vfs.crash();
+            assert_eq!(
+                seq_nos(
+                    &replay_file(vfs.process().as_ref(), active_path(), WalFileKind::Rolled)
+                        .expect("the synced repair must survive the crash")
+                ),
+                vec![vec![1]]
+            );
+        }
     }
 }

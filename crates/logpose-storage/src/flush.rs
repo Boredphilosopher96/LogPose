@@ -1,7 +1,8 @@
 //! Flush: write the mutable delta as a new segment, publish the manifest, and rotate the WAL.
 
 use crate::{
-    LocalStorageEngine, fs_util::atomic_write, manifest::Manifest, state::CollectionState,
+    LocalStorageEngine, fs_util::atomic_write, manifest::Manifest, segment_v1::SegmentPurpose,
+    state::CollectionState,
 };
 use logpose_types::{Result, Snapshot};
 use logpose_wal::rotate_active;
@@ -16,7 +17,8 @@ impl LocalStorageEngine {
         }
 
         let segment_records = state.delta.clone();
-        let new_segment = self.write_segment_file(&state.descriptor, &segment_records)?;
+        let new_segment =
+            self.write_segment_file(&state.descriptor, &segment_records, SegmentPurpose::Flush)?;
         let checkpoint_seq_no = segment_records
             .last()
             .map(|record| record.seq_no)
@@ -31,6 +33,7 @@ impl LocalStorageEngine {
             segments,
         };
         atomic_write(
+            self.vfs.as_ref(),
             &Self::pending_rotation_file_path(&state.descriptor),
             checkpoint_seq_no.to_string().into_bytes(),
         )?;
@@ -41,10 +44,14 @@ impl LocalStorageEngine {
             .root_path
             .join("wal")
             .join(format!("{checkpoint_seq_no:020}.wal"));
-        rotate_active(Self::active_wal_path(&state.descriptor), rolled_path)?;
+        rotate_active(
+            &self.vfs,
+            Self::active_wal_path(&state.descriptor),
+            rolled_path,
+        )?;
         // A surviving marker makes the next load treat `active.wal` as checkpointed, so the
         // flush must not report success unless the marker is durably gone.
-        Self::clear_pending_rotation_marker(&state.descriptor)?;
+        self.clear_pending_rotation_marker(&state.descriptor)?;
 
         Ok(Snapshot {
             manifest_generation: next_manifest.generation,

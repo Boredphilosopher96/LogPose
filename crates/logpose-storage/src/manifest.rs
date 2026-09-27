@@ -2,13 +2,15 @@
 
 use crate::{
     LocalStorageEngine,
-    error::{io_message, json_message},
-    fs_util::{atomic_write, read_json},
+    durable_fs::read_file,
+    error::json_message,
+    fs_util::{AtomicWritePoints, atomic_write_with_points, read_json},
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats, SeqNo};
+use logpose_vfs::CrashPoint;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs};
+use std::collections::BTreeMap;
 
 impl LocalStorageEngine {
     pub(crate) fn load_manifest(
@@ -22,7 +24,7 @@ impl LocalStorageEngine {
         };
 
         let path = Self::manifest_file_path(descriptor, generation);
-        if !path.exists() {
+        if !self.exists(&path)? {
             if generation_override.is_some() && generation != 0 {
                 return Err(LogPoseError::Message(format!(
                     "invalid snapshot: manifest generation {} does not exist",
@@ -31,38 +33,52 @@ impl LocalStorageEngine {
             }
             return Ok(Manifest::empty(generation));
         }
-        read_json(&path)
+        read_json(self.vfs.as_ref(), &path)
     }
 
     pub(crate) fn read_current_generation(&self, descriptor: &CollectionDescriptor) -> Result<u64> {
         let path = Self::current_manifest_pointer(descriptor);
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Ok(0);
         }
-        let contents = fs::read_to_string(&path)
-            .map_err(|error| io_message("failed to read CURRENT pointer", error))?;
-        contents.trim().parse::<u64>().map_err(|error| {
-            LogPoseError::Message(format!(
-                "failed to parse CURRENT manifest generation: {error}"
-            ))
-        })
+        let contents = read_file(self.vfs.as_ref(), &path, "failed to read CURRENT pointer")?;
+        String::from_utf8_lossy(&contents)
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| {
+                LogPoseError::Message(format!(
+                    "failed to parse CURRENT manifest generation: {error}"
+                ))
+            })
     }
 
+    /// Durably write the manifest generation, then point `CURRENT` at it.
     pub(crate) fn publish_manifest(
         &self,
         descriptor: &CollectionDescriptor,
         manifest: &Manifest,
     ) -> Result<()> {
         let manifest_path = Self::manifest_file_path(descriptor, manifest.generation);
-        atomic_write(
+        atomic_write_with_points(
+            self.vfs.as_ref(),
             &manifest_path,
             serde_json::to_vec_pretty(manifest).map_err(json_message)?,
+            AtomicWritePoints {
+                after_temp_sync: Some(CrashPoint::ManifestAfterFileSync),
+                after_rename: None,
+                after_dir_sync: Some(CrashPoint::ManifestAfterDirSync),
+            },
         )?;
-        atomic_write(
+        atomic_write_with_points(
+            self.vfs.as_ref(),
             &Self::current_manifest_pointer(descriptor),
             manifest.generation.to_string().into_bytes(),
-        )?;
-        Ok(())
+            AtomicWritePoints {
+                after_temp_sync: Some(CrashPoint::CurrentAfterTempSync),
+                after_rename: Some(CrashPoint::CurrentAfterRename),
+                after_dir_sync: Some(CrashPoint::CurrentAfterDirSync),
+            },
+        )
     }
 }
 

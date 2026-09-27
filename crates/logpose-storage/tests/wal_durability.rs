@@ -7,6 +7,7 @@ use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query as _;
+use logpose_vfs as _;
 use logpose_wal as _;
 use postcard as _;
 use rand as _;

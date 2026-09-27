@@ -13,12 +13,19 @@ use std::{
 
 impl LocalStorageEngine {
     /// Remove the pending-rotation marker and make the removal durable.
-    pub(crate) fn clear_pending_rotation_marker(descriptor: &CollectionDescriptor) -> Result<()> {
+    pub(crate) fn clear_pending_rotation_marker(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<()> {
         let marker_path = Self::pending_rotation_file_path(descriptor);
         #[cfg(test)]
         failpoints::check_marker_removal(&marker_path)?;
-        remove_file_if_exists(&marker_path, "failed to clear pending WAL rotation marker")?;
-        sync_parent_dir(&marker_path)
+        remove_file_if_exists(
+            self.vfs.as_ref(),
+            &marker_path,
+            "failed to clear pending WAL rotation marker",
+        )?;
+        sync_parent_dir(self.vfs.as_ref(), &marker_path)
     }
 }
 

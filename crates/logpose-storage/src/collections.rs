@@ -10,7 +10,10 @@ use crate::{
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{CollectionAssignment, CollectionRef, LogPoseError, MaintenanceStatus, Result};
 use logpose_wal::WalWriter;
-use std::fs;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 impl LocalStorageEngine {
     /// Build the descriptor that would be persisted for one collection request.
@@ -44,7 +47,7 @@ impl LocalStorageEngine {
         descriptor: CollectionDescriptor,
         assignment: Option<&CollectionAssignment>,
     ) -> Result<CollectionDescriptor> {
-        create_dir_all_synced(&self.collections_root())?;
+        create_dir_all_synced(self.vfs.as_ref(), &self.collections_root())?;
         if self
             .find_collection_descriptor_ref(&descriptor.collection_ref())
             .is_ok()
@@ -64,10 +67,12 @@ impl LocalStorageEngine {
             }
             self.publish_manifest(&descriptor, &Manifest::empty(0))?;
             self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
-            let mut wal_writer = WalWriter::open(Self::active_wal_path(&descriptor))?;
+            let mut wal_writer =
+                WalWriter::open(Arc::clone(&self.vfs), Self::active_wal_path(&descriptor))?;
             wal_writer.truncate()?;
-            sync_parent_dir(&Self::active_wal_path(&descriptor))?;
+            sync_parent_dir(self.vfs.as_ref(), &Self::active_wal_path(&descriptor))?;
             atomic_write(
+                self.vfs.as_ref(),
                 &Self::descriptor_path(&descriptor),
                 serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
             )?;
@@ -76,7 +81,7 @@ impl LocalStorageEngine {
         match result {
             Ok(()) => Ok(descriptor),
             Err(error) => {
-                cleanup_dir(&descriptor.root_path);
+                cleanup_dir(self.vfs.as_ref(), &descriptor.root_path);
                 Err(error)
             }
         }
@@ -87,13 +92,13 @@ impl LocalStorageEngine {
         descriptor: &CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
         let path = Self::placement_file_path(descriptor);
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Err(LogPoseError::Message(format!(
                 "collection '{}' is missing placement metadata",
                 descriptor.name
             )));
         }
-        read_json(&path)
+        read_json(self.vfs.as_ref(), &path)
     }
 
     fn persist_collection_assignment(
@@ -102,6 +107,7 @@ impl LocalStorageEngine {
         assignment: &CollectionAssignment,
     ) -> Result<()> {
         atomic_write(
+            self.vfs.as_ref(),
             &Self::placement_file_path(descriptor),
             serde_json::to_vec_pretty(assignment).map_err(json_message)?,
         )
@@ -126,14 +132,34 @@ impl LocalStorageEngine {
     }
 
     fn create_collection_directories(&self, descriptor: &CollectionDescriptor) -> Result<()> {
-        create_dir_all_synced(&descriptor.root_path)?;
-        fs::create_dir_all(descriptor.root_path.join("manifests"))
-            .and_then(|_| fs::create_dir_all(descriptor.root_path.join("wal")))
-            .and_then(|_| fs::create_dir_all(descriptor.root_path.join("segments")))
-            .and_then(|_| fs::create_dir_all(descriptor.root_path.join("indexes")))
-            .and_then(|_| fs::create_dir_all(descriptor.root_path.join("tmp")))
-            .map_err(|error| io_message("failed to create collection directories", error))?;
-        sync_dir(&descriptor.root_path)
+        create_dir_all_synced(self.vfs.as_ref(), &descriptor.root_path)?;
+        for child in ["manifests", "wal", "segments", "indexes", "tmp"] {
+            self.vfs
+                .create_dir_all(&descriptor.root_path.join(child))
+                .map_err(|error| io_message("failed to create collection directories", error))?;
+        }
+        sync_dir(self.vfs.as_ref(), &descriptor.root_path)
+    }
+
+    /// Paths of `<root>/<entry>/descriptor.json` for every subdirectory of `root` that has one,
+    /// in name order. A missing `root` has none.
+    pub(crate) fn descriptor_files_under(&self, root: &Path) -> Result<Vec<PathBuf>> {
+        if !self.exists(root)? {
+            return Ok(Vec::new());
+        }
+        let mut entries = self
+            .vfs
+            .list(root)
+            .map_err(|error| io_message("failed to list descriptor directory", error))?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut paths = Vec::new();
+        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            let path = root.join(entry.name).join("descriptor.json");
+            if self.exists(&path)? {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
     }
 
     pub(crate) fn find_collection_descriptor(&self, name: &str) -> Result<CollectionDescriptor> {
@@ -144,25 +170,8 @@ impl LocalStorageEngine {
         &self,
         collection: &CollectionRef,
     ) -> Result<CollectionDescriptor> {
-        let collections_root = self.collections_root();
-        if !collections_root.exists() {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}/{}' does not exist",
-                collection.database_name, collection.collection_name
-            )));
-        }
-
-        for entry in fs::read_dir(&collections_root)
-            .map_err(|error| io_message("failed to list collections root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read collection entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let descriptor = read_json::<CollectionDescriptor>(&path)?;
+        for path in self.descriptor_files_under(&self.collections_root())? {
+            let descriptor = read_json::<CollectionDescriptor>(self.vfs.as_ref(), &path)?;
             if descriptor.database_name == collection.database_name
                 && descriptor.name == collection.collection_name
             {
@@ -178,23 +187,9 @@ impl LocalStorageEngine {
     }
 
     pub(crate) fn list_collection_descriptors(&self) -> Result<Vec<CollectionDescriptor>> {
-        let collections_root = self.collections_root();
-        if !collections_root.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut descriptors = Vec::new();
-        for entry in fs::read_dir(&collections_root)
-            .map_err(|error| io_message("failed to list collections root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read collection entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let descriptor = read_json::<CollectionDescriptor>(&path)?;
+        for path in self.descriptor_files_under(&self.collections_root())? {
+            let descriptor = read_json::<CollectionDescriptor>(self.vfs.as_ref(), &path)?;
             descriptor.validate()?;
             descriptors.push(descriptor);
         }

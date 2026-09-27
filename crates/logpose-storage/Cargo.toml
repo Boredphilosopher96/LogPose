@@ -16,6 +16,7 @@ logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-index = { path = "../logpose-index" }
 logpose-types = { path = "../logpose-types" }
+logpose-vfs = { path = "../logpose-vfs" }
 logpose-wal = { path = "../logpose-wal" }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 roaring.workspace = true

@@ -47,10 +47,10 @@ impl LocalStorageEngine {
         descriptor: &CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
         let path = Self::maintenance_file_path(descriptor);
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Ok(MaintenanceStatus::default());
         }
-        read_json(&path)
+        read_json(self.vfs.as_ref(), &path)
     }
 
     pub(crate) fn persist_maintenance_status(
@@ -59,6 +59,7 @@ impl LocalStorageEngine {
         status: &MaintenanceStatus,
     ) -> Result<()> {
         atomic_write(
+            self.vfs.as_ref(),
             &Self::maintenance_file_path(descriptor),
             serde_json::to_vec_pretty(status).map_err(json_message)?,
         )

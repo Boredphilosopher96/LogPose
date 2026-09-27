@@ -1,14 +1,15 @@
 //! Segment v1 decoding.
 
 use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader};
-use crate::error::{io_message, json_message};
+use crate::{durable_fs::read_file, error::json_message};
 use crc32fast::hash;
 use logpose_types::{LogPoseError, PutRecord, RecordId, Result, WriteOperation};
+use logpose_vfs::Vfs;
 use logpose_wal::WalRecord;
-use std::{fs, path::Path};
+use std::path::Path;
 
-pub(crate) fn read_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
-    let bytes = fs::read(path).map_err(|error| io_message("failed to read segment file", error))?;
+pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<WalRecord>> {
+    let bytes = read_file(vfs, path, "failed to read segment file")?;
     if bytes.len() < 4 || &bytes[..4] != b"LPS1" {
         return Err(LogPoseError::Message(format!(
             "invalid segment magic in '{}'",
@@ -144,6 +145,7 @@ mod tests {
     };
     use logpose_types::DistanceMetric;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn truncated_segment_returns_error_instead_of_panicking() {
@@ -187,7 +189,8 @@ mod tests {
         let bytes = fs::read(&segment_path).expect("segment file should exist");
         fs::write(&segment_path, &bytes[..10]).expect("truncate should succeed");
 
-        let result = std::panic::catch_unwind(|| read_segment_file(&segment_path));
+        let result =
+            std::panic::catch_unwind(|| read_segment_file(&logpose_vfs::StdVfs, &segment_path));
         assert!(result.is_ok(), "truncated segment should not panic");
         assert!(result.expect("result should exist").is_err());
     }
