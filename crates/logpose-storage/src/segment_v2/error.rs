@@ -6,7 +6,7 @@ use logpose_types::{
     record::PrimaryKey,
     schema::{FieldId, FieldType, PrimaryKeyType},
 };
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 use thiserror::Error;
 
 /// A part of a segment file, named in corruption errors.
@@ -92,11 +92,18 @@ impl fmt::Display for Region {
 /// Every defect in stored bytes is [`SegmentError::Corrupt`] or
 /// [`SegmentError::Checksum`] (see [`is_corruption`](Self::is_corruption)).
 /// The other variants reject invalid builder input.
-#[derive(Debug, Error)]
+///
+/// Errors are cheap to clone: a failed load is shared by every caller that
+/// waited on it (see [`BufferCache`](crate::cache::BufferCache)).
+#[derive(Clone, Debug, Error)]
 pub enum SegmentError {
     /// Reading or writing the underlying file failed.
     #[error("segment I/O failed: {0}")]
-    Io(#[from] io::Error),
+    Io(Arc<io::Error>),
+    /// A cached load did not finish: the loader panicked, or its executor
+    /// shut down before running it. Nothing was cached; a retry loads again.
+    #[error("a segment load was aborted before it finished")]
+    LoadAborted,
     /// A CRC does not match the bytes it covers.
     #[error("segment checksum mismatch in {region}")]
     Checksum {
@@ -197,6 +204,12 @@ pub enum SegmentError {
         /// The field id.
         field: FieldId,
     },
+}
+
+impl From<io::Error> for SegmentError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(Arc::new(error))
+    }
 }
 
 impl SegmentError {

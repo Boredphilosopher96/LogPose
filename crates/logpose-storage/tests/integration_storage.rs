@@ -1,6 +1,7 @@
 //! Integration tests for `logpose-storage` workflows.
 
 use async_trait as _;
+use bytemuck as _;
 use crc32c as _;
 use crc32fast as _;
 use logpose_auth as _;

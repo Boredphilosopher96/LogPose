@@ -1444,6 +1444,7 @@ name = "logpose-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytemuck",
  "crc32c",
  "crc32fast",
  "logpose-auth",
