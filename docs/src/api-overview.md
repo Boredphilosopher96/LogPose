@@ -123,7 +123,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | `PERMISSION_DENIED`          | `PERMISSION_DENIED`   |                                                                 | no         |
 | `NOT_OWNER`                  | `UNAVAILABLE`         | `collection`, `node`, `owner_node` when known                   | 1 s        |
 | `NOT_LEADER`                 | `UNAVAILABLE`         | `node`, `leader_node` when known                                | 1 s        |
-| `READ_BARRIER_NOT_SATISFIED` | `UNAVAILABLE`         | `collection`, `required_manifest_generation`, `required_seq_no`, `visible_manifest_generation`, `visible_seq_no` | 100 ms |
+| `READ_BARRIER_NOT_SATISFIED` | `FAILED_PRECONDITION` | `collection`, `required_manifest_generation`, `required_seq_no`, `visible_manifest_generation`, `visible_seq_no` | no |
 | `UNAVAILABLE`                | `UNAVAILABLE`         |                                                                 | sometimes  |
 | `COLLECTION_POISONED`        | `UNAVAILABLE`         | `collection`                                                    | no         |
 | `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
@@ -584,9 +584,9 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | `200`  | Query returned                           |
 | `400`  | Invalid request                          |
 | `404`  | Collection not found                     |
-| `409`  | Wrong node role, or read barriers rejected after ownership promotion until freshness metadata exists |
+| `409`  | Wrong node role, read barrier not visible (`READ_BARRIER_NOT_SATISFIED`), or read barriers rejected after ownership promotion until freshness metadata exists |
 | `413`  | Request body too large                   |
-| `503`  | Not the owner (`NOT_OWNER`), or read barrier not yet visible (`READ_BARRIER_NOT_SATISFIED`, retry) |
+| `503`  | Not the owner (`NOT_OWNER`)              |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
@@ -699,8 +699,8 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 | `200`  | Collection stats returned                |
 | `400`  | Invalid request                          |
 | `404`  | Collection not found                     |
-| `409`  | Wrong node role, or read barriers rejected after ownership promotion until freshness metadata exists |
-| `503`  | Not the owner (`NOT_OWNER`), or read barrier not yet visible (`READ_BARRIER_NOT_SATISFIED`, retry) |
+| `409`  | Wrong node role, read barrier not visible (`READ_BARRIER_NOT_SATISFIED`), or read barriers rejected after ownership promotion until freshness metadata exists |
+| `503`  | Not the owner (`NOT_OWNER`)              |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:

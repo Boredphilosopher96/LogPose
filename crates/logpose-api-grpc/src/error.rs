@@ -171,7 +171,7 @@ mod tests {
         ("PermissionDenied", Code::PermissionDenied),
         ("NotOwner", Code::Unavailable),
         ("NotLeader", Code::Unavailable),
-        ("ReadBarrierNotSatisfied", Code::Unavailable),
+        ("ReadBarrierNotSatisfied", Code::FailedPrecondition),
         ("Unavailable", Code::Unavailable),
         ("Corrupt", Code::DataLoss),
         ("CollectionPoisoned", Code::Unavailable),

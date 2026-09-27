@@ -644,7 +644,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Conflict:
-      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation.
+      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, or a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`; retrying does not help).
       content:
         application/json:
           schema:
@@ -656,7 +656,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Unavailable:
-      description: This node cannot serve the request now (`UNAVAILABLE`), for example it does not own the collection (`NOT_OWNER`, with `owner_node`), it is not the control-plane leader (`NOT_LEADER`, with `leader_node`), or a read barrier is not yet visible. Retry after the `Retry-After` delay, on the hinted node when one is named.
+      description: This node cannot serve the request now (`UNAVAILABLE`), for example it does not own the collection (`NOT_OWNER`, with `owner_node`) or it is not the control-plane leader (`NOT_LEADER`, with `leader_node`). Retry after the `Retry-After` delay, on the hinted node when one is named.
       headers:
         Retry-After:
           description: Seconds to wait before retrying, present when a retry is expected to help.

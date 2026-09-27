@@ -1458,7 +1458,8 @@ mod tests {
             }))
             .await
             .expect_err("unsatisfied read barrier should fail");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.get_details_retry_info().is_none());
         assert_eq!(
             error
                 .get_details_error_info()

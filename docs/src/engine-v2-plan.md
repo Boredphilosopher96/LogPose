@@ -456,7 +456,7 @@ Runs alongside the engine phases. Each slice lands when its engine support exist
 Starts after Phase 5.
 
 1. Storage-level fencing: every WAL frame and manifest records the ownership epoch; the engine rejects writes from a stale epoch; an owner stops acknowledging writes before its ownership lease can expire; only the elected controller promotes, and only after the old owner's lease has expired.
-2. Replication by WAL shipping from primary to replicas, keyed by sequence number; acknowledgment policy `primary` or `quorum`; replica freshness is the applied sequence number, which makes read barriers work after failover.
+2. Replication by WAL shipping from primary to replicas, keyed by sequence number; acknowledgment policy `primary` or `quorum`; replica freshness is the applied sequence number, which makes read barriers work after failover. A read barrier that a lagging replica has not reached yet then maps to `UNAVAILABLE` with a retry hint; until then it is `FAILED_PRECONDITION`, because waiting on a single node never satisfies it.
 3. Hash sharding by primary key; scatter-gather search with global top-k merge; watch-driven routing caches instead of several etcd reads per request.
 4. Fix the leader re-campaign bug if Phase 0 did not already, and extend the deterministic control-plane simulation to the etcd backend.
 5. Optional: segments to object storage for backup and fast replica bootstrap (the blob storage milestone).

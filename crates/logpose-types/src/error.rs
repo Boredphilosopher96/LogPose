@@ -22,10 +22,6 @@ use thiserror::Error;
 /// [`LogPoseError::NotLeader`]) and with transient metadata unavailability.
 pub const ROUTING_RETRY_AFTER: Duration = Duration::from_secs(1);
 
-/// Retry hint returned with [`LogPoseError::ReadBarrierNotSatisfied`]: visibility normally
-/// catches up within one group commit.
-pub const READ_BARRIER_RETRY_AFTER: Duration = Duration::from_millis(100);
-
 /// Canonical, transport-neutral error class.
 ///
 /// The names and meanings follow the gRPC status codes of the same name. LogPose never uses
@@ -366,6 +362,12 @@ pub enum LogPoseError {
     ///
     /// A barrier needs both its manifest generation and its sequence number to be visible, so
     /// the error reports both sides of each.
+    ///
+    /// This is `FAILED_PRECONDITION` with no retry hint: a single-node engine acknowledges a
+    /// write only after publishing it, so a barrier taken from an acknowledgement is always
+    /// satisfied, and one that is not will never become satisfied by waiting. Phase 7
+    /// replication brings back `UNAVAILABLE` with a retry hint for a replica that lags the
+    /// primary.
     #[error(
         "read barrier (manifest generation {required_manifest_generation}, seq {required_seq_no}) is not yet visible; collection '{collection}' is at manifest generation {visible_manifest_generation}, seq {visible_seq_no}"
     )]
@@ -573,12 +575,12 @@ impl LogPoseError {
             Self::FailedPrecondition { .. }
             | Self::WrongNodeRole { .. }
             | Self::ReconciliationRequired { .. }
-            | Self::StorageRootLocked { .. } => ErrorCode::FailedPrecondition,
+            | Self::StorageRootLocked { .. }
+            | Self::ReadBarrierNotSatisfied { .. } => ErrorCode::FailedPrecondition,
             Self::Unauthenticated { .. } => ErrorCode::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::NotOwner { .. }
             | Self::NotLeader { .. }
-            | Self::ReadBarrierNotSatisfied { .. }
             | Self::Unavailable { .. }
             | Self::CollectionPoisoned { .. } => ErrorCode::Unavailable,
             Self::Corrupt { .. } => ErrorCode::DataLoss,
@@ -621,7 +623,6 @@ impl LogPoseError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::NotOwner { .. } | Self::NotLeader { .. } => Some(ROUTING_RETRY_AFTER),
-            Self::ReadBarrierNotSatisfied { .. } => Some(READ_BARRIER_RETRY_AFTER),
             Self::Unavailable { retry_after, .. } => *retry_after,
             Self::BulkBatchFailed { source, .. } => source.retry_after(),
             _ => None,
@@ -1001,7 +1002,7 @@ mod tests {
             ("NotLeader", ErrorCode::Unavailable, "NOT_LEADER"),
             (
                 "ReadBarrierNotSatisfied",
-                ErrorCode::Unavailable,
+                ErrorCode::FailedPrecondition,
                 "READ_BARRIER_NOT_SATISFIED",
             ),
             ("Unavailable", ErrorCode::Unavailable, "UNAVAILABLE"),
@@ -1048,6 +1049,10 @@ mod tests {
         assert_eq!(details.metadata["visible_manifest_generation"], "2");
         assert_eq!(details.metadata["required_seq_no"], "3");
         assert_eq!(details.metadata["visible_seq_no"], "7");
+        // Waiting cannot satisfy a barrier on a single node, so clients must not retry.
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.retry_after(), None);
+        assert_eq!(details.retry_after_ms, None);
     }
 
     #[test]

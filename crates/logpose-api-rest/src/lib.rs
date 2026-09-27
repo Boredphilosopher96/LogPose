@@ -960,7 +960,8 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.headers().get("retry-after").is_none());
         let body = json_body(response).await;
         assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
         let metadata = &body["details"]["metadata"];
@@ -1618,11 +1619,13 @@ mod tests {
             )
             .await
             .expect("router should respond");
-        assert_eq!(unsatisfied.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unsatisfied.headers()["retry-after"], "1");
+        // Waiting never satisfies a barrier on one node, so there is no retry hint.
+        assert_eq!(unsatisfied.status(), StatusCode::CONFLICT);
+        assert!(unsatisfied.headers().get("retry-after").is_none());
         let body = json_body(unsatisfied).await;
-        assert_eq!(body["code"], "UNAVAILABLE");
+        assert_eq!(body["code"], "FAILED_PRECONDITION");
         assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
+        assert!(body["details"].get("retry_after_ms").is_none());
     }
 
     #[tokio::test]

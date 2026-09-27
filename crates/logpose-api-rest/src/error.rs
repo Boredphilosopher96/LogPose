@@ -184,7 +184,7 @@ mod tests {
         ("PermissionDenied", StatusCode::FORBIDDEN),
         ("NotOwner", StatusCode::SERVICE_UNAVAILABLE),
         ("NotLeader", StatusCode::SERVICE_UNAVAILABLE),
-        ("ReadBarrierNotSatisfied", StatusCode::SERVICE_UNAVAILABLE),
+        ("ReadBarrierNotSatisfied", StatusCode::CONFLICT),
         ("Unavailable", StatusCode::SERVICE_UNAVAILABLE),
         ("Corrupt", StatusCode::INTERNAL_SERVER_ERROR),
         ("CollectionPoisoned", StatusCode::SERVICE_UNAVAILABLE),
