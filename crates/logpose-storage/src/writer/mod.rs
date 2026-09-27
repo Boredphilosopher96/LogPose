@@ -362,12 +362,18 @@ impl Writer {
                         }
                         continue;
                     }
+                    // The private state before this group, to restore if the group is never
+                    // appended: the log must not skip the sequence numbers it took.
+                    let before = self
+                        .state
+                        .clone()
+                        .map(|state| (state, self.next_seq_no));
                     let prepared = self.prepare(requests).await;
                     if let Some(io) = inflight.take() {
                         self.finish(io).await;
                     }
                     if let Some((prepared, version)) = prepared {
-                        inflight = self.start(prepared, version);
+                        inflight = self.start(prepared, version, before);
                     }
                 }
             }
@@ -480,14 +486,27 @@ impl Writer {
         Some(version)
     }
 
-    /// Start the I/O of a prepared group on the I/O pool.
-    fn start(&mut self, prepared: PreparedRequests, version: Version) -> Option<InFlight> {
-        if let Some(refusal) = self.refusal() {
+    /// Start the I/O of a prepared group on the I/O pool. When the group cannot be started (the
+    /// collection was dropped or poisoned, or the engine is shutting down, while it was
+    /// prepared), its writes fail and the private state goes back to `before`, so a drop that
+    /// does not commit leaves the writer exactly where the log is.
+    fn start(
+        &mut self,
+        prepared: PreparedRequests,
+        version: Version,
+        before: Option<(LogicalState, SeqNo)>,
+    ) -> Option<InFlight> {
+        let refusal = self.refusal();
+        if refusal.is_some() || self.wal.is_none() {
+            let refusal = refusal.unwrap_or_else(|| Refusal::Handle(Arc::clone(&self.handle)));
             fail_all(prepared.pending, || refusal.not_applied(&self.handle));
+            if let Some((state, next_seq_no)) = before {
+                self.state = Some(state);
+                self.next_seq_no = next_seq_no;
+            }
             return None;
         }
         let Some(mut wal) = self.wal.take() else {
-            fail_all(prepared.pending, || self.handle.unavailable());
             return None;
         };
         let mut frames = prepared.frames;
