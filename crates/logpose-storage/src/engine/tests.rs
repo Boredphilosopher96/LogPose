@@ -513,6 +513,9 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
                 );
                 acked.push((id, ack.last_seq_no));
                 index += 1;
+                // The writer slot is a plain mutex, which a thread that relocks it at once can
+                // hold indefinitely; pause so that flush and compaction get it too.
+                thread::sleep(Duration::from_millis(1));
             }
             acked
         })
@@ -610,6 +613,8 @@ async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
                 core.write(&busy, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
                     .expect("write should succeed");
                 index += 1;
+                // Let the busy collection's flushes take the writer slot between writes.
+                thread::sleep(Duration::from_millis(1));
             }
         })
     };
