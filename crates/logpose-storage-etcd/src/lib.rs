@@ -1111,12 +1111,60 @@ pub enum PromotionResult {
 pub struct EtcdCoordinationClient {
     store: EtcdPlacementStore,
     config: EtcdMetadataConfig,
-    lease_sessions: Arc<tokio::sync::Mutex<BTreeMap<i64, LeaseSession>>>,
+    lease_sessions: Arc<tokio::sync::Mutex<BTreeMap<i64, SharedLeaseSession>>>,
 }
+
+/// Outcome of one lease keep-alive round trip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaseKeepAlive {
+    /// Etcd refreshed the lease.
+    Alive {
+        /// Remaining time-to-live etcd reported after the refresh.
+        ttl_secs: i64,
+    },
+    /// Etcd no longer knows the lease: it expired or was revoked, and every
+    /// key attached to it is gone. The caller must acquire a new lease.
+    Expired,
+}
+
+type SharedLeaseSession = Arc<tokio::sync::Mutex<LeaseSession>>;
 
 #[derive(Debug)]
 struct LeaseSession {
     keeper: LeaseKeeper,
+    stream: LeaseKeepAliveStream,
+}
+
+impl LeaseSession {
+    /// Send one keep-alive request and wait for its response on the stream.
+    async fn round_trip(&mut self) -> Result<LeaseKeepAlive> {
+        self.keeper.keep_alive().await.map_err(etcd_message)?;
+        match self.stream.message().await {
+            Ok(Some(response)) if response.ttl() > 0 => Ok(LeaseKeepAlive::Alive {
+                ttl_secs: response.ttl(),
+            }),
+            Ok(Some(_)) => Ok(LeaseKeepAlive::Expired),
+            Ok(None) => Err(LogPoseError::Message(format!(
+                "etcd keep-alive stream for lease '{}' closed",
+                self.keeper.id()
+            ))),
+            Err(error) if is_lease_not_found(&error) => Ok(LeaseKeepAlive::Expired),
+            Err(error) => Err(etcd_message(error)),
+        }
+    }
+}
+
+/// Whether etcd rejected a lease operation because the lease no longer exists.
+fn is_lease_not_found(error: &etcd_client::Error) -> bool {
+    match error {
+        // Raised by the client when opening a keep-alive stream returns TTL 0.
+        etcd_client::Error::LeaseKeepAliveError(message) => message.contains("lease not found"),
+        // `rpctypes.ErrGRPCLeaseNotFound` on the server side.
+        etcd_client::Error::GRpcStatus(status) => {
+            status.message().contains("requested lease not found")
+        }
+        _ => false,
+    }
 }
 
 impl EtcdCoordinationClient {
@@ -1163,7 +1211,7 @@ impl EtcdCoordinationClient {
             Ok(_) => {
                 if let Err(error) = self.attach_keep_alive_session(&mut client, lease_id).await {
                     let _ = client.lease_revoke(lease_id).await;
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Ok(MembershipLease {
                     node_id: node_id.to_owned(),
@@ -1178,17 +1226,45 @@ impl EtcdCoordinationClient {
         }
     }
 
-    /// Keep one lease alive by issuing a keep-alive signal.
-    pub async fn keep_alive(&self, lease_id: i64) -> Result<()> {
-        let mut sessions = self.lease_sessions.lock().await;
-        let session = sessions.get_mut(&lease_id).ok_or_else(|| {
-            LogPoseError::Message(format!(
-                "no keep-alive session is registered for lease '{lease_id}'"
-            ))
-        })?;
-        let keeper = &mut session.keeper;
-        keeper.keep_alive().await.map_err(etcd_message)?;
-        Ok(())
+    /// Refresh one lease and report whether etcd still holds it.
+    ///
+    /// Waits for etcd's keep-alive response, so a lease that expired or was
+    /// revoked is reported as [`LeaseKeepAlive::Expired`] instead of being
+    /// silently kept. A transport failure is an error and leaves the lease
+    /// state unknown; the next call reopens the keep-alive stream.
+    pub async fn keep_alive(&self, lease_id: i64) -> Result<LeaseKeepAlive> {
+        let existing = self.lease_sessions.lock().await.get(&lease_id).cloned();
+        let session = match existing {
+            Some(session) => session,
+            None => {
+                let mut client = self.store.client().await?;
+                match self.attach_keep_alive_session(&mut client, lease_id).await {
+                    Ok(session) => session,
+                    Err(KeepAliveAttachError::Expired) => return Ok(LeaseKeepAlive::Expired),
+                    Err(KeepAliveAttachError::Failed(error)) => return Err(error),
+                }
+            }
+        };
+        let round_trip = {
+            let mut guard = session.lock().await;
+            tokio::time::timeout(
+                Duration::from_millis(self.store.timeout_ms.max(1)),
+                guard.round_trip(),
+            )
+            .await
+        };
+        let outcome = round_trip.unwrap_or_else(|_| {
+            Err(LogPoseError::Message(format!(
+                "etcd keep-alive for lease '{lease_id}' timed out after {}ms",
+                self.store.timeout_ms
+            )))
+        });
+        if !matches!(outcome, Ok(LeaseKeepAlive::Alive { .. })) {
+            // A dead lease never recovers, and a failed or timed-out stream may
+            // still deliver a late response, so drop the session either way.
+            self.forget_session(lease_id, &session).await;
+        }
+        outcome
     }
 
     /// Revoke one lease and remove any local keep-alive session.
@@ -1240,7 +1316,7 @@ impl EtcdCoordinationClient {
         }
         if let Err(error) = self.attach_keep_alive_session(&mut client, lease_id).await {
             let _ = client.lease_revoke(lease_id).await;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(Some(LeadershipLease {
             node_id: node_id.to_owned(),
@@ -1388,32 +1464,50 @@ impl EtcdCoordinationClient {
         )
     }
 
-    async fn attach_keep_alive_session(&self, client: &mut Client, lease_id: i64) -> Result<()> {
-        let (keeper, stream) = client
-            .lease_keep_alive(lease_id)
-            .await
-            .map_err(etcd_message)?;
-        self.spawn_keep_alive_stream_drain(lease_id, stream);
+    async fn attach_keep_alive_session(
+        &self,
+        client: &mut Client,
+        lease_id: i64,
+    ) -> std::result::Result<SharedLeaseSession, KeepAliveAttachError> {
+        let (keeper, stream) = client.lease_keep_alive(lease_id).await.map_err(|error| {
+            if is_lease_not_found(&error) {
+                KeepAliveAttachError::Expired
+            } else {
+                KeepAliveAttachError::Failed(etcd_message(error))
+            }
+        })?;
+        let session = Arc::new(tokio::sync::Mutex::new(LeaseSession { keeper, stream }));
         self.lease_sessions
             .lock()
             .await
-            .insert(lease_id, LeaseSession { keeper });
-        Ok(())
+            .insert(lease_id, Arc::clone(&session));
+        Ok(session)
     }
 
-    fn spawn_keep_alive_stream_drain(&self, lease_id: i64, mut stream: LeaseKeepAliveStream) {
-        let sessions = Arc::clone(&self.lease_sessions);
-        tokio::spawn(async move {
-            loop {
-                match stream.message().await {
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
-                        let _ = sessions.lock().await.remove(&lease_id);
-                        break;
-                    }
-                }
+    async fn forget_session(&self, lease_id: i64, session: &SharedLeaseSession) {
+        let mut sessions = self.lease_sessions.lock().await;
+        if sessions
+            .get(&lease_id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
+            sessions.remove(&lease_id);
+        }
+    }
+}
+
+enum KeepAliveAttachError {
+    Expired,
+    Failed(LogPoseError),
+}
+
+impl From<KeepAliveAttachError> for LogPoseError {
+    fn from(error: KeepAliveAttachError) -> Self {
+        match error {
+            KeepAliveAttachError::Expired => {
+                LogPoseError::Message("etcd lease expired before keep-alive started".to_owned())
             }
-        });
+            KeepAliveAttachError::Failed(error) => error,
+        }
     }
 }
 
