@@ -3,6 +3,7 @@ use http_body_util::BodyExt;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
+use logpose_catalog::{CollectionDescriptor, DEFAULT_COMPACTION_THRESHOLD_SEGMENTS};
 use logpose_core::AppState;
 use logpose_query::{
     ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
@@ -29,6 +30,12 @@ use tower::util::ServiceExt;
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 30;
 const DEFAULT_RANDOM_SCENARIOS: usize = 4;
+/// Seeds that once failed. Each runs on every test run.
+///
+/// - 7687000562331537183: four manual flushes reached the default compaction threshold, and a
+///   background compaction bumped the manifest generation behind the model, because the
+///   thresholds were written to `descriptor.json` under a live engine that never reread it.
+const REGRESSION_SEEDS: [u64; 1] = [7_687_000_562_331_537_183];
 const RECORD_DIMENSIONS: usize = 2;
 const RECORD_ID_POOL: usize = 6;
 const EXACT_QUERY_TOP_K: usize = 3;
@@ -332,28 +339,71 @@ pub async fn run_service_scenarios() {
     }
 }
 
+/// Run the seeds that once failed, whatever `LOGPOSE_SERVICE_RANDOM_SEED` says.
+pub async fn run_regression_seeds() {
+    for seed in REGRESSION_SEEDS {
+        run_seeded_service_scenario(seed, DEFAULT_SCENARIO_STEPS).await;
+    }
+}
+
+/// Fill the collection past the default flush and compaction thresholds and check that no
+/// background job was queued. The minimized form of seed 7687000562331537183, which failed
+/// once four manual flushes reached the default compaction threshold and a background
+/// compaction published a generation the model never saw.
+pub async fn run_background_maintenance_stays_off() {
+    let root = unique_temp_dir("service-maintenance-off");
+    let (state, _) = open_state_without_background_maintenance(&root, 0).await;
+    let segments = DEFAULT_COMPACTION_THRESHOLD_SEGMENTS as u64;
+    let put = |slot: u64| {
+        vec![WriteOperation::Put(PutRecord {
+            id: RecordId::new(format!("id-{slot}")),
+            vector: vec![1.0, slot as f32],
+            metadata: json!({ "kind": "keep", "slot": slot, "version": 0 }),
+        })]
+    };
+
+    for slot in 0..segments {
+        state
+            .write(COLLECTION_NAME, put(slot))
+            .await
+            .expect("write should succeed");
+        let snapshot = state
+            .flush(COLLECTION_NAME)
+            .await
+            .expect("flush should succeed");
+        assert_eq!(snapshot.manifest_generation, slot + 1);
+    }
+    // On a collection that kept the default thresholds, this write queues a compaction.
+    let ack = state
+        .write(COLLECTION_NAME, put(segments))
+        .await
+        .expect("write should succeed");
+    assert_eq!(
+        ack.snapshot,
+        Snapshot {
+            manifest_generation: segments,
+            visible_seq_no: segments + 1,
+        }
+    );
+
+    let stats = state
+        .stats(COLLECTION_NAME)
+        .await
+        .expect("stats should succeed");
+    assert_eq!(stats.maintenance, MaintenanceStatus::default());
+    assert_eq!(stats.manifest_generation, segments);
+    assert_eq!(stats.segment_count as u64, segments);
+}
+
 async fn run_seeded_service_scenario(seed: u64, steps: usize) {
     let root = unique_temp_dir(&format!("service-random-{seed}"));
-    let state = Arc::new(AppState::new(test_config(&root)));
+    let (state, descriptor) = open_state_without_background_maintenance(&root, seed).await;
     let rest = logpose_api_rest::router(Arc::clone(&state));
     let grpc = GrpcLogPoseService::new(Arc::clone(&state));
     let mut rng = StdRng::seed_from_u64(seed);
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
     let mut snapshots = Vec::new();
-
-    let descriptor = state
-        .control
-        .create_collection(CreateCollectionRequest::new(
-            COLLECTION_NAME,
-            RECORD_DIMENSIONS,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .unwrap_or_else(|error| {
-            panic_with_context(seed, &trace, format!("create failed: {error}"))
-        });
-    disable_background_maintenance(&descriptor.root_path);
     model.register_collection(descriptor.collection_id.to_string(), descriptor.metric);
 
     for _ in 0..steps {
@@ -1357,6 +1407,50 @@ fn inspect_request(target: InspectTarget) -> axum::http::Request<Body> {
         .expect("request should build")
 }
 
+/// Open the service over `root` with the scenario's collection created with flush and
+/// compaction thresholds that never trigger, so background maintenance never races the model.
+///
+/// Collections are resident: the engine reads `descriptor.json` only when it opens the root,
+/// and an edit made under a live engine is never seen. So the collection is created, the
+/// engine is dropped, the thresholds are written, and the root is opened again.
+async fn open_state_without_background_maintenance(
+    root: &Path,
+    seed: u64,
+) -> (Arc<AppState>, CollectionDescriptor) {
+    let state = AppState::new(test_config(root));
+    let descriptor = state
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            COLLECTION_NAME,
+            RECORD_DIMENSIONS,
+            DistanceMetric::Cosine,
+        ))
+        .await
+        .unwrap_or_else(|error| panic_with_context(seed, &[], format!("create failed: {error}")));
+    drop(state);
+    disable_background_maintenance(&descriptor.root_path);
+
+    let state = Arc::new(AppState::new(test_config(root)));
+    let descriptor = state
+        .get_collection(COLLECTION_NAME)
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, &[], format!("get collection failed: {error}"))
+        });
+    assert_eq!(
+        (
+            descriptor.flush_threshold_ops,
+            descriptor.flush_threshold_bytes,
+            descriptor.compaction_threshold_segments,
+        ),
+        (usize::MAX, usize::MAX, usize::MAX),
+        "seed={seed}: the open collection must not run background maintenance"
+    );
+    (state, descriptor)
+}
+
+/// Rewrite the collection's descriptor with thresholds that never trigger. No engine may have
+/// the root open.
 fn disable_background_maintenance(root_path: &Path) {
     let descriptor_path = root_path.join("descriptor.json");
     let mut descriptor = serde_json::from_slice::<Value>(
