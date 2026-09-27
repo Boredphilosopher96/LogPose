@@ -502,8 +502,9 @@ rpc BulkWriteCollection(stream BulkWriteCollectionRequest) returns (BulkWriteCol
   `committed_operations`, and `last_committed_seq_no` when a batch was
   committed, so a client can resume from `failed_batch_index`.
 - If the client cancels or disconnects, a batch that is being committed still
-  commits or fails as a whole, and no later batch is applied. Resume after
-  checking what is visible.
+  commits or fails as a whole, and once the server sees the cancellation it
+  starts no further batch, even one the client sent before cancelling. Resume
+  after checking what is visible.
 - An empty stream is `INVALID_ARGUMENT`.
 
 ### Query Collection

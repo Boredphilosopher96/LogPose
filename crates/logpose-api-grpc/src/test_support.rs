@@ -16,6 +16,8 @@ use tonic::transport::Channel;
 pub(crate) struct TestServer {
     pub(crate) client: LogPoseServiceClient<Channel>,
     pub(crate) address: String,
+    /// The server's state, for tests that drive a handler directly.
+    pub(crate) state: Arc<AppState>,
     task: JoinHandle<()>,
     root: PathBuf,
 }
@@ -42,8 +44,9 @@ impl TestServer {
             "http://{}",
             listener.local_addr().expect("listener has an address")
         );
+        let server_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            serve_with_listener(state, listener)
+            serve_with_listener(server_state, listener)
                 .await
                 .expect("gRPC server should run");
         });
@@ -61,6 +64,7 @@ impl TestServer {
         Self {
             client,
             address,
+            state,
             task,
             root,
         }

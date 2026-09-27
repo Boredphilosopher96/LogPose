@@ -233,7 +233,8 @@ message WriteCollectionRequest {
 //   `ErrorInfo` metadata reports `failed_batch_index`, `committed_batches`,
 //   `committed_operations`, and `last_committed_seq_no` (when a batch was committed).
 // - If the client cancels or disconnects, the batch being committed (if any) still completes
-//   or fails as a whole, and no later batch is applied.
+//   or fails as a whole, and once the server sees the cancellation it starts no further
+//   batch, even one the client sent before cancelling.
 message BulkWriteCollectionRequest {
   string collection_name = 1;
   string database_name = 2;

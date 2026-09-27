@@ -10,7 +10,9 @@
 //! - The first failing batch fails the RPC with a [`LogPoseError::BulkBatchFailed`] that names
 //!   it and reports how many batches were committed before it. Nothing after it is read.
 //! - The stream is drained on its own task, so a client that disconnects mid-batch cannot
-//!   cancel a batch half way: it commits or fails as a whole, and no later batch is applied.
+//!   cancel a batch half way: it commits or fails as a whole. Once tonic drops the handler for
+//!   a cancelled call, the task starts no further batch, even one the client sent before it
+//!   cancelled and that is still buffered in the HTTP/2 stream.
 
 use super::{
     collection_lookup_key, normalize_database_name, proto, request_auth_from_metadata,
@@ -20,7 +22,11 @@ use crate::error::message_too_large;
 use logpose_core::{AppState, RequestAuth};
 use logpose_types::{CommitAck, LogPoseError};
 use proto::{BulkWriteCollectionReply, BulkWriteCollectionRequest};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Code, Request, Status, Streaming};
 
 pub(crate) async fn bulk_write_collection(
@@ -30,10 +36,22 @@ pub(crate) async fn bulk_write_collection(
     let auth = request_auth_from_metadata(&request)?;
     let stream = request.into_inner();
     // If the client goes away, tonic drops this future; the spawned task keeps a batch that is
-    // being committed from being cancelled half way and stops at the next read.
-    tokio::spawn(ingest(state, auth, stream))
+    // being committed from being cancelled half way, and the guard tells it to start no other.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
+    tokio::spawn(ingest(state, auth, stream, cancelled))
         .await
         .map_err(|error| LogPoseError::internal(format!("bulk write task failed: {error}")))?
+}
+
+/// Marks the call cancelled when dropped. The handler future owns it, and tonic drops that
+/// future when the client cancels or disconnects.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// Where the stream writes, fixed by its first message.
@@ -68,20 +86,31 @@ impl Progress {
     }
 }
 
-async fn ingest(
+async fn ingest<S>(
     state: Arc<AppState>,
     auth: RequestAuth,
-    mut stream: Streaming<BulkWriteCollectionRequest>,
-) -> Result<BulkWriteCollectionReply, LogPoseError> {
+    mut stream: S,
+    cancelled: Arc<AtomicBool>,
+) -> Result<BulkWriteCollectionReply, LogPoseError>
+where
+    S: Stream<Item = Result<BulkWriteCollectionRequest, Status>> + Unpin,
+{
     let limit = state.config.limits.max_grpc_message_bytes;
     let mut target = None;
     let mut progress = Progress::default();
     loop {
-        let message = match stream.message().await {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
-            Err(status) => return Err(progress.fail(stream_error(&status, limit))),
+        let message = match stream.next().await {
+            Some(Ok(message)) => message,
+            None => break,
+            Some(Err(status)) => return Err(progress.fail(stream_error(&status, limit))),
         };
+        // HTTP/2 can still hand over a message the client sent before it cancelled; nobody is
+        // waiting for its result, so do not start it.
+        if cancelled.load(Ordering::Acquire) {
+            return Err(progress.fail(LogPoseError::unavailable(
+                "the client cancelled the bulk write stream",
+            )));
+        }
         let result = async {
             let target = resolve_target(&mut target, &message)?;
             let operations = write_operations_from_proto(message.operations)?;
@@ -349,6 +378,54 @@ mod tests {
             .into_inner();
         assert_eq!(reply.committed_batches, 1);
         assert_eq!(server.live_records("docs").await, 3);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_starts_no_batch_after_the_client_cancels() {
+        let mut server = TestServer::start("bulk-cancel-buffered", LimitsConfig::default()).await;
+        server.create_collection("docs").await;
+        let (sender, receiver) = mpsc::channel(4);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = CancelOnDrop(Arc::clone(&cancelled));
+        let task = tokio::spawn(ingest(
+            Arc::clone(&server.state),
+            RequestAuth::default(),
+            ReceiverStream::new(receiver),
+            cancelled,
+        ));
+        sender
+            .send(Ok(batch("docs", &["a", "b"])))
+            .await
+            .expect("first batch should be sent");
+        let mut waited = 0;
+        while server.live_records("docs").await < 2 {
+            waited += 1;
+            assert!(waited < 250, "the first batch was never committed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The client cancels; tonic drops the handler, and so the guard. A batch the client
+        // sent before cancelling can still arrive from the HTTP/2 stream buffer.
+        drop(guard);
+        sender
+            .send(Ok(batch("docs", &["late"])))
+            .await
+            .expect("buffered batch should be delivered");
+        drop(sender);
+
+        let error = task
+            .await
+            .expect("ingest task should finish")
+            .expect_err("a cancelled stream should stop");
+        assert!(matches!(
+            error,
+            LogPoseError::BulkBatchFailed {
+                batch_index: 1,
+                committed_batches: 1,
+                ..
+            }
+        ));
+        assert_eq!(server.live_records("docs").await, 2);
     }
 
     #[tokio::test]
