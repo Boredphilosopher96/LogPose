@@ -3,7 +3,20 @@
 //! the file holds.
 
 use super::{Patcher, fixture};
-use crate::segment_v2::{MemorySource, SectionKind, SectionSource, SegmentError, SegmentReader};
+use crate::segment_v2::{
+    MemorySource, SectionKind, SectionSource, SegmentBuilder, SegmentError, SegmentIdentity,
+    SegmentReader,
+};
+use logpose_types::{
+    CollectionId, DistanceMetric,
+    record::PrimaryKey,
+    schema::{
+        CollectionSchema, ElementType, FieldType, PrimaryKeySpec, PrimaryKeyType, ScalarFieldSpec,
+        VectorFieldSpec,
+    },
+    value::Value,
+};
+use std::sync::Arc;
 use std::{
     io,
     sync::atomic::{AtomicU64, Ordering},
@@ -232,4 +245,62 @@ fn inner_lengths_are_bounded_by_the_section() {
         assert!(fails(&reader, &schema), "{what} was accepted");
         assert!(reader.verify().is_err(), "{what} passed verify");
     }
+}
+
+/// An `array<bool>` cell of about 2^32 elements fits in a few bytes, because
+/// its child block is a bitmap of the true elements. That is a valid file,
+/// and `verify` must check it without materializing the cell (which would
+/// need over 100 GiB).
+#[test]
+fn verify_does_not_materialize_compressed_cells() {
+    let schema = Arc::new(
+        CollectionSchema::new(
+            PrimaryKeySpec {
+                name: "id".to_owned(),
+                key_type: PrimaryKeyType::Int64,
+            },
+            vec![VectorFieldSpec {
+                name: "v".to_owned(),
+                dimensions: 1,
+                metric: DistanceMetric::Dot,
+            }],
+            vec![ScalarFieldSpec::new(
+                "flags",
+                FieldType::Array(ElementType::Bool),
+            )],
+            false,
+        )
+        .expect("schema"),
+    );
+    let flags = schema.scalar_field("flags").expect("flags").id;
+    let identity = SegmentIdentity {
+        collection_id: CollectionId::default(),
+        unit_id: 1,
+    };
+    let mut builder = SegmentBuilder::new(Arc::clone(&schema), identity).expect("builder");
+    builder
+        .push_row(1, &PrimaryKey::Int64(1))
+        .expect("row")
+        .scalar(flags, &Value::Array(vec![Value::Bool(false)]))
+        .expect("flags");
+    let (bytes, _) = builder.finish_to_vec().expect("builds");
+    let mut patch = Patcher::new(&bytes);
+    let section = (0..patch.section_count())
+        .find(|index| patch.entry(*index).0 == SectionKind::ScalarColumn.code())
+        .expect("flags column");
+    // Column header (64 bytes), then `u32 offsets[2]`, then the child
+    // block, whose row count is at byte 4 of its header.
+    let data = patch.entry(section).1 + 64;
+    let elements = u32::MAX - 1;
+    patch
+        .set_u32(data + 4, elements)
+        .set_u32(data + 8 + 4, elements)
+        .seal_section(section);
+    let reader = SegmentReader::open(MemorySource::new(patch.bytes.clone())).expect("opens");
+    reader.verify().expect("a long array of false verifies");
+    let column = reader
+        .scalar_column(flags)
+        .expect("decodes")
+        .expect("present");
+    assert_eq!(column.len(), 1);
 }

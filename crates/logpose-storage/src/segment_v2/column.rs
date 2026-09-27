@@ -712,6 +712,10 @@ impl ScalarColumn {
 
     /// The value of `row`, [`Value::Null`] for null rows.
     ///
+    /// The value can be much larger than the bytes that store it: dictionary
+    /// codes repeat their string, and an `array<bool>` cell of any length
+    /// can be stored in a few bytes of bitmap.
+    ///
     /// # Errors
     ///
     /// Fails if the row is out of range or its stored value is invalid
@@ -719,6 +723,20 @@ impl ScalarColumn {
     /// when the column is decoded).
     pub fn value(&self, row: usize) -> Result<Value, SegmentError> {
         self.value_inner(row).map_err(|error| error.at(self.region))
+    }
+
+    /// Check every stored value that decoding does not already check (JSON
+    /// cells and timestamps) without materializing rows, so the work and
+    /// memory are bounded by the payload size. Once this passes,
+    /// [`value`](Self::value) succeeds for every row.
+    pub(crate) fn check_values(&self) -> Result<(), SegmentError> {
+        let checked = match (&self.block, self.field_type) {
+            (Block::Array { child, .. }, FieldType::Array(element)) => {
+                check_stored(child, element.into(), &RoaringBitmap::new())
+            }
+            (block, field_type) => check_stored(block, field_type, &self.nulls),
+        };
+        checked.map_err(|error| error.at(self.region))
     }
 
     pub(crate) fn value_inner(&self, row: usize) -> DecodeResult<Value> {
@@ -741,6 +759,23 @@ impl ScalarColumn {
             (block, field_type) => element_value(block, field_type, row),
         }
     }
+}
+
+/// Check each non-null stored value of `block` that decoding leaves
+/// unchecked: timestamps must be in range and JSON cells must decode.
+fn check_stored(block: &Block, field_type: FieldType, nulls: &RoaringBitmap) -> DecodeResult<()> {
+    let count = match (block, field_type) {
+        (Block::Int(values), FieldType::Timestamp) => values.len(),
+        (Block::Json(strings), _) => strings.offsets.len().saturating_sub(1),
+        _ => return Ok(()),
+    };
+    for index in 0..count {
+        if u32::try_from(index).is_ok_and(|index| nulls.contains(index)) {
+            continue;
+        }
+        element_value(block, field_type, index)?;
+    }
+    Ok(())
 }
 
 fn element_value(block: &Block, field_type: FieldType, index: usize) -> DecodeResult<Value> {

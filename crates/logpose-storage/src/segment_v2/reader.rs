@@ -887,9 +887,7 @@ impl<S: SectionSource> SegmentReader<S> {
                 }
                 Some(SectionKind::ScalarColumn) => {
                     let column = self.decode_scalar(index, entry, &bytes)?;
-                    for row in 0..column.len() {
-                        column.value(row)?;
-                    }
+                    column.check_values()?;
                     let nulls = u32::try_from(column.nulls().len()).unwrap_or(u32::MAX);
                     let recorded = entry
                         .field
