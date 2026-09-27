@@ -196,16 +196,18 @@ impl Value {
     }
 
     /// Check that an already typed value conforms to `field_type` and return
-    /// it in canonical form (`-0.0` becomes `0.0`). [`Value::Null`] conforms
-    /// to every type; nullability is checked by the record validator. No
-    /// coercion happens here: an `Int64` does not conform to `float64`.
+    /// it in canonical form: `-0.0` becomes `0.0`, and a JSON `null` in a
+    /// `json` field becomes [`Value::Null`], matching [`Value::from_json`],
+    /// so null has one representation. [`Value::Null`] conforms to every
+    /// type; nullability is checked by the record validator. No coercion
+    /// happens here: an `Int64` does not conform to `float64`.
     ///
     /// # Errors
     ///
     /// Returns a [`ValueError`] when the value does not conform.
     pub fn conform(self, field_type: FieldType) -> Result<Self, ValueError> {
         match (field_type, self) {
-            (_, Self::Null) => Ok(Self::Null),
+            (_, Self::Null) | (FieldType::Json, Self::Json(JsonValue::Null)) => Ok(Self::Null),
             (FieldType::Float64, Self::Float64(value)) => Self::float64(value),
             (FieldType::Bool, value @ Self::Bool(_))
             | (FieldType::Int64, value @ Self::Int64(_))

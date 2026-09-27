@@ -452,3 +452,53 @@ fn partial_update_accepts_array_fields() {
         Ok(Value::Array(vec![Value::String("x".to_owned())]))
     );
 }
+
+#[test]
+fn typed_json_null_is_treated_as_null() {
+    let spec: CreateCollectionSpec = serde_json::from_value(json!({
+        "name": "docs",
+        "primary_key": { "name": "id", "type": "int64" },
+        "vectors": [{ "name": "v", "dimensions": 2 }],
+        "fields": [
+            { "name": "body", "type": "json", "nullable": false },
+            { "name": "meta", "type": "json" }
+        ],
+        "dynamic_fields": false
+    }))
+    .expect("spec should parse");
+    let schema = spec.to_schema().expect("schema should validate");
+
+    let bypass = Record::new(1)
+        .with_vector("v", vec![0.0; 2])
+        .with_field("body", Value::Json(serde_json::Value::Null));
+    assert_eq!(
+        schema.validate_record(bypass),
+        Err(RecordError::RequiredField {
+            field: "body".to_owned()
+        }),
+        "a JSON null must not satisfy a non-nullable json field"
+    );
+
+    let record = Record::new(1)
+        .with_vector("v", vec![0.0; 2])
+        .with_field("body", Value::Json(json!({ "a": 1 })))
+        .with_field("meta", Value::Json(serde_json::Value::Null));
+    let record = schema
+        .validate_record(record)
+        .expect("record should validate");
+    assert!(
+        !record.fields.contains_key("meta"),
+        "a JSON null is dropped from canonical records like any null"
+    );
+
+    let mut clear_required = PartialUpdate::new(1);
+    clear_required
+        .fields
+        .insert("body".to_owned(), Value::Json(serde_json::Value::Null));
+    assert_eq!(
+        schema.validate_update(clear_required),
+        Err(RecordError::RequiredField {
+            field: "body".to_owned()
+        })
+    );
+}
