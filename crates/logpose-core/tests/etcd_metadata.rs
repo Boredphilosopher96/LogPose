@@ -1,8 +1,9 @@
 //! End-to-end etcd metadata integration coverage for `AppState`.
 //!
 //! Tests that need a live etcd run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` is
-//! set, for example to `http://127.0.0.1:2379`; otherwise they print a skip
-//! message and pass. When the variable is set, an unreachable etcd is a failure.
+//! set, for example to `http://127.0.0.1:2379`; otherwise they pass without
+//! running (the skip message shows with `--nocapture`). When the variable is
+//! set, an unreachable etcd is a failure, and under CI a missing variable is too.
 
 use etcd_client::{Client, DeleteOptions};
 use logpose_auth::{
@@ -1935,7 +1936,8 @@ fn test_config_with_auth(
 ///
 /// The etcd tests run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` names one or more
 /// comma-separated endpoints. When it does, an unreachable etcd fails the test
-/// instead of skipping it, so CI cannot silently lose this coverage.
+/// instead of skipping it. Under CI (`CI` is set, as on GitHub Actions) a
+/// missing variable also fails, so CI cannot silently lose this coverage.
 async fn etcd_endpoints_or_skip(test_name: &str) -> Option<Vec<String>> {
     let endpoints = std::env::var(ETCD_ENDPOINTS_ENV)
         .map(|value| {
@@ -1948,6 +1950,10 @@ async fn etcd_endpoints_or_skip(test_name: &str) -> Option<Vec<String>> {
         })
         .unwrap_or_default();
     if endpoints.is_empty() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{test_name}: CI is set but {ETCD_ENDPOINTS_ENV} is not; set it so the etcd integration tests run in CI"
+        );
         eprintln!(
             "skipping {test_name}: set {ETCD_ENDPOINTS_ENV} (for example http://127.0.0.1:2379) to run the etcd integration tests"
         );
