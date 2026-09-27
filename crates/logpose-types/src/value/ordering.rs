@@ -10,8 +10,10 @@ impl Value {
     /// Values of different kinds order by kind: null, bool, int64, float64,
     /// string, timestamp, array, json. Within a kind:
     ///
-    /// - floats use [`f64::total_cmp`]; conversion already rejects NaN and
-    ///   folds `-0.0` into `0.0`, so this matches numeric order
+    /// - floats use [`f64::total_cmp`] after folding `-0.0` into `0.0`, so
+    ///   this agrees with `==` on `Value` even for values built directly
+    ///   rather than through [`Value::float64`]; conversion rejects NaN, so
+    ///   this matches numeric order
     /// - strings compare by bytes
     /// - arrays compare element by element, then by length
     /// - JSON compares null, bool, number, string, array, object in that
@@ -25,7 +27,9 @@ impl Value {
             (Self::Null, Self::Null) => Ordering::Equal,
             (Self::Bool(left), Self::Bool(right)) => left.cmp(right),
             (Self::Int64(left), Self::Int64(right)) => left.cmp(right),
-            (Self::Float64(left), Self::Float64(right)) => left.total_cmp(right),
+            (Self::Float64(left), Self::Float64(right)) => {
+                fold_negative_zero(*left).total_cmp(&fold_negative_zero(*right))
+            }
             (Self::String(left), Self::String(right)) => left.cmp(right),
             (Self::Timestamp(left), Self::Timestamp(right)) => left.cmp(right),
             (Self::Array(left), Self::Array(right)) => cmp_slices(left, right, Self::total_cmp),
@@ -64,6 +68,11 @@ impl From<Value> for OrderedValue {
     fn from(value: Value) -> Self {
         Self(value)
     }
+}
+
+/// Map `-0.0` to `0.0` so both zeros are one index key.
+fn fold_negative_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
 }
 
 fn kind_rank(value: &Value) -> u8 {

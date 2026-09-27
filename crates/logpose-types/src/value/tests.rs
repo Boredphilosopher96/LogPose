@@ -433,3 +433,65 @@ fn total_order_is_usable_for_index_keys() {
         Some(&vec![0, 3])
     );
 }
+
+#[test]
+fn total_order_folds_negative_zero_like_equality() {
+    let negative = Value::Float64(-0.0);
+    let positive = Value::Float64(0.0);
+    assert_eq!(negative, positive, "Value equality treats -0.0 as 0.0");
+    assert_eq!(negative.total_cmp(&positive), Ordering::Equal);
+    assert_eq!(
+        OrderedValue(negative.clone()),
+        OrderedValue(positive.clone())
+    );
+
+    let mut index = BTreeMap::new();
+    index.insert(OrderedValue(positive), "row");
+    assert_eq!(
+        index.get(&OrderedValue(negative)),
+        Some(&"row"),
+        "an index lookup with -0.0 finds the 0.0 key"
+    );
+    assert_eq!(
+        Value::Array(vec![Value::Float64(-0.0)])
+            .total_cmp(&Value::Array(vec![Value::Float64(0.0)])),
+        Ordering::Equal
+    );
+}
+
+#[test]
+fn timestamps_follow_gregorian_leap_rules_at_the_edges() {
+    for valid in [
+        "0000-02-29T00:00:00Z",
+        "2000-02-29T00:00:00Z",
+        "9996-02-29T23:59:59Z",
+        "2026-12-31T23:59:59.999999-00:00",
+    ] {
+        assert!(Timestamp::parse_rfc3339(valid).is_ok(), "{valid} is valid");
+    }
+    for invalid in [
+        "1900-02-29T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "2026-06-31T00:00:00Z",
+        "2026-01-00T00:00:00Z",
+        "2026-01-32T00:00:00Z",
+        "2026-01-01T00:00:00+00:60",
+    ] {
+        assert!(
+            matches!(
+                Timestamp::parse_rfc3339(invalid),
+                Err(TimestampError::InvalidRfc3339 { .. })
+            ),
+            "{invalid} is invalid"
+        );
+    }
+    assert!(matches!(
+        Timestamp::parse_rfc3339("9999-12-31T23:59:59-00:01"),
+        Err(TimestampError::OutOfRange { .. })
+    ));
+    assert_eq!(
+        Timestamp::parse_rfc3339("0001-01-01T00:59:59+01:00").map(Timestamp::to_rfc3339),
+        Ok("0000-12-31T23:59:59Z".to_owned())
+    );
+}
