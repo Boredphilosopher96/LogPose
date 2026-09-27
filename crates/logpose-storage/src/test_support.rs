@@ -58,6 +58,8 @@ struct ControlState {
     fail_syncs: u32,
     /// Creations of paths containing this fail with ENOSPC.
     fail_creates: Option<String>,
+    /// Renames whose destination contains this fail with EIO.
+    fail_renames: Option<String>,
 }
 
 impl ControlledVfs {
@@ -119,6 +121,11 @@ impl ControlledVfs {
     pub(crate) fn fail_creates_containing(&self, fragment: &str) {
         self.state().fail_creates = Some(fragment.to_owned());
     }
+
+    /// Fail every later rename whose destination path contains `fragment`, or none with `None`.
+    pub(crate) fn fail_renames_to(&self, fragment: Option<&str>) {
+        self.state().fail_renames = fragment.map(str::to_owned);
+    }
 }
 
 impl Control {
@@ -168,6 +175,11 @@ impl Vfs for ControlledVfs {
         self.inner.list(dir)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if let Some(fragment) = &self.state().fail_renames
+            && to.to_string_lossy().contains(fragment.as_str())
+        {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         self.inner.rename(from, to)
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
