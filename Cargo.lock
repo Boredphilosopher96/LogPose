@@ -1347,6 +1347,7 @@ dependencies = [
  "criterion",
  "logpose-types",
  "pulp",
+ "rayon",
  "roaring",
  "serde",
  "serde_json",

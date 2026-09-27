@@ -8,6 +8,7 @@ use logpose_index::{
 };
 use logpose_types as _;
 use pulp as _;
+use rayon as _;
 use roaring as _;
 use serde as _;
 use serde_json as _;
