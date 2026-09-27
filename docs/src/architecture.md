@@ -33,7 +33,7 @@ LogPose is still a local filesystem engine.
 - mutable writes land in WAL-backed local state under `storage_root`; each collection has one writer task that applies write batches and schema changes in order
 - each write batch is one CRC-framed WAL frame; concurrent batches share one fsync (group commit), a batch is acknowledged only after its fsync returned and the state that includes it is published, and recovery replays a batch entirely or not at all
 - the WAL is a directory of `wal/<first sequence number>.wal` files (the WAL v2 format); a torn tail left by a crash is truncated when the collection is recovered, while damage followed by a later durable group, any damage in an older file, and a sequence gap are reported as corruption instead
-- a failed append or fsync truncates the active WAL file back to its last synced group, fails the group's writes with an outcome (`not applied`, or `unknown` when that rollback failed too), and makes the collection read-only until it is reopened; when the rollback failed, a `wal/FSYNC_FAILED` marker refuses a reopen in the same boot
+- a failed append or fsync truncates the active WAL file back to its last synced group, fails the group's writes with an outcome (`not applied`, or `unknown` when that rollback failed too), and makes the collection read-only until the engine is reopened; when the rollback failed, a `wal/FSYNC_FAILED` marker refuses a reopen in the same boot
 - storage roots written by earlier builds (a `wal/active.wal` file) are not readable and fail to open as corrupt; there is no migration
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
 - a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`

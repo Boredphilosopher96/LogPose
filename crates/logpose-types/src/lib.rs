@@ -1,15 +1,19 @@
 //! Shared domain types for LogPose.
 
+pub mod error;
 pub mod filter;
 pub mod legacy;
 pub mod record;
 pub mod schema;
 pub mod value;
 
+pub use error::{
+    CorruptionKind, ErrorCode, ErrorDetails, FieldViolation, LogPoseError, ResourceKind,
+    WriteOutcome,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::{collections::BTreeMap, fmt};
-use thiserror::Error;
 use uuid::Uuid;
 
 /// Common result type for workspace crates.
@@ -20,177 +24,6 @@ pub const PRODUCT_NAME: &str = "LogPose";
 pub const ANONYMOUS_LOCAL_NODE_NAME: &str = "local";
 /// Built-in database name used until callers provision explicit databases.
 pub const DEFAULT_DATABASE_NAME: &str = "default";
-
-/// Top-level workspace error.
-#[derive(Debug, Error)]
-pub enum LogPoseError {
-    /// Generic bootstrap and configuration errors.
-    #[error("{0}")]
-    Message(String),
-    /// The storage root is already served by another engine, in this process or another one.
-    ///
-    /// Exactly one engine may own a storage root: engines keep collection state resident, so
-    /// two engines on one root would each publish state the other never sees.
-    #[error(
-        "storage root '{}' is already in use by another engine{}; lock file '{}' is held exclusively",
-        .root.display(),
-        .holder_pid.as_ref().map(|pid| format!(" (held by pid {pid})")).unwrap_or_default(),
-        .lock_file.display()
-    )]
-    StorageRootLocked {
-        /// The storage root.
-        root: std::path::PathBuf,
-        /// The lock file inside it.
-        lock_file: std::path::PathBuf,
-        /// Process id recorded in the lock file by the holder, if readable.
-        holder_pid: Option<String>,
-    },
-
-    // Storage health and the write path: an operator or the client has to act.
-    /// Stored data is corrupt: a WAL that no crash can produce, an undecodable payload, or a
-    /// checkpoint frame the manifest has not reached.
-    #[error("{message}")]
-    Corrupt {
-        /// Which structure is damaged.
-        kind: CorruptionKind,
-        /// The file or key, when known.
-        location: Option<String>,
-        /// What is wrong.
-        message: String,
-    },
-    /// A collection refuses writes and maintenance until it is reopened, after a WAL write or
-    /// a manifest publish failed. It keeps serving reads of its last published state.
-    #[error("collection '{collection}' is read-only until it is reopened: {reason}")]
-    CollectionPoisoned {
-        /// The collection, as `database/collection`.
-        collection: String,
-        /// The failure that poisoned it.
-        reason: String,
-    },
-    /// The WAL group holding this write could not be made durable, so the write was not
-    /// acknowledged. `outcome` says whether it can still appear after recovery: treat
-    /// [`WriteOutcome::Unknown`] like a timeout.
-    #[error("WAL write to collection '{collection}' failed ({outcome}): {reason}")]
-    WalWriteFailed {
-        /// The collection, as `database/collection`.
-        collection: String,
-        /// Whether the failed group can reappear after recovery.
-        outcome: WriteOutcome,
-        /// What failed.
-        reason: String,
-    },
-    /// A filesystem operation failed.
-    #[error("{context}: {source}")]
-    Io {
-        /// What LogPose was doing.
-        context: String,
-        /// The underlying error.
-        #[source]
-        source: std::sync::Arc<std::io::Error>,
-    },
-    /// A request, message, or batch exceeds a size limit.
-    #[error(
-        "{what}{} exceeds the {limit}-byte limit",
-        size.map(|size| format!(" of {size} bytes")).unwrap_or_default()
-    )]
-    TooLarge {
-        /// What was too large, such as `WAL frame payload`.
-        what: String,
-        /// Its size in bytes, when known.
-        size: Option<u64>,
-        /// The limit in bytes.
-        limit: u64,
-    },
-    /// An unexpected failure that no other variant describes.
-    #[error("{message}")]
-    Internal {
-        /// What went wrong.
-        message: String,
-    },
-}
-
-/// Which stored structure a [`LogPoseError::Corrupt`] error found damaged.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum CorruptionKind {
-    /// A write-ahead log file.
-    Wal,
-    /// A segment file.
-    Segment,
-    /// A manifest or the `CURRENT` pointer.
-    Manifest,
-    /// An index sidecar file.
-    Index,
-    /// A descriptor file: collection, database, principal, or policy.
-    Descriptor,
-    /// A record in the distributed metadata store.
-    Metadata,
-}
-
-impl CorruptionKind {
-    /// Stable machine name, reported as `corruption_kind` in error metadata.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wal => "wal",
-            Self::Segment => "segment",
-            Self::Manifest => "manifest",
-            Self::Index => "index",
-            Self::Descriptor => "descriptor",
-            Self::Metadata => "metadata",
-        }
-    }
-}
-
-impl fmt::Display for CorruptionKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl LogPoseError {
-    /// A filesystem operation failed while doing `context`.
-    pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {
-        Self::Io {
-            context: context.into(),
-            source: std::sync::Arc::new(source),
-        }
-    }
-
-    /// An unexpected failure.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
-            message: message.into(),
-        }
-    }
-}
-
-/// What a failed WAL group append means for the writes it held.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteOutcome {
-    /// The WAL was truncated back to the last synced group and the truncation was synced: the
-    /// writes are absent after any crash and will never be replayed.
-    NotApplied,
-    /// The rollback failed, so the writes may or may not be replayed later. Clients must treat
-    /// this like a timeout.
-    Unknown {
-        /// Whether the `FSYNC_FAILED` fence marker was written durably. When it was not, a
-        /// later open in the same boot cannot notice the hazard, so the process must stop.
-        fenced: bool,
-    },
-}
-
-impl fmt::Display for WriteOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotApplied => formatter.write_str("not applied"),
-            Self::Unknown { fenced: true } => formatter.write_str("outcome unknown, WAL fenced"),
-            Self::Unknown { fenced: false } => {
-                formatter.write_str("outcome unknown, WAL not fenced")
-            }
-        }
-    }
-}
 
 /// Build metadata surfaced by service entrypoints.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,9 +118,10 @@ impl std::str::FromStr for NodeRole {
             "combined" => Ok(Self::Combined),
             "control" => Ok(Self::Control),
             "data" => Ok(Self::Data),
-            other => Err(LogPoseError::Message(format!(
-                "unsupported node role '{other}'"
-            ))),
+            other => Err(LogPoseError::invalid_field(
+                "node_role",
+                format!("unsupported node role '{other}'"),
+            )),
         }
     }
 }
@@ -330,7 +164,7 @@ impl std::str::FromStr for DatabaseId {
     fn from_str(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value)
             .map(Self)
-            .map_err(|error| LogPoseError::Message(error.to_string()))
+            .map_err(|error| LogPoseError::invalid_field("database_id", error.to_string()))
     }
 }
 
@@ -407,24 +241,46 @@ impl CollectionRef {
         validate_collection_ref_segment("collection_name", &self.collection_name)?;
         Ok(())
     }
+
+    /// Parse a lookup key, `collection` (in the default database) or `database/collection`,
+    /// and validate it.
+    pub fn parse(lookup_name: &str) -> Result<Self> {
+        let reference = match lookup_name.trim().split('/').collect::<Vec<_>>().as_slice() {
+            [collection_name] => Self::new_default(*collection_name),
+            [database_name, collection_name] => Self::new(*database_name, *collection_name),
+            _ => {
+                return Err(LogPoseError::invalid_field(
+                    "collection_name",
+                    format!(
+                        "unsupported collection reference '{lookup_name}': expected 'collection' or 'database/collection'"
+                    ),
+                ));
+            }
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
 }
 
 fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not be empty"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not be empty"),
+        ));
     }
     if value.contains('/') {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not contain '/'"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not contain '/'"),
+        ));
     }
     if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(format!(
-            "{field_name} must not be a relative path component"
-        )));
+        return Err(LogPoseError::invalid_field(
+            field_name,
+            format!("{field_name} must not be a relative path component"),
+        ));
     }
     Ok(())
 }
@@ -515,9 +371,10 @@ impl std::str::FromStr for DistanceMetric {
             "cosine" => Ok(Self::Cosine),
             "dot" => Ok(Self::Dot),
             "l2" => Ok(Self::L2),
-            other => Err(LogPoseError::Message(format!(
-                "unsupported distance metric '{other}'"
-            ))),
+            other => Err(LogPoseError::invalid_field(
+                "metric",
+                format!("unsupported distance metric '{other}'"),
+            )),
         }
     }
 }
@@ -575,12 +432,12 @@ impl WriteOperation {
     pub fn validate_dimensions(&self, expected_dimensions: usize) -> Result<()> {
         match self {
             Self::Put(record) if record.vector.len() != expected_dimensions => {
-                Err(LogPoseError::Message(format!(
-                    "record '{}' expected {} dimensions but found {}",
-                    record.id,
-                    expected_dimensions,
-                    record.vector.len()
-                )))
+                Err(LogPoseError::DimensionMismatch {
+                    field: "vector".to_owned(),
+                    record_id: Some(record.id.to_string()),
+                    expected: expected_dimensions,
+                    actual: record.vector.len(),
+                })
             }
             _ => Ok(()),
         }
@@ -852,9 +709,8 @@ impl EtcdMetadataConfig {
     /// Validate etcd-specific configuration invariants.
     pub fn validate(&self) -> Result<()> {
         if self.endpoints.is_empty() {
-            return Err(LogPoseError::Message(
-                "metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'"
-                    .to_owned(),
+            return Err(LogPoseError::invalid_config(
+                "metadata.etcd.endpoints must be non-empty when metadata.backend is 'etcd'",
             ));
         }
         if self
@@ -862,32 +718,32 @@ impl EtcdMetadataConfig {
             .iter()
             .any(|endpoint| endpoint.trim().is_empty())
         {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.endpoints must not contain blank values".to_owned(),
             ));
         }
         if self.key_prefix.trim().is_empty() {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.key_prefix must not be blank".to_owned(),
             ));
         }
         if self.cluster_name.trim().is_empty() {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.cluster_name must not be blank".to_owned(),
             ));
         }
         if self.timeout_ms == 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.timeout_ms must be greater than 0".to_owned(),
             ));
         }
         if self.membership_ttl_secs <= 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.membership_ttl_secs must be greater than 0".to_owned(),
             ));
         }
         if self.leadership_ttl_secs <= 0 {
-            return Err(LogPoseError::Message(
+            return Err(LogPoseError::invalid_config(
                 "metadata.etcd.leadership_ttl_secs must be greater than 0".to_owned(),
             ));
         }

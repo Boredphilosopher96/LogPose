@@ -31,8 +31,8 @@ use logpose_auth::{
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot,
-    WriteOperation,
+    CorruptionKind, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, ErrorCode, LogPoseError,
+    PutRecord, RecordId, Snapshot, WriteOperation,
 };
 use serde_json::{Value, json};
 use std::{
@@ -123,6 +123,65 @@ async fn create_collection_persists_default_database_descriptor() {
     assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
     assert_eq!(database_descriptor.name, DEFAULT_DATABASE_NAME);
     assert!(database_descriptor.is_default);
+}
+
+#[test]
+fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
+    let root = support::unique_temp_dir("storage-catalog-invalid-stored");
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    engine
+        .put_database(DatabaseDescriptor::new("analytics"))
+        .expect("database descriptor should persist");
+    engine
+        .put_principal(Principal::new_with_access_tier(
+            "reader",
+            PrincipalKind::User,
+            AccessTier::Observer,
+        ))
+        .expect("principal descriptor should persist");
+
+    // Damage the stored copies so they no longer pass validation: only the default database
+    // may be the default, and a principal name may not contain '/'.
+    let database_path = root.join("databases/analytics/descriptor.json");
+    let mut database: Value =
+        serde_json::from_slice(&fs::read(&database_path).expect("database descriptor exists"))
+            .expect("database descriptor is JSON");
+    database["is_default"] = json!(true);
+    fs::write(&database_path, database.to_string()).expect("database descriptor rewrites");
+    let principal_path = root.join("principals/reader/descriptor.json");
+    let mut principal: Value =
+        serde_json::from_slice(&fs::read(&principal_path).expect("principal descriptor exists"))
+            .expect("principal descriptor is JSON");
+    principal["name"] = json!("a/b");
+    fs::write(&principal_path, principal.to_string()).expect("principal descriptor rewrites");
+
+    for error in [
+        engine
+            .get_database("analytics")
+            .expect_err("a damaged database descriptor should fail"),
+        engine
+            .list_databases()
+            .expect_err("listing a damaged database descriptor should fail"),
+        engine
+            .get_principal("reader")
+            .expect_err("a damaged principal descriptor should fail"),
+        engine
+            .list_principals()
+            .expect_err("listing a damaged principal descriptor should fail"),
+    ] {
+        assert_eq!(error.code(), ErrorCode::DataLoss, "{error}");
+        assert!(
+            matches!(
+                &error,
+                LogPoseError::Corrupt {
+                    kind: CorruptionKind::Descriptor,
+                    location: Some(_),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]

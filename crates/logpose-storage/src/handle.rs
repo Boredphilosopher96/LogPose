@@ -9,8 +9,8 @@ use crate::{
 use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, Result, SeqNo,
-    Snapshot, record::ClientOp,
+    CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, ResourceKind,
+    Result, SeqNo, Snapshot, record::ClientOp,
 };
 use std::{
     fmt,
@@ -157,11 +157,13 @@ impl CollectionHandle {
         if version.visible_seq_no >= min_seq_no {
             return Ok(version);
         }
-        Err(LogPoseError::Message(format!(
-            "read barrier seq {min_seq_no} is not yet visible; collection '{}' is at seq {}",
-            self.meta.descriptor.lookup_name(),
-            version.visible_seq_no
-        )))
+        Err(LogPoseError::ReadBarrierNotSatisfied {
+            collection: self.meta.descriptor.lookup_name(),
+            required_manifest_generation: 0,
+            required_seq_no: min_seq_no,
+            visible_manifest_generation: version.manifest_generation,
+            visible_seq_no: version.visible_seq_no,
+        })
     }
 
     /// Durably commit `ops` as one atomic batch. Returns once the batch's WAL group is synced
@@ -220,7 +222,7 @@ impl CollectionHandle {
         if self.is_poisoned() || self.is_dropped() {
             return self.unavailable();
         }
-        LogPoseError::Message(format!(
+        LogPoseError::internal(format!(
             "the writer of collection '{}' stopped before answering; the write's outcome is \
              unknown",
             self.meta.descriptor.lookup_name()
@@ -302,7 +304,7 @@ impl CollectionHandle {
     pub(crate) fn unavailable(&self) -> LogPoseError {
         let name = self.meta.descriptor.lookup_name();
         if self.is_dropped() {
-            return LogPoseError::Message(format!("collection '{name}' does not exist"));
+            return LogPoseError::not_found(ResourceKind::Collection, name);
         }
         match self.poison.get() {
             Some(Poison {
@@ -328,7 +330,7 @@ impl CollectionHandle {
                     }
                 ),
             },
-            None => LogPoseError::Message(format!("collection '{name}' is unavailable")),
+            None => LogPoseError::unavailable(format!("collection '{name}' is unavailable")),
         }
     }
 

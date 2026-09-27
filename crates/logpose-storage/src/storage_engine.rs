@@ -39,7 +39,7 @@ pub trait StorageEngine: Send + Sync {
         let _ = request;
         let _ = assignment;
         let _ = leader_fence;
-        Err(LogPoseError::Message(
+        Err(LogPoseError::internal(
             "persisted collection assignments are not supported by this storage engine".to_owned(),
         ))
     }
@@ -70,7 +70,7 @@ pub trait StorageEngine: Send + Sync {
 
     /// List every known collection descriptor.
     async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
-        Err(LogPoseError::Message(
+        Err(LogPoseError::internal(
             "listing collections is not supported by this storage engine".to_owned(),
         ))
     }
@@ -81,7 +81,7 @@ pub trait StorageEngine: Send + Sync {
         descriptor: &CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
         let _ = descriptor;
-        Err(LogPoseError::Message(
+        Err(LogPoseError::internal(
             "persisted collection assignments are not supported by this storage engine".to_owned(),
         ))
     }

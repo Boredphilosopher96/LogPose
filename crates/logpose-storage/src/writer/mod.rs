@@ -27,7 +27,7 @@
 //! A failed group append poisons the collection. The WAL layer rolls the file back to the last
 //! synced group; the group's writes fail with [`LogPoseError::WalWriteFailed`] carrying the
 //! rollback's outcome, and the next prepared group fails with `NotApplied`. A clean rollback
-//! leaves the collection read-only until it is reopened. A failed rollback fences the WAL and
+//! leaves the collection read-only until the engine is reopened. A failed rollback fences the WAL and
 //! fails the collection for this process; when the fence could not be written either, the
 //! engine's fatal handler stops the process.
 
@@ -815,7 +815,7 @@ impl Writer {
                 if checkpoint_seq_no < durable.checkpoint_seq_no
                     || checkpoint_seq_no >= self.next_seq_no
                 {
-                    return Err(LogPoseError::Message(format!(
+                    return Err(LogPoseError::internal(format!(
                         "flush checkpoint {checkpoint_seq_no} is outside the log (durable \
                          checkpoint {}, next sequence number {})",
                         durable.checkpoint_seq_no, self.next_seq_no
@@ -839,8 +839,8 @@ impl Writer {
                     .iter()
                     .position(|segment| inputs.contains(&segment.segment_id))
                 else {
-                    return Err(LogPoseError::Message(
-                        "compaction inputs are no longer in the manifest".to_owned(),
+                    return Err(LogPoseError::internal(
+                        "compaction inputs are no longer in the manifest",
                     ));
                 };
                 let present = durable
@@ -849,8 +849,8 @@ impl Writer {
                     .filter(|segment| inputs.contains(&segment.segment_id))
                     .count();
                 if present != inputs.len() {
-                    return Err(LogPoseError::Message(
-                        "compaction inputs are no longer in the manifest".to_owned(),
+                    return Err(LogPoseError::internal(
+                        "compaction inputs are no longer in the manifest",
                     ));
                 }
                 let mut segments = Vec::with_capacity(durable.segments.len() - present + 1);
@@ -1015,7 +1015,7 @@ fn fail_all(pending: Vec<Pending>, error: impl Fn() -> LogPoseError) {
 }
 
 fn shutting_down() -> LogPoseError {
-    LogPoseError::Message("the storage engine is shutting down".to_owned())
+    LogPoseError::unavailable("the storage engine is shutting down")
 }
 
 /// A checkpoint frame naming `manifest`'s generation and checkpoint.

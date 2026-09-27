@@ -226,7 +226,7 @@ async fn a_failed_fsync_poisons_the_collection_and_fails_the_group_as_not_applie
     assert!(
         refused
             .to_string()
-            .contains("read-only until it is reopened"),
+            .contains("read-only until the engine is reopened"),
         "{refused}"
     );
     assert_eq!(

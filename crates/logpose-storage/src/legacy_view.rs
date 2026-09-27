@@ -28,17 +28,22 @@ pub(crate) fn legacy_ops(
     operations: Vec<WriteOperation>,
 ) -> Result<Vec<ClientOp>> {
     if operations.is_empty() {
-        return Err(LogPoseError::Message(
-            "write batch must include at least one operation".to_owned(),
+        return Err(LogPoseError::invalid_field(
+            "operations",
+            "write batch must include at least one operation",
         ));
     }
     operations
         .into_iter()
-        .map(|operation| {
-            operation.validate_dimensions(descriptor.dimensions)?;
+        .enumerate()
+        .map(|(index, operation)| {
+            let prefix = format!("operations[{index}]");
+            descriptor
+                .validate_operation(&operation)
+                .map_err(|error| error.with_field_prefix(&prefix))?;
             let id = operation.id().clone();
             client_op_from_write(operation).map_err(|error| {
-                LogPoseError::Message(format!("record '{id}' is invalid: {error}"))
+                LogPoseError::invalid_field(prefix, format!("record '{id}' is invalid: {error}"))
             })
         })
         .collect()
@@ -55,7 +60,7 @@ pub(crate) fn legacy_id(pk: &WirePk) -> RecordId {
 /// The v1 put of `image` as a reader of `schema` sees it.
 pub(crate) fn legacy_put(schema: &CollectionSchema, image: &RowImage) -> Result<PutRecord> {
     let mut record = image.to_record(schema).map_err(|error| {
-        LogPoseError::Message(format!(
+        LogPoseError::internal(format!(
             "row '{}' cannot be read with schema version {}: {error}",
             legacy_id(&image.pk),
             schema.schema_version()

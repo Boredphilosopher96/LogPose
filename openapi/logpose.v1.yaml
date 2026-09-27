@@ -21,7 +21,7 @@ paths:
   /v1/metadata:
     get:
       summary: Cluster metadata
-      operationId: metadata
+      operationId: getMetadata
       responses:
         "200":
           description: Normalized node metadata
@@ -42,24 +42,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeRuntimeStatus"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Operator access required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
-          description: Internal runtime-status failure
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/databases:
     get:
       summary: List databases
@@ -75,18 +71,20 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/DatabaseDescriptor"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Operator access required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/databases/{name}:
     get:
       summary: Get a database descriptor
@@ -106,24 +104,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DatabaseDescriptor"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Operator access required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
         "404":
-          description: Database not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
     put:
       summary: Create or replace a database descriptor
       operationId: putDatabase
@@ -149,23 +143,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/DatabaseDescriptor"
         "400":
-          description: Invalid database descriptor or path/body mismatch
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Operator access required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections:
     post:
       summary: Create a collection
@@ -186,29 +178,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionDescriptor"
         "400":
-          description: Invalid create request or control-plane lifecycle unavailable for the current node role
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "409":
-          description: Collection already exists
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database write permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/databases/{name}/policy:
     get:
       summary: Get a database access policy
@@ -228,30 +212,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DatabaseAccessPolicy"
-        "404":
-          description: Database access policy not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database owner permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
-          description: Internal database policy lookup failure
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
     put:
       summary: Create or replace a database access policy
       operationId: putDatabasePolicy
@@ -277,35 +251,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/DatabaseAccessPolicy"
         "400":
-          description: Invalid policy request or control-plane database policy mutations unavailable for the current node role
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Database not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database owner permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
-          description: Internal database policy persistence failure
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}:
     get:
       summary: Get collection metadata
@@ -332,29 +292,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionDescriptor"
         "400":
-          description: Invalid namespace selection or reconciliation is required before the collection can be served
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database read permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/placement:
     get:
       summary: Get collection placement
@@ -381,35 +331,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionPlacement"
         "400":
-          description: Invalid namespace selection or reconciliation is required before placement can be resolved
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Operator access required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "500":
-          description: Internal placement lookup failure
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/writes:
     post:
       summary: Write a mixed put/delete batch
@@ -436,29 +370,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionCommitAck"
         "400":
-          description: Invalid write request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database write permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/query:
     post:
       summary: Execute a planner-controlled vector query
@@ -485,35 +411,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionQueryResponse"
         "400":
-          description: Invalid query request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database read permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "412":
-          description: The requested read barrier is not yet visible on the current serving node, or the current owner cannot safely satisfy read barriers after ownership promotion
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/stats:
     get:
       summary: Get collection stats
@@ -564,35 +476,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionStats"
         "400":
-          description: Invalid stats request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database read permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "412":
-          description: The requested read barrier is not yet visible on the current serving node, or the current owner cannot safely satisfy read barriers after ownership promotion
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/flush:
     post:
       summary: Flush the mutable delta into a new segment
@@ -619,29 +515,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionSnapshot"
         "400":
-          description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database write permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/compact:
     post:
       summary: Compact immutable segments
@@ -668,29 +554,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionSnapshot"
         "400":
-          description: Data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database write permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/collections/{name}/inspect:
     get:
       summary: Inspect collection storage state
@@ -728,30 +604,75 @@ paths:
               schema:
                 $ref: "#/components/schemas/CollectionInspectReport"
         "400":
-          description: Invalid inspect request or data-plane workflow unavailable because the current runtime cannot serve the collection locally
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "404":
-          description: Collection or segment not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/InvalidArgument"
         "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/Unauthenticated"
         "403":
-          description: Database read permission required
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
 components:
+  responses:
+    InvalidArgument:
+      description: The request is invalid (`INVALID_ARGUMENT`). `details.field_violations` names the offending fields when known.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthenticated:
+      description: Missing or invalid bearer token (`UNAUTHENTICATED`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PermissionDenied:
+      description: The principal may not perform this operation (`PERMISSION_DENIED`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: A named resource does not exist (`NOT_FOUND`). `details.metadata` holds `resource_type` and `resource_name`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`), or a storage failure made the collection read-only until the engine is reopened (`COLLECTION_POISONED`). Retrying does not help.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PayloadTooLarge:
+      description: The request body exceeds `limits.max_rest_body_bytes` (`RESOURCE_EXHAUSTED`, reason `TOO_LARGE`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unavailable:
+      description: This node cannot serve the request now (`UNAVAILABLE`), for example it does not own the collection (`NOT_OWNER`, with `owner_node`) or it is not the control-plane leader (`NOT_LEADER`, with `leader_node`). Retry after the `Retry-After` delay, on the hinted node when one is named.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying, present when a retry is expected to help.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Internal:
+      description: An unexpected server failure (`INTERNAL`) or corrupt stored data (`DATA_LOSS`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
   securitySchemes:
     bearerAuth:
       type: http
@@ -841,11 +762,9 @@ components:
         assigned_role:
           $ref: "#/components/schemas/NodeRole"
         owner_node:
-          type: string
-          nullable: true
+          type: [string, "null"]
         ownership_epoch:
-          type: integer
-          nullable: true
+          type: [integer, "null"]
         route_kind:
           type: string
         route_reason:
@@ -879,25 +798,21 @@ components:
         membership_registered:
           type: boolean
         membership_lease_id:
-          type: integer
+          type: [integer, "null"]
           format: int64
-          nullable: true
         registered_members:
           type: array
           items:
             type: string
         leader_node:
-          type: string
-          nullable: true
+          type: [string, "null"]
         is_local_leader:
           type: boolean
         leadership_lease_id:
-          type: integer
+          type: [integer, "null"]
           format: int64
-          nullable: true
         last_error:
-          type: string
-          nullable: true
+          type: [string, "null"]
     NodeRuntimeStatus:
       type: object
       required:
@@ -938,9 +853,9 @@ components:
           items:
             $ref: "#/components/schemas/CollectionPlacement"
         coordination:
-          allOf:
+          oneOf:
             - $ref: "#/components/schemas/CoordinationStatus"
-          nullable: true
+            - type: "null"
         maintenance:
           $ref: "#/components/schemas/MaintenanceBacklog"
     CreateCollectionRequest:
@@ -1193,7 +1108,7 @@ components:
         value:
           type: number
         metadata:
-          nullable: true
+          description: The record's metadata, any JSON value (including null).
     QueryStageTimings:
       type: object
       required:
@@ -1437,7 +1352,7 @@ components:
         target:
           type: string
         payload:
-          nullable: true
+          description: Target-specific inspection payload, any JSON value (including null).
     CollectionCommitAck:
       allOf:
         - $ref: "#/components/schemas/CollectionContext"
@@ -1450,9 +1365,80 @@ components:
       allOf:
         - $ref: "#/components/schemas/CollectionContext"
         - $ref: "#/components/schemas/InspectReport"
+    ErrorCode:
+      type: string
+      description: Canonical error class, named like the gRPC status code the gRPC API returns for the same error.
+      enum:
+        - INVALID_ARGUMENT
+        - NOT_FOUND
+        - ALREADY_EXISTS
+        - FAILED_PRECONDITION
+        - UNAUTHENTICATED
+        - PERMISSION_DENIED
+        - RESOURCE_EXHAUSTED
+        - UNAVAILABLE
+        - DATA_LOSS
+        - INTERNAL
+    ErrorReason:
+      type: string
+      description: Stable machine-readable reason; the same value gRPC sends in `google.rpc.ErrorInfo.reason`.
+      enum:
+        - INVALID_ARGUMENT
+        - DIMENSION_MISMATCH
+        - TOO_LARGE
+        - INVALID_CONFIG
+        - RESOURCE_NOT_FOUND
+        - RESOURCE_ALREADY_EXISTS
+        - FAILED_PRECONDITION
+        - WRONG_NODE_ROLE
+        - RECONCILIATION_REQUIRED
+        - STORAGE_ROOT_LOCKED
+        - UNAUTHENTICATED
+        - PERMISSION_DENIED
+        - NOT_OWNER
+        - NOT_LEADER
+        - READ_BARRIER_NOT_SATISFIED
+        - UNAVAILABLE
+        - DATA_CORRUPTION
+        - COLLECTION_POISONED
+        - WAL_WRITE_FAILED
+        - IO_ERROR
+        - INTERNAL
+    FieldViolation:
+      type: object
+      required: [field, description]
+      properties:
+        field:
+          type: string
+          description: Path of the field in the request, such as `operations[2].vector`.
+        description:
+          type: string
+    ErrorDetails:
+      type: object
+      required: [reason, metadata, field_violations]
+      properties:
+        reason:
+          $ref: "#/components/schemas/ErrorReason"
+        metadata:
+          type: object
+          description: Structured fields of the error, such as `owner_node`, `resource_type`, or `limit_bytes`. A failed bulk batch adds `failed_batch_index`, `committed_batches`, `committed_operations`, and `last_committed_seq_no`.
+          additionalProperties:
+            type: string
+        field_violations:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldViolation"
+        retry_after_ms:
+          type: integer
+          minimum: 0
+          description: How long to wait before retrying, present when a retry is expected to help.
     ErrorResponse:
       type: object
-      required: [error]
+      required: [code, message, details]
       properties:
-        error:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
           type: string
+        details:
+          $ref: "#/components/schemas/ErrorDetails"

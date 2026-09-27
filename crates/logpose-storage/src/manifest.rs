@@ -13,7 +13,8 @@ use crate::{
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats, SeqNo, schema::CollectionSchema,
+    CorruptionKind, LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats, SeqNo,
+    schema::CollectionSchema,
 };
 use logpose_vfs::CrashPoint;
 use serde::{Deserialize, Serialize};
@@ -33,14 +34,18 @@ impl EngineCore {
         let path = Self::manifest_file_path(descriptor, generation);
         if !self.exists(&path)? {
             if generation_override.is_some() {
-                return Err(LogPoseError::Message(format!(
-                    "invalid snapshot: manifest generation {} does not exist",
-                    generation
-                )));
+                return Err(LogPoseError::invalid_field(
+                    "snapshot",
+                    format!("invalid snapshot: manifest generation {generation} does not exist"),
+                ));
             }
-            return Err(LogPoseError::Message(format!(
-                "manifest generation {generation} named by CURRENT does not exist"
-            )));
+            return Err(LogPoseError::Corrupt {
+                kind: CorruptionKind::Manifest,
+                location: Some(path.display().to_string()),
+                message: format!(
+                    "manifest generation {generation} named by CURRENT does not exist"
+                ),
+            });
         }
         read_json(self.vfs.as_ref(), &path)
     }
@@ -55,9 +60,10 @@ impl EngineCore {
             .trim()
             .parse::<u64>()
             .map_err(|error| {
-                LogPoseError::Message(format!(
-                    "failed to parse CURRENT manifest generation: {error}"
-                ))
+                LogPoseError::corrupt(
+                    CorruptionKind::Manifest,
+                    format!("failed to parse CURRENT manifest generation: {error}"),
+                )
             })
     }
 
