@@ -9,6 +9,16 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+crc32fast = "1.4"
 logpose-types = { path = "../logpose-types" }
+roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "scalar_range"
+harness = false
