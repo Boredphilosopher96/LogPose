@@ -506,9 +506,7 @@ impl Writer {
             }
             return None;
         }
-        let Some(mut wal) = self.wal.take() else {
-            return None;
-        };
+        let mut wal = self.wal.take()?;
         let mut frames = prepared.frames;
         if let Some(checkpoint) = self.pending_checkpoint.take() {
             frames.insert(0, checkpoint);
