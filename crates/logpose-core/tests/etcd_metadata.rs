@@ -1123,6 +1123,7 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         &follower_config.storage_root,
         &descriptor.root_path,
     );
+    let follower = restart_with_mirrored_state(follower, &follower_config).await;
 
     let coordination = EtcdCoordinationClient::new(owner_config.metadata.etcd.clone())
         .expect("coordination client should build");
@@ -1321,6 +1322,7 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         &follower_config.storage_root,
         &descriptor.root_path,
     );
+    let follower = restart_with_mirrored_state(follower, &follower_config).await;
 
     let coordination = EtcdCoordinationClient::new(owner_config.metadata.etcd.clone())
         .expect("coordination client should build");
@@ -2368,6 +2370,22 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("logpose-core-{label}-{suffix}"));
     fs::create_dir_all(&path).expect("temp dir should be created");
     path
+}
+
+/// Restart a node so that its engine recovers the collection state mirrored into its storage
+/// root, as a node that received a state transfer would. The engine keeps collection state
+/// resident and owns its root exclusively, so the running instance is dropped first.
+async fn restart_with_mirrored_state(node: Arc<AppState>, config: &LogPoseConfig) -> Arc<AppState> {
+    drop(node);
+    let node = Arc::new(AppState::new(config.clone()));
+    wait_for_runtime_status(&node, |status| {
+        status
+            .coordination
+            .as_ref()
+            .is_some_and(|coordination| coordination.membership_registered)
+    })
+    .await;
+    node
 }
 
 fn mirror_collection_state(from_root: &Path, to_root: &Path, collection_root: &Path) {

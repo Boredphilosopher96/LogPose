@@ -322,6 +322,7 @@ async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
         .await
         .expect("compaction should succeed");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let response = query_exact(
         &reopened,

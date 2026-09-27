@@ -774,6 +774,8 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
         })
         .await
         .expect("collection should be created");
+    // One engine owns a storage root at a time; the node opens its own.
+    drop(engine);
 
     let state = Arc::new(AppState::new(test_config_with_root(
         "raw-local-status",
@@ -824,6 +826,8 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
         )
         .await
         .expect("collection should be created");
+    // One engine owns a storage root at a time; the node opens its own.
+    drop(engine);
 
     let state = Arc::new(AppState::new(test_config_with_root(
         "local-control-assignment",
@@ -874,7 +878,8 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
 
 #[tokio::test]
 async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
-    let state = Arc::new(AppState::new(test_config("control-maintenance")));
+    let config = test_config("control-maintenance");
+    let state = Arc::new(AppState::new(config.clone()));
     let descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
@@ -897,6 +902,9 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
         .expect("maintenance json should serialize"),
     )
     .expect("maintenance file should be written");
+    // The engine keeps maintenance status resident; a restart picks up the edited file.
+    drop(state);
+    let state = Arc::new(AppState::new(config));
 
     let status = state
         .control
@@ -912,7 +920,8 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
 
 #[tokio::test]
 async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs() {
-    let state = Arc::new(AppState::new(test_config("control-maintenance-namespace")));
+    let config = test_config("control-maintenance-namespace");
+    let state = Arc::new(AppState::new(config.clone()));
     let default_descriptor = state
         .control
         .create_collection(CreateCollectionRequest {
@@ -956,6 +965,9 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
         .expect("database maintenance json should serialize"),
     )
     .expect("database maintenance file should be written");
+    // The engine keeps maintenance status resident; a restart picks up the edited files.
+    drop(state);
+    let state = Arc::new(AppState::new(config));
 
     let status = state
         .control

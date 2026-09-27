@@ -1,278 +1,27 @@
-//! Background maintenance: flush and compaction triggers, the persisted maintenance status, and the per-collection worker queue.
+//! Background maintenance: flush and compaction triggers, and each collection's job queue with
+//! its persisted status.
+//!
+//! The queue and status live on the [`CollectionHandle`]; jobs run on the engine's job threads,
+//! at most one per collection at a time. `maintenance.json` persists the status so that a job
+//! interrupted by a crash or a shutdown resumes when the engine reopens.
 
 use crate::{
-    LocalStorageEngine,
+    durable_fs::path_exists,
+    engine::{CoreRef, EngineCore},
     error::json_message,
-    fs_util::{atomic_write, read_json},
-    stats::approximate_record_bytes,
-    wal_rotation::wal_rotation_lock,
+    fs_util::{atomic_write_in_existing_dir, read_json},
+    handle::CollectionHandle,
+    version::Version,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{MaintenanceStatus, Result, Snapshot};
-use logpose_wal::WalRecord;
 use std::{
-    collections::{BTreeMap, VecDeque},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
-    thread,
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, MutexGuard, PoisonError},
 };
 
-impl LocalStorageEngine {
-    pub(crate) fn should_flush(
-        &self,
-        descriptor: &CollectionDescriptor,
-        delta: &[WalRecord],
-    ) -> bool {
-        if delta.len() >= descriptor.flush_threshold_ops {
-            return true;
-        }
-
-        let approx_bytes = delta
-            .iter()
-            .map(|record| approximate_record_bytes(&record.op))
-            .sum::<usize>();
-        approx_bytes >= descriptor.flush_threshold_bytes
-    }
-
-    pub(crate) fn should_compact(
-        &self,
-        descriptor: &CollectionDescriptor,
-        segment_count: usize,
-    ) -> bool {
-        segment_count >= descriptor.compaction_threshold_segments
-    }
-
-    pub(crate) fn load_maintenance_status(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<MaintenanceStatus> {
-        let path = Self::maintenance_file_path(descriptor);
-        if !self.exists(&path)? {
-            return Ok(MaintenanceStatus::default());
-        }
-        read_json(self.vfs.as_ref(), &path)
-    }
-
-    pub(crate) fn persist_maintenance_status(
-        &self,
-        descriptor: &CollectionDescriptor,
-        status: &MaintenanceStatus,
-    ) -> Result<()> {
-        atomic_write(
-            self.vfs.as_ref(),
-            &Self::maintenance_file_path(descriptor),
-            serde_json::to_vec_pretty(status).map_err(json_message)?,
-        )
-    }
-
-    pub(crate) fn enqueue_maintenance(
-        &self,
-        descriptor: &CollectionDescriptor,
-        operations: Vec<MaintenanceOperation>,
-    ) -> Result<()> {
-        if operations.is_empty() {
-            return Ok(());
-        }
-
-        let status_lock = maintenance_status_lock(&descriptor.root_path);
-        {
-            let _guard = status_lock
-                .lock()
-                .expect("maintenance status lock should not be poisoned");
-            let mut persisted = self.load_maintenance_status(descriptor)?;
-            for operation in &operations {
-                let label = operation.as_str().to_owned();
-                if persisted.in_progress.as_deref() == Some(label.as_str())
-                    || persisted.pending.iter().any(|pending| pending == &label)
-                {
-                    continue;
-                }
-                persisted.pending.push(label);
-            }
-            self.persist_maintenance_status(descriptor, &persisted)?;
-        }
-
-        let key = descriptor.root_path.clone();
-        let should_spawn = {
-            let mut coordinator = maintenance_coordinator()
-                .lock()
-                .expect("maintenance coordinator lock should not be poisoned");
-            let state = coordinator.entry(key.clone()).or_default();
-            for operation in operations {
-                if !state.queue.iter().any(|pending| pending == &operation) {
-                    state.queue.push_back(operation);
-                }
-            }
-            if state.running {
-                false
-            } else {
-                state.running = true;
-                true
-            }
-        };
-
-        if should_spawn {
-            let engine = self.clone();
-            let collection_name = descriptor.lookup_name();
-            thread::spawn(move || engine.run_maintenance_worker(collection_name, key));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn recover_persisted_maintenance(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<()> {
-        let key = descriptor.root_path.clone();
-        {
-            let coordinator = maintenance_coordinator()
-                .lock()
-                .expect("maintenance coordinator lock should not be poisoned");
-            if coordinator.contains_key(&key) {
-                return Ok(());
-            }
-        }
-
-        let status_lock = maintenance_status_lock(&descriptor.root_path);
-        let operations = {
-            let _guard = status_lock
-                .lock()
-                .expect("maintenance status lock should not be poisoned");
-            let mut status = self.load_maintenance_status(descriptor)?;
-            let mut needs_persist = false;
-            if let Some(in_progress) = status.in_progress.take() {
-                if !status.pending.iter().any(|pending| pending == &in_progress) {
-                    status.pending.insert(0, in_progress);
-                }
-                needs_persist = true;
-            }
-            let operations = status
-                .pending
-                .iter()
-                .filter_map(|label| MaintenanceOperation::from_str(label))
-                .collect::<Vec<_>>();
-            if needs_persist {
-                self.persist_maintenance_status(descriptor, &status)?;
-            }
-            operations
-        };
-
-        if operations.is_empty() {
-            return Ok(());
-        }
-
-        self.enqueue_maintenance(descriptor, operations)
-    }
-
-    fn run_maintenance_worker(self, collection_name: String, coordinator_key: PathBuf) {
-        loop {
-            let operation = {
-                let mut coordinator = maintenance_coordinator()
-                    .lock()
-                    .expect("maintenance coordinator lock should not be poisoned");
-                let Some(state) = coordinator.get_mut(&coordinator_key) else {
-                    return;
-                };
-                match state.queue.pop_front() {
-                    Some(operation) => operation,
-                    None => {
-                        coordinator.remove(&coordinator_key);
-                        return;
-                    }
-                }
-            };
-
-            let descriptor = match self.find_collection_descriptor(&collection_name) {
-                Ok(descriptor) => descriptor,
-                Err(_) => {
-                    clear_maintenance_runtime_state(&coordinator_key);
-                    return;
-                }
-            };
-
-            let status_lock = maintenance_status_lock(&descriptor.root_path);
-            if let Ok(_guard) = status_lock.lock()
-                && let Ok(mut status) = self.load_maintenance_status(&descriptor)
-            {
-                let label = operation.as_str().to_owned();
-                status.pending.retain(|pending| pending != &label);
-                status.in_progress = Some(label);
-                let _ = self.persist_maintenance_status(&descriptor, &status);
-            }
-
-            let result = self.perform_maintenance_operation(&collection_name, operation);
-
-            let follow_up_operations = if result.is_ok() {
-                self.load_collection_state(&collection_name, None)
-                    .ok()
-                    .map(|state| {
-                        let mut operations = Vec::new();
-                        if self.should_flush(&state.descriptor, &state.delta) {
-                            operations.push(MaintenanceOperation::Flush);
-                        }
-                        if self.should_compact(&state.descriptor, state.manifest.segments.len()) {
-                            operations.push(MaintenanceOperation::Compact);
-                        }
-                        operations
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            if let Ok(_guard) = status_lock.lock()
-                && let Ok(mut status) = self.load_maintenance_status(&descriptor)
-            {
-                status.in_progress = None;
-                match result {
-                    Ok(_) => {
-                        status.completed_runs += 1;
-                        status.last_error = None;
-                    }
-                    Err(error) => {
-                        status.last_error = Some(error.to_string());
-                    }
-                }
-                let _ = self.persist_maintenance_status(&descriptor, &status);
-            }
-
-            if !follow_up_operations.is_empty() {
-                let _ = self.enqueue_maintenance(&descriptor, follow_up_operations);
-            }
-        }
-    }
-
-    pub(crate) fn perform_maintenance_operation(
-        &self,
-        collection_name: &str,
-        operation: MaintenanceOperation,
-    ) -> Result<Snapshot> {
-        let descriptor = self.find_collection_descriptor(collection_name)?;
-        let manifest_lock = maintenance_operation_lock(&descriptor.root_path);
-        match operation {
-            MaintenanceOperation::Flush => {
-                let _manifest_guard = manifest_lock
-                    .lock()
-                    .expect("maintenance operation lock should not be poisoned");
-                let wal_lock = wal_rotation_lock(&descriptor.root_path);
-                let _wal_guard = wal_lock
-                    .lock()
-                    .expect("wal rotation lock should not be poisoned");
-                let state =
-                    self.load_collection_state_descriptor_with_wal_lock(descriptor, None)?;
-                self.flush_state(state)
-            }
-            MaintenanceOperation::Compact => {
-                let _manifest_guard = manifest_lock
-                    .lock()
-                    .expect("maintenance operation lock should not be poisoned");
-                let state = self.load_collection_state_descriptor(descriptor, None)?;
-                self.compact_state(state)
-            }
-        }
-    }
-}
-
+/// A background maintenance job.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MaintenanceOperation {
     Flush,
@@ -280,7 +29,7 @@ pub(crate) enum MaintenanceOperation {
 }
 
 impl MaintenanceOperation {
-    fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Flush => "flush",
             Self::Compact => "compact",
@@ -296,87 +45,344 @@ impl MaintenanceOperation {
     }
 }
 
-#[derive(Default)]
-struct RuntimeMaintenanceState {
-    running: bool,
+/// A collection's maintenance queue and the status it persists.
+#[derive(Debug, Default)]
+pub(crate) struct MaintenanceState {
+    status: MaintenanceStatus,
     queue: VecDeque<MaintenanceOperation>,
+    /// Whether a job loop is scheduled or running for the collection.
+    running: bool,
 }
 
-fn maintenance_coordinator() -> &'static Mutex<BTreeMap<PathBuf, RuntimeMaintenanceState>> {
-    static COORDINATOR: OnceLock<Mutex<BTreeMap<PathBuf, RuntimeMaintenanceState>>> =
-        OnceLock::new();
-    COORDINATOR.get_or_init(|| Mutex::new(BTreeMap::new()))
+impl MaintenanceState {
+    /// State recovered from a persisted status. A job that was in progress when the process
+    /// stopped goes back to the front of the pending list. Returns the operations to resume and
+    /// whether the status changed and must be persisted again.
+    pub(crate) fn recovered(
+        mut status: MaintenanceStatus,
+    ) -> (Self, Vec<MaintenanceOperation>, bool) {
+        let mut changed = false;
+        if let Some(in_progress) = status.in_progress.take() {
+            if !status.pending.iter().any(|pending| pending == &in_progress) {
+                status.pending.insert(0, in_progress);
+            }
+            changed = true;
+        }
+        let resume = status
+            .pending
+            .iter()
+            .filter_map(|label| MaintenanceOperation::from_str(label))
+            .collect();
+        (
+            Self {
+                status,
+                ..Self::default()
+            },
+            resume,
+            changed,
+        )
+    }
+
+    /// The status this state persists.
+    pub(crate) fn status(&self) -> &MaintenanceStatus {
+        &self.status
+    }
 }
 
-fn clear_maintenance_runtime_state(path: &Path) {
-    let mut coordinator = maintenance_coordinator()
-        .lock()
-        .expect("maintenance coordinator lock should not be poisoned");
-    coordinator.remove(path);
+/// Whether the delta of `version` has reached a flush threshold.
+pub(crate) fn should_flush(descriptor: &CollectionDescriptor, version: &Version) -> bool {
+    version.counters.memtable_rows >= descriptor.flush_threshold_ops as u64
+        || version.counters.memtable_bytes >= descriptor.flush_threshold_bytes as u64
 }
 
-fn maintenance_operation_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+/// Whether `version` has enough segments to compact.
+pub(crate) fn should_compact(descriptor: &CollectionDescriptor, version: &Version) -> bool {
+    version.counters.segment_count as usize >= descriptor.compaction_threshold_segments
 }
 
-fn maintenance_operation_lock(path: &Path) -> Arc<Mutex<()>> {
-    let mut locks = maintenance_operation_locks()
-        .lock()
-        .expect("maintenance operation lock map should not be poisoned");
-    locks
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+impl EngineCore {
+    pub(crate) fn maintenance_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("maintenance.json")
+    }
+
+    pub(crate) fn load_maintenance_status(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        let path = Self::maintenance_file_path(descriptor);
+        if !path_exists(self.vfs.as_ref(), &path)? {
+            return Ok(MaintenanceStatus::default());
+        }
+        read_json(self.vfs.as_ref(), &path)
+    }
+
+    /// Persist `status`. The collection directory must exist: a job or a write that races a
+    /// drop must not recreate the retired directory.
+    pub(crate) fn persist_maintenance_status(
+        &self,
+        descriptor: &CollectionDescriptor,
+        status: &MaintenanceStatus,
+    ) -> Result<()> {
+        atomic_write_in_existing_dir(
+            self.vfs.as_ref(),
+            &Self::maintenance_file_path(descriptor),
+            serde_json::to_vec_pretty(status).map_err(json_message)?,
+        )
+    }
+
+    /// The collection's maintenance status. Resident; no file read.
+    pub(crate) fn maintenance_status(&self, handle: &CollectionHandle) -> MaintenanceStatus {
+        lock_jobs(handle).status.clone()
+    }
+
+    /// Persist `state.status`. A failure is recorded in the status rather than returned: the
+    /// in-memory queue is authoritative while the engine runs, and the file only matters for
+    /// resuming after a restart.
+    fn persist_locked(&self, handle: &CollectionHandle, state: &mut MaintenanceState) {
+        if let Err(error) = self.persist_maintenance_status(handle.descriptor(), &state.status) {
+            state.status.last_error =
+                Some(format!("failed to persist maintenance status: {error}"));
+        }
+    }
 }
 
-fn maintenance_status_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn lock_jobs(handle: &CollectionHandle) -> MutexGuard<'_, MaintenanceState> {
+    handle.jobs.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn maintenance_status_lock(path: &Path) -> Arc<Mutex<()>> {
-    let mut locks = maintenance_status_locks()
-        .lock()
-        .expect("maintenance status lock map should not be poisoned");
-    locks
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+impl CoreRef {
+    /// Queue `operations` for `handle` and make sure a job loop will run them.
+    pub(crate) fn enqueue_maintenance(
+        &self,
+        handle: &Arc<CollectionHandle>,
+        operations: Vec<MaintenanceOperation>,
+    ) {
+        if operations.is_empty() || handle.is_dropped() {
+            return;
+        }
+        let start = {
+            let mut state = lock_jobs(handle);
+            for operation in &operations {
+                let label = operation.as_str();
+                if state.status.in_progress.as_deref() != Some(label)
+                    && !state.status.pending.iter().any(|pending| pending == label)
+                {
+                    state.status.pending.push(label.to_owned());
+                }
+                if !state.queue.contains(operation) {
+                    state.queue.push_back(*operation);
+                }
+            }
+            self.persist_locked(handle, &mut state);
+            !std::mem::replace(&mut state.running, true)
+        };
+        if start {
+            let core = self.clone();
+            let loop_handle = Arc::clone(handle);
+            if self
+                .jobs
+                .execute(move || core.run_maintenance_queue(&loop_handle))
+                .is_err()
+            {
+                lock_jobs(handle).running = false;
+            }
+        }
+    }
+
+    /// Resume the maintenance that recovery found pending, once, on the first data-plane
+    /// access of `handle` (v1 semantics: metadata and status reads never start jobs).
+    pub(crate) fn resume_armed_maintenance(&self, handle: &Arc<CollectionHandle>) {
+        if handle.take_maintenance_resume() {
+            self.resume_maintenance(handle);
+        }
+    }
+
+    /// Resume the persisted pending operations of `handle` if its queue is idle.
+    pub(crate) fn resume_maintenance(&self, handle: &Arc<CollectionHandle>) {
+        let operations = {
+            let state = lock_jobs(handle);
+            if state.running {
+                return;
+            }
+            state
+                .status
+                .pending
+                .iter()
+                .filter_map(|label| MaintenanceOperation::from_str(label))
+                .collect::<Vec<_>>()
+        };
+        self.enqueue_maintenance(handle, operations);
+    }
+
+    /// Run the next queued job for `handle`, then, if more are queued, go to the back of the
+    /// job threads' queue for the next one. Yielding after every job keeps the shared job
+    /// threads fair: a collection whose writes keep refilling its queue cannot starve other
+    /// collections or explicit flush and compaction requests. Stops when the queue is empty, the
+    /// collection is dropped, or the engine shuts down; pending operations left behind stay
+    /// persisted and resume on reopen.
+    fn run_maintenance_queue(&self, handle: &Arc<CollectionHandle>) {
+        let operation = {
+            let mut state = lock_jobs(handle);
+            let next = if self.is_shutting_down() || handle.is_dropped() {
+                None
+            } else {
+                state.queue.pop_front()
+            };
+            let Some(operation) = next else {
+                state.running = false;
+                return;
+            };
+            let label = operation.as_str();
+            state.status.pending.retain(|pending| pending != label);
+            state.status.in_progress = Some(label.to_owned());
+            self.persist_locked(handle, &mut state);
+            operation
+        };
+
+        let result = self.perform_maintenance(handle, operation);
+        let follow_up = if result.is_ok() {
+            let version = handle.current();
+            let descriptor = handle.descriptor();
+            let mut operations = Vec::new();
+            if should_flush(descriptor, &version) {
+                operations.push(MaintenanceOperation::Flush);
+            }
+            if should_compact(descriptor, &version) {
+                operations.push(MaintenanceOperation::Compact);
+            }
+            operations
+        } else {
+            Vec::new()
+        };
+
+        {
+            let mut state = lock_jobs(handle);
+            state.status.in_progress = None;
+            match result {
+                Ok(_) => {
+                    state.status.completed_runs += 1;
+                    state.status.last_error = None;
+                }
+                Err(error) => state.status.last_error = Some(error.to_string()),
+            }
+            if !handle.is_dropped() {
+                self.persist_locked(handle, &mut state);
+            }
+        }
+        // This job still owns the queue (`running` is set), so this only queues.
+        self.enqueue_maintenance(handle, follow_up);
+
+        let more = {
+            let mut state = lock_jobs(handle);
+            if state.queue.is_empty() {
+                state.running = false;
+            }
+            state.running
+        };
+        if more {
+            let core = self.clone();
+            let next_handle = Arc::clone(handle);
+            if self
+                .jobs
+                .execute(move || core.run_maintenance_queue(&next_handle))
+                .is_err()
+            {
+                lock_jobs(handle).running = false;
+            }
+        }
+    }
+
+    /// Run one maintenance operation now, on the calling thread.
+    pub(crate) fn perform_maintenance(
+        &self,
+        handle: &Arc<CollectionHandle>,
+        operation: MaintenanceOperation,
+    ) -> Result<Snapshot> {
+        match operation {
+            MaintenanceOperation::Flush => self.flush_collection(handle),
+            MaintenanceOperation::Compact => self.compact_collection(handle),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::unique_temp_dir;
+    use crate::{
+        CreateCollectionRequest, Engine, EngineConfig,
+        test_support::{put, unique_temp_dir},
+    };
+    use logpose_types::{CollectionRef, DistanceMetric};
+    use logpose_vfs::std_vfs;
+
+    /// A write or job that checked the collection just before a concurrent drop still persists
+    /// its status afterwards; that must not recreate the retired directory.
+    #[test]
+    fn a_status_persisted_after_a_drop_does_not_recreate_the_directory() {
+        let root = unique_temp_dir("maintenance-after-drop");
+        let engine =
+            Engine::open(std_vfs(), &root, EngineConfig::default()).expect("engine should open");
+        let descriptor = engine
+            .core()
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
+                "events",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .expect("descriptor should plan");
+        let handle = engine
+            .create_collection(descriptor, None)
+            .expect("collection should be created");
+        engine
+            .core()
+            .write(&handle, vec![put("alpha", vec![1.0, 0.0])])
+            .expect("write should succeed");
+        engine
+            .drop_collection(&CollectionRef::new_default("events"))
+            .expect("drop should succeed");
+
+        let status = MaintenanceStatus {
+            pending: vec!["flush".to_owned()],
+            ..MaintenanceStatus::default()
+        };
+        engine
+            .core()
+            .persist_maintenance_status(handle.descriptor(), &status)
+            .expect_err("the retired directory is gone");
+        assert!(
+            !handle.meta().dir.exists(),
+            "persisting a status must not resurrect a dropped collection's directory"
+        );
+    }
 
     #[test]
-    fn maintenance_worker_clears_coordinator_on_descriptor_lookup_failure() {
-        let root = unique_temp_dir("storage-maintenance-descriptor-failure");
-        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-        let coordinator_key = root.join("collections").join("missing-collection");
-
-        {
-            let mut coordinator = maintenance_coordinator()
-                .lock()
-                .expect("maintenance coordinator lock should not be poisoned");
-            coordinator.insert(
-                coordinator_key.clone(),
-                RuntimeMaintenanceState {
-                    running: true,
-                    queue: VecDeque::from([MaintenanceOperation::Flush]),
-                },
-            );
-        }
-
-        engine.run_maintenance_worker("missing".to_owned(), coordinator_key.clone());
-
-        let coordinator = maintenance_coordinator()
-            .lock()
-            .expect("maintenance coordinator lock should not be poisoned");
-        assert!(
-            !coordinator.contains_key(&coordinator_key),
-            "descriptor lookup failure should clear runtime coordinator state"
+    fn recovered_state_resumes_the_interrupted_job_first() {
+        let (state, resume, changed) = MaintenanceState::recovered(MaintenanceStatus {
+            pending: vec!["compact".to_owned(), "bogus".to_owned()],
+            in_progress: Some("flush".to_owned()),
+            last_error: None,
+            completed_runs: 3,
+        });
+        assert!(changed);
+        assert_eq!(
+            resume,
+            vec![MaintenanceOperation::Flush, MaintenanceOperation::Compact]
         );
+        assert_eq!(state.status.pending, vec!["flush", "compact", "bogus"]);
+        assert_eq!(state.status.in_progress, None);
+        assert_eq!(state.status.completed_runs, 3);
+        assert!(!state.running);
+    }
+
+    #[test]
+    fn recovered_state_without_an_interrupted_job_is_unchanged() {
+        let status = MaintenanceStatus {
+            pending: vec!["compact".to_owned()],
+            ..MaintenanceStatus::default()
+        };
+        let (state, resume, changed) = MaintenanceState::recovered(status.clone());
+        assert!(!changed);
+        assert_eq!(resume, vec![MaintenanceOperation::Compact]);
+        assert_eq!(state.status, status);
     }
 }

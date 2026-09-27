@@ -73,12 +73,19 @@ impl StoredCollectionDescriptor {
 }
 
 impl EtcdBackedStorageEngine {
-    /// Construct the wrapper over a local storage root.
+    /// Construct the wrapper over a local storage root, opening its engine.
+    ///
+    /// Fails if another engine holds the root; to share an open engine, use
+    /// [`EtcdBackedStorageEngine::with_local`].
     pub fn new(root: impl AsRef<Path>, config: EtcdMetadataConfig) -> Result<Self> {
-        let etcd = EtcdPlacementStore::new(config)?;
+        Self::with_local(LocalStorageEngine::new(root)?, config)
+    }
+
+    /// Construct the wrapper over an already open local engine.
+    pub fn with_local(local: LocalStorageEngine, config: EtcdMetadataConfig) -> Result<Self> {
         Ok(Self {
-            local: Arc::new(LocalStorageEngine::new(root)?),
-            etcd,
+            local: Arc::new(local),
+            etcd: EtcdPlacementStore::new(config)?,
         })
     }
 
@@ -1890,8 +1897,9 @@ mod tests {
             ))
             .await
             .expect("local collection should be created");
-        let engine = EtcdBackedStorageEngine::new(&root, etcd_config("http://127.0.0.1:1"))
-            .expect("engine should build");
+        let engine =
+            EtcdBackedStorageEngine::with_local(local.clone(), etcd_config("http://127.0.0.1:1"))
+                .expect("engine should build");
 
         let error = engine
             .collection_assignment_descriptor(&descriptor)

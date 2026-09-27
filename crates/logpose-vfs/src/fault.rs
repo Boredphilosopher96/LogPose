@@ -25,6 +25,7 @@
 //!   under its old name, a newly created file may vanish, a removed file may come back, and an
 //!   unsynced change may also survive. A rename within one directory is atomic; a rename across
 //!   directories is two independent changes, so the file may end up under both names or none.
+//!   Directories can be renamed only within their parent and only onto a free name.
 //!   A directory whose own entry set was never synced keeps only the persisted prefix of its
 //!   changes.
 //! - **Crash halts the process.** After a crash triggers, every call returns an
@@ -253,6 +254,40 @@ impl FaultVfs {
         world.check_alive(self.pinned_boot)?;
         Ok(world)
     }
+
+    /// Rename directory `dir` within its parent, as one atomic change to the parent's entry set.
+    ///
+    /// Only same-directory renames onto a free name are modelled: that is what retiring a
+    /// collection directory needs, and it keeps every directory reachable under exactly one name
+    /// whatever a crash keeps.
+    fn rename_dir(
+        &self,
+        mut world: MutexGuard<'_, World>,
+        dir: u64,
+        (from_parent, from_name): (u64, String),
+        (to_parent, to_name): (u64, String),
+    ) -> io::Result<()> {
+        if from_parent != to_parent {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "FaultVfs renames directories only within their parent directory",
+            ));
+        }
+        if from_name == to_name {
+            return Ok(());
+        }
+        if world.entry(to_parent, &to_name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("rename target '{to_name}' of a directory already exists"),
+            ));
+        }
+        world.begin_mutation(self.pinned_boot)?;
+        world.change_namespace(
+            from_parent,
+            vec![(from_name, None), (to_name, Some(Node::Dir(dir)))],
+        )
+    }
 }
 
 impl Vfs for FaultVfs {
@@ -351,11 +386,8 @@ impl Vfs for FaultVfs {
         let (to_parent, to_name) = world.split(to)?;
         let ino = match world.entry(from_parent, &from_name)? {
             Some(Node::File(ino)) => ino,
-            Some(Node::Dir(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "FaultVfs renames files only",
-                ));
+            Some(Node::Dir(dir)) => {
+                return self.rename_dir(world, dir, (from_parent, from_name), (to_parent, to_name));
             }
             None => return Err(not_found(from)),
         };
@@ -1106,6 +1138,64 @@ mod tests {
             read_file(vfs.as_ref(), Path::new("/db/old")).expect("read"),
             b"new"
         );
+    }
+
+    #[test]
+    fn a_directory_rename_is_atomic_and_volatile_until_the_parent_is_synced() {
+        let mut outcomes = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let vfs = FaultVfs::new(seed);
+            vfs.create_dir_all(Path::new("/db/coll")).expect("mkdir");
+            vfs.sync_dir(Path::new("/")).expect("sync root");
+            vfs.sync_dir(Path::new("/db")).expect("sync db");
+            write_synced(vfs.as_ref(), Path::new("/db/coll/data"), b"data");
+            vfs.sync_dir(Path::new("/db/coll")).expect("sync coll");
+
+            vfs.rename(Path::new("/db/coll"), Path::new("/db/coll.dropped"))
+                .expect("directory rename");
+            assert_eq!(names(vfs.as_ref(), "/db"), vec!["coll.dropped"]);
+            assert_eq!(
+                read_file(vfs.as_ref(), Path::new("/db/coll.dropped/data")).expect("read"),
+                b"data"
+            );
+            vfs.set_plan(FaultPlan {
+                tear: TearMode::KeepRandomPrefix,
+                ..FaultPlan::default()
+            });
+            vfs.crash();
+            let state = names(vfs.as_ref(), "/db");
+            assert!(
+                state == ["coll"] || state == ["coll.dropped"],
+                "the rename is all or nothing: {state:?}"
+            );
+            let data = Path::new("/db").join(&state[0]).join("data");
+            assert_eq!(read_file(vfs.as_ref(), &data).expect("read"), b"data");
+            outcomes.insert(state[0].clone());
+
+            vfs.rename(&Path::new("/db").join(&state[0]), Path::new("/db/final"))
+                .expect("directory rename");
+            vfs.sync_dir(Path::new("/db")).expect("sync db");
+            vfs.crash();
+            assert_eq!(
+                names(vfs.as_ref(), "/db"),
+                vec!["final"],
+                "a synced rename is durable"
+            );
+        }
+        assert_eq!(outcomes.len(), 2, "both outcomes occur: {outcomes:?}");
+
+        let vfs = FaultVfs::new(0);
+        vfs.create_dir_all(Path::new("/db/a")).expect("mkdir");
+        vfs.create_dir_all(Path::new("/db/b")).expect("mkdir");
+        vfs.create_dir_all(Path::new("/other")).expect("mkdir");
+        let error = vfs
+            .rename(Path::new("/db/a"), Path::new("/db/b"))
+            .expect_err("a directory is not renamed over an existing entry");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let error = vfs
+            .rename(Path::new("/db/a"), Path::new("/other/a"))
+            .expect_err("directories move only within their parent");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

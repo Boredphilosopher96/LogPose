@@ -9,6 +9,7 @@
 // Assertion helpers panic with the crash context on failure.
 #![allow(clippy::panic)]
 
+use arc_swap as _;
 use async_trait as _;
 use crc32c as _;
 use crc32fast as _;
@@ -19,6 +20,7 @@ use logpose_query as _;
 use logpose_wal as _;
 use postcard as _;
 use rand as _;
+use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
@@ -27,8 +29,8 @@ use uuid as _;
 
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, DeleteRecord, DistanceMetric, NodeRole,
-    PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DeleteRecord, DistanceMetric,
+    NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use serde_json::json;
@@ -166,6 +168,24 @@ impl Harness {
             }
         }
         outcome
+    }
+
+    /// Drop the engine (the crashed process), apply the crash model, and reopen with a crash
+    /// planned `crash_after_ops` operations into recovery. The interrupted open may fail, or
+    /// succeed with the collection registered as failed; either way the process then dies.
+    fn crash_then_crash_during_recovery(&mut self, crash_after_ops: u64, tear: TearMode) {
+        self.engine = None;
+        self.fault.crash();
+        self.fault.set_plan(FaultPlan {
+            crash_after_ops: Some(crash_after_ops),
+            tear,
+            ..FaultPlan::default()
+        });
+        drop(LocalStorageEngine::with_vfs(
+            self.fault.process(),
+            ROOT,
+            None,
+        ));
     }
 
     /// Drop the engine (the crashed process), apply the crash model, and reopen.
@@ -358,27 +378,21 @@ async fn a_crash_during_recovery_is_recovered() {
             let mut harness = Harness::new(seed).await;
             harness.fault.set_plan(plan.clone());
             let outcome = harness.run(&steps).await;
-            harness.crash_and_reopen();
 
             // Count what recovery does on this state, on a throwaway copy of the same run.
+            // Recovery runs inside `open`.
             let recovery_ops = {
                 let mut probe = Harness::new(seed).await;
                 probe.fault.set_plan(plan);
                 probe.run(&steps).await;
                 probe.crash_and_reopen();
-                let _ = probe.engine().stats(COLLECTION).await;
                 probe.fault.mutating_ops()
             };
 
             for recovery_crash in 0..recovery_ops {
-                harness.fault.set_plan(FaultPlan {
-                    crash_after_ops: Some(recovery_crash),
-                    tear,
-                    ..FaultPlan::default()
-                });
-                let _ = harness.engine().stats(COLLECTION).await;
-                harness.crash_and_reopen();
+                harness.crash_then_crash_during_recovery(recovery_crash, tear);
             }
+            harness.crash_and_reopen();
             let context = format!("tear={tear:?} crash_after_ops={k} then recovery crashes");
             let kept = assert_recovered(&harness, &outcome, &context).await;
             assert_engine_keeps_working(&mut harness, kept, &context).await;
@@ -482,6 +496,90 @@ async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
                 expected_visible(&[vec![put("a", 1.0)]]),
                 "{context}"
             );
+        }
+    }
+}
+
+/// Collection directories left under the storage root, retired ones included.
+fn collection_dir_entries(harness: &Harness) -> Vec<String> {
+    harness
+        .fault
+        .process()
+        .list(&Path::new(ROOT).join("collections"))
+        .expect("collections should list")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// A drop that returned `Ok` survives any crash; a drop interrupted by a crash leaves the
+/// collection either gone or whole, and the root usable either way.
+#[tokio::test]
+async fn a_crash_while_dropping_a_collection_leaves_it_gone_or_whole() {
+    let steps = &scenario()[..3];
+    let drop_ops = {
+        let harness = Harness::new(0).await;
+        harness.run(steps).await;
+        let before = harness.fault.mutating_ops();
+        harness
+            .engine()
+            .engine()
+            .drop_collection(&CollectionRef::new_default(COLLECTION))
+            .expect("clean drop should succeed");
+        harness.fault.mutating_ops() - before
+    };
+    assert!(drop_ops >= 3, "a drop renames, syncs and removes");
+
+    for tear in TearMode::ALL {
+        for k in 0..=drop_ops {
+            let context = format!("tear={tear:?} crash_after_ops={k} during drop");
+            let mut harness = Harness::new(k * 4 + tear as u64).await;
+            let outcome = harness.run(steps).await;
+            assert!(outcome.failed_step.is_none(), "{context}: setup failed");
+            harness.fault.set_plan(FaultPlan {
+                crash_after_ops: Some(harness.fault.mutating_ops() + k),
+                tear,
+                ..FaultPlan::default()
+            });
+            let dropped = harness
+                .engine()
+                .engine()
+                .drop_collection(&CollectionRef::new_default(COLLECTION))
+                .is_ok();
+            harness.crash_and_reopen();
+
+            let listed = harness
+                .engine()
+                .list_collections()
+                .await
+                .unwrap_or_else(|error| panic!("{context}: listing failed: {error}"));
+            if dropped || listed.is_empty() {
+                assert!(
+                    listed.is_empty(),
+                    "{context}: an acknowledged drop must survive the crash"
+                );
+                assert!(
+                    collection_dir_entries(&harness).is_empty(),
+                    "{context}: open removes what the drop left behind"
+                );
+                harness
+                    .engine()
+                    .create_collection(CreateCollectionRequest::new(
+                        COLLECTION,
+                        2,
+                        DistanceMetric::Dot,
+                    ))
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
+                harness
+                    .engine()
+                    .write(COLLECTION, vec![put("a", 1.0)])
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: write failed: {error}"));
+            } else {
+                let kept = assert_recovered(&harness, &outcome, &context).await;
+                assert_engine_keeps_working(&mut harness, kept, &context).await;
+            }
         }
     }
 }
@@ -685,12 +783,14 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
     }
 }
 
-/// A torn WAL tail is repaired on the next write; a crash right after the repair keeps it.
+/// A torn WAL tail is repaired when the collection is recovered; a crash right after the repair
+/// keeps it.
 #[tokio::test]
 async fn crash_after_wal_tail_repair_keeps_the_repair() {
     let mut harness = Harness::new(60).await;
     let outcome = harness.run(&scenario()[..2]).await;
     assert_eq!(outcome.acked.len(), 2);
+    harness.engine = None;
 
     let active = active_wal_path(&harness);
     let file = harness
@@ -700,25 +800,30 @@ async fn crash_after_wal_tail_repair_keeps_the_repair() {
     file.append(&[IoSlice::new(b"torn frame")])
         .expect("garbage append");
     file.sync_data().expect("garbage sync");
+    drop(file);
 
     harness.fault.set_plan(FaultPlan {
         crash_at: Some(CrashPoint::RecoveryAfterTailRepair),
         ..FaultPlan::default()
     });
-    harness
-        .engine()
-        .write(COLLECTION, vec![put("f", 1.5)])
+    let engine = LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
+        .expect("the engine opens even when a collection fails to recover");
+    let error = engine
+        .stats(COLLECTION)
         .await
-        .expect_err("the write should crash after repairing the tail");
-    let outcome = Outcome {
-        acked: outcome.acked,
-        in_flight: Some(vec![put("f", 1.5)]),
-        failed_step: Some(2),
-        snapshots: outcome.snapshots,
-    };
-    harness.crash_and_reopen();
+        .expect_err("recovery should crash right after repairing the tail");
+    assert!(error.to_string().contains("tail repair"), "{error}");
+    drop(engine);
+    assert_eq!(
+        harness.fault.crash().triggered_at,
+        Some(CrashPoint::RecoveryAfterTailRepair)
+    );
+    harness.engine = Some(
+        LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
+            .expect("engine should reopen"),
+    );
     let kept = assert_recovered(&harness, &outcome, "RecoveryAfterTailRepair").await;
-    assert_eq!(kept.len(), 2, "the crashed write never reached the WAL");
+    assert_eq!(kept.len(), 2, "no write was in flight");
     assert_engine_keeps_working(&mut harness, kept, "RecoveryAfterTailRepair").await;
 }
 

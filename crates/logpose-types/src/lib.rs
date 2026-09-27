@@ -27,6 +27,24 @@ pub enum LogPoseError {
     /// Generic bootstrap and configuration errors.
     #[error("{0}")]
     Message(String),
+    /// The storage root is already served by another engine, in this process or another one.
+    ///
+    /// Exactly one engine may own a storage root: engines keep collection state resident, so
+    /// two engines on one root would each publish state the other never sees.
+    #[error(
+        "storage root '{}' is already in use by another engine{}; lock file '{}' is held exclusively",
+        .root.display(),
+        .holder_pid.as_ref().map(|pid| format!(" (held by pid {pid})")).unwrap_or_default(),
+        .lock_file.display()
+    )]
+    StorageRootLocked {
+        /// The storage root.
+        root: std::path::PathBuf,
+        /// The lock file inside it.
+        lock_file: std::path::PathBuf,
+        /// Process id recorded in the lock file by the holder, if readable.
+        holder_pid: Option<String>,
+    },
 }
 
 /// Build metadata surfaced by service entrypoints.
