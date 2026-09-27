@@ -12,7 +12,7 @@ Other work lands in parallel and is referenced, not redesigned, here:
 | SIMD kernels (`logpose-index`) | `dot`, `l2_sq`, SQ8 variants, and batched scoring over `&[f32]` and `&[u8]` |
 | SQ8 (`logpose-index`) | per-segment quantizer params plus codes, serialized into one payload |
 | Scalar inverted and sorted indexes (`logpose-index`) | builders over `(row_id, value)` and readers that return `RoaringBitmap` |
-| Schema, `Value`, `Record` (`logpose-types`) | `Schema`, `FieldId`, `FieldType`, `Value`, `PrimaryKey`, `Record`, and the binary `Value` codec |
+| Schema, `Value`, `Record` (`logpose-types`) | `CollectionSchema` (with `schema_version: u64`), `FieldId(u32)`, `FieldType`, `Value`, `PrimaryKey`, `Record`, `PartialUpdate`; the binary value codec is **not** in that PR and is specified here ([Binary Value Codec](#binary-value-codec)) |
 | WAL batch frames (Phase 0) | one frame per batch; WAL v2 below supersedes the format |
 | Durability fixes (Phase 0) | directory fsync, tail repair, storage-root lock; this design absorbs them into the `Vfs` |
 
@@ -48,11 +48,12 @@ Tests assert these by number. "Logical state at `s`" means the map `pk -> row` o
 6. **I6 Sequence monotonicity.** Sequence numbers are assigned gap-free starting at 1. Published `Version` ids strictly increase and `visible_seq_no` never decreases.
 7. **I7 GC safety.** A segment file is deleted only when (a) the durable `CURRENT` manifest does not reference it and (b) no live `Version`, including a token-pinned one, references it. A WAL file, DV file, or manifest file is deleted only after a durable manifest supersedes it.
 8. **I8 Crash-recovery equivalence.** After recovery, the logical state equals the logical state at `R`, where `R` is the last sequence number of the longest valid WAL frame prefix, and `R` is at least the last acknowledged sequence number.
-9. **I9 Checkpoint coverage.** For the manifest `M` named by `CURRENT` with checkpoint `C`: every row of every segment in `M` that was deleted by an operation with sequence number at most `C` is set in the DV file that `M` names for that segment; and every operation with sequence number greater than `C` is in a WAL file that still exists.
+9. **I9 Checkpoint coverage.** For the manifest `M` named by `CURRENT` with checkpoint `C`: every row of every segment in `M` that was deleted by an operation with sequence number at most `C` is set in the DV file that `M` names for that segment; and every operation with sequence number greater than `C` is in a WAL file that still exists. Conversely, every bit in a DV file, and every row a segment omits because it was deleted, comes from an operation whose WAL group was fsynced before the file was written (bits may be early, never speculative).
 10. **I10 Row address stability.** A `RowAddr { unit, row }` never changes meaning. Segments are immutable; memtable slots are append-only; deletion bits are only ever set, never cleared, for a given unit.
 11. **I11 Recovery idempotence.** Recovery that crashes at any point and is rerun produces the same state as a single uninterrupted recovery.
 12. **I12 Token repeatability.** Two reads with the same unexpired snapshot token return identical results.
 13. **I13 Counter exactness.** `Version` live and deleted row counters equal the values computed from row counts and deletion-vector cardinalities.
+14. **I14 Durable visibility.** Every operation reflected in a published `Version` is durable: its WAL group's fsync returned `Ok` before the `Version` was stored. There is no visible-but-not-durable state, so a crash never takes back something a reader saw. Maintenance jobs snapshot only published (hence durable) state.
 
 ## Module and Crate Layout
 
@@ -199,14 +200,14 @@ pub trait VfsFile: Send + Sync {
     fn sync_all(&self) -> io::Result<()>;
     /// Current length, including unsynced appends.
     fn len(&self) -> io::Result<u64>;
-    /// Truncate. Used only by WAL tail repair.
+    /// Truncate. Used only by WAL tail repair and failed-group rollback.
     fn set_len(&self, len: u64) -> io::Result<()>;
 }
 
 pub trait VfsLock: Send + Sync {}
 ```
 
-The trait is deliberately narrow: no seek, no in-place overwrite, no mmap. Immutable files are written once with `CreateNew` plus `append`, and the only mutable file is the WAL tail.
+The trait is deliberately narrow: no seek, no in-place overwrite, no mmap. Immutable files are written once with `CreateNew` plus `append`, and the only mutable file is the WAL tail. Because `CreateNew` fails on an existing name, no file name (segment unit id, DV generation, manifest generation) is ever reused within a process, including after a failed attempt; see [Id Allocation and Failed Commits](#id-allocation-and-failed-commits).
 
 ### StdVfs
 
@@ -290,6 +291,7 @@ Crash-point API for tests:
 pub enum CrashPoint {
     WalAfterAppend,
     WalAfterSync,
+    WalAfterRollback,
     WalAfterRotateCreate,
     FlushAfterSegmentSync,
     FlushAfterDvSync,
@@ -411,7 +413,7 @@ pub struct Version {
     /// Strictly increasing per collection (I6).
     pub id: VersionId,
     pub meta: Arc<CollectionMeta>,
-    pub schema: Arc<Schema>,
+    pub schema: Arc<CollectionSchema>,
     /// Last sequence number of the last batch included (I3).
     pub visible_seq_no: SeqNo,
     /// Durable manifest at publish time (diagnostics only; not a read key).
@@ -462,6 +464,8 @@ Ack strictly after store gives I1: a client that has the ack and then calls `loa
 
 Maintenance commits (flush, compaction) publish the same way, with no WAL frame.
 
+Position on visibility and durability: a group becomes visible only after its own fsync returned, and fsyncs of one collection's WAL are strictly sequential (at most one `io` in flight, and `io(n+1)` starts only after `V(n)` is published). So a reader can never observe `G(n+1)` before `G(n)` is durable, and never observe any group before it is durable (I14). The pipelining overlaps `prepare(n+1)` with `io(n)`; it never overlaps two fsyncs or publishes ahead of one. This is stricter than D7 requires, and it is what lets DV files and flush outputs, which are built from published state, contain only durable operations (the second half of I9).
+
 ### Single Writer Task
 
 Each collection has one writer task on the tokio runtime. It owns `WriterState` exclusively; nothing else can touch it, so it has no locks.
@@ -494,7 +498,7 @@ pub enum ControlMsg {
 }
 
 struct WriterState {
-    schema: Arc<Schema>,
+    schema: Arc<CollectionSchema>,
     next_seq_no: SeqNo,
     next_unit_id: u32,
     epoch: Epoch,
@@ -505,6 +509,7 @@ struct WriterState {
     deletes: DeletionMap,
     pk_index: PkIndex,
     durable: DurableState,             // manifest generation, checkpoint, DV gens, live files
+    ids: IdCounters,                   // next_dv_gen, next_manifest_gen (never reused), group_no
     jobs: InFlightJobs,                // flush ticket, compaction tickets, reserved inputs
     counters: VersionCounters,
     last_version_id: VersionId,
@@ -529,21 +534,28 @@ Algorithm, per iteration:
 
 1. **Collect.** Take the first request (await). Then drain with `try_recv` until `max_group_requests` (256) or `max_group_bytes` (16 MiB) is reached or the channel is empty. If `commit_delay` (default 0) is non-zero and the group is smaller than `min_group_requests`, wait up to `commit_delay` for more. The default of 0 relies on the pipeline for batching: while `io(n)` runs, requests accumulate into `G(n+1)`.
 2. **Prepare** (in the writer task, while `io(n)` is in flight). CPU work that scales with batch size (validation, cosine normalization, postcard encoding) runs on the query pool through `run_cpu` over owned request data; `apply` runs inline for groups under 64 rows and otherwise on the query pool with `WriterState` moved in and returned. For each request in arrival order:
-   1. Validate against the schema (types, dimensions, required vectors, pk type, duplicate pk within the batch, frame size limit). On failure, fail that request's ack and skip it. No sequence number is consumed.
+   1. Validate against the writer's schema at this point in the request stream (an `AlterSchema` earlier in the same group has already been applied): types, dimensions, required vectors, pk type, non-finite vector components, zero-norm vectors in cosine fields (normalization would produce NaN), duplicate pk within the batch, frame size limit. Name-keyed `Record`s and `PartialUpdate`s become `FieldId`-keyed `RowImage`s here, and only here (see [Schema Changes](#schema-changes)). On failure, fail that request's ack and skip it. No sequence number is consumed.
    2. For `Update` and filter requests, gather the old rows: memtable rows are read directly; segment rows go through a fetch stage on the I/O pool (the writer awaits it). On I/O error, fail that request only.
-   3. Resolve filters through `RowSetResolver` against a `ReadView` over the writer's current private state (not the published one), so resolution sees every prior batch in order.
+   3. Resolve filters through `RowSetResolver` against a `ReadView` over the writer's current private state (not the published one), so resolution sees every prior batch in order. A filter request is resolved exactly once, to a fixed key set; see [Record Types](#record-types) for chunking.
    4. Convert to `RowOp`s (full row images and pk deletes), assign `first_seq_no..=last_seq_no`, apply to the private state with `apply`, and encode one WAL frame.
    5. After the group, build the candidate `Version` and evaluate flush triggers. If one fires, set `freeze_pending`: the writer stops collecting, drains the pipeline (steps 3 and 4 for this group, then awaits its I/O and publishes it), and freezes before collecting the next group, so the frozen memtable's operations are exactly those in WAL files that end before the rotation.
 3. **Await `io(n)`**, then publish `V(n)` and ack `G(n)` as in the publication protocol.
 4. **Start `io(n+1)`**: one `append` call with all frames of `G(n+1)` as `IoSlice`s, then one `sync_data`. Frames are never split across `append` calls, so a torn write can only damage the last frames of the last group.
 
-Maintenance messages drain the pipeline: when a `ControlMsg` is pending, the writer stops collecting, awaits the in-flight `io(n)`, publishes `V(n)`, and only then handles the message. Every maintenance step that runs on the writer (freeze, flush begin, compaction begin, reconcile, commit) therefore sees private state equal to the published state. The cost is one pipeline bubble per maintenance event.
+Maintenance messages drain the pipeline: when a `ControlMsg` other than `Tick` is pending, the writer does not collect the next group, awaits the in-flight `io` (which covers the last prepared group), publishes its `Version`, and only then handles the message. After the drain no group is prepared but unpublished, so every maintenance step that runs on the writer (freeze, flush begin, compaction begin, reconcile, commit) sees private state equal to the published state, which is durable (I14). The cost is one pipeline bubble per maintenance event. `Tick` does not drain: age-trigger checks only read counters, and pk-index rewrite slices touch only writer-private state that no `Version` contains.
+
+Copy-on-write rule: every shared structure the writer mutates (`Arc<RoaringBitmap>`, `Arc<[f32]>` tails, the `imbl` structures) is copied when it is *shared*, which is `Arc::make_mut` semantics (strong count above one), never when a flag says it was *published*. A candidate `V(n)` is built before `prepare(n+1)` mutates private state but published only after `io(n)`; a published-flag rule would let `prepare(n+1)` mutate structures that the not-yet-published `V(n)` already references.
 
 Decision: one frame per client batch, many frames per fsync. The frame is the atomicity unit (I3) and the replication unit (Phase 7). A multi-batch frame would save 48 header bytes per batch and couple independent batches' fate for no benefit.
 
-Decision: apply before fsync, publish after. Applying early lets `prepare(n+1)` see `G(n)`'s effects (a partial update of a pk inserted by the previous group) without waiting for the disk. The cost is that an fsync failure cannot be rolled back, so it poisons the collection:
+Decision: apply before fsync, publish after. Applying early lets `prepare(n+1)` see `G(n)`'s effects (a partial update of a pk inserted by the previous group) without waiting for the disk. The cost is that an fsync failure cannot be rolled back in memory, so it poisons the collection. The WAL writer tracks `synced_len`, the end offset of the last group whose `sync_data` returned `Ok`. On an `io(n)` error (append or sync):
 
-- `io(n)` error: fail every ack in `G(n)` and `G(n+1)` with `LogPoseError::WalWriteFailed`, set `state = ReadOnly`, store the error in `poison`, stop accepting requests. The last published `Version` keeps serving reads. Reopening the engine recovers from what is on disk. This matches the fault model: after a failed fsync the page cache state is unknowable.
+1. Roll back the file: `set_len(synced_len)`, then `sync_all`, then `crash_point(WalAfterRollback)`. This is what the Phase 0 atomic-batch PR does, and it makes a failed batch definitely absent after recovery instead of possibly replayed.
+2. Fail every ack in `G(n)` with `LogPoseError::WalWriteFailed { outcome }`, where `outcome` is `NotApplied` if the rollback's `sync_all` returned `Ok` and `Unknown` otherwise. Fail every ack in `G(n+1)` (prepared, never appended) with `WalWriteFailed { outcome: NotApplied }`. Clients must treat `Unknown` like a timeout.
+3. Set `state = ReadOnly`, store the error in `poison`, stop accepting requests, abandon in-flight jobs (their `Done` messages are dropped; their files become orphans), and never publish again. Private state includes `G(n)` and `G(n+1)`, which are not durable, so no `Version`, manifest, or DV file may be built from it. The last published `Version` keeps serving reads.
+4. The collection recovers only by reopening it, which runs [Recovery on Open](#recovery-on-open) including its durability barrier. If the rollback succeeded, reopening is safe in-process. If it failed, the page cache may hold `G(n)` frames that are not on disk, and Linux may report a later fsync as successful without writing them, so an in-process reopen could make non-durable frames visible. The handle therefore moves to `Failed { rollback_failed: true }`, in-process reopen is refused, and the operator must restart the process (ideally after checking the device). This residual case is the known fsync-failure hazard and is listed in [Review Log](#review-log) open questions.
+
+This matches the fault model: after a failed fsync the page cache state is unknowable, so nothing after the failure is trusted until it has been re-synced.
 
 ### Readers Pinning a Version
 
@@ -578,6 +590,8 @@ struct Pin {
 - An unknown or expired token fails with `LogPoseError::SnapshotExpired`. Clients restart the scroll.
 - A collection holds at most `max_tokens_per_collection` pins; creating one more fails with `LogPoseError::TooManySnapshots`. Pinned versions hold obsolete segment files on disk, so the cap bounds disk growth.
 - One engine-wide reaper task runs every second and drops expired pins. Dropping a pin may drop the last reference to a `Version`, which may enqueue file deletions (see GC).
+- Expiry never pulls files out from under a running read. A request resolves the token to an `Arc<Version>` once, at `read_view`, and holds that `Arc` until it finishes; the pin only keeps the `Version` alive *between* requests. A scan that outlives the TTL completes normally (its files stay referenced, I7), and only the next page with that token fails with `SnapshotExpired`.
+- Pins also keep retired memtables in memory: a token taken before a flush holds the flushed memtable (up to `memtable.max_bytes`) until it is released. The registry tracks `pinned_retired_bytes`, the bytes of memtables that only pinned `Version`s still reference, and charges them to the engine-wide memtable budget. When the engine-wide total exceeds `token_memory_limit` (default a quarter of the memtable budget), the reaper expires pins oldest-first until it is below the limit, and those tokens fail with `SnapshotExpired`. Without this, 64 tokens taken across 64 flushes could hold 4 GiB of memtables that no budget counts.
 
 The registry mutex is held only for a hash map operation, never across I/O or `.await`.
 
@@ -587,7 +601,7 @@ The registry mutex is held only for a hash map operation, never across I/O or `.
 2. Internally synchronized objects: `BufferCache` (sharded mutexes plus atomics), `FileHandle::obsolete` (`AtomicBool`, `Release` store, `Acquire` load), metric counters (`Relaxed`).
 3. No lock is held across `.await`, across I/O, or across a call into another component. Every critical section is a map or queue operation.
 4. No nested locks. The engine has no lock order because no code path holds two locks.
-5. Rayon tasks never block on a future and never do I/O. Tokio tasks never do blocking I/O or more than about 50 µs of CPU work; larger work goes to a pool.
+5. Rayon tasks never block on a future and never do I/O. Tokio tasks never do blocking I/O or more than about 50 µs of CPU work; larger work goes to a pool. Freeing a flushed memtable (up to 1M slots of persistent-structure nodes) is such work: when the writer retires a memtable or a `Version` whose last holder may be the writer itself, it moves its `Arc` into a retire queue drained on the maintenance pool instead of dropping it inline.
 6. `std::sync::Mutex` is used (not `tokio::sync::Mutex`), because no lock is held across `.await`.
 
 ### Async and Blocking Boundaries
@@ -653,7 +667,7 @@ offset size field
     24    8 first_seq_no
     32    8 last_seq_no
     40    4 payload_crc    crc32c(payload)
-    44    4 reserved       0
+    44    4 group_no       low 32 bits of the writer's fsync-group counter
     48    n payload        postcard-encoded WalPayload
   48+n    p padding        zeros so the next frame starts 8-byte aligned (not CRC-covered)
 ```
@@ -666,7 +680,9 @@ Sequence rules:
 - `SchemaChange` consumes exactly one sequence number (`first == last`).
 - `Checkpoint` consumes none. It carries `first == last == checkpoint_seq_no` and is excluded from the contiguity check.
 - Across data frames, `first_seq_no` must equal the previous data frame's `last_seq_no + 1`. A gap in the uncheckpointed range is corruption.
-- The last frame of every fsync group has `GROUP_END` set. Only the frames after the last durable `GROUP_END` can be unsynced, which is what lets tail repair tell a torn tail from corruption.
+- The last frame of every fsync group has `GROUP_END` set, and every frame of a group carries the same `group_no`; consecutive groups have consecutive numbers (mod 2^32). Only the frames after the last durable `GROUP_END` can be unsynced, and `group_no` is what lets tail repair tell which group a frame after a damaged one belongs to.
+- The first data frame of a file has `first_seq_no` equal to the sequence number in the file name.
+- On replay, a data frame with `first_seq_no <= checkpoint_seq_no < last_seq_no` is corruption: checkpoints fall on batch boundaries (a freeze happens between groups), so a straddling frame means a sequence number was written twice.
 
 ### Record Types
 
@@ -681,8 +697,8 @@ pub enum WalPayload {
 
 #[derive(Serialize, Deserialize)]
 pub struct WriteBatchPayload {
-    /// Schema version the rows were validated against.
-    pub schema_version: u32,
+    /// `CollectionSchema::schema_version` the rows were validated against.
+    pub schema_version: u64,
     /// One sequence number each, in order, starting at first_seq_no.
     pub ops: Vec<RowOp>,
 }
@@ -693,27 +709,40 @@ pub enum RowOp {
     /// update-by-filter all become `Put` with the merged full row.
     Put(RowImage),
     /// Blind delete by key. Delete-by-filter becomes many `Delete`s.
-    Delete(PrimaryKey),
+    Delete(WirePk),
 }
 
-/// A row normalized to the schema.
+/// Externally tagged mirror of `logpose_types::PrimaryKey`, which is
+/// `#[serde(untagged)]` for JSON and so cannot be decoded by postcard.
+#[derive(Serialize, Deserialize)]
+pub enum WirePk {
+    Int64(i64),
+    String(String),
+}
+
+/// A row normalized to the schema. Keyed by FieldId, never by name.
 #[derive(Serialize, Deserialize)]
 pub struct RowImage {
-    pub pk: PrimaryKey,
+    pub pk: WirePk,
     /// Sparse (FieldId, vector) pairs sorted by FieldId; absent = null.
     /// Cosine fields are already normalized. Each vector is encoded as
     /// length-prefixed little-endian f32 bytes (serde_bytes).
     pub vectors: Vec<(FieldId, F32Bytes)>,
-    /// Sparse (FieldId, Value) pairs sorted by FieldId; absent = null.
-    pub scalars: Vec<(FieldId, Value)>,
-    /// Undeclared keys (`$extra`), as a Value::Object.
-    pub dynamic: Option<Value>,
+    /// Sparse (FieldId, value) pairs sorted by FieldId; absent = null.
+    /// Each value is in the binary value codec (serde_bytes).
+    pub scalars: Vec<(FieldId, ValueBytes)>,
+    /// Undeclared keys (`$extra`): one JSON object node in the binary value
+    /// codec, keys sorted, with no key equal to a field name declared in the
+    /// schema the row was validated against. None when there are no keys.
+    pub dynamic: Option<ValueBytes>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct SchemaChangePayload {
-    /// The complete new schema, including FieldId assignments and dropped-field tombstones.
-    pub schema: Schema,
+    /// The complete new schema. `schema_version` is the previous one plus 1.
+    /// Dropped fields are simply absent; `next_field_id` guarantees that
+    /// their FieldIds are never reassigned.
+    pub schema: CollectionSchema,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -731,13 +760,43 @@ Decision: operations are resolved into blind writes (full row images and deletes
 
 Costs: a partial update logs the full row, including a 3 KB vector the client did not send; a large delete-by-filter logs every key (about 9 bytes per `int64` key). Both are acceptable next to the alternative's correctness risk.
 
-Delete-by-filter and update-by-filter atomicity: the writer resolves the filter and writes one frame when the result fits `MAX_FRAME_PAYLOAD`. When it does not, the writer commits successive frames, each an atomic batch resolved against the state after the previous one, and the ack reports `chunks > 1`. This is a deliberate limit (see [Deviations From the Plan](#deviations-from-the-plan)).
+Delete-by-filter and update-by-filter atomicity: the writer resolves the filter exactly once, against its private state when the request reaches the front of the stream, to a fixed list of keys (and, for updates, their merged row images). It writes one frame when the result fits `MAX_FRAME_PAYLOAD`. When it does not, it splits the fixed key list into chunks, each one frame and one atomic batch, and commits them in consecutive groups without taking any other request from the channel in between; the ack reports `chunks > 1` and is sent after the last chunk is published. The filter is never re-evaluated between chunks: re-resolving an update-by-filter whose patch does not change the filter's truth value would match the already-updated rows again and never terminate. Readers can observe a prefix of the chunks, and a crash can leave a prefix durable (the ack then never arrives). This is a deliberate limit (see [Deviations From the Plan](#deviations-from-the-plan)).
 
 Checkpoint frames are written as the first frame of every new WAL file and after every flush commit. Recovery uses them only as a cross-check (`manifest.checkpoint_seq_no >= marker`). They exist so a WAL tailer in Phase 7 learns what is safe to discard without reading manifests.
 
 ### Encoding Choice
 
-Decision: postcard (via serde) for payloads, a hand-written layout for the frame header. The payload types (`Schema`, `Value`, `PrimaryKey`) are serde types owned by the schema PR, and a hand-written codec for them would duplicate that work and drift. Postcard is compact (varints) and deterministic. It is not self-describing, so `format_version` gates decoding and a golden-bytes test pins the encoding. Vectors use a `serde_bytes` wrapper (`F32Bytes`), so a 768-dim vector is one 3072-byte copy. The WAL is short-lived, so format evolution is handled by refusing to open a WAL with an unknown `format_version`.
+Decision: postcard (via serde) for the payload envelope, a hand-written layout for the frame header, and the [Binary Value Codec](#binary-value-codec) for values. Postcard is compact (varints) and deterministic, but it is not self-describing, so it cannot decode anything that needs `deserialize_any`. Two schema-PR types do: `PrimaryKey` is `#[serde(untagged)]`, and `Value::Json` and `Record::extra` hold `serde_json::Value`. The WAL therefore never postcard-encodes `PrimaryKey`, `Value`, or `Record`; it uses `WirePk` and `ValueBytes`. `CollectionSchema` (plain structs and externally tagged enums) is postcard-safe, and PR 7 adds a round-trip test that keeps it so. `format_version` gates decoding and a golden-bytes test pins the encoding. Vectors use a `serde_bytes` wrapper (`F32Bytes`), so a 768-dim vector is one 3072-byte copy. The WAL is short-lived, so format evolution is handled by refusing to open a WAL with an unknown `format_version`.
+
+### Binary Value Codec
+
+One deterministic byte encoding for `Value` and JSON, owned by `logpose-types` (`value::codec`, PR 7) and used by WAL `ValueBytes`, memtable `Json` and `$extra` cells, the segment `JsonValue` scalar encoding, and `DynamicJson` blocks. The schema PR has no binary codec, so this document specifies it. Varints are LEB128; signed integers are zigzag varints.
+
+```text
+tag  Value            payload
+0x00 Null             none
+0x01 Bool false       none
+0x02 Bool true        none
+0x03 Int64            zigzag varint
+0x04 Float64          8 bytes LE (finite; -0.0 already folded to 0.0)
+0x05 String           varint byte length, UTF-8
+0x06 Timestamp        zigzag varint microseconds
+0x07 Array            varint count, then that many encoded Values
+0x08 Json             one JSON node
+
+tag  JSON node        payload
+0x10 null             none
+0x11 false            none
+0x12 true             none
+0x13 integer (i64)    zigzag varint
+0x14 integer (u64)    varint, only for values above i64::MAX
+0x15 float            8 bytes LE
+0x16 string           varint byte length, UTF-8
+0x17 array            varint count, then nodes
+0x18 object           varint count, then (varint key length, key UTF-8, node), keys in byte order
+```
+
+`decode(bytes, FieldType)` checks that the tag fits the field type, so a corrupt cell is a typed error, not a wrong value. Equal values always encode to equal bytes (object keys sorted, one integer form per value), which the segment dictionary encodings and golden files rely on.
 
 ### Tail Repair
 
@@ -745,7 +804,7 @@ On open, for the highest-named file only:
 
 1. Scan frames from offset 0. Stop at the first frame that fails any check: short header, bad magic, bad `header_crc`, oversized or out-of-file `payload_len`, bad `payload_crc`, undecodable payload, or sequence discontinuity.
 2. Let `valid_end` be the end offset (after padding) of the last good frame.
-3. Distinguish a torn tail from corruption: search from the failed offset to EOF, at 8-byte steps, for frames with valid magic, `header_crc`, and `payload_crc`. Because a group is one append followed by one fsync, and the next group is appended only after that fsync returns, at most one group (the last) can be partially persisted, and a page cache may persist its pages in any order. So valid frames after the failure are expected, but only within one group. If some valid frame after the failure has `GROUP_END` set and is followed by any further valid frame, a later group was durably written after the damaged one: fail the collection open with `LogPoseError::WalCorrupt { file, offset }` and modify nothing.
+3. Distinguish a torn tail from corruption: search from the failed offset to EOF, at 8-byte steps, for frames with valid magic, `header_crc`, and `payload_crc`. Because a group is one append followed by one fsync, and the next group is appended only after that fsync returns, at most one group (the last) can be partially persisted, and a page cache may persist its pages in any order. So valid frames after the failure are expected, but only from the damaged frame's own group. That group is `g* = P.group_no` when the last good frame `P` lacks `GROUP_END`, `P.group_no + 1` when it has it, and unknown when the failure is at offset 0. The tail is torn only if every valid frame after the failure has `group_no == g*` (all one value when `g*` is unknown) and at most the last of them has `GROUP_END`. Otherwise a later group was durably written after the damaged one: fail the collection open with `LogPoseError::WalCorrupt { file, offset }` and modify nothing. `group_no` matters when the damaged frame is the `GROUP_END` frame of an acknowledged group followed by one complete later group: without it, the later group's single `GROUP_END` looks like the end of the torn group, and repair would truncate two acknowledged groups.
 4. Otherwise it is a torn tail: `set_len(valid_end)`, `sync_all`, `crash_point(RecoveryAfterTailRepair)`.
 5. A bad frame in any file other than the highest-named one is corruption, unless the whole file is at or below the checkpoint (then it is skipped and deleted by orphan cleanup).
 
@@ -776,7 +835,10 @@ A memtable is append-only in slots. All structures are persistent (`imbl`, the m
 #[derive(Clone)]
 pub struct MemtableData {
     pub unit: UnitId,
-    pub schema: Arc<Schema>,
+    /// Latest schema applied to this memtable. Schema changes apply in place
+    /// (see Schema Changes); readers use `Version::schema`, never this, to map
+    /// names to FieldIds.
+    pub schema: Arc<CollectionSchema>,
     /// Seq range of operations applied to this memtable.
     pub first_seq_no: SeqNo,
     pub last_seq_no: SeqNo,
@@ -792,9 +854,12 @@ pub struct MemtableData {
     pub pk_to_slot: imbl::OrdMap<PrimaryKey, u32>,
     /// One arena per live vector field, sorted by FieldId.
     pub vectors: Vec<(FieldId, VectorArena)>,
-    /// One column per live scalar field, sorted by FieldId.
-    pub columns: Vec<(FieldId, MemColumn)>,
-    /// `$extra`, binary Value encoding.
+    /// One column per scalar field declared at any time during this
+    /// memtable's life, sorted by FieldId, with the first slot it covers.
+    /// Slots below `first_slot` (rows written before the field was added)
+    /// read null. Columns of dropped fields stay until flush and are never read.
+    pub columns: Vec<(FieldId, u32 /* first_slot */, MemColumn)>,
+    /// `$extra`: one JSON object node per slot in the binary value codec.
     pub dynamic: imbl::Vector<Option<Arc<[u8]>>>,
     /// Live indexes over slots, per indexed field.
     pub indexes: Vec<(FieldId, MemScalarIndex)>,
@@ -832,23 +897,23 @@ Memtable slot deletions are not stored in `MemtableData`. They live in `Version:
 
 ```rust
 /// Over slot ids. Persistent: updating one key path-copies O(log n) nodes and
-/// copy-on-writes that key's bitmap.
+/// copy-on-writes the `recent` tier of that key's posting (see CowBitmap).
 pub enum MemScalarIndex {
     /// bool, string, int64, and array elements: equality and IN.
     Inverted {
-        terms: imbl::OrdMap<IndexKey, Arc<RoaringBitmap>>,
-        nulls: Arc<RoaringBitmap>,
+        terms: imbl::OrdMap<IndexKey, CowBitmap>,
+        nulls: CowBitmap,
     },
     /// int64, float64, timestamp: ranges and order_by. Keys are total-ordered
     /// (floats via a total-order wrapper; NaN rejected at validation).
     Sorted {
-        values: imbl::OrdMap<OrderedKey, Arc<RoaringBitmap>>,
-        nulls: Arc<RoaringBitmap>,
+        values: imbl::OrdMap<OrderedKey, CowBitmap>,
+        nulls: CowBitmap,
     },
 }
 ```
 
-`auto` indexing (D4) creates `Inverted` for `bool`, `string`, and arrays, and both `Sorted` and `Inverted` for numbers and timestamps. Indexes include dead slots; readers always `AND NOT` the unit's deletion vector, so slots never need to be removed from bitmaps. Copying a touched key's bitmap per group is bounded by the memtable size, at most a few KB per touched key.
+`auto` indexing (D4) creates `Inverted` for `bool`, `string`, and arrays, and both `Sorted` and `Inverted` for numbers and timestamps. Indexes include dead slots; readers always `AND NOT` the unit's deletion vector, so slots never need to be removed from bitmaps. Postings use the two-tier `CowBitmap` from [Deletion Vectors](#dv-structure), so a group copies at most about 8 KB per touched key. A plain `Arc<RoaringBitmap>` per key would copy the whole posting per group; for a low-cardinality field (a `bool`, or a `tenant` with a few values) in a 1M-slot memtable that is up to 128 KB per touched key per group, and several such fields per row.
 
 ### Upsert of an Existing Key
 
@@ -858,7 +923,7 @@ Decision: a new slot plus a deletion bit on the old slot, never in-place slot re
 
 1. `old = pk_index.resolve(pk)`, following forwarding tables (see [Primary-Key Index](#primary-key-index)).
 2. If `old` is `Some(addr)`: `deletes.mark(addr)`.
-3. For `Put(row)`: append slot `s` to the active memtable (pk, seq, vectors, columns, dynamic, index entries); `pk_to_slot.insert(pk, s)`; `pk_index.insert(pk, RowAddr { unit: active.unit, row: s })`.
+3. For `Put(row)`: append slot `s` to the active memtable (pk, seq, vectors, columns, dynamic, index entries); `pk_to_slot.insert(pk, s)`; `pk_index.insert(pk, RowAddr { unit: active.unit, row: s })`. Values whose `FieldId` the memtable's current schema does not declare are discarded (this happens only in replay, when the manifest's schema is newer than the frame; see [Schema Changes](#schema-changes)).
 4. For `Delete(pk)`: `pk_index.remove(pk)`. If `old` was `None`, the operation changes nothing but still consumes its sequence number.
 5. Update counters.
 
@@ -898,6 +963,42 @@ Freeze (writer, between groups):
 5. Request a flush permit from the scheduler.
 
 A frozen memtable is never mutated. Deletions of its rows after the freeze accumulate in `deletes[frozen.unit]`.
+
+## Schema Changes
+
+`CollectionSchema` from the schema PR assigns every field a `FieldId(u32)` that is never reused (`next_field_id` only grows), bumps `schema_version: u64` on every change, and supports add scalar field (always nullable), drop field, and rename field. Dropped fields leave no tombstone; their ids are simply absent. `Record` and `PartialUpdate` are keyed by field *name*. Storage never stores or logs names: every WAL row, memtable column, and segment section is keyed by `FieldId`, and every WAL batch and segment is stamped with the `schema_version` it was written under.
+
+Name to `FieldId` resolution happens in exactly two places, both against a known schema: the writer's validation step (against the writer's schema at that point in the request stream), and query compilation (against the `ReadView`'s `Version::schema`). A request that names a field dropped before it reached the writer is validated against the new schema, so with dynamic fields on its value lands in `$extra`, and with dynamic fields off it is rejected.
+
+### Alter Protocol
+
+`AlterSchema` is a request in the same stream as writes, so it is ordered with them:
+
+1. In prepare, apply the change to the writer's schema, producing `S'` with `schema_version = v + 1`. Invalid changes fail the request and consume nothing.
+2. Assign one sequence number and encode a `SchemaChange` frame carrying all of `S'`. It commits in its group like a batch (I3: it is a batch of one).
+3. Apply in place, with no freeze: set `schema` on the writer, the active memtable, and the candidate `Version`. An added field gets a memtable column with `first_slot = slot_count` and, if indexed, empty indexes. A dropped field's memtable column and indexes stay until flush; no reader resolves its `FieldId`. A rename changes nothing in storage.
+4. Later requests in the same group validate against `S'`.
+
+The next manifest records the writer's schema at its commit, which may be newer than its `checkpoint_seq_no`. Segments record their own `SchemaSnapshot`: a flush or compaction writes sections for the fields declared in the schema it captured at Begin, and omits dropped ones. A segment whose snapshot predates an added field has no section for it, so the field reads null; a segment written before a drop still has the section, which nothing reads, and the next compaction omits it.
+
+### Replay Across Schema Versions
+
+Recovery starts from the manifest's schema `S_M`, which may already include changes whose `SchemaChange` frames lie after the checkpoint. Replay rules:
+
+Let `cur` be the schema replay holds, initially `S_M`.
+
+- A `SchemaChange` frame with `schema_version <= cur.schema_version` is already reflected and is skipped. One with `cur.schema_version + 1` becomes `cur` and is applied as in step 3. Any other version is `WalCorrupt`.
+- A `WriteBatch` with `schema_version` greater than `cur.schema_version` is `WalCorrupt`. One with an older version is applied normally, and `apply` discards values for `FieldId`s that `cur` does not declare. That yields the same final state as live execution: the field was dropped at a later sequence number, which hides the values the batch wrote.
+
+### Dynamic Field Shadowing
+
+A key in `$extra` collides with a declared name when a field is added, or renamed, to a name that rows written earlier carry in `$extra`. The rule is a pure function of the stored bytes and the reading schema, so it cannot depend on whether a compaction has run:
+
+- **Write.** Validation never stores a key in `$extra` that the writer's schema declares; a partial update that merges an old row removes such keys from the merged `$extra` (the old value is not promoted into the typed field).
+- **Read.** A key in a row's `$extra` is visible (to projection, to `$extra` path filters, and to undeclared-name filters) only if the `ReadView`'s schema does not declare that name. Added fields therefore read null on old rows, as D4 requires, instead of exposing the old dynamic value under the new typed name.
+- **Storage.** Flush and compaction copy `$extra` bytes unchanged. They never strip shadowed keys, because stripping would make a later drop or rename (which un-shadows the name) return different results depending on compaction timing.
+
+Consequence to document for users: dropping or renaming a field makes pre-existing `$extra` values under the old name visible again. See the open questions in the [Review Log](#review-log).
 
 ## Primary-Key Index
 
@@ -939,9 +1040,11 @@ struct RewriteTask {
 }
 ```
 
-Lookup resolves forwarding: while the address's unit is in `forwards`, replace it with `RowAddr { unit: target, row: map[row] }`. Chains are at most as long as the number of unfinished rewrites, normally one.
+Lookup resolves forwarding: while the address's unit is in `forwards`, replace it with `RowAddr { unit: target, row: map[row] }`. Chains are at most as long as the number of unfinished rewrites, normally one. A chain arises when a compaction takes, as input, a unit whose own rewrite has not finished (flush output `s` compacted into `o`, or `o1` compacted again into `o2`); it resolves `m -> s -> o` or `I -> o1 -> o2`. Reaching `map[row] == u32::MAX` means an index entry pointed at a row that was already deleted when the job started, which I5 forbids; it is an invariant violation (`strict_invariants` fails the write; otherwise the entry is treated as absent and `pk_forwarding_violations` is incremented).
 
 Incremental rewrite: after every group and on every `Tick`, the writer processes up to `pk_rewrite_slice` (65,536) rows of the front task. For new row `o`: if the raw (unresolved) map entry for `pks[o]` equals `sources[o]`, set it to `RowAddr { unit: target, row: o }`; otherwise leave it, because the key moved or was deleted since. When a task finishes, the writer removes its `forwards` entries. This bounds the writer stall for a multi-million-row compaction to a few milliseconds per slice instead of one long pause.
+
+Tasks run strictly in FIFO order: a task starts only after every earlier task finished. Correctness depends on it. For a chain `I -> o1 -> o2`, task 2 compares raw entries against `(o1, x)`, but entries still hold `(I, r)` until task 1 rewrites them. If task 2 ran first, it would skip those keys, finish, and remove `forwards[o1]`, and task 1 would then write `(o1, x)` entries that resolve to nothing. With FIFO order, every entry that should point into `o1` does so before task 2 reads it, and when a task removes its `forwards` entry no raw entry points into that unit: the task rewrote every entry equal to a source, and any other entry for a source row would be a second live row for that key (I5).
 
 Memory per row at load factors between 0.44 and 0.875:
 
@@ -966,30 +1069,45 @@ At 10M `int64` keys the rebuild reads about 120 MB of pk and seq columns and ins
 ### DV Structure
 
 ```rust
-/// Deleted rows of one unit. Clone is two Arc increments.
-#[derive(Clone)]
-pub struct DeletionVector {
+/// Append-mostly bitmap with cheap copy-on-write, shared by deletion vectors
+/// and memtable index postings. Clone is two Arc increments.
+#[derive(Clone, Default)]
+pub struct CowBitmap {
     /// Large, rarely copied.
-    pub base: Arc<RoaringBitmap>,
-    /// Recent deletions. Copy-on-write per group; folded into `base` when
-    /// recent.len() > max(4096, base.len() / 8).
-    pub recent: Arc<RoaringBitmap>,
-    /// Cached base.len() + recent.len(); the two are disjoint.
-    pub len: u64,
+    base: Arc<RoaringBitmap>,
+    /// Recent insertions, disjoint from `base`. Copied (Arc::make_mut) on the
+    /// first insert after a clone; folded into `base` when it would exceed
+    /// RECENT_MAX entries.
+    recent: Arc<RoaringBitmap>,
+    /// Cached base.len() + recent.len().
+    len: u64,
 }
+pub const RECENT_MAX: u64 = 4096;
 
-impl DeletionVector {
+impl CowBitmap {
     pub fn contains(&self, row: RowId) -> bool;
+    /// Set the bit; return false if it was already set.
+    pub fn insert(&mut self, row: RowId) -> bool;
+    pub fn len(&self) -> u64;
     /// bitmap := bitmap AND NOT self.
     pub fn subtract_from(&self, bitmap: &mut RoaringBitmap);
-    /// Set the bit; return false if it was already set.
-    pub fn mark(&mut self, row: RowId) -> bool;
+    /// bitmap := bitmap OR self (index postings).
+    pub fn union_into(&self, bitmap: &mut RoaringBitmap);
     /// base OR recent, for serialization.
     pub fn to_bitmap(&self) -> RoaringBitmap;
 }
+
+/// Deleted rows of one unit. `mark(row)` is `insert(row)` on the inner bitmap.
+#[derive(Clone, Default)]
+pub struct DeletionVector(pub CowBitmap);
 ```
 
-Two tiers make copy-on-write per `Version` cheap: a published `Version` shares `base`, and the writer copies only the small `recent` bitmap on its first mark after a publish. The fold copies `base` at most once per one-eighth growth, so the amortized copy cost per deletion is O(1).
+Two tiers make copy-on-write per `Version` cheap: a published `Version` shares `base`, and the writer copies only `recent` on its first mark after a clone. Costs, with `RECENT_MAX = 4096`:
+
+- Per group, per touched unit: one copy of `recent`, at most 4096 entries, about 8 KB in array containers.
+- Per fold: one copy of `base`, at most `row_count / 8` bytes in bitmap containers (256 KB for a 2M-row segment), once per 4096 insertions, so at most about 64 bytes amortized per deletion.
+
+A threshold proportional to `base` (for example `base.len() / 8`) would be wrong here. A 2M-row segment with 400k deleted rows would carry a `recent` of up to 50k entries (about 100 KB), copied once per group for every segment the group touches. A random-upsert stream over 10M rows touches most segments in every group, which would be megabytes of copying per group. The fixed bound keeps the per-group cost proportional to the number of touched units.
 
 ### Marking Rows
 
@@ -1000,29 +1118,29 @@ Two tiers make copy-on-write per `Version` cheap: a published `Version` shares `
 
 ### DV Files
 
-Layout of `segments/<unit:08x>.dv.<generation:08>`:
+Layout of `segments/<unit:08x>.dv.<generation:016x>`:
 
 ```text
 offset size field
      0    8 magic            "LPDV" 0x00 0x00 0x02 0x00
      8    4 unit_id
-    12    4 generation
-    16    4 row_count        the segment's row count, for validation
-    20    4 reserved
+    12    4 row_count        the segment's row count, for validation
+    16    8 generation       from the collection's next_dv_gen counter
     24    8 covered_seq_no   every deletion with seq <= this is included
     32    8 bitmap_len
     40    n bitmap           RoaringBitmap portable serialization
   40+n    4 crc32c           over bytes 0..40+n
 ```
 
-DV files are immutable: each checkpoint writes a new generation, and the manifest names the generation in force for each segment. DV files are written in exactly two places:
+DV files are immutable: each checkpoint writes a new generation, and the manifest names the generation in force for each segment. Generations come from one per-collection `u64` counter, `next_dv_gen`, persisted in the manifest like `next_unit_id` and never reused within a process (see [Id Allocation and Failed Commits](#id-allocation-and-failed-commits)); a per-segment counter would reuse a generation when a failed flush is retried. DV files are written in exactly two places:
 
-- **Flush job.** At flush start the writer snapshots every segment's `DeletionVector` (Arc clones). The job writes a new generation for each segment whose cardinality differs from its durable generation's. `covered_seq_no` is the writer's `visible_seq_no` at the snapshot, which is at least the checkpoint the flush publishes.
-- **Compaction commit.** The writer writes generation 1 of the output segment when reconciliation set any bit (see [Compaction](#compaction)).
+- **Flush job.** At flush start the writer, having drained the pipeline, snapshots every segment's `DeletionVector` (Arc clones). The job writes a new generation for each segment whose cardinality differs from its durable generation's (bits are only ever added, so equal cardinality means equal sets). `covered_seq_no` is the writer's `visible_seq_no` at the snapshot, which is at least the checkpoint the flush publishes, and every bit in the snapshot is from a durable operation (I14).
+- **Compaction commit.** The writer writes a DV file for the output segment when reconciliation set any bit (see [Compaction](#compaction)).
 
 A DV file may contain deletions newer than the manifest's checkpoint. That is safe because every WAL operation is a blind write. The argument that I9 plus blind writes gives I8:
 
-- The recovered base state (segments minus DV files) can differ from the logical state at checkpoint `C` only for keys that some operation after `C` touched, because a DV bit can be early but never missing (I9), and every segment row is a copy of a row written at or before `C` (flush copies only a memtable frozen at or before `C`; compaction copies existing segment rows).
+- The recovered base state (segments minus DV files) can differ from the logical state at checkpoint `C` only for keys that some operation after `C` touched, because a DV bit can be early but never missing (I9), and every segment row is a copy of a row written at or before `C` (flush copies only a memtable frozen at or before `C`; compaction copies existing segment rows). Rows a job omitted because they were already deleted (`D_F` in flush, `D0` in compaction) are early deletions of the same kind.
+- Every early deletion comes from a durable operation (second half of I9), so `R` is at least its sequence number and replay reapplies it. If a DV file could hold a bit from a group whose fsync had not completed, a crash that lost that group would lose the row with nothing in the WAL to explain it; the drain before every job snapshot rules this out.
 - Replay applies every operation after `C` in order. For a key touched after `C`, the final state is the last operation's blind write, independent of the base. For every other key, the base already equals the state at `C`.
 
 ### DV Recovery From WAL Replay
@@ -1073,10 +1191,9 @@ offset size field
     12    4 flags           reserved, 0
     16   16 collection_id   UUID bytes
     32    4 unit_id
-    36    4 schema_version
-    40    8 schema_hash     xxh3_64 of the SchemaSnapshot section payload
-    48    4 row_count
-    52    4 reserved
+    36    4 row_count
+    40    8 schema_version  CollectionSchema::schema_version (u64)
+    48    8 schema_hash     xxh3_64 of the SchemaSnapshot section payload
     56    8 min_seq_no
     64    8 max_seq_no
     72   52 reserved        zeros
@@ -1088,15 +1205,15 @@ offset size field
 ```text
 offset size field
      0    2 kind            SectionKind code (table below)
-     2    2 field_id        FieldId, or 0xFFFF when not per-field
-     4    2 encoding        kind-specific encoding code
-     6    2 flags           reserved, 0
+     2    2 encoding        kind-specific encoding code
+     4    4 field_id        FieldId (u32), or 0xFFFF_FFFF when not per-field
      8    8 offset          absolute, 64-aligned
     16    8 length          payload bytes, excluding padding
     24    4 crc32c          of the whole payload
     28    4 aux32           kind-specific (dimension, page_rows, ...)
     32    8 aux64           kind-specific (element counts, ...)
-    40   24 reserved        zeros
+    40    2 flags           reserved, 0
+    42   22 reserved        zeros
 ```
 
 ### Footer
@@ -1137,7 +1254,7 @@ Unknown section kinds are ignored by readers, which is how Tier 2 adds codes and
 
 ### Row and Key Sections
 
-- `SchemaSnapshot`: postcard `Schema` at write time. Makes a segment decodable on its own and pins `FieldId` meaning.
+- `SchemaSnapshot`: postcard `CollectionSchema` at write time. Makes a segment decodable on its own and pins `FieldId` meaning.
 - `RowMeta`: per-row sequence numbers. Encoding 1 = `u64` plain; encoding 2 = `u32` offsets from `aux64 = base` when `max - min < 2^32`.
 - `PkColumn`: keys in row order. `int64`: `i64[row_count]`. `string`: `u32 offsets[row_count + 1]` then UTF-8 bytes.
 - `PkSorted`: row ids sorted by key. `int64`: `i64 keys[row_count]` then `u32 rows[row_count]` (binary search needs no other section). `string`: `u32 rows[row_count]` sorted by key bytes; binary search reads `PkColumn`.
@@ -1154,14 +1271,15 @@ offset size field
      8    4 page_rows       max(1, 8192 / (dim * 4))
     12    4 page_count
     16    8 nulls_len       bytes of the null bitmap (0 when no nulls)
-    24   40 reserved
+    24    4 prefix_crc      crc32c of bytes 0..24, nulls, and page_crcs
+    28   36 reserved
     64    n nulls           RoaringBitmap portable serialization, padded to 8
      .  4*p page_crcs       crc32c of each page's bytes
      .    . padding to 64
      .    . data            row_count * dim f32 LE, rows contiguous; null rows are zeros
 ```
 
-Pages are the load unit for rerank: a page is `page_rows` consecutive rows, verified against its own CRC when loaded. The section CRC covers the whole payload and is checked by compaction and by `inspect --verify`.
+Pages are the load unit for rerank: a page is `page_rows` consecutive rows, verified against its own CRC when loaded. The prefix (header, `nulls`, and `page_crcs`, 4 bytes per page, so about 4 MB for a 2M-row segment at 768 dimensions) is its own cache unit (`page = u32::MAX` in the cache key, class `RawVectors`), verified against `prefix_crc` and loaded on the first page access; page loads read their CRC from the pinned prefix. The section CRC covers the whole payload and is checked by compaction and by `inspect --verify`.
 
 `VectorSq8` and `VectorGraph` payloads are produced and parsed by `logpose-index`. The contract storage relies on:
 
@@ -1242,7 +1360,7 @@ pub struct SegmentHandle {
     pub row_count: u32,
     pub sections: Arc<[SectionEntry]>,
     /// Parsed at open: small and needed by every read.
-    pub schema: Arc<Schema>,
+    pub schema: Arc<CollectionSchema>,
     /// From the manifest: zone maps, counts, graph and SQ8 presence.
     pub summary: Arc<SegmentSummary>,
 }
@@ -1271,8 +1389,10 @@ pub struct Manifest {
     /// Every operation with seq <= this is reflected in segments and DV files (I9).
     pub checkpoint_seq_no: SeqNo,
     /// Current schema, including FieldId assignments and dropped-field tombstones.
-    pub schema: Schema,
+    pub schema: CollectionSchema,
     pub next_unit_id: u32,
+    /// Next DV file generation; one counter for all segments.
+    pub next_dv_gen: u64,
     /// Ascending by unit.
     pub segments: Vec<ManifestSegment>,
     pub totals: ManifestTotals,
@@ -1296,7 +1416,7 @@ pub struct ManifestSegment {
 
 #[derive(Serialize, Deserialize)]
 pub struct DvRef {
-    pub generation: u32,
+    pub generation: u64,
     pub cardinality: u32,
     pub covered_seq_no: SeqNo,
 }
@@ -1337,22 +1457,32 @@ Precondition: every new file the manifest references (segment files, DV files) h
 
 The commit point is step 5 returning `Ok`. Before it, recovery may see either the old or the new `CURRENT`, and both name complete, consistent states. Only after step 5 does the writer publish the new `Version`, mark superseded files obsolete, and enqueue deletions.
 
-Errors: a failure in steps 1 to 3 aborts the commit with no state change (the job is retried with backoff; the orphan files are cleaned later). A failure in step 4 or 5 leaves the durable `CURRENT` unknown, so the writer poisons the collection (read-only until reopen), exactly like a WAL fsync failure.
+Errors: a failure in steps 1 to 3 aborts the commit with no state change to `CURRENT`; the job is abandoned and re-planned as in [Id Allocation and Failed Commits](#id-allocation-and-failed-commits). A failure in step 4 or 5 leaves the durable `CURRENT` unknown: the rename may be visible in the page cache but not on disk. The writer poisons the collection (read-only until reopen), exactly like a WAL fsync failure, and the reopen's [durability barrier](#recovery-on-open) syncs the collection directory before recovery trusts whichever `CURRENT` it reads.
+
+### Id Allocation and Failed Commits
+
+Every immutable file is created with `CreateNew`, so a name must never be issued twice within a process, including by a retry after a failure. The writer allocates, and never gives back:
+
+- unit ids from `next_unit_id` (memtables, flush outputs, compaction outputs);
+- DV generations from `next_dv_gen`;
+- manifest generations from `next_manifest_gen`, which starts at the durable generation plus one and advances on every publish *attempt*.
+
+A flush or compaction whose files or manifest publish (steps 1 to 3) fail is abandoned: its unit id, DV generations, and manifest generation are burned, and every file it created (segment, DV files, the partial `<g>.mf`) is enqueued for GC right away, because no durable manifest names them. The scheduler re-plans the work later with fresh ids, and the new attempt's Begin captures fresh inputs. Without this rule, a retry would hit `EEXIST` on its own leftovers and the job would fail forever until a restart ran orphan cleanup. A burned manifest generation leaves a gap in the numbering, which recovery tolerates: it only ever reads the generation `CURRENT` names. The manifest records the counters as of its commit; after a crash, orphan cleanup removes every file the counters could collide with before the writer starts.
 
 ## Flush
 
 ### Flush Steps
 
-The flush of frozen memtable `F` (unit `m`, frozen at last sequence number `L`), with durable manifest generation `g`:
+The flush of frozen memtable `F` (unit `m`, frozen at last sequence number `L`). Below, "manifest `g + 1`" means a manifest built on whatever manifest is durable at commit time (a compaction may have committed since Begin) with the next generation from `next_manifest_gen`; the same holds for compaction.
 
 1. **Freeze** (writer). As in [Frozen Memtable](#frozen-memtable): `F` joins `frozen`, the WAL rotates so the new file starts at `L + 1`, a `Version` is published, a permit is requested.
 2. **Begin** (writer, when the permit arrives and `F` is the oldest frozen memtable; flushes are serialized per collection). First complete and publish any in-flight group. Then capture a `FlushInput`: `Arc<MemtableData>` for `F`, `D_F` (the snapshot of `deletes[m]`), `D_S` (snapshots of every segment's deletion vector), the segment list, the schema, a new unit id `s`, and DV generations for each segment whose cardinality differs from its durable generation. Let `J` be `visible_seq_no` now (`J >= L`).
-3. **Build** (maintenance pool). Iterate `F`'s slots in order, skipping slots set in `D_F`. Assign row ids densely. Build pk, sorted pk, filter, row meta, columns, dynamic blocks, SQ8, graph (if at least `graph_min_rows`), scalar indexes, and stats. Record `slot_to_row: Arc<[u32]>` (`u32::MAX` for skipped slots). If no slot is live, steps 3 and 4 produce nothing and the flush is a pure checkpoint: no segment is added.
+3. **Build** (maintenance pool). Iterate `F`'s slots in order, skipping slots set in `D_F`. Assign row ids densely. Build pk, sorted pk, filter, row meta, columns (for fields declared in the captured schema), dynamic blocks, SQ8, graph (if at least `graph_min_rows`), scalar indexes, and stats; the three index kinds from PR 12 on. Record `slot_to_row: Arc<[u32]>` (`u32::MAX` for skipped slots). If no slot is live, steps 3 and 4 produce nothing and the flush is a pure checkpoint: no segment is added.
 4. **Write segment** (I/O pool). Stream sections to `segments/<s:08x>.seg` (`CreateNew`), then `sync_all`. `crash_point(FlushAfterSegmentSync)`.
 5. **Write DV files** (I/O pool). For each segment with a new generation: write `segments/<id>.dv.<gen>` from `D_S` with `covered_seq_no = J`, `sync_all`. `crash_point(FlushAfterDvSync)`.
 6. **Sync directory.** `sync_dir(segments/)`. `crash_point(FlushAfterSegmentsDirSync)`.
 7. **Commit manifest** (writer, on `FlushDone`). Complete any in-flight group first. Build manifest `g + 1`: the current `Version`'s segments plus `s`, `checkpoint_seq_no = L`. For each segment that is present both now and in `D_S` and got a new generation in step 5, name that generation; for every other segment (including segments that a compaction created after step 2), keep its current durable generation. Run the atomic publish protocol.
-8. **Install** (writer). New `Version`: drop `F` from `frozen`; add `SegmentHandle` for `s`; set `deletes[s]` to the reconciliation of `F`'s late deletions, `{ slot_to_row[x] : x in deletes[m] now, x not in D_F }`; remove `deletes[m]`. Add forwarding `m -> (s, slot_to_row)` and a rewrite task. Publish. Enqueue for deletion the superseded DV generations, any DV file the job wrote for a segment that a compaction removed in the meantime, and the WAL files whose successor starts at or below `L + 1`. Append a `Checkpoint` frame with the next group.
+8. **Install** (writer). New `Version`: drop `F` from `frozen`; add `SegmentHandle` for `s`; set `deletes[s]` to the reconciliation of `F`'s late deletions, `{ slot_to_row[x] : x in deletes[m] now, x not in D_F }`; remove `deletes[m]`. Add forwarding `m -> (s, slot_to_row)` and a rewrite task (for a pure checkpoint, no pk entry points into `m`, so there is neither). Publish. Enqueue for deletion the superseded DV generations, any DV file the job wrote for a segment that a compaction removed in the meantime, and the WAL files whose successor starts at or below `L + 1`. Append a `Checkpoint` frame with the next group.
 9. **Rewrite** (writer, incremental). Rewrite pk-index entries from `m` to `s` in slices; drop the forwarding when done.
 
 Why `checkpoint_seq_no = L` is correct (I9): the only operations at or below `L` not reflected in `F` are deletions of segment rows, and those are in `D_S`, which was captured at `J >= L`. Segments created by a compaction that committed between steps 2 and 7 carry their own DV generation written at that compaction's commit, which covers every deletion up to that commit (see [Compaction](#compaction)). The late deletions of `F`'s slots reconciled in step 8 all have sequence numbers above `J`, so the WAL still holds them.
@@ -1380,13 +1510,16 @@ Every row is either in `F` (reconstructed by replay) or in `s` (durable), never 
 
 ```rust
 pub struct CompactionConfig {
-    /// Tier t holds segments with live rows in [base_rows * ratio^(t-1), base_rows * ratio^t).
+    /// Tier 0 holds segments with fewer than base_rows live rows; tier t >= 1
+    /// holds [base_rows * ratio^(t-1), base_rows * ratio^t).
     pub base_rows: u32,            // default 32_768
     pub tier_ratio: u32,           // default 4
     pub min_merge: usize,          // default 4
     pub max_merge: usize,          // default 10
-    pub max_output_rows: u32,      // default 2_000_000
+    pub max_output_rows: u32,      // default 2_000_000, further capped by maintenance_memory
     pub max_output_bytes: u64,     // default 8 GiB of f32 vectors
+    /// Engine-wide memory that running flush and compaction builds may hold.
+    pub maintenance_memory: f32,   // default 0.2 of memory_limit
     /// Rewrite a segment whose deleted fraction reaches this.
     pub deleted_ratio: f32,        // default 0.2
     pub max_jobs_per_collection: usize, // default 2
@@ -1400,20 +1533,23 @@ The writer runs the policy after every commit that changes the segment set, over
 1. **Deletion-driven.** If any segment has `dv.len / row_count >= deleted_ratio`, pick the one with the most deleted rows; add up to `min_merge - 1` of the smallest unreserved segments in the same or lower tier. Emit a job.
 2. **Tiered.** For each tier from the lowest: if at least `min_merge` unreserved segments are in it, take them in ascending unit order until `max_merge`, `max_output_rows`, or `max_output_bytes` would be exceeded. Emit a job.
 3. Never emit more than `max_jobs_per_collection` concurrent jobs, and never reserve a segment twice.
+4. Size every job to fit its memory reservation. A graph build holds the output's f32 vectors and the graph under construction: `build_bytes = rows * (Σ dim * 4 + 32 * 4 * 1.1)` for the vector fields, plus the output's scalar columns. A 2M-row output at 768 dimensions needs about 6.4 GB, which does not fit beside a 9 GB hot set in a 16 GB budget. The scheduler grants a compaction permit only with a reservation of `build_bytes` from the engine-wide `maintenance_memory` pool, and the policy caps the output so that `build_bytes` is at most half the pool (two jobs can run). At `memory_limit = 16 GB` that caps 768-dimension outputs near 500k rows, so 10M rows settle into about 20 top-tier segments; at 32 GB, near 1M rows. `max_output_rows` is the upper bound when memory is plentiful.
 
-Write amplification: a row is rewritten once per tier it climbs, about `log_4(2,000,000 / 32,768)`, so roughly 3 compactions plus the flush. The engine counts bytes written by flush and by compaction and reports the ratio to bytes ingested, which the Phase 2 exit criterion measures.
+Write amplification: a row is rewritten once per tier it climbs, about `log_4(max_output / 32,768)`, so roughly 2 to 3 compactions plus the flush. The engine counts bytes written by flush and by compaction and reports the ratio to bytes ingested, which the Phase 2 exit criterion measures.
 
 ### Compaction Steps
 
-For inputs `I_1..I_n` (ascending unit ids) with durable manifest generation `g`:
+For inputs `I_1..I_n` (ascending unit ids):
 
-1. **Begin** (writer, on permit). Complete and publish any in-flight group. Reserve the inputs. Capture `D0_i` (snapshot of `deletes[I_i]`) for each input, the current schema, and a new unit id `o`.
+1. **Begin** (writer, on permit, which carries the job's memory reservation). Complete and publish any in-flight group. Reserve the inputs. Capture `D0_i` (snapshot of `deletes[I_i]`) for each input, the current schema, and a new unit id `o`.
 2. **Build** (maintenance pool, reads through the I/O pool with `CacheMode::Bypass`, so compaction does not evict hot data). For each input in order, for each row `r` not in `D0_i`: append the row to the output (dropping fields the schema dropped, filling null for fields it added) and set `map_i[r] = next output row`; set `map_i[r] = u32::MAX` for rows in `D0_i`. Retrain SQ8 and build the graph over the output. Record `pks` and `sources` in output row order.
 3. **Write** (I/O pool). Stream `segments/<o:08x>.seg`, `sync_all`, `sync_dir(segments/)`. `crash_point(CompactionAfterOutputSync)`.
 4. **Reconcile** (writer, on `CompactionDone`). Complete and publish any in-flight group. For each input, `delta_i = deletes[I_i] now AND NOT D0_i`. For each `r` in `delta_i`, set bit `map_i[r]` in `DV_o`. Every such `map_i[r]` is valid, because `r` was not in `D0_i`, so it was copied.
-5. **Write output DV** (writer, I/O pool). If `DV_o` is not empty: write `segments/<o:08x>.dv.00000001` with `covered_seq_no = visible_seq_no`, `sync_all`, `sync_dir(segments/)`. `crash_point(CompactionAfterDvSync)`.
-6. **Commit manifest.** Manifest `g + 1` = current segments minus inputs plus `o` (with `dv = Some(generation 1)` when step 5 wrote one), checkpoint unchanged. Atomic publish protocol.
-7. **Install.** New `Version`: remove inputs and their `deletes` entries, add `o` with `DV_o`. Add forwarding `I_i -> (o, map_i)` for every input and one rewrite task. Release reservations. Publish. Remove the inputs from the writer's `live_files` (marking their `FileHandle`s obsolete) and enqueue the inputs' DV files for deletion.
+5. **Write output DV** (writer, I/O pool). If `DV_o` is not empty: allocate `d` from `next_dv_gen`, write `segments/<o:08x>.dv.<d:016x>` with `covered_seq_no = visible_seq_no`, `sync_all`, `sync_dir(segments/)`. `crash_point(CompactionAfterDvSync)`.
+6. **Commit manifest.** Manifest `g + 1` = the currently durable manifest's segments minus inputs plus `o` (with `dv = Some(d)` when step 5 wrote one), its checkpoint unchanged. If a flush committed while the job ran, that durable manifest already names newer DV generations for the inputs and a newer checkpoint; both are carried forward (the inputs' generations are dropped with the inputs). Atomic publish protocol.
+7. **Install.** New `Version`: remove inputs and their `deletes` entries, add `o` with `DV_o`. Add forwarding `I_i -> (o, map_i)` for every input and one rewrite task. Release reservations and the memory reservation. Publish. Remove the inputs from the writer's `live_files` (marking their `FileHandle`s obsolete) and enqueue for deletion the inputs' DV files named by the manifest this commit superseded.
+
+The writer processes no write between steps 4 and 7, so a compaction commit stalls the write path for one DV-file write and one manifest publish, about five fsyncs. That is a deliberate trade: letting writes run during the publish would require a second reconciliation pass at install and serializing it against flush commits. A job that fails in steps 2, 3, 5, or 6 releases its reservations and burns its ids ([Id Allocation and Failed Commits](#id-allocation-and-failed-commits)).
 
 ### DV Reconciliation at Commit
 
@@ -1425,6 +1561,13 @@ At commit the writer transfers exactly those bits. Claim: after step 7, for ever
 
 After the commit, a write that resolves a key to `(I_i, r)` (a pk-index entry not yet rewritten) follows the forwarding table to `(o, map_i[r])`, so its bit lands in `DV_o`. The rewrite task later points the entry directly at `(o, x)`, but only if the entry still equals the source address, so a key that was deleted or re-inserted during or after the compaction is never clobbered.
 
+Worked cases, each a required deterministic-interleaving test:
+
+- **Upsert moves a key during the job.** `k` lives at `(I_1, r)`. An upsert of `k` marks `r` in `deletes[I_1]` and appends a memtable slot; a flush may even move that slot into a new segment `s` before the compaction commits. At commit, `r` is in `delta_1`, so `map_1[r]` is set in `DV_o`: the stale copy is dead and `k`'s live row is the memtable or `s` row. The rewrite task finds `k`'s raw entry pointing at the memtable or `s`, not at `(I_1, r)`, and leaves it.
+- **Upsert, then delete, during the job.** Both operations resolve through the pk index: the upsert marks `(I_1, r)`, the delete marks the memtable slot. `DV_o` gets `map_1[r]`; the key is absent everywhere, as in the logical state.
+- **A row compacted twice.** Compaction 1 turns `(I, r)` into `(o1, x)`, and compaction 2 takes `o1` as input before rewrite task 1 finished (inputs are reserved by one job at a time, but a committed output is immediately eligible). A delete of `k` during compaction 2 resolves `(I, r) -> (o1, x)` through `forwards[I]`, marks `x` in `deletes[o1]`, and compaction 2's reconciliation transfers it to `(o2, map[x])`. After compaction 2 commits, the chain `I -> o1 -> o2` resolves any remaining stale entry, and FIFO rewrite order ([Primary-Key Index](#primary-key-index)) retires the chain safely.
+- **A delete of a row already in `D0_i`.** It cannot reach the input: the pk index no longer points at a deleted row, so the delete resolves to the key's current row (or none).
+
 Durability of reconciled bits (I9): a reconciled deletion may have a sequence number at or below the current checkpoint `C`, because a flush can commit while the compaction runs and move the checkpoint past it; the WAL files holding it may already be deleted, and the input's DV file that recorded it is dropped with the input. That is why step 5 writes the output's DV file before the manifest is published, and why a DV file is required whenever `DV_o` is not empty.
 
 ### Compaction Crash Analysis
@@ -1434,8 +1577,8 @@ Durability of reconciled bits (I9): a reconciled deletion may have a sequence nu
 | 1 begin, 2 build | nothing new | manifest `g`; the job is forgotten and re-planned |
 | 3 output sync | `o.seg` unreferenced | orphan cleanup deletes it |
 | 4 reconcile | same | same |
-| 5 output DV sync | `o.seg`, `o.dv.1` unreferenced | orphan cleanup deletes both |
-| 6 publish, before its step 5 | `CURRENT` old or new | old: as above plus deleting manifest `g + 1`; new: load `g + 1` with `o` and `o.dv.1`, inputs are orphans and deleted |
+| 5 output DV sync | `o.seg`, `o.dv.<d>` unreferenced | orphan cleanup deletes both |
+| 6 publish, before its step 5 | `CURRENT` old or new | old: as above plus deleting manifest `g + 1`; new: load `g + 1` with `o` and `o.dv.<d>`, inputs are orphans and deleted |
 | 7 install | `CURRENT = g + 1` | load `g + 1`; inputs and their DV files are orphans |
 
 In every case the WAL after the durable checkpoint is untouched, so replay restores every later deletion, including those of `o`'s rows.
@@ -1483,10 +1626,10 @@ The GC worker runs on the `IoPool`, calls `remove_file`, `crash_point(GcAfterRem
 
 ### GC Crash Safety and Orphan Cleanup
 
-A removal is not durable until its directory is synced, so after a crash a removed file may reappear. Neither outcome matters, because nothing references an obsolete file. Orphan cleanup runs during recovery, after `CURRENT` and its manifest `M` are loaded and before the writer starts (so before any unit id or DV generation can be reused):
+A removal is not durable until its directory is synced, so after a crash a removed file may reappear. Neither outcome matters, because nothing references an obsolete file. Orphan cleanup runs during recovery, after the durability barrier, after `CURRENT` and its manifest `M` are loaded, and before the writer starts (so before any unit id, DV generation, or manifest generation can be reused). It deletes relative to `M`, so it is only safe because the barrier has made `M`'s selection by `CURRENT` durable; otherwise a `CURRENT` rename seen only in the page cache could lead it to delete the segments of the manifest that is actually durable:
 
 1. `segments/`: remove every `.seg` whose unit is not in `M`, every `.dv.<gen>` whose `(unit, gen)` is not named by `M`, and every `.tmp`.
-2. `manifests/`: remove every generation other than `M.generation` and `M.generation - 1`.
+2. `manifests/`: remove every generation other than `M.generation` and the newest generation below it (generations can have gaps after a failed publish), including every generation above `M.generation`.
 3. `wal/`: remove every file whose successor starts at or below `M.checkpoint_seq_no + 1`.
 4. Remove `CURRENT.tmp`.
 5. `sync_dir` every directory that changed. `crash_point(RecoveryAfterOrphanCleanup)`.
@@ -1506,7 +1649,10 @@ cache_budget = memory_limit
              - pk_index_reservation      (sum of writer pk-index sizes, updated every second)
              - memtable_reservation      (global_fraction * memory_limit)
              - query_working_reserve     (10 percent of memory_limit, for bitmaps, heaps, visited sets)
+             - maintenance_memory        (compaction.maintenance_memory * memory_limit, for job builds)
 ```
+
+At `memory_limit = 16 GB` with 10M int64 keys this leaves about 9 GB, which is the D1 hot set (SQ8 codes plus layer-0 graph) with little room for scalar indexes; 24 GB or more leaves headroom. The warm-up stop at 90 percent and the per-class floors keep that case working, with cold scalar sections read on demand.
 
 ```rust
 /// Priority order from D8, highest first. Eviction starts from the bottom.
@@ -1609,19 +1755,20 @@ Every fetch stage returns a `FetchReport`, and the operator that asked for it re
 
 `open_collection(dir)`:
 
-1. Read `descriptor.json` and `CURRENT`; load manifest `M` and verify it. A version-1 layout (`maintenance.json`, `active.wal`, or a JSON manifest) fails with `LogPoseError::UnsupportedFormat`.
-2. Orphan cleanup, as in [GC Crash Safety and Orphan Cleanup](#gc-crash-safety-and-orphan-cleanup).
-3. Open a `SegmentHandle` for every segment in `M` (header, footer, table, schema snapshot; about three small reads each).
-4. Load each named DV file, verify CRC, `unit_id`, `row_count`, and generation; build `DeletionMap`.
-5. Rebuild the pk index from segment pk and row-meta sections minus deletion vectors, as in [Primary-Key Index](#primary-key-index).
-6. List `wal/`, sort by first sequence number, skip files entirely at or below `M.checkpoint_seq_no`, and run tail repair on the last file.
-7. Replay frames in order. Skip frames with `last_seq_no <= checkpoint`. Check contiguity from `checkpoint + 1`. For each `WriteBatch`, call the same `apply` the live writer uses, into a fresh active memtable (unit id from `M.next_unit_id`); for `SchemaChange`, swap the schema; for `Checkpoint`, cross-check. Replay is CPU-bound and runs on the maintenance pool.
-8. Set `next_seq_no = max(checkpoint, last replayed) + 1`, `next_unit_id` past every allocated id, `durable` from `M`, and `live_files` from the segment handles.
-9. Open the WAL writer on the last file (after repair) in append mode, or create a new file if there is none.
-10. Build and publish `Version` 1. If the replayed memtable already exceeds a flush trigger, freeze it right away.
-11. Run `Version::check_invariants` when `strict_invariants` is on (tests): unique live keys, pk index agreement, DV bits below row counts, counter exactness.
+1. **Durability barrier.** `sync_dir` the collection directory, `manifests/`, `segments/`, and `wal/`, and `sync_all` every file in `wal/`. Recovery then reasons only about state that is on disk. Without the barrier, an in-process reopen after a poisoned publish (a `CURRENT` rename that succeeded but whose directory sync failed) or after a WAL rollback failure could act on page-cache state: orphan cleanup would delete the segments of the manifest that is actually durable, or replay would publish frames that a power loss then takes back (I14). If any sync fails, the open fails.
+2. Read `descriptor.json` and `CURRENT`; load manifest `M` and verify it. A version-1 layout (`maintenance.json`, `active.wal`, or a JSON manifest) fails with `LogPoseError::UnsupportedFormat`.
+3. Orphan cleanup, as in [GC Crash Safety and Orphan Cleanup](#gc-crash-safety-and-orphan-cleanup).
+4. Open a `SegmentHandle` for every segment in `M` (header, footer, table, schema snapshot; about three small reads each).
+5. Load each named DV file, verify CRC, `unit_id`, `row_count`, and generation; build `DeletionMap`.
+6. Rebuild the pk index from segment pk and row-meta sections minus deletion vectors, as in [Primary-Key Index](#primary-key-index).
+7. List `wal/`, sort by first sequence number, skip files entirely at or below `M.checkpoint_seq_no`, and run tail repair on the last file.
+8. Replay frames in order. Skip frames with `last_seq_no <= checkpoint`; reject a frame that straddles it. Check contiguity from `checkpoint + 1`. For each `WriteBatch`, call the same `apply` the live writer uses, into a fresh active memtable (unit id from `M.next_unit_id`); for `SchemaChange`, follow [Replay Across Schema Versions](#replay-across-schema-versions); for `Checkpoint`, cross-check. Replay is CPU-bound and runs on the maintenance pool.
+9. Set `next_seq_no = max(checkpoint, last replayed) + 1`, `next_unit_id` past every allocated id, `next_dv_gen` from `M`, `next_manifest_gen = M.generation + 1`, the group counter to one past the last frame's `group_no`, `durable` from `M`, and `live_files` from the segment handles.
+10. Open the WAL writer on the last file (after repair) in append mode with `synced_len` = its length, or create a new file named `next_seq_no` (then `sync_dir(wal/)`) if there is none.
+11. Build and publish `Version` 1. If the replayed memtable already exceeds a flush trigger, freeze it right away.
+12. Run `Version::check_invariants` when `strict_invariants` is on (tests): unique live keys, pk index agreement, DV bits below row counts, counter exactness.
 
-Recovery is idempotent (I11): the only file changes before the writer starts are orphan removal (step 2), tail truncation (step 6), and creating an empty WAL file (step 9). Each removes or adds only bytes that no durable state references, so rerunning recovery after a crash at any point converges to the same state.
+Recovery is idempotent (I11): the only file changes before the writer starts are the barrier's syncs (step 1, no content change), orphan removal (step 3), tail truncation (step 7), and creating an empty WAL file (step 10). Each removes or adds only bytes that no durable state references, and each runs after the barrier, so rerunning recovery after a crash at any point converges to the same state.
 
 ## Read Path
 
@@ -1658,11 +1805,12 @@ pub struct ReadView {
 }
 
 impl ReadView {
-    pub fn schema(&self) -> &Arc<Schema>;
+    pub fn schema(&self) -> &Arc<CollectionSchema>;
     pub fn visible_seq_no(&self) -> SeqNo;
     pub fn token(&self) -> Option<&SnapshotToken>;
     pub fn counters(&self) -> VersionCounters;
-    /// Frozen memtables, the active memtable, then segments; oldest to newest.
+    /// Segments ascending by UnitId, then frozen memtables oldest first, then
+    /// the active memtable. Correctness never depends on the order (I5).
     pub fn units(&self) -> Vec<UnitView<'_>>;
     pub fn query_pool(&self) -> &rayon::ThreadPool;
     /// The only async data access: load and pin sections, rows, or blocks.
@@ -1751,7 +1899,7 @@ A vector search runs as alternating fetch and compute stages, so that no rayon w
 2. **Plan.** For each unit, use `summary()` zone maps to prune units the filter cannot match. For the rest, list the sections the filter needs (index if one exists for the field, otherwise column or dynamic blocks) and the vector index.
 3. **Fetch 1** (I/O pool). `fetch(plan)`; memtable units need nothing.
 4. **Compute 1** (query pool, one rayon task per unit):
-   1. Compile the filter to a bitmap `B` using `ScalarIndexOps` or a column scan; `NOT p` becomes `live AND NOT B_p`. Then `B := B AND NOT deleted`. Without a filter, `B = live()`.
+   1. Compile the filter to a bitmap `B` using `ScalarIndexOps` or a column scan; `NOT p` becomes `live AND NOT B_p`. Then `B := B AND NOT deleted`. Without a filter, `B = live()`. Field names resolve against `ReadView::schema()`: a declared name becomes its `FieldId` (a unit with no section or column for it yields nulls), and an undeclared name, when dynamic fields are on, becomes an `$extra` path subject to [shadowing](#dynamic-field-shadowing).
    2. `n = |B|`, `N = live_count`. Choose the strategy (thresholds are constants in `logpose-query`, calibrated by the harness): memtable, or no graph, or `n <= exact_threshold`, gives an exact scan over `B` (SQ8 codes when present, f32 otherwise); a graph with small `n / N` gives a filter-aware (ACORN-1 style) walk; otherwise a graph walk that admits only rows in `B`.
    3. Produce the unit's top `k * rerank_factor` candidates as `(RowAddr, approximate score)`.
 5. **Merge.** Global k-way heap merge to the top `k * rerank_factor`.
@@ -1819,7 +1967,7 @@ Phase 1, format-compatible in behavior, new internals:
 2. **Engine shell.** `Engine` owns the collection map and the storage-root lock; `LocalStorageEngine` becomes a thin wrapper that implements `StorageEngine` by delegating to `Engine`. Descriptor lookup becomes a map lookup; `find_collection_descriptor` and `list_collection_descriptors` directory scans are deleted. The process-global lock maps (`wal_rotation_locks`, `maintenance_operation_locks`, `maintenance_status_locks`, `maintenance_coordinator`) are deleted along with `thread::spawn` maintenance, replaced by the writer and the scheduler.
 3. **Resident state.** `CollectionHandle` with `ArcSwap<Version>` and the writer task. At this step a `Version` holds the v1 manifest plus the replayed delta, and `load_collection_state` is deleted: every trait method reads the current `Version`.
 4. **WAL v2 and group commit.** The writer writes WAL v2 frames with group commit; the v1 JSON WAL, `WalMode`, `rotate_active`, and `PENDING_ROTATION` handling are deleted. WAL v2 payloads are `RowOp`s, so the schema and row-op step (Phase 2 step 1 below) lands before this one; until segment v2 exists, the `Version` delta holds `(seq_no, RowOp)` pairs and flush converts them into v1 segment records.
-5. **Pools, GC, tokens.** I/O moves to the `IoPool`, search CPU to rayon. Version-refcount GC and manifest v2 land. Snapshot tokens replace historical `Snapshot` reads.
+5. **Pools, GC, tokens.** I/O moves to the `IoPool`, search CPU to rayon. Version-refcount GC and manifest v2 land. Snapshot tokens replace historical `Snapshot` reads. Until segment v2 exists, `ManifestSegment` entries describe v1 segment files with the v2-only fields empty (`dv: None`, no `vectors` or `zones`, `footer_crc = 0` meaning unchecked); PR 10 removes that allowance.
 
 Phase 2, data model:
 
@@ -1853,8 +2001,8 @@ The storage harness gets a new model and action set. The model is a `BTreeMap<Pr
 | `Flush`, `Compact` | none | full-state equality afterwards |
 | `StepJob(job, phase)` | none | interleaves begin, build, and commit of a job with other actions |
 | `Crash(k)` then `Reopen` | truncate to the durable prefix | I2, I3, I8 (below) |
-| `FailSync(n)` | the in-flight batch becomes "unknown" | collection is read-only; reopen passes I8 |
-| `AlterSchema(add or drop)` | update model schema | reads return null for new fields, hide dropped fields |
+| `FailSync(n)` | batches acked `NotApplied` are absent; `Unknown` ones may be either | collection is read-only; nothing new becomes visible; reopen passes I8 |
+| `AlterSchema(add, drop, or rename)` | update model schema | reads return null for new fields, hide dropped fields, and apply `$extra` shadowing |
 
 After every action the harness runs `Version::check_invariants` (I5, I10, I13). The seed and action trace are printed on failure, as today.
 
@@ -1862,7 +2010,10 @@ After every action the harness runs `Version::check_invariants` (I5, I10, I13). 
 
 Every test that crashes uses `FaultVfs`:
 
-- **Exhaustive crash points.** Run a scenario once cleanly and count mutating ops `T`. For each `k` in `0..=T` and each `TearMode`, rerun with `crash_after_ops = k`, reopen, and check I8: the recovered state equals the model after some prefix of batches that includes every acknowledged batch and contains no partial batch. Scenarios: a single group commit, a flush, a compaction with concurrent deletes, a flush during a compaction, a checkpoint-only flush, and GC after a pinned token is released.
+- **Exhaustive crash points.** Run a scenario once cleanly and count mutating ops `T`. For each `k` in `0..=T` and each `TearMode`, rerun with `crash_after_ops = k`, reopen, and check I8: the recovered state equals the model after some prefix of batches that includes every acknowledged batch and contains no partial batch. Scenarios: a single group commit, a flush, a compaction with concurrent deletes, a flush during a compaction, a checkpoint-only flush, a schema change followed by a flush, a failed manifest publish followed by a retry, and GC after a pinned token is released.
+- **Visibility never runs ahead of durability (I14).** Readers record every state they observe; after each crash, every observed state must be a prefix of the recovered one.
+- **Failure then in-process reopen.** Fail a WAL sync, a `CURRENT` rename, and a manifest directory sync; reopen on the same `FaultVfs` without a crash, then crash, then reopen again. The durability barrier must make both reopens agree.
+- **WAL group classification.** Corrupt the `GROUP_END` frame of an acknowledged group that is followed by exactly one complete group; the open must fail with `WalCorrupt`, not truncate.
 - **Named crash points.** One test per `CrashPoint` variant asserts the recovery outcome from the crash analysis tables in this document.
 - **Recovery idempotence (I11).** Crash during recovery at every op count, reopen again, and compare to a clean recovery.
 - **Corruption.** Flip bytes in each segment section, DV file, manifest, and mid-WAL frame; expect the typed error from the corresponding section (`SegmentCorrupt`, `ManifestCorrupt`, `WalCorrupt`), never a panic or silent data change.
@@ -1885,16 +2036,16 @@ Each PR keeps `cargo test --workspace` green, deletes what it replaces, and exte
 | --- | --- | --- | --- |
 | 1 | Split `logpose-storage` into modules (no behavior change) | none | 7 |
 | 2 | `logpose-vfs` crate: `Vfs`, `StdVfs`, `FaultVfs`, crash points; route all storage and WAL I/O through it; crash-and-reopen in the harness | 1 | 7 |
-| 3 | `Engine` shell: collection map, root lock, `IoPool` and rayon pools, `CollectionHandle` with `ArcSwap<Version>` over v1 state; delete directory scans and global lock maps | 2 | 4, 7, 8, 9 |
-| 4 | WAL v2 in `logpose-wal`: frame codec, postcard payloads, reader with tail repair, writer with rotation; standalone tests on `FaultVfs` | 2, schema PR | 3, 7, 8, 9 |
-| 5 | Writer task and group commit on WAL v2; `apply` shared with replay; poisoning on fsync failure; delete v1 WAL | 3, 4, 7 | 8, 9 |
-| 6 | Manifest v2 and `CURRENT` protocol, version-refcount GC, orphan cleanup, snapshot tokens and reaper; replace historical snapshot reads | 5 | 8, 9 |
-| 7 | Schema integration: `Schema`, `Record`, `FieldId` from the schema PR into descriptor, validation, `RowOp`, legacy mapping; move predicate AST to `FilterExpr` in `logpose-types` | schema PR | 2, 3, 4 |
-| 8 | Segment v2 writer and reader as a standalone module: layout, all storage-owned encodings, opaque index sections, CRC and corruption tests, golden file | 2, 7 | 3 to 6, 9 |
+| 3 | `Engine` shell: collection map, root lock, `IoPool` and rayon pools, `CollectionHandle` with `ArcSwap<Version>` over v1 state; delete directory scans and global lock maps | 2 | 4, 7, 8 |
+| 4 | WAL v2 frame layer in `logpose-wal`: header with `group_no`, reader with tail repair and group classification, writer with rotation and failed-group rollback; payloads are opaque bytes here; standalone tests on `FaultVfs` | 2 | 3, 7, 8, 9 |
+| 5 | Writer task and group commit on WAL v2; `apply` shared with replay; `AlterSchema` in the stream and replay across schema versions; poisoning with rollback and outcome-typed errors; delete v1 WAL | 3, 4, 7 | 8, 9 |
+| 6 | Manifest v2 (with the transitional v1 segment entries) and `CURRENT` protocol, id allocation and failed-commit handling, version-refcount GC, orphan cleanup, the recovery durability barrier, snapshot tokens and reaper with the pinned-memory limit; replace historical snapshot reads | 5 | 8, 9 |
+| 7 | Schema integration: `CollectionSchema`, `Record`, `FieldId` from the schema PR into descriptor, validation, and `Record` to `RowImage` conversion; the binary value codec in `logpose-types`; WAL payload types (`WalPayload`, `RowOp`, `WirePk`, `ValueBytes`) and their postcard codec with golden bytes and a `CollectionSchema` round-trip test; legacy mapping; move predicate AST to `FilterExpr` in `logpose-types` | schema PR | 1, 2, 3, 4 |
+| 8 | Segment v2 writer and reader as a standalone module: layout, all storage-owned encodings, a `SegmentBuilder` that accepts opaque index sections, CRC and corruption tests, golden file | 2, 7 | 3 to 6, 9 |
 | 9 | Buffer cache v1: classes, CLOCK, single-flight, pins, `FetchReport`, warm-up | 3 | 4 to 8 |
-| 10 | Memtable v2, writer-private pk index, deletion vectors and DV files, flush to segment v2, recovery with pk rebuild; delete resolve-latest paths and v1 segments and sidecars | 5, 6, 8, 9 | none |
-| 11 | Compaction v2: size-tiered policy, reconciliation, forwarding and incremental pk rewrite, scheduler priorities; delete `compact_state` | 10 | 12 |
-| 12 | `CollectionReader`, `ReadView`, `UnitView`; query crate on the new interfaces for search, get, count, scroll, order by (using the HNSW, SQ8, kernel, and scalar-index PRs); `RowSetResolver`; delete old trait read methods | 10, index PRs | 11 |
+| 10 | Memtable v2 with `CowBitmap` postings, writer-private pk index, deletion vectors and DV files, flush to segment v2 with storage-owned sections only (pk, row meta, f32 vectors, columns, dynamic, stats), recovery with pk rebuild; the legacy adapter serves ANN by exact scan; delete resolve-latest paths and v1 segments and sidecars | 5, 6, 8, 9 | none |
+| 11 | Compaction v2: size-tiered policy with the maintenance-memory reservation, reconciliation, forwarding and FIFO incremental pk rewrite, scheduler priorities; delete `compact_state` | 10 | 12 |
+| 12 | `CollectionReader`, `ReadView`, `UnitView`; index sections (SQ8, HNSW, scalar inverted and sorted) added to the shared `SegmentBuilder`, so flush and compaction write them; query crate on the new interfaces for search, get, count, scroll, order by; `RowSetResolver` and the filter write requests; delete old trait read methods | 10, index PRs | 11 |
 | 13 | Harness v2 and crash-equivalence suite: full action table, exhaustive crash enumeration, deterministic job interleaving, stress tests | 10 (extends with 11, 12) | 11, 12 |
 | 14 | Remove the `StorageEngine` trait and `legacy.rs`; service calls `Engine`; update `architecture.md`, `operations.md`, `configuration.md` | 11, 12, 13 | none |
 
@@ -1908,7 +2059,9 @@ Each PR keeps `cargo test --workspace` green, deletes what it replaces, and exte
  external:      schema PR -> 7;  HNSW, SQ8, kernel, scalar-index PRs -> 12
 ```
 
-Critical path: 1, 2, 3, 5, 6, 10, 11 or 12, 14. PRs 4, 7, 8, and 9 run beside it and should start as soon as their inputs land; 7 must land before 5 because WAL v2 payloads are `RowOp`s over the new schema types.
+Critical path: 1, 2, 3, 5, 6, 10, 11 or 12, 14. PRs 4, 7, 8, and 9 run beside it and should start as soon as their inputs land; 7 must land before 5 because WAL v2 payloads are `RowImage`s built from the new schema types and encoded with the codec that 7 adds. PR 4 takes opaque payloads so it does not wait for 7.
+
+Why the index sections move to PR 12: flush (PR 10) and compaction (PR 11) would otherwise need the HNSW, SQ8, and scalar-index PRs, which do not exist yet as branches, and the engine critical path would wait on them. Until PR 12, segments carry no index sections, which every reader already handles (a segment below `graph_min_rows` has none either). PRs 11 and 12 both touch segment building, but 11 only calls `SegmentBuilder` and 12 only extends it, so they merge cleanly in either order.
 
 ## Deviations From the Plan
 
@@ -1917,5 +2070,39 @@ Critical path: 1, 2, 3, 5, 6, 10, 11 or 12, 14. PRs 4, 7, 8, and 9 run beside it
 3. **Historical `Snapshot { manifest_generation, visible_seq_no }` reads are dropped.** The plan lists the snapshot type as worth keeping. With deletion vectors, a `Version` cannot be reconstructed for an arbitrary past sequence number, so repeatable reads use snapshot tokens (D7), and read barriers compare only `visible_seq_no` (the manifest generation is a physical detail that compaction changes without any logical change).
 4. **Two rayon pools.** D8 names one rayon pool for CPU search. Index builds for multi-million-row compactions would starve queries on a shared pool, so maintenance CPU work gets its own smaller pool.
 5. **Compaction writes the output's DV file at commit.** D3 says deletion vectors are written at checkpoints and the WAL covers them in between. That is not enough for compaction: a deletion reconciled onto the output may already be below the checkpoint (its WAL file deleted and its input's DV file dropped), so the output's DV file must be written before the compaction's manifest is published.
-6. **Delete-by-filter and update-by-filter are atomic only up to one frame.** D7 makes every batch atomic. A filter matching more rows than fit in `MAX_FRAME_PAYLOAD` (about 7M `int64` keys) commits in several atomic chunks, reported in the ack, rather than requiring unbounded frames or an in-memory undo mechanism.
+6. **Delete-by-filter and update-by-filter are atomic only up to one frame.** D7 makes every batch atomic. A filter matching more rows than fit in `MAX_FRAME_PAYLOAD` (about 6M `int64` keys for a delete, about 21,000 rows for an update at 768 dimensions, since updates log full row images) commits in several atomic chunks over a key set resolved once, reported in the ack, rather than requiring unbounded frames or an in-memory undo mechanism. Readers may observe a prefix of the chunks. Justified: D7's atomicity is about client batches, which stay atomic, and a filter write of millions of rows is rare enough that an explicit chunk count in the ack is an acceptable contract.
 7. **The segment section table is at the end of the file.** Phase 2's layout sketch places the section table in the header. Compaction output is streamed, so section lengths are unknown when the header is written; the header keeps what is known up front (row count, schema hash, sequence range) and the footer points at the table.
+8. **Memtable indexes are persistent maps of two-tier bitmaps.** Phase 3 task 3 sketches `BTreeMap<Value, RoaringBitmap>`. A `Version` must hold an O(1) snapshot of the memtable while the writer keeps appending, so the map is `imbl::OrdMap` and each posting a `CowBitmap`; a `BTreeMap` would have to be cloned per published `Version`.
+9. **Snapshot-token expiry is sliding and can come early.** D7 says tokens expire after a TTL. Here every use extends the TTL (so an active scroll never loses its snapshot), and the reaper may expire the oldest tokens early when pinned retired memtables exceed `token_memory_limit`. Both keep D7's intent (bounded retention) while making long scrolls usable and memory bounded.
+10. **Compaction output size is bounded by memory, not only by `max_output_rows`.** The plan assumes large segments; at 16 GB and 768 dimensions the maintenance-memory reservation caps outputs near 500k rows, so 10M rows live in about 20 top-tier segments instead of 5. Search fans out to more graphs, which the Phase 4 benchmark must measure; the alternative, building graphs over rows that do not fit in memory, would violate D1's budget.
+
+## Review Log
+
+### Changes From Design Review
+
+Principal storage-engine review of this design, before implementation. Each item names the defect and the fix now in the text above.
+
+1. **WAL tail repair could truncate acknowledged groups** (high; [Tail Repair](#tail-repair)). The torn-versus-corrupt rule looked only at `GROUP_END` flags. If the damaged frame was the `GROUP_END` frame of an acknowledged group and exactly one complete group followed, the later group's single `GROUP_END` made the damage look like a torn tail, and repair truncated two acknowledged groups. Frames now carry `group_no`, and the tail is torn only if every valid frame after the damage belongs to the damaged frame's own group.
+2. **WAL payloads could not be decoded, and the assumed codec did not exist** (high; [Record Types](#record-types), [Encoding Choice](#encoding-choice), [Binary Value Codec](#binary-value-codec)). The schema PR's `PrimaryKey` is `#[serde(untagged)]` and `Value::Json`/`Record::extra` hold `serde_json::Value`; postcard cannot deserialize either. The schema PR has no binary `Value` codec and no `Value::Object`. The WAL now uses `WirePk` and `ValueBytes`, and this document specifies the binary value codec, owned by PR 7.
+3. **Schema changes had no protocol** (high; new [Schema Changes](#schema-changes)). `AlterSchema` and `SchemaChange` existed as types only. Added: in-stream alter with one sequence number and no freeze, `FieldId`-keyed memtable columns with `first_slot`, replay rules when the manifest's schema is newer than the frames, and a deterministic `$extra` shadowing rule that does not depend on compaction timing. Also aligned types with the schema PR: `CollectionSchema`, `schema_version: u64` in WAL, segment header, and manifest, and a `u32` `field_id` in the section table (`FieldId` is `u32` and never reused, so `u16` would overflow).
+4. **Failed WAL fsync reported "failed" for batches that recovery could replay** (high; [Group Commit](#group-commit)). Acks said `WalWriteFailed` but the frames might survive. Now the writer rolls the file back to `synced_len` (as the Phase 0 atomic-batch PR does), errors carry `outcome: NotApplied | Unknown`, the poisoned writer publishes and commits nothing further, and a failed rollback refuses in-process reopen.
+5. **Recovery acted on non-durable directory state** (high; [Recovery on Open](#recovery-on-open), [GC Crash Safety and Orphan Cleanup](#gc-crash-safety-and-orphan-cleanup)). After a poisoned publish (rename done, directory sync failed) an in-process reopen could read a `CURRENT` that exists only in the page cache, and orphan cleanup would then delete the segments of the manifest that is actually durable. Recovery now starts with a durability barrier that syncs every directory and WAL file it will reason about.
+6. **Update-by-filter chunking could loop forever** (high; [Record Types](#record-types)). Each chunk re-resolved the filter against the state after the previous chunk, so a patch that keeps rows matching re-matched them indefinitely. The filter is now resolved once to a fixed key set, and chunks commit back to back with no interleaved requests.
+7. **Retried jobs collided with their own files** (medium; new [Id Allocation and Failed Commits](#id-allocation-and-failed-commits)). A publish failure in steps 1 to 3 "retried with backoff" but reused the manifest generation, unit id, and per-segment DV generation, so `CreateNew` would fail until restart. Ids are now burned on failure, DV generations come from a per-collection `u64` counter in the manifest (file names use 16 hex digits), abandoned files are collected immediately, and a compaction commit builds on the latest durable manifest rather than the one at Begin.
+8. **Visibility versus durability was implicit** (medium; [Invariants](#invariants), [Publication Protocol](#publication-protocol)). The design already published only after fsync, but nothing stated it, and the second half of I9 (DV bits must come only from durable operations) depended on it silently. Added I14, the explicit position (a reader never sees group `n+1` before group `n` is durable), the rule that copy-on-write keys on sharing (`Arc::make_mut`), not on a published flag, and clarified that `Tick` does not drain the pipeline.
+9. **Deletion-vector copy-on-write cost grew with segment size** (medium; [DV Structure](#dv-structure)). Folding at `base.len() / 8` let `recent` reach about 100 KB on a large segment, copied once per group per touched segment; a random-upsert stream touches most segments per group. `recent` is now capped at 4096 entries, about 8 KB per touched unit per group.
+10. **Memtable index postings copied whole bitmaps per group** (medium; [Mutable Scalar Indexes](#mutable-scalar-indexes)). The "few KB per touched key" claim fails for low-cardinality fields (up to 128 KB per key per group at 1M slots). Postings now use the same two-tier `CowBitmap`.
+11. **Compaction build memory was unbudgeted** (medium; [Size-Tiered Policy](#size-tiered-policy), [Budget and Classes](#budget-and-classes)). A 2M-row, 768-dimension output needs about 6.4 GB of vectors and graph during the build, beside a 9 GB hot set in a 16 GB budget. Added a `maintenance_memory` pool that permits reserve from and that caps output size, and subtracted it from the cache budget. Listed as deviation 10.
+12. **Pinned tokens held retired memtables outside every budget** (medium; [Snapshot Tokens](#snapshot-tokens)). Added `pinned_retired_bytes` accounting and early expiry past `token_memory_limit`, and stated that TTL expiry never affects a request already running (its `ReadView` holds the `Arc<Version>`).
+13. **PR breakdown had a cycle and hidden dependencies** (medium; [PR Breakdown](#pr-breakdown)). PR 3 listed PR 9 as parallel although 9 depends on 3. PRs 10 and 11 built SQ8, graph, and scalar-index sections without depending on the index PRs, whose branches do not exist yet. PR 6 introduced manifest v2 before segment v2 existed. PR 4 needed PR 7's codec. Fixed: index sections move to PR 12, manifest v2 carries transitional v1 entries until PR 10, PR 4 takes opaque payloads, and PR 7 owns the codec and payload types.
+14. **Smaller corrections.** FIFO rewrite order is now stated as a correctness requirement, with the chain cases spelled out, and a `u32::MAX` forward is an invariant violation (PK index). Replay rejects frames that straddle the checkpoint, and a file's first data frame must match its name (WAL). Tier 0 is defined for segments below `base_rows`. `units()` order is described correctly. Validation rejects non-finite vector components and zero-norm cosine vectors. The `VectorF32` page-CRC array gets its own CRC and cache unit. Orphan cleanup tolerates gaps in manifest generations. Large `Version` and memtable drops leave tokio workers. Worked DV-reconciliation cases for moved keys and twice-compacted rows are listed as required tests. Deviations 6 and 7 were sharpened and 8 to 10 added.
+
+Verified and left unchanged: ack after publish gives I1; flush with `checkpoint_seq_no = L` and DV snapshots at `J >= L` gives I9, including compactions that commit between flush Begin and commit; the reconciliation proof (the maps are injective and the writer runs steps 4 to 7 with no write in between); I7 for token-pinned segments; blind-write replay over early DV bits.
+
+### Open Questions
+
+- **fsync failure without successful rollback.** After a WAL fsync `EIO`, Linux may mark the dirty pages clean, and the page cache can then serve frames that are not on disk even after a process restart. The design refuses in-process reopen in that case, but a restart without a reboot has the same exposure. Decide whether to require `O_DIRECT` for the WAL tail, a reboot, or operator acknowledgement.
+- **Shadowed `$extra` keys resurfacing.** With a deterministic read-time rule, dropping or renaming a field makes pre-existing `$extra` values under the old name visible again. The alternative (permanently shadowing any name that was ever declared) needs retired-name tombstones in `CollectionSchema`, which the schema PR does not have. The schema owner should pick one.
+- **Index PR interfaces.** `origin/claude/p4-hnsw-v2`, `origin/claude/p4-kernels-sq8`, and `origin/claude/p3-scalar-index` do not exist yet, so the `Sq8Codes`, `HnswGraph`, and scalar-index `write_to`/`view` contracts here are unverified. PR 12 is the only PR blocked on them.
+- **Segment fan-out at 16 GB.** The memory cap yields about 20 top-tier segments at 10M by 768. Whether per-segment graph search at that fan-out meets the Phase 4 QPS target, or whether graph builds should instead stream vectors from disk to allow larger outputs, needs the benchmark.
+- **Writer stall at commit.** Flush and compaction commits block writes for about five fsyncs. Measure p99 write latency under a steady flush rate before deciding whether to overlap the manifest publish with writes (which requires a second reconciliation pass).
