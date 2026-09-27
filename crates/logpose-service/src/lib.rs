@@ -210,29 +210,44 @@ async fn run_coordination_loop(
 
         let mut members = client.list_membership().await;
         let mut leader = client.current_leader().await;
+        let mut dropped_leases = Vec::new();
         if membership_lease_id.is_some()
             && members
                 .as_ref()
                 .is_ok_and(|records| !lists_member(records, &node_name))
         {
-            revoke_tracked_membership_lease(&client, &mut membership_lease_id).await;
+            dropped_leases.extend(membership_lease_id.take());
         }
         if membership_lease_id.is_none() {
-            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
+            dropped_leases.extend(leadership_lease.take().map(|lease| lease.lease_id));
         }
         if let Some(lease) = &leadership_lease
             && leader
                 .as_ref()
                 .is_ok_and(|record| !holds_leadership(record.as_ref(), lease))
         {
-            revoke_tracked_leadership_lease(&client, &mut leadership_lease).await;
+            dropped_leases.extend(leadership_lease.take().map(|lease| lease.lease_id));
         }
+        // Stop advertising lost claims before the revoke round trips, so
+        // request gates never see a claim this tick already knows is gone.
         demote_lost_claims(
             &snapshot,
             &node_name,
             membership_lease_id,
             leadership_lease.as_ref(),
         );
+        for lease_id in &dropped_leases {
+            let _ = client.revoke_lease(*lease_id).await;
+        }
+        // Revoking a lease deletes the keys attached to it, so a leader key
+        // read before the revoke that named one of those leases is now vacant.
+        if leader.as_ref().is_ok_and(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| dropped_leases.contains(&record.lease_id))
+        }) {
+            leader = Ok(None);
+        }
 
         let mut acquired = false;
         if membership_lease_id.is_none() {
@@ -247,7 +262,10 @@ async fn run_coordination_loop(
                 }
             }
         }
-        if campaigns && leadership_lease.is_none() && !led_by_another_node(&leader, &node_name) {
+        // Any live leader key makes the campaign transaction fail, including
+        // one left by this node's previous process, so only campaign when the
+        // key is vacant or unreadable instead of granting a lease every tick.
+        if campaigns && leadership_lease.is_none() && !matches!(leader, Ok(Some(_))) {
             match client.try_acquire_leadership(&node_name).await {
                 Ok(Some(lease)) => {
                     leadership_lease = Some(lease);
@@ -291,15 +309,8 @@ fn holds_leadership(leader: Option<&LeadershipRecord>, lease: &LeadershipLease) 
         .is_some_and(|record| record.node_id == lease.node_id && record.lease_id == lease.lease_id)
 }
 
-fn led_by_another_node(
-    leader: &logpose_types::Result<Option<LeadershipRecord>>,
-    node_name: &str,
-) -> bool {
-    matches!(leader, Ok(Some(record)) if record.node_id != node_name)
-}
-
-/// Clear snapshot claims this tick found lost, before any network call to
-/// re-acquire them, so request gates stop trusting them immediately.
+/// Clear snapshot claims this tick found lost, before revoking them or
+/// re-acquiring replacements, so request gates stop trusting them immediately.
 fn demote_lost_claims(
     snapshot: &RwLock<CoordinationStatus>,
     node_name: &str,
@@ -320,24 +331,6 @@ fn demote_lost_claims(
         if current.leader_node.as_deref() == Some(node_name) {
             current.leader_node = None;
         }
-    }
-}
-
-async fn revoke_tracked_leadership_lease(
-    client: &EtcdCoordinationClient,
-    leadership_lease: &mut Option<LeadershipLease>,
-) {
-    if let Some(lease) = leadership_lease.take() {
-        let _ = client.revoke_lease(lease.lease_id).await;
-    }
-}
-
-async fn revoke_tracked_membership_lease(
-    client: &EtcdCoordinationClient,
-    membership_lease_id: &mut Option<i64>,
-) {
-    if let Some(lease_id) = membership_lease_id.take() {
-        let _ = client.revoke_lease(lease_id).await;
     }
 }
 

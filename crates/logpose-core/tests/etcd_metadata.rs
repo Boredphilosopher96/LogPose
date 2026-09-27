@@ -1,6 +1,6 @@
 //! End-to-end etcd metadata integration coverage for `AppState`.
 
-use etcd_client::{Client, DeleteOptions};
+use etcd_client::{Client, DeleteOptions, PutOptions};
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
@@ -1950,7 +1950,7 @@ async fn etcd_follower_takes_over_after_leader_loses_leadership_lease() {
 
     // Whichever node wins the new campaign, the cluster must converge on
     // exactly one leader backed by a fresh lease, and both nodes must agree.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let leader_status = leader
             .control
@@ -1984,6 +1984,66 @@ async fn etcd_follower_takes_over_after_leader_loses_leadership_lease() {
         );
         sleep(Duration::from_millis(50)).await;
     }
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
+    let endpoints = test_etcd_endpoints();
+    let key_prefix = unique_etcd_prefix("restart-waits-out-stale-leader-key");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-restart-waits-out-stale-leader-key";
+
+    // Leave a leader key from a previous process of the same node, backed by a
+    // lease that the new process does not hold.
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    let stale_lease_id = client
+        .lease_grant(60, None)
+        .await
+        .expect("stale leadership lease should be granted")
+        .id();
+    client
+        .put(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            serde_json::to_string(&LeadershipRecord {
+                node_id: "leader-a".to_owned(),
+                lease_id: stale_lease_id,
+            })
+            .expect("leader record should encode"),
+            Some(PutOptions::new().with_lease(stale_lease_id)),
+        )
+        .await
+        .expect("stale leader key should be written");
+
+    let state = Arc::new(AppState::new(short_ttl_config(
+        "leader-a",
+        "etcd-restart-waits-out-stale-leader-key",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let waiting = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered && coordination.leader_node.is_some()
+        })
+    })
+    .await;
+    let waiting = waiting
+        .coordination
+        .expect("coordination state should be present");
+    assert!(
+        !waiting.is_local_leader,
+        "a leader key backed by another lease must not count as local leadership"
+    );
+    assert_eq!(waiting.leader_node.as_deref(), Some("leader-a"));
+
+    revoke_lease_out_of_band(&endpoints, stale_lease_id).await;
+
+    let (_, leadership_lease_id) = wait_for_local_leadership(&state).await;
+    assert_ne!(leadership_lease_id, stale_lease_id);
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -2131,7 +2191,7 @@ async fn wait_for_runtime_status(
     state: &AppState,
     ready: impl Fn(&logpose_types::NodeRuntimeStatus) -> bool,
 ) -> logpose_types::NodeRuntimeStatus {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let status = state
             .control

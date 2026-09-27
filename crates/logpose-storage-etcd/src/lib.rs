@@ -1469,7 +1469,20 @@ impl EtcdCoordinationClient {
         client: &mut Client,
         lease_id: i64,
     ) -> std::result::Result<SharedLeaseSession, KeepAliveAttachError> {
-        let (keeper, stream) = client.lease_keep_alive(lease_id).await.map_err(|error| {
+        // Opening the stream waits for etcd's first keep-alive response, which
+        // the per-request gRPC timeout does not cover once headers arrive.
+        let opened = tokio::time::timeout(
+            Duration::from_millis(self.store.timeout_ms.max(1)),
+            client.lease_keep_alive(lease_id),
+        )
+        .await
+        .map_err(|_| {
+            KeepAliveAttachError::Failed(LogPoseError::Message(format!(
+                "etcd keep-alive stream for lease '{lease_id}' did not open within {}ms",
+                self.store.timeout_ms
+            )))
+        })?;
+        let (keeper, stream) = opened.map_err(|error| {
             if is_lease_not_found(&error) {
                 KeepAliveAttachError::Expired
             } else {
