@@ -246,4 +246,74 @@ mod tests {
             Some("1000")
         );
     }
+
+    #[tokio::test]
+    async fn unary_requests_above_the_message_limit_are_resource_exhausted() {
+        use crate::{
+            proto,
+            test_support::{TestServer, put, small_grpc_limit},
+        };
+
+        let mut server = TestServer::start("grpc-message-limit", small_grpc_limit(1024)).await;
+        server.create_collection("docs").await;
+
+        // Under the limit: accepted.
+        server
+            .client
+            .write_collection(proto::WriteCollectionRequest {
+                collection_name: "docs".to_owned(),
+                operations: vec![put("a")],
+                database_name: String::new(),
+            })
+            .await
+            .expect("a small write should succeed");
+
+        // Over the limit: rejected before the handler runs, with a typed error.
+        let mut oversized = put("b");
+        if let Some(proto::write_operation::Operation::Put(record)) = &mut oversized.operation {
+            record.metadata_json = format!("{{\"blob\":\"{}\"}}", "x".repeat(4096));
+        }
+        let status = server
+            .client
+            .write_collection(proto::WriteCollectionRequest {
+                collection_name: "docs".to_owned(),
+                operations: vec![oversized],
+                database_name: String::new(),
+            })
+            .await
+            .expect_err("an oversized write should be rejected");
+
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let info = status
+            .get_details_error_info()
+            .expect("error info is attached");
+        assert_eq!(info.reason, "TOO_LARGE");
+        assert_eq!(info.metadata["limit_bytes"], "1024");
+        assert_eq!(server.live_records("docs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_message_limit_layer_leaves_other_statuses_alone() {
+        use crate::{proto, test_support::TestServer};
+        use logpose_config::LimitsConfig;
+
+        let mut server = TestServer::start("grpc-limit-passthrough", LimitsConfig::default()).await;
+        let status = server
+            .client
+            .get_collection(proto::GetCollectionRequest {
+                collection_name: "missing".to_owned(),
+                database_name: String::new(),
+            })
+            .await
+            .expect_err("a missing collection should be reported");
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(
+            status
+                .get_details_error_info()
+                .map(|info| info.reason)
+                .as_deref(),
+            Some("RESOURCE_NOT_FOUND")
+        );
+        assert!(!server.address.is_empty());
+    }
 }

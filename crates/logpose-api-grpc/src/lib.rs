@@ -2,6 +2,8 @@
 
 mod bulk;
 mod error;
+#[cfg(test)]
+mod test_support;
 
 pub use error::{ERROR_DOMAIN, RETRY_AFTER_METADATA_KEY, grpc_code, status_from_error};
 

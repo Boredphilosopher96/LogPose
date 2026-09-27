@@ -171,3 +171,242 @@ fn stream_error(status: &Status, limit: usize) -> LogPoseError {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestServer, put, small_grpc_limit};
+    use logpose_config::LimitsConfig;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic_types::StatusExt;
+
+    fn batch(collection: &str, ids: &[&str]) -> BulkWriteCollectionRequest {
+        BulkWriteCollectionRequest {
+            collection_name: collection.to_owned(),
+            database_name: String::new(),
+            operations: ids.iter().map(|id| put(id)).collect(),
+        }
+    }
+
+    fn error_metadata(status: &Status, key: &str) -> Option<String> {
+        status
+            .get_details_error_info()
+            .and_then(|info| info.metadata.get(key).cloned())
+    }
+
+    fn reason(status: &Status) -> Option<String> {
+        status.get_details_error_info().map(|info| info.reason)
+    }
+
+    #[tokio::test]
+    async fn bulk_write_commits_every_batch_and_returns_a_summary() {
+        let mut server = TestServer::start("bulk-happy", LimitsConfig::default()).await;
+        server.create_collection("docs").await;
+
+        let reply = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([
+                batch("docs", &["a", "b"]),
+                batch("", &["c"]),
+                batch("docs", &["d", "e", "f"]),
+            ]))
+            .await
+            .expect("bulk write should succeed")
+            .into_inner();
+
+        assert_eq!(reply.database_name, "default");
+        assert_eq!(reply.collection_name, "docs");
+        assert_eq!(reply.committed_batches, 3);
+        assert_eq!(reply.applied_ops, 6);
+        assert_eq!(reply.last_seq_no, 6);
+        assert_eq!(
+            reply.snapshot.map(|snapshot| snapshot.visible_seq_no),
+            Some(6)
+        );
+        assert_eq!(server.live_records("docs").await, 6);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_stops_at_the_first_failed_batch_and_reports_committed_progress() {
+        let mut server = TestServer::start("bulk-mid-failure", LimitsConfig::default()).await;
+        server.create_collection("docs").await;
+        let mut bad = batch("docs", &["c"]);
+        if let Some(proto::write_operation::Operation::Put(record)) =
+            &mut bad.operations[0].operation
+        {
+            record.vector = vec![1.0, 2.0, 3.0];
+        }
+
+        let status = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([
+                batch("docs", &["a", "b"]),
+                bad,
+                batch("docs", &["d"]),
+            ]))
+            .await
+            .expect_err("the second batch should fail the stream");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(reason(&status).as_deref(), Some("DIMENSION_MISMATCH"));
+        assert_eq!(
+            error_metadata(&status, "failed_batch_index").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            error_metadata(&status, "committed_batches").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            error_metadata(&status, "committed_operations").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            error_metadata(&status, "last_committed_seq_no").as_deref(),
+            Some("2")
+        );
+        let violations = status
+            .get_details_bad_request()
+            .map(|bad_request| bad_request.field_violations)
+            .unwrap_or_default();
+        assert_eq!(violations[0].field, "operations[0].vector");
+        // The failed batch is atomic and nothing after it is applied.
+        assert_eq!(server.live_records("docs").await, 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_rejects_an_oversized_batch_as_resource_exhausted() {
+        let mut server = TestServer::start("bulk-oversize", small_grpc_limit(1024)).await;
+        server.create_collection("docs").await;
+        let mut oversized = batch("docs", &["big"]);
+        if let Some(proto::write_operation::Operation::Put(record)) =
+            &mut oversized.operations[0].operation
+        {
+            record.metadata_json = format!("{{\"blob\":\"{}\"}}", "x".repeat(4096));
+        }
+
+        let status = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([batch("docs", &["a"]), oversized]))
+            .await
+            .expect_err("an oversized batch should fail the stream");
+
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(reason(&status).as_deref(), Some("TOO_LARGE"));
+        assert_eq!(
+            error_metadata(&status, "limit_bytes").as_deref(),
+            Some("1024")
+        );
+        assert_eq!(
+            error_metadata(&status, "failed_batch_index").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            error_metadata(&status, "committed_batches").as_deref(),
+            Some("1")
+        );
+        assert_eq!(server.live_records("docs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_keeps_committed_batches_when_the_client_disconnects() {
+        let mut server = TestServer::start("bulk-disconnect", LimitsConfig::default()).await;
+        server.create_collection("docs").await;
+        let (sender, receiver) = mpsc::channel(4);
+        let mut client = server.client.clone();
+        let call = tokio::spawn(async move {
+            client
+                .bulk_write_collection(ReceiverStream::new(receiver))
+                .await
+        });
+        sender
+            .send(batch("docs", &["a", "b"]))
+            .await
+            .expect("first batch should be sent");
+        let mut waited = 0;
+        while server.live_records("docs").await < 2 {
+            waited += 1;
+            assert!(waited < 250, "the first batch was never committed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Disconnect mid-stream: the call is dropped while the server waits for batch 2.
+        call.abort();
+        let _ = call.await;
+        let _ = sender.send(batch("docs", &["late"])).await;
+        drop(sender);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(server.live_records("docs").await, 2);
+        // The server keeps serving the collection.
+        let reply = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([batch("docs", &["c"])]))
+            .await
+            .expect("a new stream should succeed after a disconnect")
+            .into_inner();
+        assert_eq!(reply.committed_batches, 1);
+        assert_eq!(server.live_records("docs").await, 3);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_rejects_an_empty_stream() {
+        let mut server = TestServer::start("bulk-empty", LimitsConfig::default()).await;
+        let status = server
+            .client
+            .bulk_write_collection(tokio_stream::iter(Vec::<BulkWriteCollectionRequest>::new()))
+            .await
+            .expect_err("an empty stream should be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(reason(&status).as_deref(), Some("INVALID_ARGUMENT"));
+    }
+
+    #[tokio::test]
+    async fn bulk_write_rejects_batches_that_switch_collections() {
+        let mut server = TestServer::start("bulk-switch", LimitsConfig::default()).await;
+        server.create_collection("docs").await;
+        server.create_collection("other").await;
+
+        let status = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([
+                batch("docs", &["a"]),
+                batch("other", &["b"]),
+            ]))
+            .await
+            .expect_err("switching collections should be rejected");
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        let violations = status
+            .get_details_bad_request()
+            .map(|bad_request| bad_request.field_violations)
+            .unwrap_or_default();
+        assert_eq!(violations[0].field, "collection_name");
+        assert_eq!(
+            error_metadata(&status, "failed_batch_index").as_deref(),
+            Some("1")
+        );
+        assert_eq!(server.live_records("other").await, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_write_requires_the_first_batch_to_name_the_collection() {
+        let mut server = TestServer::start("bulk-unnamed", LimitsConfig::default()).await;
+        let status = server
+            .client
+            .bulk_write_collection(tokio_stream::iter([batch("", &["a"])]))
+            .await
+            .expect_err("an unnamed first batch should be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(
+            error_metadata(&status, "failed_batch_index").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            error_metadata(&status, "committed_batches").as_deref(),
+            Some("0")
+        );
+    }
+}

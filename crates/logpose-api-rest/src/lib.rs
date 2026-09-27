@@ -840,6 +840,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_bodies_above_the_limit_are_rejected_with_a_typed_413() {
+        let mut config = test_config("rest-body-limit");
+        config.limits.max_rest_body_bytes = 256;
+        let app = router(Arc::new(AppState::new(config)));
+        let body = json!({
+            "name": "documents",
+            "dimensions": 2,
+            "metric": "dot",
+            "padding": "x".repeat(512),
+        })
+        .to_string();
+        let size = body.len();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .header("content-length", size)
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
+        assert_eq!(body["details"]["reason"], "TOO_LARGE");
+        assert_eq!(body["details"]["metadata"]["limit_bytes"], "256");
+        assert_eq!(body["details"]["metadata"]["size_bytes"], size.to_string());
+
+        // A body under the limit is accepted.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_and_query_strings_are_typed_invalid_arguments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-malformed"))));
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+        assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats?snapshot_visible_seq_no=abc")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["code"], "INVALID_ARGUMENT");
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_return_a_typed_not_found() {
+        let app = router(Arc::new(AppState::new(test_config("rest-unknown-route"))));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/nothing")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(body["details"]["metadata"]["resource_type"], "route");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            "GET /v2/nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_validation_errors_name_the_offending_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-field-path"))));
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let write = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections/documents/writes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "operations": [
+                                {"op": "put", "id": "a", "vector": [1.0, 0.0], "metadata": {}},
+                                {"op": "put", "id": "b", "vector": [1.0], "metadata": {}}
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(write).await;
+        assert_eq!(body["details"]["reason"], "DIMENSION_MISMATCH");
+        assert_eq!(
+            body["details"]["field_violations"][0]["field"],
+            "operations[1].vector"
+        );
+        assert_eq!(body["details"]["metadata"]["record_id"], "b");
+    }
+
+    #[tokio::test]
     async fn runtime_status_requires_bearer_token_when_auth_is_configured() {
         let state = Arc::new(AppState::new(auth_test_config("rest-auth-runtime")));
         let app = router(state);

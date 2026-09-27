@@ -203,6 +203,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_limits_default_to_sixteen_mebibytes_and_parse_from_toml() {
+        assert_eq!(
+            LogPoseConfig::default().limits,
+            LimitsConfig {
+                max_rest_body_bytes: 16 * 1024 * 1024,
+                max_grpc_message_bytes: 16 * 1024 * 1024,
+            }
+        );
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "127.0.0.1"
+rest_port = 8080
+grpc_host = "127.0.0.1"
+grpc_port = 50051
+log_filter = "info"
+storage_root = ".logpose"
+
+[limits]
+max_rest_body_bytes = 1024
+"#,
+        )
+        .expect("limits should parse");
+        assert_eq!(config.limits.max_rest_body_bytes, 1024);
+        assert_eq!(
+            config.limits.max_grpc_message_bytes,
+            DEFAULT_MAX_GRPC_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn rejects_zero_request_limits() {
+        let mut config = LogPoseConfig::default();
+        config.limits.max_grpc_message_bytes = 0;
+        let error = config.validate().expect_err("a zero limit is invalid");
+        assert!(matches!(error, LogPoseError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("limits.max_grpc_message_bytes"));
+    }
+
+    #[test]
     fn default_config_includes_storage_root() {
         let config = LogPoseConfig::default();
         assert_eq!(config.storage_root, PathBuf::from(".logpose"));
