@@ -91,7 +91,7 @@ impl WalRecovery {
     /// In order:
     ///
     /// 1. **Fence check.** An `FSYNC_FAILED` marker from the current boot fails with
-    ///    [`WalError::FsyncFailedSameBoot`] (an unparseable one with
+    ///    [`WalError::FsyncFailedSameBoot`] (an unparsable one with
     ///    [`WalError::FenceUnreadable`]) before anything is touched. A marker from an earlier
     ///    boot is reported and removed by [`into_writer`](Self::into_writer).
     /// 2. **Durability barrier.** Every WAL file is `sync_all`ed and the directory synced, so
