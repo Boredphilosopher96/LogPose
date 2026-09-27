@@ -1,5 +1,7 @@
 //! Shared domain types for LogPose.
 
+pub mod schema;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use std::{collections::BTreeMap, fmt};
