@@ -1391,9 +1391,12 @@ dependencies = [
 name = "logpose-index"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "logpose-types",
+ "rayon",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
