@@ -270,13 +270,14 @@ pub(super) fn scan_tail(
         // A damaged frame whose header is checksummed has a trustworthy extent: bytes inside
         // it are its payload, never frames. Otherwise search right after its start.
         let search_from = damaged_at + defect.claimed_len().unwrap_or(FRAME_ALIGN);
-        let later = find_frames_after(file, path, search_from, len)?;
         // When the first frame of the file is damaged the group is unknown, and every later
-        // frame must agree with the first one found.
-        let expected = damaged_group.or_else(|| later.first().map(|(_, header)| header.group_no));
-        for (index, (at, header)) in later.iter().enumerate() {
-            let is_last = index + 1 == later.len();
-            if Some(header.group_no) != expected || (header.group_end && !is_last) {
+        // frame must agree with the first one found. The first frame that breaks the rule ends
+        // the search, so a damaged frame early in a large file costs one pass, not one per frame.
+        let mut expected = damaged_group;
+        let mut seen_group_end = false;
+        find_frames_after(file, path, search_from, len, |at, header| {
+            let expected_group = *expected.get_or_insert(header.group_no);
+            if header.group_no != expected_group || seen_group_end {
                 return Err(WalError::corrupt(
                     path,
                     damaged_at,
@@ -288,8 +289,10 @@ pub(super) fn scan_tail(
                     ),
                 ));
             }
-        }
-        discarded.extend(later.into_iter().map(|(_, header)| header));
+            seen_group_end = header.group_end;
+            discarded.push(header);
+            Ok(())
+        })?;
     }
     Ok(TailScan {
         committed_end,
@@ -298,16 +301,21 @@ pub(super) fn scan_tail(
     })
 }
 
-/// Checksummed frames in `from..len`, found by searching for the magic at 8-byte steps. A found
-/// frame's extent is skipped, so frames embedded in a valid frame's payload are not reported.
+/// Visit the checksummed frames in `from..len`, found by searching for the magic at 8-byte
+/// steps. A found frame's extent is skipped, so frames embedded in a valid frame's payload are
+/// not reported. `visit` returning an error stops the search.
+///
+/// The file is read in windows of at most 1 MiB, and each byte is read into a window at most
+/// once: after a found frame the search continues inside the current window when the frame
+/// ends there.
 fn find_frames_after(
     file: &dyn VfsFile,
     path: &Path,
     from: u64,
     len: u64,
-) -> Result<Vec<(u64, FrameHeader)>, WalError> {
+    mut visit: impl FnMut(u64, FrameHeader) -> Result<(), WalError>,
+) -> Result<(), WalError> {
     const WINDOW: u64 = 1 << 20;
-    let mut found = Vec::new();
     let mut payload = Vec::new();
     let mut window = Vec::new();
     let mut base = from.next_multiple_of(FRAME_ALIGN);
@@ -323,16 +331,26 @@ fn find_frames_after(
             if window[index..index + MAGIC_BYTES.len()] == MAGIC_BYTES {
                 let at = base + index as u64;
                 if let Probe::Frame(header) = probe(file, path, at, len, &mut payload)? {
-                    found.push((at, header));
-                    next_base = at + header.frame_len();
-                    break;
+                    visit(at, header)?;
+                    let end = at + header.frame_len();
+                    // Frames are 8-byte aligned and sized, so `end - base` stays aligned.
+                    match usize::try_from(end - base) {
+                        Ok(next_index) if next_index < window.len() => {
+                            index = next_index;
+                            continue;
+                        }
+                        _ => {
+                            next_base = end;
+                            break;
+                        }
+                    }
                 }
             }
             index += FRAME_ALIGN as usize;
         }
         base = next_base;
     }
-    Ok(found)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -420,6 +438,108 @@ mod tests {
             Probe::Torn(TornDefect::PastEndOfFile { .. })
         ));
         assert_eq!(payload.capacity(), 0);
+        Ok(())
+    }
+
+    /// A read-only in-memory file that counts the bytes read from it.
+    struct CountingFile {
+        bytes: Vec<u8>,
+        read: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingFile {
+        fn read_bytes(&self) -> u64 {
+            self.read.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl VfsFile for CountingFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(self.bytes.len());
+            let count = buf.len().min(self.bytes.len() - start);
+            buf[..count].copy_from_slice(&self.bytes[start..start + count]);
+            self.read
+                .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(count)
+        }
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            if self.read_at(buf, offset)? == buf.len() {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+        fn append(&self, _bufs: &[IoSlice<'_>]) -> std::io::Result<u64> {
+            Err(std::io::Error::other("read-only"))
+        }
+        fn sync_data(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn len(&self) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+        fn set_len(&self, _len: u64) -> std::io::Result<()> {
+            Err(std::io::Error::other("read-only"))
+        }
+    }
+
+    /// A lone checkpoint group, then `frames` single-operation frames. With `one_group`, they
+    /// form one group whose first frame's magic is destroyed (a torn group); otherwise every
+    /// frame is its own group and the first one's magic is destroyed (mid-log damage).
+    fn damaged_log(frames: u64, one_group: bool) -> Result<CountingFile, WalError> {
+        let mut bytes = WalFrame::checkpoint(0, Vec::new())?.encode(0, 0, true);
+        let damaged_at = bytes.len();
+        for seq in 1..=frames {
+            let (group_no, group_end) = if one_group {
+                (1, seq == frames)
+            } else {
+                (u32::try_from(seq).unwrap_or(u32::MAX), true)
+            };
+            bytes.extend(WalFrame::write_batch(seq, seq, vec![7; 8])?.encode(0, group_no, group_end));
+        }
+        bytes[damaged_at..damaged_at + 4].copy_from_slice(b"XXXX");
+        Ok(CountingFile {
+            bytes,
+            read: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn tail_search_reads_each_byte_about_once() -> Result<(), WalError> {
+        // A torn group of many small frames: every one of them is found and discarded, and the
+        // search must not re-read a window per found frame.
+        let file = damaged_log(4000, true)?;
+        let len = file.bytes.len() as u64;
+        let scan = scan_tail(&file, Path::new("/f.wal"), 1, len)?;
+        assert_eq!(scan.committed_end, 48);
+        assert_eq!(scan.discarded.len(), 3999);
+        assert!(
+            file.read_bytes() <= 3 * len,
+            "read {} bytes of a {len}-byte file",
+            file.read_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_search_stops_at_the_first_frame_of_a_later_group() -> Result<(), WalError> {
+        let file = damaged_log(4000, false)?;
+        let len = file.bytes.len() as u64;
+        let result = scan_tail(&file, Path::new("/f.wal"), 1, len);
+        assert!(
+            matches!(result, Err(WalError::Corrupt { offset: 48, .. })),
+            "{result:?}"
+        );
+        assert!(
+            file.read_bytes() <= 2 * len,
+            "read {} bytes of a {len}-byte file",
+            file.read_bytes()
+        );
         Ok(())
     }
 
