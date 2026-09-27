@@ -1,5 +1,6 @@
 //! Shared domain types for LogPose.
 
+pub mod record;
 pub mod schema;
 pub mod value;
 
