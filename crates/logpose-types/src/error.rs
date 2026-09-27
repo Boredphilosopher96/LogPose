@@ -766,7 +766,7 @@ impl LogPoseError {
 #[doc(hidden)]
 /// One error of every variant, for transport mapping tests in other crates.
 ///
-/// [`every_variant_is_listed`](tests) keeps this list complete.
+/// The `every_variant_is_listed` test keeps this list complete.
 pub mod fixtures {
     use super::{CorruptionKind, LogPoseError, ResourceKind};
     use crate::NodeRole;
