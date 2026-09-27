@@ -1039,6 +1039,7 @@ fn status_from_service_error(error: ServiceError) -> Status {
         ServiceError::NotFound(message) => Status::not_found(message),
         ServiceError::InvalidArgument(message) => Status::invalid_argument(message),
         ServiceError::FailedPrecondition(message) => Status::failed_precondition(message),
+        ServiceError::ResourceExhausted(message) => Status::resource_exhausted(message),
         ServiceError::Unauthenticated(message) => Status::unauthenticated(message),
         ServiceError::PermissionDenied(message) => Status::permission_denied(message),
         ServiceError::Internal(message) => Status::internal(message),
@@ -1062,6 +1063,17 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn resource_exhausted_maps_to_the_grpc_resource_exhausted_code() {
+        let status =
+            status_from_service_error(ServiceError::ResourceExhausted("too many pins".to_owned()));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(status.message(), "too many pins");
+        let status =
+            status_from_service_error(ServiceError::FailedPrecondition("expired".to_owned()));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
 
     #[test]
     fn query_diagnostics_to_proto_preserves_ann_fields() {

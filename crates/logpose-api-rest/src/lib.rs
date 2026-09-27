@@ -505,6 +505,7 @@ impl IntoResponse for ApiError {
             ServiceError::NotFound(message) => (StatusCode::NOT_FOUND, message),
             ServiceError::InvalidArgument(message) => (StatusCode::BAD_REQUEST, message),
             ServiceError::FailedPrecondition(message) => (StatusCode::PRECONDITION_FAILED, message),
+            ServiceError::ResourceExhausted(message) => (StatusCode::TOO_MANY_REQUESTS, message),
             ServiceError::Unauthenticated(message) => (StatusCode::UNAUTHORIZED, message),
             ServiceError::PermissionDenied(message) => (StatusCode::FORBIDDEN, message),
             ServiceError::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message),
@@ -643,6 +644,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tower::util::ServiceExt;
+
+    #[test]
+    fn resource_exhausted_maps_to_http_429() {
+        let response =
+            ApiError(ServiceError::ResourceExhausted("too many pins".to_owned())).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 
     #[test]
     fn query_response_serializes_ann_diagnostics_fields() {

@@ -46,6 +46,28 @@ pub enum LogPoseError {
         holder_pid: Option<String>,
     },
 
+    // Snapshot tokens: the caller restarts its read, or releases tokens it holds.
+    /// A snapshot token (or an exact snapshot) names a collection state that is no longer
+    /// retained: the token expired, was released, or was never issued, or the snapshot's
+    /// manifest generation is neither current nor pinned by a token. Restart the read.
+    #[error("snapshot of collection '{collection}' is no longer available: {reason}")]
+    SnapshotExpired {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Why the snapshot cannot be served.
+        reason: String,
+    },
+    /// No more snapshots can be pinned: the collection holds as many tokens as it allows, or
+    /// pinned snapshots already hold as much retired memory as the engine allows. Release a
+    /// token or wait for one to expire.
+    #[error("collection '{collection}' cannot pin another snapshot: {reason}")]
+    TooManySnapshots {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Which limit was reached.
+        reason: String,
+    },
+
     // Storage health and the write path: an operator or the client has to act.
     /// Stored data is corrupt: a WAL that no crash can produce, an undecodable payload, or a
     /// checkpoint frame the manifest has not reached.
@@ -431,6 +453,20 @@ fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> 
 
 /// Monotonic sequence number assigned to durable write operations.
 pub type SeqNo = u64;
+
+/// Identifier of a memtable or a segment of one collection. Allocated from one per-collection
+/// counter (`next_unit_id`, persisted in the manifest) and never reused, even after a failed
+/// maintenance job burned it.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize,
+)]
+pub struct UnitId(pub u32);
+
+impl fmt::Display for UnitId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:08x}", self.0)
+    }
+}
 
 /// Identifier for a collection.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

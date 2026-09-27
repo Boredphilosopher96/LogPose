@@ -77,6 +77,10 @@ pub enum ServiceError {
     /// The request is well-formed but cannot be satisfied by the current node state yet.
     #[error("{0}")]
     FailedPrecondition(String),
+    /// A per-collection or engine-wide limit is reached; retry after releasing resources or
+    /// waiting.
+    #[error("{0}")]
+    ResourceExhausted(String),
     /// The caller failed authentication.
     #[error("{0}")]
     Unauthenticated(String),
@@ -1339,8 +1343,12 @@ impl From<LogPoseError> for ServiceError {
         match error {
             LogPoseError::Message(message) => classify_message(message),
             error @ (LogPoseError::StorageRootLocked { .. }
-            | LogPoseError::CollectionPoisoned { .. }) => {
+            | LogPoseError::CollectionPoisoned { .. }
+            | LogPoseError::SnapshotExpired { .. }) => {
                 ServiceError::FailedPrecondition(error.to_string())
+            }
+            error @ LogPoseError::TooManySnapshots { .. } => {
+                ServiceError::ResourceExhausted(error.to_string())
             }
             error @ LogPoseError::TooLarge { .. } => {
                 ServiceError::InvalidArgument(error.to_string())
@@ -1480,6 +1488,26 @@ mod tests {
         },
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn snapshot_token_errors_map_to_failed_precondition_and_resource_exhausted() {
+        let expired = ServiceError::from(LogPoseError::SnapshotExpired {
+            collection: "default/docs".to_owned(),
+            reason: "the token expired".to_owned(),
+        });
+        assert!(
+            matches!(expired, ServiceError::FailedPrecondition(ref message) if message.contains("the token expired")),
+            "{expired:?}"
+        );
+        let exhausted = ServiceError::from(LogPoseError::TooManySnapshots {
+            collection: "default/docs".to_owned(),
+            reason: "64 pins".to_owned(),
+        });
+        assert!(
+            matches!(exhausted, ServiceError::ResourceExhausted(ref message) if message.contains("64 pins")),
+            "{exhausted:?}"
+        );
+    }
 
     #[test]
     fn preserves_checksum_style_expected_messages_as_internal_errors() {
