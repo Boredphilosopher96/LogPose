@@ -16,7 +16,7 @@
 
 use crate::{dataset::Dataset, oracle::closeness, rng::SplitMix64};
 use clap::ValueEnum;
-use logpose_query::{Predicate, PredicateComparison, PredicateOperator, ScalarMetadataValue};
+use logpose_query::{FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue};
 use serde::Serialize;
 
 const STREAM_UNCORRELATED: u64 = 101;
@@ -162,12 +162,12 @@ impl FilterSpec {
 
     /// The filter in the query crate's predicate AST.
     #[must_use]
-    pub fn predicate(&self) -> Predicate {
+    pub fn predicate(&self) -> FilterExpr {
         let (operator, value) = match self.style {
-            FilterStyle::Equality => (PredicateOperator::Eq, 1_u32),
-            FilterStyle::Range => (PredicateOperator::Lt, self.threshold),
+            FilterStyle::Equality => (FilterOperator::Eq, 1_u32),
+            FilterStyle::Range => (FilterOperator::Lt, self.threshold),
         };
-        Predicate::Comparison(PredicateComparison {
+        FilterExpr::Comparison(FilterComparison {
             field: self.field.clone(),
             operator,
             value: Some(ScalarMetadataValue::Number(value.into())),
