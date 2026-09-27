@@ -868,6 +868,54 @@ mod tests {
         Ok(())
     }
 
+    /// Unit steps from zero with small-integer queries and codes make every
+    /// estimate exact, so a dropped or misread tail lane shows up as a
+    /// mismatch on the backend under test.
+    fn check_backend<S: Simd>(simd: S, backend: &str) -> Result<(), Sq8Error> {
+        let mut rng = Rng::new(0x5a8_bac);
+        for &dims in TEST_LENGTHS.iter().filter(|dims| **dims > 0) {
+            let params = Sq8Params::from_bounds(vec![0.0; dims], vec![255.0; dims])?;
+            assert!(params.step().iter().all(|step| *step == 1.0));
+            let query = rng.integer_vector(dims);
+            let code: Vec<u8> = (0..dims).map(|_| (rng.next_u64() % 9) as u8).collect();
+            let decoded = params.decode(&code)?;
+            for (metric, expected) in [
+                (Sq8Metric::Dot, scalar::dot(&query, &decoded)),
+                (Sq8Metric::L2Squared, scalar::l2_squared(&query, &decoded)),
+            ] {
+                let prepared = params.query(metric, &query)?;
+                let estimate = simd.vectorize(Estimate {
+                    query: &prepared,
+                    code: &code,
+                });
+                assert_eq!(estimate, expected, "{backend} {metric:?} dims {dims}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_simd_backend_estimates_every_tail_length_exactly() -> Result<(), Sq8Error> {
+        check_backend(pulp::Scalar::new(), "scalar")?;
+        check_backend(pulp::Scalar128b, "scalar128")?;
+        check_backend(pulp::Scalar256b, "scalar256")?;
+        check_backend(pulp::Scalar512b, "scalar512")?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(simd) = pulp::x86::V3::try_new() {
+                check_backend(simd, "x86-64-v3")?;
+            }
+            if let Some(simd) = pulp::x86::V4::try_new() {
+                check_backend(simd, "x86-64-v4")?;
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(simd) = pulp::aarch64::Neon::try_new() {
+            check_backend(simd, "neon")?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn reranked_sq8_candidates_recover_exact_top_10() -> Result<(), Sq8Error> {
         const DIMS: usize = 96;
