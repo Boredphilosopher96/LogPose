@@ -69,8 +69,8 @@ fn canonical_pk_hash_matches_the_reference() {
         (PrimaryKey::String("a".to_owned()), 0x9134_6750_400E_332E),
         (PrimaryKey::String("A-1".to_owned()), 0x08C0_359F_752D_D9CB),
         (
-            PrimaryKey::String("caf\u{e9}".to_owned()),
-            0xA41A_8808_2F3B_F61A,
+            PrimaryKey::String("na\u{ef}ve".to_owned()),
+            0x449C_4192_8890_6BE9,
         ),
         (PrimaryKey::String("x".repeat(300)), 0x380F_A685_5E75_DBE3),
     ];
