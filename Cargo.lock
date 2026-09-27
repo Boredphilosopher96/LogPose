@@ -1305,6 +1305,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "logpose-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "logpose-query",
+ "logpose-storage",
+ "logpose-types",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "logpose-catalog"
 version = "0.1.0"
 dependencies = [
