@@ -49,7 +49,8 @@ fn recover(
         frames.push(frame);
     }
     let report = recovery.report().clone();
-    Ok((frames, recovery.into_writer()?, report))
+    let writer = recovery.into_writer(&WalFrame::checkpoint(checkpoint, Vec::new())?)?;
+    Ok((frames, writer, report))
 }
 
 fn payload(seq: SeqNo, len: usize) -> Vec<u8> {
@@ -107,14 +108,17 @@ fn fresh_directory_creates_the_first_file_durably() -> TestResult {
     assert!(frames.is_empty());
     assert_eq!(report, RecoveryReport::default());
     assert_eq!(writer.next_seq_no(), 1);
-    assert_eq!(writer.next_group_no(), 0);
+    // The file starts with its own checkpoint group, group 0.
+    assert_eq!(writer.next_group_no(), 1);
+    assert_eq!(writer.synced_len(), frame_len(0));
     assert_eq!(writer.active_path(), dir().join(wal_file_name(1)));
     drop(writer);
     vfs.crash();
-    assert!(logpose_vfs::exists(
-        vfs.as_ref(),
-        &dir().join(wal_file_name(1))
-    )?);
+    let bytes = file_bytes(vfs.as_ref(), &dir().join(wal_file_name(1)))?;
+    assert_eq!(
+        bytes,
+        WalFrame::checkpoint(0, Vec::new())?.encode(0, 0, true)
+    );
     Ok(())
 }
 
@@ -127,8 +131,9 @@ fn groups_replay_in_order_with_group_numbers_and_group_end() -> TestResult {
             .iter()
             .map(|commit| commit.group_no)
             .collect::<Vec<_>>(),
-        vec![0, 1, 2]
+        vec![1, 2, 3]
     );
+    assert_eq!(commits[0].start_offset, frame_len(0));
     assert_eq!(commits[1].seq_range, Some((2, 3)));
     assert_eq!(commits[1].start_offset, commits[0].end_offset);
     assert_eq!(writer.synced_len(), commits[2].end_offset);
@@ -142,11 +147,11 @@ fn groups_replay_in_order_with_group_numbers_and_group_end() -> TestResult {
         .iter()
         .map(|frame| (frame.header.group_no, frame.header.group_end))
         .collect();
-    assert_eq!(groups, vec![(0, true), (1, false), (1, true), (2, true)]);
+    assert_eq!(groups, vec![(1, true), (2, false), (2, true), (3, true)]);
     assert_eq!(frames[2].payload, payload(3, 30));
     assert_eq!(frames[2].offset, commits[1].start_offset + frame_len(20));
     assert_eq!(writer.next_seq_no(), 5);
-    assert_eq!(writer.next_group_no(), 3);
+    assert_eq!(writer.next_group_no(), 4);
     assert_eq!(writer.synced_len(), commits[2].end_offset);
     Ok(())
 }
@@ -156,12 +161,13 @@ fn a_group_is_one_append_and_one_sync() -> TestResult {
     let vfs = new_vfs(3);
     let (_, mut writer, _) = recover(vfs.process(), "boot-a", 0)?;
     let before = vfs.mutating_ops();
+    let points = vfs.crash_points_hit().len();
     let group = batch_group(&writer, &[100, 5000, 3])?;
     writer.append_group(&group)?;
     assert_eq!(vfs.mutating_ops() - before, 2);
     assert_eq!(
-        vfs.crash_points_hit(),
-        vec![CrashPoint::WalAfterAppend, CrashPoint::WalAfterSync]
+        vfs.crash_points_hit()[points..],
+        [CrashPoint::WalAfterAppend, CrashPoint::WalAfterSync]
     );
     Ok(())
 }
@@ -207,7 +213,7 @@ fn torn_partial_frame_at_the_tail_is_truncated_on_open() -> TestResult {
     let (writer, commits) = three_groups(vfs.process())?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    let torn = WalFrame::write_batch(5, 5, payload(5, 100))?.encode(0, 3, true);
+    let torn = WalFrame::write_batch(5, 5, payload(5, 100))?.encode(0, 4, true);
     append_raw(vfs.as_ref(), &path, &torn[..70])?;
 
     let (frames, writer, report) = recover(vfs.process(), "boot-a", 0)?;
@@ -238,9 +244,9 @@ fn incomplete_last_group_is_discarded_as_a_unit() -> TestResult {
     let (writer, commits) = three_groups(vfs.process())?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    // Two complete, checksummed frames of group 3 whose GROUP_END frame never made it.
-    let mut raw = WalFrame::write_batch(5, 5, payload(5, 9))?.encode(0, 3, false);
-    raw.extend(WalFrame::write_batch(6, 7, payload(6, 17))?.encode(0, 3, false));
+    // Two complete, checksummed frames of group 4 whose GROUP_END frame never made it.
+    let mut raw = WalFrame::write_batch(5, 5, payload(5, 9))?.encode(0, 4, false);
+    raw.extend(WalFrame::write_batch(6, 7, payload(6, 17))?.encode(0, 4, false));
     append_raw(vfs.as_ref(), &path, &raw)?;
 
     let (frames, writer, report) = recover(vfs.process(), "boot-a", 0)?;
@@ -251,7 +257,7 @@ fn incomplete_last_group_is_discarded_as_a_unit() -> TestResult {
     assert_eq!(repair.discarded_seq, Some((5, 7)));
     assert_eq!(repair.damage, None);
     // The writer reuses the discarded group's number and sequence numbers.
-    assert_eq!(writer.next_group_no(), 3);
+    assert_eq!(writer.next_group_no(), 4);
     assert_eq!(writer.next_seq_no(), 5);
     Ok(())
 }
@@ -351,17 +357,131 @@ fn damaged_first_frame_of_a_file_with_several_later_groups_is_corruption() -> Te
 fn damaged_first_frame_of_a_single_group_file_is_a_torn_tail() -> TestResult {
     let vfs = new_vfs(11);
     let (_, mut writer, _) = recover(vfs.process(), "boot-a", 0)?;
-    writer.append_group(&batch_group(&writer, &[10, 20, 30])?)?;
+    let group = writer.append_group(&batch_group(&writer, &[10, 20, 30])?)?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    vfs.corrupt(&path, 0, b"XXXX")?;
+    vfs.corrupt(&path, group.start_offset, b"XXXX")?;
     let (frames, writer, report) = recover(vfs.process(), "boot-a", 0)?;
     assert!(frames.is_empty());
     assert_eq!(
         report.tail_repair.map(|repair| repair.repaired_len),
-        Some(0)
+        Some(group.start_offset)
     );
     assert_eq!(writer.next_seq_no(), 1);
+    Ok(())
+}
+
+#[test]
+fn damaged_checkpoint_frame_followed_by_one_acked_group_is_corruption() -> TestResult {
+    // The file's first frame is its checkpoint group, synced before anything else is appended,
+    // so damage to it followed by a checksummed frame is media damage to a durable group.
+    // Without that rule, the single later group looks like the rest of a torn first group and
+    // repair truncates the file to nothing, losing an acknowledged group.
+    for remove_older in [false, true] {
+        for damage_at in [20, 50] {
+            let vfs = new_vfs(40);
+            let (_, mut writer, _) = recover(vfs.process(), "boot-a", 0)?;
+            writer.append_group(&batch_group(&writer, &[10])?)?;
+            assert!(writer.rotate(&WalFrame::checkpoint(0, vec![1; 16])?)?);
+            if remove_older {
+                writer.remove_checkpointed(1)?;
+            }
+            let acked = writer.append_group(&batch_group(&writer, &[10])?)?;
+            assert_eq!(acked.seq_range, Some((2, 2)));
+            let path = writer.active_path().to_path_buf();
+            drop(writer);
+            vfs.corrupt(&path, damage_at, &[0xFF])?;
+            let before = file_bytes(vfs.as_ref(), &path)?;
+            let checkpoint = u64::from(remove_older);
+            let error = recover(vfs.process(), "boot-a", checkpoint)
+                .err()
+                .ok_or("expected an error, not a truncated log")?;
+            assert!(
+                matches!(error, WalError::Corrupt { offset: 0, .. }),
+                "{error}"
+            );
+            assert_eq!(file_bytes(vfs.as_ref(), &path)?, before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn damaged_first_group_of_a_new_directory_followed_by_one_group_is_corruption() -> TestResult {
+    let vfs = new_vfs(41);
+    let (_, mut writer, _) = recover(vfs.process(), "boot-a", 0)?;
+    let first = writer.append_group(&batch_group(&writer, &[10])?)?;
+    writer.append_group(&batch_group(&writer, &[10])?)?;
+    let path = writer.active_path().to_path_buf();
+    drop(writer);
+    for offset in [0, first.start_offset] {
+        let original = file_bytes(vfs.as_ref(), &path)?;
+        vfs.corrupt(&path, offset + 20, &[0xFF])?;
+        let error = recover(vfs.process(), "boot-a", 0)
+            .err()
+            .ok_or("expected an error, not a truncated log")?;
+        assert!(error.is_corruption(), "{error}");
+        vfs.corrupt(&path, 0, &original)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_file_that_does_not_start_with_a_checkpoint_group_is_corruption() -> TestResult {
+    let vfs = new_vfs(42);
+    let (_, writer, _) = recover(vfs.process(), "boot-a", 0)?;
+    drop(writer);
+    let path = dir().join(wal_file_name(1));
+    vfs.process().open(&path, OpenMode::Append)?.set_len(0)?;
+    append_raw(
+        vfs.as_ref(),
+        &path,
+        &WalFrame::write_batch(1, 1, payload(1, 8))?.encode(0, 0, true),
+    )?;
+    let error = recover(vfs.process(), "boot-a", 0)
+        .err()
+        .ok_or("expected an error")?;
+    assert!(
+        matches!(&error, WalError::Corrupt { offset: 0, reason, .. } if reason.contains("checkpoint")),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_file_repaired_to_nothing_gets_a_new_checkpoint_group() -> TestResult {
+    let vfs = new_vfs(43);
+    let (_, mut writer, _) = recover(vfs.process(), "boot-a", 0)?;
+    writer.append_group(&batch_group(&writer, &[10])?)?;
+    assert!(writer.rotate(&WalFrame::checkpoint(1, vec![3; 40])?)?);
+    let path = writer.active_path().to_path_buf();
+    drop(writer);
+    // The rotation's checkpoint frame is torn: the file is repaired to nothing.
+    vfs.corrupt(&path, 60, &[0xFF])?;
+    let mut recovery = WalRecovery::open(vfs.process(), dir(), config("boot-a"), 0)?;
+    while recovery.next_frame()?.is_some() {}
+    assert_eq!(
+        recovery
+            .report()
+            .tail_repair
+            .as_ref()
+            .map(|repair| repair.repaired_len),
+        Some(0)
+    );
+    // The writer needs a checkpoint frame to start the empty file.
+    assert!(matches!(
+        recovery.into_writer(&WalFrame::write_batch(2, 2, Vec::new())?),
+        Err(WalError::InvalidFrame { .. })
+    ));
+    let (frames, mut writer, _) = recover(vfs.process(), "boot-a", 1)?;
+    assert!(frames.is_empty());
+    assert_eq!(writer.synced_len(), frame_len(0));
+    let commit = writer.append_group(&batch_group(&writer, &[5])?)?;
+    assert_eq!(commit.seq_range, Some((2, 2)));
+    drop(writer);
+    vfs.crash();
+    let (frames, _, _) = recover(vfs.process(), "boot-b", 1)?;
+    assert_eq!(seqs(&frames), vec![2]);
     Ok(())
 }
 
@@ -461,7 +581,7 @@ fn failed_sync_rolls_back_the_group_and_the_next_group_takes_its_place() -> Test
 
         // The next group reuses the failed group's number and lands where it would have.
         let retry = writer.append_group(&batch_group(&writer, &[7])?)?;
-        assert_eq!(retry.group_no, 1);
+        assert_eq!(retry.group_no, first.group_no + 1);
         assert_eq!(retry.start_offset, first.end_offset);
         assert_eq!(retry.seq_range, Some((2, 2)));
         drop(writer);
@@ -616,9 +736,9 @@ fn rotation_makes_the_new_file_durable_before_switching() -> TestResult {
     let marker = frames.last().ok_or("expected the checkpoint frame")?;
     assert_eq!(marker.header.kind, PayloadKind::Checkpoint);
     assert_eq!(marker.payload, b"manifest 0");
-    assert_eq!((marker.header.group_no, marker.header.group_end), (1, true));
+    assert_eq!((marker.header.group_no, marker.header.group_end), (2, true));
     let commit = writer.append_group(&batch_group(&writer, &[5])?)?;
-    assert_eq!(commit.group_no, 2);
+    assert_eq!(commit.group_no, 3);
     assert_eq!(commit.seq_range, Some((3, 3)));
     Ok(())
 }

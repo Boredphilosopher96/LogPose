@@ -1,7 +1,7 @@
 //! Opening a WAL directory: fence check, durability barrier, tail repair and replay.
 
 use super::{
-    FenceMarker, FrameHeader, WalConfig, WalError, WalWriter, data_range,
+    FenceMarker, FrameHeader, WalConfig, WalError, WalFrame, WalWriter, data_range,
     fence::{fence_path, read_marker},
     files::{WalFile, list_dir, wal_file_name},
     scan::{Continuity, Probe, TornDefect, probe, scan_tail},
@@ -339,7 +339,18 @@ impl WalRecovery {
     /// first. The writer appends to the highest-named file; if the directory has no WAL file, it
     /// creates the directory (made durable in its parent) and a file named
     /// `checkpoint_seq_no + 1`. A fence marker from an earlier boot is removed durably.
-    pub fn into_writer(mut self) -> Result<WalWriter, WalError> {
+    ///
+    /// Every WAL file starts with a checkpoint frame that is a group of its own. When the file
+    /// the writer continues is empty (new, or truncated to nothing by tail repair), `checkpoint`
+    /// is appended and synced as that group before the writer is returned; otherwise it is not
+    /// used. It must be a checkpoint frame for the durable manifest's checkpoint.
+    pub fn into_writer(mut self, checkpoint: &WalFrame) -> Result<WalWriter, WalError> {
+        if checkpoint.is_data() {
+            return Err(WalError::invalid(format!(
+                "a new WAL file must start with a checkpoint frame, got a {} frame",
+                checkpoint.kind()
+            )));
+        }
         while self.next_frame()?.is_some() {}
         let last_data_seq = self.cursor.continuity.last_data_seq;
         let next_seq_no = last_data_seq
@@ -367,7 +378,7 @@ impl WalRecovery {
             self.vfs
                 .sync_dir(&self.dir)
                 .map_err(|error| WalError::io("failed to sync WAL directory", &self.dir, error))?;
-            return Ok(WalWriter::resume(ResumeState {
+            return WalWriter::resume(ResumeState {
                 vfs: self.vfs,
                 dir: self.dir,
                 config: self.config,
@@ -380,7 +391,8 @@ impl WalRecovery {
                 next_seq_no,
                 next_group_no,
                 active_has_data: false,
-            }));
+            })
+            .start_file(checkpoint);
         };
         let Some(active) = self.files.last().cloned() else {
             return Err(WalError::invalid("the active WAL file vanished"));
@@ -402,7 +414,7 @@ impl WalRecovery {
                 ),
             ));
         }
-        Ok(WalWriter::resume(ResumeState {
+        let writer = WalWriter::resume(ResumeState {
             vfs: self.vfs,
             dir: self.dir,
             config: self.config,
@@ -412,7 +424,12 @@ impl WalRecovery {
             next_seq_no,
             next_group_no,
             active_has_data,
-        }))
+        });
+        if len == 0 {
+            writer.start_file(checkpoint)
+        } else {
+            Ok(writer)
+        }
     }
 }
 

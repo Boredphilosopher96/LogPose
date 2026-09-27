@@ -188,6 +188,12 @@ impl WalWriter {
         })
     }
 
+    /// Write `checkpoint` as the first group of the empty active file.
+    pub(super) fn start_file(mut self, checkpoint: &WalFrame) -> Result<Self, WalError> {
+        self.append_group(std::slice::from_ref(checkpoint))?;
+        Ok(self)
+    }
+
     /// Check a group against the sequence rules. Returns the next sequence number after it.
     fn validate_group(&self, frames: &[WalFrame]) -> Result<SeqNo, WalError> {
         if frames.is_empty() {

@@ -165,7 +165,8 @@ fn try_recover(vfs: &Arc<FaultVfs>, checkpoint: u64) -> Result<(Vec<Rec>, WalWri
     while let Some(frame) = recovery.next_frame()? {
         frames.push(Rec::from_replay(&frame));
     }
-    Ok((frames, recovery.into_writer()?))
+    let writer = recovery.into_writer(&WalFrame::checkpoint(checkpoint, Vec::new())?)?;
+    Ok((frames, writer))
 }
 
 fn random_payload(rng: &mut Rng) -> Vec<u8> {

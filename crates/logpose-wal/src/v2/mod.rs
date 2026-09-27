@@ -16,6 +16,9 @@
 //!   Anything else means a later group was durably written after the damage, and
 //!   [`WalRecovery::open`] fails with [`WalError::Corrupt`] without modifying anything. A bad
 //!   frame in any other file is always corruption.
+//! - **Every file starts with a checkpoint group.** The first frame of every file is a
+//!   checkpoint frame that is a group of its own, synced before anything else is appended, so
+//!   damage at offset 0 followed by any checksummed frame is corruption, never a torn tail.
 //! - **Failed groups are rolled back.** If the append or the sync of a group fails, the writer
 //!   truncates the file back to the end of the last synced group and syncs that, so the failed
 //!   group is definitely absent after recovery ([`WriteOutcome::NotApplied`]). If the rollback
@@ -41,7 +44,9 @@
 //!     // decode `frame.payload` and apply it
 //!     let _ = (frame.header.kind, frame.payload);
 //! }
-//! let mut writer = recovery.into_writer()?;
+//! // Used only if the writer has to start an empty file; the engine encodes the durable
+//! // manifest's generation and checkpoint into the payload.
+//! let mut writer = recovery.into_writer(&WalFrame::checkpoint(0, Vec::new())?)?;
 //! let seq = writer.next_seq_no();
 //! let frame = WalFrame::new(PayloadKind::WriteBatch, seq, seq, b"payload".to_vec())?;
 //! writer.append_group(&[frame])?;

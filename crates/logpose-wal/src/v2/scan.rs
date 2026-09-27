@@ -4,6 +4,7 @@ use super::{
     WalError,
     frame::{FRAME_ALIGN, FRAME_HEADER_LEN, FrameHeader, HeaderDefect, MAGIC_BYTES, crc32c},
 };
+use crate::codec::PayloadKind;
 use logpose_types::SeqNo;
 use logpose_vfs::VfsFile;
 use std::path::Path;
@@ -135,6 +136,8 @@ pub(super) struct Continuity {
     file_first_seq: SeqNo,
     /// Whether the current file had a data frame yet.
     file_has_data: bool,
+    /// Whether the current file had any frame yet.
+    file_has_frame: bool,
 }
 
 impl Continuity {
@@ -155,6 +158,7 @@ impl Continuity {
         }
         self.file_first_seq = first_seq_no;
         self.file_has_data = false;
+        self.file_has_frame = false;
         Ok(())
     }
 
@@ -164,7 +168,22 @@ impl Continuity {
     }
 
     /// Check one checksummed frame against the frames before it, then record it.
+    ///
+    /// Every file starts with a checkpoint frame that is a group of its own, synced before
+    /// anything else is appended. Tail repair relies on this: damage at offset 0 is then damage
+    /// to a durable group, never part of a torn one.
     pub(super) fn frame(&mut self, header: &FrameHeader) -> Result<(), String> {
+        if !self.file_has_frame && (header.kind != PayloadKind::Checkpoint || !header.group_end) {
+            return Err(format!(
+                "the first frame of a WAL file must be a checkpoint frame that ends its own group, got a {} frame{}",
+                header.kind,
+                if header.group_end {
+                    ""
+                } else {
+                    " without GROUP_END"
+                }
+            ));
+        }
         match self.last_frame {
             Some((group_no, true)) if header.group_no != group_no.wrapping_add(1) => {
                 return Err(format!(
@@ -199,6 +218,7 @@ impl Continuity {
             self.file_has_data = true;
         }
         self.last_frame = Some((header.group_no, header.group_end));
+        self.file_has_frame = true;
         Ok(())
     }
 }
@@ -222,8 +242,9 @@ pub(super) struct TailScan {
 /// corruption. Past a damaged frame, the rest of the file is searched at 8-byte steps for
 /// checksummed frames; the tail is torn only if all of them belong to the damaged frame's own
 /// fsync group (the group after the last `GROUP_END`) and only the last of them may carry
-/// `GROUP_END`. Anything else means a later group was durably written after the damage, so it
-/// is corruption and the caller must not truncate.
+/// `GROUP_END`. When the damaged frame is the file's first frame, its checkpoint group, any
+/// later checksummed frame at all is corruption. Anything else means a later group was durably
+/// written after the damage, so it is corruption and the caller must not truncate.
 pub(super) fn scan_tail(
     file: &dyn VfsFile,
     path: &Path,
@@ -259,7 +280,9 @@ pub(super) fn scan_tail(
     let mut discarded = open_group;
     if let Some((damaged_at, defect)) = damage {
         // The damaged frame's group: the unfinished group it interrupts, or the group after the
-        // last complete one. Unknown only when the very first frame of the file is damaged.
+        // last complete one. `None` when the first frame of the file is damaged: that is the
+        // file's checkpoint group, one frame synced before anything else was appended, so no
+        // later frame can belong to it.
         let damaged_group = continuity.last_frame.map(|(group_no, group_end)| {
             if group_end {
                 group_no.wrapping_add(1)
@@ -270,14 +293,11 @@ pub(super) fn scan_tail(
         // A damaged frame whose header is checksummed has a trustworthy extent: bytes inside
         // it are its payload, never frames. Otherwise search right after its start.
         let search_from = damaged_at + defect.claimed_len().unwrap_or(FRAME_ALIGN);
-        // When the first frame of the file is damaged the group is unknown, and every later
-        // frame must agree with the first one found. The first frame that breaks the rule ends
-        // the search, so a damaged frame early in a large file costs one pass, not one per frame.
-        let mut expected = damaged_group;
+        // The first frame that breaks the rule ends the search, so a damaged frame early in a
+        // large file costs one pass, not one per frame.
         let mut seen_group_end = false;
         find_frames_after(file, path, search_from, len, |at, header| {
-            let expected_group = *expected.get_or_insert(header.group_no);
-            if header.group_no != expected_group || seen_group_end {
+            if Some(header.group_no) != damaged_group || seen_group_end {
                 return Err(WalError::corrupt(
                     path,
                     damaged_at,
@@ -500,7 +520,9 @@ mod tests {
             } else {
                 (u32::try_from(seq).unwrap_or(u32::MAX), true)
             };
-            bytes.extend(WalFrame::write_batch(seq, seq, vec![7; 8])?.encode(0, group_no, group_end));
+            bytes.extend(
+                WalFrame::write_batch(seq, seq, vec![7; 8])?.encode(0, group_no, group_end),
+            );
         }
         bytes[damaged_at..damaged_at + 4].copy_from_slice(b"XXXX");
         Ok(CountingFile {
@@ -549,25 +571,35 @@ mod tests {
             WalFrame::write_batch(first, last, Vec::new())
                 .map(|frame| frame.header(0, group_no, group_end))
         };
+        let checkpoint = |seq, group_no, group_end| {
+            WalFrame::checkpoint(seq, Vec::new()).map(|frame| frame.header(0, group_no, group_end))
+        };
         let mut continuity = Continuity::default();
         assert!(continuity.start_file(5).is_ok());
-        assert!(continuity.frame(&header(6, 6, 0, true)?).is_err());
-        assert!(continuity.frame(&header(5, 6, 0, false)?).is_ok());
+        // A file starts with a checkpoint frame that is a group of its own.
+        assert!(continuity.clone().frame(&header(5, 5, 0, true)?).is_err());
+        assert!(continuity.clone().frame(&checkpoint(4, 0, false)?).is_err());
+        assert!(continuity.frame(&checkpoint(4, 0, true)?).is_ok());
+        assert!(continuity.frame(&header(6, 6, 1, true)?).is_err());
+        assert!(continuity.frame(&header(5, 6, 1, false)?).is_ok());
         // Same group continues; a new group number here is an error.
-        assert!(continuity.clone().frame(&header(7, 7, 1, true)?).is_err());
-        assert!(continuity.frame(&header(7, 7, 0, true)?).is_ok());
+        assert!(continuity.clone().frame(&header(7, 7, 2, true)?).is_err());
+        assert!(continuity.frame(&header(7, 7, 1, true)?).is_ok());
         // After GROUP_END the next frame must be the next group.
-        assert!(continuity.clone().frame(&header(8, 8, 0, true)?).is_err());
-        assert!(continuity.clone().frame(&header(9, 9, 1, true)?).is_err());
-        assert!(continuity.frame(&header(8, 8, 1, true)?).is_ok());
-        // The next file must start right after the last sequence number.
+        assert!(continuity.clone().frame(&header(8, 8, 1, true)?).is_err());
+        assert!(continuity.clone().frame(&header(9, 9, 2, true)?).is_err());
+        assert!(continuity.frame(&header(8, 8, 2, true)?).is_ok());
+        // The next file must start right after the last sequence number, again with a
+        // checkpoint group.
         assert!(continuity.clone().start_file(10).is_err());
         assert!(continuity.start_file(9).is_ok());
+        assert!(continuity.clone().frame(&header(9, 9, 3, true)?).is_err());
+        assert!(continuity.frame(&checkpoint(8, 3, true)?).is_ok());
         // Group numbers wrap.
         let mut wrapping = Continuity::default();
         assert!(wrapping.start_file(1).is_ok());
-        assert!(wrapping.frame(&header(1, 1, u32::MAX, true)?).is_ok());
-        assert!(wrapping.frame(&header(2, 2, 0, true)?).is_ok());
+        assert!(wrapping.frame(&checkpoint(0, u32::MAX, true)?).is_ok());
+        assert!(wrapping.frame(&header(1, 1, 0, true)?).is_ok());
         Ok(())
     }
 }
