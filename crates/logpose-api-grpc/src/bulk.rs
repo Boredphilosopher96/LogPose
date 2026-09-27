@@ -185,12 +185,17 @@ fn resolve_target(
 }
 
 /// The error for a stream that failed before a message could be read.
+///
+/// Tonic reports both an undecodable message and an HTTP/2 transport failure (a protocol
+/// error, a reset connection) as `INTERNAL`. It tells them apart the same way this does: a
+/// status built from a transport error carries that error as its `source`, while the statuses
+/// its decoder builds for bad message bytes carry none.
 fn stream_error(status: &Status, limit: usize) -> LogPoseError {
+    let transport_failure = std::error::Error::source(status).is_some();
     match status.code() {
         // Tonic's decode limit; see `MessageLimitLayer`.
-        Code::OutOfRange => message_too_large(limit),
-        // Tonic reports an undecodable protobuf message as INTERNAL.
-        Code::Internal => LogPoseError::invalid_argument(format!(
+        Code::OutOfRange if !transport_failure => message_too_large(limit),
+        Code::Internal if !transport_failure => LogPoseError::invalid_argument(format!(
             "malformed bulk write message: {}",
             status.message()
         )),
@@ -426,6 +431,50 @@ mod tests {
             }
         ));
         assert_eq!(server.live_records("docs").await, 2);
+    }
+
+    /// A transport failure as tonic reports it: a status whose source chain holds the error.
+    #[derive(Debug)]
+    struct TransportFailure(Status);
+
+    impl std::fmt::Display for TransportFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("connection error")
+        }
+    }
+
+    impl std::error::Error for TransportFailure {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn stream_errors_separate_bad_messages_from_transport_failures() {
+        // What tonic's decoder returns for bytes that are not a valid message.
+        let malformed = stream_error(&Status::internal("failed to decode Protobuf message"), 64);
+        assert_eq!(malformed.code(), logpose_types::ErrorCode::InvalidArgument);
+        assert!(
+            malformed
+                .to_string()
+                .contains("malformed bulk write message")
+        );
+
+        // What tonic returns when the HTTP/2 stream itself fails.
+        let transport = Status::from_error(Box::new(TransportFailure(Status::internal(
+            "h2 protocol error: stream error received: unexpected internal error",
+        ))));
+        assert_eq!(transport.code(), Code::Internal);
+        let interrupted = stream_error(&transport, 64);
+        assert_eq!(interrupted.code(), logpose_types::ErrorCode::Unavailable);
+        assert!(
+            interrupted
+                .to_string()
+                .contains("bulk write stream was interrupted")
+        );
+
+        let too_large = stream_error(&Status::out_of_range("message too large"), 64);
+        assert_eq!(too_large.reason(), "TOO_LARGE");
     }
 
     #[tokio::test]
