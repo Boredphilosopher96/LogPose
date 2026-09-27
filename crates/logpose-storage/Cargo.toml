@@ -9,6 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = "1.7"
 async-trait.workspace = true
 bytemuck = "1.25"
 crc32c = "0.6"
@@ -20,14 +21,15 @@ logpose-types = { path = "../logpose-types" }
 logpose-vfs = { path = "../logpose-vfs" }
 logpose-wal = { path = "../logpose-wal" }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+rayon.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 uuid.workspace = true
 
 [dev-dependencies]
 logpose-query = { path = "../logpose-query" }
 rand = "0.10.1"
-tokio.workspace = true

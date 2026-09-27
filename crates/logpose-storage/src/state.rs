@@ -1,24 +1,43 @@
-//! Per-operation collection state: the descriptor, manifest and replayed WAL delta, and snapshot validation against it.
+//! The v1 logical state a read runs against (manifest plus replayed delta), and snapshot
+//! validation against it.
 
-use crate::manifest::Manifest;
-use logpose_catalog::CollectionDescriptor;
+use crate::{
+    manifest::Manifest,
+    version::{DeltaLog, Version, visible_seq_no},
+};
 use logpose_types::{LogPoseError, Result, SeqNo, Snapshot};
-use logpose_wal::WalRecord;
+use std::sync::Arc;
 
+/// A manifest and the WAL delta above its checkpoint: the current state (from the published
+/// `Version`) or a historical one (loaded from disk for an older manifest generation).
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionState {
-    pub(crate) descriptor: CollectionDescriptor,
-    pub(crate) manifest: Manifest,
-    pub(crate) delta: Vec<WalRecord>,
+    pub(crate) manifest: Arc<Manifest>,
+    pub(crate) delta: DeltaLog,
 }
 
 impl CollectionState {
     pub(crate) fn visible_seq_no(&self) -> SeqNo {
-        self.delta.last().map(|record| record.seq_no).unwrap_or(
-            self.manifest
-                .checkpoint_seq_no
-                .max(self.manifest.max_segment_seq_no()),
-        )
+        visible_seq_no(&self.manifest, &self.delta)
+    }
+}
+
+impl Version {
+    /// The v1 state this version publishes.
+    pub(crate) fn state(&self) -> CollectionState {
+        CollectionState {
+            manifest: Arc::clone(&self.manifest),
+            delta: self.delta.clone(),
+        }
+    }
+
+    /// The snapshot naming exactly this version's state.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            manifest_generation: self.manifest_generation,
+            visible_seq_no: self.visible_seq_no,
+        }
     }
 }
 

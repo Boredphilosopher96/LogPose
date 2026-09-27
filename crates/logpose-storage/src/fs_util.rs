@@ -49,6 +49,25 @@ pub(crate) fn atomic_write_with_points(
     {
         create_dir_all_synced(vfs, parent)?;
     }
+    replace_atomically(vfs, path, bytes, points)
+}
+
+/// [`atomic_write`] into a directory that must already exist. For files of a collection that
+/// may be dropped concurrently, where recreating the directory would resurrect it on disk.
+pub(crate) fn atomic_write_in_existing_dir(
+    vfs: &dyn Vfs,
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    replace_atomically(vfs, path, bytes, AtomicWritePoints::default())
+}
+
+fn replace_atomically(
+    vfs: &dyn Vfs,
+    path: &Path,
+    bytes: Vec<u8>,
+    points: AtomicWritePoints,
+) -> Result<()> {
     static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let temp_path = path.with_file_name(format!(
         ".{}.{}.{}.tmp",

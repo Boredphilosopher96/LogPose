@@ -1,17 +1,12 @@
-//! WAL rotation protocol shared by writes, flush and recovery: the per-collection rotation lock and the `PENDING_ROTATION` marker.
+//! WAL rotation protocol shared by flush and recovery: the `PENDING_ROTATION` marker.
 
 #[cfg(test)]
 use crate::failpoints;
-use crate::{LocalStorageEngine, durable_fs::sync_parent_dir, fs_util::remove_file_if_exists};
+use crate::{durable_fs::sync_parent_dir, engine::EngineCore, fs_util::remove_file_if_exists};
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::Result;
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
-};
 
-impl LocalStorageEngine {
+impl EngineCore {
     /// Remove the pending-rotation marker and make the removal durable.
     pub(crate) fn clear_pending_rotation_marker(
         &self,
@@ -27,19 +22,4 @@ impl LocalStorageEngine {
         )?;
         sync_parent_dir(self.vfs.as_ref(), &marker_path)
     }
-}
-
-fn wal_rotation_locks() -> &'static Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-pub(crate) fn wal_rotation_lock(path: &Path) -> Arc<Mutex<()>> {
-    let mut locks = wal_rotation_locks()
-        .lock()
-        .expect("wal rotation lock map should not be poisoned");
-    locks
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
 }

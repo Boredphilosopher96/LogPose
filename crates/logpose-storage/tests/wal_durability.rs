@@ -1,5 +1,6 @@
 //! Crash-recovery tests for WAL batch atomicity and torn-tail repair.
 
+use arc_swap as _;
 use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
@@ -12,6 +13,7 @@ use logpose_vfs as _;
 use logpose_wal as _;
 use postcard as _;
 use rand as _;
+use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
@@ -93,6 +95,7 @@ async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() 
     let bytes = fs::read(&active).expect("active wal should exist");
     fs::write(&active, &bytes[..bytes.len() - 1]).expect("tear should succeed");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a"]);
     assert_eq!(
@@ -132,6 +135,8 @@ async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
         .expect("write should succeed");
     let full = fs::read(&active).expect("active wal should exist");
 
+    drop(engine);
+
     let step = ((full.len() - committed) / 7).max(1);
     for cut in (committed + 1..full.len()).step_by(step) {
         fs::write(&active, &full[..cut]).expect("tear should succeed");
@@ -166,6 +171,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
         .expect("tear should succeed");
 
     // Readers ignore the torn tail before anything repairs it.
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b"]);
 
@@ -181,6 +187,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
         .expect("write should succeed");
     assert_eq!(ack.last_seq_no, 5);
 
+    drop(reopened);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c", "d", "e"]);
     let stats = reopened
@@ -206,6 +213,7 @@ async fn garbage_tail_is_truncated_by_the_next_write() {
     bytes.extend_from_slice(b"\0\0\0garbage left by a crash");
     fs::write(&active, &bytes).expect("garbage should be written");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a"]);
     reopened
@@ -221,6 +229,7 @@ async fn garbage_tail_is_truncated_by_the_next_write() {
             .any(|window| window == b"garbage"),
         "the garbage tail must be truncated before appending"
     );
+    drop(reopened);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b"]);
 }
@@ -235,6 +244,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .write("documents", vec![put("a"), put("b"), put("c")])
         .await
         .expect("write should succeed");
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c"]);
 
@@ -250,6 +260,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .expect("write should succeed");
     assert_eq!(ack.last_seq_no, 5);
 
+    drop(reopened);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c", "d", "e"]);
     let stats = reopened
@@ -291,6 +302,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .await
         .expect("second flush should succeed");
     assert_eq!(flushed.visible_seq_no, 5);
+    drop(reopened);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
@@ -319,6 +331,7 @@ async fn flush_after_a_torn_tail_rolls_a_clean_wal() {
     bytes.extend_from_slice(b"torn");
     fs::write(&active, &bytes).expect("garbage should be written");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let flushed = reopened
         .flush("documents")

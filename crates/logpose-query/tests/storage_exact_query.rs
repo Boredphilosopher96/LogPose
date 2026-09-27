@@ -263,6 +263,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("flush should succeed");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let historical = query_exact(

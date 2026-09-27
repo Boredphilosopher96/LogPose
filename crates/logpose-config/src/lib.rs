@@ -125,6 +125,7 @@ impl LogPoseConfig {
                 LogPoseError::Message(message) => {
                     LogPoseError::Message(format!("invalid LOGPOSE_CONFIG: {message}"))
                 }
+                other => other,
             })?;
         }
         self.auth.validate()?;

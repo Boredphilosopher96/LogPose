@@ -1,5 +1,6 @@
 //! Seeded state-machine tests for `LocalStorageEngine`.
 
+use arc_swap as _;
 use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
@@ -10,6 +11,7 @@ use logpose_index as _;
 use logpose_query as _;
 use logpose_wal as _;
 use postcard as _;
+use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;

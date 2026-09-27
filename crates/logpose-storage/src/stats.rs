@@ -1,10 +1,10 @@
 //! Collection and query-unit statistics and the size estimates behind them.
 
 use crate::{
-    LocalStorageEngine,
+    engine::EngineCore,
+    handle::CollectionHandle,
     manifest::SegmentMeta,
     resolve::{ResolvedState, resolve_latest_state_selected},
-    state::{CollectionState, resolve_snapshot},
 };
 use logpose_index::{FlatIndexEntrySource, HnswIndexSidecar, build_flat_index};
 use logpose_types::{
@@ -13,15 +13,17 @@ use logpose_types::{
 use logpose_wal::WalRecord;
 use std::collections::BTreeMap;
 
-impl LocalStorageEngine {
-    pub(crate) fn collection_stats_from_state(
+impl EngineCore {
+    pub(crate) fn collection_stats(
         &self,
-        state: CollectionState,
+        handle: &CollectionHandle,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
-        let effective_snapshot = resolve_snapshot(&state, snapshot)?;
+        let (state, effective_snapshot) = self.read_state(handle, snapshot)?;
+        let descriptor = handle.descriptor();
         let resolved = resolve_latest_state_selected(
             self.vfs.as_ref(),
+            descriptor,
             &state,
             effective_snapshot.visible_seq_no,
             true,
@@ -35,7 +37,7 @@ impl LocalStorageEngine {
                 ResolvedState::Deleted { .. } => deleted_record_count += 1,
             }
         }
-        let maintenance = self.load_maintenance_status(&state.descriptor)?;
+        let maintenance = self.maintenance_status(handle);
         let delta_records = state
             .delta
             .iter()
@@ -46,9 +48,9 @@ impl LocalStorageEngine {
         query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
 
         Ok(CollectionStats {
-            collection_id: state.descriptor.collection_id.clone(),
-            database_name: state.descriptor.database_name.clone(),
-            collection_name: state.descriptor.name.clone(),
+            collection_id: descriptor.collection_id.clone(),
+            database_name: descriptor.database_name.clone(),
+            collection_name: descriptor.name.clone(),
             manifest_generation: effective_snapshot.manifest_generation,
             visible_seq_no: effective_snapshot.visible_seq_no,
             mutable_op_count: delta_records.len(),

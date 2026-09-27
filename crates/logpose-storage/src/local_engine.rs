@@ -1,17 +1,22 @@
-//! `LocalStorageEngine`: the filesystem-backed engine, its storage-root claim, and its `StorageEngine` implementation.
+//! `LocalStorageEngine`: the `StorageEngine` implementation over an [`Engine`].
+//!
+//! Every trait method resolves its collection with a map lookup and runs its blocking work on
+//! the engine's I/O pool (reads and writes) or maintenance job threads (flush and compaction),
+//! never on a tokio worker. Reads of the current state use the published `Version` and read no
+//! metadata files.
 
 use crate::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
+    collections::collection_ref_from_lookup,
     durable_fs::{path_exists, read_file},
+    engine::{CoreRef, Engine, EngineConfig, EngineCore, not_found},
     error::{io_message, json_message},
+    handle::CollectionHandle,
     maintenance::MaintenanceOperation,
     manifest::{SegmentMeta, segment_artifact_file_name},
     metric::{storage_metric_compare, storage_metric_value},
     resolve::{ResolvedState, resolve_latest_state_for_ids_selected},
-    root_lock::StorageRootLock,
     segment_v1::read_segment_file,
-    state::resolve_snapshot,
-    wal_rotation::wal_rotation_lock,
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
@@ -20,23 +25,629 @@ use logpose_index::{
     is_unsupported_hnsw_version,
 };
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
+    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
     CollectionStats, CommitAck, DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus,
     NodeRole, RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{Vfs, std_vfs};
-use logpose_wal::{WalBatch, WalRecord, WalWriter};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
+
+/// A metadata filter over record metadata, as the query layer passes it down.
+type MetadataFilter = Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>;
+
+/// Local filesystem-backed storage engine: the [`StorageEngine`] trait over an [`Engine`].
+///
+/// Every file access goes through the engine's [`Vfs`]: [`StdVfs`](logpose_vfs::StdVfs) for
+/// the convenience constructors, or any `Vfs` passed to [`LocalStorageEngine::with_vfs`] (tests
+/// use [`FaultVfs`](logpose_vfs::FaultVfs) to inject crashes).
+///
+/// Opening claims the storage root exclusively: a second engine on the same root fails with
+/// [`LogPoseError::StorageRootLocked`], in this process or another. Share one engine by cloning
+/// it; the root is released when the last clone is dropped.
+#[derive(Clone, Debug)]
+pub struct LocalStorageEngine {
+    engine: Engine,
+}
+
+impl LocalStorageEngine {
+    /// Open a local storage engine rooted at the provided path on the real filesystem.
+    ///
+    /// Creates the root directory if needed and fails if another engine holds the root.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        Self::with_blob_store(root, None)
+    }
+
+    /// Open a local storage engine on the real filesystem with an optional blob-store
+    /// implementation.
+    ///
+    /// Creates the root directory if needed and fails if another engine holds the root.
+    pub fn with_blob_store(
+        root: impl AsRef<Path>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+    ) -> Result<Self> {
+        Self::with_vfs(std_vfs(), root, blob_store)
+    }
+
+    /// Open a local storage engine that performs all file I/O through `vfs`.
+    ///
+    /// Creates the root directory if needed and fails if another engine holds the root.
+    pub fn with_vfs(
+        vfs: Arc<dyn Vfs>,
+        root: impl AsRef<Path>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+    ) -> Result<Self> {
+        let config = EngineConfig {
+            blob_store,
+            ..EngineConfig::default()
+        };
+        Ok(Self::from_engine(Engine::open(vfs, root, config)?))
+    }
+
+    /// Serve the `StorageEngine` trait over an open engine.
+    #[must_use]
+    pub fn from_engine(engine: Engine) -> Self {
+        Self { engine }
+    }
+
+    /// The engine behind this adapter.
+    #[must_use]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// The filesystem this engine performs all I/O through.
+    #[must_use]
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        self.engine.vfs()
+    }
+
+    /// Build the descriptor that would be persisted for one collection request.
+    pub fn plan_collection_descriptor(
+        &self,
+        request: &CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        self.engine.core().plan_collection_descriptor(request)
+    }
+
+    /// Persist a collection using a previously planned descriptor. Blocking.
+    pub fn create_collection_from_descriptor(
+        &self,
+        descriptor: CollectionDescriptor,
+        assignment: Option<&CollectionAssignment>,
+    ) -> Result<CollectionDescriptor> {
+        self.engine
+            .create_collection(descriptor, assignment)
+            .map(|handle| handle.descriptor().clone())
+    }
+
+    /// Open a collection descriptor using an explicit database namespace.
+    pub async fn open_collection_in_database(
+        &self,
+        database_name: &str,
+        name: &str,
+    ) -> Result<CollectionDescriptor> {
+        self.engine
+            .collection(&CollectionRef::new(database_name, name))
+            .map(|handle| handle.descriptor().clone())
+    }
+
+    fn handle(&self, name: &str) -> Result<Arc<CollectionHandle>> {
+        self.engine.collection(&collection_ref_from_lookup(name))
+    }
+
+    /// Run data-plane work for `handle` on the I/O pool. The first data-plane access of a
+    /// recovered collection resumes its persisted maintenance, as a v1 state load did.
+    async fn data_io<T: Send + 'static>(
+        &self,
+        handle: Arc<CollectionHandle>,
+        f: impl FnOnce(&CoreRef, &Arc<CollectionHandle>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.engine
+            .io(move |core| {
+                core.resume_armed_maintenance(&handle);
+                f(core, &handle)
+            })
+            .await
+    }
+
+    /// The handle serving `descriptor`, which must name the same collection (same id).
+    fn handle_for(&self, descriptor: &CollectionDescriptor) -> Result<Arc<CollectionHandle>> {
+        let reference = descriptor.collection_ref();
+        let handle = self.engine.collection(&reference)?;
+        if handle.meta().id != descriptor.collection_id {
+            return Err(not_found(&reference));
+        }
+        Ok(handle)
+    }
+
+    async fn create(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+    ) -> Result<CollectionDescriptor> {
+        self.engine
+            .io(move |core| {
+                let descriptor = core.plan_collection_descriptor(&request)?;
+                core.create_collection(descriptor, Some(&assignment))
+                    .map(|handle| handle.descriptor().clone())
+            })
+            .await
+    }
+
+    async fn maintain(
+        &self,
+        collection_name: &str,
+        operation: MaintenanceOperation,
+    ) -> Result<Snapshot> {
+        let handle = self.handle(collection_name)?;
+        self.engine
+            .job(move |core| {
+                core.resume_armed_maintenance(&handle);
+                core.perform_maintenance(&handle, operation)
+            })
+            .await
+    }
+
+    async fn stats_of(
+        &self,
+        handle: Arc<CollectionHandle>,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        self.data_io(handle, move |core, handle| {
+            core.collection_stats(handle, snapshot)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl StorageEngine for LocalStorageEngine {
+    async fn engine_name(&self) -> &'static str {
+        "local"
+    }
+
+    async fn create_collection(
+        &self,
+        request: CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        self.create(
+            request,
+            CollectionAssignment {
+                assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
+                assigned_role: NodeRole::Data,
+            },
+        )
+        .await
+    }
+
+    async fn create_collection_with_assignment(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+        _leader_fence: Option<LeadershipFence>,
+    ) -> Result<CollectionDescriptor> {
+        self.create(request, assignment).await
+    }
+
+    async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
+        self.handle(name).map(|handle| handle.descriptor().clone())
+    }
+
+    async fn has_local_collection(&self, name: &str) -> Result<bool> {
+        Ok(self.handle(name).is_ok())
+    }
+
+    async fn local_collection_matches_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<bool> {
+        match self.handle(&descriptor.lookup_name()) {
+            Ok(handle) => Ok(handle.descriptor().matches_serving_identity(descriptor)),
+            Err(error) if error.to_string().contains("does not exist") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.engine.core().list_descriptors()
+    }
+
+    async fn collection_assignment_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        self.handle_for(descriptor)?
+            .meta()
+            .assignment
+            .clone()
+            .ok_or_else(|| {
+                LogPoseError::Message(format!(
+                    "collection '{}' is missing placement metadata",
+                    descriptor.name
+                ))
+            })
+    }
+
+    async fn write(
+        &self,
+        collection_name: &str,
+        operations: Vec<WriteOperation>,
+    ) -> Result<CommitAck> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| core.write(handle, operations))
+            .await
+    }
+
+    async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
+        let handle = self.handle(collection_name)?;
+        handle.ensure_open()?;
+        Ok(handle.current().snapshot())
+    }
+
+    async fn scan_exact(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.scan_exact_internal(handle, snapshot, true, None)
+        })
+        .await
+    }
+
+    async fn scan_exact_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.scan_exact_internal(
+                handle,
+                snapshot,
+                include_mutable,
+                Some(immutable_unit_ids.into_iter().collect()),
+            )
+        })
+        .await
+    }
+
+    async fn ann_search_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        immutable_unit_ids: Vec<String>,
+        request: AnnSearchRequest,
+        filter: Option<MetadataFilter>,
+    ) -> Result<Vec<AnnCandidate>> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.ann_search_selected(handle, snapshot, immutable_unit_ids, &request, filter)
+        })
+        .await
+    }
+
+    async fn latest_visible_selected(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+        record_ids: Vec<RecordId>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.latest_visible_selected(
+                handle,
+                snapshot,
+                record_ids,
+                include_mutable,
+                immutable_unit_ids,
+            )
+        })
+        .await
+    }
+
+    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
+        self.maintain(collection_name, MaintenanceOperation::Flush)
+            .await
+    }
+
+    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
+        self.maintain(collection_name, MaintenanceOperation::Compact)
+            .await
+    }
+
+    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
+        self.stats_snapshot(collection_name, None).await
+    }
+
+    async fn stats_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let handle = self.handle_for(descriptor)?;
+        self.stats_of(handle, snapshot).await
+    }
+
+    async fn maintenance_status_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<MaintenanceStatus> {
+        let handle = self.handle_for(descriptor)?;
+        Ok(self.engine.core().maintenance_status(&handle))
+    }
+
+    async fn recover_maintenance_descriptor(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<()> {
+        let handle = self.handle_for(descriptor)?;
+        self.engine
+            .io(move |core| {
+                handle.take_maintenance_resume();
+                core.resume_maintenance(&handle);
+                Ok(())
+            })
+            .await
+    }
+
+    async fn stats_snapshot(
+        &self,
+        collection_name: &str,
+        snapshot: Option<Snapshot>,
+    ) -> Result<CollectionStats> {
+        let handle = self.handle(collection_name)?;
+        self.stats_of(handle, snapshot).await
+    }
+
+    async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| core.inspect(handle, target))
+            .await
+    }
+}
+
+impl EngineCore {
+    pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
+        path_exists(self.vfs.as_ref(), path)
+    }
+
+    fn read_hnsw_sidecar(&self, path: &Path) -> Result<HnswIndexSidecar> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
+        decode_hnsw_index(bytes, path)
+            .map_err(|error| io_message("failed to read hnsw sidecar", error))
+    }
+
+    /// Read an HNSW sidecar the ANN path can traverse. `Ok(None)` means the sidecar has a graph
+    /// layout this build does not read; the segment's records are still readable, so the caller
+    /// scores them exactly instead of failing the query.
+    fn read_current_hnsw_sidecar(&self, path: &Path) -> Result<Option<HnswIndexSidecar>> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
+        match decode_hnsw_index(bytes, path) {
+            Ok(hnsw) => Ok(Some(hnsw)),
+            Err(error) if is_unsupported_hnsw_version(&error) => Ok(None),
+            Err(error) => Err(io_message("failed to read hnsw sidecar", error)),
+        }
+    }
+
+    fn read_flat_sidecar(&self, path: &Path) -> Result<FlatIndexSidecar> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read flat index sidecar")?;
+        decode_flat_index(&bytes)
+            .map_err(|error| io_message("failed to read flat index sidecar", error))
+    }
+
+    fn ann_search_selected(
+        &self,
+        handle: &CollectionHandle,
+        snapshot: Option<Snapshot>,
+        immutable_unit_ids: Vec<String>,
+        request: &AnnSearchRequest,
+        filter: Option<MetadataFilter>,
+    ) -> Result<Vec<AnnCandidate>> {
+        let (state, snapshot) = self.read_state(handle, snapshot)?;
+        let descriptor = handle.descriptor();
+        let metric = descriptor.metric;
+        let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
+        let mut candidates_by_record_id = BTreeMap::<RecordId, AnnCandidate>::new();
+        let request_budget = request.candidate_budget.max(request.top_k);
+
+        for segment in state
+            .manifest
+            .segments
+            .iter()
+            .rev()
+            .filter(|segment| selected.contains(&segment.segment_id))
+        {
+            let hnsw_path = descriptor.root_path.join("indexes").join(
+                segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
+                    LogPoseError::Message(format!(
+                        "segment '{}' is missing hnsw artifact metadata",
+                        segment.segment_id
+                    ))
+                })?,
+            );
+            let segment_candidates = match self.read_current_hnsw_sidecar(&hnsw_path)? {
+                Some(hnsw) => logpose_index::search_hnsw(
+                    &hnsw,
+                    &request.vector,
+                    request_budget,
+                    filter.as_deref(),
+                )
+                .map_err(|error| io_message("failed to search hnsw sidecar", error))?
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
+                .map(|candidate| AnnCandidate {
+                    unit_id: segment.segment_id.clone(),
+                    record_id: candidate.record_id,
+                    seq_no: candidate.seq_no,
+                    value: candidate.value,
+                })
+                .collect::<Vec<_>>(),
+                // A sidecar from an older graph layout cannot be traversed, but the segment's
+                // records are still readable: score them exactly rather than fail the query.
+                // A compaction that merges the segment writes a current sidecar.
+                None => exact_segment_candidates(
+                    self.vfs.as_ref(),
+                    &descriptor.root_path,
+                    segment,
+                    metric,
+                    &request.vector,
+                    snapshot.visible_seq_no,
+                    request_budget,
+                    filter.as_deref(),
+                )?,
+            };
+            for candidate in segment_candidates {
+                match candidates_by_record_id.entry(candidate.record_id.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if candidate.seq_no > entry.get().seq_no {
+                            entry.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut candidates = candidates_by_record_id.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            storage_metric_compare(metric, right.value, left.value)
+                .then(right.seq_no.cmp(&left.seq_no))
+                .then(left.record_id.cmp(&right.record_id))
+                .then(left.unit_id.cmp(&right.unit_id))
+        });
+        candidates.truncate(request_budget);
+
+        Ok(candidates)
+    }
+
+    fn latest_visible_selected(
+        &self,
+        handle: &CollectionHandle,
+        snapshot: Option<Snapshot>,
+        record_ids: Vec<RecordId>,
+        include_mutable: bool,
+        immutable_unit_ids: Vec<String>,
+    ) -> Result<Vec<VisibleRecord>> {
+        let (state, snapshot) = self.read_state(handle, snapshot)?;
+        let resolved = resolve_latest_state_for_ids_selected(
+            self.vfs.as_ref(),
+            handle.descriptor(),
+            &state,
+            snapshot.visible_seq_no,
+            &record_ids.into_iter().collect(),
+            include_mutable,
+            Some(immutable_unit_ids.into_iter().collect()),
+        )?;
+        let mut records = resolved
+            .into_values()
+            .filter_map(|state| match state {
+                ResolvedState::Visible(record) => Some(record),
+                ResolvedState::Deleted { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    fn inspect(&self, handle: &CollectionHandle, target: InspectTarget) -> Result<InspectReport> {
+        handle.ensure_open()?;
+        let version = handle.current();
+        let descriptor = handle.descriptor();
+        match target {
+            InspectTarget::Manifest => Ok(InspectReport {
+                target: "manifest".to_owned(),
+                payload: serde_json::to_value(&*version.manifest).map_err(json_message)?,
+            }),
+            InspectTarget::Wal => Ok(InspectReport {
+                target: "wal".to_owned(),
+                payload: json!({
+                    "checkpoint_seq_no": version.checkpoint_seq_no,
+                    "records": version.delta,
+                }),
+            }),
+            InspectTarget::Maintenance => Ok(InspectReport {
+                target: "maintenance".to_owned(),
+                payload: serde_json::to_value(self.maintenance_status(handle))
+                    .map_err(json_message)?,
+            }),
+            InspectTarget::Segment(segment_id) => {
+                let segment = version
+                    .manifest
+                    .segments
+                    .iter()
+                    .find(|segment| segment.segment_id == segment_id)
+                    .ok_or_else(|| {
+                        LogPoseError::Message(format!("segment '{segment_id}' does not exist"))
+                    })?;
+                let records = read_segment_file(
+                    self.vfs.as_ref(),
+                    &descriptor
+                        .root_path
+                        .join("segments")
+                        .join(&segment.file_name),
+                )?;
+                let index = self.read_flat_sidecar(&descriptor.root_path.join("indexes").join(
+                    segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
+                        LogPoseError::Message(format!(
+                            "segment '{}' is missing flat artifact metadata",
+                            segment.segment_id
+                        ))
+                    })?,
+                ))?;
+                let hnsw = self.read_hnsw_sidecar(&descriptor.root_path.join("indexes").join(
+                    segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
+                        LogPoseError::Message(format!(
+                            "segment '{}' is missing hnsw artifact metadata",
+                            segment.segment_id
+                        ))
+                    })?,
+                ))?;
+                Ok(InspectReport {
+                    target: format!("segment:{segment_id}"),
+                    payload: json!({
+                        "segment": segment,
+                        "artifacts": segment.artifacts,
+                        "flat_index": index,
+                        "hnsw_index": {
+                            "index_kind": hnsw.index_kind.as_str(),
+                            "dimensions": hnsw.dimensions,
+                            "entry_point": hnsw.entry_point,
+                            "max_level": hnsw.max_level,
+                            "node_count": hnsw.nodes.len(),
+                            "params": {
+                                "max_neighbors": hnsw.params.max_neighbors,
+                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
+                                "ef_construction": hnsw.params.ef_construction,
+                                "ef_search": hnsw.params.ef_search,
+                            },
+                        },
+                        "records": records,
+                    }),
+                })
+            }
+        }
+    }
+}
 
 /// Score a segment's records exactly, standing in for its HNSW sidecar when that cannot be read.
 ///
 /// The candidates match what the sidecar would hold: the latest record per id in the segment,
 /// when it is a put visible at `visible_seq_no` and admitted by `filter`, best `budget` first.
+#[allow(clippy::too_many_arguments)]
 fn exact_segment_candidates(
     vfs: &dyn Vfs,
     collection_root: &Path,
@@ -78,518 +689,29 @@ fn exact_segment_candidates(
     Ok(candidates)
 }
 
-/// Local filesystem-backed storage engine.
-///
-/// Every file access goes through the engine's [`Vfs`]: [`StdVfs`](logpose_vfs::StdVfs) for
-/// the convenience constructors, or any `Vfs` passed to [`LocalStorageEngine::with_vfs`] (tests
-/// use [`FaultVfs`](logpose_vfs::FaultVfs) to inject crashes).
-///
-/// Opening an engine claims exclusive ownership of its storage root for this process by locking
-/// `<root>/LOCK`; the claim is held until the last clone of every engine on that root in this
-/// process is dropped. Engines in the same process on the same `Vfs` share the claim.
-#[derive(Clone)]
-pub struct LocalStorageEngine {
-    pub(crate) root: PathBuf,
-    pub(crate) blob_store: Option<Arc<dyn BlobStore>>,
-    pub(crate) vfs: Arc<dyn Vfs>,
-    _root_lock: Arc<StorageRootLock>,
-}
-
-impl LocalStorageEngine {
-    /// Open a local storage engine rooted at the provided path on the real filesystem.
-    ///
-    /// Creates the root directory if needed and fails if another process holds the root.
-    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
-        Self::with_blob_store(root, None)
-    }
-
-    /// Open a local storage engine on the real filesystem with an optional blob-store
-    /// implementation.
-    ///
-    /// Creates the root directory if needed and fails if another process holds the root.
-    pub fn with_blob_store(
-        root: impl AsRef<Path>,
-        blob_store: Option<Arc<dyn BlobStore>>,
-    ) -> Result<Self> {
-        Self::with_vfs(std_vfs(), root, blob_store)
-    }
-
-    /// Open a local storage engine that performs all file I/O through `vfs`.
-    ///
-    /// Creates the root directory if needed and fails if another holder has the root locked.
-    pub fn with_vfs(
-        vfs: Arc<dyn Vfs>,
-        root: impl AsRef<Path>,
-        blob_store: Option<Arc<dyn BlobStore>>,
-    ) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let root_lock = StorageRootLock::acquire(&vfs, &root)?;
-        Ok(Self {
-            root,
-            blob_store,
-            vfs,
-            _root_lock: Arc::new(root_lock),
-        })
-    }
-
-    /// The filesystem this engine performs all I/O through.
-    #[must_use]
-    pub fn vfs(&self) -> &Arc<dyn Vfs> {
-        &self.vfs
-    }
-
-    pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
-        path_exists(self.vfs.as_ref(), path)
-    }
-
-    pub(crate) fn read_hnsw_sidecar(&self, path: &Path) -> Result<HnswIndexSidecar> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
-        decode_hnsw_index(bytes, path)
-            .map_err(|error| io_message("failed to read hnsw sidecar", error))
-    }
-
-    /// Read an HNSW sidecar the ANN path can traverse. `Ok(None)` means the sidecar has a graph
-    /// layout this build does not read; the segment's records are still readable, so the caller
-    /// scores them exactly instead of failing the query.
-    pub(crate) fn read_current_hnsw_sidecar(
-        &self,
-        path: &Path,
-    ) -> Result<Option<HnswIndexSidecar>> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
-        match decode_hnsw_index(bytes, path) {
-            Ok(hnsw) => Ok(Some(hnsw)),
-            Err(error) if is_unsupported_hnsw_version(&error) => Ok(None),
-            Err(error) => Err(io_message("failed to read hnsw sidecar", error)),
-        }
-    }
-
-    pub(crate) fn read_flat_sidecar(&self, path: &Path) -> Result<FlatIndexSidecar> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read flat index sidecar")?;
-        decode_flat_index(&bytes)
-            .map_err(|error| io_message("failed to read flat index sidecar", error))
-    }
-}
-
-#[async_trait]
-impl StorageEngine for LocalStorageEngine {
-    async fn engine_name(&self) -> &'static str {
-        "local"
-    }
-
-    async fn create_collection(
-        &self,
-        request: CreateCollectionRequest,
-    ) -> Result<CollectionDescriptor> {
-        self.create_collection_internal(
-            request,
-            Some(&CollectionAssignment {
-                assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
-                assigned_role: NodeRole::Data,
-            }),
-        )
-    }
-
-    async fn create_collection_with_assignment(
-        &self,
-        request: CreateCollectionRequest,
-        assignment: CollectionAssignment,
-        _leader_fence: Option<LeadershipFence>,
-    ) -> Result<CollectionDescriptor> {
-        self.create_collection_internal(request, Some(&assignment))
-    }
-
-    async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        self.find_collection_descriptor(name)
-    }
-
-    async fn has_local_collection(&self, name: &str) -> Result<bool> {
-        Ok(self.find_collection_descriptor(name).is_ok())
-    }
-
-    async fn local_collection_matches_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<bool> {
-        match self.find_collection_descriptor(&descriptor.lookup_name()) {
-            Ok(local_descriptor) => Ok(local_descriptor.matches_serving_identity(descriptor)),
-            Err(error) if error.to_string().contains("does not exist") => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
-        self.list_collection_descriptors()
-    }
-
-    async fn collection_assignment_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<CollectionAssignment> {
-        Ok(self.load_collection_assignment(descriptor)?)
-    }
-
-    async fn write(
-        &self,
-        collection_name: &str,
-        operations: Vec<WriteOperation>,
-    ) -> Result<CommitAck> {
-        if operations.is_empty() {
-            return Err(LogPoseError::Message(
-                "write batch must include at least one operation".to_owned(),
-            ));
-        }
-
-        let descriptor = self.find_collection_descriptor(collection_name)?;
-        let wal_lock = wal_rotation_lock(&descriptor.root_path);
-        let _guard = wal_lock
-            .lock()
-            .expect("wal rotation lock should not be poisoned");
-        let state = self.load_collection_state_descriptor_with_wal_lock(descriptor, None)?;
-        let existing_max = state.visible_seq_no();
-        let mut seen_ids = BTreeMap::<RecordId, ()>::new();
-        for operation in &operations {
-            state.descriptor.validate_operation(operation)?;
-            if seen_ids.insert(operation.id().clone(), ()).is_some() {
-                return Err(LogPoseError::Message(format!(
-                    "write batch includes duplicate record id '{}'",
-                    operation.id()
-                )));
-            }
-        }
-
-        // The whole batch is one WAL frame with one fsync, so replay sees all of it or none.
-        let applied_ops = operations.len();
-        let batch = WalBatch::new(
-            operations
-                .into_iter()
-                .zip(existing_max + 1..)
-                .map(|(op, seq_no)| WalRecord { seq_no, op })
-                .collect(),
-        )?;
-        let last_seq_no = batch.last_seq_no();
-        let mut wal_writer = WalWriter::open(
-            Arc::clone(&self.vfs),
-            Self::active_wal_path(&state.descriptor),
-        )?;
-        wal_writer.append_batch(&batch)?;
-        let mut delta_after_write = state.delta.clone();
-        delta_after_write.extend(batch.into_records());
-
-        if self.should_flush(&state.descriptor, &delta_after_write) {
-            self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Flush])?;
-        } else if self.should_compact(&state.descriptor, state.manifest.segments.len()) {
-            self.enqueue_maintenance(&state.descriptor, vec![MaintenanceOperation::Compact])?;
-        }
-
-        Ok(CommitAck {
-            last_seq_no,
-            applied_ops,
-            snapshot: Snapshot {
-                manifest_generation: state.manifest.generation,
-                visible_seq_no: last_seq_no,
-            },
-        })
-    }
-
-    async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
-        let state = self.load_collection_state(collection_name, None)?;
-        Ok(Snapshot {
-            manifest_generation: state.manifest.generation,
-            visible_seq_no: state.visible_seq_no(),
-        })
-    }
-
-    async fn scan_exact(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<Vec<VisibleRecord>> {
-        self.scan_exact_internal(collection_name, snapshot, true, None)
-    }
-
-    async fn scan_exact_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        self.scan_exact_internal(
-            collection_name,
-            snapshot,
-            include_mutable,
-            Some(immutable_unit_ids.into_iter().collect()),
-        )
-    }
-
-    async fn ann_search_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        immutable_unit_ids: Vec<String>,
-        request: AnnSearchRequest,
-        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
-    ) -> Result<Vec<AnnCandidate>> {
-        let state = self.load_collection_state(
-            collection_name,
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        let snapshot = resolve_snapshot(&state, snapshot)?;
-        let metric = state.descriptor.metric;
-        let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
-        let mut candidates_by_record_id = BTreeMap::<RecordId, AnnCandidate>::new();
-        let request_budget = request.candidate_budget.max(request.top_k);
-
-        for segment in state
-            .manifest
-            .segments
-            .iter()
-            .rev()
-            .filter(|segment| selected.contains(&segment.segment_id))
-        {
-            let hnsw_path = state.descriptor.root_path.join("indexes").join(
-                segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                    LogPoseError::Message(format!(
-                        "segment '{}' is missing hnsw artifact metadata",
-                        segment.segment_id
-                    ))
-                })?,
-            );
-            let segment_candidates = match self.read_current_hnsw_sidecar(&hnsw_path)? {
-                Some(hnsw) => logpose_index::search_hnsw(
-                    &hnsw,
-                    &request.vector,
-                    request_budget,
-                    filter.as_deref(),
-                )
-                .map_err(|error| io_message("failed to search hnsw sidecar", error))?
-                .candidates
-                .into_iter()
-                .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
-                .map(|candidate| AnnCandidate {
-                    unit_id: segment.segment_id.clone(),
-                    record_id: candidate.record_id,
-                    seq_no: candidate.seq_no,
-                    value: candidate.value,
-                })
-                .collect::<Vec<_>>(),
-                // A sidecar from an older graph layout cannot be traversed, but the segment's
-                // records are still readable: score them exactly rather than fail the query.
-                // A compaction that merges the segment writes a current sidecar.
-                None => exact_segment_candidates(
-                    self.vfs.as_ref(),
-                    &state.descriptor.root_path,
-                    segment,
-                    metric,
-                    &request.vector,
-                    snapshot.visible_seq_no,
-                    request_budget,
-                    filter.as_deref(),
-                )?,
-            };
-            for candidate in segment_candidates {
-                match candidates_by_record_id.entry(candidate.record_id.clone()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(candidate);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        if candidate.seq_no > entry.get().seq_no {
-                            entry.insert(candidate);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut candidates = candidates_by_record_id.into_values().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            storage_metric_compare(metric, right.value, left.value)
-                .then(right.seq_no.cmp(&left.seq_no))
-                .then(left.record_id.cmp(&right.record_id))
-                .then(left.unit_id.cmp(&right.unit_id))
-        });
-        candidates.truncate(request_budget);
-
-        Ok(candidates)
-    }
-
-    async fn latest_visible_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        record_ids: Vec<RecordId>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let state = self.load_collection_state(
-            collection_name,
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        let snapshot = resolve_snapshot(&state, snapshot)?;
-        let resolved = resolve_latest_state_for_ids_selected(
-            self.vfs.as_ref(),
-            &state,
-            snapshot.visible_seq_no,
-            &record_ids.into_iter().collect(),
-            include_mutable,
-            Some(immutable_unit_ids.into_iter().collect()),
-        )?;
-        let mut records = resolved
-            .into_values()
-            .filter_map(|state| match state {
-                ResolvedState::Visible(record) => Some(record),
-                ResolvedState::Deleted { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(records)
-    }
-
-    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        self.perform_maintenance_operation(collection_name, MaintenanceOperation::Flush)
-    }
-
-    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        self.perform_maintenance_operation(collection_name, MaintenanceOperation::Compact)
-    }
-
-    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        self.stats_snapshot(collection_name, None).await
-    }
-
-    async fn stats_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        let state = self.load_collection_state_descriptor(
-            descriptor.clone(),
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        self.collection_stats_from_state(state, snapshot)
-    }
-
-    async fn maintenance_status_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<MaintenanceStatus> {
-        self.load_maintenance_status(descriptor)
-    }
-
-    async fn recover_maintenance_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<()> {
-        self.recover_persisted_maintenance(descriptor)
-    }
-
-    async fn stats_snapshot(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        let state = self.load_collection_state(
-            collection_name,
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        self.collection_stats_from_state(state, snapshot)
-    }
-
-    async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport> {
-        let state = self.load_collection_state(collection_name, None)?;
-        match target {
-            InspectTarget::Manifest => Ok(InspectReport {
-                target: "manifest".to_owned(),
-                payload: serde_json::to_value(&state.manifest).map_err(json_message)?,
-            }),
-            InspectTarget::Wal => Ok(InspectReport {
-                target: "wal".to_owned(),
-                payload: json!({
-                    "checkpoint_seq_no": state.manifest.checkpoint_seq_no,
-                    "records": state.delta,
-                }),
-            }),
-            InspectTarget::Maintenance => Ok(InspectReport {
-                target: "maintenance".to_owned(),
-                payload: serde_json::to_value(self.load_maintenance_status(&state.descriptor)?)
-                    .map_err(json_message)?,
-            }),
-            InspectTarget::Segment(segment_id) => {
-                let segment = state
-                    .manifest
-                    .segments
-                    .iter()
-                    .find(|segment| segment.segment_id == segment_id)
-                    .ok_or_else(|| {
-                        LogPoseError::Message(format!("segment '{segment_id}' does not exist"))
-                    })?;
-                let records = read_segment_file(
-                    self.vfs.as_ref(),
-                    &state
-                        .descriptor
-                        .root_path
-                        .join("segments")
-                        .join(&segment.file_name),
-                )?;
-                let index =
-                    self.read_flat_sidecar(&state.descriptor.root_path.join("indexes").join(
-                        segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
-                            LogPoseError::Message(format!(
-                                "segment '{}' is missing flat artifact metadata",
-                                segment.segment_id
-                            ))
-                        })?,
-                    ))?;
-                let hnsw =
-                    self.read_hnsw_sidecar(&state.descriptor.root_path.join("indexes").join(
-                        segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                            LogPoseError::Message(format!(
-                                "segment '{}' is missing hnsw artifact metadata",
-                                segment.segment_id
-                            ))
-                        })?,
-                    ))?;
-                Ok(InspectReport {
-                    target: format!("segment:{segment_id}"),
-                    payload: json!({
-                        "segment": segment,
-                        "artifacts": segment.artifacts,
-                        "flat_index": index,
-                        "hnsw_index": {
-                            "index_kind": hnsw.index_kind.as_str(),
-                            "dimensions": hnsw.dimensions,
-                            "entry_point": hnsw.entry_point,
-                            "max_level": hnsw.max_level,
-                            "node_count": hnsw.nodes.len(),
-                            "params": {
-                                "max_neighbors": hnsw.params.max_neighbors,
-                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
-                                "ef_construction": hnsw.params.ef_construction,
-                                "ef_search": hnsw.params.ef_search,
-                            },
-                        },
-                        "records": records,
-                    }),
-                })
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::unique_temp_dir;
-    use rand as _;
     use std::fs;
 
     #[test]
-    fn engine_open_fails_while_another_process_holds_the_storage_root() {
+    fn engine_open_fails_while_another_engine_holds_the_storage_root() {
         let root = unique_temp_dir("storage-root-lock");
         let first = LocalStorageEngine::new(&root).expect("first engine should open");
-        let second = LocalStorageEngine::new(&root).expect("in-process engines share the root");
+        let error = LocalStorageEngine::new(&root)
+            .expect_err("a second engine on the same root must not open");
+        assert!(
+            matches!(error, LogPoseError::StorageRootLocked { .. }),
+            "unexpected error: {error}"
+        );
+        let shared = first.clone();
         drop(first);
-        drop(second);
+        assert!(
+            LocalStorageEngine::new(&root).is_err(),
+            "a clone keeps the root locked"
+        );
+        drop(shared);
 
         // An independent handle on LOCK is what another process looks like to the OS.
         let foreign = fs::OpenOptions::new()
@@ -599,15 +721,14 @@ mod tests {
             .expect("engine should have created the lock file");
         foreign
             .try_lock()
-            .expect("the root should be released once every engine is dropped");
+            .expect("the root should be released once every clone is dropped");
 
         let error = LocalStorageEngine::new(&root)
-            .err()
-            .expect("engine must not open a root held by another process");
+            .expect_err("engine must not open a root held by another process");
         assert!(
             error
                 .to_string()
-                .contains("is already in use by another process"),
+                .contains("is already in use by another engine"),
             "unexpected error: {error}"
         );
 

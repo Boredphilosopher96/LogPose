@@ -3,7 +3,7 @@
 #[cfg(test)]
 use etcd_client as _;
 use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
-use logpose_catalog::DatabaseDescriptor;
+use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
 use logpose_service::{
@@ -96,15 +96,17 @@ impl AppState {
             ))
         })?;
         let build = BuildInfo::current();
+        // One engine owns the storage root; the data plane and the catalog share it.
+        let local = LocalStorageEngine::new(&config.storage_root)?;
         let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
-            MetadataBackend::Local => Arc::new(LocalStorageEngine::new(&config.storage_root)?),
-            MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::new(
-                &config.storage_root,
+            MetadataBackend::Local => Arc::new(local.clone()),
+            MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::with_local(
+                local.clone(),
                 config.metadata.etcd.clone(),
             )?),
         };
         let data = Arc::new(LogPoseDataService::new(storage));
-        let catalog = logpose_service::local_catalog_store(&config.storage_root)?;
+        let catalog: Arc<dyn CatalogStore> = Arc::new(local);
         let shared_catalog = match config.metadata.backend {
             MetadataBackend::Local => SharedCatalog::Local,
             MetadataBackend::Etcd => {
@@ -817,7 +819,6 @@ mod tests {
         Principal, PrincipalKind,
     };
     use logpose_config::BootstrapTokenConfig;
-    use logpose_service::local_catalog_store;
     use logpose_storage::CreateCollectionRequest;
     use logpose_types::DistanceMetric;
     use std::{
@@ -963,8 +964,9 @@ mod tests {
                 ),
             }],
         ));
-        local_catalog_store(&state.config.storage_root)
-            .expect("catalog store should open")
+        state
+            .control
+            .catalog_store()
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,
@@ -1002,8 +1004,9 @@ mod tests {
             }],
         );
         let state = AppState::new(config.clone());
-        local_catalog_store(&state.config.storage_root)
-            .expect("catalog store should open")
+        state
+            .control
+            .catalog_store()
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,
