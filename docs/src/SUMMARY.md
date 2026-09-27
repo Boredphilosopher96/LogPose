@@ -2,6 +2,7 @@
 
 - [Overview](./overview.md)
 - [Architecture](./architecture.md)
+- [Engine Core Design](./engine-core-design.md)
 - [Better Vector DB Architecture](./better-vector-db.md)
 - [Future Milestones](./future-milestones.md)
   - [Multi-Cluster Metadata and Consistency](./future-milestones/multicluster-metadata-and-consistency.md)
