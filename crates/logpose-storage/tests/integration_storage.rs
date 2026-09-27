@@ -1453,6 +1453,124 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
 }
 
 #[tokio::test]
+async fn ann_queries_score_segments_with_outdated_hnsw_sidecars_exactly() {
+    let root = support::unique_temp_dir("storage-hnsw-outdated");
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+
+    let descriptor = engine
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created");
+    engine
+        .write(
+            "documents",
+            (1..=12)
+                .map(|index| {
+                    WriteOperation::Put(PutRecord {
+                        id: RecordId::new(format!("doc-{index:02}")),
+                        vector: vec![index as f32, 0.0],
+                        metadata: json!({
+                            "kind": if index % 3 == 0 { "drop" } else { "keep" }
+                        }),
+                    })
+                })
+                .collect(),
+        )
+        .await
+        .expect("write should succeed");
+    engine
+        .write(
+            "documents",
+            vec![
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("doc-12"),
+                    vector: vec![0.5, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                }),
+                WriteOperation::Delete(DeleteRecord {
+                    id: RecordId::new("doc-11"),
+                }),
+            ],
+        )
+        .await
+        .expect("write should succeed");
+    engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+
+    let query = |filters: Vec<logpose_query::MetadataFilter>| logpose_query::QueryRequest {
+        collection_name: "documents".to_owned(),
+        vector: vec![1.0, 0.0],
+        top_k: 2,
+        snapshot: None,
+        read_barrier: None,
+        filters,
+        predicate: None,
+        explain: logpose_query::ExplainMode::None,
+    };
+    let keep = || {
+        vec![logpose_query::MetadataFilter {
+            field: "kind".to_owned(),
+            value: logpose_types::ScalarMetadataValue::String("keep".to_owned()),
+        }]
+    };
+    let ids = |response: logpose_query::QueryResponse| {
+        response
+            .matches
+            .into_iter()
+            .map(|matched| matched.id.as_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let unfiltered = ids(logpose_query::query_exact(&engine, query(Vec::new()))
+        .await
+        .expect("query should succeed"));
+    let filtered = ids(logpose_query::query_exact(&engine, query(keep()))
+        .await
+        .expect("filtered query should succeed"));
+    assert_eq!(unfiltered, ["doc-10", "doc-09"]);
+    assert_eq!(filtered, ["doc-10", "doc-08"]);
+
+    // Rewrite the sidecar header as a version 1 graph, which this build no longer reads.
+    let segment_id = engine
+        .inspect("documents", InspectTarget::Manifest)
+        .await
+        .expect("manifest inspect should succeed")
+        .payload
+        .get("segments")
+        .and_then(Value::as_array)
+        .and_then(|segments| segments.first())
+        .and_then(|segment| segment.get("segment_id"))
+        .and_then(Value::as_str)
+        .expect("segment id should exist")
+        .to_owned();
+    let sidecar_path = descriptor
+        .root_path
+        .join("indexes")
+        .join(format!("{segment_id}.hnsw.bin"));
+    let mut sidecar = fs::read(&sidecar_path).expect("sidecar should read");
+    sidecar[4..6].copy_from_slice(&1u16.to_le_bytes());
+    fs::write(&sidecar_path, &sidecar).expect("outdated sidecar should be written");
+
+    assert_eq!(
+        ids(logpose_query::query_exact(&engine, query(Vec::new()))
+            .await
+            .expect("query over an outdated sidecar should fall back to an exact scan")),
+        unfiltered
+    );
+    assert_eq!(
+        ids(logpose_query::query_exact(&engine, query(keep()))
+            .await
+            .expect("filtered query over an outdated sidecar should succeed")),
+        filtered
+    );
+}
+
+#[tokio::test]
 async fn ann_search_selected_enforces_a_global_candidate_budget() {
     let root = support::unique_temp_dir("storage-ann-budget");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");

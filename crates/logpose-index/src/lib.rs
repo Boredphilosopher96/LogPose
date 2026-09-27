@@ -486,7 +486,34 @@ pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<(
     durable::write_atomic(path, &bytes)
 }
 
+/// A sidecar written with a graph layout this build does not read.
+///
+/// [`read_hnsw_index`] reports it as an [`io::ErrorKind::InvalidData`] error carrying this value;
+/// [`is_unsupported_hnsw_version`] detects it, so a caller can score the segment exactly instead
+/// of failing the query. Rewriting the segment, as a compaction that merges it does, writes a
+/// current sidecar.
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported hnsw version {found} in '{}' (expected {HNSW_VERSION})", path.display())]
+pub struct UnsupportedHnswVersion {
+    /// Sidecar that was read.
+    pub path: std::path::PathBuf,
+    /// Version found in the sidecar header.
+    pub found: u16,
+}
+
+/// Whether `error` came from [`read_hnsw_index`] finding a sidecar version it does not read.
+#[must_use]
+pub fn is_unsupported_hnsw_version(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<UnsupportedHnswVersion>())
+}
+
 /// Load an HNSW sidecar from disk.
+///
+/// A sidecar with a different version fails with an error that [`is_unsupported_hnsw_version`]
+/// recognizes; any other malformed content fails with [`io::ErrorKind::InvalidData`] or
+/// [`io::ErrorKind::UnexpectedEof`].
 pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     let bytes = fs::read(path)?;
     let mut cursor = 0usize;
@@ -501,10 +528,10 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     if version != HNSW_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "unsupported hnsw version {version} in '{}' (expected {HNSW_VERSION})",
-                path.display()
-            ),
+            UnsupportedHnswVersion {
+                path: path.to_path_buf(),
+                found: version,
+            },
         ));
     }
     let segment_id = read_string(&bytes, &mut cursor)?;
@@ -1640,7 +1667,26 @@ mod tests {
         let error = read_hnsw_index(&path).expect_err("unsupported version should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
+            is_unsupported_hnsw_version(&error),
+            "unexpected error: {error}"
+        );
+        assert!(
             error.to_string().contains("unsupported hnsw version"),
+            "unexpected error: {error}"
+        );
+
+        index.version = 1;
+        write_hnsw_index(&path, &index).expect("index should write");
+        let error = read_hnsw_index(&path).expect_err("version 1 should fail");
+        assert!(
+            is_unsupported_hnsw_version(&error),
+            "unexpected error: {error}"
+        );
+
+        fs::write(&path, b"LPH1").expect("truncated payload should write");
+        let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
+        assert!(
+            !is_unsupported_hnsw_version(&error),
             "unexpected error: {error}"
         );
 

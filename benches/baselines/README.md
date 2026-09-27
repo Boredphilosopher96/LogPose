@@ -60,7 +60,7 @@ Evidence at one bench-shaped segment (6,700 rows of 128 dimensions, 32 clusters,
 | Selection heuristic only | 0.44 | 5,386 |
 | All three, M = 8 and `ef_construction` = 32 | 0.88 | 6,576 |
 
-No single change reaches high recall. The fix applies all three: levels are drawn from the same deterministic hash but mapped to a geometric distribution with `mL = 1 / ln(M)`, layer 0 holds up to 2M neighbors, and both linking and pruning use the diversity heuristic with pruned connections kept (Malkov and Yashunin, Algorithm 4). The defaults also rose to M = 16, `ef_construction` = 128, and `ef_search` = 64. The sidecar version moved to 2, so sidecars written by the old builder are rejected. The HNSW v2 work in the engine v2 plan still replaces this index wholesale.
+No single change reaches high recall. The fix applies all three: levels are drawn from the same deterministic hash but mapped to a geometric distribution with `mL = 1 / ln(M)`, layer 0 holds up to 2M neighbors, and both linking and pruning use the diversity heuristic with pruned connections kept (Malkov and Yashunin, Algorithm 4). The defaults also rose to M = 16, `ef_construction` = 128, and `ef_search` = 64. The heuristic also treats an exact copy of an already kept neighbor as redundant and breaks distance ties toward the newer node, so bursts of identical vectors stay reachable instead of forming islands. The sidecar version moved to 2. The reader rejects sidecars written by the old builder, and ANN queries score those segments exactly instead of failing, until a compaction that merges them writes current sidecars. The HNSW v2 work in the engine v2 plan still replaces this index wholesale.
 
 ## Reading The Numbers
 
