@@ -115,7 +115,7 @@ impl Version {
     /// counters equal the values computed from the state (I13).
     pub fn check_invariants(&self) -> Result<()> {
         let fail = |message: String| {
-            Err(LogPoseError::Message(format!(
+            Err(LogPoseError::internal(format!(
                 "version {} of collection '{}' violates an invariant: {message}",
                 self.id.0,
                 self.meta.descriptor.lookup_name()

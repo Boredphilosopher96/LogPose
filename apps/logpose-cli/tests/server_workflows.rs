@@ -335,10 +335,9 @@ fn data_only_nodes_reject_collection_creation_over_cli_transport() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
 
     assert!(stderr.contains("failed to create collection"));
-    assert!(
-        stderr
-            .contains("data-only nodes cannot accept control-plane collection lifecycle mutations")
-    );
+    assert!(stderr.contains(
+        "is running as 'data' and cannot accept control-plane collection lifecycle mutations"
+    ));
 }
 
 #[test]
@@ -358,7 +357,9 @@ fn control_only_nodes_reject_collection_creation_over_cli_transport() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
 
     assert!(stderr.contains("failed to create collection"));
-    assert!(stderr.contains("without a local data plane"));
+    assert!(stderr.contains(
+        "is running as 'control' and cannot accept control-plane collection lifecycle mutations"
+    ));
 }
 
 #[test]

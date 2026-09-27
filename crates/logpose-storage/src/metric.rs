@@ -9,11 +9,12 @@ pub(crate) fn storage_metric_value(
     candidate: &[f32],
 ) -> Result<f32> {
     if query.len() != candidate.len() {
-        return Err(LogPoseError::Message(format!(
-            "vector expected {} dimensions but found {}",
-            query.len(),
-            candidate.len()
-        )));
+        return Err(LogPoseError::DimensionMismatch {
+            field: "vector".to_owned(),
+            record_id: None,
+            expected: query.len(),
+            actual: candidate.len(),
+        });
     }
 
     Ok(match metric {

@@ -13,11 +13,11 @@ workspace = true
 ignored = ["prost", "tonic-prost", "prost-build", "protoc-bin-vendored", "tonic-prost-build"]
 
 [dependencies]
+http.workspace = true
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-core = { path = "../logpose-core" }
 logpose-query = { path = "../logpose-query" }
-logpose-service = { path = "../logpose-service" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 prost.workspace = true
@@ -27,6 +27,8 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-prost.workspace = true
+tonic-types.workspace = true
+tower.workspace = true
 tracing.workspace = true
 
 [build-dependencies]

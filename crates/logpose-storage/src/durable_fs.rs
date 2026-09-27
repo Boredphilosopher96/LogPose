@@ -12,10 +12,10 @@ use std::{io::IoSlice, path::Path};
 /// Fsync a directory so entries created, renamed or removed inside it survive power loss.
 pub(crate) fn sync_dir(vfs: &dyn Vfs, path: &Path) -> Result<()> {
     vfs.sync_dir(path).map_err(|error| {
-        LogPoseError::Message(format!(
-            "failed to fsync directory '{}': {error}",
-            path.display()
-        ))
+        LogPoseError::io(
+            format!("failed to fsync directory '{}'", path.display()),
+            error,
+        )
     })
 }
 
@@ -26,9 +26,8 @@ pub(crate) fn sync_parent_dir(vfs: &dyn Vfs, path: &Path) -> Result<()> {
 
 /// Whether `path` exists.
 pub(crate) fn path_exists(vfs: &dyn Vfs, path: &Path) -> Result<bool> {
-    logpose_vfs::exists(vfs, path).map_err(|error| {
-        LogPoseError::Message(format!("failed to look up '{}': {error}", path.display()))
-    })
+    logpose_vfs::exists(vfs, path)
+        .map_err(|error| LogPoseError::io(format!("failed to look up '{}'", path.display()), error))
 }
 
 /// Create `path` and any missing ancestors, fsyncing the parent of every directory created.
@@ -47,10 +46,10 @@ pub(crate) fn create_dir_all_synced(vfs: &dyn Vfs, path: &Path) -> Result<()> {
     }
 
     vfs.create_dir_all(path).map_err(|error| {
-        LogPoseError::Message(format!(
-            "failed to create directory '{}': {error}",
-            path.display()
-        ))
+        LogPoseError::io(
+            format!("failed to create directory '{}'", path.display()),
+            error,
+        )
     })?;
     for created in missing.iter().rev() {
         sync_parent_dir(vfs, created)?;
@@ -64,27 +63,21 @@ pub(crate) fn create_dir_all_synced(vfs: &dyn Vfs, path: &Path) -> Result<()> {
 /// file (renaming it into place and syncing the directory).
 pub(crate) fn write_file_synced(vfs: &dyn Vfs, path: &Path, bytes: &[u8]) -> Result<()> {
     let context = |error: std::io::Error| {
-        LogPoseError::Message(format!(
-            "failed to write file '{}': {error}",
-            path.display()
-        ))
+        LogPoseError::io(format!("failed to write file '{}'", path.display()), error)
     };
     let file = match vfs.open(path, OpenMode::CreateNew) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             vfs.remove_file(path).map_err(context)?;
             vfs.open(path, OpenMode::CreateNew).map_err(|error| {
-                LogPoseError::Message(format!(
-                    "failed to create file '{}': {error}",
-                    path.display()
-                ))
+                LogPoseError::io(format!("failed to create file '{}'", path.display()), error)
             })?
         }
         Err(error) => {
-            return Err(LogPoseError::Message(format!(
-                "failed to create file '{}': {error}",
-                path.display()
-            )));
+            return Err(LogPoseError::io(
+                format!("failed to create file '{}'", path.display()),
+                error,
+            ));
         }
     };
     file.append(&[IoSlice::new(bytes)])
@@ -95,7 +88,7 @@ pub(crate) fn write_file_synced(vfs: &dyn Vfs, path: &Path, bytes: &[u8]) -> Res
 /// Read a whole file.
 pub(crate) fn read_file(vfs: &dyn Vfs, path: &Path, context: &str) -> Result<Vec<u8>> {
     logpose_vfs::read_file(vfs, path)
-        .map_err(|error| LogPoseError::Message(format!("{context} '{}': {error}", path.display())))
+        .map_err(|error| LogPoseError::io(format!("{context} '{}'", path.display()), error))
 }
 
 #[cfg(test)]

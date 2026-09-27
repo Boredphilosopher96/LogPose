@@ -34,7 +34,7 @@ pub(crate) fn check_marker_removal(marker_path: &Path) -> Result<()> {
         .unwrap_or_else(PoisonError::into_inner)
         .contains(marker_path)
     {
-        return Err(LogPoseError::Message(format!(
+        return Err(LogPoseError::internal(format!(
             "failed to clear pending WAL rotation marker '{}': injected failure",
             marker_path.display()
         )));

@@ -703,6 +703,16 @@ PR 3 builds the engine shell over the v1 state. Where it differs from the sketch
   - Later PRs: `Clock`, `BufferCache`, scheduler priorities, and `RowSetResolver` injection.
   - PR 10: `stats` still resolves every segment, which is O(data), until deletion-vector counters exist.
 
+## Errors
+
+`LogPoseError` (`crates/logpose-types/src/error.rs`) is typed from storage to the wire (P6a). Each variant has a canonical `ErrorCode`, a stable `reason`, and structured details; the REST and gRPC crates map them to wire statuses in one function each. The error names used in this document map onto it as follows:
+
+- `WalCorrupt`, `SegmentCorrupt`, and `ManifestCorrupt` are `Corrupt { kind: CorruptionKind::{Wal, Segment, Manifest}, location, message }` (`DATA_LOSS`). `WalError` and `SegmentError` convert with `From`, using their `is_corruption`.
+- A poisoned collection is `CollectionPoisoned { collection, reason }` (`FAILED_PRECONDITION`, no retry hint): only an engine reopen clears it, so clients must not retry it automatically.
+- `ReadBarrierNotSatisfied` and `StorageRootLocked` are variants of the same name. `ReadBarrierNotSatisfied` is `FAILED_PRECONDITION` with no retry hint: a single-node engine acknowledges a write only after publishing it, so waiting never satisfies a barrier that is not already satisfied. Phase 7 replication reintroduces `UNAVAILABLE` with a retry hint for replica lag.
+- `BatchTooLarge` is `TooLarge { what, size, limit }` (`RESOURCE_EXHAUSTED`).
+- `WalWriteFailed { outcome }`, `WriteStalled`, `SnapshotExpired`, `TooManySnapshots`, `UnsupportedFormat`, and `NotFetched` do not exist yet. The PR that introduces one adds a variant with its code and reason, and adds it to `fixtures::one_of_each_variant`; the exhaustive match in the `error.rs` tests and the transport mapping tables fail until it does.
+
 ## WAL v2
 
 ### WAL Files
