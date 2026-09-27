@@ -44,16 +44,17 @@ pub fn norm(a: &[f32]) -> f32 {
 
 /// Scales `a` to unit length.
 ///
-/// Returns `false` and leaves `a` unchanged when its norm is zero or not
-/// finite.
+/// The norm is computed in f64, so every finite non-zero vector is
+/// normalized. Returns `false` and leaves `a` unchanged when every component
+/// is zero or any component is NaN or infinite.
 pub fn normalize_in_place(a: &mut [f32]) -> bool {
-    let length = norm(a);
-    if length == 0.0 || !length.is_finite() {
+    let squared: f64 = a.iter().map(|value| f64::from(*value).powi(2)).sum();
+    if squared == 0.0 || !squared.is_finite() {
         return false;
     }
-    let inverse = 1.0 / length;
+    let inverse = 1.0 / squared.sqrt();
     for value in a.iter_mut() {
-        *value *= inverse;
+        *value = (f64::from(*value) * inverse) as f32;
     }
     true
 }
