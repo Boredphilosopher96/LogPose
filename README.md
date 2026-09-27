@@ -27,8 +27,13 @@ LogPose is a high-performance, reliable vector database built for low-latency re
 
 - Rust `1.94.1` via `rustup`
 - Cargo `1.94.1`
-- `protoc` / `protobuf-compiler` on `PATH` for gRPC code generation
-- a reachable etcd endpoint at `http://127.0.0.1:2379` for the full workspace test suite and `scripts/check.sh`
+
+No system `protoc` is needed. `.cargo/config.toml` points `PROTOC` at `scripts/protoc.sh`, which runs the vendored `protoc-bin-vendored` binary; set `PROTOC` yourself to override it (required on Windows).
+
+Optional:
+
+- etcd, only for the etcd integration tests. They are skipped unless `LOGPOSE_TEST_ETCD_ENDPOINTS` is set, for example `LOGPOSE_TEST_ETCD_ENDPOINTS=http://127.0.0.1:2379`, and fail if etcd is then unreachable.
+- `mdbook` and `mdbook-toc`, only to build the documentation site; `scripts/check.sh` skips that step without them.
 
 ### Bootstrap
 

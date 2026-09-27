@@ -9,6 +9,7 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult, ShardOwnership};
 use logpose_types::{CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig};
+use protoc_bin_vendored as _;
 use serde as _;
 use std::path::Path;
 use std::time::Duration;
