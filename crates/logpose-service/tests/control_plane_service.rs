@@ -764,7 +764,7 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
 #[tokio::test]
 async fn raw_local_storage_creates_surface_local_runtime_status() {
     let root = unique_temp_dir("raw-local-status");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     engine
         .create_collection(CreateCollectionRequest {
             database_name: "default".to_owned(),
@@ -807,7 +807,7 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
 #[tokio::test]
 async fn local_control_assignments_still_reject_data_plane_operations() {
     let root = unique_temp_dir("local-control-assignment");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     engine
         .create_collection_with_assignment(
             CreateCollectionRequest {

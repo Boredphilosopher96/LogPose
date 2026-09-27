@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     let config = LogPoseConfig::load().context("failed to load configuration")?;
     logpose_telemetry::init(&config.log_filter);
 
-    let state = Arc::new(AppState::new(config));
+    let state = Arc::new(AppState::try_new(config).context("failed to start LogPose server")?);
     info!(node = %state.config.node_name, "starting LogPose server");
 
     let rest_state = Arc::clone(&state);
