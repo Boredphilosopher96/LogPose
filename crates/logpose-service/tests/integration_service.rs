@@ -39,7 +39,7 @@ use tower::util::ServiceExt;
 #[tokio::test]
 async fn service_runs_filtered_query_and_storage_workflow() {
     let root = unique_temp_dir("service-workflow");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     let descriptor = service
         .create_collection(CreateCollectionRequest {
@@ -142,7 +142,7 @@ async fn service_runs_filtered_query_and_storage_workflow() {
 #[tokio::test]
 async fn service_write_ack_returns_immediate_read_snapshot() {
     let root = unique_temp_dir("service-write-ack-session-snapshot");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -228,7 +228,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
 #[tokio::test]
 async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
     let root = unique_temp_dir("service-write-ack-snapshot-after-rotation");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -292,7 +292,7 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
 #[tokio::test]
 async fn service_query_read_barrier_advances_to_latest_snapshot() {
     let root = unique_temp_dir("service-query-read-barrier-advances");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -349,7 +349,7 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
 #[tokio::test]
 async fn service_rejects_unsatisfied_query_read_barrier() {
     let root = unique_temp_dir("service-query-read-barrier-unsatisfied");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -399,7 +399,7 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
 #[tokio::test]
 async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
     let root = unique_temp_dir("service-query-read-barrier-conflict");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -441,7 +441,7 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
 #[tokio::test]
 async fn service_stats_read_barrier_advances_to_latest_snapshot() {
     let root = unique_temp_dir("service-stats-read-barrier-advances");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -483,7 +483,7 @@ async fn service_stats_read_barrier_advances_to_latest_snapshot() {
 #[tokio::test]
 async fn service_rejects_unsatisfied_stats_read_barrier() {
     let root = unique_temp_dir("service-stats-read-barrier-unsatisfied");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -528,7 +528,7 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
 #[tokio::test]
 async fn service_rejects_impossible_snapshots() {
     let root = unique_temp_dir("service-invalid-snapshot");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -578,7 +578,7 @@ async fn service_rejects_impossible_snapshots() {
 #[tokio::test]
 async fn service_rejects_snapshots_below_manifest_checkpoint() {
     let root = unique_temp_dir("service-below-checkpoint-snapshot");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -1305,7 +1305,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
 #[tokio::test]
 async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
     let root = unique_temp_dir("service-inspect");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
         .create_collection(CreateCollectionRequest {
@@ -1417,7 +1417,7 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
 #[tokio::test]
 async fn service_maps_missing_collections_to_not_found() {
     let root = unique_temp_dir("service-missing");
-    let service = LogPoseDataService::local(&root);
+    let service = LogPoseDataService::local(&root).expect("data service should open");
 
     let error = service
         .get_collection("missing")

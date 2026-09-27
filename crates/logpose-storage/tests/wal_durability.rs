@@ -63,7 +63,7 @@ fn wal_len(path: &Path) -> usize {
 #[tokio::test]
 async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() {
     let root = support::unique_temp_dir("storage-wal-one-frame");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
 
     let first = engine
@@ -86,7 +86,7 @@ async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() 
     let bytes = fs::read(&active).expect("active wal should exist");
     fs::write(&active, &bytes[..bytes.len() - 1]).expect("tear should succeed");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a"]);
     assert_eq!(
         reopened
@@ -102,7 +102,7 @@ async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() 
 #[tokio::test]
 async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
     let root = support::unique_temp_dir("storage-wal-torn-batch");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
 
     engine
@@ -128,7 +128,7 @@ async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
     let step = ((full.len() - committed) / 7).max(1);
     for cut in (committed + 1..full.len()).step_by(step) {
         fs::write(&active, &full[..cut]).expect("tear should succeed");
-        let reopened = LocalStorageEngine::new(&root);
+        let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
         assert_eq!(visible_ids(&reopened).await, vec!["keep"], "cut at {cut}");
         let stats = reopened
             .stats("documents")
@@ -142,7 +142,7 @@ async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
 #[tokio::test]
 async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
     let root = support::unique_temp_dir("storage-wal-torn-append");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
 
     engine
@@ -159,7 +159,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
         .expect("tear should succeed");
 
     // Readers ignore the torn tail before anything repairs it.
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b"]);
 
     // The torn batch was never acknowledged, so its sequence numbers are reused.
@@ -174,7 +174,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
         .expect("write should succeed");
     assert_eq!(ack.last_seq_no, 5);
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c", "d", "e"]);
     let stats = reopened
         .stats("documents")
@@ -187,7 +187,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
 #[tokio::test]
 async fn garbage_tail_is_truncated_by_the_next_write() {
     let root = support::unique_temp_dir("storage-wal-garbage-tail");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
 
     engine
@@ -199,7 +199,7 @@ async fn garbage_tail_is_truncated_by_the_next_write() {
     bytes.extend_from_slice(b"\0\0\0garbage left by a crash");
     fs::write(&active, &bytes).expect("garbage should be written");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a"]);
     reopened
         .write("documents", vec![put("b")])
@@ -214,21 +214,21 @@ async fn garbage_tail_is_truncated_by_the_next_write() {
             .any(|window| window == b"garbage"),
         "the garbage tail must be truncated before appending"
     );
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b"]);
 }
 
 #[tokio::test]
 async fn multi_op_batches_survive_reopen_flush_and_rotation() {
     let root = support::unique_temp_dir("storage-wal-batch-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     create(&engine).await;
 
     engine
         .write("documents", vec![put("a"), put("b"), put("c")])
         .await
         .expect("write should succeed");
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c"]);
 
     let flushed = reopened
@@ -243,7 +243,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .expect("write should succeed");
     assert_eq!(ack.last_seq_no, 5);
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(visible_ids(&reopened).await, vec!["a", "b", "c", "d", "e"]);
     let stats = reopened
         .stats("documents")
@@ -284,7 +284,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
         .await
         .expect("second flush should succeed");
     assert_eq!(flushed.visible_seq_no, 5);
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
         .await
@@ -301,7 +301,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
 #[tokio::test]
 async fn flush_after_a_torn_tail_rolls_a_clean_wal() {
     let root = support::unique_temp_dir("storage-wal-torn-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
 
     engine
@@ -312,7 +312,7 @@ async fn flush_after_a_torn_tail_rolls_a_clean_wal() {
     bytes.extend_from_slice(b"torn");
     fs::write(&active, &bytes).expect("garbage should be written");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let flushed = reopened
         .flush("documents")
         .await

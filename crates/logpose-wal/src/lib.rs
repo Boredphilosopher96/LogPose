@@ -351,7 +351,33 @@ pub fn rotate_active(active_path: impl AsRef<Path>, rolled_path: impl AsRef<Path
 
     let mut writer = WalWriter::open(active_path)?;
     writer.truncate()?;
+    // The rename and the new active file exist only in the directory until it is fsynced.
+    sync_parent_dir(active_path)?;
+    if rolled_path.parent() != active_path.parent() {
+        sync_parent_dir(rolled_path)?;
+    }
     Ok(())
+}
+
+/// Fsync the directory containing `path` so entries created or renamed in it survive power loss.
+///
+/// Directory fsync is only available through `std` on unix; elsewhere it is a no-op.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    #[cfg(unix)]
+    {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io_message("failed to fsync WAL directory", error))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
 }
 
 /// Why a frame scan stopped before the end of the file.
