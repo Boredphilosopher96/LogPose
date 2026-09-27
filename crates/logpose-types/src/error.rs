@@ -363,14 +363,21 @@ pub enum LogPoseError {
         leader_node: Option<String>,
     },
     /// A read barrier is ahead of what the collection has made visible.
+    ///
+    /// A barrier needs both its manifest generation and its sequence number to be visible, so
+    /// the error reports both sides of each.
     #[error(
-        "read barrier seq {required_seq_no} is not yet visible; collection '{collection}' is at seq {visible_seq_no}"
+        "read barrier (manifest generation {required_manifest_generation}, seq {required_seq_no}) is not yet visible; collection '{collection}' is at manifest generation {visible_manifest_generation}, seq {visible_seq_no}"
     )]
     ReadBarrierNotSatisfied {
         /// The collection, as `database/collection`.
         collection: String,
+        /// The manifest generation the barrier requires; 0 when it requires none.
+        required_manifest_generation: u64,
         /// The sequence number the barrier requires.
         required_seq_no: u64,
+        /// The current manifest generation.
+        visible_manifest_generation: u64,
         /// The highest visible sequence number.
         visible_seq_no: u64,
     },
@@ -716,11 +723,21 @@ impl LogPoseError {
             }
             Self::ReadBarrierNotSatisfied {
                 collection,
+                required_manifest_generation,
                 required_seq_no,
+                visible_manifest_generation,
                 visible_seq_no,
             } => {
                 put("collection", collection.clone());
+                put(
+                    "required_manifest_generation",
+                    required_manifest_generation.to_string(),
+                );
                 put("required_seq_no", required_seq_no.to_string());
+                put(
+                    "visible_manifest_generation",
+                    visible_manifest_generation.to_string(),
+                );
                 put("visible_seq_no", visible_seq_no.to_string());
             }
             Self::Corrupt { kind, location, .. } => {
@@ -833,7 +850,9 @@ pub mod fixtures {
             },
             LogPoseError::ReadBarrierNotSatisfied {
                 collection: "default/docs".to_owned(),
+                required_manifest_generation: 2,
                 required_seq_no: 9,
+                visible_manifest_generation: 2,
                 visible_seq_no: 7,
             },
             LogPoseError::Unavailable {
@@ -1007,6 +1026,28 @@ mod tests {
             assert_eq!(error.reason(), *reason, "{name}");
             assert_eq!(error.details().reason, *reason, "{name}");
         }
+    }
+
+    #[test]
+    fn read_barrier_errors_report_the_generation_that_is_behind() {
+        // The sequence number is visible; only the manifest generation lags.
+        let error = LogPoseError::ReadBarrierNotSatisfied {
+            collection: "default/docs".to_owned(),
+            required_manifest_generation: 5,
+            required_seq_no: 3,
+            visible_manifest_generation: 2,
+            visible_seq_no: 7,
+        };
+        assert_eq!(
+            error.to_string(),
+            "read barrier (manifest generation 5, seq 3) is not yet visible; collection \
+             'default/docs' is at manifest generation 2, seq 7"
+        );
+        let details = error.details();
+        assert_eq!(details.metadata["required_manifest_generation"], "5");
+        assert_eq!(details.metadata["visible_manifest_generation"], "2");
+        assert_eq!(details.metadata["required_seq_no"], "3");
+        assert_eq!(details.metadata["visible_seq_no"], "7");
     }
 
     #[test]

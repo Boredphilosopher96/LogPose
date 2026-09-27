@@ -511,7 +511,9 @@ where
             } else {
                 Err(QueryError::Storage(LogPoseError::ReadBarrierNotSatisfied {
                     collection: collection_name.to_owned(),
+                    required_manifest_generation: read_barrier.manifest_generation,
                     required_seq_no: read_barrier.visible_seq_no,
+                    visible_manifest_generation: current.manifest_generation,
                     visible_seq_no: current.visible_seq_no,
                 }))
             }

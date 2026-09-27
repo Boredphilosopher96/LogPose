@@ -929,6 +929,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_barriers_ahead_only_in_manifest_generation_name_the_generation() {
+        let app = router(Arc::new(AppState::new(test_config(
+            "rest-barrier-generation",
+        ))));
+        let create = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        // Sequence 0 is visible; manifest generation 9 is not.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/collections/documents/stats?read_barrier_manifest_generation=9&read_barrier_visible_seq_no=0")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = json_body(response).await;
+        assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
+        let metadata = &body["details"]["metadata"];
+        assert_eq!(metadata["required_manifest_generation"], "9");
+        assert_eq!(metadata["visible_manifest_generation"], "0");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("manifest generation 9")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_routes_return_a_typed_not_found() {
         let app = router(Arc::new(AppState::new(test_config("rest-unknown-route"))));
         let response = app

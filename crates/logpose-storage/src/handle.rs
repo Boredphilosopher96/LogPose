@@ -140,7 +140,9 @@ impl CollectionHandle {
         }
         Err(LogPoseError::ReadBarrierNotSatisfied {
             collection: self.meta.descriptor.lookup_name(),
+            required_manifest_generation: 0,
             required_seq_no: min_seq_no,
+            visible_manifest_generation: version.manifest_generation,
             visible_seq_no: version.visible_seq_no,
         })
     }
