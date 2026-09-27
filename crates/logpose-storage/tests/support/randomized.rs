@@ -3,15 +3,17 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    CollectionId, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionId, CollectionStats, CommitAck,
+    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, NodeRole, PutRecord, RecordId, SeqNo,
+    Snapshot, VisibleRecord, WriteOperation,
 };
+use logpose_vfs::{FaultPlan, FaultVfs, TearMode, Vfs};
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
+    path::PathBuf,
+    sync::Arc,
 };
 
 #[path = "fs.rs"]
@@ -19,6 +21,54 @@ mod fs_support;
 
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 40;
+/// Storage root on the in-memory `FaultVfs` backend.
+const FAULT_ROOT: &str = "/storage";
+/// Chance, in percent, that a step on the `FaultVfs` backend is a crash.
+const CRASH_PERCENT: u32 = 10;
+/// Upper bound for the crash position inside a flush or compaction, in mutating operations.
+/// A flush performs a few dozen; larger values let the operation finish before power is lost.
+const MAX_MAINTENANCE_CRASH_OPS: u64 = 48;
+/// Upper bound for the crash position inside a write, in mutating operations.
+const MAX_WRITE_CRASH_OPS: u64 = 3;
+/// Upper bound for the crash position inside the recovery that follows a crash.
+const MAX_RECOVERY_CRASH_OPS: u64 = 10;
+
+/// Where a scenario's storage lives.
+enum Backend {
+    /// The real filesystem through `StdVfs`.
+    Std { root: PathBuf },
+    /// An in-memory `FaultVfs` that crash actions power-cycle. `process` is the handle of the
+    /// current simulated process; it dies with each crash.
+    Fault {
+        fault: Arc<FaultVfs>,
+        process: Arc<dyn Vfs>,
+    },
+}
+
+impl Backend {
+    fn open_engine(&self) -> LocalStorageEngine {
+        match self {
+            Self::Std { root } => LocalStorageEngine::new(root),
+            Self::Fault { process, .. } => {
+                LocalStorageEngine::with_vfs(Arc::clone(process), FAULT_ROOT, None)
+            }
+        }
+        .expect("storage engine should open")
+    }
+
+    fn allows_crashes(&self) -> bool {
+        matches!(self, Self::Fault { .. })
+    }
+}
+
+/// Which backend a seeded scenario runs on.
+#[derive(Clone, Copy, Debug)]
+pub enum BackendKind {
+    /// The real filesystem; no crash actions.
+    Std,
+    /// `FaultVfs`, with crash-and-reopen actions.
+    Fault,
+}
 const DEFAULT_RANDOM_SCENARIOS: usize = 5;
 const RECORD_DIMENSIONS: usize = 2;
 const RECORD_ID_POOL: usize = 8;
@@ -29,10 +79,14 @@ const EXACT_QUERY_VECTORS: [[f32; RECORD_DIMENSIONS]; 3] = [[1.0, 0.0], [0.0, 1.
 pub enum StorageAction {
     CreateCollection,
     PutBatch(Vec<TestRecord>),
-    Delete { id: String },
+    Delete {
+        id: String,
+    },
     Snapshot,
     ScanCurrent,
-    ScanSnapshot { snapshot_index: usize },
+    ScanSnapshot {
+        snapshot_index: usize,
+    },
     Flush,
     Compact,
     Stats,
@@ -40,6 +94,24 @@ pub enum StorageAction {
     InspectWal,
     InspectSegment,
     Reopen,
+    /// Power-cycle the `FaultVfs` while `during` runs: crash before its `crash_after_ops`-th
+    /// mutating operation (or right after it finishes, if it performs fewer), tear unsynced data
+    /// per `tear`, optionally crash again inside the recovery that follows, then reopen.
+    Crash {
+        during: CrashDuring,
+        crash_after_ops: u64,
+        tear: TearMode,
+        recovery_crash_after_ops: Option<u64>,
+    },
+}
+
+/// The operation a crash interrupts.
+#[derive(Clone, Debug)]
+pub enum CrashDuring {
+    PutBatch(Vec<TestRecord>),
+    Delete { id: String },
+    Flush,
+    Compact,
 }
 
 #[derive(Clone, Debug)]
@@ -236,10 +308,10 @@ impl ExpectedModel {
     }
 }
 
-pub async fn run_storage_scenarios() {
+pub async fn run_storage_scenarios(kind: BackendKind) {
     let seeds = scenario_seeds();
     for seed in seeds {
-        run_seeded_storage_scenario(seed, DEFAULT_SCENARIO_STEPS).await;
+        run_seeded_storage_scenario(seed, DEFAULT_SCENARIO_STEPS, kind).await;
     }
 }
 
@@ -247,33 +319,39 @@ pub fn current_exact_query_request_for_test(vector: Vec<f32>) -> QueryRequest {
     current_exact_query_request(vector)
 }
 
-async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
-    let root = fs_support::unique_temp_dir(&format!("storage-random-{seed}"));
-    let mut engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind) {
+    let mut backend = match kind {
+        BackendKind::Std => Backend::Std {
+            root: fs_support::unique_temp_dir(&format!("storage-random-{seed}")),
+        },
+        BackendKind::Fault => {
+            let fault = FaultVfs::new(seed);
+            let process = fault.process();
+            Backend::Fault { fault, process }
+        }
+    };
+    let mut engine = backend.open_engine();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
     let mut snapshots = Vec::new();
 
     trace.push(StorageAction::CreateCollection);
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            COLLECTION_NAME,
-            RECORD_DIMENSIONS,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .unwrap_or_else(|error| {
+    let descriptor =
+        create_collection_without_background_maintenance(&engine).unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))
         });
-    disable_background_maintenance(&descriptor.root_path);
     model.register_collection(descriptor.collection_id.clone(), descriptor.metric);
     assert_stats_match(&engine, &model, None, seed, &trace).await;
     assert_current_scan_matches(&engine, &model, seed, &trace).await;
     assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
 
     for _ in 0..steps {
-        let action = next_action(&mut rng, snapshots.len(), model.segment_count);
+        let action = if backend.allows_crashes() && rng.random_range(0..100) < CRASH_PERCENT {
+            next_crash_action(&mut rng, snapshots.len(), model.segment_count)
+        } else {
+            next_action(&mut rng, snapshots.len(), model.segment_count)
+        };
         trace.push(action.clone());
 
         match action {
@@ -281,16 +359,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 panic_with_context(seed, &trace, "duplicate create action".to_owned());
             }
             StorageAction::PutBatch(records) => {
-                let operations = records
-                    .iter()
-                    .map(|record| {
-                        WriteOperation::Put(PutRecord {
-                            id: RecordId::new(record.id.clone()),
-                            vector: record.vector.clone(),
-                            metadata: record.metadata.clone(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
+                let operations = records.iter().map(put_operation).collect::<Vec<_>>();
                 let ack = engine
                     .write(COLLECTION_NAME, operations.clone())
                     .await
@@ -428,12 +497,268 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 assert_segment_inspect_matches(&engine, &model, seed, &trace).await;
             }
             StorageAction::Reopen => {
-                engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+                // The same process reopens its root, so it shares the root claim.
+                engine = backend.open_engine();
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, None, seed, &trace).await;
             }
+            StorageAction::Crash {
+                during,
+                crash_after_ops,
+                tear,
+                recovery_crash_after_ops,
+            } => {
+                let crash = PlannedCrash {
+                    during,
+                    crash_after_ops,
+                    tear,
+                    recovery_crash_after_ops,
+                };
+                engine =
+                    crash_and_recover(&mut backend, engine, &mut model, crash, seed, &trace).await;
+                assert_current_scan_matches(&engine, &model, seed, &trace).await;
+                assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
+                assert_stats_match(&engine, &model, None, seed, &trace).await;
+                // Every snapshot handed out before the crash still reads what it named.
+                for snapshot in &snapshots {
+                    assert_scan_matches_snapshot(&engine, &model, snapshot, seed, &trace).await;
+                    assert_exact_queries_match_snapshot(&engine, &model, snapshot, seed, &trace)
+                        .await;
+                    assert_stats_match(&engine, &model, Some(snapshot.clone()), seed, &trace).await;
+                }
+            }
         }
+    }
+}
+
+struct PlannedCrash {
+    during: CrashDuring,
+    crash_after_ops: u64,
+    tear: TearMode,
+    recovery_crash_after_ops: Option<u64>,
+}
+
+/// What a crashed operation got done before power was lost.
+enum Interrupted {
+    /// A write batch that was not acknowledged: after recovery it must be entirely present or
+    /// entirely absent.
+    Write(Vec<WriteOperation>),
+    /// A flush or compaction that did not report success: after recovery it is either
+    /// published (one more manifest generation) or not at all.
+    Maintenance(MaintenanceKind),
+    /// The operation finished; nothing is uncertain.
+    Nothing,
+}
+
+#[derive(Clone, Copy)]
+enum MaintenanceKind {
+    Flush,
+    Compact,
+}
+
+/// Run `crash.during` with a crash planned inside it, power-cycle the `FaultVfs`, optionally
+/// crash again inside recovery, reopen, and fold the outcome of the interrupted operation into
+/// the model. Acknowledged operations were already folded in when they returned.
+async fn crash_and_recover(
+    backend: &mut Backend,
+    engine: LocalStorageEngine,
+    model: &mut ExpectedModel,
+    crash: PlannedCrash,
+    seed: u64,
+    trace: &[StorageAction],
+) -> LocalStorageEngine {
+    let Backend::Fault { fault, process } = backend else {
+        panic_with_context(seed, trace, "crash action on a real filesystem".to_owned());
+    };
+    fault.set_plan(FaultPlan {
+        crash_after_ops: Some(fault.mutating_ops() + crash.crash_after_ops),
+        tear: crash.tear,
+        ..FaultPlan::default()
+    });
+
+    let interrupted = match crash.during {
+        CrashDuring::PutBatch(records) => {
+            let operations = records.iter().map(put_operation).collect::<Vec<_>>();
+            interrupted_write(&engine, model, operations, seed, trace).await
+        }
+        CrashDuring::Delete { id } => {
+            let operations = vec![WriteOperation::Delete(DeleteRecord {
+                id: RecordId::new(id),
+            })];
+            interrupted_write(&engine, model, operations, seed, trace).await
+        }
+        CrashDuring::Flush => match engine.flush(COLLECTION_NAME).await {
+            Ok(_) => {
+                model.record_flush();
+                Interrupted::Nothing
+            }
+            Err(_) => Interrupted::Maintenance(MaintenanceKind::Flush),
+        },
+        CrashDuring::Compact => match engine.compact(COLLECTION_NAME).await {
+            Ok(_) => {
+                model.record_compact();
+                Interrupted::Nothing
+            }
+            Err(_) => Interrupted::Maintenance(MaintenanceKind::Compact),
+        },
+    };
+
+    // The crashed process is gone: its handle and every file it opened stay dead.
+    drop(engine);
+    fault.crash();
+    *process = fault.process();
+    if let Some(recovery_crash_after_ops) = crash.recovery_crash_after_ops {
+        fault.set_plan(FaultPlan {
+            crash_after_ops: Some(recovery_crash_after_ops),
+            tear: crash.tear,
+            ..FaultPlan::default()
+        });
+        let recovering = backend.open_engine();
+        // Recovery runs on the first load; it may crash part-way.
+        let _ = recovering.stats(COLLECTION_NAME).await;
+        drop(recovering);
+        let Backend::Fault { fault, process } = backend else {
+            panic_with_context(seed, trace, "backend changed during a crash".to_owned());
+        };
+        fault.crash();
+        *process = fault.process();
+    }
+    let engine = backend.open_engine();
+
+    match interrupted {
+        Interrupted::Nothing => {}
+        Interrupted::Write(operations) => {
+            let recovered = engine
+                .snapshot(COLLECTION_NAME)
+                .await
+                .unwrap_or_else(|error| {
+                    panic_with_context(seed, trace, format!("recovery failed: {error}"))
+                })
+                .visible_seq_no;
+            let absent = model.next_seq_no;
+            let present = absent + operations.len() as SeqNo;
+            if recovered == present {
+                model.record_write(&operations);
+            } else if recovered != absent {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!(
+                        "recovered visible_seq_no {recovered}: the interrupted batch must be \
+                         wholly absent ({absent}) or wholly present ({present}), and \
+                         acknowledged batches must survive"
+                    ),
+                );
+            }
+        }
+        Interrupted::Maintenance(kind) => {
+            let generation = engine
+                .stats(COLLECTION_NAME)
+                .await
+                .unwrap_or_else(|error| {
+                    panic_with_context(seed, trace, format!("recovery failed: {error}"))
+                })
+                .manifest_generation;
+            if generation == model.manifest_generation + 1 {
+                match kind {
+                    MaintenanceKind::Flush => model.record_flush(),
+                    MaintenanceKind::Compact => model.record_compact(),
+                }
+            }
+            if generation != model.manifest_generation {
+                panic_with_context(
+                    seed,
+                    trace,
+                    format!(
+                        "recovered manifest generation {generation}, but the interrupted \
+                         operation leaves {} (not published) or one more (published)",
+                        model.manifest_generation
+                    ),
+                );
+            }
+        }
+    }
+    engine
+}
+
+/// Write `operations`; an acknowledged batch goes into the model now, a failed one is uncertain
+/// until recovery.
+async fn interrupted_write(
+    engine: &LocalStorageEngine,
+    model: &mut ExpectedModel,
+    operations: Vec<WriteOperation>,
+    seed: u64,
+    trace: &[StorageAction],
+) -> Interrupted {
+    match engine.write(COLLECTION_NAME, operations.clone()).await {
+        Ok(ack) => {
+            model.record_write(&operations);
+            assert_ack_matches(&ack, operations.len(), model, seed, trace);
+            Interrupted::Nothing
+        }
+        Err(_) => Interrupted::Write(operations),
+    }
+}
+
+fn put_operation(record: &TestRecord) -> WriteOperation {
+    WriteOperation::Put(PutRecord {
+        id: RecordId::new(record.id.clone()),
+        vector: record.vector.clone(),
+        metadata: record.metadata.clone(),
+    })
+}
+
+/// Create the scenario's collection with flush and compaction thresholds that never trigger, so
+/// background maintenance threads never race the scenario (and crash positions are
+/// deterministic).
+fn create_collection_without_background_maintenance(
+    engine: &LocalStorageEngine,
+) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+    let mut descriptor = engine.plan_collection_descriptor(&CreateCollectionRequest::new(
+        COLLECTION_NAME,
+        RECORD_DIMENSIONS,
+        DistanceMetric::Cosine,
+    ))?;
+    descriptor.flush_threshold_ops = usize::MAX;
+    descriptor.flush_threshold_bytes = usize::MAX;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    engine.create_collection_from_descriptor(
+        descriptor,
+        Some(&CollectionAssignment {
+            assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
+            assigned_role: NodeRole::Data,
+        }),
+    )
+}
+
+fn next_crash_action(
+    rng: &mut StdRng,
+    snapshot_count: usize,
+    segment_count: usize,
+) -> StorageAction {
+    let (during, max_ops) = match rng.random_range(0..4) {
+        0 => (
+            CrashDuring::PutBatch(generate_put_batch(rng)),
+            MAX_WRITE_CRASH_OPS,
+        ),
+        1 => (
+            CrashDuring::Delete {
+                id: format!("id-{}", rng.random_range(0..RECORD_ID_POOL)),
+            },
+            MAX_WRITE_CRASH_OPS,
+        ),
+        2 => (CrashDuring::Flush, MAX_MAINTENANCE_CRASH_OPS),
+        _ => (CrashDuring::Compact, MAX_MAINTENANCE_CRASH_OPS),
+    };
+    let _ = (snapshot_count, segment_count);
+    StorageAction::Crash {
+        during,
+        crash_after_ops: rng.random_range(0..=max_ops),
+        tear: TearMode::ALL[rng.random_range(0..TearMode::ALL.len())],
+        recovery_crash_after_ops: rng
+            .random_bool(0.25)
+            .then(|| rng.random_range(0..MAX_RECOVERY_CRASH_OPS)),
     }
 }
 
@@ -927,22 +1252,6 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         predicate: None,
         explain: logpose_query::ExplainMode::None,
     }
-}
-
-fn disable_background_maintenance(root_path: &Path) {
-    let descriptor_path = root_path.join("descriptor.json");
-    let mut descriptor = serde_json::from_slice::<Value>(
-        &fs::read(&descriptor_path).expect("descriptor should exist"),
-    )
-    .expect("descriptor should parse");
-    descriptor["flush_threshold_ops"] = json!(usize::MAX);
-    descriptor["flush_threshold_bytes"] = json!(usize::MAX);
-    descriptor["compaction_threshold_segments"] = json!(usize::MAX);
-    fs::write(
-        &descriptor_path,
-        serde_json::to_vec_pretty(&descriptor).expect("descriptor should serialize"),
-    )
-    .expect("descriptor should be updated");
 }
 
 fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRequest {

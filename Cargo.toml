@@ -17,6 +17,7 @@ members = [
     "crates/logpose-storage-etcd",
     "crates/logpose-telemetry",
     "crates/logpose-types",
+    "crates/logpose-vfs",
     "crates/logpose-wal",
 ]
 resolver = "2"

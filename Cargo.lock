@@ -1441,6 +1441,7 @@ dependencies = [
  "logpose-index",
  "logpose-query",
  "logpose-types",
+ "logpose-vfs",
  "logpose-wal",
  "rand 0.10.1",
  "serde",
@@ -1485,11 +1486,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "logpose-vfs"
+version = "0.1.0"
+
+[[package]]
 name = "logpose-wal"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
  "logpose-types",
+ "logpose-vfs",
  "postcard",
  "serde",
  "serde_json",

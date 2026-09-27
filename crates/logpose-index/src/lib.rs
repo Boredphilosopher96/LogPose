@@ -14,13 +14,10 @@ use serde_json::Value;
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap, HashSet},
-    fs,
     hash::{DefaultHasher, Hash, Hasher},
     io,
     path::Path,
 };
-
-mod durable;
 
 /// Index family available for a queryable unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -141,19 +138,16 @@ pub fn build_flat_index(
     }
 }
 
-/// Durably persist a flat exact sidecar to disk.
-///
-/// The write is atomic: readers see either the previous file or the complete new one, and the
-/// contents and directory entry are fsynced before this returns.
-pub fn write_flat_index(path: &Path, sidecar: &FlatIndexSidecar) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(sidecar)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    durable::write_atomic(path, &bytes)
+/// Serialize a flat exact sidecar. This crate does no I/O: `logpose-storage` writes the bytes
+/// through its `Vfs`.
+pub fn encode_flat_index(sidecar: &FlatIndexSidecar) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(sidecar)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-/// Load a flat exact sidecar from disk.
-pub fn read_flat_index(path: &Path) -> io::Result<FlatIndexSidecar> {
-    serde_json::from_slice(&fs::read(path)?)
+/// Deserialize a flat exact sidecar from the bytes [`encode_flat_index`] produced.
+pub fn decode_flat_index(bytes: &[u8]) -> io::Result<FlatIndexSidecar> {
+    serde_json::from_slice(bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
@@ -438,11 +432,9 @@ pub fn build_hnsw_index(
     Ok(index)
 }
 
-/// Durably persist an HNSW sidecar to disk as a binary artifact.
-///
-/// The write is atomic: readers see either the previous file or the complete new one, and the
-/// contents and directory entry are fsynced before this returns.
-pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<()> {
+/// Serialize an HNSW sidecar to its binary format. This crate does no I/O: `logpose-storage`
+/// writes the bytes through its `Vfs`.
+pub fn encode_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(HNSW_MAGIC);
     write_u16(&mut bytes, sidecar.version);
@@ -483,15 +475,15 @@ pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<(
             }
         }
     }
-    durable::write_atomic(path, &bytes)
+    Ok(bytes)
 }
 
 /// A sidecar written with a graph layout this build does not read.
 ///
-/// [`read_hnsw_index`] reports it as an [`io::ErrorKind::InvalidData`] error carrying this value;
-/// [`is_unsupported_hnsw_version`] detects it, so a caller can score the segment exactly instead
-/// of failing the query. Rewriting the segment, as a compaction that merges it does, writes a
-/// current sidecar.
+/// [`decode_hnsw_index`] reports it as an [`io::ErrorKind::InvalidData`] error carrying this
+/// value; [`is_unsupported_hnsw_version`] detects it, so a caller can score the segment exactly
+/// instead of failing the query. Rewriting the segment, as a compaction that merges it does,
+/// writes a current sidecar.
 #[derive(Debug, thiserror::Error)]
 #[error("unsupported hnsw version {found} in '{}' (expected {HNSW_VERSION})", path.display())]
 pub struct UnsupportedHnswVersion {
@@ -501,7 +493,7 @@ pub struct UnsupportedHnswVersion {
     pub found: u16,
 }
 
-/// Whether `error` came from [`read_hnsw_index`] finding a sidecar version it does not read.
+/// Whether `error` came from [`decode_hnsw_index`] finding a sidecar version it does not read.
 #[must_use]
 pub fn is_unsupported_hnsw_version(error: &io::Error) -> bool {
     error
@@ -509,13 +501,14 @@ pub fn is_unsupported_hnsw_version(error: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<UnsupportedHnswVersion>())
 }
 
-/// Load an HNSW sidecar from disk.
+/// Deserialize an HNSW sidecar from the bytes [`encode_hnsw_index`] produced. `path` names the
+/// source in error messages. This crate does no I/O: `logpose-storage` reads the bytes through
+/// its `Vfs`.
 ///
 /// A sidecar with a different version fails with an error that [`is_unsupported_hnsw_version`]
 /// recognizes; any other malformed content fails with [`io::ErrorKind::InvalidData`] or
 /// [`io::ErrorKind::UnexpectedEof`].
-pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
-    let bytes = fs::read(path)?;
+pub fn decode_hnsw_index(bytes: Vec<u8>, path: &Path) -> io::Result<HnswIndexSidecar> {
     let mut cursor = 0usize;
     if read_bytes(&bytes, &mut cursor, 4)? != HNSW_MAGIC {
         return Err(io::Error::new(
@@ -1345,10 +1338,11 @@ mod tests {
     use super::*;
     use logpose_types::{DistanceMetric, RecordId};
     use serde_json::json;
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+
+    /// Encode and decode `index`, as a sidecar write followed by a read does.
+    fn round_trip_hnsw(index: &HnswIndexSidecar) -> io::Result<HnswIndexSidecar> {
+        decode_hnsw_index(encode_hnsw_index(index)?, Path::new("test.hnsw.bin"))
+    }
 
     #[test]
     fn build_flat_index_tracks_norms_offsets_and_scalar_stats() {
@@ -1392,7 +1386,6 @@ mod tests {
 
     #[test]
     fn hnsw_round_trip_preserves_top_candidates() {
-        let path = temp_file_path("hnsw-round-trip.bin");
         let index = build_hnsw_index(
             "segment-2",
             DistanceMetric::Dot,
@@ -1423,8 +1416,7 @@ mod tests {
         )
         .expect("index should build");
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let restored = read_hnsw_index(&path).expect("index should read");
+        let restored = round_trip_hnsw(&index).expect("index should round-trip");
 
         let original = search_hnsw(&index, &[1.0, 0.0], 2, None).expect("search should succeed");
         let round_trip =
@@ -1450,8 +1442,6 @@ mod tests {
                 .map(|candidate| candidate.record_id.as_str())
                 .collect::<Vec<_>>()
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1574,19 +1564,14 @@ mod tests {
     }
 
     #[test]
-    fn read_hnsw_index_rejects_truncated_payload() {
-        let path = temp_file_path("hnsw-truncated.bin");
-        fs::write(&path, b"LPH1").expect("truncated payload should write");
-
-        let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
+    fn decode_hnsw_index_rejects_truncated_payload() {
+        let error = decode_hnsw_index(b"LPH1".to_vec(), Path::new("truncated.hnsw.bin"))
+            .expect_err("truncated payload should fail");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_corrupt_counts_as_truncated() {
-        let path = temp_file_path("hnsw-corrupt-counts.bin");
+    fn decode_hnsw_index_rejects_corrupt_counts_as_truncated() {
         let index = build_hnsw_index(
             "s",
             DistanceMetric::L2,
@@ -1600,8 +1585,7 @@ mod tests {
             }],
         )
         .expect("index should build");
-        write_hnsw_index(&path, &index).expect("index should write");
-        let pristine = fs::read(&path).expect("sidecar should read");
+        let pristine = encode_hnsw_index(&index).expect("index should encode");
         // Magic, version, segment id "s", kind, metric, dimensions, three params, max level,
         // and the present entry point come before the node count.
         let node_count_at = 4 + 2 + (4 + 1) + 1 + 1 + 4 + 3 * 4 + 1 + (1 + 4);
@@ -1610,19 +1594,16 @@ mod tests {
         for at in [node_count_at, vector_len_at] {
             let mut corrupt = pristine.clone();
             corrupt[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            fs::write(&path, &corrupt).expect("corrupt sidecar should write");
             // Preallocation is bounded by the bytes left, so this fails on the short read
             // instead of reserving memory for four billion entries.
-            let error = read_hnsw_index(&path).expect_err("corrupt count should fail");
+            let error = decode_hnsw_index(corrupt, Path::new("corrupt-counts.hnsw.bin"))
+                .expect_err("corrupt count should fail");
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "offset {at}");
         }
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_out_of_range_entry_points() {
-        let path = temp_file_path("hnsw-invalid-entry-point.bin");
+    fn decode_hnsw_index_rejects_out_of_range_entry_points() {
         let mut index = build_hnsw_index(
             "segment-invalid-entry",
             DistanceMetric::Dot,
@@ -1638,16 +1619,12 @@ mod tests {
         .expect("index should build");
         index.entry_point = Some(9);
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("invalid entry point should fail");
+        let error = round_trip_hnsw(&index).expect_err("invalid entry point should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_unsupported_version() {
-        let path = temp_file_path("hnsw-unsupported-version.bin");
+    fn decode_hnsw_index_rejects_unsupported_version() {
         let mut index = build_hnsw_index(
             "segment-unsupported-version",
             DistanceMetric::Dot,
@@ -1663,8 +1640,7 @@ mod tests {
         .expect("index should build");
         index.version = HNSW_VERSION + 1;
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("unsupported version should fail");
+        let error = round_trip_hnsw(&index).expect_err("unsupported version should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             is_unsupported_hnsw_version(&error),
@@ -1676,26 +1652,22 @@ mod tests {
         );
 
         index.version = 1;
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("version 1 should fail");
+        let error = round_trip_hnsw(&index).expect_err("version 1 should fail");
         assert!(
             is_unsupported_hnsw_version(&error),
             "unexpected error: {error}"
         );
 
-        fs::write(&path, b"LPH1").expect("truncated payload should write");
-        let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
+        let error = decode_hnsw_index(b"LPH1".to_vec(), Path::new("truncated.hnsw.bin"))
+            .expect_err("truncated payload should fail");
         assert!(
             !is_unsupported_hnsw_version(&error),
             "unexpected error: {error}"
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_missing_entry_point_for_non_empty_graph() {
-        let path = temp_file_path("hnsw-missing-entry-point.bin");
+    fn decode_hnsw_index_rejects_missing_entry_point_for_non_empty_graph() {
         let mut index = build_hnsw_index(
             "segment-missing-entry",
             DistanceMetric::Dot,
@@ -1711,16 +1683,12 @@ mod tests {
         .expect("index should build");
         index.entry_point = None;
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("missing entry point should fail");
+        let error = round_trip_hnsw(&index).expect_err("missing entry point should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_trailing_bytes() {
-        let path = temp_file_path("hnsw-trailing-bytes.bin");
+    fn decode_hnsw_index_rejects_trailing_bytes() {
         let index = build_hnsw_index(
             "segment-trailing-bytes",
             DistanceMetric::Dot,
@@ -1735,24 +1703,20 @@ mod tests {
         )
         .expect("index should build");
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let mut bytes = fs::read(&path).expect("serialized sidecar should read");
+        let mut bytes = encode_hnsw_index(&index).expect("index should encode");
         bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        fs::write(&path, bytes).expect("trailing bytes should write");
 
-        let error = read_hnsw_index(&path).expect_err("trailing bytes should fail");
+        let error = decode_hnsw_index(bytes, Path::new("trailing.hnsw.bin"))
+            .expect_err("trailing bytes should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("unexpected trailing bytes"),
             "unexpected error: {error}"
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_out_of_range_neighbor_references() {
-        let path = temp_file_path("hnsw-invalid-neighbor.bin");
+    fn decode_hnsw_index_rejects_out_of_range_neighbor_references() {
         let mut index = build_hnsw_index(
             "segment-invalid-neighbor",
             DistanceMetric::Dot,
@@ -1777,16 +1741,12 @@ mod tests {
         .expect("index should build");
         index.nodes[0].neighbors_by_level[0].push(99);
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("invalid neighbor should fail");
+        let error = round_trip_hnsw(&index).expect_err("invalid neighbor should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn read_hnsw_index_rejects_overfull_neighbor_lists() {
-        let path = temp_file_path("hnsw-overfull-neighbors.bin");
+    fn decode_hnsw_index_rejects_overfull_neighbor_lists() {
         let entries = clustered_entries(&mut TestRng::new(3), 40, 4, 2, 5.0);
         let mut index = build_hnsw_index(
             "segment-overfull",
@@ -1800,15 +1760,12 @@ mod tests {
         .expect("index should build");
         index.nodes[0].neighbors_by_level[0] = (1..=5).collect();
 
-        write_hnsw_index(&path, &index).expect("index should write");
-        let error = read_hnsw_index(&path).expect_err("overfull neighbor list should fail");
+        let error = round_trip_hnsw(&index).expect_err("overfull neighbor list should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
             error.to_string().contains("at most 4 are allowed"),
             "unexpected error: {error}"
         );
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2131,13 +2088,5 @@ mod tests {
         );
         assert!(metric_value(DistanceMetric::Dot, &query, &[1.0]).is_err());
         Ok(())
-    }
-
-    fn temp_file_path(name: &str) -> std::path::PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir().join(format!("logpose-{unique}-{name}"))
     }
 }

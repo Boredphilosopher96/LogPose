@@ -15,7 +15,15 @@ mod support;
 
 #[tokio::test]
 async fn randomized_storage_scenarios_match_the_expected_model() {
-    support::run_storage_scenarios().await;
+    support::run_storage_scenarios(support::BackendKind::Std).await;
+}
+
+/// The same scenarios on `FaultVfs`, with crash-and-reopen actions: every acknowledged write
+/// survives, an interrupted batch is wholly present or wholly absent, and every snapshot taken
+/// before a crash still reads the same state after it.
+#[tokio::test]
+async fn randomized_storage_scenarios_survive_crashes() {
+    support::run_storage_scenarios(support::BackendKind::Fault).await;
 }
 
 #[test]

@@ -121,7 +121,8 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 ### Now
 
-- a seeded, replayable state-machine harness at the storage boundary
+- a seeded, replayable state-machine harness at the storage boundary, run both on the real filesystem and on the fault-injecting in-memory `FaultVfs` (`crates/logpose-vfs`), where it power-cycles the engine at seeded points, optionally crashes again inside recovery, and checks that acknowledged writes survive, interrupted batches are all-or-nothing, and earlier snapshots still read the same state
+- exhaustive crash enumeration on `FaultVfs` (`crates/logpose-storage/tests/crash_recovery.rs`): a small write, flush, rotation and compaction scenario crashed before every mutating filesystem operation under every tear mode, crashes inside the recovery that follows, crashes while creating a collection, a failed WAL fsync followed by more writes and then a crash, plus one test per named crash point
 - seeded service and transport harnesses that exercise planner-controlled ANN, hybrid merge, and profile diagnostics paths
 - deterministic service-boundary simulation scenarios for control-plane/runtime status, placement diagnostics, persistence/recovery behavior, recorded placement, and wrong-plane rejection, with REST and gRPC parity checks focused on the same read-side operator contracts
 - continued explicit regression coverage for storage atomicity and corruption cases

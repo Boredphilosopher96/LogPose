@@ -20,8 +20,13 @@ impl LocalStorageEngine {
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
         let effective_snapshot = resolve_snapshot(&state, snapshot)?;
-        let resolved =
-            resolve_latest_state_selected(&state, effective_snapshot.visible_seq_no, true, None)?;
+        let resolved = resolve_latest_state_selected(
+            self.vfs.as_ref(),
+            &state,
+            effective_snapshot.visible_seq_no,
+            true,
+            None,
+        )?;
         let mut live_record_count = 0usize;
         let mut deleted_record_count = 0usize;
         for value in resolved.values() {
