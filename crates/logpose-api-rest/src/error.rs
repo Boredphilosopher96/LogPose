@@ -187,7 +187,7 @@ mod tests {
         ("ReadBarrierNotSatisfied", StatusCode::CONFLICT),
         ("Unavailable", StatusCode::SERVICE_UNAVAILABLE),
         ("Corrupt", StatusCode::INTERNAL_SERVER_ERROR),
-        ("CollectionPoisoned", StatusCode::SERVICE_UNAVAILABLE),
+        ("CollectionPoisoned", StatusCode::CONFLICT),
         ("Io", StatusCode::INTERNAL_SERVER_ERROR),
         // The fixture's bulk failure wraps a missing collection.
         ("BulkBatchFailed", StatusCode::NOT_FOUND),

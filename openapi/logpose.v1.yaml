@@ -644,7 +644,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Conflict:
-      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, or a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`; retrying does not help).
+      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`), or a storage failure made the collection read-only until the engine is reopened (`COLLECTION_POISONED`). Retrying does not help.
       content:
         application/json:
           schema:

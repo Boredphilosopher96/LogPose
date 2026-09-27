@@ -125,7 +125,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | `NOT_LEADER`                 | `UNAVAILABLE`         | `node`, `leader_node` when known                                | 1 s        |
 | `READ_BARRIER_NOT_SATISFIED` | `FAILED_PRECONDITION` | `collection`, `required_manifest_generation`, `required_seq_no`, `visible_manifest_generation`, `visible_seq_no` | no |
 | `UNAVAILABLE`                | `UNAVAILABLE`         |                                                                 | sometimes  |
-| `COLLECTION_POISONED`        | `UNAVAILABLE`         | `collection`                                                    | no         |
+| `COLLECTION_POISONED`        | `FAILED_PRECONDITION` | `collection`                                                    | no         |
 | `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
 | `IO_ERROR`                   | `INTERNAL`            | `io_error_kind`                                                 | no         |
 | `INTERNAL`                   | `INTERNAL`            |                                                                 | no         |
@@ -134,7 +134,8 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 `NOT_OWNER` and `NOT_LEADER` mean the request reached the wrong node: send it
 to `owner_node` or `leader_node` when the error names one, or retry after the
 hint. `COLLECTION_POISONED` means a storage failure made the collection
-read-only until the engine is reopened; reads keep working.
+read-only until an operator reopens the engine; reads keep working. Do not
+retry it automatically.
 
 ## Request Size Limits
 
@@ -464,9 +465,9 @@ anything is written, and one invalid operation rejects the whole batch:
 | `200`  | Write committed                             |
 | `400`  | Invalid request; see `field_violations`     |
 | `404`  | Collection not found                        |
-| `409`  | This node's role does not serve data        |
+| `409`  | Wrong node role, or collection read-only until the engine is reopened (`COLLECTION_POISONED`) |
 | `413`  | Request body too large                      |
-| `503`  | Not the owner (`NOT_OWNER`) or poisoned     |
+| `503`  | Not the owner (`NOT_OWNER`)                 |
 
 gRPC equivalent:
 

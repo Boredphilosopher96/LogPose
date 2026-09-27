@@ -174,7 +174,7 @@ mod tests {
         ("ReadBarrierNotSatisfied", Code::FailedPrecondition),
         ("Unavailable", Code::Unavailable),
         ("Corrupt", Code::DataLoss),
-        ("CollectionPoisoned", Code::Unavailable),
+        ("CollectionPoisoned", Code::FailedPrecondition),
         ("Io", Code::Internal),
         // The fixture's bulk failure wraps a missing collection.
         ("BulkBatchFailed", Code::NotFound),

@@ -191,7 +191,9 @@ mod tests {
             .write(&handle, vec![put("beta", vec![0.0, 1.0])])
             .expect_err("the next write must not reuse the frame's sequence numbers");
         assert!(
-            error.to_string().contains("read-only until it is reopened"),
+            error
+                .to_string()
+                .contains("read-only until the engine is reopened"),
             "{error}"
         );
         assert_eq!(

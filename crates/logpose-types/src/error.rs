@@ -404,7 +404,12 @@ pub enum LogPoseError {
         message: String,
     },
     /// A collection refuses writes and maintenance until the engine is reopened.
-    #[error("collection '{collection}' is read-only until it is reopened: {reason}")]
+    ///
+    /// This is `FAILED_PRECONDITION` with no retry hint: retrying cannot help until an operator
+    /// reopens the engine, and clients must not retry it automatically. Reads keep working.
+    #[error(
+        "collection '{collection}' is read-only until the engine is reopened (operator action required): {reason}"
+    )]
     CollectionPoisoned {
         /// The collection, as `database/collection`.
         collection: String,
@@ -576,13 +581,13 @@ impl LogPoseError {
             | Self::WrongNodeRole { .. }
             | Self::ReconciliationRequired { .. }
             | Self::StorageRootLocked { .. }
-            | Self::ReadBarrierNotSatisfied { .. } => ErrorCode::FailedPrecondition,
+            | Self::ReadBarrierNotSatisfied { .. }
+            | Self::CollectionPoisoned { .. } => ErrorCode::FailedPrecondition,
             Self::Unauthenticated { .. } => ErrorCode::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
-            Self::NotOwner { .. }
-            | Self::NotLeader { .. }
-            | Self::Unavailable { .. }
-            | Self::CollectionPoisoned { .. } => ErrorCode::Unavailable,
+            Self::NotOwner { .. } | Self::NotLeader { .. } | Self::Unavailable { .. } => {
+                ErrorCode::Unavailable
+            }
             Self::Corrupt { .. } => ErrorCode::DataLoss,
             Self::Io { .. } | Self::Internal { .. } => ErrorCode::Internal,
             Self::BulkBatchFailed { source, .. } => source.code(),
@@ -1009,7 +1014,7 @@ mod tests {
             ("Corrupt", ErrorCode::DataLoss, "DATA_CORRUPTION"),
             (
                 "CollectionPoisoned",
-                ErrorCode::Unavailable,
+                ErrorCode::FailedPrecondition,
                 "COLLECTION_POISONED",
             ),
             ("Io", ErrorCode::Internal, "IO_ERROR"),
@@ -1053,6 +1058,24 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert_eq!(error.retry_after(), None);
         assert_eq!(details.retry_after_ms, None);
+    }
+
+    #[test]
+    fn poisoned_collections_need_an_engine_reopen_and_are_not_retryable() {
+        let error = LogPoseError::CollectionPoisoned {
+            collection: "default/docs".to_owned(),
+            reason: "WAL fsync failed".to_owned(),
+        };
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(error.reason(), "COLLECTION_POISONED");
+        assert_eq!(error.retry_after(), None);
+        assert_eq!(error.details().metadata["collection"], "default/docs");
+        assert!(
+            error
+                .to_string()
+                .contains("read-only until the engine is reopened"),
+            "{error}"
+        );
     }
 
     #[test]
