@@ -1453,6 +1453,7 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
         put("a".to_owned(), vec![1.0, 0.0], json!("text")),
         put("a".to_owned(), vec![1.0, 0.0], json!({"id": "x"})),
         put("a".to_owned(), vec![1.0, 0.0], json!({"vector": 1})),
+        put("a".to_owned(), vec![1.0, 0.0], json!({"$extra": 1})),
         put("a".to_owned(), vec![f32::INFINITY, 0.0], Value::Null),
         put("a".repeat(1_025), vec![1.0, 0.0], Value::Null),
         put(String::new(), vec![1.0, 0.0], Value::Null),

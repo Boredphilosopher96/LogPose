@@ -369,7 +369,7 @@ anything is written, and one invalid operation rejects the whole batch:
 - `vector` must have exactly `dimensions` components, all finite.
 - `metadata` must be a JSON object or `null`. Its keys are stored as dynamic
   fields, so they cannot be named `id` or `vector`, the collection's
-  declared key and vector fields.
+  declared key and vector fields, or `$extra`, which is reserved.
 
 | Status | Meaning                                     |
 |--------|---------------------------------------------|

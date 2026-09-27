@@ -1035,7 +1035,7 @@ components:
             type: number
         metadata:
           type: [object, "null"]
-          description: Stored as dynamic fields; keys cannot be `id` or `vector`.
+          description: Stored as dynamic fields; keys cannot be `id`, `vector`, or `$extra`.
     DeleteOperation:
       type: object
       required: [op, id]

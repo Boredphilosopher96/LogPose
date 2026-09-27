@@ -40,7 +40,7 @@ pub enum LegacyError {
     },
     /// The mapped record does not fit the collection schema. This includes
     /// metadata keys named `id` or `vector`, which collide with the legacy
-    /// primary key and vector field.
+    /// primary key and vector field, and the reserved key `$extra`.
     #[error(transparent)]
     Record(#[from] RecordError),
     /// A v2 record cannot be expressed as a v1 record: it has an integer

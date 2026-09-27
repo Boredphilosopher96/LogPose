@@ -227,7 +227,7 @@ impl CollectionDescriptor {
     /// a non-empty string of at most 1,024 bytes, the vector has the
     /// configured dimensions and finite components, and metadata is a JSON
     /// object (or null) whose keys become dynamic fields, so it cannot use
-    /// the names `id` or `vector`.
+    /// the names `id` or `vector`, or the reserved name `$extra`.
     pub fn validate_operation(&self, operation: &WriteOperation) -> logpose_types::Result<()> {
         let schema = self.validated_schema()?;
         operation.validate_dimensions(self.dimensions)?;
