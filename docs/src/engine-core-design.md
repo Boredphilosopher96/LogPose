@@ -100,9 +100,10 @@ Module map for `crates/logpose-storage/src`:
 | `writer/pk_index.rs` | writer-private primary-key index, forwarding tables |
 | `memtable/` | `MemtableData`, `VectorArena`, `MemColumn`, `MemScalarIndex` |
 | `dv.rs` | `DeletionVector`, DV file codec |
-| `segment/format.rs` | byte layout constants, header, section table, footer |
-| `segment/writer.rs` | streaming segment writer |
-| `segment/reader.rs` | `SegmentHandle`, lazy section access |
+| `segment_v2/format.rs` | byte layout constants, header, section table, footer |
+| `segment_v2/builder.rs` | `SegmentBuilder`, streaming segment writer |
+| `segment_v2/reader.rs` | `SegmentReader` over a `SectionSource`, lazy section access (the engine's `SegmentHandle` wraps it) |
+| `segment_v2/{pk,column,vector,dynamic,stats}.rs` | storage-owned section encodings |
 | `manifest.rs` | manifest v2 codec, `CURRENT` protocol |
 | `flush.rs` | flush job |
 | `compaction.rs` | policy and compaction job |
@@ -1290,7 +1291,7 @@ Unknown section kinds are ignored by readers, which is how Tier 2 adds codes and
 - `RowMeta`: per-row sequence numbers. Encoding 1 = `u64` plain; encoding 2 = `u32` offsets from `aux64 = base` when `max - min < 2^32`.
 - `PkColumn`: keys in row order. `int64`: `i64[row_count]`. `string`: `u32 offsets[row_count + 1]` then UTF-8 bytes.
 - `PkSorted`: row ids sorted by key. `int64`: `i64 keys[row_count]` then `u32 rows[row_count]` (binary search needs no other section). `string`: `u32 rows[row_count]` sorted by key bytes; binary search reads `PkColumn`.
-- `PkFilter`: binary fuse filter (8-bit fingerprints, about 9 bits per key, 0.4 percent false positives) over `xxh3_64(canonical_pk_bytes, seed 0)`, where canonical bytes are `0x01 ++ i64 LE` or `0x02 ++ UTF-8`. The hash and seed are part of the format.
+- `PkFilter`: binary fuse filter (arity 3, 8-bit fingerprints, about 9 bits per key, 0.4 percent false positives) over `xxh3_64(canonical_pk_bytes, seed 0)`, where canonical bytes are `0x01 ++ i64 LE` or `0x02 ++ UTF-8`. The hash and seed are part of the format. Payload: `seed u64, segment_length u32, segment_count u32, array_length u32, key_count u32, reserved 8`, then `u8 fingerprints[array_length]`; a key's slots are `h0 = mulhi(h, segment_count * segment_length)`, `h1 = (h0 + segment_length) ^ ((h >> 18) & mask)`, `h2 = (h0 + 2 * segment_length) ^ (h & mask)` with `h = murmur3_fmix64(key + seed)`, and its fingerprint is `h ^ (h >> 32)` truncated to 8 bits.
 
 ### Vector Sections
 
@@ -1303,7 +1304,7 @@ offset size field
      8    4 page_rows       max(1, 8192 / (dim * 4))
     12    4 page_count
     16    8 nulls_len       bytes of the null bitmap (0 when no nulls)
-    24    4 prefix_crc      crc32c of bytes 0..24, nulls, and page_crcs
+    24    4 prefix_crc      crc32c of bytes 0..24 and 28..prefix_end (reserved, nulls, page_crcs)
     28   36 reserved
     64    n nulls           RoaringBitmap portable serialization, padded to 8
      .  4*p page_crcs       crc32c of each page's bytes
@@ -1347,7 +1348,8 @@ offset size field
      8    8 nulls_len
     16    8 dict_len        0 when no dictionary
     24    8 data_len
-    32   32 reserved
+    32    4 dict_count      number of dictionary entries (0 without a dictionary)
+    36   28 reserved
     64    . nulls           RoaringBitmap portable serialization, padded to 8
      .    . dict            present for dictionary encodings, padded to 8
      .    . data
@@ -1360,7 +1362,7 @@ offset size field
 | 3 `BoolBitmap` | `bool` | RoaringBitmap of true rows |
 | 4 `StringDict` | `string` | dict: `u32 offsets[d + 1]` then sorted unique bytes; data: codes of `value_width` 1, 2, or 4 bytes |
 | 5 `StringPlain` | `string` | `u32 offsets[row_count + 1]` then bytes; used when distinct values exceed half the rows |
-| 6 `Array` | `array<T>` | `u32 offsets[row_count + 1]` into a child block encoded as one of the above over all elements |
+| 6 `Array` | `array<T>` | `u32 offsets[row_count + 1]` into a child block, zero padding to 8, then the child block: a complete column block (same 64-byte header) encoded as one of 1 to 5 over all elements, with no nulls |
 | 7 `JsonValue` | `json` | `u32 offsets[row_count + 1]` then binary `Value` bytes |
 
 A dropped field has no section in segments written after the drop; readers return null for fields whose `FieldId` has no section, which is also how added fields read in old segments.
@@ -1370,7 +1372,8 @@ A dropped field has no section in segments written after the drop; readers retur
 `DynamicJson` stores `$extra` as the binary `Value` codec from the schema PR, in blocks of 4096 rows:
 
 ```text
-header (64 bytes): row_count u32, block_rows u32 (4096), block_count u32, reserved
+header (64 bytes): row_count u32, block_rows u32 (4096), block_count u32,
+                  index_crc u32 (crc32c of header bytes 0..12 and the block index), reserved
 block index: block_count x { offset u64 (relative to section), len u32, crc32c u32 }
 blocks: each = u32 offsets[rows_in_block + 1] then value bytes; 8-byte aligned
 ```
@@ -1380,7 +1383,7 @@ A block is the load and verification unit, so a filter on `$extra.color` scans b
 ### Index and Stats Sections
 
 - `ScalarInverted` and `ScalarSorted`: produced and parsed by the scalar-index PR (`InvertedIndex::write_to`, `InvertedView::view`, and the same for sorted). Storage requires lookups that return `RoaringBitmap` over row ids, and, for sorted, an ordered iterator of `(value, row)` from a starting value in either direction (serves `order_by`).
-- `Stats`: postcard `SegmentStats`: per field a zone map (`min`, `max`, `null_count`), a HyperLogLog sketch (precision 12), the top 16 values with counts, and a 32-bucket equi-depth histogram for numbers. There is no unbounded `value_counts`. Zone maps and distinct estimates are also copied into the manifest so pruning never opens the file.
+- `Stats`: postcard `SegmentStats`: per field a zone map (`min`, `max`, `null_count`), the exact distinct count, the top 16 values with counts, and a 32-bucket equi-depth histogram for numbers; array fields describe their elements. There is no unbounded `value_counts`. Zone maps and distinct counts are also copied into the manifest so pruning never opens the file.
 
 ### Lazy Section Loading
 
@@ -1405,7 +1408,24 @@ impl SegmentHandle {
 }
 ```
 
+The reader reads through a minimal positioned-read trait, `SectionSource { len, read_exact_at }`, which mirrors the read half of `VfsFile` so a Vfs file adapts with a forwarding impl; `MemorySource` and `FileSource` (std `pread`) implement it today.
+
 Section bytes are never read directly: every access goes through `BufferCache::get_or_load(CacheKey { file, section, page }, class, loader)`, where the loader runs on the `IoPool`, reads with `read_exact_at`, and verifies the whole-section CRC (whole units) or page CRC (paged units) before the bytes enter the cache. A CRC failure returns `LogPoseError::SegmentCorrupt { unit, section }`; the collection stays open and the query fails.
+
+### Implementation Notes (PR 8)
+
+PR 8 implements the format as a standalone module, `logpose-storage::segment_v2`, not yet used by flush or compaction. Where this section left a detail open, the implementation fixed it as follows; the golden file `crates/logpose-storage/testdata/segment_v2/golden.seg` pins every byte, and any change to it requires a `format_version` bump.
+
+- **Strict layout.** Open rejects a table whose sections are not in file order, back to back with only the padding that 64-byte alignment requires, starting at byte 128 and ending where the table starts. Padding therefore has a known length; `verify` (compaction and `inspect --verify`) also checks that every padding byte is zero, so every byte of the file is checked by something even though padding has no CRC.
+- **Open reads** the header, the footer, the section table, and `SchemaSnapshot` (checked against `schema_hash`), and checks per-field sections against the snapshot (vector dimension in `aux32`, row count in `aux64`). Everything else is verified when loaded. Every read is bounds-checked against the validated file length before a buffer is allocated, and every count inside a section is checked against the section's length before anything is reserved. Materialized values are the exception by design: dictionary codes repeat their string and an `array<bool>` cell of any length fits in a few bytes of bitmap, so `ScalarColumn::value` and `read_rows` cost the logical size of the data. `verify` checks every stored value without materializing rows, so its work and memory stay bounded by the file size.
+- **Section set.** `SchemaSnapshot`, `RowMeta`, `PkColumn`, `PkSorted`, `PkFilter`, and `Stats` are always present. Each declared vector and scalar field gets one section even if every row is null. `DynamicJson` is written only when at least one row has dynamic keys. Index sections come last, ordered by kind and field.
+- **`RowMeta`** uses encoding 2 whenever every `seq - min` fits in `u32` (base `min` in `aux64`), else encoding 1. An empty segment has an empty encoding-1 payload and sequence range 0..0.
+- **Offsets are `u32`**, as specified, so one string, JSON, array, or dynamic block column holds at most 4 GiB of values; the builder reports `TooLarge` past it. A segment holds at most `u32::MAX - 1` rows because `u32::MAX` is the forwarding sentinel.
+- **Canonical stored values.** Null rows store 0, 0.0, code 0, or an empty range; floats are finite with no `-0.0`; dictionaries are strictly sorted. The decoder rejects anything else, so decoding and re-encoding reproduces the bytes.
+- **Lazy units have their own CRCs.** The `DynamicJson` header and block index gained `index_crc`, because they are the unit loaded before any block and had no checksum of their own. The `VectorF32` `prefix_crc` covers the reserved bytes and the padding after the nulls too, so the whole prefix is checked as loaded.
+- **Stats keep an exact distinct count** instead of a HyperLogLog sketch: every build (flush or compaction) sees every row it writes and nothing merges per-segment sketches, so a sketch would only add 4 KiB per field and estimation error.
+- **CRC and hash crates.** CRC-32C comes from `crc32c` and `xxh3_64` from `twox-hash` (both MIT or Apache-2.0); `xxhash-rust` was not used because its BSL-1.0 license is outside the `deny.toml` allow list.
+- **Builder memory.** `SegmentBuilder` holds every column until `finish`, which then streams the file section by section to any `Write`, so peak memory is about the size of the segment. That is what compaction's maintenance-memory reservation accounts for.
 
 ## Manifest v2 and CURRENT
 
