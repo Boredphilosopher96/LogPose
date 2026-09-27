@@ -169,7 +169,9 @@ impl EtcdCatalogStore {
         };
         let descriptor: DatabaseDescriptor =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
-        descriptor.validate()?;
+        descriptor
+            .validate()
+            .map_err(|error| stored_invalid(kv.key(), error))?;
         Ok(descriptor)
     }
 
@@ -200,7 +202,9 @@ impl EtcdCatalogStore {
             }
             let descriptor: DatabaseDescriptor =
                 serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
-            descriptor.validate()?;
+            descriptor
+                .validate()
+                .map_err(|error| stored_invalid(kv.key(), error))?;
             descriptors.push(descriptor);
         }
         if !descriptors
@@ -240,7 +244,9 @@ impl EtcdCatalogStore {
         };
         let principal: Principal =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
-        principal.validate().map_err(string_message)?;
+        principal
+            .validate()
+            .map_err(|error| stored_invalid(kv.key(), error))?;
         Ok(principal)
     }
 
@@ -271,7 +277,9 @@ impl EtcdCatalogStore {
             }
             let principal: Principal =
                 serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
-            principal.validate().map_err(string_message)?;
+            principal
+                .validate()
+                .map_err(|error| stored_invalid(kv.key(), error))?;
             principals.push(principal);
         }
         principals.sort_by(|left, right| left.name.cmp(&right.name));
@@ -328,7 +336,9 @@ impl EtcdCatalogStore {
         };
         let policy: DatabaseAccessPolicy =
             serde_json::from_slice(kv.value()).map_err(json_decode_message)?;
-        policy.validate().map_err(string_message)?;
+        policy
+            .validate()
+            .map_err(|error| stored_invalid(kv.key(), error))?;
         Ok(policy)
     }
 }
@@ -997,6 +1007,17 @@ fn json_decode_message(error: serde_json::Error) -> LogPoseError {
         CorruptionKind::Metadata,
         format!("failed to decode metadata payload: {error}"),
     )
+}
+
+/// A record read back from `key` fails validation. Records are validated before they are
+/// written, so this is damaged metadata, not a bad request.
+fn stored_invalid(key: &[u8], error: impl std::fmt::Display) -> LogPoseError {
+    let key = String::from_utf8_lossy(key).into_owned();
+    LogPoseError::Corrupt {
+        kind: CorruptionKind::Metadata,
+        message: format!("stored metadata record '{key}' fails validation: {error}"),
+        location: Some(key),
+    }
 }
 
 /// The metadata store could not be reached or refused the operation; retrying may help.

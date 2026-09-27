@@ -20,8 +20,8 @@ use logpose_storage_etcd::{
     EtcdCatalogStore, EtcdCoordinationClient, LeadershipRecord, LeaseKeepAlive, PromotionResult,
 };
 use logpose_types::{
-    CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, LogPoseError,
-    MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
+    CollectionAssignment, CollectionRef, CorruptionKind, DistanceMetric, EtcdMetadataConfig,
+    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
 };
 use serde as _;
 use serde_json::json;
@@ -298,6 +298,69 @@ async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
         LogPoseError::PermissionDenied { message }
             if message.contains("not allowed to perform operator actions")
     ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_stored_principals_that_fail_validation_are_reported_as_corrupt() {
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_stored_principals_that_fail_validation_are_reported_as_corrupt",
+    )
+    .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("invalid-stored-principal");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-invalid-principal";
+    let config = test_config(
+        "invalid-principal-node",
+        unique_temp_dir("etcd-invalid-principal"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    // A record that decodes but fails validation: principal names may not contain '/'.
+    let key = format!("{key_prefix}/clusters/{cluster_name}/principals/reader/descriptor");
+    let mut record = serde_json::to_value(Principal::new_with_access_tier(
+        "reader",
+        PrincipalKind::User,
+        AccessTier::Observer,
+    ))
+    .expect("principal serializes");
+    record["name"] = json!("a/b");
+    Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd should connect")
+        .put(key.clone(), record.to_string(), None)
+        .await
+        .expect("the damaged record should be written");
+
+    let catalog =
+        EtcdCatalogStore::new(config.metadata.etcd).expect("etcd catalog store should open");
+    for error in [
+        catalog
+            .get_principal("reader")
+            .await
+            .expect_err("a damaged principal should fail"),
+        catalog
+            .list_principals()
+            .await
+            .expect_err("listing a damaged principal should fail"),
+    ] {
+        assert!(
+            matches!(
+                &error,
+                LogPoseError::Corrupt {
+                    kind: CorruptionKind::Metadata,
+                    location: Some(location),
+                    ..
+                } if *location == key
+            ),
+            "{error:?}"
+        );
+    }
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }

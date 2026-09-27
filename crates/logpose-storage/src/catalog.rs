@@ -9,7 +9,9 @@ use crate::{
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
-use logpose_types::{DEFAULT_DATABASE_NAME, LogPoseError, ResourceKind, Result};
+use logpose_types::{CorruptionKind, DEFAULT_DATABASE_NAME, LogPoseError, ResourceKind, Result};
+use serde::de::DeserializeOwned;
+use std::path::Path;
 
 impl EngineCore {
     pub(crate) fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
@@ -21,8 +23,7 @@ impl EngineCore {
         }
         let path = self.database_descriptor_path(database_name);
         if self.exists(&path)? {
-            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-            descriptor.validate()?;
+            read_stored(self, &path, DatabaseDescriptor::validate)?;
             return Ok(());
         }
 
@@ -45,9 +46,7 @@ impl EngineCore {
     fn list_database_descriptors(&self) -> Result<Vec<DatabaseDescriptor>> {
         let mut descriptors = Vec::new();
         for path in self.descriptor_files_under(&self.databases_root())? {
-            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-            descriptor.validate()?;
-            descriptors.push(descriptor);
+            descriptors.push(read_stored(self, &path, DatabaseDescriptor::validate)?);
         }
 
         descriptors.sort_by(|left, right| left.name.cmp(&right.name));
@@ -57,10 +56,7 @@ impl EngineCore {
     fn list_principal_descriptors(&self) -> Result<Vec<Principal>> {
         let mut principals = Vec::new();
         for path in self.descriptor_files_under(&self.principals_root())? {
-            let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
-            validate_principal_name(&principal.name)?;
-            principal.validate().map_err(invalid_descriptor)?;
-            principals.push(principal);
+            principals.push(read_stored(self, &path, validate_principal)?);
         }
 
         principals.sort_by(|left, right| left.name.cmp(&right.name));
@@ -101,9 +97,7 @@ impl CatalogStore for EngineCore {
             ));
         }
 
-        let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
-        descriptor.validate()?;
-        Ok(descriptor)
+        read_stored(self, &path, DatabaseDescriptor::validate)
     }
 
     fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
@@ -112,8 +106,7 @@ impl CatalogStore for EngineCore {
     }
 
     fn put_principal(&self, principal: Principal) -> Result<Principal> {
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(invalid_descriptor)?;
+        validate_principal(&principal)?;
         atomic_write(
             self.vfs.as_ref(),
             &self.principal_descriptor_path(&principal.name),
@@ -132,10 +125,7 @@ impl CatalogStore for EngineCore {
             ));
         }
 
-        let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
-        validate_principal_name(&principal.name)?;
-        principal.validate().map_err(invalid_descriptor)?;
-        Ok(principal)
+        read_stored(self, &path, validate_principal)
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
@@ -166,9 +156,9 @@ impl CatalogStore for EngineCore {
             ));
         }
 
-        let policy = read_json::<DatabaseAccessPolicy>(self.vfs.as_ref(), &path)?;
-        policy.validate().map_err(invalid_descriptor)?;
-        Ok(policy)
+        read_stored(self, &path, |policy: &DatabaseAccessPolicy| {
+            policy.validate().map_err(invalid_descriptor)
+        })
     }
 }
 
@@ -209,6 +199,35 @@ impl CatalogStore for LocalStorageEngine {
             .core()
             .get_database_access_policy(database_name)
     }
+}
+
+/// Read the descriptor stored at `path` and check it with `validate`.
+///
+/// Every descriptor is validated before it is written, so one that fails now is damaged
+/// stored data (`DATA_LOSS`), not a bad request.
+fn read_stored<T>(
+    core: &EngineCore,
+    path: &Path,
+    validate: impl FnOnce(&T) -> Result<()>,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value = read_json::<T>(core.vfs.as_ref(), path)?;
+    validate(&value).map_err(|error| LogPoseError::Corrupt {
+        kind: CorruptionKind::Descriptor,
+        location: Some(path.display().to_string()),
+        message: format!(
+            "stored descriptor '{}' fails validation: {error}",
+            path.display()
+        ),
+    })?;
+    Ok(value)
+}
+
+fn validate_principal(principal: &Principal) -> Result<()> {
+    validate_principal_name(&principal.name)?;
+    principal.validate().map_err(invalid_descriptor)
 }
 
 fn validate_principal_name(value: &str) -> Result<()> {
