@@ -123,7 +123,7 @@ impl RecallScenario {
                         id: format!("row-{index}"),
                         vector: sample_near(&mut rng, &centers),
                         // Uncorrelated with the clusters, so about 10 percent of every cluster.
-                        flagged: rng.next_u64() % 10 == 0,
+                        flagged: rng.next_u64().is_multiple_of(10),
                     }
                 })
                 .collect::<Vec<_>>();
