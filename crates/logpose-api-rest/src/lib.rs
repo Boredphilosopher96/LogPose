@@ -794,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
-        let state = Arc::new(AppState::new(LogPoseConfig::default()));
+        let state = Arc::new(AppState::new(test_config("rest-health")));
         let app = router(state);
         let response = app
             .oneshot(

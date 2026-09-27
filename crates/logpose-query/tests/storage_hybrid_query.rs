@@ -21,7 +21,7 @@ use thiserror as _;
 #[tokio::test]
 async fn uses_vector_first_ann_after_flush_and_reranks_exact_vectors() {
     let root = unique_temp_dir("query-hnsw-vector-first");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -106,7 +106,7 @@ async fn uses_vector_first_ann_after_flush_and_reranks_exact_vectors() {
 #[tokio::test]
 async fn uses_cooperative_filtered_ann_for_selective_immutable_predicates() {
     let root = unique_temp_dir("query-hnsw-cooperative-filtered");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -189,7 +189,7 @@ async fn uses_cooperative_filtered_ann_for_selective_immutable_predicates() {
 #[tokio::test]
 async fn hybrid_query_prefers_latest_mutable_version_over_stale_immutable_candidate() {
     let root = unique_temp_dir("query-hybrid-latest-visible");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -274,7 +274,7 @@ async fn hybrid_query_prefers_latest_mutable_version_over_stale_immutable_candid
 #[tokio::test]
 async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
     let root = unique_temp_dir("query-hnsw-fallback-reopen");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -322,7 +322,7 @@ async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
         .await
         .expect("compaction should succeed");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let response = query_exact(
         &reopened,
         QueryRequest {

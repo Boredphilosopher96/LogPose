@@ -21,7 +21,7 @@ use thiserror as _;
 #[tokio::test]
 async fn queries_storage_records_and_honors_snapshots() {
     let root = unique_temp_dir("query-storage-snapshots");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -133,7 +133,7 @@ async fn queries_storage_records_and_honors_snapshots() {
 #[tokio::test]
 async fn returns_empty_matches_for_empty_collection() {
     let root = unique_temp_dir("query-empty-collection");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -176,7 +176,7 @@ async fn returns_empty_matches_for_empty_collection() {
 #[tokio::test]
 async fn rejects_query_vector_with_wrong_collection_dimensions() {
     let root = unique_temp_dir("query-dimension-mismatch");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -214,7 +214,7 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
 #[tokio::test]
 async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
     let root = unique_temp_dir("query-delete-flush-compact");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -263,7 +263,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("flush should succeed");
 
-    let reopened = LocalStorageEngine::new(&root);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let historical = query_exact(
         &reopened,
@@ -338,7 +338,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 #[tokio::test]
 async fn exists_predicates_match_non_scalar_fields_after_flush() {
     let root = unique_temp_dir("query-exists-non-scalar-after-flush");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -395,7 +395,7 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
 #[tokio::test]
 async fn surfaces_unknown_collection_errors_from_storage() {
     let root = unique_temp_dir("query-missing-collection");
-    let engine = LocalStorageEngine::new(&root);
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let result = query_exact(
         &engine,

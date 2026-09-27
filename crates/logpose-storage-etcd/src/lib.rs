@@ -77,7 +77,7 @@ impl EtcdBackedStorageEngine {
     pub fn new(root: impl AsRef<Path>, config: EtcdMetadataConfig) -> Result<Self> {
         let etcd = EtcdPlacementStore::new(config)?;
         Ok(Self {
-            local: Arc::new(LocalStorageEngine::new(root)),
+            local: Arc::new(LocalStorageEngine::new(root)?),
             etcd,
         })
     }
@@ -1881,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn authoritative_assignment_reads_fail_closed_when_etcd_is_unreachable() {
         let root = unique_temp_dir("fail-closed-assignment");
-        let local = LocalStorageEngine::new(&root);
+        let local = LocalStorageEngine::new(&root).expect("storage engine should open");
         let descriptor = local
             .create_collection(CreateCollectionRequest::new(
                 "documents",
