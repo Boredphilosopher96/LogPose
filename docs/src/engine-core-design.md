@@ -994,7 +994,7 @@ Let `cur` be the schema replay holds, initially `S_M`.
 
 A key in `$extra` collides with a declared name when a field is added, or renamed, to a name that rows written earlier carry in `$extra`. The rule is a pure function of the stored bytes and the reading schema, so it cannot depend on whether a compaction has run:
 
-- **Write.** Validation never stores a key in `$extra` that the writer's schema declares; a partial update that merges an old row removes such keys from the merged `$extra` (the old value is not promoted into the typed field).
+- **Write.** Validation never stores a key in `$extra` that the writer's schema declares or retires (a retired name is rejected with `RecordError::RetiredKey`, since readers would hide it); a partial update that merges an old row removes such keys from the merged `$extra` (the old value is not promoted into the typed field).
 - **Read.** A key in a row's `$extra` is visible (to projection, to `$extra` path filters, and to undeclared-name filters) only if the `ReadView`'s schema does not declare that name. Added fields therefore read null on old rows, as D4 requires, instead of exposing the old dynamic value under the new typed name.
 - **Storage.** Flush and compaction copy `$extra` bytes unchanged. They never strip shadowed keys, because stripping would make a later drop or rename (which un-shadows the name) return different results depending on compaction timing.
 
