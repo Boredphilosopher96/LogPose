@@ -236,7 +236,10 @@ impl From<SegmentError> for LogPoseError {
             return LogPoseError::corrupt(CorruptionKind::Segment, error.to_string());
         }
         match error {
-            SegmentError::Io(source) => LogPoseError::io("segment I/O failed", source),
+            SegmentError::Io(source) => LogPoseError::Io {
+                context: "segment I/O failed".to_owned(),
+                source,
+            },
             // Every other variant rejects builder input that the engine produced itself.
             other => LogPoseError::internal(other.to_string()),
         }
