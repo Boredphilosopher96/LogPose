@@ -128,8 +128,12 @@ fn lock_file_exclusively(root: &Path) -> Result<File> {
         }
         Err(TryLockError::Error(error)) => {
             return Err(LogPoseError::Message(format!(
-                "failed to lock storage root '{}': {error}",
-                lock_path.display()
+                "failed to take the exclusive lock on '{}': {error}; storage_root must be on a \
+                 filesystem that supports advisory file locks (flock), such as a local disk, so \
+                 that two processes cannot serve '{}' at once; move storage_root to such a \
+                 filesystem or enable locking on the mount",
+                lock_path.display(),
+                root.display()
             )));
         }
     }
