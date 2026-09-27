@@ -342,39 +342,142 @@ async fn a_crash_during_recovery_is_recovered() {
     let (setup_ops, scenario_ops) = ops_after_setup(1, &steps).await;
 
     // Crash points inside the flushes, where recovery has the most to do.
-    for k in (0..=scenario_ops).step_by(3) {
-        let mut harness = Harness::new(k).await;
-        harness.fault.set_plan(FaultPlan {
-            crash_after_ops: Some(setup_ops + k),
-            ..FaultPlan::default()
-        });
-        let outcome = harness.run(&steps).await;
-        harness.crash_and_reopen();
-
-        // Count what recovery does on this state, on a throwaway copy of the same run.
-        let recovery_ops = {
-            let mut probe = Harness::new(k).await;
-            probe.fault.set_plan(FaultPlan {
+    for tear in TearMode::ALL {
+        for k in (0..=scenario_ops).step_by(3) {
+            let seed = k * 4 + tear as u64;
+            let plan = FaultPlan {
                 crash_after_ops: Some(setup_ops + k),
+                tear,
                 ..FaultPlan::default()
-            });
-            probe.run(&steps).await;
-            probe.crash_and_reopen();
-            let _ = probe.engine().stats(COLLECTION).await;
-            probe.fault.mutating_ops()
-        };
-
-        for recovery_crash in 0..recovery_ops {
-            harness.fault.set_plan(FaultPlan {
-                crash_after_ops: Some(recovery_crash),
-                ..FaultPlan::default()
-            });
-            let _ = harness.engine().stats(COLLECTION).await;
+            };
+            let mut harness = Harness::new(seed).await;
+            harness.fault.set_plan(plan.clone());
+            let outcome = harness.run(&steps).await;
             harness.crash_and_reopen();
+
+            // Count what recovery does on this state, on a throwaway copy of the same run.
+            let recovery_ops = {
+                let mut probe = Harness::new(seed).await;
+                probe.fault.set_plan(plan);
+                probe.run(&steps).await;
+                probe.crash_and_reopen();
+                let _ = probe.engine().stats(COLLECTION).await;
+                probe.fault.mutating_ops()
+            };
+
+            for recovery_crash in 0..recovery_ops {
+                harness.fault.set_plan(FaultPlan {
+                    crash_after_ops: Some(recovery_crash),
+                    tear,
+                    ..FaultPlan::default()
+                });
+                let _ = harness.engine().stats(COLLECTION).await;
+                harness.crash_and_reopen();
+            }
+            let context = format!("tear={tear:?} crash_after_ops={k} then recovery crashes");
+            let kept = assert_recovered(&harness, &outcome, &context).await;
+            assert_engine_keeps_working(&mut harness, kept, &context).await;
         }
-        let context = format!("crash_after_ops={k} then recovery crashes");
-        let kept = assert_recovered(&harness, &outcome, &context).await;
-        assert_engine_keeps_working(&mut harness, kept, &context).await;
+    }
+}
+
+/// Crash before every mutating operation of creating a collection: afterwards the collection
+/// either does not exist and can be created again, or exists, is empty, and works.
+#[tokio::test]
+async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
+    let create_ops = {
+        let fault = FaultVfs::new(0);
+        let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
+            .expect("engine should open on a fresh filesystem");
+        let before = fault.mutating_ops();
+        engine
+            .create_collection(CreateCollectionRequest::new(
+                COLLECTION,
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("clean create should succeed");
+        fault.mutating_ops() - before
+    };
+    assert!(
+        create_ops > 10,
+        "creating a collection should take many operations"
+    );
+
+    for tear in TearMode::ALL {
+        for k in 0..=create_ops {
+            let context = format!("tear={tear:?} crash_after_ops={k} during create");
+            let fault = FaultVfs::new(k * 4 + tear as u64);
+            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
+                .expect("engine should open on a fresh filesystem");
+            fault.set_plan(FaultPlan {
+                crash_after_ops: Some(fault.mutating_ops() + k),
+                tear,
+                ..FaultPlan::default()
+            });
+            let created = engine
+                .create_collection(CreateCollectionRequest::new(
+                    COLLECTION,
+                    2,
+                    DistanceMetric::Dot,
+                ))
+                .await
+                .is_ok();
+            drop(engine);
+            fault.crash();
+
+            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
+                .unwrap_or_else(|error| panic!("{context}: reopen failed: {error}"));
+            let listed = engine
+                .list_collections()
+                .await
+                .unwrap_or_else(|error| panic!("{context}: listing failed: {error}"));
+            if created {
+                assert_eq!(
+                    listed.len(),
+                    1,
+                    "{context}: an acknowledged create must survive"
+                );
+            }
+            if listed.is_empty() {
+                engine
+                    .create_collection(CreateCollectionRequest::new(
+                        COLLECTION,
+                        2,
+                        DistanceMetric::Dot,
+                    ))
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
+            } else {
+                assert_eq!(listed.len(), 1, "{context}");
+                let visible = engine
+                    .scan_exact(COLLECTION, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: scan failed: {error}"));
+                assert!(visible.is_empty(), "{context}: a new collection is empty");
+            }
+            engine
+                .write(COLLECTION, vec![put("a", 1.0)])
+                .await
+                .unwrap_or_else(|error| panic!("{context}: write failed: {error}"));
+            engine
+                .flush(COLLECTION)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: flush failed: {error}"));
+            drop(engine);
+            fault.crash();
+            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
+                .unwrap_or_else(|error| panic!("{context}: second reopen failed: {error}"));
+            assert_eq!(
+                engine
+                    .scan_exact(COLLECTION, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: second scan failed: {error}")),
+                expected_visible(&[vec![put("a", 1.0)]]),
+                "{context}"
+            );
+        }
     }
 }
 
@@ -490,36 +593,91 @@ async fn named_crash_points_have_the_documented_outcome() {
 }
 
 /// A failed WAL fsync is rolled back before the write reports failure, so the batch never
-/// reappears, even when the process crashes right after the rollback.
+/// reappears, even when the process crashes right after the rollback. The failed sync may have
+/// written the whole frame before its error, so this fails unless the rollback is itself synced.
 #[tokio::test]
 async fn failed_wal_fsync_is_rolled_back_and_the_batch_never_reappears() {
-    let mut harness = Harness::new(50).await;
-    let outcome = harness.run(&scenario()[..1]).await;
-    assert_eq!(outcome.acked.len(), 1);
+    for tear in TearMode::ALL {
+        for seed in 0..16 {
+            let context = format!("WalAfterRollback tear={tear:?} seed={seed}");
+            let mut harness = Harness::new(50 + seed).await;
+            let outcome = harness.run(&scenario()[..1]).await;
+            assert_eq!(outcome.acked.len(), 1, "{context}");
 
-    // A write performs exactly one file sync: the WAL fsync. Fail the next one.
-    harness.fault.set_plan(FaultPlan {
-        fail_sync: Some(harness.fault.file_syncs()),
-        crash_at: Some(CrashPoint::WalAfterRollback),
-        tear: TearMode::KeepRandomPrefix,
-        ..FaultPlan::default()
-    });
-    let failed = vec![put("lost", 8.0)];
-    let error = harness
-        .engine()
-        .write(COLLECTION, failed.clone())
-        .await
-        .expect_err("the fsync failure should fail the write");
-    assert!(error.to_string().contains("fsync"), "{error}");
-    let outcome = Outcome {
-        acked: outcome.acked,
-        in_flight: None,
-        failed_step: Some(1),
-        snapshots: outcome.snapshots,
-    };
-    harness.crash_and_reopen();
-    let kept = assert_recovered(&harness, &outcome, "WalAfterRollback").await;
-    assert_engine_keeps_working(&mut harness, kept, "WalAfterRollback").await;
+            // A write performs exactly one file sync: the WAL fsync. Fail the next one.
+            harness.fault.set_plan(FaultPlan {
+                fail_sync: Some(harness.fault.file_syncs()),
+                crash_at: Some(CrashPoint::WalAfterRollback),
+                tear,
+                ..FaultPlan::default()
+            });
+            let error = harness
+                .engine()
+                .write(COLLECTION, vec![put("lost", 8.0)])
+                .await
+                .expect_err("the fsync failure should fail the write");
+            assert!(error.to_string().contains("fsync"), "{context}: {error}");
+            let outcome = Outcome {
+                acked: outcome.acked,
+                in_flight: None,
+                failed_step: Some(1),
+                snapshots: outcome.snapshots,
+            };
+            harness.crash_and_reopen();
+            let kept = assert_recovered(&harness, &outcome, &context).await;
+            assert_engine_keeps_working(&mut harness, kept, &context).await;
+        }
+    }
+}
+
+/// A failed WAL fsync followed by more work in the same process, then a crash: the failed batch
+/// is invisible before and after the crash, and every batch acknowledged after the failure
+/// survives. Under every tear mode the failed sync may have written part or all of its frame
+/// before the error, so only a durable rollback keeps the batch from coming back.
+#[tokio::test]
+async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_batches() {
+    for tear in TearMode::ALL {
+        for seed in 0..8 {
+            let context = format!("tear={tear:?} seed={seed}");
+            let mut harness = Harness::new(100 + seed).await;
+            let mut outcome = harness.run(&scenario()[..2]).await;
+            assert_eq!(outcome.acked.len(), 2, "{context}");
+
+            harness.fault.set_plan(FaultPlan {
+                fail_sync: Some(harness.fault.file_syncs()),
+                tear,
+                ..FaultPlan::default()
+            });
+            harness
+                .engine()
+                .write(COLLECTION, vec![put("lost", 8.0)])
+                .await
+                .expect_err("the fsync failure should fail the write");
+            let visible = harness
+                .engine()
+                .scan_exact(COLLECTION, None)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: scan after the failure: {error}"));
+            assert_eq!(
+                visible,
+                expected_visible(&outcome.acked),
+                "{context}: the failed batch must stay invisible in the same process"
+            );
+
+            let after = vec![put("after", 3.0), delete("b")];
+            harness
+                .engine()
+                .write(COLLECTION, after.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{context}: write after the failure: {error}"));
+            outcome.acked.push(after);
+
+            // `crash` applies the plan's tear mode to everything not yet synced.
+            harness.crash_and_reopen();
+            let kept = assert_recovered(&harness, &outcome, &context).await;
+            assert_engine_keeps_working(&mut harness, kept, &context).await;
+        }
+    }
 }
 
 /// A torn WAL tail is repaired on the next write; a crash right after the repair keeps it.
