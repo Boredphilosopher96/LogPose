@@ -122,9 +122,11 @@ impl LocalEngineTarget {
             .enable_all()
             .build()
             .context("building tokio runtime")?;
+        let engine = LocalStorageEngine::new(&root)
+            .with_context(|| format!("opening engine at {}", root.display()))?;
         Ok(Self {
             runtime,
-            engine: LocalStorageEngine::new(&root),
+            engine,
             root,
             remove_on_drop,
             collection: None,
@@ -144,6 +146,10 @@ impl LocalEngineTarget {
     fn wait_for_maintenance(&self) -> Result<()> {
         let collection = self.collection()?;
         let started = Instant::now();
+        // The engine clears `in_progress` before it enqueues follow-up work (a
+        // flush that crosses the compaction threshold), so one idle reading can
+        // fall in that gap. Require two idle readings with no run in between.
+        let mut idle_after_runs = None;
         loop {
             let stats = self.runtime.block_on(self.engine.stats(collection))?;
             let maintenance = &stats.maintenance;
@@ -151,7 +157,12 @@ impl LocalEngineTarget {
                 return Err(anyhow!("background maintenance failed: {error}"));
             }
             if maintenance.pending.is_empty() && maintenance.in_progress.is_none() {
-                return Ok(());
+                if idle_after_runs == Some(maintenance.completed_runs) {
+                    return Ok(());
+                }
+                idle_after_runs = Some(maintenance.completed_runs);
+            } else {
+                idle_after_runs = None;
             }
             if started.elapsed() > MAINTENANCE_TIMEOUT {
                 return Err(anyhow!(
