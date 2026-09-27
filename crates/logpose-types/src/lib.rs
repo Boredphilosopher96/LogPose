@@ -1,6 +1,7 @@
 //! Shared domain types for LogPose.
 
 pub mod schema;
+pub mod value;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
