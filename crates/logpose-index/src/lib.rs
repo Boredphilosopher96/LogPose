@@ -12,8 +12,8 @@ use logpose_types::{DistanceMetric, RecordId, ScalarFieldStats, ScalarMetadataVa
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    cmp::{Ordering, Reverse},
+    collections::{BTreeMap, BinaryHeap, HashSet},
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     io,
@@ -158,27 +158,82 @@ pub fn read_flat_index(path: &Path) -> io::Result<FlatIndexSidecar> {
 }
 
 const HNSW_MAGIC: &[u8; 4] = b"LPH1";
-const HNSW_VERSION: u16 = 1;
-const MAX_HNSW_LEVEL: u8 = 4;
+/// Sidecar layout and graph-semantics version.
+///
+/// Version 2 draws node levels with `mL = 1 / ln(M)`, bounds layer 0 at `2 * M` neighbors, and
+/// picks neighbors with the diversity heuristic. Version 1 graphs were built with a different
+/// level distribution and degree bound, so they are rejected rather than reinterpreted.
+const HNSW_VERSION: u16 = 2;
+/// Upper bound on node levels. With `M >= 2`, a level this high has probability at most
+/// `2^-16` per node, and clamping the rare outlier only costs it a little extra reach.
+const MAX_HNSW_LEVEL: u8 = 16;
+/// Fewest bytes one encoded node can occupy besides its vector components: level, entry
+/// offset, sequence number, the record id, vector, and metadata length prefixes, one byte of
+/// metadata JSON, the neighbor list count, and the layer 0 neighbor count. Bounds preallocation
+/// when a length field is corrupt.
+const MIN_ENCODED_HNSW_NODE_BYTES: usize = 1 + 4 + 8 + 4 + 4 + 4 + 1 + 4 + 4;
 
 /// Deterministic build parameters for the persisted HNSW sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HnswBuildParams {
-    /// Maximum bidirectional neighbors kept per layer.
+    /// Maximum neighbors kept per node on layers above 0 (`M`).
+    ///
+    /// Layer 0 keeps up to `2 * M` neighbors, and node levels are drawn with `mL = 1 / ln(M)`.
+    /// Must be at least 2.
     pub max_neighbors: usize,
-    /// Search breadth used while linking new nodes.
+    /// Search breadth used while linking new nodes. Must be at least 1.
     pub ef_construction: usize,
-    /// Default search breadth used at query time.
+    /// Default search breadth used at query time. Must be at least 1.
     pub ef_search: usize,
 }
 
 impl Default for HnswBuildParams {
     fn default() -> Self {
         Self {
-            max_neighbors: 8,
-            ef_construction: 32,
-            ef_search: 32,
+            max_neighbors: 16,
+            ef_construction: 128,
+            ef_search: 64,
         }
+    }
+}
+
+impl HnswBuildParams {
+    /// Maximum neighbor count allowed on `layer`: `2 * M` on layer 0 and `M` above it.
+    #[must_use]
+    pub fn max_neighbors_for_layer(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.max_neighbors.saturating_mul(2)
+        } else {
+            self.max_neighbors
+        }
+    }
+
+    /// Level normalization factor `mL = 1 / ln(M)`, which makes each layer hold about `1 / M`
+    /// of the nodes of the layer below it.
+    fn level_multiplier(&self) -> f64 {
+        1.0 / (self.max_neighbors as f64).ln()
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.max_neighbors < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "hnsw max_neighbors must be at least 2 but was {}",
+                    self.max_neighbors
+                ),
+            ));
+        }
+        if self.ef_construction == 0 || self.ef_search == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "hnsw ef_construction and ef_search must be at least 1 but were {} and {}",
+                    self.ef_construction, self.ef_search
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -283,10 +338,58 @@ pub struct HnswSearchResult {
     pub stats: HnswSearchStats,
 }
 
+/// A node scored against a query or base vector.
+///
+/// `Ord` ranks better nodes as greater: a higher similarity for cosine and dot, a smaller
+/// distance for L2. Ties break toward the higher node index, the more recently inserted node,
+/// so builds and searches stay deterministic. Preferring the newer node matters for exact
+/// duplicate vectors: every copy then keeps edges from the copies inserted after it, instead of
+/// all copies competing for the same oldest few and orphaning the rest.
 #[derive(Clone, Copy, Debug)]
 struct ScoredNode {
     index: usize,
     value: f32,
+    goodness: f32,
+}
+
+impl ScoredNode {
+    fn new(metric: DistanceMetric, index: usize, value: f32) -> Self {
+        let goodness = match metric {
+            DistanceMetric::Cosine | DistanceMetric::Dot => value,
+            DistanceMetric::L2 => -value,
+        };
+        Self {
+            index,
+            value,
+            goodness: if goodness.is_nan() {
+                f32::NEG_INFINITY
+            } else {
+                goodness
+            },
+        }
+    }
+}
+
+impl PartialEq for ScoredNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ScoredNode {}
+
+impl PartialOrd for ScoredNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.goodness
+            .total_cmp(&other.goodness)
+            .then_with(|| self.index.cmp(&other.index))
+    }
 }
 
 /// Build a deterministic HNSW sidecar from immutable visible put entries.
@@ -296,6 +399,7 @@ pub fn build_hnsw_index(
     params: HnswBuildParams,
     entries: &[HnswIndexEntrySource],
 ) -> io::Result<HnswIndexSidecar> {
+    params.validate()?;
     let dimensions = entries
         .first()
         .map(|entry| entry.vector.len())
@@ -326,8 +430,9 @@ pub fn build_hnsw_index(
         nodes: Vec::with_capacity(entries.len()),
     };
 
+    let level_multiplier = index.params.level_multiplier();
     for entry in entries {
-        insert_hnsw_entry(&mut index, entry)?;
+        insert_hnsw_entry(&mut index, entry, level_multiplier)?;
     }
 
     Ok(index)
@@ -381,7 +486,34 @@ pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<(
     durable::write_atomic(path, &bytes)
 }
 
+/// A sidecar written with a graph layout this build does not read.
+///
+/// [`read_hnsw_index`] reports it as an [`io::ErrorKind::InvalidData`] error carrying this value;
+/// [`is_unsupported_hnsw_version`] detects it, so a caller can score the segment exactly instead
+/// of failing the query. Rewriting the segment, as a compaction that merges it does, writes a
+/// current sidecar.
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported hnsw version {found} in '{}' (expected {HNSW_VERSION})", path.display())]
+pub struct UnsupportedHnswVersion {
+    /// Sidecar that was read.
+    pub path: std::path::PathBuf,
+    /// Version found in the sidecar header.
+    pub found: u16,
+}
+
+/// Whether `error` came from [`read_hnsw_index`] finding a sidecar version it does not read.
+#[must_use]
+pub fn is_unsupported_hnsw_version(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<UnsupportedHnswVersion>())
+}
+
 /// Load an HNSW sidecar from disk.
+///
+/// A sidecar with a different version fails with an error that [`is_unsupported_hnsw_version`]
+/// recognizes; any other malformed content fails with [`io::ErrorKind::InvalidData`] or
+/// [`io::ErrorKind::UnexpectedEof`].
 pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     let bytes = fs::read(path)?;
     let mut cursor = 0usize;
@@ -396,10 +528,10 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     if version != HNSW_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "unsupported hnsw version {version} in '{}' (expected {HNSW_VERSION})",
-                path.display()
-            ),
+            UnsupportedHnswVersion {
+                path: path.to_path_buf(),
+                found: version,
+            },
         ));
     }
     let segment_id = read_string(&bytes, &mut cursor)?;
@@ -434,7 +566,10 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     let max_level = read_u8(&bytes, &mut cursor)?;
     let entry_point = read_optional_u32(&bytes, &mut cursor)?;
     let node_count = read_u32(&bytes, &mut cursor)? as usize;
-    let mut nodes = Vec::with_capacity(node_count);
+    // Size buffers from the bytes left rather than the claimed counts, so a corrupt count
+    // fails on the truncated read instead of reserving memory far beyond the file size.
+    let min_node_bytes = MIN_ENCODED_HNSW_NODE_BYTES.saturating_add(dimensions.saturating_mul(4));
+    let mut nodes = Vec::with_capacity(node_count.min(remaining(&bytes, cursor) / min_node_bytes));
     for _ in 0..node_count {
         let level = read_u8(&bytes, &mut cursor)?;
         let entry_offset_index = read_u32(&bytes, &mut cursor)? as usize;
@@ -443,7 +578,7 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
         let vector = read_f32_slice(&bytes, &mut cursor)?;
         let metadata = serde_json::from_str::<Value>(&read_string(&bytes, &mut cursor)?)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        if dimensions != 0 && vector.len() != dimensions {
+        if vector.len() != dimensions {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -455,10 +590,12 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
             ));
         }
         let level_count = read_u32(&bytes, &mut cursor)? as usize;
-        let mut neighbors_by_level = Vec::with_capacity(level_count);
+        let mut neighbors_by_level =
+            Vec::with_capacity(level_count.min(usize::from(MAX_HNSW_LEVEL) + 1));
         for _ in 0..level_count {
             let neighbor_count = read_u32(&bytes, &mut cursor)? as usize;
-            let mut neighbors = Vec::with_capacity(neighbor_count);
+            let mut neighbors =
+                Vec::with_capacity(neighbor_count.min(remaining(&bytes, cursor) / 4));
             for _ in 0..neighbor_count {
                 neighbors.push(read_u32(&bytes, &mut cursor)?);
             }
@@ -532,7 +669,7 @@ pub fn search_hnsw(
     }
     let mut ef = sidecar.params.ef_search.max(top_k);
     let mut stats;
-    let mut candidates = Vec::with_capacity(top_k);
+    let mut candidates = Vec::with_capacity(top_k.min(sidecar.nodes.len()));
     loop {
         let (scored, visited_nodes) = search_layer(sidecar, query, 0, &[entry], ef, None)?;
         stats = HnswSearchStats {
@@ -568,66 +705,106 @@ pub fn search_hnsw(
     Ok(HnswSearchResult { candidates, stats })
 }
 
+fn invalid_data(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
 fn validate_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<()> {
-    if !sidecar.nodes.is_empty() && sidecar.entry_point.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "non-empty hnsw sidecar is missing an entry point",
-        ));
+    if sidecar.index_kind != IndexKind::Hnsw {
+        return Err(invalid_data(format!(
+            "hnsw sidecar has index kind '{}'",
+            sidecar.index_kind.as_str()
+        )));
+    }
+    sidecar
+        .params
+        .validate()
+        .map_err(|error| invalid_data(error.to_string()))?;
+    if sidecar.max_level > MAX_HNSW_LEVEL {
+        return Err(invalid_data(format!(
+            "max level {} exceeds the limit of {MAX_HNSW_LEVEL}",
+            sidecar.max_level
+        )));
     }
 
-    if let Some(entry_point) = sidecar.entry_point {
-        if entry_point as usize >= sidecar.nodes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
+    match sidecar.entry_point {
+        None if !sidecar.nodes.is_empty() => {
+            return Err(invalid_data(
+                "non-empty hnsw sidecar is missing an entry point".to_owned(),
+            ));
+        }
+        None if sidecar.max_level != 0 => {
+            return Err(invalid_data(format!(
+                "empty hnsw sidecar has max level {}",
+                sidecar.max_level
+            )));
+        }
+        None => {}
+        Some(entry_point) => {
+            let Some(entry_node) = sidecar.nodes.get(entry_point as usize) else {
+                return Err(invalid_data(format!(
                     "entry point {entry_point} is out of range for {} nodes",
                     sidecar.nodes.len()
-                ),
-            ));
-        }
-        if sidecar.nodes[entry_point as usize].level != sidecar.max_level {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
+                )));
+            };
+            if entry_node.level != sidecar.max_level {
+                return Err(invalid_data(format!(
                     "entry point level {} does not match max level {}",
-                    sidecar.nodes[entry_point as usize].level, sidecar.max_level
-                ),
-            ));
+                    entry_node.level, sidecar.max_level
+                )));
+            }
         }
     }
 
+    let mut seen = Vec::new();
     for (node_index, node) in sidecar.nodes.iter().enumerate() {
+        if node.level > sidecar.max_level {
+            return Err(invalid_data(format!(
+                "node {node_index} level {} exceeds max level {}",
+                node.level, sidecar.max_level
+            )));
+        }
         if node.neighbors_by_level.len() != usize::from(node.level) + 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "node {node_index} level {} expected {} neighbor lists but found {}",
-                    node.level,
-                    usize::from(node.level) + 1,
-                    node.neighbors_by_level.len()
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "node {node_index} level {} expected {} neighbor lists but found {}",
+                node.level,
+                usize::from(node.level) + 1,
+                node.neighbors_by_level.len()
+            )));
         }
         for (layer, neighbors) in node.neighbors_by_level.iter().enumerate() {
+            let max_degree = sidecar.params.max_neighbors_for_layer(layer);
+            if neighbors.len() > max_degree {
+                return Err(invalid_data(format!(
+                    "node {node_index} layer {layer} has {} neighbors but at most {max_degree} are allowed",
+                    neighbors.len()
+                )));
+            }
             for neighbor in neighbors {
                 let neighbor_index = *neighbor as usize;
                 let Some(neighbor_node) = sidecar.nodes.get(neighbor_index) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "node {node_index} layer {layer} references out-of-range neighbor {neighbor_index}"
-                        ),
-                    ));
+                    return Err(invalid_data(format!(
+                        "node {node_index} layer {layer} references out-of-range neighbor {neighbor_index}"
+                    )));
                 };
-                if usize::from(neighbor_node.level) < layer {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "node {node_index} layer {layer} references neighbor {neighbor_index} below that layer"
-                        ),
-                    ));
+                if neighbor_index == node_index {
+                    return Err(invalid_data(format!(
+                        "node {node_index} layer {layer} references itself"
+                    )));
                 }
+                if usize::from(neighbor_node.level) < layer {
+                    return Err(invalid_data(format!(
+                        "node {node_index} layer {layer} references neighbor {neighbor_index} below that layer"
+                    )));
+                }
+            }
+            seen.clear();
+            seen.extend_from_slice(neighbors);
+            seen.sort_unstable();
+            if seen.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(invalid_data(format!(
+                    "node {node_index} layer {layer} lists a neighbor more than once"
+                )));
             }
         }
     }
@@ -635,11 +812,13 @@ fn validate_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<()> {
     Ok(())
 }
 
+/// Insert one entry following Malkov & Yashunin, Algorithm 1.
 fn insert_hnsw_entry(
     sidecar: &mut HnswIndexSidecar,
     entry: &HnswIndexEntrySource,
+    level_multiplier: f64,
 ) -> io::Result<()> {
-    let level = deterministic_level(&entry.record_id, entry.seq_no);
+    let level = deterministic_level(&entry.record_id, entry.seq_no, level_multiplier);
     let new_index = sidecar.nodes.len();
     sidecar.nodes.push(HnswNode {
         record: HnswStoredRecord {
@@ -653,43 +832,44 @@ fn insert_hnsw_entry(
         neighbors_by_level: vec![Vec::new(); usize::from(level) + 1],
     });
 
-    if sidecar.entry_point.is_none() {
+    let Some(entry_point) = sidecar.entry_point else {
         sidecar.entry_point = Some(new_index as u32);
         sidecar.max_level = level;
         return Ok(());
+    };
+
+    let mut current_entry = entry_point as usize;
+    for layer in ((level.saturating_add(1))..=sidecar.max_level).rev() {
+        current_entry = greedy_descent(
+            sidecar,
+            &sidecar.nodes[new_index].record.vector,
+            layer,
+            current_entry,
+        )?;
     }
 
-    let mut current_entry = sidecar.entry_point.unwrap_or_default() as usize;
-    if sidecar.max_level > level {
-        for layer in ((level + 1)..=sidecar.max_level).rev() {
-            current_entry = greedy_descent(
-                sidecar,
-                &sidecar.nodes[new_index].record.vector,
-                layer,
-                current_entry,
-            )?;
-        }
-    }
-
-    let upper_layer = sidecar.max_level.min(level);
-    for layer in (0..=upper_layer).rev() {
+    let mut entry_points = vec![current_entry];
+    let ef_construction = sidecar
+        .params
+        .ef_construction
+        .max(sidecar.params.max_neighbors);
+    for layer in (0..=sidecar.max_level.min(level)).rev() {
         let (candidates, _) = search_layer(
             sidecar,
             &sidecar.nodes[new_index].record.vector,
             layer,
-            &[current_entry],
-            sidecar
-                .params
-                .ef_construction
-                .max(sidecar.params.max_neighbors),
+            &entry_points,
+            ef_construction,
             Some(new_index),
         )?;
-        let selected =
-            select_best_neighbors(sidecar.metric, candidates, sidecar.params.max_neighbors);
-        if let Some(best) = selected.first() {
-            current_entry = *best;
-        }
-        connect_node(sidecar, new_index, layer as usize, &selected);
+        let selected = select_neighbors_heuristic(
+            sidecar.metric,
+            &sidecar.nodes,
+            &candidates,
+            sidecar.params.max_neighbors,
+        )?;
+        connect_node(sidecar, new_index, usize::from(layer), &selected)?;
+        entry_points = candidates.iter().map(|candidate| candidate.index).collect();
     }
 
     if level > sidecar.max_level {
@@ -699,17 +879,22 @@ fn insert_hnsw_entry(
     Ok(())
 }
 
-fn deterministic_level(record_id: &RecordId, seq_no: SeqNo) -> u8 {
+/// Draw a node level from the geometric distribution `floor(-ln(U) * mL)`.
+///
+/// `U` comes from a hash of the record id and sequence number rather than a random generator,
+/// so rebuilding a segment from the same entries yields the same graph.
+fn deterministic_level(record_id: &RecordId, seq_no: SeqNo, level_multiplier: f64) -> u8 {
     let mut hasher = DefaultHasher::new();
     record_id.hash(&mut hasher);
     seq_no.hash(&mut hasher);
-    let mut value = hasher.finish();
-    let mut level = 0u8;
-    while level < MAX_HNSW_LEVEL && value & 1 == 0 {
-        level += 1;
-        value >>= 1;
+    // The top 53 bits give a uniform value in (0, 1] that an f64 represents exactly.
+    let uniform = ((hasher.finish() >> 11) + 1) as f64 / (1u64 << 53) as f64;
+    let level = (-uniform.ln() * level_multiplier).floor();
+    if level >= f64::from(MAX_HNSW_LEVEL) {
+        MAX_HNSW_LEVEL
+    } else {
+        level as u8
     }
-    level
 }
 
 fn greedy_descent(
@@ -718,29 +903,34 @@ fn greedy_descent(
     layer: u8,
     mut current: usize,
 ) -> io::Result<usize> {
+    let metric = sidecar.metric;
+    let mut best = ScoredNode::new(
+        metric,
+        current,
+        metric_value(metric, query, &sidecar.nodes[current].record.vector)?,
+    );
     loop {
-        let current_value =
-            metric_value(sidecar.metric, query, &sidecar.nodes[current].record.vector)?;
-        let mut best_index = current;
-        let mut best_value = current_value;
-        for neighbor in neighbor_indices(sidecar, current, layer) {
-            let value = metric_value(
-                sidecar.metric,
-                query,
-                &sidecar.nodes[neighbor].record.vector,
-            )?;
-            if is_better(sidecar.metric, value, best_value) {
-                best_index = neighbor;
-                best_value = value;
+        for &neighbor in neighbor_slice(sidecar, current, layer) {
+            let neighbor = neighbor as usize;
+            let scored = ScoredNode::new(
+                metric,
+                neighbor,
+                metric_value(metric, query, &sidecar.nodes[neighbor].record.vector)?,
+            );
+            if scored.goodness > best.goodness {
+                best = scored;
             }
         }
-        if best_index == current {
+        if best.index == current {
             return Ok(current);
         }
-        current = best_index;
+        current = best.index;
     }
 }
 
+/// Beam search over one layer (Malkov & Yashunin, Algorithm 2).
+///
+/// Returns up to `ef` nodes ordered best first, plus the number of distinct nodes visited.
 fn search_layer(
     sidecar: &HnswIndexSidecar,
     query: &[f32],
@@ -749,211 +939,176 @@ fn search_layer(
     ef: usize,
     exclude_index: Option<usize>,
 ) -> io::Result<(Vec<ScoredNode>, usize)> {
+    let metric = sidecar.metric;
+    // A layer never yields more than every node, and the clamp keeps `ef + 1` from overflowing.
+    let ef = ef.clamp(1, sidecar.nodes.len().max(1));
     let mut visited = HashSet::new();
-    let mut candidates = Vec::<ScoredNode>::new();
-    let mut results = Vec::<ScoredNode>::new();
+    // Max-heap: the best unexpanded candidate is on top.
+    let mut candidates = BinaryHeap::<ScoredNode>::new();
+    // Min-heap: the worst kept result is on top.
+    let mut results = BinaryHeap::<Reverse<ScoredNode>>::with_capacity(ef + 1);
 
     for &entry_point in entry_points {
-        if Some(entry_point) == exclude_index || entry_point >= sidecar.nodes.len() {
+        if Some(entry_point) == exclude_index
+            || entry_point >= sidecar.nodes.len()
+            || !visited.insert(entry_point)
+        {
             continue;
         }
-        if !visited.insert(entry_point) {
-            continue;
-        }
-        let value = metric_value(
-            sidecar.metric,
-            query,
-            &sidecar.nodes[entry_point].record.vector,
-        )?;
-        let scored = ScoredNode {
-            index: entry_point,
-            value,
-        };
+        let scored = ScoredNode::new(
+            metric,
+            entry_point,
+            metric_value(metric, query, &sidecar.nodes[entry_point].record.vector)?,
+        );
         candidates.push(scored);
-        results.push(scored);
+        results.push(Reverse(scored));
+        if results.len() > ef {
+            results.pop();
+        }
     }
 
-    while !candidates.is_empty() {
-        let candidate = pop_best_scored(sidecar.metric, &mut candidates);
-        let Some(worst_result) = worst_scored(sidecar.metric, &results) else {
-            break;
-        };
+    while let Some(candidate) = candidates.pop() {
         if results.len() >= ef
-            && is_worse_or_equal(sidecar.metric, candidate.value, worst_result.value)
+            && results
+                .peek()
+                .is_some_and(|Reverse(worst)| candidate.goodness < worst.goodness)
         {
             break;
         }
 
-        for neighbor in neighbor_indices(sidecar, candidate.index, layer) {
+        for &neighbor in neighbor_slice(sidecar, candidate.index, layer) {
+            let neighbor = neighbor as usize;
             if Some(neighbor) == exclude_index || !visited.insert(neighbor) {
                 continue;
             }
-            let value = metric_value(
-                sidecar.metric,
-                query,
-                &sidecar.nodes[neighbor].record.vector,
-            )?;
-            let scored = ScoredNode {
-                index: neighbor,
-                value,
-            };
-            if results.len() < ef
-                || worst_scored(sidecar.metric, &results)
-                    .is_some_and(|worst| is_better(sidecar.metric, value, worst.value))
-            {
+            let scored = ScoredNode::new(
+                metric,
+                neighbor,
+                metric_value(metric, query, &sidecar.nodes[neighbor].record.vector)?,
+            );
+            if results.len() < ef || results.peek().is_some_and(|Reverse(worst)| scored > *worst) {
                 candidates.push(scored);
-                results.push(scored);
+                results.push(Reverse(scored));
                 if results.len() > ef {
-                    drop_worst_scored(sidecar.metric, &mut results);
+                    results.pop();
                 }
             }
         }
     }
 
-    sort_scored_best_first(sidecar.metric, &mut results);
-    Ok((results, visited.len()))
-}
-
-fn select_best_neighbors(
-    metric: DistanceMetric,
-    mut candidates: Vec<ScoredNode>,
-    limit: usize,
-) -> Vec<usize> {
-    sort_scored_best_first(metric, &mut candidates);
-    candidates
+    let mut ranked = results
         .into_iter()
-        .take(limit)
-        .map(|candidate| candidate.index)
-        .collect()
+        .map(|Reverse(scored)| scored)
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| right.cmp(left));
+    Ok((ranked, visited.len()))
 }
 
+/// Pick up to `limit` neighbors from `candidates` with the diversity heuristic
+/// (Malkov & Yashunin, Algorithm 4, with `keepPrunedConnections`).
+///
+/// `candidates` must be ordered best first and scored against the node being linked. A
+/// candidate is kept only if it is at least as close to that node as to every neighbor already
+/// kept and is not an exact copy of one, which preserves the long edges that bridge clusters.
+/// Remaining slots are then filled with the closest pruned candidates.
+fn select_neighbors_heuristic(
+    metric: DistanceMetric,
+    nodes: &[HnswNode],
+    candidates: &[ScoredNode],
+    limit: usize,
+) -> io::Result<Vec<usize>> {
+    let mut selected = Vec::<usize>::with_capacity(limit);
+    let mut pruned = Vec::<usize>::new();
+    for candidate in candidates {
+        if selected.len() >= limit {
+            break;
+        }
+        let candidate_vector = &nodes[candidate.index].record.vector;
+        let mut diverse = true;
+        for &kept in &selected {
+            let kept_vector = &nodes[kept].record.vector;
+            let between = ScoredNode::new(
+                metric,
+                kept,
+                metric_value(metric, candidate_vector, kept_vector)?,
+            );
+            // An exact copy of a kept neighbor adds no reach, even when the tie on distance
+            // means the metric test alone cannot reject it.
+            if between.goodness > candidate.goodness || kept_vector == candidate_vector {
+                diverse = false;
+                break;
+            }
+        }
+        if diverse {
+            selected.push(candidate.index);
+        } else {
+            pruned.push(candidate.index);
+        }
+    }
+    let open_slots = limit.saturating_sub(selected.len());
+    selected.extend(pruned.into_iter().take(open_slots));
+    Ok(selected)
+}
+
+/// Link `node_index` to `neighbors` on `layer` and add the reverse edges, shrinking any
+/// neighbor list that grows past the layer's degree bound.
 fn connect_node(
     sidecar: &mut HnswIndexSidecar,
     node_index: usize,
-    layer_index: usize,
+    layer: usize,
     neighbors: &[usize],
-) {
+) -> io::Result<()> {
+    let metric = sidecar.metric;
+    let max_degree = sidecar.params.max_neighbors_for_layer(layer);
+    let node_id = node_index as u32;
+    sidecar.nodes[node_index].neighbors_by_level[layer] =
+        neighbors.iter().map(|&neighbor| neighbor as u32).collect();
+
     for &neighbor in neighbors {
-        sidecar.nodes[node_index].neighbors_by_level[layer_index].push(neighbor as u32);
-        if sidecar.nodes[neighbor].neighbors_by_level.len() <= layer_index {
+        let Some(list) = sidecar.nodes[neighbor].neighbors_by_level.get_mut(layer) else {
+            continue;
+        };
+        if list.contains(&node_id) {
             continue;
         }
-        sidecar.nodes[neighbor].neighbors_by_level[layer_index].push(node_index as u32);
-        let trimmed = trimmed_neighbors(
-            sidecar.metric,
-            &sidecar.nodes[neighbor].neighbors_by_level[layer_index],
-            &sidecar.nodes,
-            neighbor,
-            sidecar.params.max_neighbors,
-        );
-        sidecar.nodes[neighbor].neighbors_by_level[layer_index] = trimmed;
+        list.push(node_id);
+        if list.len() > max_degree {
+            let shrunk = shrink_neighbors(metric, &sidecar.nodes, neighbor, layer, max_degree)?;
+            sidecar.nodes[neighbor].neighbors_by_level[layer] = shrunk;
+        }
     }
-    let trimmed = trimmed_neighbors(
-        sidecar.metric,
-        &sidecar.nodes[node_index].neighbors_by_level[layer_index],
-        &sidecar.nodes,
-        node_index,
-        sidecar.params.max_neighbors,
-    );
-    sidecar.nodes[node_index].neighbors_by_level[layer_index] = trimmed;
+    Ok(())
 }
 
-fn trimmed_neighbors(
+/// Re-select an overfull neighbor list with the same heuristic used for new nodes.
+fn shrink_neighbors(
     metric: DistanceMetric,
-    neighbors: &[u32],
     nodes: &[HnswNode],
     node_index: usize,
+    layer: usize,
     limit: usize,
-) -> Vec<u32> {
-    let mut unique = neighbors
+) -> io::Result<Vec<u32>> {
+    let base = &nodes[node_index].record.vector;
+    let mut scored = nodes[node_index].neighbors_by_level[layer]
         .iter()
-        .copied()
-        .filter(|neighbor| *neighbor as usize != node_index)
-        .collect::<Vec<_>>();
-    unique.sort_unstable();
-    unique.dedup();
-    unique.sort_by(|left, right| {
-        let left_value = metric_value(
-            metric,
-            &nodes[node_index].record.vector,
-            &nodes[*left as usize].record.vector,
-        )
-        .unwrap_or_default();
-        let right_value = metric_value(
-            metric,
-            &nodes[node_index].record.vector,
-            &nodes[*right as usize].record.vector,
-        )
-        .unwrap_or_default();
-        metric_compare(metric, left_value, right_value).reverse()
-    });
-    unique.truncate(limit);
-    unique
+        .map(|&neighbor| {
+            let neighbor = neighbor as usize;
+            metric_value(metric, base, &nodes[neighbor].record.vector)
+                .map(|value| ScoredNode::new(metric, neighbor, value))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    scored.sort_unstable_by(|left, right| right.cmp(left));
+    Ok(select_neighbors_heuristic(metric, nodes, &scored, limit)?
+        .into_iter()
+        .map(|neighbor| neighbor as u32)
+        .collect())
 }
 
-fn neighbor_indices(sidecar: &HnswIndexSidecar, node_index: usize, layer: u8) -> Vec<usize> {
+fn neighbor_slice(sidecar: &HnswIndexSidecar, node_index: usize, layer: u8) -> &[u32] {
     sidecar.nodes[node_index]
         .neighbors_by_level
-        .get(layer as usize)
-        .into_iter()
-        .flatten()
-        .map(|neighbor| *neighbor as usize)
-        .collect()
-}
-
-fn pop_best_scored(metric: DistanceMetric, scored: &mut Vec<ScoredNode>) -> ScoredNode {
-    let mut best_index = 0usize;
-    for index in 1..scored.len() {
-        if is_better(metric, scored[index].value, scored[best_index].value) {
-            best_index = index;
-        }
-    }
-    scored.swap_remove(best_index)
-}
-
-fn worst_scored(metric: DistanceMetric, scored: &[ScoredNode]) -> Option<ScoredNode> {
-    let mut worst = *scored.first()?;
-    for candidate in &scored[1..] {
-        if is_worse_or_equal(metric, candidate.value, worst.value) {
-            worst = *candidate;
-        }
-    }
-    Some(worst)
-}
-
-fn drop_worst_scored(metric: DistanceMetric, scored: &mut Vec<ScoredNode>) {
-    if scored.is_empty() {
-        return;
-    }
-    let mut worst_index = 0usize;
-    for index in 1..scored.len() {
-        if is_worse_or_equal(metric, scored[index].value, scored[worst_index].value) {
-            worst_index = index;
-        }
-    }
-    scored.swap_remove(worst_index);
-}
-
-fn sort_scored_best_first(metric: DistanceMetric, scored: &mut [ScoredNode]) {
-    scored.sort_by(|left, right| metric_compare(metric, right.value, left.value));
-}
-
-fn is_better(metric: DistanceMetric, left: f32, right: f32) -> bool {
-    metric_compare(metric, left, right) == Ordering::Greater
-}
-
-fn is_worse_or_equal(metric: DistanceMetric, left: f32, right: f32) -> bool {
-    let ordering = metric_compare(metric, left, right);
-    ordering == Ordering::Less || ordering == Ordering::Equal
-}
-
-fn metric_compare(metric: DistanceMetric, left: f32, right: f32) -> Ordering {
-    match metric {
-        DistanceMetric::Cosine | DistanceMetric::Dot => {
-            left.partial_cmp(&right).unwrap_or(Ordering::Equal)
-        }
-        DistanceMetric::L2 => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
-    }
+        .get(usize::from(layer))
+        .map_or(&[], Vec::as_slice)
 }
 
 fn metric_value(metric: DistanceMetric, query: &[f32], candidate: &[f32]) -> io::Result<f32> {
@@ -1072,7 +1227,7 @@ fn read_string(bytes: &[u8], cursor: &mut usize) -> io::Result<String> {
 
 fn read_f32_slice(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<f32>> {
     let len = read_u32(bytes, cursor)? as usize;
-    let mut values = Vec::with_capacity(len);
+    let mut values = Vec::with_capacity(len.min(remaining(bytes, *cursor) / 4));
     for _ in 0..len {
         values.push(f32::from_le_bytes(
             read_bytes(bytes, cursor, 4)?
@@ -1081,6 +1236,10 @@ fn read_f32_slice(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<f32>> {
         ));
     }
     Ok(values)
+}
+
+fn remaining(bytes: &[u8], cursor: usize) -> usize {
+    bytes.len().saturating_sub(cursor)
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
@@ -1426,6 +1585,42 @@ mod tests {
     }
 
     #[test]
+    fn read_hnsw_index_rejects_corrupt_counts_as_truncated() {
+        let path = temp_file_path("hnsw-corrupt-counts.bin");
+        let index = build_hnsw_index(
+            "s",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &[HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![1.0, 0.0],
+                metadata: json!(null),
+            }],
+        )
+        .expect("index should build");
+        write_hnsw_index(&path, &index).expect("index should write");
+        let pristine = fs::read(&path).expect("sidecar should read");
+        // Magic, version, segment id "s", kind, metric, dimensions, three params, max level,
+        // and the present entry point come before the node count.
+        let node_count_at = 4 + 2 + (4 + 1) + 1 + 1 + 4 + 3 * 4 + 1 + (1 + 4);
+        // The node's level, entry offset, sequence number, id "alpha", and vector length.
+        let vector_len_at = node_count_at + 4 + 1 + 4 + 8 + (4 + 5);
+        for at in [node_count_at, vector_len_at] {
+            let mut corrupt = pristine.clone();
+            corrupt[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            fs::write(&path, &corrupt).expect("corrupt sidecar should write");
+            // Preallocation is bounded by the bytes left, so this fails on the short read
+            // instead of reserving memory for four billion entries.
+            let error = read_hnsw_index(&path).expect_err("corrupt count should fail");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "offset {at}");
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn read_hnsw_index_rejects_out_of_range_entry_points() {
         let path = temp_file_path("hnsw-invalid-entry-point.bin");
         let mut index = build_hnsw_index(
@@ -1472,7 +1667,26 @@ mod tests {
         let error = read_hnsw_index(&path).expect_err("unsupported version should fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(
+            is_unsupported_hnsw_version(&error),
+            "unexpected error: {error}"
+        );
+        assert!(
             error.to_string().contains("unsupported hnsw version"),
+            "unexpected error: {error}"
+        );
+
+        index.version = 1;
+        write_hnsw_index(&path, &index).expect("index should write");
+        let error = read_hnsw_index(&path).expect_err("version 1 should fail");
+        assert!(
+            is_unsupported_hnsw_version(&error),
+            "unexpected error: {error}"
+        );
+
+        fs::write(&path, b"LPH1").expect("truncated payload should write");
+        let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
+        assert!(
+            !is_unsupported_hnsw_version(&error),
             "unexpected error: {error}"
         );
 
@@ -1568,6 +1782,333 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_hnsw_index_rejects_overfull_neighbor_lists() {
+        let path = temp_file_path("hnsw-overfull-neighbors.bin");
+        let entries = clustered_entries(&mut TestRng::new(3), 40, 4, 2, 5.0);
+        let mut index = build_hnsw_index(
+            "segment-overfull",
+            DistanceMetric::L2,
+            HnswBuildParams {
+                max_neighbors: 2,
+                ..HnswBuildParams::default()
+            },
+            &entries,
+        )
+        .expect("index should build");
+        index.nodes[0].neighbors_by_level[0] = (1..=5).collect();
+
+        write_hnsw_index(&path, &index).expect("index should write");
+        let error = read_hnsw_index(&path).expect_err("overfull neighbor list should fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("at most 4 are allowed"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_hnsw_saturating_top_k_returns_every_node() {
+        let entries = clustered_entries(&mut TestRng::new(5), 30, 3, 4, 5.0);
+        let index = build_hnsw_index(
+            "segment-huge-top-k",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+
+        let result =
+            search_hnsw(&index, &entries[0].vector, usize::MAX, None).expect("search should work");
+        assert_eq!(result.candidates.len(), entries.len());
+        assert_eq!(result.candidates[0].entry_offset_index, 0);
+    }
+
+    #[test]
+    fn build_hnsw_index_rejects_degenerate_params() {
+        for params in [
+            HnswBuildParams {
+                max_neighbors: 1,
+                ..HnswBuildParams::default()
+            },
+            HnswBuildParams {
+                ef_construction: 0,
+                ..HnswBuildParams::default()
+            },
+            HnswBuildParams {
+                ef_search: 0,
+                ..HnswBuildParams::default()
+            },
+        ] {
+            let error = build_hnsw_index("segment-bad-params", DistanceMetric::L2, params, &[])
+                .expect_err("degenerate params should fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn deterministic_levels_thin_out_by_a_factor_of_m() {
+        let params = HnswBuildParams::default();
+        let multiplier = params.level_multiplier();
+        let total = 20_000u64;
+        let mut at_least = [0usize; 3];
+        for seq_no in 0..total {
+            let level =
+                deterministic_level(&RecordId::new(format!("row-{seq_no}")), seq_no, multiplier);
+            for (threshold, count) in at_least.iter_mut().enumerate() {
+                if usize::from(level) > threshold {
+                    *count += 1;
+                }
+            }
+        }
+        // P(level >= 1) = 1/16 and P(level >= 2) = 1/256 for M = 16.
+        let above_zero = at_least[0] as f64 / total as f64;
+        let above_one = at_least[1] as f64 / total as f64;
+        assert!(
+            (0.05..0.075).contains(&above_zero),
+            "level >= 1 fraction {above_zero}"
+        );
+        assert!(
+            (0.002..0.006).contains(&above_one),
+            "level >= 2 fraction {above_one}"
+        );
+        assert_eq!(
+            deterministic_level(&RecordId::new("row-7"), 7, multiplier),
+            deterministic_level(&RecordId::new("row-7"), 7, multiplier),
+            "levels must be reproducible"
+        );
+    }
+
+    #[test]
+    fn hnsw_recall_on_clustered_data_meets_target_at_default_ef() {
+        let mut rng = TestRng::new(42);
+        let dimensions = 32;
+        let entries = clustered_entries(&mut rng, 5_000, 16, dimensions, 5.0);
+        let index = build_hnsw_index(
+            "segment-recall",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+        validate_hnsw_index(&index).expect("built graph should satisfy sidecar invariants");
+        assert_eq!(
+            layer0_reachable_from_entry_point(&index),
+            entries.len(),
+            "every node should be reachable on layer 0"
+        );
+
+        let queries = clustered_entries(&mut rng, 100, 16, dimensions, 5.0);
+        let recall = mean_recall_at_10(&index, &entries, &queries);
+        assert!(recall >= 0.95, "recall@10 was {recall}");
+    }
+
+    #[test]
+    fn hnsw_recall_on_clustered_cosine_data_meets_target_at_default_ef() {
+        let mut rng = TestRng::new(7);
+        let entries = clustered_entries(&mut rng, 2_000, 8, 16, 3.0);
+        let index = build_hnsw_index(
+            "segment-recall-cosine",
+            DistanceMetric::Cosine,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+        validate_hnsw_index(&index).expect("built graph should satisfy sidecar invariants");
+
+        let queries = clustered_entries(&mut rng, 50, 8, 16, 3.0);
+        let recall = mean_recall_at_10(&index, &entries, &queries);
+        assert!(recall >= 0.95, "recall@10 was {recall}");
+    }
+
+    #[test]
+    fn hnsw_keeps_exact_duplicate_vectors_reachable() {
+        // Bursts of identical vectors, as repeated log lines produce. Without duplicate-aware
+        // selection every copy links to the same oldest copies, most copies end up with no
+        // incoming layer 0 edge, and each burst becomes an island.
+        let (distinct, copies, dimensions) = (60, 50, 8);
+        let mut rng = TestRng::new(11);
+        let centers = (0..distinct)
+            .map(|_| {
+                (0..dimensions)
+                    .map(|_| rng.next_unit() as f32 * 2.0 - 1.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let entries = (0..distinct * copies)
+            .map(|index| HnswIndexEntrySource {
+                entry_offset_index: index,
+                record_id: RecordId::new(format!("row-{index}")),
+                seq_no: index as u64 + 1,
+                vector: centers[index / copies].clone(),
+                metadata: json!({ "row": index }),
+            })
+            .collect::<Vec<_>>();
+        let index = build_hnsw_index(
+            "segment-duplicates",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+        validate_hnsw_index(&index).expect("built graph should satisfy sidecar invariants");
+        assert_eq!(
+            layer0_reachable_from_entry_point(&index),
+            entries.len(),
+            "every copy should be reachable on layer 0"
+        );
+
+        // A filter that admits one specific copy must still find it.
+        for entry in entries.iter().step_by(7) {
+            let wanted = entry.metadata.clone();
+            let only_this_row = move |metadata: &Value| *metadata == wanted;
+            let found = search_hnsw(&index, &entry.vector, 1, Some(&only_this_row))
+                .expect("search should succeed");
+            assert_eq!(
+                found
+                    .candidates
+                    .first()
+                    .map(|candidate| candidate.entry_offset_index),
+                Some(entry.entry_offset_index),
+                "filtered search should reach row {}",
+                entry.entry_offset_index
+            );
+        }
+
+        // Unfiltered top-k over a burst should return copies of the query vector.
+        let mut exact_hits = 0;
+        for center in &centers {
+            exact_hits += search_hnsw(&index, center, 10, None)
+                .expect("search should succeed")
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.vector == *center)
+                .count();
+        }
+        let hit_rate = exact_hits as f64 / (distinct * 10) as f64;
+        assert!(hit_rate >= 0.95, "exact duplicate hit rate was {hit_rate}");
+    }
+
+    /// Deterministic SplitMix64 generator so the recall tests need no extra dependency.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.0;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^ (value >> 31)
+        }
+
+        /// Uniform value in (0, 1].
+        fn next_unit(&mut self) -> f64 {
+            ((self.next_u64() >> 11) + 1) as f64 / (1u64 << 53) as f64
+        }
+
+        fn next_gaussian(&mut self) -> f32 {
+            let radius = (-2.0 * self.next_unit().ln()).sqrt();
+            let angle = std::f64::consts::TAU * self.next_unit();
+            (radius * angle.cos()) as f32
+        }
+    }
+
+    /// Gaussian blobs with unit spread around centers drawn uniformly from
+    /// `[-center_range, center_range]` per dimension. The same seed yields the same centers.
+    fn clustered_entries(
+        rng: &mut TestRng,
+        count: usize,
+        clusters: usize,
+        dimensions: usize,
+        center_range: f32,
+    ) -> Vec<HnswIndexEntrySource> {
+        let mut center_rng = TestRng::new(0x5eed);
+        let centers = (0..clusters)
+            .map(|_| {
+                (0..dimensions)
+                    .map(|_| (center_rng.next_unit() as f32 * 2.0 - 1.0) * center_range)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let id_base = rng.next_u64();
+        (0..count)
+            .map(|index| {
+                let center = &centers[(rng.next_u64() % clusters as u64) as usize];
+                HnswIndexEntrySource {
+                    entry_offset_index: index,
+                    record_id: RecordId::new(format!("row-{id_base:x}-{index}")),
+                    seq_no: index as u64 + 1,
+                    vector: center
+                        .iter()
+                        .map(|value| value + rng.next_gaussian())
+                        .collect(),
+                    metadata: json!({}),
+                }
+            })
+            .collect()
+    }
+
+    fn mean_recall_at_10(
+        index: &HnswIndexSidecar,
+        entries: &[HnswIndexEntrySource],
+        queries: &[HnswIndexEntrySource],
+    ) -> f64 {
+        let k = 10;
+        let mut total = 0.0;
+        for query in queries {
+            let mut exact = entries
+                .iter()
+                .map(|entry| {
+                    let value = metric_value(index.metric, &query.vector, &entry.vector)
+                        .expect("dimensions should match");
+                    (value, entry.entry_offset_index)
+                })
+                .collect::<Vec<_>>();
+            exact.sort_unstable_by(|left, right| {
+                let by_value = match index.metric {
+                    DistanceMetric::L2 => left.0.total_cmp(&right.0),
+                    DistanceMetric::Cosine | DistanceMetric::Dot => right.0.total_cmp(&left.0),
+                };
+                by_value.then(left.1.cmp(&right.1))
+            });
+            let truth = exact
+                .iter()
+                .take(k)
+                .map(|(_, index)| *index)
+                .collect::<HashSet<_>>();
+            let found = search_hnsw(index, &query.vector, k, None)
+                .expect("search should succeed")
+                .candidates
+                .iter()
+                .filter(|candidate| truth.contains(&candidate.entry_offset_index))
+                .count();
+            total += found as f64 / k as f64;
+        }
+        total / queries.len() as f64
+    }
+
+    fn layer0_reachable_from_entry_point(index: &HnswIndexSidecar) -> usize {
+        let Some(entry_point) = index.entry_point else {
+            return 0;
+        };
+        let mut seen = HashSet::from([entry_point as usize]);
+        let mut stack = vec![entry_point as usize];
+        while let Some(node) = stack.pop() {
+            for &neighbor in &index.nodes[node].neighbors_by_level[0] {
+                if seen.insert(neighbor as usize) {
+                    stack.push(neighbor as usize);
+                }
+            }
+        }
+        seen.len()
     }
 
     #[test]

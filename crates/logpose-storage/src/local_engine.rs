@@ -4,8 +4,8 @@ use crate::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
     error::{io_message, json_message},
     maintenance::MaintenanceOperation,
-    manifest::segment_artifact_file_name,
-    metric::storage_metric_compare,
+    manifest::{SegmentMeta, segment_artifact_file_name},
+    metric::{storage_metric_compare, storage_metric_value},
     resolve::{ResolvedState, resolve_latest_state_for_ids_selected},
     root_lock::StorageRootLock,
     segment_v1::read_segment_file,
@@ -14,11 +14,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
-use logpose_index::{read_flat_index, read_hnsw_index};
+use logpose_index::{is_unsupported_hnsw_version, read_flat_index, read_hnsw_index};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
-    CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
-    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus,
+    NodeRole, RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_wal::{WalBatch, WalRecord, WalWriter};
 use serde_json::{Value, json};
@@ -27,6 +27,47 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Score a segment's records exactly, standing in for its HNSW sidecar when that cannot be read.
+///
+/// The candidates match what the sidecar would hold: the latest record per id in the segment,
+/// when it is a put visible at `visible_seq_no` and admitted by `filter`, best `budget` first.
+fn exact_segment_candidates(
+    collection_root: &Path,
+    segment: &SegmentMeta,
+    metric: DistanceMetric,
+    query: &[f32],
+    visible_seq_no: SeqNo,
+    budget: usize,
+    filter: Option<&(dyn for<'a> Fn(&'a Value) -> bool + Send + Sync)>,
+) -> Result<Vec<AnnCandidate>> {
+    let records = read_segment_file(&collection_root.join("segments").join(&segment.file_name))?;
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for record in records.iter().rev() {
+        if !seen.insert(record.op.id()) {
+            continue;
+        }
+        let WriteOperation::Put(put) = &record.op else {
+            continue;
+        };
+        if record.seq_no > visible_seq_no || filter.is_some_and(|filter| !filter(&put.metadata)) {
+            continue;
+        }
+        candidates.push(AnnCandidate {
+            unit_id: segment.segment_id.clone(),
+            record_id: put.id.clone(),
+            seq_no: record.seq_no,
+            value: storage_metric_value(metric, query, &put.vector)?,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        storage_metric_compare(metric, right.value, left.value)
+            .then(left.record_id.cmp(&right.record_id))
+    });
+    candidates.truncate(budget);
+    Ok(candidates)
+}
 
 /// Local filesystem-backed storage engine.
 ///
@@ -247,16 +288,14 @@ impl StorageEngine for LocalStorageEngine {
                     ))
                 })?,
             );
-            let hnsw = read_hnsw_index(&hnsw_path)
-                .map_err(|error| io_message("failed to read hnsw sidecar", error))?;
-            let search = logpose_index::search_hnsw(
-                &hnsw,
-                &request.vector,
-                request_budget,
-                filter.as_deref(),
-            )
-            .map_err(|error| io_message("failed to search hnsw sidecar", error))?;
-            for candidate in search
+            let segment_candidates = match read_hnsw_index(&hnsw_path) {
+                Ok(hnsw) => logpose_index::search_hnsw(
+                    &hnsw,
+                    &request.vector,
+                    request_budget,
+                    filter.as_deref(),
+                )
+                .map_err(|error| io_message("failed to search hnsw sidecar", error))?
                 .candidates
                 .into_iter()
                 .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
@@ -266,7 +305,22 @@ impl StorageEngine for LocalStorageEngine {
                     seq_no: candidate.seq_no,
                     value: candidate.value,
                 })
-            {
+                .collect::<Vec<_>>(),
+                // A sidecar from an older graph layout cannot be traversed, but the segment's
+                // records are still readable: score them exactly rather than fail the query.
+                // A compaction that merges the segment writes a current sidecar.
+                Err(error) if is_unsupported_hnsw_version(&error) => exact_segment_candidates(
+                    &state.descriptor.root_path,
+                    segment,
+                    metric,
+                    &request.vector,
+                    snapshot.visible_seq_no,
+                    request_budget,
+                    filter.as_deref(),
+                )?,
+                Err(error) => return Err(io_message("failed to read hnsw sidecar", error)),
+            };
+            for candidate in segment_candidates {
                 match candidates_by_record_id.entry(candidate.record_id.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(candidate);
@@ -440,6 +494,7 @@ impl StorageEngine for LocalStorageEngine {
                             "node_count": hnsw.nodes.len(),
                             "params": {
                                 "max_neighbors": hnsw.params.max_neighbors,
+                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
                                 "ef_construction": hnsw.params.ef_construction,
                                 "ef_search": hnsw.params.ef_search,
                             },
