@@ -1,14 +1,19 @@
 //! Crash-recovery tests for WAL batch atomicity and torn-tail repair.
 
 use async_trait as _;
+use crc32c as _;
 use crc32fast as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query as _;
 use logpose_wal as _;
+use postcard as _;
 use rand as _;
+use roaring as _;
 use serde as _;
+use thiserror as _;
+use twox_hash as _;
 use uuid as _;
 
 #[path = "support/fs.rs"]

@@ -10,14 +10,19 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+crc32c = "0.6"
 crc32fast = "1.4"
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-index = { path = "../logpose-index" }
 logpose-types = { path = "../logpose-types" }
 logpose-wal = { path = "../logpose-wal" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 uuid.workspace = true
 
 [dev-dependencies]

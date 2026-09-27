@@ -9,6 +9,7 @@
 //! - `paths`: the on-disk layout.
 //! - `recovery`, `wal_rotation`, `state`: loading a collection's manifest and WAL delta.
 //! - `manifest`, `segment_v1`: the v1 manifest and segment file formats.
+//! - `segment_v2`: the v2 segment file format, builder, and reader (not yet wired in).
 //! - `flush`, `compaction`, `maintenance`: background maintenance jobs and their queue.
 //! - `resolve`, `stats`, `metric`: latest-visible resolution, statistics and scoring.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
@@ -36,6 +37,7 @@ mod recovery;
 mod resolve;
 mod root_lock;
 mod segment_v1;
+pub mod segment_v2;
 mod state;
 mod stats;
 mod storage_engine;
