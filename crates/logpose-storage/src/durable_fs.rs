@@ -1,4 +1,4 @@
-//! Crash-durable filesystem helpers.
+//! Crash-durable filesystem helpers over [`Vfs`].
 //!
 //! A file's contents are durable after `fsync` on the file, but its name is
 //! only durable once the directory that holds the entry is fsynced too. Every
@@ -6,45 +6,36 @@
 //! followed by a sync of the parent directory.
 
 use logpose_types::{LogPoseError, Result};
-use std::{
-    fs::{self, File},
-    io::Write,
-    path::Path,
-};
+use logpose_vfs::{OpenMode, Vfs, parent_dir};
+use std::{io::IoSlice, path::Path};
 
 /// Fsync a directory so entries created, renamed or removed inside it survive power loss.
-///
-/// Directory fsync is only meaningful (and only possible through `std`) on unix; elsewhere it
-/// is a no-op.
-pub(crate) fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                LogPoseError::Message(format!(
-                    "failed to fsync directory '{}': {error}",
-                    path.display()
-                ))
-            })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+pub(crate) fn sync_dir(vfs: &dyn Vfs, path: &Path) -> Result<()> {
+    vfs.sync_dir(path).map_err(|error| {
+        LogPoseError::Message(format!(
+            "failed to fsync directory '{}': {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Fsync the directory that contains `path`.
-pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
-    sync_dir(parent_dir(path))
+pub(crate) fn sync_parent_dir(vfs: &dyn Vfs, path: &Path) -> Result<()> {
+    sync_dir(vfs, parent_dir(path))
+}
+
+/// Whether `path` exists.
+pub(crate) fn path_exists(vfs: &dyn Vfs, path: &Path) -> Result<bool> {
+    logpose_vfs::exists(vfs, path).map_err(|error| {
+        LogPoseError::Message(format!("failed to look up '{}': {error}", path.display()))
+    })
 }
 
 /// Create `path` and any missing ancestors, fsyncing the parent of every directory created.
-pub(crate) fn create_dir_all_synced(path: &Path) -> Result<()> {
+pub(crate) fn create_dir_all_synced(vfs: &dyn Vfs, path: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut cursor = path;
-    while !cursor.exists() {
+    while !path_exists(vfs, cursor)? {
         missing.push(cursor);
         match cursor.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
@@ -55,49 +46,66 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(path).map_err(|error| {
+    vfs.create_dir_all(path).map_err(|error| {
         LogPoseError::Message(format!(
             "failed to create directory '{}': {error}",
             path.display()
         ))
     })?;
     for created in missing.iter().rev() {
-        sync_parent_dir(created)?;
+        sync_parent_dir(vfs, created)?;
     }
     Ok(())
 }
 
 /// Write `bytes` to a new file at `path` and fsync the file contents.
 ///
-/// The caller owns publishing the file (renaming it into place and syncing the directory).
-pub(crate) fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = File::create(path).map_err(|error| {
+/// A stale file left at `path` by a crashed process is replaced. The caller owns publishing the
+/// file (renaming it into place and syncing the directory).
+pub(crate) fn write_file_synced(vfs: &dyn Vfs, path: &Path, bytes: &[u8]) -> Result<()> {
+    let context = |error: std::io::Error| {
         LogPoseError::Message(format!(
-            "failed to create file '{}': {error}",
+            "failed to write file '{}': {error}",
             path.display()
         ))
-    })?;
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| {
-            LogPoseError::Message(format!(
-                "failed to write file '{}': {error}",
+    };
+    let file = match vfs.open(path, OpenMode::CreateNew) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            vfs.remove_file(path).map_err(context)?;
+            vfs.open(path, OpenMode::CreateNew).map_err(|error| {
+                LogPoseError::Message(format!(
+                    "failed to create file '{}': {error}",
+                    path.display()
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(LogPoseError::Message(format!(
+                "failed to create file '{}': {error}",
                 path.display()
-            ))
-        })
+            )));
+        }
+    };
+    file.append(&[IoSlice::new(bytes)])
+        .and_then(|_| file.sync_all())
+        .map_err(context)
 }
 
-fn parent_dir(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
+/// Read a whole file.
+pub(crate) fn read_file(vfs: &dyn Vfs, path: &Path, context: &str) -> Result<Vec<u8>> {
+    logpose_vfs::read_file(vfs, path)
+        .map_err(|error| LogPoseError::Message(format!("{context} '{}': {error}", path.display())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use logpose_vfs::{FaultVfs, StdVfs};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn create_dir_all_synced_creates_every_missing_ancestor() {
@@ -111,18 +119,34 @@ mod tests {
         ));
         let nested = base.join("a").join("b").join("c");
 
-        create_dir_all_synced(&nested).expect("nested directories should be created");
+        create_dir_all_synced(&StdVfs, &nested).expect("nested directories should be created");
         assert!(nested.is_dir());
-        create_dir_all_synced(&nested).expect("existing directories should be a no-op");
+        create_dir_all_synced(&StdVfs, &nested).expect("existing directories should be a no-op");
 
         let file = nested.join("payload");
-        write_file_synced(&file, b"payload").expect("file should be written");
-        sync_parent_dir(&file).expect("parent directory should sync");
+        write_file_synced(&StdVfs, &file, b"payload").expect("file should be written");
+        write_file_synced(&StdVfs, &file, b"replaced").expect("stale file should be replaced");
+        sync_parent_dir(&StdVfs, &file).expect("parent directory should sync");
         assert_eq!(
             fs::read(&file).expect("file should be readable"),
-            b"payload".to_vec()
+            b"replaced".to_vec()
         );
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn synced_directories_and_files_survive_a_crash() {
+        let vfs = FaultVfs::new(0);
+        let nested = Path::new("/root/a/b");
+        create_dir_all_synced(vfs.as_ref(), nested).expect("directories should be created");
+        let file = nested.join("payload");
+        write_file_synced(vfs.as_ref(), &file, b"payload").expect("file should be written");
+        sync_parent_dir(vfs.as_ref(), &file).expect("parent should sync");
+        vfs.crash();
+        assert_eq!(
+            read_file(vfs.as_ref(), &file, "failed to read").expect("file should survive"),
+            b"payload".to_vec()
+        );
     }
 }

@@ -1,23 +1,24 @@
 //! Segment v1 encoding and publication of the segment file with its flat and HNSW sidecars.
 
-use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader};
+use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader, SegmentPurpose};
 use crate::{
     LocalStorageEngine,
     durable_fs::{create_dir_all_synced, sync_parent_dir, write_file_synced},
     error::{io_message, json_message},
-    fs_util::cleanup_file,
+    fs_util::{cleanup_file, crash_point},
     manifest::{RemoteArtifact, RemoteSyncState, SegmentMeta},
     stats::segment_component_bytes,
 };
 use crc32fast::hash;
 use logpose_catalog::CollectionDescriptor;
 use logpose_index::{
-    FlatIndexEntrySource, FlatIndexSidecar, HnswBuildParams, HnswIndexEntrySource,
-    HnswIndexSidecar, build_flat_index, build_hnsw_index, write_flat_index, write_hnsw_index,
+    FlatIndexEntrySource, HnswBuildParams, HnswIndexEntrySource, build_flat_index,
+    build_hnsw_index, encode_flat_index, encode_hnsw_index,
 };
 use logpose_types::{QueryUnitArtifactStats, Result, WriteOperation};
+use logpose_vfs::Vfs;
 use logpose_wal::WalRecord;
-use std::{collections::BTreeSet, fs, io, path::Path};
+use std::{collections::BTreeSet, io, path::Path};
 use uuid::Uuid;
 
 impl LocalStorageEngine {
@@ -25,6 +26,7 @@ impl LocalStorageEngine {
         &self,
         descriptor: &CollectionDescriptor,
         records: &[WalRecord],
+        purpose: SegmentPurpose,
     ) -> Result<SegmentMeta> {
         let segment_id = Uuid::new_v4().to_string();
         let temp_path = descriptor
@@ -176,7 +178,13 @@ impl LocalStorageEngine {
             &visible_hnsw_entries,
         )
         .map_err(|error| io_message("failed to build hnsw sidecar", error))?;
+        let flat_bytes = encode_flat_index(&flat_index)
+            .map_err(|error| io_message("failed to encode flat index sidecar", error))?;
+        let hnsw_bytes = encode_hnsw_index(&hnsw_index)
+            .map_err(|error| io_message("failed to encode hnsw sidecar", error))?;
+        let (segment_len, flat_len, hnsw_len) = (bytes.len(), flat_bytes.len(), hnsw_bytes.len());
         publish_segment_artifacts(
+            self.vfs.as_ref(),
             SegmentArtifactPaths {
                 segment_temp_path: &temp_path,
                 segment_path: &final_path,
@@ -185,23 +193,17 @@ impl LocalStorageEngine {
                 hnsw_temp_path: &hnsw_temp_path,
                 hnsw_path: &hnsw_path,
             },
-            bytes,
-            &flat_index,
-            &hnsw_index,
+            SegmentArtifactBytes {
+                segment: &bytes,
+                flat: &flat_bytes,
+                hnsw: &hnsw_bytes,
+            },
+            purpose,
         )?;
 
-        let segment_bytes = final_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let flat_bytes = sidecar_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
-        let hnsw_bytes = hnsw_path
-            .metadata()
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or_default();
+        let segment_bytes = segment_len;
+        let flat_bytes = flat_len;
+        let hnsw_bytes = hnsw_len;
         let artifacts = vec![
             QueryUnitArtifactStats {
                 kind: "flat_exact".to_owned(),
@@ -268,58 +270,89 @@ struct SegmentArtifactPaths<'a> {
     hnsw_path: &'a Path,
 }
 
+struct SegmentArtifactBytes<'a> {
+    segment: &'a [u8],
+    flat: &'a [u8],
+    hnsw: &'a [u8],
+}
+
+/// Write the segment and both sidecars to temp files, sync them, rename them into place, and
+/// sync the destination directories, cleaning up on failure.
+///
+/// The sidecars are encoded by `logpose-index` and written here, so every byte goes through the
+/// engine's `Vfs`.
 fn publish_segment_artifacts(
+    vfs: &dyn Vfs,
     paths: SegmentArtifactPaths<'_>,
-    segment_bytes: Vec<u8>,
-    flat_index: &FlatIndexSidecar,
-    hnsw_index: &HnswIndexSidecar,
+    bytes: SegmentArtifactBytes<'_>,
+    purpose: SegmentPurpose,
 ) -> Result<()> {
+    let cleanup = |files: &[&Path]| {
+        for file in files {
+            cleanup_file(vfs, file);
+        }
+    };
     if let Some(parent) = paths.segment_temp_path.parent() {
-        create_dir_all_synced(parent)?;
+        create_dir_all_synced(vfs, parent)?;
     }
-    if let Err(error) = write_file_synced(paths.segment_temp_path, &segment_bytes) {
-        cleanup_file(paths.segment_temp_path);
+    if let Err(error) = write_file_synced(vfs, paths.segment_temp_path, bytes.segment) {
+        cleanup(&[paths.segment_temp_path]);
         return Err(error);
     }
-    if let Err(error) = write_flat_index(paths.flat_temp_path, flat_index) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish flat index sidecar", error));
+    crash_point(vfs, purpose.after_file_sync())?;
+    if let Err(error) = write_file_synced(vfs, paths.flat_temp_path, bytes.flat) {
+        cleanup(&[
+            paths.segment_temp_path,
+            paths.flat_temp_path,
+            paths.hnsw_temp_path,
+        ]);
+        return Err(prefixed("failed to publish flat index sidecar", error));
     }
-    if let Err(error) = write_hnsw_index(paths.hnsw_temp_path, hnsw_index) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
-        return Err(io_message("failed to publish hnsw sidecar", error));
+    if let Err(error) = write_file_synced(vfs, paths.hnsw_temp_path, bytes.hnsw) {
+        cleanup(&[
+            paths.segment_temp_path,
+            paths.flat_temp_path,
+            paths.hnsw_temp_path,
+        ]);
+        return Err(prefixed("failed to publish hnsw sidecar", error));
     }
-    if let Err(error) = fs::rename(paths.segment_temp_path, paths.segment_path) {
-        cleanup_file(paths.segment_temp_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
+    if let Err(error) = vfs.rename(paths.segment_temp_path, paths.segment_path) {
+        cleanup(&[
+            paths.segment_temp_path,
+            paths.flat_temp_path,
+            paths.hnsw_temp_path,
+        ]);
         return Err(io_message("failed to publish segment file", error));
     }
-    if let Err(error) = fs::rename(paths.flat_temp_path, paths.flat_path) {
-        cleanup_file(paths.segment_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
+    if let Err(error) = vfs.rename(paths.flat_temp_path, paths.flat_path) {
+        cleanup(&[
+            paths.segment_path,
+            paths.flat_temp_path,
+            paths.hnsw_temp_path,
+        ]);
         return Err(io_message("failed to publish flat index sidecar", error));
     }
-    if let Err(error) = fs::rename(paths.hnsw_temp_path, paths.hnsw_path) {
-        cleanup_file(paths.segment_path);
-        cleanup_file(paths.flat_path);
-        cleanup_file(paths.flat_temp_path);
-        cleanup_file(paths.hnsw_temp_path);
+    if let Err(error) = vfs.rename(paths.hnsw_temp_path, paths.hnsw_path) {
+        cleanup(&[
+            paths.segment_path,
+            paths.flat_path,
+            paths.flat_temp_path,
+            paths.hnsw_temp_path,
+        ]);
         return Err(io_message("failed to publish hnsw sidecar", error));
     }
     // The renames above are durable only once their directories are synced, and the manifest
     // that references these files must not be published before that.
-    sync_parent_dir(paths.segment_path)?;
-    sync_parent_dir(paths.flat_path)?;
+    sync_parent_dir(vfs, paths.segment_path)?;
+    sync_parent_dir(vfs, paths.flat_path)?;
     if paths.hnsw_path.parent() != paths.flat_path.parent() {
-        sync_parent_dir(paths.hnsw_path)?;
+        sync_parent_dir(vfs, paths.hnsw_path)?;
     }
-    Ok(())
+    crash_point(vfs, Some(purpose.after_dir_sync()))
+}
+
+fn prefixed(context: &str, error: logpose_types::LogPoseError) -> logpose_types::LogPoseError {
+    logpose_types::LogPoseError::Message(format!("{context}: {error}"))
 }
 
 fn visible_hnsw_entries(
@@ -360,6 +393,7 @@ mod tests {
     use crate::{CreateCollectionRequest, StorageEngine, test_support::unique_temp_dir};
     use logpose_types::{DistanceMetric, PutRecord, RecordId};
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn visible_hnsw_entries_ignore_shadowed_dimension_mismatches() {
@@ -432,6 +466,7 @@ mod tests {
                         metadata: json!({"kind":"broken"}),
                     }),
                 }],
+                SegmentPurpose::Flush,
             )
         });
 
@@ -485,6 +520,7 @@ mod tests {
         .expect("hnsw index should build");
 
         let result = publish_segment_artifacts(
+            &logpose_vfs::StdVfs,
             SegmentArtifactPaths {
                 segment_temp_path: &temp_path,
                 segment_path: &final_path,
@@ -493,9 +529,12 @@ mod tests {
                 hnsw_temp_path: &hnsw_temp_path,
                 hnsw_path: &hnsw_path,
             },
-            b"segment-bytes".to_vec(),
-            &flat_index,
-            &hnsw_index,
+            SegmentArtifactBytes {
+                segment: b"segment-bytes",
+                flat: &encode_flat_index(&flat_index).expect("flat sidecar should encode"),
+                hnsw: &encode_hnsw_index(&hnsw_index).expect("hnsw sidecar should encode"),
+            },
+            SegmentPurpose::Flush,
         );
 
         assert!(result.is_err(), "sidecar publish should fail");

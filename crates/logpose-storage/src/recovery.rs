@@ -1,15 +1,16 @@
 //! Open and recover: load a collection's manifest and WAL delta, completing an interrupted WAL rotation first.
 
 use crate::{
-    LocalStorageEngine, error::io_message, manifest::Manifest, segment_v1::read_segment_file,
+    LocalStorageEngine, durable_fs::read_file, manifest::Manifest, segment_v1::read_segment_file,
     state::CollectionState, wal_rotation::wal_rotation_lock,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{LogPoseError, Result, SeqNo};
+use logpose_vfs::Vfs;
 use logpose_wal::{
     WalBatch, WalFileKind, WalRecord, WalWriter, replay_dir_after_checkpoint, replay_file,
 };
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 impl LocalStorageEngine {
     pub(crate) fn load_collection_state(
@@ -46,7 +47,7 @@ impl LocalStorageEngine {
         self.recover_persisted_maintenance(&descriptor)?;
         let current_generation = self.read_current_generation(&descriptor)?;
         let target_generation = manifest_generation.unwrap_or(current_generation);
-        let has_pending_rotation = Self::pending_rotation_file_path(&descriptor).exists();
+        let has_pending_rotation = self.exists(&Self::pending_rotation_file_path(&descriptor))?;
         let wal_lock = if has_pending_rotation && !wal_lock_already_held {
             Some(wal_rotation_lock(&descriptor.root_path))
         } else {
@@ -71,9 +72,9 @@ impl LocalStorageEngine {
                         self.load_manifest(&descriptor, Some(target_generation))?;
                     let previous_manifest = self
                         .load_manifest(&descriptor, Some(current_generation.saturating_sub(1)))?;
-                    if !Self::rolled_wal_path(&descriptor, current_manifest.checkpoint_seq_no)
-                        .exists()
-                    {
+                    let rolled_wal =
+                        Self::rolled_wal_path(&descriptor, current_manifest.checkpoint_seq_no);
+                    if !self.exists(&rolled_wal)? {
                         promoted_delta = self.pending_rotation_promoted_delta(
                             &descriptor,
                             &previous_manifest,
@@ -89,6 +90,7 @@ impl LocalStorageEngine {
             self.load_manifest(&descriptor, Some(target_generation))?
         };
         let delta = replay_dir_after_checkpoint(
+            self.vfs.as_ref(),
             descriptor.root_path.join("wal"),
             manifest.checkpoint_seq_no,
         )?
@@ -124,6 +126,7 @@ impl LocalStorageEngine {
             }
 
             promoted.extend(read_segment_file(
+                self.vfs.as_ref(),
                 &descriptor
                     .root_path
                     .join("segments")
@@ -140,12 +143,16 @@ impl LocalStorageEngine {
         manifest: &Manifest,
     ) -> Result<bool> {
         let marker_path = Self::pending_rotation_file_path(descriptor);
-        if !marker_path.exists() {
+        if !self.exists(&marker_path)? {
             return Ok(false);
         }
 
-        let pending_checkpoint = fs::read_to_string(&marker_path)
-            .map_err(|error| io_message("failed to read pending WAL rotation marker", error))?
+        let marker = read_file(
+            self.vfs.as_ref(),
+            &marker_path,
+            "failed to read pending WAL rotation marker",
+        )?;
+        let pending_checkpoint = String::from_utf8_lossy(&marker)
             .trim()
             .parse::<u64>()
             .map_err(|error| {
@@ -156,10 +163,15 @@ impl LocalStorageEngine {
 
         if pending_checkpoint == manifest.checkpoint_seq_no {
             let active_wal_path = Self::active_wal_path(descriptor);
-            ensure_active_wal_is_checkpointed(&active_wal_path, &marker_path, pending_checkpoint)?;
-            let mut wal_writer = WalWriter::open(&active_wal_path)?;
+            ensure_active_wal_is_checkpointed(
+                self.vfs.as_ref(),
+                &active_wal_path,
+                &marker_path,
+                pending_checkpoint,
+            )?;
+            let mut wal_writer = WalWriter::open(Arc::clone(&self.vfs), &active_wal_path)?;
             wal_writer.truncate()?;
-            Self::clear_pending_rotation_marker(descriptor)?;
+            self.clear_pending_rotation_marker(descriptor)?;
             return Ok(true);
         }
 
@@ -178,11 +190,12 @@ impl LocalStorageEngine {
 /// recovery. Any other defect is an error: truncating an undecodable WAL could discard exactly
 /// the records this check exists to protect, and opening it for truncation fails the same way.
 fn ensure_active_wal_is_checkpointed(
+    vfs: &dyn Vfs,
     active_wal_path: &Path,
     marker_path: &Path,
     checkpoint_seq_no: SeqNo,
 ) -> Result<()> {
-    let batches = replay_file(active_wal_path, WalFileKind::Active)?;
+    let batches = replay_file(vfs, active_wal_path, WalFileKind::Active)?;
     let Some(max_seq_no) = batches.iter().map(WalBatch::last_seq_no).max() else {
         return Ok(());
     };
@@ -251,6 +264,7 @@ mod tests {
             "unexpected error: {error}"
         );
         let active_wal = replay_file(
+            &logpose_vfs::StdVfs,
             LocalStorageEngine::active_wal_path(&descriptor),
             WalFileKind::Active,
         )
@@ -310,7 +324,7 @@ mod tests {
         assert_eq!(stats.mutable_op_count, 0);
         assert!(!marker_path.exists(), "marker should be cleared");
         assert!(
-            replay_file(&active_path, WalFileKind::Active)
+            replay_file(&logpose_vfs::StdVfs, &active_path, WalFileKind::Active)
                 .expect("active wal should be readable")
                 .is_empty(),
             "checkpointed records should be truncated"

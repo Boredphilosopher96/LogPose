@@ -2,6 +2,7 @@
 
 use crate::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
+    durable_fs::{path_exists, read_file},
     error::{io_message, json_message},
     maintenance::MaintenanceOperation,
     manifest::segment_artifact_file_name,
@@ -14,12 +15,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
-use logpose_index::{read_flat_index, read_hnsw_index};
+use logpose_index::{FlatIndexSidecar, HnswIndexSidecar, decode_flat_index, decode_hnsw_index};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment,
     CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
     RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
+use logpose_vfs::{Vfs, std_vfs};
 use logpose_wal::{WalBatch, WalRecord, WalWriter};
 use serde_json::{Value, json};
 use std::{
@@ -30,38 +32,78 @@ use std::{
 
 /// Local filesystem-backed storage engine.
 ///
+/// Every file access goes through the engine's [`Vfs`]: [`StdVfs`](logpose_vfs::StdVfs) for
+/// the convenience constructors, or any `Vfs` passed to [`LocalStorageEngine::with_vfs`] (tests
+/// use [`FaultVfs`](logpose_vfs::FaultVfs) to inject crashes).
+///
 /// Opening an engine claims exclusive ownership of its storage root for this process by locking
 /// `<root>/LOCK`; the claim is held until the last clone of every engine on that root in this
-/// process is dropped. Engines in the same process share the claim.
+/// process is dropped. Engines in the same process on the same `Vfs` share the claim.
 #[derive(Clone)]
 pub struct LocalStorageEngine {
     pub(crate) root: PathBuf,
     pub(crate) blob_store: Option<Arc<dyn BlobStore>>,
+    pub(crate) vfs: Arc<dyn Vfs>,
     _root_lock: Arc<StorageRootLock>,
 }
 
 impl LocalStorageEngine {
-    /// Open a local storage engine rooted at the provided path.
+    /// Open a local storage engine rooted at the provided path on the real filesystem.
     ///
     /// Creates the root directory if needed and fails if another process holds the root.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         Self::with_blob_store(root, None)
     }
 
-    /// Open a local storage engine with an optional blob-store implementation.
+    /// Open a local storage engine on the real filesystem with an optional blob-store
+    /// implementation.
     ///
     /// Creates the root directory if needed and fails if another process holds the root.
     pub fn with_blob_store(
         root: impl AsRef<Path>,
         blob_store: Option<Arc<dyn BlobStore>>,
     ) -> Result<Self> {
+        Self::with_vfs(std_vfs(), root, blob_store)
+    }
+
+    /// Open a local storage engine that performs all file I/O through `vfs`.
+    ///
+    /// Creates the root directory if needed and fails if another holder has the root locked.
+    pub fn with_vfs(
+        vfs: Arc<dyn Vfs>,
+        root: impl AsRef<Path>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let root_lock = StorageRootLock::acquire(&root)?;
+        let root_lock = StorageRootLock::acquire(&vfs, &root)?;
         Ok(Self {
             root,
             blob_store,
+            vfs,
             _root_lock: Arc::new(root_lock),
         })
+    }
+
+    /// The filesystem this engine performs all I/O through.
+    #[must_use]
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        &self.vfs
+    }
+
+    pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
+        path_exists(self.vfs.as_ref(), path)
+    }
+
+    pub(crate) fn read_hnsw_sidecar(&self, path: &Path) -> Result<HnswIndexSidecar> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
+        decode_hnsw_index(bytes, path)
+            .map_err(|error| io_message("failed to read hnsw sidecar", error))
+    }
+
+    pub(crate) fn read_flat_sidecar(&self, path: &Path) -> Result<FlatIndexSidecar> {
+        let bytes = read_file(self.vfs.as_ref(), path, "failed to read flat index sidecar")?;
+        decode_flat_index(&bytes)
+            .map_err(|error| io_message("failed to read flat index sidecar", error))
     }
 }
 
@@ -162,7 +204,10 @@ impl StorageEngine for LocalStorageEngine {
                 .collect(),
         )?;
         let last_seq_no = batch.last_seq_no();
-        let mut wal_writer = WalWriter::open(Self::active_wal_path(&state.descriptor))?;
+        let mut wal_writer = WalWriter::open(
+            Arc::clone(&self.vfs),
+            Self::active_wal_path(&state.descriptor),
+        )?;
         wal_writer.append_batch(&batch)?;
         let mut delta_after_write = state.delta.clone();
         delta_after_write.extend(batch.into_records());
@@ -247,8 +292,7 @@ impl StorageEngine for LocalStorageEngine {
                     ))
                 })?,
             );
-            let hnsw = read_hnsw_index(&hnsw_path)
-                .map_err(|error| io_message("failed to read hnsw sidecar", error))?;
+            let hnsw = self.read_hnsw_sidecar(&hnsw_path)?;
             let search = logpose_index::search_hnsw(
                 &hnsw,
                 &request.vector,
@@ -306,6 +350,7 @@ impl StorageEngine for LocalStorageEngine {
         )?;
         let snapshot = resolve_snapshot(&state, snapshot)?;
         let resolved = resolve_latest_state_for_ids_selected(
+            self.vfs.as_ref(),
             &state,
             snapshot.visible_seq_no,
             &record_ids.into_iter().collect(),
@@ -402,30 +447,31 @@ impl StorageEngine for LocalStorageEngine {
                         LogPoseError::Message(format!("segment '{segment_id}' does not exist"))
                     })?;
                 let records = read_segment_file(
+                    self.vfs.as_ref(),
                     &state
                         .descriptor
                         .root_path
                         .join("segments")
                         .join(&segment.file_name),
                 )?;
-                let index = read_flat_index(&state.descriptor.root_path.join("indexes").join(
-                    segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
-                        LogPoseError::Message(format!(
-                            "segment '{}' is missing flat artifact metadata",
-                            segment.segment_id
-                        ))
-                    })?,
-                ))
-                .map_err(|error| io_message("failed to read flat index sidecar", error))?;
-                let hnsw = read_hnsw_index(&state.descriptor.root_path.join("indexes").join(
-                    segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                        LogPoseError::Message(format!(
-                            "segment '{}' is missing hnsw artifact metadata",
-                            segment.segment_id
-                        ))
-                    })?,
-                ))
-                .map_err(|error| io_message("failed to read hnsw sidecar", error))?;
+                let index =
+                    self.read_flat_sidecar(&state.descriptor.root_path.join("indexes").join(
+                        segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
+                            LogPoseError::Message(format!(
+                                "segment '{}' is missing flat artifact metadata",
+                                segment.segment_id
+                            ))
+                        })?,
+                    ))?;
+                let hnsw =
+                    self.read_hnsw_sidecar(&state.descriptor.root_path.join("indexes").join(
+                        segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
+                            LogPoseError::Message(format!(
+                                "segment '{}' is missing hnsw artifact metadata",
+                                segment.segment_id
+                            ))
+                        })?,
+                    ))?;
                 Ok(InspectReport {
                     target: format!("segment:{segment_id}"),
                     payload: json!({

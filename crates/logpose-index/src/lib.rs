@@ -146,14 +146,23 @@ pub fn build_flat_index(
 /// The write is atomic: readers see either the previous file or the complete new one, and the
 /// contents and directory entry are fsynced before this returns.
 pub fn write_flat_index(path: &Path, sidecar: &FlatIndexSidecar) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(sidecar)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    durable::write_atomic(path, &bytes)
+    durable::write_atomic(path, &encode_flat_index(sidecar)?)
+}
+
+/// Serialize a flat exact sidecar to the bytes [`write_flat_index`] persists.
+pub fn encode_flat_index(sidecar: &FlatIndexSidecar) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(sidecar)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 /// Load a flat exact sidecar from disk.
 pub fn read_flat_index(path: &Path) -> io::Result<FlatIndexSidecar> {
-    serde_json::from_slice(&fs::read(path)?)
+    decode_flat_index(&fs::read(path)?)
+}
+
+/// Deserialize a flat exact sidecar from the bytes [`encode_flat_index`] produced.
+pub fn decode_flat_index(bytes: &[u8]) -> io::Result<FlatIndexSidecar> {
+    serde_json::from_slice(bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
@@ -338,6 +347,11 @@ pub fn build_hnsw_index(
 /// The write is atomic: readers see either the previous file or the complete new one, and the
 /// contents and directory entry are fsynced before this returns.
 pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<()> {
+    durable::write_atomic(path, &encode_hnsw_index(sidecar)?)
+}
+
+/// Serialize an HNSW sidecar to the binary bytes [`write_hnsw_index`] persists.
+pub fn encode_hnsw_index(sidecar: &HnswIndexSidecar) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(HNSW_MAGIC);
     write_u16(&mut bytes, sidecar.version);
@@ -378,12 +392,17 @@ pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<(
             }
         }
     }
-    durable::write_atomic(path, &bytes)
+    Ok(bytes)
 }
 
 /// Load an HNSW sidecar from disk.
 pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
-    let bytes = fs::read(path)?;
+    decode_hnsw_index(fs::read(path)?, path)
+}
+
+/// Deserialize an HNSW sidecar from the bytes [`encode_hnsw_index`] produced. `path` names the
+/// source in error messages.
+pub fn decode_hnsw_index(bytes: Vec<u8>, path: &Path) -> io::Result<HnswIndexSidecar> {
     let mut cursor = 0usize;
     if read_bytes(&bytes, &mut cursor, 4)? != HNSW_MAGIC {
         return Err(io::Error::new(

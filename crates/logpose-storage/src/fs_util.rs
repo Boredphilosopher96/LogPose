@@ -1,32 +1,53 @@
 //! File helpers shared by the local engine: JSON reads, atomic replacement, and cleanup.
 
 use crate::{
-    durable_fs::{create_dir_all_synced, sync_parent_dir, write_file_synced},
+    durable_fs::{create_dir_all_synced, read_file, sync_parent_dir, write_file_synced},
     error::{io_message, json_message},
 };
-use logpose_types::Result;
+use logpose_types::{LogPoseError, Result};
+use logpose_vfs::{CrashPoint, Vfs};
 use serde::Deserialize;
 use std::{
-    fs,
     path::Path,
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
-pub(crate) fn read_json<T>(path: &Path) -> Result<T>
+pub(crate) fn read_json<T>(vfs: &dyn Vfs, path: &Path) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let bytes = fs::read(path).map_err(|error| io_message("failed to read JSON file", error))?;
+    let bytes = read_file(vfs, path, "failed to read JSON file")?;
     serde_json::from_slice(&bytes).map_err(json_message)
+}
+
+/// Crash points [`atomic_write_with_points`] reports after each of its durable steps.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AtomicWritePoints {
+    /// After the temp file is written and synced.
+    pub(crate) after_temp_sync: Option<CrashPoint>,
+    /// After the temp file is renamed over the destination.
+    pub(crate) after_rename: Option<CrashPoint>,
+    /// After the destination directory is synced.
+    pub(crate) after_dir_sync: Option<CrashPoint>,
 }
 
 /// Durably replace `path` with `bytes`: write a temp file, fsync it, rename it into place, and
 /// fsync the parent directory so the rename survives power loss.
-pub(crate) fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
+pub(crate) fn atomic_write(vfs: &dyn Vfs, path: &Path, bytes: Vec<u8>) -> Result<()> {
+    atomic_write_with_points(vfs, path, bytes, AtomicWritePoints::default())
+}
+
+/// [`atomic_write`] that reports a named crash point after each durable step.
+pub(crate) fn atomic_write_with_points(
+    vfs: &dyn Vfs,
+    path: &Path,
+    bytes: Vec<u8>,
+    points: AtomicWritePoints,
+) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_dir_all_synced(parent)?;
+        create_dir_all_synced(vfs, parent)?;
     }
     static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let temp_path = path.with_file_name(format!(
@@ -37,27 +58,40 @@ pub(crate) fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
         std::process::id(),
         ATOMIC_WRITE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
     ));
-    if let Err(error) = write_file_synced(&temp_path, &bytes) {
-        cleanup_file(&temp_path);
+    if let Err(error) = write_file_synced(vfs, &temp_path, &bytes) {
+        cleanup_file(vfs, &temp_path);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&temp_path, path) {
-        cleanup_file(&temp_path);
+    crash_point(vfs, points.after_temp_sync)?;
+    if let Err(error) = vfs.rename(&temp_path, path) {
+        cleanup_file(vfs, &temp_path);
         return Err(io_message("failed to atomically rename file", error));
     }
-    sync_parent_dir(path)
+    crash_point(vfs, points.after_rename)?;
+    sync_parent_dir(vfs, path)?;
+    crash_point(vfs, points.after_dir_sync)
 }
 
-pub(crate) fn cleanup_file(path: &Path) {
-    let _ = fs::remove_file(path);
+/// Report `point` if there is one. A crash there halts the operation with an error.
+pub(crate) fn crash_point(vfs: &dyn Vfs, point: Option<CrashPoint>) -> Result<()> {
+    match point {
+        Some(point) => vfs.crash_point(point).map_err(|error| {
+            LogPoseError::Message(format!("interrupted at crash point {point:?}: {error}"))
+        }),
+        None => Ok(()),
+    }
 }
 
-pub(crate) fn cleanup_dir(path: &Path) {
-    let _ = fs::remove_dir_all(path);
+pub(crate) fn cleanup_file(vfs: &dyn Vfs, path: &Path) {
+    let _ = vfs.remove_file(path);
 }
 
-pub(crate) fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
-    match fs::remove_file(path) {
+pub(crate) fn cleanup_dir(vfs: &dyn Vfs, path: &Path) {
+    let _ = vfs.remove_dir_all(path);
+}
+
+pub(crate) fn remove_file_if_exists(vfs: &dyn Vfs, path: &Path, context: &str) -> Result<()> {
+    match vfs.remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_message(context, error)),

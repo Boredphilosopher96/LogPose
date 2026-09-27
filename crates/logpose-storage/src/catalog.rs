@@ -3,13 +3,12 @@
 use crate::{
     LocalStorageEngine,
     durable_fs::create_dir_all_synced,
-    error::{io_message, json_message, string_message},
+    error::{json_message, string_message},
     fs_util::{atomic_write, read_json},
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_types::{DEFAULT_DATABASE_NAME, LogPoseError, Result};
-use std::fs;
 
 impl LocalStorageEngine {
     pub(crate) fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
@@ -19,8 +18,8 @@ impl LocalStorageEngine {
             ));
         }
         let path = self.database_descriptor_path(database_name);
-        if path.exists() {
-            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+        if self.exists(&path)? {
+            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
             descriptor.validate()?;
             return Ok(());
         }
@@ -32,8 +31,9 @@ impl LocalStorageEngine {
                 "database descriptor path for '{database_name}' is missing a parent directory"
             ))
         })?;
-        create_dir_all_synced(parent)?;
+        create_dir_all_synced(self.vfs.as_ref(), parent)?;
         atomic_write(
+            self.vfs.as_ref(),
             &path,
             serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
         )?;
@@ -41,23 +41,9 @@ impl LocalStorageEngine {
     }
 
     fn list_database_descriptors(&self) -> Result<Vec<DatabaseDescriptor>> {
-        let databases_root = self.databases_root();
-        if !databases_root.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut descriptors = Vec::new();
-        for entry in fs::read_dir(&databases_root)
-            .map_err(|error| io_message("failed to list databases root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read database entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+        for path in self.descriptor_files_under(&self.databases_root())? {
+            let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
             descriptor.validate()?;
             descriptors.push(descriptor);
         }
@@ -67,23 +53,9 @@ impl LocalStorageEngine {
     }
 
     fn list_principal_descriptors(&self) -> Result<Vec<Principal>> {
-        let principals_root = self.principals_root();
-        if !principals_root.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut principals = Vec::new();
-        for entry in fs::read_dir(&principals_root)
-            .map_err(|error| io_message("failed to list principals root", error))?
-        {
-            let entry =
-                entry.map_err(|error| io_message("failed to read principal entry", error))?;
-            let path = entry.path().join("descriptor.json");
-            if !path.exists() {
-                continue;
-            }
-
-            let principal = read_json::<Principal>(&path)?;
+        for path in self.descriptor_files_under(&self.principals_root())? {
+            let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
             validate_principal_name(&principal.name)?;
             principal.validate().map_err(string_message)?;
             principals.push(principal);
@@ -107,6 +79,7 @@ impl CatalogStore for LocalStorageEngine {
         }
         descriptor.validate()?;
         atomic_write(
+            self.vfs.as_ref(),
             &self.database_descriptor_path(&descriptor.name),
             serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
         )?;
@@ -116,16 +89,16 @@ impl CatalogStore for LocalStorageEngine {
     fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
         validate_namespace_segment("database name", database_name)?;
         let path = self.database_descriptor_path(database_name);
-        if database_name == DEFAULT_DATABASE_NAME && !path.exists() {
+        if database_name == DEFAULT_DATABASE_NAME && !self.exists(&path)? {
             self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
         }
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Err(LogPoseError::Message(format!(
                 "database '{database_name}' does not exist"
             )));
         }
 
-        let descriptor = read_json::<DatabaseDescriptor>(&path)?;
+        let descriptor = read_json::<DatabaseDescriptor>(self.vfs.as_ref(), &path)?;
         descriptor.validate()?;
         Ok(descriptor)
     }
@@ -139,6 +112,7 @@ impl CatalogStore for LocalStorageEngine {
         validate_principal_name(&principal.name)?;
         principal.validate().map_err(string_message)?;
         atomic_write(
+            self.vfs.as_ref(),
             &self.principal_descriptor_path(&principal.name),
             serde_json::to_vec_pretty(&principal).map_err(json_message)?,
         )?;
@@ -148,13 +122,13 @@ impl CatalogStore for LocalStorageEngine {
     fn get_principal(&self, principal_name: &str) -> Result<Principal> {
         validate_principal_name(principal_name)?;
         let path = self.principal_descriptor_path(principal_name);
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Err(LogPoseError::Message(format!(
                 "principal '{principal_name}' does not exist"
             )));
         }
 
-        let principal = read_json::<Principal>(&path)?;
+        let principal = read_json::<Principal>(self.vfs.as_ref(), &path)?;
         validate_principal_name(&principal.name)?;
         principal.validate().map_err(string_message)?;
         Ok(principal)
@@ -171,6 +145,7 @@ impl CatalogStore for LocalStorageEngine {
         policy.validate().map_err(string_message)?;
         self.ensure_database_descriptor(&policy.database_name)?;
         atomic_write(
+            self.vfs.as_ref(),
             &self.database_policy_path(&policy.database_name),
             serde_json::to_vec_pretty(&policy).map_err(json_message)?,
         )?;
@@ -180,13 +155,13 @@ impl CatalogStore for LocalStorageEngine {
     fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
         validate_namespace_segment("database name", database_name)?;
         let path = self.database_policy_path(database_name);
-        if !path.exists() {
+        if !self.exists(&path)? {
             return Err(LogPoseError::Message(format!(
                 "database access policy '{database_name}' does not exist"
             )));
         }
 
-        let policy = read_json::<DatabaseAccessPolicy>(&path)?;
+        let policy = read_json::<DatabaseAccessPolicy>(self.vfs.as_ref(), &path)?;
         policy.validate().map_err(string_message)?;
         Ok(policy)
     }

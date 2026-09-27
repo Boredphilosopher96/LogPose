@@ -4,6 +4,7 @@ use crate::{
     LocalStorageEngine,
     manifest::Manifest,
     resolve::{ResolvedState, resolve_latest_from_segments},
+    segment_v1::SegmentPurpose,
     state::CollectionState,
 };
 use logpose_types::{PutRecord, Result, Snapshot, WriteOperation};
@@ -18,7 +19,8 @@ impl LocalStorageEngine {
             });
         }
 
-        let resolved = resolve_latest_from_segments(&state.descriptor, &state.manifest)?;
+        let resolved =
+            resolve_latest_from_segments(self.vfs.as_ref(), &state.descriptor, &state.manifest)?;
         let mut compacted_records = resolved
             .into_values()
             .map(|state| match state {
@@ -38,7 +40,11 @@ impl LocalStorageEngine {
             .collect::<Vec<_>>();
         compacted_records.sort_by_key(|record| record.seq_no);
 
-        let replacement = self.write_segment_file(&state.descriptor, &compacted_records)?;
+        let replacement = self.write_segment_file(
+            &state.descriptor,
+            &compacted_records,
+            SegmentPurpose::Compaction,
+        )?;
         let next_manifest = Manifest {
             generation: state.manifest.generation + 1,
             checkpoint_seq_no: state.manifest.checkpoint_seq_no,

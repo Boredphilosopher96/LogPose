@@ -8,6 +8,7 @@ use crate::{
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation};
+use logpose_vfs::Vfs;
 use logpose_wal::WalRecord;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +19,7 @@ pub(crate) enum ResolvedState {
 }
 
 pub(crate) fn resolve_latest_state_selected(
+    vfs: &dyn Vfs,
     state: &CollectionState,
     visible_seq_no: SeqNo,
     include_mutable: bool,
@@ -42,6 +44,7 @@ pub(crate) fn resolve_latest_state_selected(
             .is_none_or(|selected| selected.contains(&segment.segment_id))
     }) {
         let records = read_segment_file(
+            vfs,
             &state
                 .descriptor
                 .root_path
@@ -61,12 +64,14 @@ pub(crate) fn resolve_latest_state_selected(
 }
 
 pub(crate) fn resolve_latest_from_segments(
+    vfs: &dyn Vfs,
     descriptor: &CollectionDescriptor,
     manifest: &Manifest,
 ) -> Result<BTreeMap<RecordId, ResolvedState>> {
     let mut resolved = BTreeMap::new();
     for segment in manifest.segments.iter().rev() {
         let records = read_segment_file(
+            vfs,
             &descriptor
                 .root_path
                 .join("segments")
@@ -80,6 +85,7 @@ pub(crate) fn resolve_latest_from_segments(
 }
 
 pub(crate) fn resolve_latest_state_for_ids_selected(
+    vfs: &dyn Vfs,
     state: &CollectionState,
     visible_seq_no: SeqNo,
     wanted_ids: &BTreeSet<RecordId>,
@@ -110,6 +116,7 @@ pub(crate) fn resolve_latest_state_for_ids_selected(
             .is_none_or(|selected| selected.contains(&segment.segment_id))
     }) {
         let records = read_segment_file(
+            vfs,
             &state
                 .descriptor
                 .root_path
@@ -176,6 +183,7 @@ impl LocalStorageEngine {
         let snapshot = resolve_snapshot(&state, snapshot)?;
 
         let resolved = resolve_latest_state_selected(
+            self.vfs.as_ref(),
             &state,
             snapshot.visible_seq_no,
             include_mutable,
