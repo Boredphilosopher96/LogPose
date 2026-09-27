@@ -7,7 +7,7 @@ use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_query::{
-    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
     ScalarMetadataValue, query_exact,
 };
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
@@ -182,9 +182,9 @@ async fn query_recall(
     filtered: bool,
 ) -> f64 {
     let predicate = filtered.then(|| {
-        Predicate::Comparison(PredicateComparison {
+        FilterExpr::Comparison(FilterComparison {
             field: "flag".to_owned(),
-            operator: PredicateOperator::Eq,
+            operator: FilterOperator::Eq,
             value: Some(ScalarMetadataValue::String("hit".to_owned())),
         })
     });
