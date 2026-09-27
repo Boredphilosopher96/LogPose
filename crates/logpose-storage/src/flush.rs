@@ -1,175 +1,50 @@
-//! Flush: write the mutable delta as a new segment, publish the manifest, rotate the WAL, and
-//! publish a `Version` with an empty delta.
+//! Flush: write the delta a writer-frozen `Version` holds as a v1 segment, then have the writer
+//! publish the manifest that checkpoints it and a `Version` without it.
+//!
+//! The job runs on a job thread and talks to the collection's writer task:
+//!
+//! 1. **Begin.** The writer waits until no other maintenance job of the collection is active,
+//!    drains its pipeline, rotates the WAL (so the frozen delta ends in an older file than every
+//!    later write), and replies with the published, hence durable, `Version`. Its
+//!    `visible_seq_no` `L` is the checkpoint. Writes continue meanwhile.
+//! 2. **Build.** The job writes the delta's rows as a segment (`FlushAfterSegmentSync`,
+//!    `FlushAfterSegmentsDirSync`). A delta of schema changes only needs no segment.
+//! 3. **Commit.** The writer drains again, publishes manifest `g + 1` (the durable manifest
+//!    plus the segment, checkpoint `L`, the writer's schema), drops the delta at or below `L`
+//!    from its state, publishes the next `Version`, and queues a checkpoint frame for its next
+//!    WAL group.
+//!
+//! A failure before the manifest's `CURRENT` rename abandons the flush with no state change; a
+//! failure at or after it poisons the collection. Checkpointed WAL files are kept: historical
+//! snapshots still replay them, until snapshot tokens and GC replace that (PR 6).
 
 use crate::{
-    engine::{CoreRef, EngineCore},
-    fs_util::atomic_write,
-    handle::CollectionHandle,
-    manifest::Manifest,
-    segment_v1::SegmentPurpose,
-    version::{DeltaLog, Version},
+    engine::CoreRef, handle::CollectionHandle, legacy_view::legacy_record,
+    segment_v1::SegmentPurpose, writer::JobCommit, writer::JobKind,
 };
-use logpose_catalog::CollectionDescriptor;
 use logpose_types::{Result, Snapshot};
-use logpose_wal::rotate_active;
 use std::sync::Arc;
 
 impl CoreRef {
-    /// Flush the collection's delta into a new segment.
-    ///
-    /// Holds the maintenance slot and, because rotation replaces the active WAL, the writer slot
-    /// for the whole flush, so writes wait for it. A failure after the durable state may have
-    /// changed reloads the collection from disk (see `reload_after_failure`).
+    /// Flush the collection's delta into a new segment. Blocking; runs on a job thread.
     pub(crate) fn flush_collection(&self, handle: &Arc<CollectionHandle>) -> Result<Snapshot> {
-        handle.ensure_writable()?;
-        let _maintenance = handle.lock_maintenance()?;
-        let mut writer = handle.lock_writer()?;
-        handle.ensure_writable()?;
-        let current = handle.current();
-        if current.delta.is_empty() {
-            return Ok(current.snapshot());
+        let (ticket, frozen) = handle.begin_job(JobKind::Flush)?;
+        if frozen.delta.is_empty() {
+            return Ok(frozen.snapshot());
         }
-
-        // Rotation renames the active WAL, so the open writer must not outlive it.
-        writer.wal = None;
-        let descriptor = handle.descriptor();
-        let flushed = self
-            .flush_state(descriptor, &current)
-            .and_then(|manifest| Ok((manifest, self.open_active_wal(descriptor)?)));
-        match flushed {
-            Ok((manifest, wal)) => {
-                writer.wal = Some(wal);
-                let version =
-                    handle.publish(&writer, current.with_state(manifest, DeltaLog::default()));
-                Ok(version.snapshot())
-            }
-            Err(error) => Err(self.reload_after_failure(handle, &mut writer, error)),
+        let checkpoint_seq_no = frozen.visible_seq_no;
+        let mut records = Vec::with_capacity(frozen.delta.len());
+        for record in frozen.delta.iter() {
+            records.extend(legacy_record(&frozen.schema, record)?);
         }
-    }
-}
-
-impl EngineCore {
-    /// Write `version`'s delta as a segment, durably publish the next manifest, and rotate the
-    /// WAL. Returns the published manifest.
-    fn flush_state(
-        &self,
-        descriptor: &CollectionDescriptor,
-        version: &Version,
-    ) -> Result<Manifest> {
-        let segment_records = version.delta.to_vec();
-        let new_segment =
-            self.write_segment_file(descriptor, &segment_records, SegmentPurpose::Flush)?;
-        let checkpoint_seq_no = segment_records
-            .last()
-            .map(|record| record.seq_no)
-            .unwrap_or(version.checkpoint_seq_no);
-
-        let mut segments = version.manifest.segments.clone();
-        segments.push(new_segment);
-
-        let next_manifest = Manifest {
-            generation: version.manifest_generation + 1,
-            checkpoint_seq_no,
-            segments,
+        let segment = if records.is_empty() {
+            None
+        } else {
+            Some(self.write_segment_file(handle.descriptor(), &records, SegmentPurpose::Flush)?)
         };
-        atomic_write(
-            self.vfs.as_ref(),
-            &Self::pending_rotation_file_path(descriptor),
-            checkpoint_seq_no.to_string().into_bytes(),
-        )?;
-        self.publish_manifest(descriptor, &next_manifest)?;
-
-        rotate_active(
-            &self.vfs,
-            Self::active_wal_path(descriptor),
-            Self::rolled_wal_path(descriptor, checkpoint_seq_no),
-        )?;
-        // A surviving marker makes the next recovery treat `active.wal` as checkpointed, so the
-        // flush must not report success unless the marker is durably gone.
-        self.clear_pending_rotation_marker(descriptor)?;
-        Ok(next_manifest)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{
-        CreateCollectionRequest, LocalStorageEngine, StorageEngine,
-        engine::EngineCore,
-        failpoints,
-        test_support::{put, unique_temp_dir, visible_ids},
-    };
-    use logpose_types::DistanceMetric;
-
-    #[tokio::test]
-    async fn flush_fails_when_pending_rotation_marker_cannot_be_removed() {
-        let root = unique_temp_dir("storage-marker-removal-failure");
-        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-        let descriptor = engine
-            .create_collection(CreateCollectionRequest::new(
-                "documents",
-                2,
-                DistanceMetric::Dot,
-            ))
-            .await
-            .expect("collection should be created");
-        engine
-            .write("documents", vec![put("alpha", vec![1.0, 0.0])])
-            .await
-            .expect("write should succeed");
-
-        let marker_path = EngineCore::pending_rotation_file_path(&descriptor);
-        failpoints::fail_marker_removal(&marker_path);
-        let error = engine
-            .flush("documents")
-            .await
-            .expect_err("flush must not report success while the rotation marker survives");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to clear pending WAL rotation marker"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            marker_path.exists(),
-            "marker should survive the failed removal"
-        );
-
-        let refused = engine
-            .write("documents", vec![put("beta", vec![0.0, 1.0])])
-            .await
-            .expect_err("writes must be refused while the stale marker cannot be cleared");
-        assert!(
-            refused
-                .to_string()
-                .contains("read-only until the engine is reopened"),
-            "unexpected error: {refused}"
-        );
-        let visible = engine
-            .scan_exact("documents", None)
-            .await
-            .expect("the last published version keeps serving reads");
-        assert_eq!(visible_ids(&visible), vec!["alpha"]);
-
-        // Reopening runs recovery, which clears the checkpointed marker.
-        failpoints::clear_marker_removal_failure(&marker_path);
-        drop(engine);
-        let engine = LocalStorageEngine::new(&root).expect("storage engine should reopen");
-        assert!(
-            !marker_path.exists(),
-            "recovery should clear the checkpointed marker"
-        );
-        engine
-            .write("documents", vec![put("beta", vec![0.0, 1.0])])
-            .await
-            .expect("write should succeed after recovery");
-
-        drop(engine);
-        let reopened = LocalStorageEngine::new(&root).expect("storage engine should reopen");
-        let visible = reopened
-            .scan_exact("documents", None)
-            .await
-            .expect("scan should succeed after reopen");
-        assert_eq!(visible_ids(&visible), vec!["alpha", "beta"]);
+        ticket.commit(JobCommit::Flush {
+            checkpoint_seq_no,
+            segment,
+        })
     }
 }

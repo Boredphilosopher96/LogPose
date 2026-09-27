@@ -8,12 +8,14 @@
 //! - `engine`: `Engine`, the collection map, the storage-root lock, and create and drop.
 //! - `runtime`: the `IoPool`, the `query` and `maintenance` rayon pools, and `run_cpu`.
 //! - `handle`, `version`: `CollectionHandle`, publication, and the immutable `Version`.
-//! - `writer`: the write path, serialized per collection until the writer task lands.
+//! - `writer`: each collection's single writer task, group commit on the WAL, the `apply`
+//!   function shared with replay, and poisoning after a failed WAL write.
+//! - `legacy_view`: the v1 record view of v2 rows, for the legacy read paths.
 //! - `storage_engine`: the trait and its public request, inspection and blob-store types.
 //! - `local_engine`: the trait implementation over `Engine`.
 //! - `collections`, `catalog`: collection, database and principal descriptor files.
 //! - `paths`: the on-disk layout.
-//! - `recovery`, `wal_rotation`, `state`: recovering a collection's manifest and WAL delta.
+//! - `recovery`, `state`: recovering a collection's manifest and replaying its WAL.
 //! - `manifest`, `segment_v1`: the v1 manifest and segment file formats.
 //! - `segment_v2`: the v2 segment file format, builder, and reader (not yet wired in).
 //! - `cache`: the buffer cache of segment section bytes that segment v2 readers load through.
@@ -33,11 +35,10 @@ mod compaction;
 mod durable_fs;
 mod engine;
 mod error;
-#[cfg(test)]
-mod failpoints;
 mod flush;
 mod fs_util;
 mod handle;
+mod legacy_view;
 mod local_engine;
 mod maintenance;
 mod manifest;
@@ -55,10 +56,9 @@ mod storage_engine;
 #[cfg(test)]
 mod test_support;
 mod version;
-mod wal_rotation;
 mod writer;
 
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, FatalHandler};
 pub use handle::{CollectionHandle, CollectionMeta};
 pub use local_engine::LocalStorageEngine;
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
@@ -66,3 +66,4 @@ pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
 };
 pub use version::{Version, VersionCounters, VersionId};
+pub use writer::{GroupCommitConfig, SchemaChange};

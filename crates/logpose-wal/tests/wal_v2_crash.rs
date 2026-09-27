@@ -6,7 +6,6 @@
 //! group.
 
 use crc32c as _;
-use crc32fast as _;
 use logpose_types as _;
 use postcard as _;
 use serde as _;
@@ -16,11 +15,8 @@ use tracing as _;
 
 use logpose_vfs::{FaultPlan, FaultVfs, TearMode, Vfs};
 use logpose_wal::{
-    codec::PayloadKind,
-    v2::{
-        BootId, GroupCommit, ReplayFrame, WalConfig, WalError, WalFrame, WalRecovery, WalWriter,
-        WriteOutcome, frame_len,
-    },
+    BootId, GroupCommit, ReplayFrame, WalConfig, WalError, WalFrame, WalRecovery, WalWriter,
+    WriteOutcome, codec::PayloadKind, frame_len,
 };
 use std::{
     path::{Path, PathBuf},
@@ -290,7 +286,7 @@ fn write_round(
             let active = writer
                 .active_path()
                 .file_name()
-                .and_then(|name| logpose_wal::v2::parse_wal_file_name(&name.to_string_lossy()))
+                .and_then(|name| logpose_wal::parse_wal_file_name(&name.to_string_lossy()))
                 .ok_or("active file has no WAL name")?;
             let checkpoint = active.saturating_sub(1);
             if checkpoint > model.checkpoint {

@@ -156,7 +156,7 @@ mod tests {
     use logpose_types::error::fixtures::{one_of_each_variant, variant_name};
 
     /// The documented gRPC code of every variant (see `docs/src/api-overview.md`).
-    const EXPECTED: [(&str, Code); 21] = [
+    const EXPECTED: [(&str, Code); 22] = [
         ("InvalidArgument", Code::InvalidArgument),
         ("DimensionMismatch", Code::InvalidArgument),
         ("TooLarge", Code::ResourceExhausted),
@@ -175,6 +175,8 @@ mod tests {
         ("Unavailable", Code::Unavailable),
         ("Corrupt", Code::DataLoss),
         ("CollectionPoisoned", Code::FailedPrecondition),
+        // The fixture's WAL failure was rolled back (`NotApplied`).
+        ("WalWriteFailed", Code::Unavailable),
         ("Io", Code::Internal),
         // The fixture's bulk failure wraps a missing collection.
         ("BulkBatchFailed", Code::NotFound),
@@ -315,5 +317,28 @@ mod tests {
             Some("RESOURCE_NOT_FOUND")
         );
         assert!(!server.address.is_empty());
+    }
+
+    #[test]
+    fn wal_write_failures_depend_on_whether_the_write_can_reappear() {
+        let failed = |outcome| LogPoseError::WalWriteFailed {
+            collection: "default/docs".to_owned(),
+            outcome,
+            reason: "fsync failed".to_owned(),
+        };
+        let status = status_from_error(&failed(logpose_types::WriteOutcome::NotApplied));
+        assert_eq!(status.code(), Code::Unavailable);
+        let info = status
+            .get_details_error_info()
+            .expect("the status carries ErrorInfo");
+        assert_eq!(info.reason, "WAL_WRITE_FAILED");
+        assert_eq!(
+            info.metadata.get("outcome").map(String::as_str),
+            Some("not_applied")
+        );
+        for fenced in [true, false] {
+            let unknown = failed(logpose_types::WriteOutcome::Unknown { fenced });
+            assert_eq!(grpc_code(&unknown), Code::Internal);
+        }
     }
 }

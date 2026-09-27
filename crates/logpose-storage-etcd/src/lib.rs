@@ -418,7 +418,8 @@ impl StorageEngine for EtcdBackedStorageEngine {
         };
         match self
             .local
-            .create_collection_from_descriptor(descriptor.clone(), Some(&assignment))
+            .create_collection_from_descriptor_async(descriptor.clone(), Some(assignment.clone()))
+            .await
         {
             Ok(local_descriptor) => {
                 self.etcd

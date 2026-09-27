@@ -169,7 +169,7 @@ mod tests {
     use serde_json::Value;
 
     /// The documented HTTP status of every variant (see `docs/src/api-overview.md`).
-    const EXPECTED: [(&str, StatusCode); 21] = [
+    const EXPECTED: [(&str, StatusCode); 22] = [
         ("InvalidArgument", StatusCode::BAD_REQUEST),
         ("DimensionMismatch", StatusCode::BAD_REQUEST),
         ("TooLarge", StatusCode::PAYLOAD_TOO_LARGE),
@@ -188,6 +188,8 @@ mod tests {
         ("Unavailable", StatusCode::SERVICE_UNAVAILABLE),
         ("Corrupt", StatusCode::INTERNAL_SERVER_ERROR),
         ("CollectionPoisoned", StatusCode::CONFLICT),
+        // The fixture's WAL failure was rolled back (`NotApplied`).
+        ("WalWriteFailed", StatusCode::SERVICE_UNAVAILABLE),
         ("Io", StatusCode::INTERNAL_SERVER_ERROR),
         // The fixture's bulk failure wraps a missing collection.
         ("BulkBatchFailed", StatusCode::NOT_FOUND),
@@ -265,5 +267,23 @@ mod tests {
             }),
         };
         assert_eq!(http_status(&wrapped_size), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn wal_write_failures_depend_on_whether_the_write_can_reappear() {
+        let failed = |outcome| LogPoseError::WalWriteFailed {
+            collection: "default/docs".to_owned(),
+            outcome,
+            reason: "fsync failed".to_owned(),
+        };
+        let not_applied = failed(logpose_types::WriteOutcome::NotApplied);
+        assert_eq!(http_status(&not_applied), StatusCode::SERVICE_UNAVAILABLE);
+        let body = ErrorBody::from_error(&not_applied);
+        assert_eq!(body.details.reason, "WAL_WRITE_FAILED");
+        assert_eq!(body.details.metadata["outcome"], "not_applied");
+        for fenced in [true, false] {
+            let unknown = failed(logpose_types::WriteOutcome::Unknown { fenced });
+            assert_eq!(http_status(&unknown), StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 }

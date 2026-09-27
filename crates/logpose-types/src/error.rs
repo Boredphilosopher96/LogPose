@@ -14,7 +14,7 @@
 //! message text.
 
 use crate::NodeRole;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc, time::Duration};
 use thiserror::Error;
 
@@ -178,6 +178,46 @@ impl CorruptionKind {
 impl fmt::Display for CorruptionKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// What a failed WAL group append means for the writes it held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcome {
+    /// The WAL was truncated back to the last synced group and the truncation was synced: the
+    /// writes are absent after any crash and will never be replayed.
+    NotApplied,
+    /// The rollback failed, so the writes may or may not be replayed later. Clients must treat
+    /// this like a timeout.
+    Unknown {
+        /// Whether the `FSYNC_FAILED` fence marker was written durably. When it was not, a
+        /// later open in the same boot cannot notice the hazard, so the process must stop.
+        fenced: bool,
+    },
+}
+
+impl WriteOutcome {
+    /// Stable machine name, reported as `outcome` in error metadata.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Unknown { fenced: true } => "unknown_fenced",
+            Self::Unknown { fenced: false } => "unknown_unfenced",
+        }
+    }
+}
+
+impl fmt::Display for WriteOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotApplied => formatter.write_str("not applied"),
+            Self::Unknown { fenced: true } => formatter.write_str("outcome unknown, WAL fenced"),
+            Self::Unknown { fenced: false } => {
+                formatter.write_str("outcome unknown, WAL not fenced")
+            }
+        }
     }
 }
 
@@ -416,6 +456,21 @@ pub enum LogPoseError {
         /// The failure that poisoned it.
         reason: String,
     },
+    /// The WAL group holding this write could not be made durable, so the write was not
+    /// acknowledged, and the collection is poisoned.
+    ///
+    /// With [`WriteOutcome::NotApplied`] the write is definitely absent: `UNAVAILABLE`, and it
+    /// may be retried once the engine is reopened. With [`WriteOutcome::Unknown`] it may still
+    /// appear after recovery, like a timeout: `INTERNAL`.
+    #[error("WAL write to collection '{collection}' failed ({outcome}): {reason}")]
+    WalWriteFailed {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Whether the failed group can reappear after recovery.
+        outcome: WriteOutcome,
+        /// What failed.
+        reason: String,
+    },
     /// A filesystem operation failed.
     #[error("{context}: {source}")]
     Io {
@@ -585,9 +640,17 @@ impl LogPoseError {
             | Self::CollectionPoisoned { .. } => ErrorCode::FailedPrecondition,
             Self::Unauthenticated { .. } => ErrorCode::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
-            Self::NotOwner { .. } | Self::NotLeader { .. } | Self::Unavailable { .. } => {
-                ErrorCode::Unavailable
-            }
+            Self::NotOwner { .. }
+            | Self::NotLeader { .. }
+            | Self::Unavailable { .. }
+            | Self::WalWriteFailed {
+                outcome: WriteOutcome::NotApplied,
+                ..
+            } => ErrorCode::Unavailable,
+            Self::WalWriteFailed {
+                outcome: WriteOutcome::Unknown { .. },
+                ..
+            } => ErrorCode::Internal,
             Self::Corrupt { .. } => ErrorCode::DataLoss,
             Self::Io { .. } | Self::Internal { .. } => ErrorCode::Internal,
             Self::BulkBatchFailed { source, .. } => source.code(),
@@ -617,6 +680,7 @@ impl LogPoseError {
             Self::Unavailable { .. } => "UNAVAILABLE",
             Self::Corrupt { .. } => "DATA_CORRUPTION",
             Self::CollectionPoisoned { .. } => "COLLECTION_POISONED",
+            Self::WalWriteFailed { .. } => "WAL_WRITE_FAILED",
             Self::Io { .. } => "IO_ERROR",
             Self::Internal { .. } => "INTERNAL",
             Self::BulkBatchFailed { source, .. } => source.reason(),
@@ -752,6 +816,14 @@ impl LogPoseError {
                     put("location", location.clone());
                 }
             }
+            Self::WalWriteFailed {
+                collection,
+                outcome,
+                ..
+            } => {
+                put("collection", collection.clone());
+                put("outcome", outcome.as_str().to_owned());
+            }
             Self::Io { source, .. } => {
                 put("io_error_kind", format!("{:?}", source.kind()));
             }
@@ -791,7 +863,7 @@ impl LogPoseError {
 ///
 /// The `every_variant_is_listed` test keeps this list complete.
 pub mod fixtures {
-    use super::{CorruptionKind, LogPoseError, ResourceKind};
+    use super::{CorruptionKind, LogPoseError, ResourceKind, WriteOutcome};
     use crate::NodeRole;
     use std::{path::PathBuf, time::Duration};
 
@@ -874,6 +946,11 @@ pub mod fixtures {
                 collection: "default/docs".to_owned(),
                 reason: "WAL fsync failed".to_owned(),
             },
+            LogPoseError::WalWriteFailed {
+                collection: "default/docs".to_owned(),
+                outcome: WriteOutcome::NotApplied,
+                reason: "fsync failed: Input/output error".to_owned(),
+            },
             LogPoseError::io(
                 "failed to write file",
                 std::io::Error::other("disk on fire"),
@@ -924,9 +1001,10 @@ mod tests {
             LogPoseError::Io { .. } => 18,
             LogPoseError::BulkBatchFailed { .. } => 19,
             LogPoseError::Internal { .. } => 20,
+            LogPoseError::WalWriteFailed { .. } => 21,
         }
     }
-    const VARIANT_COUNT: usize = 21;
+    const VARIANT_COUNT: usize = 22;
 
     #[test]
     fn every_variant_is_listed() {
@@ -1018,6 +1096,8 @@ mod tests {
                 "COLLECTION_POISONED",
             ),
             ("Io", ErrorCode::Internal, "IO_ERROR"),
+            // The fixture's WAL failure was rolled back, so the write is definitely absent.
+            ("WalWriteFailed", ErrorCode::Unavailable, "WAL_WRITE_FAILED"),
             // The fixture's bulk failure wraps a missing collection.
             ("BulkBatchFailed", ErrorCode::NotFound, "RESOURCE_NOT_FOUND"),
             ("Internal", ErrorCode::Internal, "INTERNAL"),
@@ -1075,6 +1155,33 @@ mod tests {
                 .to_string()
                 .contains("read-only until the engine is reopened"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn wal_write_failures_are_unavailable_when_not_applied_and_internal_when_unknown() {
+        let failed = |outcome| LogPoseError::WalWriteFailed {
+            collection: "default/docs".to_owned(),
+            outcome,
+            reason: "fsync failed".to_owned(),
+        };
+        let not_applied = failed(WriteOutcome::NotApplied);
+        assert_eq!(not_applied.code(), ErrorCode::Unavailable);
+        assert_eq!(not_applied.reason(), "WAL_WRITE_FAILED");
+        // Nothing to wait for: the collection is poisoned until the engine is reopened.
+        assert_eq!(not_applied.retry_after(), None);
+        let details = not_applied.details();
+        assert_eq!(details.metadata["collection"], "default/docs");
+        assert_eq!(details.metadata["outcome"], "not_applied");
+        for (fenced, name) in [(true, "unknown_fenced"), (false, "unknown_unfenced")] {
+            let unknown = failed(WriteOutcome::Unknown { fenced });
+            assert_eq!(unknown.code(), ErrorCode::Internal);
+            assert_eq!(unknown.reason(), "WAL_WRITE_FAILED");
+            assert_eq!(unknown.details().metadata["outcome"], name);
+        }
+        assert!(
+            not_applied.to_string().contains("(not applied)"),
+            "{not_applied}"
         );
     }
 

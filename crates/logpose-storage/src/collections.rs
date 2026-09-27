@@ -3,18 +3,19 @@
 
 use crate::{
     CreateCollectionRequest,
-    durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir},
+    durable_fs::{create_dir_all_synced, sync_dir},
     engine::{CoreRef, EngineCore, already_exists},
     error::{io_message, json_message},
     fs_util::{atomic_write, cleanup_dir, read_json},
     handle::{CollectionHandle, CollectionMeta},
     maintenance::MaintenanceState,
     manifest::Manifest,
-    version::{DeltaLog, Version},
+    version::DeltaLog,
+    writer::{LogicalState, checkpoint_frame},
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{CollectionAssignment, CollectionRef, MaintenanceStatus, Result};
-use logpose_wal::WalWriter;
+use logpose_wal::{WalRecovery, WalWriter};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -78,29 +79,35 @@ impl EngineCore {
     }
 
     /// Write every file of a new collection; `descriptor.json` last, so a crash before it
-    /// leaves a directory that the next open removes. Returns the open active WAL.
+    /// leaves a directory that the next open removes. Returns manifest 0 and the WAL writer,
+    /// whose first file already holds its synced checkpoint group.
     fn write_collection_files(
         &self,
         descriptor: &CollectionDescriptor,
         assignment: Option<&CollectionAssignment>,
-    ) -> Result<WalWriter> {
+    ) -> Result<(Manifest, WalWriter)> {
         self.ensure_database_descriptor(&descriptor.database_name)?;
         self.create_collection_directories(descriptor)?;
         if let Some(assignment) = assignment {
             self.persist_collection_assignment(descriptor, assignment)?;
         }
-        self.publish_manifest(descriptor, &Manifest::empty(0))?;
+        let manifest = Manifest::empty(descriptor.schema()?);
+        self.publish_manifest(descriptor, &manifest)
+            .map_err(|failure| failure.error)?;
         self.persist_maintenance_status(descriptor, &MaintenanceStatus::default())?;
-        let mut wal_writer =
-            WalWriter::open(Arc::clone(&self.vfs), Self::active_wal_path(descriptor))?;
-        wal_writer.truncate()?;
-        sync_parent_dir(self.vfs.as_ref(), &Self::active_wal_path(descriptor))?;
+        let wal = WalRecovery::open(
+            Arc::clone(&self.vfs),
+            Self::wal_dir(descriptor),
+            self.wal_config(),
+            manifest.checkpoint_seq_no,
+        )?
+        .into_writer(&checkpoint_frame(&manifest)?)?;
         atomic_write(
             self.vfs.as_ref(),
             &Self::descriptor_path(descriptor),
             serde_json::to_vec_pretty(descriptor).map_err(json_message)?,
         )?;
-        Ok(wal_writer)
+        Ok((manifest, wal))
     }
 
     /// Paths of `<root>/<entry>/descriptor.json` for every subdirectory of `root` that has one,
@@ -138,20 +145,25 @@ impl CoreRef {
         descriptor.validate()?;
         let reservation = self.reserve(&descriptor.collection_ref())?;
         create_dir_all_synced(self.vfs.as_ref(), &self.collections_root())?;
-        let wal = match self.write_collection_files(&descriptor, assignment) {
-            Ok(wal) => wal,
+        let (manifest, wal) = match self.write_collection_files(&descriptor, assignment) {
+            Ok(created) => created,
             Err(error) => {
                 cleanup_dir(self.vfs.as_ref(), &descriptor.root_path);
                 return Err(error);
             }
         };
         let meta = Arc::new(CollectionMeta::new(descriptor, assignment.cloned()));
-        let version = Version::initial(meta, Manifest::empty(0), DeltaLog::default());
-        let handle = Arc::new(CollectionHandle::new(
-            version,
-            Some(wal),
+        let state = LogicalState {
+            schema: Arc::new(manifest.schema.clone()),
+            delta: DeltaLog::default(),
+        };
+        let handle = self.start_collection(
+            meta,
+            Arc::new(manifest),
+            state,
+            wal,
             MaintenanceState::default(),
-        ));
+        )?;
         reservation.commit(Arc::clone(&handle));
         Ok(handle)
     }

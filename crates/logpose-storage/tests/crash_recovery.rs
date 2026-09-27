@@ -25,21 +25,27 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
+use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use logpose_storage::{
+    CreateCollectionRequest, Engine, EngineConfig, GroupCommitConfig, LocalStorageEngine,
+    StorageEngine,
+};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DeleteRecord, DistanceMetric,
-    NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    LogPoseError, NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    WriteOutcome,
 };
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::IoSlice,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 const ROOT: &str = "/storage";
@@ -643,8 +649,10 @@ async fn named_crash_points_have_the_documented_outcome() {
     let kept = assert_recovered(&harness, &outcome, "WalAfterSync").await;
     assert_eq!(kept.len(), 1, "a synced frame must survive");
 
-    // Every step of the first flush before the durable `CURRENT` rename leaves generation 0.
+    // Every step of the first flush before the durable `CURRENT` rename leaves generation 0:
+    // the WAL rotation at the flush's begin, the segment, and the manifest.
     for (seed, point) in [
+        CrashPoint::WalAfterRotateCreate,
         CrashPoint::FlushAfterSegmentSync,
         CrashPoint::FlushAfterSegmentsDirSync,
         CrashPoint::ManifestAfterFileSync,
@@ -663,15 +671,9 @@ async fn named_crash_points_have_the_documented_outcome() {
         assert_engine_keeps_working(&mut harness, kept, &context).await;
     }
 
-    // Once the directory holding `CURRENT` is synced, the flush is published; recovery finishes
-    // the WAL rotation.
-    for (seed, point) in [
-        CrashPoint::CurrentAfterDirSync,
-        CrashPoint::WalAfterRotateCreate,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // Once the directory holding `CURRENT` is synced, the flush is published: recovery replays
+    // nothing below its checkpoint.
+    for (seed, point) in [CrashPoint::CurrentAfterDirSync].into_iter().enumerate() {
         let (mut harness, outcome) = run_to_crash_point(point, 30 + seed as u64).await;
         let context = format!("{point:?}");
         assert_eq!(outcome.failed_step, Some(first_flush), "{context}");
@@ -720,7 +722,16 @@ async fn failed_wal_fsync_is_rolled_back_and_the_batch_never_reappears() {
                 .write(COLLECTION, vec![put("lost", 8.0)])
                 .await
                 .expect_err("the fsync failure should fail the write");
-            assert!(error.to_string().contains("fsync"), "{context}: {error}");
+            assert!(
+                matches!(
+                    error,
+                    LogPoseError::WalWriteFailed {
+                        outcome: WriteOutcome::NotApplied,
+                        ..
+                    }
+                ),
+                "{context}: {error}"
+            );
             let outcome = Outcome {
                 acked: outcome.acked,
                 in_flight: None,
@@ -734,10 +745,11 @@ async fn failed_wal_fsync_is_rolled_back_and_the_batch_never_reappears() {
     }
 }
 
-/// A failed WAL fsync followed by more work in the same process, then a crash: the failed batch
-/// is invisible before and after the crash, and every batch acknowledged after the failure
-/// survives. Under every tear mode the failed sync may have written part or all of its frame
-/// before the error, so only a durable rollback keeps the batch from coming back.
+/// A failed WAL fsync poisons the collection; reopening it in the same process (no crash) is
+/// safe because the rollback was durable. Then more work and a crash: the failed batch is
+/// invisible throughout, and every batch acknowledged after the reopen survives. Under every
+/// tear mode the failed sync may have written part or all of its frame before the error, so
+/// only a durable rollback keeps the batch from coming back.
 #[tokio::test]
 async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_batches() {
     for tear in TearMode::ALL {
@@ -752,11 +764,30 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
                 tear,
                 ..FaultPlan::default()
             });
-            harness
+            let error = harness
                 .engine()
                 .write(COLLECTION, vec![put("lost", 8.0)])
                 .await
                 .expect_err("the fsync failure should fail the write");
+            assert!(
+                matches!(
+                    error,
+                    LogPoseError::WalWriteFailed {
+                        outcome: WriteOutcome::NotApplied,
+                        ..
+                    }
+                ),
+                "{context}: {error}"
+            );
+            let refused = harness
+                .engine()
+                .write(COLLECTION, vec![put("refused", 8.0)])
+                .await
+                .expect_err("the poisoned collection refuses writes");
+            assert!(
+                matches!(refused, LogPoseError::CollectionPoisoned { .. }),
+                "{context}: {refused}"
+            );
             let visible = harness
                 .engine()
                 .scan_exact(COLLECTION, None)
@@ -766,6 +797,23 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
                 visible,
                 expected_visible(&outcome.acked),
                 "{context}: the failed batch must stay invisible in the same process"
+            );
+
+            // Reopen in the same process, without a crash.
+            harness.engine = None;
+            harness.engine = Some(
+                LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
+                    .expect("engine should reopen in process"),
+            );
+            let visible = harness
+                .engine()
+                .scan_exact(COLLECTION, None)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: scan after the reopen: {error}"));
+            assert_eq!(
+                visible,
+                expected_visible(&outcome.acked),
+                "{context}: the in-process reopen shows exactly the acknowledged batches"
             );
 
             let after = vec![put("after", 3.0), delete("b")];
@@ -866,5 +914,159 @@ fn active_wal_path(harness: &Harness) -> PathBuf {
     };
     let collections = list(&Path::new(ROOT).join("collections"));
     assert_eq!(collections.len(), 1);
-    collections[0].join("wal").join("active.wal")
+    let mut wal_files = list(&collections[0].join("wal"))
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
+        .collect::<Vec<_>>();
+    wal_files.sort();
+    wal_files.pop().expect("the collection has a WAL file")
+}
+
+/// Batches per group in the single-group sweep.
+const GROUP_WRITERS: usize = 6;
+
+/// An engine whose writer waits until `GROUP_WRITERS` batches are queued before it commits,
+/// so that concurrent batches deterministically form one fsync group.
+fn grouping_engine(fault: &Arc<FaultVfs>) -> LocalStorageEngine {
+    let config = EngineConfig {
+        group: GroupCommitConfig {
+            commit_delay: Duration::from_secs(30),
+            min_group_requests: GROUP_WRITERS,
+            ..GroupCommitConfig::default()
+        },
+        ..EngineConfig::default()
+    };
+    LocalStorageEngine::from_engine(
+        Engine::open(fault.process(), ROOT, config).expect("engine should open"),
+    )
+}
+
+/// Write one group: `GROUP_WRITERS` concurrent two-operation batches. Returns each batch's
+/// result.
+async fn write_group(engine: &LocalStorageEngine, round: usize) -> Vec<bool> {
+    let tasks = (0..GROUP_WRITERS)
+        .map(|writer| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .write(
+                        COLLECTION,
+                        vec![
+                            put(&format!("r{round}-w{writer}-a"), writer as f32),
+                            put(&format!("r{round}-w{writer}-b"), writer as f32),
+                        ],
+                    )
+                    .await
+                    .is_ok()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut acked = Vec::new();
+    for task in tasks {
+        acked.push(task.await.expect("writer should join"));
+    }
+    acked
+}
+
+fn group_ids(round: usize) -> BTreeSet<String> {
+    (0..GROUP_WRITERS)
+        .flat_map(|writer| {
+            [
+                format!("r{round}-w{writer}-a"),
+                format!("r{round}-w{writer}-b"),
+            ]
+        })
+        .collect()
+}
+
+async fn grouping_harness(seed: u64) -> (Arc<FaultVfs>, LocalStorageEngine) {
+    let fault = FaultVfs::new(seed);
+    let engine = grouping_engine(&fault);
+    let mut descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::new(
+            COLLECTION,
+            2,
+            DistanceMetric::Dot,
+        ))
+        .expect("descriptor should plan");
+    descriptor.flush_threshold_ops = usize::MAX;
+    descriptor.flush_threshold_bytes = usize::MAX;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    engine
+        .create_collection_from_descriptor(descriptor, None)
+        .expect("collection should be created");
+    assert!(
+        write_group(&engine, 0).await.iter().all(|acked| *acked),
+        "the setup group commits"
+    );
+    (fault, engine)
+}
+
+/// Crash before every mutating operation of one group commit holding several concurrent
+/// batches, under every tear mode. The group is one append and one fsync, so recovery keeps it
+/// whole or not at all (I3), keeps it whenever any of its batches was acknowledged, and always
+/// keeps the group committed before it (I8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_crash_point_of_one_group_commit_keeps_the_group_whole() {
+    let (group_ops, group_syncs) = {
+        let (fault, engine) = grouping_harness(0).await;
+        let (ops, syncs) = (fault.mutating_ops(), fault.file_syncs());
+        assert!(write_group(&engine, 1).await.iter().all(|acked| *acked));
+        (fault.mutating_ops() - ops, fault.file_syncs() - syncs)
+    };
+    assert_eq!(
+        group_syncs, 1,
+        "{GROUP_WRITERS} concurrent batches share one fsync"
+    );
+    assert!(group_ops >= 2, "a group is at least an append and a sync");
+
+    for tear in TearMode::ALL {
+        for k in 0..=group_ops {
+            let context = format!("tear={tear:?} crash_after_ops={k}");
+            let (fault, engine) = grouping_harness(k * 4 + tear as u64).await;
+            fault.set_plan(FaultPlan {
+                crash_after_ops: Some(fault.mutating_ops() + k),
+                tear,
+                ..FaultPlan::default()
+            });
+            let acked = write_group(&engine, 1).await;
+            drop(engine);
+            fault.crash();
+            let engine = grouping_engine(&fault);
+            let recovered = engine
+                .scan_exact(COLLECTION, None)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: recovery failed: {error}"))
+                .into_iter()
+                .map(|record| record.id.as_str().to_owned())
+                .collect::<BTreeSet<_>>();
+            let setup = group_ids(0);
+            let group = group_ids(1);
+            assert!(
+                recovered.is_superset(&setup),
+                "{context}: the earlier group is kept"
+            );
+            let kept = recovered
+                .difference(&setup)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert!(
+                kept.is_empty() || kept == group,
+                "{context}: the group is kept whole or not at all, got {kept:?}"
+            );
+            if acked.iter().any(|acked| *acked) {
+                assert_eq!(kept, group, "{context}: an acknowledged group survives");
+            }
+            let visible = engine
+                .snapshot(COLLECTION)
+                .await
+                .expect("snapshot")
+                .visible_seq_no;
+            assert_eq!(
+                visible,
+                (setup.len() + kept.len()) as SeqNo,
+                "{context}: visibility ends at a group boundary"
+            );
+        }
+    }
 }

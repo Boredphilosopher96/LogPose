@@ -30,18 +30,18 @@ The control-plane and data-plane split is real, but it is still in-process rathe
 
 LogPose is still a local filesystem engine.
 
-- mutable writes land in WAL-backed local state under `storage_root`
-- each write batch is one CRC-framed WAL frame committed with one fsync, so recovery replays a batch entirely or not at all
-- a torn tail left on `wal/active.wal` by a crash is ignored by readers and truncated (with a warning log) before the next append; a defect with any valid frame after it, any defect in a rolled WAL file, and a reused sequence number are reported as errors instead
-- a failed append or fsync truncates `wal/active.wal` back to its last synced frame, so a batch reported as failed never replays
+- mutable writes land in WAL-backed local state under `storage_root`; each collection has one writer task that applies write batches and schema changes in order
+- each write batch is one CRC-framed WAL frame; concurrent batches share one fsync (group commit), a batch is acknowledged only after its fsync returned and the state that includes it is published, and recovery replays a batch entirely or not at all
+- the WAL is a directory of `wal/<first sequence number>.wal` files (the WAL v2 format); a torn tail left by a crash is truncated when the collection is recovered, while damage followed by a later durable group, any damage in an older file, and a sequence gap are reported as corruption instead
+- a failed append or fsync truncates the active WAL file back to its last synced group, fails the group's writes with an outcome (`not applied`, or `unknown` when that rollback failed too), and makes the collection read-only until the engine is reopened; when the rollback failed, a `wal/FSYNC_FAILED` marker refuses a reopen in the same boot
+- storage roots written by earlier builds (a `wal/active.wal` file) are not readable and fail to open as corrupt; there is no migration
 - flush and compaction publish immutable segment files plus planner-visible index sidecars
 - a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
 - operator-facing namespaces are database-first: collection identities are `database/collection` outside the default database and just `collection` inside it
 - collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
-- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory; new segment and index files fsync their directories before the manifest that references them is published, and WAL rotation fsyncs `wal/` before the `PENDING_ROTATION` marker is cleared
+- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory; new segment and index files fsync their directories before the manifest that references them is published, and a new WAL file is synced, with its directory, before any write lands in it
 - one engine owns a `storage_root` at a time: opening the storage engine takes an exclusive lock on `storage_root/LOCK` and keeps every collection's state resident, so the server opens one engine and shares it between the data plane and the catalog, and a second engine (in another process or the same one) fails at startup with an "already in use by another engine" error
-- if a flush published its manifest but crashed before rotating the WAL, recovery finishes the rotation (rolling `active.wal` to `<checkpoint>.wal`, so snapshots of older manifest generations still replay those records) and clears the `wal/PENDING_ROTATION` marker
-- if a `wal/PENDING_ROTATION` marker survives while `active.wal` holds records above the marker's checkpoint, recovery leaves the WAL untouched and reports an error instead of discarding acknowledged writes
+- a flush rotates the WAL to a new file before it writes its segment, so its checkpoint falls on a file boundary; checkpointed WAL files are kept for now, because snapshots of older manifest generations replay them
 - all storage and WAL file I/O goes through the `Vfs` trait in `crates/logpose-vfs`: `StdVfs` in production, and `FaultVfs`, an in-memory filesystem that models lost unsynced data, torn writes, failed fsyncs and volatile directory entries, in crash tests
 - the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
 - mutable data remains on the exact path; ANN is currently limited to immutable HNSW units

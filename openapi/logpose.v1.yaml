@@ -1401,6 +1401,7 @@ components:
         - UNAVAILABLE
         - DATA_CORRUPTION
         - COLLECTION_POISONED
+        - WAL_WRITE_FAILED
         - IO_ERROR
         - INTERNAL
     FieldViolation:

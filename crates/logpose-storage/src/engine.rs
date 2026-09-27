@@ -10,29 +10,39 @@ use crate::{
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
+    writer::{ControlMsg, GroupCommitConfig},
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, LogPoseError, ResourceKind, Result,
 };
 use logpose_vfs::{Vfs, VfsLock};
+use logpose_wal::{BootId, DEFAULT_WAL_FILE_BYTES, WalConfig};
 use std::{
     collections::BTreeMap,
     fmt,
     ops::Deref,
+    panic::Location,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard,
+        RwLockWriteGuard,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    time::{Duration, Instant},
 };
 
 /// Suffix of a collection directory whose drop is committed but whose files are not yet removed.
 pub(crate) const DROPPED_DIR_SUFFIX: &str = ".dropped";
 
+/// Called when the engine can no longer guarantee durability for the rest of the process (a
+/// WAL fsync and its rollback failed, and the fence marker that makes a restart in this boot
+/// refuse the collection could not be written either). The default logs and aborts the process.
+pub type FatalHandler = Arc<dyn Fn(&LogPoseError) + Send + Sync>;
+
 /// Engine configuration.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Thread pool sizes.
     pub runtime: RuntimeConfig,
@@ -40,6 +50,29 @@ pub struct EngineConfig {
     pub cache: CacheConfig,
     /// Remote blob store that flushed segments are marked for upload to, if any.
     pub blob_store: Option<Arc<dyn BlobStore>>,
+    /// Group commit settings of every collection's writer.
+    pub group: GroupCommitConfig,
+    /// Size at which a collection's active WAL file is rotated. Default 64 MiB.
+    pub wal_file_bytes: u64,
+    /// Identity of this boot for the WAL fence. `None` reads [`BootId::current`]; tests inject
+    /// distinct ids to simulate reboots.
+    pub boot_id: Option<BootId>,
+    /// What to do when durability can no longer be guaranteed; `None` aborts the process.
+    pub on_fatal: Option<FatalHandler>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeConfig::default(),
+            cache: CacheConfig::default(),
+            blob_store: None,
+            group: GroupCommitConfig::default(),
+            wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
+            boot_id: None,
+            on_fatal: None,
+        }
+    }
 }
 
 impl fmt::Debug for EngineConfig {
@@ -49,6 +82,10 @@ impl fmt::Debug for EngineConfig {
             .field("runtime", &self.runtime)
             .field("cache", &self.cache)
             .field("blob_store", &self.blob_store.is_some())
+            .field("group", &self.group)
+            .field("wal_file_bytes", &self.wal_file_bytes)
+            .field("boot_id", &self.boot_id)
+            .field("on_fatal", &self.on_fatal.is_some())
             .finish()
     }
 }
@@ -68,12 +105,30 @@ pub struct Engine {
 /// Owned by user-facing clones only. Its drop is the engine's shutdown.
 struct EngineShared {
     core: Arc<EngineCore>,
+    /// The runtime every collection's writer task runs on. Shut down last, and never dropped
+    /// in place, so that dropping the engine inside an async context does not panic.
+    writers: Option<tokio::runtime::Runtime>,
 }
 
 impl Drop for EngineShared {
     fn drop(&mut self) {
         self.core.shutdown.store(true, Ordering::Release);
+        // Writer tasks finish the group they have in flight, fail what is queued, and exit,
+        // releasing their engine references.
+        let writers = std::mem::take(
+            &mut *self
+                .core
+                .writers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for writer in writers {
+            let _ = writer.send(ControlMsg::Shutdown);
+        }
         self.core.tasks.wait_idle();
+        if let Some(writers) = self.writers.take() {
+            writers.shutdown_background();
+        }
     }
 }
 
@@ -90,6 +145,16 @@ pub(crate) struct EngineCore {
     runtime: Runtime,
     /// The engine-wide buffer cache of segment units. Misses load on `runtime.io`.
     cache: BufferCache,
+    /// Handle to the runtime the writer tasks run on (owned by [`EngineShared`]).
+    writer_runtime: tokio::runtime::Handle,
+    /// Group commit settings of every writer.
+    pub(crate) group_commit: GroupCommitConfig,
+    wal_file_bytes: u64,
+    boot_id: BootId,
+    on_fatal: Option<FatalHandler>,
+    /// Control channels of every writer task started, so that shutdown reaches each one,
+    /// including those of collections that are being dropped or failed to register.
+    writers: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ControlMsg>>>,
     /// Threads that run legacy flush and compaction jobs, which interleave CPU and blocking
     /// I/O and so can run on neither the I/O pool nor a rayon pool.
     pub(crate) jobs: IoPool,
@@ -140,6 +205,12 @@ impl Engine {
             config.runtime.maintenance_threads,
             config.runtime.io_queue_depth,
         )?;
+        let writers = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(config.runtime.writer_threads.max(1))
+            .thread_name("logpose-writer")
+            .enable_time()
+            .build()
+            .map_err(|error| io_message("failed to start the writer runtime", error))?;
         let core = Arc::new(EngineCore {
             root,
             vfs,
@@ -148,15 +219,24 @@ impl Engine {
             unreadable: OnceLock::new(),
             runtime,
             cache: BufferCache::new(config.cache),
+            writer_runtime: writers.handle().clone(),
+            group_commit: config.group,
+            wal_file_bytes: config.wal_file_bytes,
+            boot_id: config.boot_id.unwrap_or_else(BootId::current),
+            on_fatal: config.on_fatal,
+            writers: Mutex::new(Vec::new()),
             jobs,
             tasks: Arc::new(TaskTracker::default()),
             shutdown: AtomicBool::new(false),
             _root_lock: root_lock,
         });
+        // From here on, dropping `shared` shuts down whatever recovery started.
+        let shared = Arc::new(EngineShared {
+            core: Arc::clone(&core),
+            writers: Some(writers),
+        });
         core.recover_collections()?;
-        Ok(Self {
-            shared: Arc::new(EngineShared { core }),
-        })
+        Ok(Self { shared })
     }
 
     /// The storage root.
@@ -228,6 +308,7 @@ impl Engine {
     }
 
     /// A tracked reference to the engine state for an engine task.
+    #[track_caller]
     pub(crate) fn core(&self) -> CoreRef {
         CoreRef::new(&self.shared.core)
     }
@@ -274,6 +355,53 @@ impl fmt::Debug for Engine {
 impl EngineCore {
     pub(crate) fn collections_root(&self) -> PathBuf {
         self.root.join("collections")
+    }
+
+    /// The engine's thread pools.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// The runtime writer tasks run on.
+    pub(crate) fn writer_runtime(&self) -> &tokio::runtime::Handle {
+        &self.writer_runtime
+    }
+
+    /// The WAL settings every collection's WAL is opened with.
+    pub(crate) fn wal_config(&self) -> WalConfig {
+        WalConfig {
+            file_bytes: self.wal_file_bytes,
+            epoch: 0,
+            boot_id: self.boot_id.clone(),
+        }
+    }
+
+    /// Durability can no longer be guaranteed for this process: report it, then run the
+    /// configured handler, which aborts by default.
+    pub(crate) fn fatal(&self, error: &LogPoseError) {
+        tracing::error!(%error, "fatal storage error; the process must stop");
+        match &self.on_fatal {
+            Some(handler) => handler(error),
+            None => std::process::abort(),
+        }
+    }
+
+    /// Remember a started writer task, so that shutdown stops it.
+    ///
+    /// A create that an engine task finishes while the engine is already shutting down starts
+    /// its writer after shutdown sent `Shutdown` to the registered ones, so that writer is told
+    /// to stop right away; otherwise it would hold its engine reference forever and the
+    /// engine's drop would never return. The shutdown flag is set before the list is taken, and
+    /// both sides look at them under this lock, so every writer is either in the list shutdown
+    /// takes or sees the flag here.
+    pub(crate) fn register_writer(&self, control: tokio::sync::mpsc::UnboundedSender<ControlMsg>) {
+        let mut writers = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.is_shutting_down() {
+            let _ = control.send(ControlMsg::Shutdown);
+            return;
+        }
+        writers.retain(|writer| !writer.is_closed());
+        writers.push(control);
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -364,6 +492,7 @@ impl EngineCore {
     }
 
     /// Recover every collection directory, in parallel on the I/O pool, and register each one.
+    /// Each recovered collection's writer task is already running.
     fn recover_collections(self: &Arc<Self>) -> Result<()> {
         let collections_root = self.collections_root();
         let dirs = self.collection_dirs_to_recover(&collections_root)?;
@@ -550,23 +679,23 @@ impl CoreRef {
     /// Stop an open collection and retire its directory.
     fn retire_open_collection(&self, handle: &Arc<CollectionHandle>) -> Result<()> {
         handle.mark_dropped();
-        // Wait for the in-flight maintenance job and write; both check the state again under
-        // these locks, so nothing starts after them. The lock order is maintenance, then writer.
-        let _maintenance = handle
-            .maintenance
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut writer = handle.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        writer.wal = None;
-        self.retire_collection_dir(&handle.meta().dir)
-            .map_err(|failure| {
+        // The writer finishes the group in flight and waits for the active maintenance job to
+        // end; it refuses everything else once the handle is dropped, so nothing is written
+        // to the directory after this returns.
+        handle.quiesce();
+        match self.retire_collection_dir(&handle.meta().dir) {
+            Ok(()) => {
+                handle.stop_writer();
+                Ok(())
+            }
+            Err(failure) => {
                 if !failure.renamed {
-                    // Nothing on disk changed, so the collection serves again; the next write
-                    // reopens its WAL.
+                    // Nothing on disk changed, so the collection serves again.
                     handle.mark_open();
                 }
-                failure.error
-            })
+                Err(failure.error)
+            }
+        }
     }
 
     /// Durably rename `dir` to `<dir>.dropped`, which commits the drop, then remove it. A crash
@@ -602,7 +731,8 @@ struct RetireFailure {
     error: LogPoseError,
 }
 
-/// A reference to the engine state held by an engine task (an I/O pool job, a maintenance job).
+/// A reference to the engine state held by an engine task (an I/O pool job, a maintenance job,
+/// a collection's writer task).
 ///
 /// The engine's drop waits until every `CoreRef` is gone, so no task can touch the storage root
 /// after the engine released its lock.
@@ -613,16 +743,21 @@ pub(crate) struct CoreRef {
 }
 
 impl CoreRef {
+    #[track_caller]
     fn new(core: &Arc<EngineCore>) -> Self {
-        core.tasks.enter();
+        let id = core.tasks.enter(Location::caller());
         Self {
             core: Arc::clone(core),
-            _task: TaskGuard(Arc::clone(&core.tasks)),
+            _task: TaskGuard {
+                tracker: Arc::clone(&core.tasks),
+                id,
+            },
         }
     }
 }
 
 impl Clone for CoreRef {
+    #[track_caller]
     fn clone(&self) -> Self {
         Self::new(&self.core)
     }
@@ -636,39 +771,108 @@ impl Deref for CoreRef {
     }
 }
 
-/// Counts live [`CoreRef`]s so that shutdown can wait for them.
+/// How often the engine's drop reports the tasks it still waits for.
+const SHUTDOWN_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a debug build's engine drop waits before it panics with that report instead of
+/// hanging, so that a leaked task fails a test loudly.
+#[cfg(debug_assertions)]
+const SHUTDOWN_DEBUG_LIMIT: Duration = Duration::from_secs(120);
+
+/// Counts live [`CoreRef`]s so that shutdown can wait for them, and remembers where each was
+/// created, so that a shutdown that waits too long can say which tasks it waits for.
 #[derive(Default)]
 struct TaskTracker {
-    live: Mutex<usize>,
+    live: Mutex<LiveTasks>,
     idle: Condvar,
 }
 
+#[derive(Default)]
+struct LiveTasks {
+    next_id: u64,
+    /// Where each live `CoreRef` was created, by id.
+    sites: BTreeMap<u64, &'static Location<'static>>,
+}
+
 impl TaskTracker {
-    fn enter(&self) {
-        *self.live.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    fn lock(&self) -> MutexGuard<'_, LiveTasks> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn exit(&self) {
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        *live = live.saturating_sub(1);
-        if *live == 0 {
+    fn enter(&self, site: &'static Location<'static>) -> u64 {
+        let mut live = self.lock();
+        let id = live.next_id;
+        live.next_id += 1;
+        live.sites.insert(id, site);
+        id
+    }
+
+    fn exit(&self, id: u64) {
+        let mut live = self.lock();
+        live.sites.remove(&id);
+        if live.sites.is_empty() {
             self.idle.notify_all();
         }
     }
 
+    /// Wait until no task is live. Every [`SHUTDOWN_REPORT_INTERVAL`] it logs where the tasks it
+    /// still waits for were created; a debug build panics with that list after
+    /// `SHUTDOWN_DEBUG_LIMIT`.
     fn wait_idle(&self) {
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        while *live > 0 {
-            live = self.idle.wait(live).unwrap_or_else(PoisonError::into_inner);
+        let started = Instant::now();
+        let mut live = self.lock();
+        while !live.sites.is_empty() {
+            let (guard, waited) = self
+                .idle
+                .wait_timeout(live, SHUTDOWN_REPORT_INTERVAL)
+                .unwrap_or_else(PoisonError::into_inner);
+            live = guard;
+            if !waited.timed_out() || live.sites.is_empty() {
+                continue;
+            }
+            let outstanding = live.outstanding();
+            tracing::error!(
+                waited_secs = started.elapsed().as_secs(),
+                %outstanding,
+                "engine shutdown is still waiting for its tasks"
+            );
+            #[cfg(debug_assertions)]
+            assert!(
+                started.elapsed() < SHUTDOWN_DEBUG_LIMIT,
+                "engine shutdown waited {:?} for tasks that never finished: {outstanding}",
+                started.elapsed()
+            );
         }
+    }
+
+    /// Where the live tasks were created, with counts, for diagnostics.
+    #[cfg(test)]
+    fn outstanding(&self) -> String {
+        self.lock().outstanding()
     }
 }
 
-struct TaskGuard(Arc<TaskTracker>);
+impl LiveTasks {
+    fn outstanding(&self) -> String {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for site in self.sites.values() {
+            *counts.entry(site.to_string()).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(site, count)| format!("{count} from {site}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+struct TaskGuard {
+    tracker: Arc<TaskTracker>,
+    id: u64,
+}
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        self.0.exit();
+        self.tracker.exit(self.id);
     }
 }
 

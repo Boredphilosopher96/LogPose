@@ -9,6 +9,7 @@ pub mod value;
 
 pub use error::{
     CorruptionKind, ErrorCode, ErrorDetails, FieldViolation, LogPoseError, ResourceKind,
+    WriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};

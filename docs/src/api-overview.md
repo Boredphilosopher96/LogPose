@@ -126,6 +126,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | `READ_BARRIER_NOT_SATISFIED` | `FAILED_PRECONDITION` | `collection`, `required_manifest_generation`, `required_seq_no`, `visible_manifest_generation`, `visible_seq_no` | no |
 | `UNAVAILABLE`                | `UNAVAILABLE`         |                                                                 | sometimes  |
 | `COLLECTION_POISONED`        | `FAILED_PRECONDITION` | `collection`                                                    | no         |
+| `WAL_WRITE_FAILED`           | `UNAVAILABLE` (`not_applied`) or `INTERNAL` (`unknown_*`) | `collection`, `outcome` (`not_applied`, `unknown_fenced`, `unknown_unfenced`) | no |
 | `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
 | `IO_ERROR`                   | `INTERNAL`            | `io_error_kind`                                                 | no         |
 | `INTERNAL`                   | `INTERNAL`            |                                                                 | no         |
@@ -135,7 +136,11 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 to `owner_node` or `leader_node` when the error names one, or retry after the
 hint. `COLLECTION_POISONED` means a storage failure made the collection
 read-only until an operator reopens the engine; reads keep working. Do not
-retry it automatically.
+retry it automatically. `WAL_WRITE_FAILED` is the error of the writes whose WAL
+group could not be made durable, which also poisons the collection: with
+`outcome` `not_applied` the write is definitely absent (`UNAVAILABLE`); with
+`unknown_fenced` or `unknown_unfenced` it may still appear after recovery, so
+treat it like a timeout (`INTERNAL`).
 
 ## Request Size Limits
 

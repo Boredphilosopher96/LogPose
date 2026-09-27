@@ -1,6 +1,6 @@
 //! The WAL v2 writer: group append, failed-group rollback, rotation and checkpoint truncation.
 
-use super::{
+use crate::{
     FenceMarker, FrameHeader, WalConfig, WalError, WalFrame, WriteOutcome, data_range,
     fence::write_fence,
     files::WalFile,
@@ -32,7 +32,7 @@ pub struct GroupCommit {
 
 /// Appends fsync groups to the highest-named WAL file.
 ///
-/// Obtained from [`WalRecovery::into_writer`](super::WalRecovery::into_writer). Every method is
+/// Obtained from [`WalRecovery::into_writer`](crate::WalRecovery::into_writer). Every method is
 /// blocking and must run on the I/O pool. After a failed append, sync or rotation whose outcome
 /// is not a clean rollback, or after an interrupted write, the writer refuses every further
 /// write with [`WalError::WriterFailed`].
@@ -53,7 +53,7 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    pub(super) fn resume(state: ResumeState) -> Self {
+    pub(crate) fn resume(state: ResumeState) -> Self {
         Self {
             vfs: state.vfs,
             dir: state.dir,
@@ -92,6 +92,13 @@ impl WalWriter {
         self.files
             .last()
             .map_or(self.dir.as_path(), |file| file.path.as_path())
+    }
+
+    /// First sequence number in the active file's name: the salt of its frame checksums.
+    fn active_first_seq_no(&self) -> SeqNo {
+        self.files
+            .last()
+            .map_or(self.next_seq_no, |file| file.first_seq_no)
     }
 
     /// Paths of every WAL file, oldest first; the last one is active.
@@ -143,8 +150,9 @@ impl WalWriter {
                 frame.header(self.config.epoch, group_no, index + 1 == frames.len())
             })
             .collect();
+        let salt = self.active_first_seq_no();
         let encoded: Vec<[u8; FRAME_HEADER_LEN]> =
-            headers.iter().map(FrameHeader::encode).collect();
+            headers.iter().map(|header| header.encode(salt)).collect();
         let mut slices = Vec::with_capacity(frames.len() * 3);
         let mut group_len = 0u64;
         for (frame, header) in frames.iter().zip(&encoded) {
@@ -189,7 +197,7 @@ impl WalWriter {
     }
 
     /// Write `checkpoint` as the first group of the empty active file.
-    pub(super) fn start_file(mut self, checkpoint: &WalFrame) -> Result<Self, WalError> {
+    pub(crate) fn start_file(mut self, checkpoint: &WalFrame) -> Result<Self, WalError> {
         self.append_group(std::slice::from_ref(checkpoint))?;
         Ok(self)
     }
@@ -320,7 +328,7 @@ impl WalWriter {
         let group_no = self.next_group_no;
         let header = checkpoint
             .header(self.config.epoch, group_no, true)
-            .encode();
+            .encode(first_seq_no);
         let padding = &ZERO_PADDING[..padding_len(checkpoint.payload().len())];
         let written = file
             .append(&[

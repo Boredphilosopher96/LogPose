@@ -1,13 +1,15 @@
-//! `Version`: an immutable, self-consistent view of one collection, and the v1 state inside it.
+//! `Version`: an immutable, self-consistent view of one collection, and the mutable delta inside
+//! it.
 //!
-//! Until the memtable and segment v2 land, a `Version` holds the v1 manifest plus the mutable
-//! delta replayed from (and appended to) the v1 WAL. Everything reachable from a published
-//! `Version` is immutable; the writer builds the next one with `Arc` clones and swaps it in.
+//! Until the memtable and segment v2 land (PR 10), a `Version` holds the v1 manifest plus the
+//! delta: the WAL operations above the manifest checkpoint, in the v2 data model (`FieldId`-keyed
+//! row images, key deletes, and schema changes), exactly as the writer's `apply` produced them.
+//! Everything reachable from a published `Version` is immutable; the writer builds the next one
+//! with `Arc` clones and swaps it in.
 
-use crate::{handle::CollectionMeta, manifest::Manifest, stats::approximate_record_bytes};
-use logpose_types::{LogPoseError, Result, SeqNo};
-use logpose_wal::WalRecord;
-use serde::{Serialize, Serializer, ser::SerializeSeq};
+use crate::{handle::CollectionMeta, manifest::Manifest};
+use logpose_types::{LogPoseError, Result, SeqNo, schema::CollectionSchema};
+use logpose_wal::codec::{RowImage, WirePk};
 use std::{fmt, sync::Arc};
 
 /// Identifier of a published [`Version`]. Strictly increasing per collection (I6).
@@ -19,7 +21,7 @@ pub struct VersionId(pub u64);
 pub struct VersionCounters {
     /// Segments in the manifest.
     pub segment_count: u32,
-    /// Operations in the mutable delta.
+    /// Operations in the mutable delta (one per sequence number).
     pub memtable_rows: u64,
     /// Approximate bytes of the mutable delta, as the flush trigger measures them.
     pub memtable_bytes: u64,
@@ -34,6 +36,8 @@ pub struct Version {
     pub id: VersionId,
     /// Identity and configuration of the collection.
     pub meta: Arc<CollectionMeta>,
+    /// The schema as of `visible_seq_no`. Readers map names to field ids with this schema only.
+    pub schema: Arc<CollectionSchema>,
     /// Last sequence number of the last batch included (I3).
     pub visible_seq_no: SeqNo,
     /// Durable manifest generation at publish time.
@@ -47,14 +51,11 @@ pub struct Version {
 }
 
 impl Version {
-    /// The first version of a recovered or created collection.
-    pub(crate) fn initial(meta: Arc<CollectionMeta>, manifest: Manifest, delta: DeltaLog) -> Self {
-        Self::build(VersionId(1), meta, Arc::new(manifest), delta)
-    }
-
-    fn build(
+    /// A version over `manifest` and `delta`.
+    pub(crate) fn build(
         id: VersionId,
         meta: Arc<CollectionMeta>,
+        schema: Arc<CollectionSchema>,
         manifest: Arc<Manifest>,
         delta: DeltaLog,
     ) -> Self {
@@ -62,6 +63,7 @@ impl Version {
         Self {
             id,
             meta,
+            schema,
             visible_seq_no,
             manifest_generation: manifest.generation,
             checkpoint_seq_no: manifest.checkpoint_seq_no,
@@ -75,44 +77,31 @@ impl Version {
         }
     }
 
-    /// The successor of this version with `records` (one committed batch) appended.
-    pub(crate) fn with_batch(&self, records: Vec<WalRecord>) -> Self {
-        Self::build(
-            self.next_id(),
-            Arc::clone(&self.meta),
-            Arc::clone(&self.manifest),
-            self.delta.appended(records),
-        )
+    /// The operations above the checkpoint.
+    #[must_use]
+    pub fn delta_len(&self) -> usize {
+        self.delta.len()
     }
 
-    /// The successor of this version over a new manifest and delta (flush, compaction, or a
-    /// reload from disk).
-    pub(crate) fn with_state(&self, manifest: Manifest, delta: DeltaLog) -> Self {
-        Self::build(
-            self.next_id(),
-            Arc::clone(&self.meta),
-            Arc::new(manifest),
-            delta,
-        )
-    }
-
-    /// The successor of this version over a new manifest, keeping the delta (compaction).
-    pub(crate) fn with_manifest(&self, manifest: Manifest) -> Self {
-        Self::build(
-            self.next_id(),
-            Arc::clone(&self.meta),
-            Arc::new(manifest),
-            self.delta.clone(),
-        )
-    }
-
-    fn next_id(&self) -> VersionId {
-        VersionId(self.id.0 + 1)
+    /// The latest row image for `pk` in the mutable delta as of this version, with its sequence
+    /// number, if the key's last operation there is a put. `None` when the key was deleted or has
+    /// no operation in the delta.
+    #[cfg(test)]
+    pub(crate) fn delta_image(&self, pk: &WirePk) -> Option<(SeqNo, &RowImage)> {
+        self.delta
+            .iter()
+            .rev()
+            .find_map(|record| match &record.op {
+                DeltaOp::Put(image) if &image.pk == pk => Some(Some((record.seq_no, image))),
+                DeltaOp::Delete(deleted) if deleted == pk => Some(None),
+                _ => None,
+            })?
     }
 
     /// Check the invariants every published version must satisfy: `visible_seq_no` is the last
-    /// sequence number included (I3), the delta is contiguous above the checkpoint, and the
-    /// counters equal the values computed from the state (I13).
+    /// sequence number included (I3), the delta is contiguous above the checkpoint, the schema
+    /// changes in the delta end at the version's schema, and the counters equal the values
+    /// computed from the state (I13).
     pub fn check_invariants(&self) -> Result<()> {
         let fail = |message: String| {
             Err(LogPoseError::internal(format!(
@@ -122,6 +111,7 @@ impl Version {
             )))
         };
         let mut expected = None::<SeqNo>;
+        let mut schema_version = None;
         for record in self.delta.iter() {
             if record.seq_no <= self.checkpoint_seq_no {
                 return fail(format!(
@@ -138,6 +128,21 @@ impl Version {
                 ));
             }
             expected = Some(record.seq_no + 1);
+            if let DeltaOp::SchemaChange {
+                schema_version: version,
+            } = record.op
+            {
+                schema_version = Some(version);
+            }
+        }
+        if let Some(version) = schema_version
+            && version > self.schema.schema_version()
+        {
+            return fail(format!(
+                "the delta changes the schema to version {version}, but the version's schema is \
+                 at {}",
+                self.schema.schema_version()
+            ));
         }
         if self.visible_seq_no != visible_seq_no(&self.manifest, &self.delta) {
             return fail(format!("visible_seq_no {} is stale", self.visible_seq_no));
@@ -147,7 +152,10 @@ impl Version {
         {
             return fail("manifest summary does not match the manifest".to_owned());
         }
-        let recomputed = DeltaLog::from_records(self.delta.iter().cloned().collect());
+        let mut recomputed = DeltaLog::default();
+        for batch in self.delta.batches() {
+            recomputed.append(batch.to_vec());
+        }
         let counters = VersionCounters {
             segment_count: u32::try_from(self.manifest.segments.len()).unwrap_or(u32::MAX),
             memtable_rows: recomputed.len() as u64,
@@ -169,6 +177,7 @@ impl fmt::Debug for Version {
             .debug_struct("Version")
             .field("id", &self.id)
             .field("collection", &self.meta.reference)
+            .field("schema_version", &self.schema.schema_version())
             .field("visible_seq_no", &self.visible_seq_no)
             .field("manifest_generation", &self.manifest_generation)
             .field("checkpoint_seq_no", &self.checkpoint_seq_no)
@@ -186,48 +195,119 @@ pub(crate) fn visible_seq_no(manifest: &Manifest, delta: &DeltaLog) -> SeqNo {
     })
 }
 
+/// One operation of the mutable delta, in the v2 data model.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DeltaOp {
+    /// A complete row image, keyed by field id.
+    Put(RowImage),
+    /// A delete by key.
+    Delete(WirePk),
+    /// A schema change to `schema_version`. Consumes its sequence number and changes no row;
+    /// the schema itself is on the `Version`.
+    SchemaChange {
+        /// The schema version the change produced.
+        schema_version: u64,
+    },
+}
+
+impl DeltaOp {
+    /// Approximate bytes, as the flush trigger measures them.
+    fn approximate_bytes(&self) -> u64 {
+        let pk_len = |pk: &WirePk| match pk {
+            WirePk::Int64(_) => 8,
+            WirePk::String(value) => value.len() as u64,
+        };
+        match self {
+            Self::Put(image) => {
+                pk_len(&image.pk)
+                    + image
+                        .vectors
+                        .iter()
+                        .map(|(_, vector)| vector.as_bytes().len() as u64)
+                        .sum::<u64>()
+                    + image
+                        .scalars
+                        .iter()
+                        .map(|(_, value)| value.as_bytes().len() as u64)
+                        .sum::<u64>()
+                    + image
+                        .dynamic
+                        .as_ref()
+                        .map_or(0, |dynamic| dynamic.as_bytes().len() as u64)
+                    + 32
+            }
+            Self::Delete(pk) => pk_len(pk) + 16,
+            Self::SchemaChange { .. } => 16,
+        }
+    }
+}
+
+/// One delta operation and its sequence number.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeltaRecord {
+    pub(crate) seq_no: SeqNo,
+    pub(crate) op: DeltaOp,
+}
+
 /// Batches per sealed chunk of a [`DeltaLog`].
 const CHUNK_BATCHES: usize = 64;
 
-/// The mutable delta: WAL records above the manifest checkpoint, oldest first.
+/// The mutable delta: operations above the manifest checkpoint, oldest first, grouped by the
+/// atomic batch (one WAL frame) they were committed in.
 ///
 /// A persistent append-only log. Cloning is O(1) and appending a batch copies at most
-/// `CHUNK_BATCHES` pointers plus one pointer per sealed chunk, so the writer can derive the next
-/// `Version` while readers keep iterating older ones.
+/// `CHUNK_BATCHES` pointers plus one pointer per sealed chunk, and only when the log is shared
+/// (copy on write keyed on sharing, never on a published flag), so the writer can derive the
+/// next `Version` while readers keep iterating older ones.
 #[derive(Clone, Default)]
 pub(crate) struct DeltaLog {
     /// Full chunks of `CHUNK_BATCHES` batches each.
-    sealed: Arc<Vec<Arc<[Arc<[WalRecord]>]>>>,
+    sealed: Arc<Vec<Arc<[Arc<[DeltaRecord]>]>>>,
     /// The chunk being filled; fewer than `CHUNK_BATCHES` batches.
-    open: Arc<Vec<Arc<[WalRecord]>>>,
+    open: Arc<Vec<Arc<[DeltaRecord]>>>,
     len: usize,
     bytes: u64,
 }
 
 impl DeltaLog {
-    /// A log holding `records` as one batch.
-    pub(crate) fn from_records(records: Vec<WalRecord>) -> Self {
-        Self::default().appended(records)
-    }
-
-    /// This log with `records` appended as one batch. An empty batch is ignored.
-    pub(crate) fn appended(&self, records: Vec<WalRecord>) -> Self {
+    /// Append `records` as one batch. An empty batch is ignored.
+    pub(crate) fn append(&mut self, records: Vec<DeltaRecord>) {
         if records.is_empty() {
-            return self.clone();
+            return;
         }
-        let mut next = self.clone();
-        next.len += records.len();
-        next.bytes += records
+        self.len += records.len();
+        self.bytes += records
             .iter()
-            .map(|record| approximate_record_bytes(&record.op) as u64)
+            .map(|record| record.op.approximate_bytes())
             .sum::<u64>();
-        let open = Arc::make_mut(&mut next.open);
+        let open = Arc::make_mut(&mut self.open);
         open.push(Arc::from(records));
         if open.len() == CHUNK_BATCHES {
             let chunk = Arc::from(std::mem::take(open));
-            Arc::make_mut(&mut next.sealed).push(chunk);
+            Arc::make_mut(&mut self.sealed).push(chunk);
         }
-        next
+    }
+
+    /// The log without the batches at or below `seq_no`. Batches never straddle a checkpoint,
+    /// so a batch is kept or dropped whole.
+    pub(crate) fn after(&self, seq_no: SeqNo) -> Self {
+        let mut kept = Self::default();
+        for batch in self.batches() {
+            if batch.last().is_some_and(|record| record.seq_no > seq_no) {
+                kept.len += batch.len();
+                kept.bytes += batch
+                    .iter()
+                    .map(|record| record.op.approximate_bytes())
+                    .sum::<u64>();
+                let open = Arc::make_mut(&mut kept.open);
+                open.push(Arc::clone(batch));
+                if open.len() == CHUNK_BATCHES {
+                    let chunk = Arc::from(std::mem::take(open));
+                    Arc::make_mut(&mut kept.sealed).push(chunk);
+                }
+            }
+        }
+        kept
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -247,18 +327,17 @@ impl DeltaLog {
         self.iter().next_back().map(|record| record.seq_no)
     }
 
-    /// Records oldest first; reversible for newest-first resolution.
-    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &WalRecord> + '_ {
+    /// Batches oldest first.
+    pub(crate) fn batches(&self) -> impl DoubleEndedIterator<Item = &Arc<[DeltaRecord]>> + '_ {
         self.sealed
             .iter()
             .flat_map(|chunk| chunk.iter())
             .chain(self.open.iter())
-            .flat_map(|batch| batch.iter())
     }
 
-    /// A copy of every record, oldest first.
-    pub(crate) fn to_vec(&self) -> Vec<WalRecord> {
-        self.iter().cloned().collect()
+    /// Records oldest first; reversible for newest-first resolution.
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &DeltaRecord> + '_ {
+        self.batches().flat_map(|batch| batch.iter())
     }
 }
 
@@ -272,27 +351,16 @@ impl fmt::Debug for DeltaLog {
     }
 }
 
-impl Serialize for DeltaLog {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.len))?;
-        for record in self.iter() {
-            seq.serialize_element(record)?;
-        }
-        seq.end()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::put;
 
-    fn records(first: SeqNo, count: usize) -> Vec<WalRecord> {
+    fn records(first: SeqNo, count: usize) -> Vec<DeltaRecord> {
         (first..)
             .take(count)
-            .map(|seq_no| WalRecord {
+            .map(|seq_no| DeltaRecord {
                 seq_no,
-                op: put(&format!("id-{seq_no}"), vec![1.0, 0.0]),
+                op: DeltaOp::Delete(WirePk::String(format!("id-{seq_no}"))),
             })
             .collect()
     }
@@ -305,7 +373,7 @@ mod tests {
         for batch in 0..(CHUNK_BATCHES * 2 + 5) {
             let size = batch % 3 + 1;
             snapshots.push((log.clone(), next - 1));
-            log = log.appended(records(next, size));
+            log.append(records(next, size));
             next += size as SeqNo;
         }
         let all = log.iter().map(|record| record.seq_no).collect::<Vec<_>>();
@@ -327,12 +395,36 @@ mod tests {
         let batch = records(1, 3);
         let expected = batch
             .iter()
-            .map(|record| approximate_record_bytes(&record.op) as u64)
+            .map(|record| record.op.approximate_bytes())
             .sum::<u64>();
-        let log = DeltaLog::default().appended(batch).appended(Vec::new());
+        let mut log = DeltaLog::default();
+        log.append(batch);
+        log.append(Vec::new());
         assert_eq!(log.bytes(), expected);
         assert_eq!(log.len(), 3);
         assert!(DeltaLog::default().is_empty());
         assert_eq!(DeltaLog::default().last_seq_no(), None);
+    }
+
+    #[test]
+    fn after_keeps_whole_batches_above_the_checkpoint() {
+        let mut log = DeltaLog::default();
+        let mut next = 1;
+        for size in [2, 3, 1, 4] {
+            log.append(records(next, size));
+            next += size as SeqNo;
+        }
+        let kept = log.after(5);
+        assert_eq!(
+            kept.iter().map(|record| record.seq_no).collect::<Vec<_>>(),
+            (6..=10).collect::<Vec<_>>()
+        );
+        assert_eq!(kept.len(), 5);
+        let mut expected = DeltaLog::default();
+        expected.append(records(6, 1));
+        expected.append(records(7, 4));
+        assert_eq!(kept.bytes(), expected.bytes());
+        assert!(log.after(10).is_empty());
+        assert_eq!(log.after(0).len(), 10);
     }
 }

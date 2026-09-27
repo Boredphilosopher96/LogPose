@@ -2,8 +2,6 @@
 
 use crate::engine::EngineCore;
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::SeqNo;
-use logpose_wal::ACTIVE_WAL_FILE_NAME;
 use std::path::PathBuf;
 
 impl EngineCore {
@@ -33,18 +31,9 @@ impl EngineCore {
             .join("descriptor.json")
     }
 
-    pub(crate) fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join(ACTIVE_WAL_FILE_NAME)
-    }
-
-    pub(crate) fn rolled_wal_path(
-        descriptor: &CollectionDescriptor,
-        checkpoint_seq_no: SeqNo,
-    ) -> PathBuf {
-        descriptor
-            .root_path
-            .join("wal")
-            .join(format!("{checkpoint_seq_no:020}.wal"))
+    /// The collection's WAL directory: `wal/<first seq no:020>.wal` files.
+    pub(crate) fn wal_dir(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("wal")
     }
 
     pub(crate) fn flat_index_file_path(
@@ -83,10 +72,6 @@ impl EngineCore {
 
     pub(crate) fn current_manifest_pointer(descriptor: &CollectionDescriptor) -> PathBuf {
         descriptor.root_path.join("CURRENT")
-    }
-
-    pub(crate) fn pending_rotation_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("wal").join("PENDING_ROTATION")
     }
 
     pub(crate) fn descriptor_path(descriptor: &CollectionDescriptor) -> PathBuf {

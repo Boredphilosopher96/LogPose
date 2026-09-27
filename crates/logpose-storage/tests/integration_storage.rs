@@ -17,6 +17,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
+use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
@@ -38,9 +39,6 @@ use std::{
     fs,
     time::{Duration, Instant},
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
@@ -731,60 +729,8 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
 }
 
 #[tokio::test]
-async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
-    let root = support::unique_temp_dir("storage-active-wal-crash-window");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
-        .await
-        .expect("write should succeed");
-    let flushed = engine
-        .flush("documents")
-        .await
-        .expect("flush should succeed");
-
-    let rolled_wal_path = descriptor
-        .root_path
-        .join("wal")
-        .join(format!("{:020}.wal", flushed.visible_seq_no));
-    let rolled_bytes = fs::read(&rolled_wal_path).expect("rolled wal should exist");
-    fs::write(
-        descriptor.root_path.join("wal").join("active.wal"),
-        rolled_bytes,
-    )
-    .expect("active wal should be repopulated");
-
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let stats = reopened
-        .stats("documents")
-        .await
-        .expect("stats should load after reopen");
-    assert_eq!(stats.segment_count, 1);
-    assert_eq!(stats.live_record_count, 1);
-    assert_eq!(stats.mutable_op_count, 0);
-}
-
-#[tokio::test]
-async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending() {
-    let root = support::unique_temp_dir("storage-pending-rotation-active-wal");
+async fn older_snapshots_replay_exactly_their_generations_wal_after_a_flush() {
+    let root = support::unique_temp_dir("storage-old-snapshot-rotated-wal");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
     let descriptor = engine
@@ -811,111 +757,33 @@ async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending(
         .snapshot("documents")
         .await
         .expect("pre-flush snapshot should succeed");
-    let flushed = engine
+    engine
         .flush("documents")
         .await
         .expect("flush should succeed");
-
-    fs::write(
-        descriptor.root_path.join("wal").join("active.wal"),
-        b"corrupt checkpointed active wal",
-    )
-    .expect("corrupted active wal should be written");
-    fs::write(
-        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
-        flushed.visible_seq_no.to_string(),
-    )
-    .expect("pending rotation marker should be written");
-
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let stats = reopened
-        .stats("documents")
+    engine
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![0.0, 1.0],
+                metadata: json!({"version":1}),
+            })],
+        )
         .await
-        .expect("checkpointed active wal corruption should be ignored when rotation was pending");
-    assert_eq!(stats.live_record_count, 1);
-    assert_eq!(stats.mutable_op_count, 0);
-
-    let snapshot_stats = reopened
-        .stats_snapshot("documents", Some(flushed.clone()))
-        .await
-        .expect("explicit current-manifest snapshots should also honor pending rotation recovery");
-    assert_eq!(snapshot_stats.live_record_count, 1);
-    assert_eq!(snapshot_stats.mutable_op_count, 0);
-
-    let visible = reopened
-        .scan_exact("documents", Some(flushed))
-        .await
-        .expect("explicit scans should recover after pending rotation cleanup");
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].id.as_str(), "alpha");
-
-    let old_snapshot_stats = reopened
-        .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
-        .await
-        .expect("older snapshots should also survive pending rotation recovery");
+        .expect("write after the flush should succeed");
     assert_eq!(
-        old_snapshot_stats.manifest_generation,
-        pre_flush_snapshot.manifest_generation
+        wal_file_count(&descriptor.root_path),
+        2,
+        "the flush rotated the WAL"
     );
-    assert_eq!(old_snapshot_stats.live_record_count, 1);
-    assert_eq!(old_snapshot_stats.segment_count, 0);
-    assert_eq!(old_snapshot_stats.mutable_op_count, 1);
-
-    let old_snapshot_visible = reopened
-        .scan_exact("documents", Some(pre_flush_snapshot))
-        .await
-        .expect("older explicit snapshots should recover after pending rotation cleanup");
-    assert_eq!(old_snapshot_visible.len(), 1);
-    assert_eq!(old_snapshot_visible[0].id.as_str(), "alpha");
-}
-
-#[tokio::test]
-async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_survives() {
-    let root = support::unique_temp_dir("storage-pending-rotation-rotated-wal");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
-        .await
-        .expect("write should succeed");
-    let pre_flush_snapshot = engine
-        .snapshot("documents")
-        .await
-        .expect("pre-flush snapshot should succeed");
-    let flushed = engine
-        .flush("documents")
-        .await
-        .expect("flush should succeed");
-
-    fs::write(
-        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
-        flushed.visible_seq_no.to_string(),
-    )
-    .expect("pending rotation marker should be recreated");
 
     drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let old_snapshot_stats = reopened
         .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
         .await
-        .expect("older snapshots should not double-count rotated wal records");
+        .expect("older snapshots should replay only their own WAL records");
     assert_eq!(old_snapshot_stats.live_record_count, 1);
     assert_eq!(old_snapshot_stats.mutable_op_count, 1);
 
@@ -928,11 +796,11 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
 }
 
 #[tokio::test]
-async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation_recovery() {
-    let root = support::unique_temp_dir("storage-pending-rotation-compaction-history");
+async fn older_snapshots_preserve_pre_compaction_history_across_a_reopen() {
+    let root = support::unique_temp_dir("storage-old-snapshot-compaction-history");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
-    let descriptor = engine
+    engine
         .create_collection(CreateCollectionRequest::new(
             "documents",
             2,
@@ -992,16 +860,10 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
         )
         .await
         .expect("third write should succeed");
-    let flushed = engine
+    engine
         .flush("documents")
         .await
         .expect("third flush should succeed");
-
-    fs::write(
-        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
-        flushed.visible_seq_no.to_string(),
-    )
-    .expect("pending rotation marker should be recreated");
 
     drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
@@ -1024,77 +886,6 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
     assert_eq!(visible[0].metadata["version"], json!(1));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
-    let root = support::unique_temp_dir("storage-pending-rotation-marker-perms");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
-        .await
-        .expect("write should succeed");
-    let flushed = engine
-        .flush("documents")
-        .await
-        .expect("flush should succeed");
-
-    fs::write(
-        descriptor.root_path.join("wal").join("active.wal"),
-        b"corrupt checkpointed active wal",
-    )
-    .expect("corrupted active wal should be written");
-    fs::write(
-        descriptor.root_path.join("wal").join("PENDING_ROTATION"),
-        flushed.visible_seq_no.to_string(),
-    )
-    .expect("pending rotation marker should be written");
-
-    let wal_dir = descriptor.root_path.join("wal");
-    let original_mode = fs::metadata(&wal_dir)
-        .expect("wal dir metadata should exist")
-        .permissions()
-        .mode();
-    fs::set_permissions(&wal_dir, fs::Permissions::from_mode(0o555))
-        .expect("wal dir should become read-only");
-    let probe_path = wal_dir.join("permission_probe");
-    if fs::write(&probe_path, b"probe").is_ok() {
-        let _ = fs::remove_file(&probe_path);
-        fs::set_permissions(&wal_dir, fs::Permissions::from_mode(original_mode))
-            .expect("wal dir permissions should be restored");
-        return;
-    }
-
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let result = reopened.stats("documents").await;
-
-    fs::set_permissions(&wal_dir, fs::Permissions::from_mode(original_mode))
-        .expect("wal dir permissions should be restored");
-
-    let error = result.expect_err("recovery should fail when the rotation marker survives");
-    assert!(
-        error.to_string().contains("pending WAL rotation marker"),
-        "unexpected error: {error}"
-    );
 }
 
 #[tokio::test]
@@ -2108,17 +1899,14 @@ async fn old_snapshot_remains_readable_after_flush() {
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "evt-1");
 
+    // The flush rotated the WAL; the older file stays, because the older snapshot replays it.
     let wal_dir = descriptor.root_path.join("wal");
-    let rolled = fs::read_dir(wal_dir)
+    let wal_files = fs::read_dir(wal_dir)
         .expect("wal dir should exist")
         .filter_map(|entry| entry.ok().map(|value| value.path()))
-        .filter(|path| {
-            path.file_name()
-                .map(|name| name != "active.wal")
-                .unwrap_or(false)
-        })
+        .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
         .count();
-    assert_eq!(rolled, 1);
+    assert_eq!(wal_files, 2);
 }
 
 #[tokio::test]
@@ -2240,4 +2028,13 @@ where
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// WAL files of the collection rooted at `root`.
+fn wal_file_count(root: &std::path::Path) -> usize {
+    fs::read_dir(root.join("wal"))
+        .expect("wal dir should exist")
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
+        .count()
 }

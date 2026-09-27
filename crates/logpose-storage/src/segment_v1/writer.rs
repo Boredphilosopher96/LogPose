@@ -2,6 +2,7 @@
 
 use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader, SegmentPurpose};
 use crate::engine::EngineCore;
+use crate::segment_v1::SegmentRecord;
 use crate::{
     durable_fs::{create_dir_all_synced, sync_parent_dir, write_file_synced},
     error::{io_message, json_message},
@@ -17,7 +18,6 @@ use logpose_index::{
 };
 use logpose_types::{QueryUnitArtifactStats, Result, WriteOperation};
 use logpose_vfs::Vfs;
-use logpose_wal::WalRecord;
 use std::{collections::BTreeSet, io, path::Path};
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ impl EngineCore {
     pub(crate) fn write_segment_file(
         &self,
         descriptor: &CollectionDescriptor,
-        records: &[WalRecord],
+        records: &[SegmentRecord],
         purpose: SegmentPurpose,
     ) -> Result<SegmentMeta> {
         let segment_id = Uuid::new_v4().to_string();
@@ -365,7 +365,7 @@ fn prefixed(context: &str, error: logpose_types::LogPoseError) -> logpose_types:
 }
 
 fn visible_hnsw_entries(
-    records: &[WalRecord],
+    records: &[SegmentRecord],
     entry_sources: &[Option<HnswIndexEntrySource>],
     dimensions: usize,
 ) -> io::Result<Vec<HnswIndexEntrySource>> {
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn visible_hnsw_entries_ignore_shadowed_dimension_mismatches() {
         let records = vec![
-            WalRecord {
+            SegmentRecord {
                 seq_no: 1,
                 op: WriteOperation::Put(PutRecord {
                     id: RecordId::new("alpha"),
@@ -417,7 +417,7 @@ mod tests {
                     metadata: json!({"version":1}),
                 }),
             },
-            WalRecord {
+            SegmentRecord {
                 seq_no: 2,
                 op: WriteOperation::Put(PutRecord {
                     id: RecordId::new("alpha"),
@@ -469,7 +469,7 @@ mod tests {
 
             engine.engine().core().write_segment_file(
                 &descriptor,
-                &[WalRecord {
+                &[SegmentRecord {
                     seq_no: 1,
                     op: WriteOperation::Put(PutRecord {
                         id: RecordId::new("alpha"),
