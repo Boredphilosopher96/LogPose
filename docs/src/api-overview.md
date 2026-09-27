@@ -72,6 +72,16 @@ Snapshot references are used across writes, queries, flushes, and compactions:
 }
 ```
 
+An exact snapshot stays readable only while its manifest generation is current.
+Every flush and compaction publishes a new generation; after that, a read of a
+snapshot from an older generation fails with `FAILED_PRECONDITION` (the storage
+error is `SnapshotExpired`) unless a snapshot token pins that state. Tokens
+are an engine interface for now (`LocalStorageEngine::pin_snapshot`); the API
+exposes them with the new read path. Queries without an explicit snapshot
+restart on their own when a flush lands between their storage reads. Pinning
+more snapshots than a collection allows, or more retired memory than the
+engine allows, fails with `RESOURCE_EXHAUSTED` (HTTP 429).
+
 Collection-scoped write/query/flush/compact/inspect responses flatten
 `database_name` and `collection_name` into the top-level JSON
 payload so operators can tell which namespace produced the response without
@@ -407,7 +417,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | `database_name` | string  | no       | Database namespace; defaults to `default`                                      |
 | `vector`        | float[] | yes      | Query vector                                                                   |
 | `top_k`         | integer | yes      | Maximum results to return (>= 1)                                               |
-| `snapshot`      | object  | no       | Pin query to a specific snapshot                                               |
+| `snapshot`      | object  | no       | Read one exact snapshot; see snapshot retention above                          |
 | `read_barrier`  | object  | no       | Require a lower-bound previously observed snapshot on the current owner; cannot be combined with `snapshot` |
 | `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata                          |
 | `predicate`     | object  | no       | Structured predicate tree (see below)                                          |
@@ -519,7 +529,7 @@ filter selectivity:
 Returns storage statistics, maintenance state, and per-query-unit breakdowns.
 Use the `database` query parameter for non-default namespaces.
 Use `snapshot_manifest_generation` and `snapshot_visible_seq_no` together to inspect
-stats at one exact historical snapshot. Use
+stats at one exact snapshot, retained as described above. Use
 `read_barrier_manifest_generation` and `read_barrier_visible_seq_no`
 together to require the current serving node to expose stats from a snapshot at
 or beyond one previously observed write or read boundary. Exact snapshots and

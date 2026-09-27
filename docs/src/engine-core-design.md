@@ -1536,7 +1536,7 @@ pub struct ManifestSegment {
     pub file_len: u64,
     pub footer_crc: u32,
     pub row_count: u32,
-    pub schema_version: u32,
+    pub schema_version: u64,         // u64, like CollectionSchema and the segment header
     pub min_seq_no: SeqNo,
     pub max_seq_no: SeqNo,
     pub origin: SegmentOrigin, // Flush { memtable_seq_range } | Compaction { inputs: Vec<UnitId> }
@@ -1769,6 +1769,63 @@ A removal is not durable until its directory is synced, so after a crash a remov
 At engine level, a collection directory without `descriptor.json` (a create that crashed before its commit point) and any `*.dropped` directory are removed with `remove_dir_all`.
 
 Collection create commits by writing `descriptor.json` last (temp file, fsync, rename, directory fsyncs of the collection directory and `collections/`), after the subdirectories, an empty generation-0 manifest, `CURRENT`, and the first WAL file exist. Drop renames the directory to `<uuid>.dropped`, syncs `collections/`, unregisters the handle, and removes the tree once the last `Version` is released.
+
+### Implementation Notes (PR 6)
+
+PR 6 replaces the JSON manifest with manifest v2 and the `CURRENT` protocol, burns ids on failed commits, adds version-refcount GC, orphan cleanup and the recovery durability barrier, and replaces historical snapshot reads with snapshot tokens. Where it differs from, or is more specific than, the sections above ([Manifest v2 and CURRENT](#manifest-v2-and-current), [Garbage Collection](#garbage-collection), [Snapshot Tokens](#snapshot-tokens), [Recovery on Open](#recovery-on-open)), this list is the current contract. It supersedes the "historical snapshots" bullet of the PR 3 notes and the "checkpointed WAL files are kept" bullet of the PR 5 notes.
+
+- **Manifest file.** `manifest.rs` implements the layout above: `manifests/<generation:020>.mf` with the 32-byte header (`LPMANIF2`, generation, payload length, CRC-32C of the payload, CRC-32C of header bytes 0..28) and a postcard `Manifest`. Decoding also rejects a header generation that differs from the payload's, a `format_version` other than 2, and segments that are not strictly ascending by unit or not below `next_unit_id`. Every failure is `Corrupt { kind: Manifest, .. }`. `CURRENT` must be exactly 21 bytes, twenty digits and a newline. A version 1 layout, whose `CURRENT` holds a bare number, fails the collection's open as manifest corruption, and recovery changes nothing.
+- **`ManifestSegment.schema_version` is `u64`**, like `CollectionSchema::schema_version` and the segment v2 header. The sketch above used `u32`.
+- **Transitional v1 entries.** Until PR 10 writes segment v2, each `ManifestSegment` describes a v1 segment. `file_len` is the `.lps` length, `row_count` is its entry count, `footer_crc = 0`, `dv = None`, and `vectors` and `zones` are empty. `origin` and `tier = 0` are filled. The v1 statistics the legacy read paths need go in `legacy: Option<SegmentMeta>`. Postcard cannot decode their untagged JSON values, so that one field is stored as JSON bytes. v1 segment files are named by unit: `segments/<unit:08x>.lps`, `indexes/<unit:08x>.{flat.json,hnsw.bin}`, staged as `tmp/<unit:08x>.*.tmp`. The query layer's unit id for a segment is the same eight hex digits. PR 10 deletes `legacy`, the `indexes/` and `tmp/` directories, and this naming.
+- **Publish protocol.** `publish_manifest` runs steps 1 to 5 with their crash points. A failure in steps 1 to 3 reports `current_unknown = false`. A failure of the rename (step 4) or of the collection-directory sync (step 5) reports `true`, and the writer then poisons the collection. Collection create publishes generation 0 through the same protocol before `descriptor.json` is written.
+- **Id allocation.**
+  - `BeginJob` allocates the job's unit id from the writer's `next_unit_id` and replies with a `JobStart { version, unit }`.
+  - `CommitJob` takes the next generation from `next_manifest_gen`, which advances on every attempt, and records `next_unit_id` in the manifest. The job's unit must be the one it was given.
+  - A publish that fails before the rename removes the job's unit files and the partial `<g>.mf` before replying. A job that ends without committing sends `EndJob { wrote_files }`, and its files are removed only if it created any.
+  - At open, orphan cleanup reports the first unit id and generation above every one it saw on disk, removed leftovers included. The writer starts from those, not from the manifest's counters, so even an in-process reopen never issues a name a failed attempt used. `next_dv_gen` is carried forward unchanged until DV files exist (PR 10).
+- **Version-refcount GC.**
+  - `gc.rs` holds `FileHandle`, one per segment unit, listing that unit's files, and the engine-wide `GcQueue`. It does not yet hold the open `VfsFile` or the cache registration, because v1 readers open files by path. PR 10 moves the segment v2 reader's cache registration into it.
+  - The writer keeps `live_files`. Every `Version` holds the handles of its manifest's segments in `files`, and `check_invariants` checks that they match the manifest.
+  - After a compaction's manifest is durable, the writer marks each input obsolete, publishes the new `Version`, and only then drops its own references. Whoever drops the last reference enqueues the removal: the writer, a reader, or the token reaper. `CollectionState` keeps the `Arc<Version>` for the whole legacy read, because v1 reads open segment files by path.
+  - The queue drains on the I/O pool: `remove_file` (missing files are fine), `GcAfterRemove`, then one directory sync per touched directory. It holds only a `Weak` engine reference and a tracked `CoreRef` while it drains. After shutdown starts it drops what is pending, and orphan cleanup redoes it at the next open. `Engine::wait_for_gc` and `Engine::gc_removed_files` exist for tests and diagnostics.
+- **Manifests and WAL files.**
+  - After each commit the writer enqueues the manifest generation older than the previous durable one, so the current generation and one before it stay on disk.
+  - After a flush commit it calls `WalWriter::remove_checkpointed(C)` on the I/O pool, once the manifest with checkpoint `C` is durable. A removal failure is logged and retried at the next checkpoint. The writer is poisoned only if the I/O job itself is lost.
+  - Recovery calls `remove_checkpointed` after `into_writer`, which is equivalent to step 3 of orphan cleanup: `WalRecovery::open` never reads those files.
+  - `logpose_wal::read_committed` is deleted, because no read goes back to the WAL.
+- **Durability barrier and orphan cleanup.**
+  - `open_collection` runs `durability_barrier` first. It syncs the collection directory and each of `manifests/`, `segments/`, `indexes/` and `tmp/` that exists. The WAL layer's own barrier already covers `wal/` and its files inside `WalRecovery::open`, after the fence check.
+  - Then it reads `CURRENT`, loads the manifest, and checks its `collection_id` against the descriptor.
+  - Then `remove_orphans` runs:
+    - It removes every v1 segment or sidecar whose unit is not in the manifest, every `.tmp` file, and everything in `tmp/`.
+    - It removes every manifest generation but the current one and the newest one below it (gaps are tolerated), and removes `CURRENT.tmp`.
+    - It syncs each directory it changed and reports `RecoveryAfterOrphanCleanup`.
+    - Files it does not recognize are left alone.
+  - Only then does WAL recovery start. `maintenance.json` stays until the scheduler replaces it; it is written only after the barrier.
+- **Snapshot tokens.**
+  - `tokens.rs` holds `SnapshotToken` (the 36-byte layout above, base64url without padding, so 48 characters) and the per-collection `TokenRegistry`. `clock.rs` holds `Clock`, `SystemClock` and `ManualClock`.
+  - `EngineConfig` gains `tokens: TokenConfig { ttl (5 min), max_per_collection (64), memory_limit (256 MiB), reaper_interval (1 s) }` and `clock`. The design's `token_memory_limit` is `TokenConfig::memory_limit`. Its default is fixed, because there is no memtable budget until PR 10.
+  - `CollectionHandle` gains `pin_snapshot`, `pin_version`, `snapshot_version` (resolves a token and slides its expiry), `release_snapshot`, `pinned_snapshots` and `pinned_retired_bytes`. `LocalStorageEngine` gains `pin_snapshot`, `release_snapshot`, `scan_exact_at_token` and `stats_at_token`. A token of another collection, or an unknown, released or expired token, fails with `SnapshotExpired`.
+  - Expired pins never count against `max_per_collection`. Pinned versions are dropped outside the registry lock, and the reaper drops them on the maintenance pool.
+- **Pinned-memory limit.**
+  - Until memtables exist, the retired memtable a pin holds is the delta batches at or below the current checkpoint. `DeltaLog` keeps per-chunk byte and sequence totals, so `bytes_in(after, through)` is O(chunks). A collection's pinned retired bytes are the union of the ranges `(checkpoint, min(visible, current checkpoint)]` over its pins, with each batch counted once.
+  - A new pin fails with `TooManySnapshots` while the engine-wide total is above the limit. The engine-wide reaper, a task on the writer runtime, first drops expired pins. It then expires the oldest pins that hold retired bytes, engine-wide by creation order, until the total fits. `Engine::reap_snapshots` runs one pass synchronously.
+- **Historical reads.**
+  - `EngineCore::read_state` resolves a `ReadAt`. With no snapshot, it reads the current `Version`. An exact `Snapshot` of the current generation reads the current `Version` up to its sequence number. An exact `Snapshot` of an older generation reads a pinned `Version` of that generation whose range covers it, and fails with `SnapshotExpired` otherwise. A token reads exactly the `Version` it pins.
+  - Nothing is loaded from disk, so `load_historical_state` is deleted. Tokens do not survive a restart.
+  - `logpose_query::query_exact` restarts a query that carries no snapshot, up to three attempts, when a flush or compaction lands between its storage calls. A query with an explicit snapshot fails instead.
+  - The API has no way to pin yet (`ReadOptions { pin }` arrives with the read path in PR 12). Over the API, an exact snapshot therefore stays readable only while its generation is current.
+- **Errors.** `LogPoseError::SnapshotExpired { collection, reason }` maps to `FAILED_PRECONDITION`. `LogPoseError::TooManySnapshots { collection, reason }`, where the reason names the count or the memory limit, maps to `RESOURCE_EXHAUSTED` and HTTP 429. `UnitId` moves to `logpose-types`.
+- **Tests.**
+  - `manifest/tests.rs`: codec round trip; every flipped byte is detected; `CURRENT` format; an exhaustive crash at every operation of a publish, for four seeds under every `TearMode`, leaves a complete old or new manifest; the five named publish crash points give the table's outcome; each failed step reports `current_unknown` correctly and the retry burns the generation.
+  - `gc/tests.rs`: orphan cleanup removes exactly the unreferenced files, and a crash at every one of its operations converges on rerun without ever removing a live file; the barrier makes a page-cache-only `CURRENT` durable; a compacted-away segment is removed only after the last `Version` and token holding it are released; WAL files and old manifests are removed only after a durable checkpoint; an abandoned job leaves no files.
+  - `recovery/tests.rs`: a crash at every operation of a flush, under every `TearMode`, recovers the same rows with no orphans; recovery interrupted at every operation converges; a failed `CURRENT` rename poisons, and an in-process reopen, a retry that never reuses a unit or generation, and a crash all agree; a failed sync, then an in-process reopen, then a crash reopen the same state for the directory sync, the `CURRENT.tmp` sync and the manifest sync; planted orphans are removed at open and their ids are never issued; named `GcAfterRemove` and `RecoveryAfterOrphanCleanup` crashes.
+  - `tokens/tests.rs`: token codec and RFC 4648 vectors; sliding expiry; release; limits; reaping; covering-snapshot lookup; retired-byte accounting; reads through a token are exact across deletes, flushes and a compaction; unpinned snapshots expire; TTL on the manual clock; the per-collection cap; the memory limit refuses pins and expires the oldest.
+  - The storage and crash-recovery harnesses now pin their snapshots and expect `SnapshotExpired` for unpinned snapshots of an older generation and after a restart. The randomized model takes manifest generations from the engine, because burned generations leave gaps.
+- **Left for later.**
+  - PR 10: segment v2 entries with `footer_crc`, DV references, `vectors`, `zones`, `next_dv_gen` and real tiers; `FileHandle` holding the open file and the cache registration; the pinned-memory accounting over real retired memtables and the memtable budget.
+  - PR 12: `ReadOptions { pin }` and tokens in the API (proto, OpenAPI).
+  - The scheduler PR: deleting `maintenance.json`.
 
 ## Buffer Cache
 
