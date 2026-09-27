@@ -31,8 +31,8 @@ use logpose_auth::{
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId, Snapshot,
-    WriteOperation,
+    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, LogPoseError, PutRecord, RecordId,
+    Snapshot, WriteOperation,
 };
 use serde_json::{Value, json};
 use std::{
@@ -670,7 +670,7 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
 }
 
 #[tokio::test]
-async fn older_snapshots_replay_exactly_their_generations_wal_after_a_flush() {
+async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart() {
     let root = support::unique_temp_dir("storage-old-snapshot-rotated-wal");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
@@ -694,10 +694,7 @@ async fn older_snapshots_replay_exactly_their_generations_wal_after_a_flush() {
         )
         .await
         .expect("write should succeed");
-    let pre_flush_snapshot = engine
-        .snapshot("documents")
-        .await
-        .expect("pre-flush snapshot should succeed");
+    let (token, pre_flush_snapshot) = engine.pin_snapshot("documents").expect("pin");
     engine
         .flush("documents")
         .await
@@ -715,29 +712,50 @@ async fn older_snapshots_replay_exactly_their_generations_wal_after_a_flush() {
         .expect("write after the flush should succeed");
     assert_eq!(
         wal_file_count(&descriptor.root_path),
-        2,
-        "the flush rotated the WAL"
+        1,
+        "the flush rotated the WAL and deleted the checkpointed file"
     );
 
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let old_snapshot_stats = reopened
-        .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
+    let old_snapshot_stats = engine
+        .stats_at_token("documents", token.clone())
         .await
-        .expect("older snapshots should replay only their own WAL records");
+        .expect("the pinned state is readable");
     assert_eq!(old_snapshot_stats.live_record_count, 1);
     assert_eq!(old_snapshot_stats.mutable_op_count, 1);
-
-    let visible = reopened
-        .scan_exact("documents", Some(pre_flush_snapshot))
+    assert_eq!(
+        old_snapshot_stats.manifest_generation,
+        pre_flush_snapshot.manifest_generation
+    );
+    let visible = engine
+        .scan_exact("documents", Some(pre_flush_snapshot.clone()))
         .await
-        .expect("older snapshots should remain readable");
+        .expect("the exact snapshot a token pins stays readable");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
+
+    // Pins live in memory: a restart ends them.
+    drop(engine);
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let error = reopened
+        .scan_exact_at_token("documents", token)
+        .await
+        .expect_err("tokens do not survive a restart");
+    assert!(
+        matches!(error, LogPoseError::SnapshotExpired { .. }),
+        "{error}"
+    );
+    let error = reopened
+        .stats_snapshot("documents", Some(pre_flush_snapshot))
+        .await
+        .expect_err("an older generation is not retained");
+    assert!(
+        matches!(error, LogPoseError::SnapshotExpired { .. }),
+        "{error}"
+    );
 }
 
 #[tokio::test]
-async fn older_snapshots_preserve_pre_compaction_history_across_a_reopen() {
+async fn a_pinned_snapshot_preserves_pre_compaction_history() {
     let root = support::unique_temp_dir("storage-old-snapshot-compaction-history");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
@@ -761,10 +779,7 @@ async fn older_snapshots_preserve_pre_compaction_history_across_a_reopen() {
         )
         .await
         .expect("first write should succeed");
-    let old_snapshot = engine
-        .snapshot("documents")
-        .await
-        .expect("old snapshot should be captured before flush");
+    let (token, old_snapshot) = engine.pin_snapshot("documents").expect("pin");
     engine
         .flush("documents")
         .await
@@ -806,12 +821,10 @@ async fn older_snapshots_preserve_pre_compaction_history_across_a_reopen() {
         .await
         .expect("third flush should succeed");
 
-    drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let old_snapshot_stats = reopened
-        .stats_snapshot("documents", Some(old_snapshot.clone()))
+    let old_snapshot_stats = engine
+        .stats_at_token("documents", token.clone())
         .await
-        .expect("older snapshot stats should remain readable after compaction");
+        .expect("pinned stats stay readable after compaction");
     assert_eq!(
         old_snapshot_stats.manifest_generation,
         old_snapshot.manifest_generation
@@ -820,13 +833,27 @@ async fn older_snapshots_preserve_pre_compaction_history_across_a_reopen() {
     assert_eq!(old_snapshot_stats.mutable_op_count, 1);
     assert_eq!(old_snapshot_stats.segment_count, 0);
 
-    let visible = reopened
-        .scan_exact("documents", Some(old_snapshot))
+    let visible = engine
+        .scan_exact_at_token("documents", token.clone())
         .await
-        .expect("older snapshot should preserve the pre-compaction record state");
+        .expect("the pinned state keeps the pre-compaction record");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
     assert_eq!(visible[0].metadata["version"], json!(1));
+
+    assert!(
+        engine
+            .release_snapshot("documents", &token)
+            .expect("release")
+    );
+    let error = engine
+        .scan_exact("documents", Some(old_snapshot))
+        .await
+        .expect_err("released");
+    assert!(
+        matches!(error, LogPoseError::SnapshotExpired { .. }),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1802,7 +1829,7 @@ async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
 }
 
 #[tokio::test]
-async fn old_snapshot_remains_readable_after_flush() {
+async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expires() {
     let root = support::unique_temp_dir("storage-snapshot-flush");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
@@ -1827,27 +1854,39 @@ async fn old_snapshot_remains_readable_after_flush() {
         .await
         .expect("write should succeed");
 
-    let snapshot = engine
+    let unpinned = engine
         .snapshot("events")
         .await
         .expect("snapshot should succeed");
+    let (token, snapshot) = engine.pin_snapshot("events").expect("pin");
+    assert_eq!(snapshot, unpinned);
     engine.flush("events").await.expect("flush should succeed");
 
     let visible = engine
-        .scan_exact("events", Some(snapshot))
+        .scan_exact_at_token("events", token.clone())
         .await
-        .expect("old snapshot should still scan");
+        .expect("the pinned snapshot still scans");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "evt-1");
 
-    // The flush rotated the WAL; the older file stays, because the older snapshot replays it.
+    // Reads never go back to the WAL: the checkpointed file is gone once the flush is durable.
     let wal_dir = descriptor.root_path.join("wal");
     let wal_files = fs::read_dir(wal_dir)
         .expect("wal dir should exist")
         .filter_map(|entry| entry.ok().map(|value| value.path()))
         .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
         .count();
-    assert_eq!(wal_files, 2);
+    assert_eq!(wal_files, 1);
+
+    engine.release_snapshot("events", &token).expect("release");
+    let error = engine
+        .scan_exact("events", Some(unpinned))
+        .await
+        .expect_err("nothing pins the old generation");
+    assert!(
+        matches!(error, LogPoseError::SnapshotExpired { .. }),
+        "{error}"
+    );
 }
 
 #[tokio::test]

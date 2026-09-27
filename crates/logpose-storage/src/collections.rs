@@ -9,7 +9,8 @@ use crate::{
     fs_util::{atomic_write, cleanup_dir, read_json},
     handle::{CollectionHandle, CollectionMeta},
     maintenance::MaintenanceState,
-    manifest::Manifest,
+    manifest::{Manifest, publish_manifest},
+    recovery::DurableStart,
     version::DeltaLog,
     writer::{LogicalState, checkpoint_frame},
 };
@@ -91,8 +92,8 @@ impl EngineCore {
         if let Some(assignment) = assignment {
             self.persist_collection_assignment(descriptor, assignment)?;
         }
-        let manifest = Manifest::empty(descriptor.schema()?);
-        self.publish_manifest(descriptor, &manifest)
+        let manifest = Manifest::empty(descriptor.collection_id.clone(), descriptor.schema()?);
+        publish_manifest(self.vfs.as_ref(), &descriptor.root_path, &manifest)
             .map_err(|failure| failure.error)?;
         self.persist_maintenance_status(descriptor, &MaintenanceStatus::default())?;
         let wal = WalRecovery::open(
@@ -159,7 +160,12 @@ impl CoreRef {
         };
         let handle = self.start_collection(
             meta,
-            Arc::new(manifest),
+            DurableStart {
+                next_manifest_gen: manifest.generation + 1,
+                next_unit_id: manifest.next_unit_id,
+                manifest: Arc::new(manifest),
+                previous_generation: None,
+            },
             state,
             wal,
             MaintenanceState::default(),

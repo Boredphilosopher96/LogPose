@@ -66,7 +66,6 @@ mod error;
 mod fence;
 mod files;
 mod frame;
-mod reader;
 mod recovery;
 mod scan;
 mod writer;
@@ -82,7 +81,6 @@ pub use frame::{
     WalFrame, frame_len,
 };
 pub use logpose_types::WriteOutcome;
-pub use reader::read_committed;
 pub use recovery::{RecoveryReport, ReplayFrame, TailRepair, WalRecovery};
 pub use writer::{GroupCommit, WalWriter};
 

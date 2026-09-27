@@ -58,6 +58,23 @@ struct ControlState {
     fail_syncs: u32,
     /// Creations of paths containing this fail with ENOSPC.
     fail_creates: Option<String>,
+    /// Syncs of files whose path contains this fail with EIO, this many times.
+    fail_file_syncs: Option<(String, u32)>,
+    /// Directory syncs of exactly this directory fail with EIO, this many times.
+    fail_dir_syncs: Option<(PathBuf, u32)>,
+    /// Renames onto paths containing this fail with EIO, this many times.
+    fail_renames: Option<(String, u32)>,
+}
+
+/// Take one failure from `slot` when `matches` accepts its key.
+fn take_failure<K>(slot: &mut Option<(K, u32)>, matches: impl FnOnce(&K) -> bool) -> bool {
+    match slot {
+        Some((key, count)) if *count > 0 && matches(key) => {
+            *count -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 impl ControlledVfs {
@@ -119,10 +136,26 @@ impl ControlledVfs {
     pub(crate) fn fail_creates_containing(&self, fragment: &str) {
         self.state().fail_creates = Some(fragment.to_owned());
     }
+
+    /// Fail the next `count` file syncs of files whose path contains `fragment` with EIO.
+    pub(crate) fn fail_file_syncs_containing(&self, fragment: &str, count: u32) {
+        self.state().fail_file_syncs = Some((fragment.to_owned(), count));
+    }
+
+    /// Fail the next `count` syncs of directory `dir` with EIO.
+    pub(crate) fn fail_dir_syncs(&self, dir: &Path, count: u32) {
+        self.state().fail_dir_syncs = Some((dir.to_path_buf(), count));
+    }
+
+    /// Fail the next `count` renames onto paths containing `fragment` with EIO, changing
+    /// nothing.
+    pub(crate) fn fail_renames_to(&self, fragment: &str, count: u32) {
+        self.state().fail_renames = Some((fragment.to_owned(), count));
+    }
 }
 
 impl Control {
-    fn sync(&self, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    fn sync(&self, path: &Path, sync: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         self.syncs.fetch_add(1, Ordering::SeqCst);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.held {
@@ -136,7 +169,10 @@ impl Control {
             }
             state.waiting -= 1;
         }
-        let fail = state.fail_syncs > 0;
+        let fail = state.fail_syncs > 0
+            || take_failure(&mut state.fail_file_syncs, |fragment| {
+                path.to_string_lossy().contains(fragment.as_str())
+            });
         state.fail_syncs = state.fail_syncs.saturating_sub(1);
         drop(state);
         if fail {
@@ -158,6 +194,7 @@ impl Vfs for ControlledVfs {
         let inner = self.inner.open(path, mode)?;
         Ok(Arc::new(ControlledFile {
             inner,
+            path: path.to_path_buf(),
             control: Arc::clone(&self.control),
         }))
     }
@@ -168,6 +205,11 @@ impl Vfs for ControlledVfs {
         self.inner.list(dir)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if take_failure(&mut self.state().fail_renames, |fragment| {
+            to.to_string_lossy().contains(fragment.as_str())
+        }) {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         self.inner.rename(from, to)
     }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -177,6 +219,9 @@ impl Vfs for ControlledVfs {
         self.inner.remove_dir_all(path)
     }
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        if take_failure(&mut self.state().fail_dir_syncs, |failing| failing == dir) {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         self.inner.sync_dir(dir)
     }
     fn try_lock_exclusive(&self, path: &Path) -> io::Result<Box<dyn VfsLock>> {
@@ -189,6 +234,7 @@ impl Vfs for ControlledVfs {
 
 struct ControlledFile {
     inner: Arc<dyn VfsFile>,
+    path: PathBuf,
     control: Arc<Control>,
 }
 
@@ -203,10 +249,10 @@ impl VfsFile for ControlledFile {
         self.inner.append(bufs)
     }
     fn sync_data(&self) -> io::Result<()> {
-        self.control.sync(|| self.inner.sync_data())
+        self.control.sync(&self.path, || self.inner.sync_data())
     }
     fn sync_all(&self) -> io::Result<()> {
-        self.control.sync(|| self.inner.sync_all())
+        self.control.sync(&self.path, || self.inner.sync_all())
     }
     fn len(&self) -> io::Result<u64> {
         self.inner.len()

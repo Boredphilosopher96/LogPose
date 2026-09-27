@@ -10,7 +10,7 @@ use crate::{
     state::CollectionState,
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation};
+use logpose_types::{RecordId, Result, SeqNo, VisibleRecord, WriteOperation};
 use logpose_vfs::Vfs;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -34,7 +34,7 @@ pub(crate) fn resolve_latest_state_selected(
         resolve_delta(&mut resolved, state, visible_seq_no, |_| true)?;
     }
 
-    for segment in state.manifest.segments.iter().rev().filter(|segment| {
+    for segment in state.manifest.legacy_segments().rev().filter(|segment| {
         immutable_unit_ids
             .as_ref()
             .is_none_or(|selected| selected.contains(&segment.segment_id))
@@ -92,7 +92,7 @@ pub(crate) fn resolve_latest_from_segments(
     manifest: &Manifest,
 ) -> Result<BTreeMap<RecordId, ResolvedState>> {
     let mut resolved = BTreeMap::new();
-    for segment in manifest.segments.iter().rev() {
+    for segment in manifest.legacy_segments().rev() {
         let records = read_segment_file(
             vfs,
             &descriptor
@@ -127,7 +127,7 @@ pub(crate) fn resolve_latest_state_for_ids_selected(
         }
     }
 
-    for segment in state.manifest.segments.iter().rev().filter(|segment| {
+    for segment in state.manifest.legacy_segments().rev().filter(|segment| {
         immutable_unit_ids
             .as_ref()
             .is_none_or(|selected| selected.contains(&segment.segment_id))
@@ -188,11 +188,11 @@ impl EngineCore {
     pub(crate) fn scan_exact_internal(
         &self,
         handle: &CollectionHandle,
-        snapshot: Option<Snapshot>,
+        at: impl Into<crate::state::ReadAt>,
         include_mutable: bool,
         immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
     ) -> Result<Vec<VisibleRecord>> {
-        let (state, snapshot) = self.read_state(handle, snapshot)?;
+        let (state, snapshot) = self.read_state(handle, at)?;
         let resolved = resolve_latest_state_selected(
             self.vfs.as_ref(),
             handle.descriptor(),

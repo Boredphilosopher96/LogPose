@@ -4,12 +4,16 @@
 use crate::{
     BlobStore,
     cache::{BufferCache, CacheConfig},
+    clock::{Clock, SystemClock},
     durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     error::io_message,
-    handle::CollectionHandle,
+    gc::GcQueue,
+    handle::{CollectionHandle, TokenContext},
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
+    tokens::TokenConfig,
+    version::Version,
     writer::{ControlMsg, GroupCommitConfig},
 };
 use logpose_catalog::CollectionDescriptor;
@@ -54,6 +58,11 @@ pub struct EngineConfig {
     pub boot_id: Option<BootId>,
     /// What to do when durability can no longer be guaranteed; `None` aborts the process.
     pub on_fatal: Option<FatalHandler>,
+    /// Snapshot token TTL, limits, and reaper interval.
+    pub tokens: TokenConfig,
+    /// The engine-wide clock token expiry is measured on; `None` uses the monotonic system
+    /// clock. Tests inject a [`ManualClock`](crate::ManualClock).
+    pub clock: Option<Arc<dyn Clock>>,
 }
 
 impl Default for EngineConfig {
@@ -66,6 +75,8 @@ impl Default for EngineConfig {
             wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
             boot_id: None,
             on_fatal: None,
+            tokens: TokenConfig::default(),
+            clock: None,
         }
     }
 }
@@ -81,6 +92,8 @@ impl fmt::Debug for EngineConfig {
             .field("wal_file_bytes", &self.wal_file_bytes)
             .field("boot_id", &self.boot_id)
             .field("on_fatal", &self.on_fatal.is_some())
+            .field("tokens", &self.tokens)
+            .field("clock", &self.clock)
             .finish()
     }
 }
@@ -153,6 +166,11 @@ pub(crate) struct EngineCore {
     /// Threads that run legacy flush and compaction jobs, which interleave CPU and blocking
     /// I/O and so can run on neither the I/O pool nor a rayon pool.
     pub(crate) jobs: IoPool,
+    /// Background file removals (segment files of released versions, superseded manifests,
+    /// abandoned job outputs).
+    pub(crate) gc: GcQueue,
+    /// The clock, token settings, and pinned-memory total every collection's tokens share.
+    pub(crate) tokens: Arc<TokenContext>,
     tasks: Arc<TaskTracker>,
     shutdown: AtomicBool,
     /// Held for the engine's lifetime; declared last so it is released last.
@@ -206,7 +224,13 @@ impl Engine {
             .enable_time()
             .build()
             .map_err(|error| io_message("failed to start the writer runtime", error))?;
-        let core = Arc::new(EngineCore {
+        let clock = config
+            .clock
+            .unwrap_or_else(|| Arc::new(SystemClock::new()) as Arc<dyn Clock>);
+        let token_config = config.tokens;
+        let core = Arc::new_cyclic(|weak| EngineCore {
+            gc: GcQueue::new(weak.clone()),
+            tokens: Arc::new(TokenContext::new(clock, token_config, weak.clone())),
             root,
             vfs,
             blob_store: config.blob_store,
@@ -231,7 +255,27 @@ impl Engine {
             writers: Some(writers),
         });
         core.recover_collections()?;
+        spawn_token_reaper(&core, config.tokens.reaper_interval);
         Ok(Self { shared })
+    }
+
+    /// Block until every queued background file removal has run.
+    pub fn wait_for_gc(&self) {
+        self.shared.core.gc.wait_idle();
+    }
+
+    /// Files the background collector has removed since the engine opened.
+    #[must_use]
+    pub fn gc_removed_files(&self) -> u64 {
+        self.shared.core.gc.removed()
+    }
+
+    /// Run one pass of the snapshot-token reaper now: drop expired pins, then, while pinned
+    /// snapshots hold more retired memory than [`TokenConfig::memory_limit`], expire pins
+    /// oldest-first. The engine runs this every [`TokenConfig::reaper_interval`]. Returns the
+    /// number of pins dropped.
+    pub fn reap_snapshots(&self) -> usize {
+        self.shared.core.reap_snapshots()
     }
 
     /// The storage root.
@@ -346,7 +390,96 @@ impl fmt::Debug for Engine {
     }
 }
 
+/// Start the engine-wide snapshot-token reaper on the writer runtime. It holds the engine only
+/// while a pass runs, and stops once the engine shuts down.
+fn spawn_token_reaper(core: &Arc<EngineCore>, interval: std::time::Duration) {
+    let weak = Arc::downgrade(core);
+    let interval = interval.max(std::time::Duration::from_millis(1));
+    core.writer_runtime.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(core) = weak.upgrade().map(|core| CoreRef::new(&core)) else {
+                break;
+            };
+            if core.is_shutting_down() {
+                break;
+            }
+            core.reap_snapshots();
+        }
+    });
+}
+
 impl EngineCore {
+    /// Every open collection's handle.
+    fn open_handles(&self) -> Vec<Arc<CollectionHandle>> {
+        self.read_collections()
+            .values()
+            .filter_map(|slot| match slot {
+                CollectionSlot::Open(handle) => Some(Arc::clone(handle)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Bytes of retired memtables that only pinned snapshots hold, engine-wide.
+    pub(crate) fn pinned_retired_bytes(&self) -> u64 {
+        self.open_handles()
+            .iter()
+            .map(|handle| handle.pinned_retired_bytes())
+            .sum()
+    }
+
+    /// One reaper pass; see [`Engine::reap_snapshots`].
+    pub(crate) fn reap_snapshots(&self) -> usize {
+        let now = self.tokens.clock.now();
+        let handles = self.open_handles();
+        let mut dropped: Vec<Arc<Version>> = Vec::new();
+        for handle in &handles {
+            dropped.extend(handle.tokens().reap(now));
+        }
+        let limit = self.tokens.config.memory_limit;
+        loop {
+            let total = handles
+                .iter()
+                .map(|handle| handle.pinned_retired_bytes())
+                .sum::<u64>();
+            if total <= limit {
+                break;
+            }
+            let oldest = handles
+                .iter()
+                .filter_map(|handle| {
+                    handle
+                        .tokens()
+                        .oldest_retired(handle.current().checkpoint_seq_no)
+                        .map(|(order, token)| (order, handle, token))
+                })
+                .min_by_key(|(order, _, _)| *order);
+            let Some((_, handle, token)) = oldest else {
+                break;
+            };
+            tracing::info!(
+                collection = %handle.descriptor().lookup_name(),
+                version = token.version_id().0,
+                pinned_bytes = total,
+                limit,
+                "expiring the oldest snapshot token early: pinned snapshots exceed the \
+                 pinned-memory limit"
+            );
+            dropped.extend(handle.tokens().evict(&token));
+        }
+        let count = dropped.len();
+        if !dropped.is_empty() {
+            // A released version may be the last holder of a retired delta; free it off the
+            // async runtime. Its segment files are then enqueued for removal.
+            self.runtime.maintenance.spawn(move || drop(dropped));
+        }
+        count
+    }
+
     pub(crate) fn collections_root(&self) -> PathBuf {
         self.root.join("collections")
     }
@@ -723,7 +856,7 @@ pub(crate) struct CoreRef {
 }
 
 impl CoreRef {
-    fn new(core: &Arc<EngineCore>) -> Self {
+    pub(crate) fn new(core: &Arc<EngineCore>) -> Self {
         core.tasks.enter();
         Self {
             core: Arc::clone(core),

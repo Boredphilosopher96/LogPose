@@ -8,6 +8,7 @@ mod reader;
 mod writer;
 
 pub(crate) use reader::read_segment_file;
+pub(crate) use writer::SegmentBuild;
 
 /// One record of a v1 segment: an operation in the v1 data model and its sequence number. Also
 /// the shape legacy readers see the mutable delta in (see `legacy_view`).

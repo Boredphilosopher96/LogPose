@@ -4,10 +4,12 @@
 //! Until the memtable and segment v2 land (PR 10), a `Version` holds the v1 manifest plus the
 //! delta: the WAL operations above the manifest checkpoint, in the v2 data model (`FieldId`-keyed
 //! row images, key deletes, and schema changes), exactly as the writer's `apply` produced them.
-//! Everything reachable from a published `Version` is immutable; the writer builds the next one
-//! with `Arc` clones and swaps it in.
+//! It also holds the [`FileHandle`] of every segment of its manifest, so a segment file stays on
+//! disk while any `Version` that contains it is alive (I7). Everything reachable from a
+//! published `Version` is immutable; the writer builds the next one with `Arc` clones and swaps
+//! it in.
 
-use crate::{handle::CollectionMeta, manifest::Manifest};
+use crate::{gc::FileHandle, handle::CollectionMeta, manifest::Manifest};
 use logpose_types::{LogPoseError, Result, SeqNo, schema::CollectionSchema};
 use logpose_wal::codec::{RowImage, WirePk};
 use std::{fmt, sync::Arc};
@@ -48,6 +50,8 @@ pub struct Version {
     pub counters: VersionCounters,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) delta: DeltaLog,
+    /// The files of every segment of `manifest`, ascending by unit.
+    pub(crate) files: Arc<[Arc<FileHandle>]>,
 }
 
 impl Version {
@@ -58,6 +62,7 @@ impl Version {
         schema: Arc<CollectionSchema>,
         manifest: Arc<Manifest>,
         delta: DeltaLog,
+        files: Arc<[Arc<FileHandle>]>,
     ) -> Self {
         let visible_seq_no = visible_seq_no(&manifest, &delta);
         Self {
@@ -74,6 +79,7 @@ impl Version {
             },
             manifest,
             delta,
+            files,
         }
     }
 
@@ -151,6 +157,14 @@ impl Version {
             || self.checkpoint_seq_no != self.manifest.checkpoint_seq_no
         {
             return fail("manifest summary does not match the manifest".to_owned());
+        }
+        if !self
+            .files
+            .iter()
+            .map(|file| file.unit())
+            .eq(self.manifest.units())
+        {
+            return fail("segment file handles do not match the manifest's segments".to_owned());
         }
         let mut recomputed = DeltaLog::default();
         for batch in self.delta.batches() {
@@ -262,7 +276,7 @@ const CHUNK_BATCHES: usize = 64;
 #[derive(Clone, Default)]
 pub(crate) struct DeltaLog {
     /// Full chunks of `CHUNK_BATCHES` batches each.
-    sealed: Arc<Vec<Arc<[Arc<[DeltaRecord]>]>>>,
+    sealed: Arc<Vec<SealedChunk>>,
     /// The chunk being filled; fewer than `CHUNK_BATCHES` batches.
     open: Arc<Vec<Arc<[DeltaRecord]>>>,
     len: usize,
@@ -276,14 +290,22 @@ impl DeltaLog {
             return;
         }
         self.len += records.len();
-        self.bytes += records
-            .iter()
-            .map(|record| record.op.approximate_bytes())
-            .sum::<u64>();
+        self.bytes += batch_bytes(&records);
+        self.push_batch(Arc::from(records));
+    }
+
+    /// Append one non-empty batch.
+    fn push_batch(&mut self, batch: Arc<[DeltaRecord]>) {
         let open = Arc::make_mut(&mut self.open);
-        open.push(Arc::from(records));
+        open.push(batch);
         if open.len() == CHUNK_BATCHES {
-            let chunk = Arc::from(std::mem::take(open));
+            let batches: Arc<[Arc<[DeltaRecord]>]> = Arc::from(std::mem::take(open));
+            let chunk = SealedChunk {
+                bytes: batches.iter().map(|batch| batch_bytes(batch)).sum(),
+                first_seq_no: first_seq_no(&batches),
+                last_seq_no: last_seq_no(&batches),
+                batches,
+            };
             Arc::make_mut(&mut self.sealed).push(chunk);
         }
     }
@@ -295,19 +317,44 @@ impl DeltaLog {
         for batch in self.batches() {
             if batch.last().is_some_and(|record| record.seq_no > seq_no) {
                 kept.len += batch.len();
-                kept.bytes += batch
-                    .iter()
-                    .map(|record| record.op.approximate_bytes())
-                    .sum::<u64>();
-                let open = Arc::make_mut(&mut kept.open);
-                open.push(Arc::clone(batch));
-                if open.len() == CHUNK_BATCHES {
-                    let chunk = Arc::from(std::mem::take(open));
-                    Arc::make_mut(&mut kept.sealed).push(chunk);
-                }
+                kept.bytes += batch_bytes(batch);
+                kept.push_batch(Arc::clone(batch));
             }
         }
         kept
+    }
+
+    /// Approximate bytes of the batches whose last sequence number is in `after + 1..=through`.
+    /// O(chunks) plus the batches of at most two partly covered chunks.
+    pub(crate) fn bytes_in(&self, after: SeqNo, through: SeqNo) -> u64 {
+        let in_range = |batch: &Arc<[DeltaRecord]>| {
+            batch
+                .last()
+                .is_some_and(|record| record.seq_no > after && record.seq_no <= through)
+        };
+        let mut total = 0;
+        for chunk in self.sealed.iter() {
+            if chunk.last_seq_no <= after || chunk.first_seq_no > through {
+                continue;
+            }
+            if chunk.first_seq_no > after && chunk.last_seq_no <= through {
+                total += chunk.bytes;
+            } else {
+                total += chunk
+                    .batches
+                    .iter()
+                    .filter(|batch| in_range(batch))
+                    .map(|batch| batch_bytes(batch))
+                    .sum::<u64>();
+            }
+        }
+        total
+            + self
+                .open
+                .iter()
+                .filter(|batch| in_range(batch))
+                .map(|batch| batch_bytes(batch))
+                .sum::<u64>()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -331,7 +378,7 @@ impl DeltaLog {
     pub(crate) fn batches(&self) -> impl DoubleEndedIterator<Item = &Arc<[DeltaRecord]>> + '_ {
         self.sealed
             .iter()
-            .flat_map(|chunk| chunk.iter())
+            .flat_map(|chunk| chunk.batches.iter())
             .chain(self.open.iter())
     }
 
@@ -339,6 +386,39 @@ impl DeltaLog {
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &DeltaRecord> + '_ {
         self.batches().flat_map(|batch| batch.iter())
     }
+}
+
+/// A full chunk of a [`DeltaLog`] with its byte total and sequence range, so range sums skip it
+/// whole.
+#[derive(Clone)]
+struct SealedChunk {
+    batches: Arc<[Arc<[DeltaRecord]>]>,
+    bytes: u64,
+    /// Last sequence number of the chunk's first batch.
+    first_seq_no: SeqNo,
+    /// Last sequence number of the chunk's last batch.
+    last_seq_no: SeqNo,
+}
+
+fn batch_bytes(batch: &[DeltaRecord]) -> u64 {
+    batch
+        .iter()
+        .map(|record| record.op.approximate_bytes())
+        .sum()
+}
+
+fn first_seq_no(batches: &[Arc<[DeltaRecord]>]) -> SeqNo {
+    batches
+        .first()
+        .and_then(|batch| batch.last())
+        .map_or(0, |record| record.seq_no)
+}
+
+fn last_seq_no(batches: &[Arc<[DeltaRecord]>]) -> SeqNo {
+    batches
+        .last()
+        .and_then(|batch| batch.last())
+        .map_or(0, |record| record.seq_no)
 }
 
 impl fmt::Debug for DeltaLog {
@@ -404,6 +484,46 @@ mod tests {
         assert_eq!(log.len(), 3);
         assert!(DeltaLog::default().is_empty());
         assert_eq!(DeltaLog::default().last_seq_no(), None);
+    }
+
+    #[test]
+    fn bytes_in_sums_exactly_the_batches_in_range_across_chunks() {
+        let mut log = DeltaLog::default();
+        let mut next = 1;
+        let mut ends = Vec::new();
+        for batch in 0..(CHUNK_BATCHES * 3 + 7) {
+            let size = batch % 4 + 1;
+            log.append(records(next, size));
+            next += size as SeqNo;
+            ends.push(next - 1);
+        }
+        let brute = |after: SeqNo, through: SeqNo| {
+            log.batches()
+                .filter(|batch| {
+                    batch
+                        .last()
+                        .is_some_and(|record| record.seq_no > after && record.seq_no <= through)
+                })
+                .map(|batch| batch_bytes(batch))
+                .sum::<u64>()
+        };
+        let last = next - 1;
+        for (after, through) in [
+            (0, last),
+            (0, 0),
+            (5, 17),
+            (ends[CHUNK_BATCHES - 1], ends[CHUNK_BATCHES * 2 - 1]),
+            (ends[10], ends[CHUNK_BATCHES * 2 + 3]),
+            (last, last + 10),
+            (3, 2),
+        ] {
+            assert_eq!(
+                log.bytes_in(after, through),
+                brute(after, through),
+                "{after}..={through}"
+            );
+        }
+        assert_eq!(log.bytes_in(0, last), log.bytes());
     }
 
     #[test]

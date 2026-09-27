@@ -499,7 +499,8 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
         .expect("write a");
     // A typed value for an undeclared field is refused... unless it can be dynamic: it moves to
     // `$extra`, which is the v1 behavior for undeclared keys.
-    let (ticket, frozen) = handle.begin_job(JobKind::Flush).expect("flush begins");
+    let (mut ticket, start) = handle.begin_job(JobKind::Flush).expect("flush begins");
+    let frozen = start.version;
     assert_eq!(frozen.visible_seq_no, 1);
 
     // Seq 2..=4, above the flush checkpoint: add `price`, write `b` with a typed price, drop it.
@@ -558,9 +559,18 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
                     crate::legacy_view::legacy_record(&frozen.schema, record).expect("legacy")
                 })
                 .collect::<Vec<_>>(),
-            crate::segment_v1::SegmentPurpose::Flush,
+            crate::segment_v1::SegmentBuild {
+                unit: start.unit,
+                purpose: crate::segment_v1::SegmentPurpose::Flush,
+                origin: crate::manifest::SegmentOrigin::Flush {
+                    first_seq_no: 1,
+                    last_seq_no: 1,
+                },
+                schema_version: frozen.schema.schema_version(),
+            },
         )
         .expect("segment should write");
+    ticket.writing_files();
     ticket
         .commit(JobCommit::Flush {
             checkpoint_seq_no: 1,
@@ -683,8 +693,9 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     assert!(engine.collection(&reference("busy")).is_err());
 }
 
-/// Recovery refuses a WAL whose checkpoint frames are ahead of the manifest: that means
-/// `CURRENT` went backwards, and replaying would resurrect checkpointed state incorrectly.
+/// Recovery refuses a log that `CURRENT` went backwards on: the WAL files below the newer
+/// checkpoint are gone once its manifest is durable, and a checkpoint frame ahead of the
+/// manifest would fail the replay's cross-check if they were not.
 #[test]
 fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let fault = FaultVfs::new(9);
@@ -697,7 +708,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     // The flush's checkpoint frame rides along with the next group.
     core.write(&handle, vec![put("b", vec![1.0, 0.0])])
         .expect("write b");
-    let current = crate::engine::EngineCore::current_manifest_pointer(handle.descriptor());
+    let current = handle.meta().dir.join(crate::manifest::CURRENT_FILE);
     drop((handle, core));
     drop(engine);
 
@@ -707,7 +718,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let file = vfs
         .open(&current, logpose_vfs::OpenMode::CreateNew)
         .expect("create CURRENT");
-    file.append(&[std::io::IoSlice::new(b"0")])
+    file.append(&[std::io::IoSlice::new(b"00000000000000000000\n")])
         .expect("write CURRENT");
     file.sync_all().expect("sync CURRENT");
 
@@ -715,7 +726,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let error = engine
         .collection(&reference("rewound"))
         .expect_err("recovery must refuse");
-    assert!(error.to_string().contains("checkpoint frame"), "{error}");
+    assert!(error.to_string().contains("checkpoint"), "{error}");
 }
 
 /// A directory with the version 1 WAL is rejected with a typed format error.

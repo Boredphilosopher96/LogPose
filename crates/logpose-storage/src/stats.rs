@@ -10,7 +10,7 @@ use crate::{
 };
 use logpose_index::{FlatIndexEntrySource, HnswIndexSidecar, build_flat_index};
 use logpose_types::{
-    CollectionStats, QueryUnitArtifactStats, QueryUnitStats, Result, Snapshot, WriteOperation,
+    CollectionStats, QueryUnitArtifactStats, QueryUnitStats, Result, WriteOperation,
 };
 use std::collections::BTreeMap;
 
@@ -18,9 +18,9 @@ impl EngineCore {
     pub(crate) fn collection_stats(
         &self,
         handle: &CollectionHandle,
-        snapshot: Option<Snapshot>,
+        at: impl Into<crate::state::ReadAt>,
     ) -> Result<CollectionStats> {
-        let (state, effective_snapshot) = self.read_state(handle, snapshot)?;
+        let (state, effective_snapshot) = self.read_state(handle, at)?;
         let descriptor = handle.descriptor();
         let resolved = resolve_latest_state_selected(
             self.vfs.as_ref(),
@@ -50,7 +50,7 @@ impl EngineCore {
             delta_records.extend(legacy_record(&state.schema, record)?);
         }
         let mut query_units = vec![mutable_query_unit(&delta_records)];
-        query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
+        query_units.extend(state.manifest.legacy_segments().map(QueryUnitStats::from));
 
         Ok(CollectionStats {
             collection_id: descriptor.collection_id.clone(),
