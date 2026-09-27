@@ -927,6 +927,13 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     for round in 0..3 {
+        // A flush of an empty delta publishes nothing, and the job is fast enough that the
+        // writers may not have published a group since the previous flush's commit.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while handle.current().delta_len() == 0 {
+            assert!(Instant::now() < deadline, "the writers stopped writing");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let flushed = tokio::time::timeout(Duration::from_secs(20), {
             let handle = Arc::clone(&handle);
             engine.job(move |core| core.flush_collection(&handle))
