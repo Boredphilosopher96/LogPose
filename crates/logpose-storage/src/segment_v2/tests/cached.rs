@@ -515,3 +515,136 @@ fn a_vfs_source_reads_segments_through_the_vfs() {
         .0;
     assert_eq!(pinned.len(), 8192);
 }
+
+/// Every accessor of `cached` returns what the same accessor of `plain` (no
+/// cache) returns.
+fn assert_same_reads(
+    plain: &SegmentReader<MemorySource>,
+    cached: &SegmentReader<MemorySource>,
+    executor: &dyn LoadExecutor,
+    what: &str,
+) {
+    assert_eq!(
+        cached.row_meta().expect("seqs"),
+        plain.row_meta().expect("seqs"),
+        "{what}"
+    );
+    let pks = plain.pk_column().expect("pk");
+    assert_eq!(cached.pk_column().expect("pk"), pks, "{what}");
+    assert_eq!(
+        cached.pk_sorted().expect("sorted"),
+        plain.pk_sorted().expect("sorted"),
+        "{what}"
+    );
+    assert_eq!(
+        cached.pk_filter().expect("filter"),
+        plain.pk_filter().expect("filter"),
+        "{what}"
+    );
+    assert_eq!(
+        cached.stats().expect("stats"),
+        plain.stats().expect("stats"),
+        "{what}"
+    );
+    let stride = pks.len() / 40 + 1;
+    for row in (0..pks.len()).step_by(stride) {
+        let pk = pks.get(row).expect("pk");
+        assert_eq!(
+            cached.find_row(&pk).expect("find"),
+            plain.find_row(&pk).expect("find"),
+            "{what}"
+        );
+    }
+    let schema = Arc::clone(plain.schema());
+    for field in schema.fields() {
+        assert_eq!(
+            cached.scalar_column(field.id).expect("column"),
+            plain.scalar_column(field.id).expect("column"),
+            "{what} field {}",
+            field.id
+        );
+    }
+    for field in schema.vectors() {
+        let expected = plain.vector(field.id).expect("vector").expect("present");
+        let handle = cached.vector(field.id).expect("vector").expect("present");
+        assert_eq!(handle, expected, "{what}");
+        for page in 0..expected.prefix().page_count() {
+            assert_eq!(
+                cached.vector_page(&handle, page).expect("page"),
+                plain.vector_page(&expected, page).expect("page"),
+                "{what} page {page}"
+            );
+            let unit = handle.page_unit(page).expect("unit");
+            let (fetched, _) = block_on(cached.fetch(&unit, executor)).expect("fetch");
+            assert_eq!(&**fetched, &**plain.load(&unit).expect("load").0, "{what}");
+        }
+        for row in (0..plain.row_count()).step_by(stride) {
+            assert_eq!(
+                cached.vector_row(&handle, row).expect("row"),
+                plain.vector_row(&expected, row).expect("row"),
+                "{what} row {row}"
+            );
+        }
+    }
+    let expected = plain.dynamic().expect("dynamic");
+    let handle = cached.dynamic().expect("dynamic");
+    assert_eq!(handle, expected, "{what}");
+    if let (Some(handle), Some(expected)) = (handle, expected) {
+        for block in 0..expected.blocks().block_count() {
+            assert_eq!(
+                cached.dynamic_block(&handle, block).expect("block"),
+                plain.dynamic_block(&expected, block).expect("block"),
+                "{what} block {block}"
+            );
+            let unit = handle.block_unit(block).expect("unit");
+            let (fetched, _) = block_on(cached.fetch(&unit, executor)).expect("fetch");
+            assert_eq!(&**fetched, &**plain.load(&unit).expect("load").0, "{what}");
+        }
+    }
+    for index in 0..plain.sections().len() {
+        let section = plain.read_section(index).expect("section");
+        assert_eq!(
+            &**cached.read_section(index).expect("section"),
+            &**section,
+            "{what} section {index}"
+        );
+        let unit = plain.section_unit(index).expect("unit");
+        let (fetched, _) = block_on(cached.fetch(&unit, executor)).expect("fetch");
+        assert_eq!(&**fetched, &**section, "{what} section {index}");
+    }
+    assert_eq!(
+        cached.read_rows().expect("rows"),
+        plain.read_rows().expect("rows"),
+        "{what}"
+    );
+    cached.verify().expect("verifies");
+}
+
+#[test]
+fn random_segments_read_the_same_through_a_thrashing_cache() {
+    let executor = SpawnExecutor::default();
+    let mut segments: Vec<Vec<u8>> = (0..24)
+        .map(|seed| super::roundtrip::random_segment(seed, 200).3)
+        .collect();
+    segments.push(fixture::golden_bytes());
+    segments.push(vector_segment(128, 300).0);
+    segments.push(vector_segment(3, 2 * 4096 + 7).0);
+    for (number, bytes) in segments.iter().enumerate() {
+        let plain = open_verified(bytes);
+        // From nothing, through a few units, to everything.
+        for budget in [0, 600, 4096, 64 << 20] {
+            let cache = BufferCache::new(CacheConfig::with_budget(budget));
+            let cached = SegmentReader::open(MemorySource::new(bytes.clone()))
+                .expect("opens")
+                .with_cache(&cache);
+            for pass in 0..2 {
+                let what = format!("segment {number} budget {budget} pass {pass}");
+                assert_same_reads(&plain, &cached, &executor, &what);
+                assert_same_reads(&plain, &cached, &InlineExecutor, &what);
+            }
+            executor.join();
+            cache.trim();
+            assert!(cache.used() <= budget, "segment {number} budget {budget}");
+        }
+    }
+}
