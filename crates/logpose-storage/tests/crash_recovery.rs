@@ -29,8 +29,8 @@ use uuid as _;
 
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, DeleteRecord, DistanceMetric, NodeRole,
-    PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DeleteRecord, DistanceMetric,
+    NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use serde_json::json;
@@ -496,6 +496,90 @@ async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
                 expected_visible(&[vec![put("a", 1.0)]]),
                 "{context}"
             );
+        }
+    }
+}
+
+/// Collection directories left under the storage root, retired ones included.
+fn collection_dir_entries(harness: &Harness) -> Vec<String> {
+    harness
+        .fault
+        .process()
+        .list(&Path::new(ROOT).join("collections"))
+        .expect("collections should list")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// A drop that returned `Ok` survives any crash; a drop interrupted by a crash leaves the
+/// collection either gone or whole, and the root usable either way.
+#[tokio::test]
+async fn a_crash_while_dropping_a_collection_leaves_it_gone_or_whole() {
+    let steps = &scenario()[..3];
+    let drop_ops = {
+        let harness = Harness::new(0).await;
+        harness.run(steps).await;
+        let before = harness.fault.mutating_ops();
+        harness
+            .engine()
+            .engine()
+            .drop_collection(&CollectionRef::new_default(COLLECTION))
+            .expect("clean drop should succeed");
+        harness.fault.mutating_ops() - before
+    };
+    assert!(drop_ops >= 3, "a drop renames, syncs and removes");
+
+    for tear in TearMode::ALL {
+        for k in 0..=drop_ops {
+            let context = format!("tear={tear:?} crash_after_ops={k} during drop");
+            let mut harness = Harness::new(k * 4 + tear as u64).await;
+            let outcome = harness.run(steps).await;
+            assert!(outcome.failed_step.is_none(), "{context}: setup failed");
+            harness.fault.set_plan(FaultPlan {
+                crash_after_ops: Some(harness.fault.mutating_ops() + k),
+                tear,
+                ..FaultPlan::default()
+            });
+            let dropped = harness
+                .engine()
+                .engine()
+                .drop_collection(&CollectionRef::new_default(COLLECTION))
+                .is_ok();
+            harness.crash_and_reopen();
+
+            let listed = harness
+                .engine()
+                .list_collections()
+                .await
+                .unwrap_or_else(|error| panic!("{context}: listing failed: {error}"));
+            if dropped || listed.is_empty() {
+                assert!(
+                    listed.is_empty(),
+                    "{context}: an acknowledged drop must survive the crash"
+                );
+                assert!(
+                    collection_dir_entries(&harness).is_empty(),
+                    "{context}: open removes what the drop left behind"
+                );
+                harness
+                    .engine()
+                    .create_collection(CreateCollectionRequest::new(
+                        COLLECTION,
+                        2,
+                        DistanceMetric::Dot,
+                    ))
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
+                harness
+                    .engine()
+                    .write(COLLECTION, vec![put("a", 1.0)])
+                    .await
+                    .unwrap_or_else(|error| panic!("{context}: write failed: {error}"));
+            } else {
+                let kept = assert_recovered(&harness, &outcome, &context).await;
+                assert_engine_keeps_working(&mut harness, kept, &context).await;
+            }
         }
     }
 }
