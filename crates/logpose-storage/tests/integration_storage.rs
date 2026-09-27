@@ -1607,7 +1607,7 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
             "events",
-            200_000,
+            65_536,
             DistanceMetric::Dot,
         ))
         .await
@@ -1619,7 +1619,7 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
             "events",
             vec![WriteOperation::Put(PutRecord {
                 id: RecordId::new("evt-1"),
-                vector: vec![1.0; 200_000],
+                vector: vec![1.0; 65_536],
                 metadata: json!({"kind":"keep","version":1}),
             })],
         )
@@ -1639,7 +1639,7 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
             "events",
             vec![WriteOperation::Put(PutRecord {
                 id: RecordId::new("evt-2"),
-                vector: vec![2.0; 200_000],
+                vector: vec![2.0; 65_536],
                 metadata: json!({"kind":"keep","version":2}),
             })],
         )

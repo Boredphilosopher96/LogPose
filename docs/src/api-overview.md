@@ -227,7 +227,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 |-----------------|---------|----------|----------------------------------------------------------|
 | `database_name` | string  | no       | Target database; defaults to `default` when omitted      |
 | `name`          | string  | yes      | Unique collection name inside the selected database      |
-| `dimensions`    | integer | yes      | Vector dimensionality (>= 1)                             |
+| `dimensions`    | integer | yes      | Vector dimensionality, from 1 to 65,536                  |
 | `metric`        | string  | yes      | Distance metric: `cosine`, `dot`, `l2`                   |
 
 **Response** (`201`):
@@ -361,6 +361,15 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/writes \
   }
 }
 ```
+
+Every operation is validated against the collection's schema before
+anything is written, and one invalid operation rejects the whole batch:
+
+- `id` must be a non-empty string of at most 1,024 bytes.
+- `vector` must have exactly `dimensions` components, all finite.
+- `metadata` must be a JSON object or `null`. Its keys are stored as dynamic
+  fields, so they cannot be named `id` or `vector`, the collection's
+  declared key and vector fields.
 
 | Status | Meaning                                     |
 |--------|---------------------------------------------|

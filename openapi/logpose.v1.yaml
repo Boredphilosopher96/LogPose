@@ -955,6 +955,7 @@ components:
         dimensions:
           type: integer
           minimum: 1
+          maximum: 65536
         metric:
           $ref: "#/components/schemas/DistanceMetric"
     CollectionDescriptor:
@@ -1025,12 +1026,16 @@ components:
           enum: [put]
         id:
           type: string
+          minLength: 1
+          description: Record key; at most 1,024 bytes of UTF-8.
         vector:
           type: array
+          description: Exactly the collection's dimension count of finite numbers.
           items:
             type: number
         metadata:
-          type: object
+          type: [object, "null"]
+          description: Stored as dynamic fields; keys cannot be `id` or `vector`.
     DeleteOperation:
       type: object
       required: [op, id]
