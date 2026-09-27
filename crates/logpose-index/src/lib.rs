@@ -336,8 +336,10 @@ pub struct HnswSearchResult {
 /// A node scored against a query or base vector.
 ///
 /// `Ord` ranks better nodes as greater: a higher similarity for cosine and dot, a smaller
-/// distance for L2. Ties break toward the lower node index so builds and searches stay
-/// deterministic.
+/// distance for L2. Ties break toward the higher node index, the more recently inserted node,
+/// so builds and searches stay deterministic. Preferring the newer node matters for exact
+/// duplicate vectors: every copy then keeps edges from the copies inserted after it, instead of
+/// all copies competing for the same oldest few and orphaning the rest.
 #[derive(Clone, Copy, Debug)]
 struct ScoredNode {
     index: usize,
@@ -381,7 +383,7 @@ impl Ord for ScoredNode {
     fn cmp(&self, other: &Self) -> Ordering {
         self.goodness
             .total_cmp(&other.goodness)
-            .then_with(|| other.index.cmp(&self.index))
+            .then_with(|| self.index.cmp(&other.index))
     }
 }
 
@@ -969,9 +971,9 @@ fn search_layer(
 /// (Malkov & Yashunin, Algorithm 4, with `keepPrunedConnections`).
 ///
 /// `candidates` must be ordered best first and scored against the node being linked. A
-/// candidate is kept only if it is closer to that node than to every neighbor already kept,
-/// which preserves the long edges that bridge clusters. Remaining slots are then filled with
-/// the closest pruned candidates.
+/// candidate is kept only if it is at least as close to that node as to every neighbor already
+/// kept and is not an exact copy of one, which preserves the long edges that bridge clusters.
+/// Remaining slots are then filled with the closest pruned candidates.
 fn select_neighbors_heuristic(
     metric: DistanceMetric,
     nodes: &[HnswNode],
@@ -987,12 +989,15 @@ fn select_neighbors_heuristic(
         let candidate_vector = &nodes[candidate.index].record.vector;
         let mut diverse = true;
         for &kept in &selected {
+            let kept_vector = &nodes[kept].record.vector;
             let between = ScoredNode::new(
                 metric,
                 kept,
-                metric_value(metric, candidate_vector, &nodes[kept].record.vector)?,
+                metric_value(metric, candidate_vector, kept_vector)?,
             );
-            if between.goodness > candidate.goodness {
+            // An exact copy of a kept neighbor adds no reach, even when the tie on distance
+            // means the metric test alone cannot reject it.
+            if between.goodness > candidate.goodness || kept_vector == candidate_vector {
                 diverse = false;
                 break;
             }
@@ -1822,6 +1827,74 @@ mod tests {
         let queries = clustered_entries(&mut rng, 50, 8, 16, 3.0);
         let recall = mean_recall_at_10(&index, &entries, &queries);
         assert!(recall >= 0.95, "recall@10 was {recall}");
+    }
+
+    #[test]
+    fn hnsw_keeps_exact_duplicate_vectors_reachable() {
+        // Bursts of identical vectors, as repeated log lines produce. Without duplicate-aware
+        // selection every copy links to the same oldest copies, most copies end up with no
+        // incoming layer 0 edge, and each burst becomes an island.
+        let (distinct, copies, dimensions) = (60, 50, 8);
+        let mut rng = TestRng::new(11);
+        let centers = (0..distinct)
+            .map(|_| {
+                (0..dimensions)
+                    .map(|_| rng.next_unit() as f32 * 2.0 - 1.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let entries = (0..distinct * copies)
+            .map(|index| HnswIndexEntrySource {
+                entry_offset_index: index,
+                record_id: RecordId::new(format!("row-{index}")),
+                seq_no: index as u64 + 1,
+                vector: centers[index / copies].clone(),
+                metadata: json!({ "row": index }),
+            })
+            .collect::<Vec<_>>();
+        let index = build_hnsw_index(
+            "segment-duplicates",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &entries,
+        )
+        .expect("index should build");
+        validate_hnsw_index(&index).expect("built graph should satisfy sidecar invariants");
+        assert_eq!(
+            layer0_reachable_from_entry_point(&index),
+            entries.len(),
+            "every copy should be reachable on layer 0"
+        );
+
+        // A filter that admits one specific copy must still find it.
+        for entry in entries.iter().step_by(7) {
+            let wanted = entry.metadata.clone();
+            let only_this_row = move |metadata: &Value| *metadata == wanted;
+            let found = search_hnsw(&index, &entry.vector, 1, Some(&only_this_row))
+                .expect("search should succeed");
+            assert_eq!(
+                found
+                    .candidates
+                    .first()
+                    .map(|candidate| candidate.entry_offset_index),
+                Some(entry.entry_offset_index),
+                "filtered search should reach row {}",
+                entry.entry_offset_index
+            );
+        }
+
+        // Unfiltered top-k over a burst should return copies of the query vector.
+        let mut exact_hits = 0;
+        for center in &centers {
+            exact_hits += search_hnsw(&index, center, 10, None)
+                .expect("search should succeed")
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.vector == *center)
+                .count();
+        }
+        let hit_rate = exact_hits as f64 / (distinct * 10) as f64;
+        assert!(hit_rate >= 0.95, "exact duplicate hit rate was {hit_rate}");
     }
 
     /// Deterministic SplitMix64 generator so the recall tests need no extra dependency.
