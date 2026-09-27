@@ -1,5 +1,8 @@
 //! Exact and ANN index sidecars for immutable units.
 
+pub mod kernels;
+pub mod sq8;
+
 use logpose_types::{DistanceMetric, RecordId, ScalarFieldStats, ScalarMetadataValue, SeqNo};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
