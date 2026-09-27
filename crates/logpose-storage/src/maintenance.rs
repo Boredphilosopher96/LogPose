@@ -212,60 +212,81 @@ impl CoreRef {
         self.enqueue_maintenance(handle, operations);
     }
 
-    /// Run queued jobs for `handle` until its queue is empty, the collection is dropped, or the
-    /// engine shuts down. Pending operations left behind stay persisted and resume on reopen.
+    /// Run the next queued job for `handle`, then, if more are queued, go to the back of the
+    /// job threads' queue for the next one. Yielding after every job keeps the shared job
+    /// threads fair: a collection whose writes keep refilling its queue cannot starve other
+    /// collections or explicit flush and compaction requests. Stops when the queue is empty, the
+    /// collection is dropped, or the engine shuts down; pending operations left behind stay
+    /// persisted and resume on reopen.
     fn run_maintenance_queue(&self, handle: &Arc<CollectionHandle>) {
-        loop {
-            let operation = {
-                let mut state = lock_jobs(handle);
-                let next = if self.is_shutting_down() || handle.is_dropped() {
-                    None
-                } else {
-                    state.queue.pop_front()
-                };
-                let Some(operation) = next else {
-                    state.running = false;
-                    return;
-                };
-                let label = operation.as_str();
-                state.status.pending.retain(|pending| pending != label);
-                state.status.in_progress = Some(label.to_owned());
-                self.persist_locked(handle, &mut state);
-                operation
-            };
-
-            let result = self.perform_maintenance(handle, operation);
-            let follow_up = if result.is_ok() {
-                let version = handle.current();
-                let descriptor = handle.descriptor();
-                let mut operations = Vec::new();
-                if should_flush(descriptor, &version) {
-                    operations.push(MaintenanceOperation::Flush);
-                }
-                if should_compact(descriptor, &version) {
-                    operations.push(MaintenanceOperation::Compact);
-                }
-                operations
+        let operation = {
+            let mut state = lock_jobs(handle);
+            let next = if self.is_shutting_down() || handle.is_dropped() {
+                None
             } else {
-                Vec::new()
+                state.queue.pop_front()
             };
+            let Some(operation) = next else {
+                state.running = false;
+                return;
+            };
+            let label = operation.as_str();
+            state.status.pending.retain(|pending| pending != label);
+            state.status.in_progress = Some(label.to_owned());
+            self.persist_locked(handle, &mut state);
+            operation
+        };
 
-            {
-                let mut state = lock_jobs(handle);
-                state.status.in_progress = None;
-                match result {
-                    Ok(_) => {
-                        state.status.completed_runs += 1;
-                        state.status.last_error = None;
-                    }
-                    Err(error) => state.status.last_error = Some(error.to_string()),
-                }
-                if !handle.is_dropped() {
-                    self.persist_locked(handle, &mut state);
-                }
+        let result = self.perform_maintenance(handle, operation);
+        let follow_up = if result.is_ok() {
+            let version = handle.current();
+            let descriptor = handle.descriptor();
+            let mut operations = Vec::new();
+            if should_flush(descriptor, &version) {
+                operations.push(MaintenanceOperation::Flush);
             }
-            // The loop still owns the queue (`running` is set), so this only queues.
-            self.enqueue_maintenance(handle, follow_up);
+            if should_compact(descriptor, &version) {
+                operations.push(MaintenanceOperation::Compact);
+            }
+            operations
+        } else {
+            Vec::new()
+        };
+
+        {
+            let mut state = lock_jobs(handle);
+            state.status.in_progress = None;
+            match result {
+                Ok(_) => {
+                    state.status.completed_runs += 1;
+                    state.status.last_error = None;
+                }
+                Err(error) => state.status.last_error = Some(error.to_string()),
+            }
+            if !handle.is_dropped() {
+                self.persist_locked(handle, &mut state);
+            }
+        }
+        // This job still owns the queue (`running` is set), so this only queues.
+        self.enqueue_maintenance(handle, follow_up);
+
+        let more = {
+            let mut state = lock_jobs(handle);
+            if state.queue.is_empty() {
+                state.running = false;
+            }
+            state.running
+        };
+        if more {
+            let core = self.clone();
+            let next_handle = Arc::clone(handle);
+            if self
+                .jobs
+                .execute(move || core.run_maintenance_queue(&next_handle))
+                .is_err()
+            {
+                lock_jobs(handle).running = false;
+            }
         }
     }
 

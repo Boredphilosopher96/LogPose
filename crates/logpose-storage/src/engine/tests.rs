@@ -2,6 +2,7 @@
 //! races, and readers pinning versions while the writer publishes.
 
 use super::*;
+use crate::runtime::RuntimeConfig;
 use crate::{
     CreateCollectionRequest,
     test_support::{put, unique_temp_dir},
@@ -533,4 +534,59 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
     drop(engine);
     let engine = open(&root).expect("engine should reopen");
     check(&engine, "after reopen");
+}
+
+/// The job threads are shared by every collection. A collection whose writes keep crossing its
+/// flush threshold must not monopolize them: other collections' jobs still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
+    let root = unique_temp_dir("engine-job-fairness");
+    let config = EngineConfig {
+        runtime: RuntimeConfig {
+            maintenance_threads: 1,
+            ..RuntimeConfig::default()
+        },
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(std_vfs(), &root, config).expect("engine should open");
+    let mut descriptor = engine
+        .core()
+        .plan_collection_descriptor(&request("busy"))
+        .expect("descriptor should plan");
+    descriptor.flush_threshold_ops = 1;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    let busy = engine
+        .create_collection(descriptor, None)
+        .expect("collection should be created");
+    let quiet = create(&engine, "quiet");
+    write(&engine, &quiet, vec![put("alpha", vec![1.0, 0.0])]);
+
+    // Every write of the busy collection queues a flush for it.
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let engine = engine.clone();
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            let core = engine.core();
+            let mut index = 0;
+            while !done.load(Ordering::Acquire) {
+                core.write(&busy, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
+                    .expect("write should succeed");
+                index += 1;
+            }
+        })
+    };
+    // Let the busy collection's job loop start.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.job(move |core| core.flush_collection(&quiet)),
+    )
+    .await;
+    done.store(true, Ordering::Release);
+    writer.join().expect("writer should join");
+    flushed
+        .expect("the quiet collection's flush must get a job thread")
+        .expect("the flush should succeed");
 }
