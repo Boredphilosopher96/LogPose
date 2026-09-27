@@ -367,6 +367,31 @@ fn dynamic_keys_are_shadowed_by_declared_and_retired_names() {
     assert_eq!(dropped.extra["size"], json!(3));
 }
 
+/// Squaring in `f32` overflows for components above about 1.8e19 and
+/// underflows to zero below about 1e-23; normalizing in `f64` must do
+/// neither, so extreme but finite vectors still come out unit length.
+#[test]
+fn cosine_normalization_survives_extreme_magnitudes() {
+    let schema = schema(DistanceMetric::Cosine);
+    let cases: [([f32; 2], [f32; 2]); 4] = [
+        ([f32::MAX, f32::MAX], [std::f32::consts::FRAC_1_SQRT_2; 2]),
+        ([-3.0e38, 0.0], [-1.0, 0.0]),
+        ([1.0e-45, 0.0], [1.0, 0.0]),
+        ([3.0e-30, 4.0e-30], [0.6, 0.8]),
+    ];
+    for (input, expected) in cases {
+        let record = Record::new("k").with_vector("v", input.to_vec());
+        let image = RowImage::from_record(&schema, record).expect("finite vectors normalize");
+        let normalized = image.vectors[0].1.to_f32s();
+        for (actual, expected) in normalized.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= f32::EPSILON,
+                "{input:?} normalized to {normalized:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn conversion_rejects_invalid_records_and_zero_cosine_vectors() {
     let schema = schema(DistanceMetric::Cosine);
