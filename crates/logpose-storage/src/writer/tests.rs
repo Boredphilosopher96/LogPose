@@ -377,7 +377,17 @@ async fn an_unfenced_rollback_failure_stops_the_process() {
 async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
     let fault = FaultVfs::new(13);
     let vfs = ControlledVfs::wrap(fault.process());
-    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    // A group waits for a second request, so the schema change and the large write below always
+    // form group N+1 together, whichever reaches the writer first.
+    let grouped = EngineConfig {
+        group: GroupCommitConfig {
+            commit_delay: Duration::from_millis(500),
+            min_group_requests: 2,
+            ..GroupCommitConfig::default()
+        },
+        ..config("boot")
+    };
+    let engine = Engine::open(vfs.clone(), ROOT, grouped).expect("engine should open");
     let handle = create(&engine, "prefix");
     let schema_version = handle.current().schema.schema_version();
     let kept = write(&handle, "kept").await.expect("write should succeed");
