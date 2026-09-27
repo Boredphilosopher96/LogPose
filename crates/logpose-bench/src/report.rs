@@ -5,7 +5,7 @@ use crate::{
     filter::{FilterMode, FilterStyle},
     metrics::{IoPerOp, LatencySummary, MemorySample},
 };
-use logpose_query::Predicate;
+use logpose_query::FilterExpr;
 use serde::Serialize;
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt::Write as _, process::Command};
@@ -253,8 +253,8 @@ pub struct CaseFilter {
     pub actual_selectivity: f64,
     /// Rows that match.
     pub matching_rows: usize,
-    /// Predicate sent to the target.
-    pub predicate: Predicate,
+    /// Filter sent to the target.
+    pub predicate: FilterExpr,
 }
 
 /// Recall distribution across queries.

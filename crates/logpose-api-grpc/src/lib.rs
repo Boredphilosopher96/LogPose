@@ -3,8 +3,8 @@
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
-    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator,
-    QueryDiagnostics, QueryPlanKind, QueryRequest, QueryStageTimings, ScalarMetadataValue,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
+    QueryPlanKind, QueryRequest, QueryStageTimings, ScalarMetadataValue,
 };
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
@@ -504,31 +504,31 @@ fn metadata_filter_from_proto(filter: proto::MetadataFilter) -> Result<MetadataF
     })
 }
 
-fn predicate_from_proto(predicate: proto::Predicate) -> Result<Predicate, Status> {
+fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, Status> {
     match predicate
         .node
         .ok_or_else(|| Status::invalid_argument("predicate node is required"))?
     {
-        proto::predicate::Node::And(list) => Ok(Predicate::And {
+        proto::predicate::Node::And(list) => Ok(FilterExpr::And {
             children: list
                 .children
                 .into_iter()
                 .map(predicate_from_proto)
                 .collect::<Result<Vec<_>, _>>()?,
         }),
-        proto::predicate::Node::Or(list) => Ok(Predicate::Or {
+        proto::predicate::Node::Or(list) => Ok(FilterExpr::Or {
             children: list
                 .children
                 .into_iter()
                 .map(predicate_from_proto)
                 .collect::<Result<Vec<_>, _>>()?,
         }),
-        proto::predicate::Node::Not(node) => Ok(Predicate::Not {
+        proto::predicate::Node::Not(node) => Ok(FilterExpr::Not {
             child: Box::new(predicate_from_proto(*node.child.ok_or_else(|| {
                 Status::invalid_argument("not predicate child is required")
             })?)?),
         }),
-        proto::predicate::Node::Comparison(comparison) => Ok(Predicate::Comparison(
+        proto::predicate::Node::Comparison(comparison) => Ok(FilterExpr::Comparison(
             predicate_comparison_from_proto(comparison)?,
         )),
     }
@@ -536,26 +536,26 @@ fn predicate_from_proto(predicate: proto::Predicate) -> Result<Predicate, Status
 
 fn predicate_comparison_from_proto(
     comparison: proto::PredicateComparison,
-) -> Result<PredicateComparison, Status> {
-    Ok(PredicateComparison {
+) -> Result<FilterComparison, Status> {
+    Ok(FilterComparison {
         field: comparison.field,
         operator: predicate_operator_from_proto(comparison.operator)?,
         value: comparison.value.map(scalar_value_from_proto).transpose()?,
     })
 }
 
-fn predicate_operator_from_proto(operator: i32) -> Result<PredicateOperator, Status> {
+fn predicate_operator_from_proto(operator: i32) -> Result<FilterOperator, Status> {
     match proto::PredicateOperator::try_from(operator)
         .unwrap_or(proto::PredicateOperator::Unspecified)
     {
-        proto::PredicateOperator::Eq => Ok(PredicateOperator::Eq),
-        proto::PredicateOperator::Ne => Ok(PredicateOperator::Ne),
-        proto::PredicateOperator::Lt => Ok(PredicateOperator::Lt),
-        proto::PredicateOperator::Lte => Ok(PredicateOperator::Lte),
-        proto::PredicateOperator::Gt => Ok(PredicateOperator::Gt),
-        proto::PredicateOperator::Gte => Ok(PredicateOperator::Gte),
-        proto::PredicateOperator::Exists => Ok(PredicateOperator::Exists),
-        proto::PredicateOperator::IsNull => Ok(PredicateOperator::IsNull),
+        proto::PredicateOperator::Eq => Ok(FilterOperator::Eq),
+        proto::PredicateOperator::Ne => Ok(FilterOperator::Ne),
+        proto::PredicateOperator::Lt => Ok(FilterOperator::Lt),
+        proto::PredicateOperator::Lte => Ok(FilterOperator::Lte),
+        proto::PredicateOperator::Gt => Ok(FilterOperator::Gt),
+        proto::PredicateOperator::Gte => Ok(FilterOperator::Gte),
+        proto::PredicateOperator::Exists => Ok(FilterOperator::Exists),
+        proto::PredicateOperator::IsNull => Ok(FilterOperator::IsNull),
         proto::PredicateOperator::Unspecified => Err(Status::invalid_argument(
             "predicate comparison operator must be set",
         )),

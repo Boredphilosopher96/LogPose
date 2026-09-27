@@ -7,6 +7,7 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_storage::StorageEngine;
 pub use logpose_types::ScalarMetadataValue;
+pub use logpose_types::filter::{FilterComparison, FilterExpr, FilterOperator};
 use logpose_types::{
     AnnSearchRequest, CollectionRef, CollectionStats, DistanceMetric, LogPoseError, QueryUnitStats,
     RecordId, ScalarFieldStats, Snapshot, VisibleRecord,
@@ -39,7 +40,7 @@ pub struct QueryRequest {
     pub filters: Vec<MetadataFilter>,
     /// Optional structured predicate tree over top-level scalar metadata.
     #[serde(default)]
-    pub predicate: Option<Predicate>,
+    pub predicate: Option<FilterExpr>,
     /// Optional explain/profile mode for planner diagnostics.
     #[serde(default)]
     pub explain: ExplainMode,
@@ -52,63 +53,6 @@ pub struct MetadataFilter {
     pub field: String,
     /// Required scalar value for the field.
     pub value: ScalarMetadataValue,
-}
-
-/// Structured predicate tree used for planner-aware metadata filtering.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Predicate {
-    /// Conjunction over child predicates.
-    And {
-        /// Child predicates.
-        children: Vec<Predicate>,
-    },
-    /// Disjunction over child predicates.
-    Or {
-        /// Child predicates.
-        children: Vec<Predicate>,
-    },
-    /// Negation over a child predicate.
-    Not {
-        /// Child predicate.
-        child: Box<Predicate>,
-    },
-    /// Comparison over a top-level scalar field.
-    Comparison(PredicateComparison),
-}
-
-/// Single field comparison inside a predicate tree.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PredicateComparison {
-    /// Target top-level field.
-    pub field: String,
-    /// Comparison operator.
-    pub operator: PredicateOperator,
-    /// Optional scalar value for operators that need one.
-    #[serde(default)]
-    pub value: Option<ScalarMetadataValue>,
-}
-
-/// Operator used by a predicate comparison.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PredicateOperator {
-    /// Exact scalar equality.
-    Eq,
-    /// Scalar inequality.
-    Ne,
-    /// Strictly less-than comparison.
-    Lt,
-    /// Less-than-or-equal comparison.
-    Lte,
-    /// Strictly greater-than comparison.
-    Gt,
-    /// Greater-than-or-equal comparison.
-    Gte,
-    /// Field existence check.
-    Exists,
-    /// Explicit null check.
-    IsNull,
 }
 
 /// Diagnostics verbosity requested by the caller.
@@ -257,7 +201,7 @@ pub enum QueryError {
         /// Actual stored dimensionality.
         actual: usize,
     },
-    /// Predicate structure is malformed for the requested operators.
+    /// Filter structure is malformed for the requested operators.
     #[error("{0}")]
     InvalidPredicate(String),
     /// Storage failures are surfaced directly from the read path.
@@ -777,28 +721,28 @@ pub fn build_query_response_with_diagnostics(
     response
 }
 
-fn combined_predicate(request: &QueryRequest) -> Option<Predicate> {
+fn combined_predicate(request: &QueryRequest) -> Option<FilterExpr> {
     let legacy = filters_to_predicate(&request.filters);
     match (legacy, request.predicate.clone()) {
         (None, None) => None,
         (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
-        (Some(left), Some(right)) => Some(Predicate::And {
+        (Some(left), Some(right)) => Some(FilterExpr::And {
             children: vec![left, right],
         }),
     }
 }
 
-fn filters_to_predicate(filters: &[MetadataFilter]) -> Option<Predicate> {
+fn filters_to_predicate(filters: &[MetadataFilter]) -> Option<FilterExpr> {
     if filters.is_empty() {
         None
     } else {
-        Some(Predicate::And {
+        Some(FilterExpr::And {
             children: filters
                 .iter()
                 .map(|filter| {
-                    Predicate::Comparison(PredicateComparison {
+                    FilterExpr::Comparison(FilterComparison {
                         field: filter.field.clone(),
-                        operator: PredicateOperator::Eq,
+                        operator: FilterOperator::Eq,
                         value: Some(filter.value.clone()),
                     })
                 })
@@ -807,9 +751,9 @@ fn filters_to_predicate(filters: &[MetadataFilter]) -> Option<Predicate> {
     }
 }
 
-fn validate_predicate(predicate: &Predicate) -> Result<()> {
+fn validate_predicate(predicate: &FilterExpr) -> Result<()> {
     match predicate {
-        Predicate::And { children } | Predicate::Or { children } => {
+        FilterExpr::And { children } | FilterExpr::Or { children } => {
             if children.is_empty() {
                 return Err(QueryError::InvalidPredicate(
                     "logical predicates must include at least one child".to_owned(),
@@ -819,9 +763,9 @@ fn validate_predicate(predicate: &Predicate) -> Result<()> {
                 validate_predicate(child)?;
             }
         }
-        Predicate::Not { child } => validate_predicate(child)?,
-        Predicate::Comparison(comparison) => match comparison.operator {
-            PredicateOperator::Exists | PredicateOperator::IsNull => {
+        FilterExpr::Not { child } => validate_predicate(child)?,
+        FilterExpr::Comparison(comparison) => match comparison.operator {
+            FilterOperator::Exists | FilterOperator::IsNull => {
                 if comparison.value.is_some() {
                     return Err(QueryError::InvalidPredicate(format!(
                         "predicate operator '{}' does not accept a value",
@@ -829,12 +773,12 @@ fn validate_predicate(predicate: &Predicate) -> Result<()> {
                     )));
                 }
             }
-            PredicateOperator::Eq
-            | PredicateOperator::Ne
-            | PredicateOperator::Lt
-            | PredicateOperator::Lte
-            | PredicateOperator::Gt
-            | PredicateOperator::Gte => {
+            FilterOperator::Eq
+            | FilterOperator::Ne
+            | FilterOperator::Lt
+            | FilterOperator::Lte
+            | FilterOperator::Gt
+            | FilterOperator::Gte => {
                 let Some(value) = comparison.value.as_ref() else {
                     return Err(QueryError::InvalidPredicate(format!(
                         "predicate operator '{}' requires a value",
@@ -843,10 +787,10 @@ fn validate_predicate(predicate: &Predicate) -> Result<()> {
                 };
                 if matches!(
                     comparison.operator,
-                    PredicateOperator::Lt
-                        | PredicateOperator::Lte
-                        | PredicateOperator::Gt
-                        | PredicateOperator::Gte
+                    FilterOperator::Lt
+                        | FilterOperator::Lte
+                        | FilterOperator::Gt
+                        | FilterOperator::Gte
                 ) && !supports_ordered_comparison(value)
                 {
                     return Err(QueryError::InvalidPredicate(format!(
@@ -860,21 +804,21 @@ fn validate_predicate(predicate: &Predicate) -> Result<()> {
     Ok(())
 }
 
-fn predicate_operator_name(operator: PredicateOperator) -> &'static str {
+fn predicate_operator_name(operator: FilterOperator) -> &'static str {
     match operator {
-        PredicateOperator::Eq => "eq",
-        PredicateOperator::Ne => "ne",
-        PredicateOperator::Lt => "lt",
-        PredicateOperator::Lte => "lte",
-        PredicateOperator::Gt => "gt",
-        PredicateOperator::Gte => "gte",
-        PredicateOperator::Exists => "exists",
-        PredicateOperator::IsNull => "is_null",
+        FilterOperator::Eq => "eq",
+        FilterOperator::Ne => "ne",
+        FilterOperator::Lt => "lt",
+        FilterOperator::Lte => "lte",
+        FilterOperator::Gt => "gt",
+        FilterOperator::Gte => "gte",
+        FilterOperator::Exists => "exists",
+        FilterOperator::IsNull => "is_null",
     }
 }
 
 fn choose_plan(
-    predicate: Option<&Predicate>,
+    predicate: Option<&FilterExpr>,
     estimated_selectivity: f32,
     top_k: usize,
     scanned_put_count: usize,
@@ -898,7 +842,7 @@ fn choose_plan(
     }
 }
 
-fn select_query_units(stats: &CollectionStats, predicate: Option<&Predicate>) -> UnitSelection {
+fn select_query_units(stats: &CollectionStats, predicate: Option<&FilterExpr>) -> UnitSelection {
     let mut selection = UnitSelection {
         units_considered: stats.query_units.len(),
         ..UnitSelection::default()
@@ -963,7 +907,7 @@ fn select_query_units(stats: &CollectionStats, predicate: Option<&Predicate>) ->
     selection
 }
 
-fn estimate_selectivity(predicate: &Predicate, stats: &CollectionStats) -> f32 {
+fn estimate_selectivity(predicate: &FilterExpr, stats: &CollectionStats) -> f32 {
     let total_records = stats
         .query_units
         .iter()
@@ -980,31 +924,31 @@ fn estimate_selectivity(predicate: &Predicate, stats: &CollectionStats) -> f32 {
     (estimated_matches / total_records).clamp(0.0, 1.0)
 }
 
-fn estimate_unit_selectivity(predicate: &Predicate, unit: &QueryUnitStats) -> f32 {
+fn estimate_unit_selectivity(predicate: &FilterExpr, unit: &QueryUnitStats) -> f32 {
     match predicate {
-        Predicate::And { children } => children.iter().fold(1.0, |current, child| {
+        FilterExpr::And { children } => children.iter().fold(1.0, |current, child| {
             (current * estimate_unit_selectivity(child, unit)).clamp(0.0, 1.0)
         }),
-        Predicate::Or { children } => {
+        FilterExpr::Or { children } => {
             1.0 - children.iter().fold(1.0, |current, child| {
                 current * (1.0 - estimate_unit_selectivity(child, unit))
             })
         }
-        Predicate::Not { child } => 1.0 - estimate_unit_selectivity(child, unit),
-        Predicate::Comparison(comparison) => estimate_comparison_selectivity(comparison, unit),
+        FilterExpr::Not { child } => 1.0 - estimate_unit_selectivity(child, unit),
+        FilterExpr::Comparison(comparison) => estimate_comparison_selectivity(comparison, unit),
     }
 }
 
-fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &QueryUnitStats) -> f32 {
+fn estimate_comparison_selectivity(comparison: &FilterComparison, unit: &QueryUnitStats) -> f32 {
     let Some(field_stats) = unit.scalar_fields.get(&comparison.field) else {
         return 0.0;
     };
     let total = unit.put_count.max(1) as f32;
 
     match comparison.operator {
-        PredicateOperator::Exists => (field_stats.present_count as f32 / total).clamp(0.0, 1.0),
-        PredicateOperator::IsNull => (field_stats.null_count as f32 / total).clamp(0.0, 1.0),
-        PredicateOperator::Eq => comparison
+        FilterOperator::Exists => (field_stats.present_count as f32 / total).clamp(0.0, 1.0),
+        FilterOperator::IsNull => (field_stats.null_count as f32 / total).clamp(0.0, 1.0),
+        FilterOperator::Eq => comparison
             .value
             .as_ref()
             .map(|value| {
@@ -1016,7 +960,7 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
                     / total
             })
             .unwrap_or(0.0),
-        PredicateOperator::Ne => {
+        FilterOperator::Ne => {
             let scalar_present = scalar_present_count(field_stats);
             if scalar_present == 0 {
                 return 0.0;
@@ -1029,10 +973,7 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
                 .unwrap_or_default();
             scalar_present.saturating_sub(eq_count) as f32 / total
         }
-        PredicateOperator::Lt
-        | PredicateOperator::Lte
-        | PredicateOperator::Gt
-        | PredicateOperator::Gte => {
+        FilterOperator::Lt | FilterOperator::Lte | FilterOperator::Gt | FilterOperator::Gte => {
             let Some(value) = comparison.value.as_ref() else {
                 return 0.0;
             };
@@ -1053,14 +994,14 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
             ) {
                 (Some(min_ordering), Some(max_ordering)) => {
                     let estimate = match comparison.operator {
-                        PredicateOperator::Lt if min_ordering != Ordering::Greater => 0.0,
-                        PredicateOperator::Lt if max_ordering == Ordering::Greater => 1.0,
-                        PredicateOperator::Lte if min_ordering == Ordering::Less => 0.0,
-                        PredicateOperator::Lte if max_ordering != Ordering::Less => 1.0,
-                        PredicateOperator::Gt if max_ordering != Ordering::Less => 0.0,
-                        PredicateOperator::Gt if min_ordering == Ordering::Less => 1.0,
-                        PredicateOperator::Gte if max_ordering == Ordering::Greater => 0.0,
-                        PredicateOperator::Gte if min_ordering != Ordering::Greater => 1.0,
+                        FilterOperator::Lt if min_ordering != Ordering::Greater => 0.0,
+                        FilterOperator::Lt if max_ordering == Ordering::Greater => 1.0,
+                        FilterOperator::Lte if min_ordering == Ordering::Less => 0.0,
+                        FilterOperator::Lte if max_ordering != Ordering::Less => 1.0,
+                        FilterOperator::Gt if max_ordering != Ordering::Less => 0.0,
+                        FilterOperator::Gt if min_ordering == Ordering::Less => 1.0,
+                        FilterOperator::Gte if max_ordering == Ordering::Greater => 0.0,
+                        FilterOperator::Gte if min_ordering != Ordering::Greater => 1.0,
                         _ => 0.6,
                     };
                     (estimate * comparable_share).clamp(0.0, 1.0)
@@ -1071,7 +1012,7 @@ fn estimate_comparison_selectivity(comparison: &PredicateComparison, unit: &Quer
     }
 }
 
-fn filter_records_by_predicate<I>(records: I, predicate: Option<&Predicate>) -> Vec<VisibleRecord>
+fn filter_records_by_predicate<I>(records: I, predicate: Option<&FilterExpr>) -> Vec<VisibleRecord>
 where
     I: IntoIterator<Item = VisibleRecord>,
 {
@@ -1084,46 +1025,46 @@ where
         .collect()
 }
 
-fn predicate_matches_metadata(metadata: &Value, predicate: &Predicate) -> bool {
+fn predicate_matches_metadata(metadata: &Value, predicate: &FilterExpr) -> bool {
     match predicate {
-        Predicate::And { children } => children
+        FilterExpr::And { children } => children
             .iter()
             .all(|child| predicate_matches_metadata(metadata, child)),
-        Predicate::Or { children } => children
+        FilterExpr::Or { children } => children
             .iter()
             .any(|child| predicate_matches_metadata(metadata, child)),
-        Predicate::Not { child } => !predicate_matches_metadata(metadata, child),
-        Predicate::Comparison(comparison) => comparison_matches_metadata(metadata, comparison),
+        FilterExpr::Not { child } => !predicate_matches_metadata(metadata, child),
+        FilterExpr::Comparison(comparison) => comparison_matches_metadata(metadata, comparison),
     }
 }
 
-fn comparison_matches_metadata(metadata: &Value, comparison: &PredicateComparison) -> bool {
+fn comparison_matches_metadata(metadata: &Value, comparison: &FilterComparison) -> bool {
     let field_value = metadata
         .as_object()
         .and_then(|fields| fields.get(&comparison.field));
 
     match comparison.operator {
-        PredicateOperator::Exists => field_value.is_some(),
-        PredicateOperator::IsNull => matches!(field_value, Some(Value::Null)),
-        PredicateOperator::Eq => field_value
+        FilterOperator::Exists => field_value.is_some(),
+        FilterOperator::IsNull => matches!(field_value, Some(Value::Null)),
+        FilterOperator::Eq => field_value
             .and_then(ScalarMetadataValue::from_json)
             .zip(comparison.value.clone())
             .is_some_and(|(actual, expected)| actual == expected),
-        PredicateOperator::Ne => field_value
+        FilterOperator::Ne => field_value
             .and_then(ScalarMetadataValue::from_json)
             .zip(comparison.value.clone())
             .is_some_and(|(actual, expected)| actual != expected),
-        PredicateOperator::Lt => {
+        FilterOperator::Lt => {
             compare_field_value(field_value, comparison.value.as_ref(), Ordering::Less)
         }
-        PredicateOperator::Lte => {
+        FilterOperator::Lte => {
             compare_field_value(field_value, comparison.value.as_ref(), Ordering::Less)
                 || compare_field_value(field_value, comparison.value.as_ref(), Ordering::Equal)
         }
-        PredicateOperator::Gt => {
+        FilterOperator::Gt => {
             compare_field_value(field_value, comparison.value.as_ref(), Ordering::Greater)
         }
-        PredicateOperator::Gte => {
+        FilterOperator::Gte => {
             compare_field_value(field_value, comparison.value.as_ref(), Ordering::Greater)
                 || compare_field_value(field_value, comparison.value.as_ref(), Ordering::Equal)
         }
@@ -1261,38 +1202,38 @@ fn unit_scan_mix(plan: QueryPlanKind, unit_selection: &UnitSelection) -> BTreeMa
     mix
 }
 
-fn predicate_may_match_unit(predicate: &Predicate, unit: &QueryUnitStats) -> bool {
+fn predicate_may_match_unit(predicate: &FilterExpr, unit: &QueryUnitStats) -> bool {
     match predicate {
-        Predicate::And { children } => children
+        FilterExpr::And { children } => children
             .iter()
             .all(|child| predicate_may_match_unit(child, unit)),
-        Predicate::Or { children } => children
+        FilterExpr::Or { children } => children
             .iter()
             .any(|child| predicate_may_match_unit(child, unit)),
-        Predicate::Not { .. } => true,
-        Predicate::Comparison(comparison) => comparison_may_match_unit(comparison, unit),
+        FilterExpr::Not { .. } => true,
+        FilterExpr::Comparison(comparison) => comparison_may_match_unit(comparison, unit),
     }
 }
 
-fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitStats) -> bool {
+fn comparison_may_match_unit(comparison: &FilterComparison, unit: &QueryUnitStats) -> bool {
     let Some(field_stats) = unit.scalar_fields.get(&comparison.field) else {
         return false;
     };
 
     match comparison.operator {
-        PredicateOperator::Exists => field_stats.present_count > 0,
-        PredicateOperator::IsNull => field_stats.null_count > 0,
-        PredicateOperator::Eq => comparison
+        FilterOperator::Exists => field_stats.present_count > 0,
+        FilterOperator::IsNull => field_stats.null_count > 0,
+        FilterOperator::Eq => comparison
             .value
             .as_ref()
             .is_some_and(|value| field_stats.value_counts.contains_key(&value.summary_key())),
-        PredicateOperator::Ne => comparison.value.as_ref().is_none_or(|value| {
+        FilterOperator::Ne => comparison.value.as_ref().is_none_or(|value| {
             field_stats
                 .value_counts
                 .get(&value.summary_key())
                 .is_none_or(|count| *count < scalar_present_count(field_stats))
         }),
-        PredicateOperator::Lt | PredicateOperator::Lte => {
+        FilterOperator::Lt | FilterOperator::Lte => {
             let Some(value) = comparison.value.as_ref() else {
                 return false;
             };
@@ -1304,12 +1245,12 @@ fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitS
                 .as_ref()
                 .and_then(|min| compare_ordered_scalars(min, value))
                 .is_none_or(|ordering| match comparison.operator {
-                    PredicateOperator::Lt => ordering == Ordering::Less,
-                    PredicateOperator::Lte => ordering != Ordering::Greater,
+                    FilterOperator::Lt => ordering == Ordering::Less,
+                    FilterOperator::Lte => ordering != Ordering::Greater,
                     _ => false,
                 })
         }
-        PredicateOperator::Gt | PredicateOperator::Gte => {
+        FilterOperator::Gt | FilterOperator::Gte => {
             let Some(value) = comparison.value.as_ref() else {
                 return false;
             };
@@ -1321,8 +1262,8 @@ fn comparison_may_match_unit(comparison: &PredicateComparison, unit: &QueryUnitS
                 .as_ref()
                 .and_then(|max| compare_ordered_scalars(max, value))
                 .is_none_or(|ordering| match comparison.operator {
-                    PredicateOperator::Gt => ordering == Ordering::Greater,
-                    PredicateOperator::Gte => ordering != Ordering::Less,
+                    FilterOperator::Gt => ordering == Ordering::Greater,
+                    FilterOperator::Gte => ordering != Ordering::Less,
                     _ => false,
                 })
         }
@@ -1903,9 +1844,9 @@ mod tests {
                 snapshot: None,
                 read_barrier: None,
                 filters: Vec::new(),
-                predicate: Some(Predicate::Comparison(PredicateComparison {
+                predicate: Some(FilterExpr::Comparison(FilterComparison {
                     field: "kind".to_owned(),
-                    operator: PredicateOperator::Eq,
+                    operator: FilterOperator::Eq,
                     value: None,
                 })),
                 explain: ExplainMode::None,
@@ -1931,9 +1872,9 @@ mod tests {
                 snapshot: None,
                 read_barrier: None,
                 filters: Vec::new(),
-                predicate: Some(Predicate::Comparison(PredicateComparison {
+                predicate: Some(FilterExpr::Comparison(FilterComparison {
                     field: "kind".to_owned(),
-                    operator: PredicateOperator::Exists,
+                    operator: FilterOperator::Exists,
                     value: Some(ScalarMetadataValue::String("keep".to_owned())),
                 })),
                 explain: ExplainMode::None,
@@ -1959,7 +1900,7 @@ mod tests {
                 snapshot: None,
                 read_barrier: None,
                 filters: Vec::new(),
-                predicate: Some(Predicate::And {
+                predicate: Some(FilterExpr::And {
                     children: Vec::new(),
                 }),
                 explain: ExplainMode::None,
@@ -1985,9 +1926,9 @@ mod tests {
                 snapshot: None,
                 read_barrier: None,
                 filters: Vec::new(),
-                predicate: Some(Predicate::Comparison(PredicateComparison {
+                predicate: Some(FilterExpr::Comparison(FilterComparison {
                     field: "kind".to_owned(),
-                    operator: PredicateOperator::Gt,
+                    operator: FilterOperator::Gt,
                     value: Some(ScalarMetadataValue::Bool(true)),
                 })),
                 explain: ExplainMode::None,
@@ -2013,9 +1954,9 @@ mod tests {
                 snapshot: None,
                 read_barrier: None,
                 filters: Vec::new(),
-                predicate: Some(Predicate::Comparison(PredicateComparison {
+                predicate: Some(FilterExpr::Comparison(FilterComparison {
                     field: "kind".to_owned(),
-                    operator: PredicateOperator::Gt,
+                    operator: FilterOperator::Gt,
                     value: Some(ScalarMetadataValue::Number(Number::from(1))),
                 })),
                 explain: ExplainMode::None,

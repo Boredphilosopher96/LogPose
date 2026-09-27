@@ -17,9 +17,8 @@ use logpose_config as _;
 #[cfg(test)]
 use logpose_core as _;
 use logpose_query::{
-    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator,
-    QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings,
-    ScalarMetadataValue,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
+    QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings, ScalarMetadataValue,
 };
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
@@ -958,24 +957,24 @@ fn metadata_filter_to_proto(filter: MetadataFilter) -> Result<proto::MetadataFil
     })
 }
 
-fn predicate_to_proto(predicate: Predicate) -> Result<proto::Predicate> {
+fn predicate_to_proto(predicate: FilterExpr) -> Result<proto::Predicate> {
     let node = match predicate {
-        Predicate::And { children } => proto::predicate::Node::And(proto::PredicateList {
+        FilterExpr::And { children } => proto::predicate::Node::And(proto::PredicateList {
             children: children
                 .into_iter()
                 .map(predicate_to_proto)
                 .collect::<Result<Vec<_>>>()?,
         }),
-        Predicate::Or { children } => proto::predicate::Node::Or(proto::PredicateList {
+        FilterExpr::Or { children } => proto::predicate::Node::Or(proto::PredicateList {
             children: children
                 .into_iter()
                 .map(predicate_to_proto)
                 .collect::<Result<Vec<_>>>()?,
         }),
-        Predicate::Not { child } => proto::predicate::Node::Not(Box::new(proto::PredicateNot {
+        FilterExpr::Not { child } => proto::predicate::Node::Not(Box::new(proto::PredicateNot {
             child: Some(Box::new(predicate_to_proto(*child)?)),
         })),
-        Predicate::Comparison(comparison) => {
+        FilterExpr::Comparison(comparison) => {
             proto::predicate::Node::Comparison(predicate_comparison_to_proto(comparison)?)
         }
     };
@@ -983,7 +982,7 @@ fn predicate_to_proto(predicate: Predicate) -> Result<proto::Predicate> {
 }
 
 fn predicate_comparison_to_proto(
-    comparison: PredicateComparison,
+    comparison: FilterComparison,
 ) -> Result<proto::PredicateComparison> {
     Ok(proto::PredicateComparison {
         field: comparison.field,
@@ -992,16 +991,16 @@ fn predicate_comparison_to_proto(
     })
 }
 
-fn predicate_operator_to_proto(operator: PredicateOperator) -> proto::PredicateOperator {
+fn predicate_operator_to_proto(operator: FilterOperator) -> proto::PredicateOperator {
     match operator {
-        PredicateOperator::Eq => proto::PredicateOperator::Eq,
-        PredicateOperator::Ne => proto::PredicateOperator::Ne,
-        PredicateOperator::Lt => proto::PredicateOperator::Lt,
-        PredicateOperator::Lte => proto::PredicateOperator::Lte,
-        PredicateOperator::Gt => proto::PredicateOperator::Gt,
-        PredicateOperator::Gte => proto::PredicateOperator::Gte,
-        PredicateOperator::Exists => proto::PredicateOperator::Exists,
-        PredicateOperator::IsNull => proto::PredicateOperator::IsNull,
+        FilterOperator::Eq => proto::PredicateOperator::Eq,
+        FilterOperator::Ne => proto::PredicateOperator::Ne,
+        FilterOperator::Lt => proto::PredicateOperator::Lt,
+        FilterOperator::Lte => proto::PredicateOperator::Lte,
+        FilterOperator::Gt => proto::PredicateOperator::Gt,
+        FilterOperator::Gte => proto::PredicateOperator::Gte,
+        FilterOperator::Exists => proto::PredicateOperator::Exists,
+        FilterOperator::IsNull => proto::PredicateOperator::IsNull,
     }
 }
 

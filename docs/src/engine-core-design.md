@@ -732,8 +732,8 @@ pub struct RowImage {
     /// Each value is in the binary value codec (serde_bytes).
     pub scalars: Vec<(FieldId, ValueBytes)>,
     /// Undeclared keys (`$extra`): one JSON object node in the binary value
-    /// codec, keys sorted, with no key equal to a field name declared in the
-    /// schema the row was validated against. None when there are no keys.
+    /// codec, keys sorted, with no key that the schema the row was validated
+    /// against declares or retires. None when there are no keys.
     pub dynamic: Option<ValueBytes>,
 }
 
@@ -790,13 +790,13 @@ tag  JSON node        payload
 0x12 true             none
 0x13 integer (i64)    zigzag varint
 0x14 integer (u64)    varint, only for values above i64::MAX
-0x15 float            8 bytes LE
+0x15 float            8 bytes LE (finite; -0.0 folded to 0.0)
 0x16 string           varint byte length, UTF-8
 0x17 array            varint count, then nodes
-0x18 object           varint count, then (varint key length, key UTF-8, node), keys in byte order
+0x18 object           varint count, then (varint key length, key UTF-8, node), keys in strictly increasing byte order
 ```
 
-`decode(bytes, FieldType)` checks that the tag fits the field type, so a corrupt cell is a typed error, not a wrong value. Equal values always encode to equal bytes (object keys sorted, one integer form per value), which the segment dictionary encodings and golden files rely on.
+`decode(bytes, FieldType)` checks that the tag fits the field type, so a corrupt cell is a typed error, not a wrong value. Equal values always encode to equal bytes (object keys sorted, one integer form per value, one zero, and a `json` value of JSON `null` stored as `0x00` Null), which the segment dictionary encodings and golden files rely on. Decoding is strict and accepts only canonical bytes (minimal varints, no NaN, infinity or -0.0, `0x14` only above `i64::MAX`, valid UTF-8, timestamps within years 0000 to 9999, no null array elements, no trailing bytes), so `encode(decode(bytes)) == bytes` for every accepted input. Arrays and JSON containers nest at most 128 levels on both sides, and a declared length or count larger than the remaining input is rejected before anything is allocated.
 
 ### Tail Repair
 
@@ -994,8 +994,8 @@ Let `cur` be the schema replay holds, initially `S_M`.
 
 A key in `$extra` collides with a declared name when a field is added, or renamed, to a name that rows written earlier carry in `$extra`. The rule is a pure function of the stored bytes and the reading schema, so it cannot depend on whether a compaction has run:
 
-- **Write.** Validation never stores a key in `$extra` that the writer's schema declares; a partial update that merges an old row removes such keys from the merged `$extra` (the old value is not promoted into the typed field).
-- **Read.** A key in a row's `$extra` is visible (to projection, to `$extra` path filters, and to undeclared-name filters) only if the `ReadView`'s schema does not declare that name. Added fields therefore read null on old rows, as D4 requires, instead of exposing the old dynamic value under the new typed name.
+- **Write.** Validation never stores a key in `$extra` that the writer's schema declares or retires (a retired name is rejected with `RecordError::RetiredKey`, since readers would hide it); a partial update that merges an old row removes such keys from the merged `$extra` (the old value is not promoted into the typed field).
+- **Read.** A key in a row's `$extra` is visible (to projection, to `$extra` path filters, and to undeclared-name filters) only if the `ReadView`'s schema neither declares nor retires that name. Added fields therefore read null on old rows, as D4 requires, instead of exposing the old dynamic value under the new typed name.
 - **Storage.** Flush and compaction copy `$extra` bytes unchanged. They never strip shadowed keys, because stripping would make a later drop or rename (which un-shadows the name) return different results depending on compaction timing.
 
 Retired names stay shadowed: once a name has been declared, `$extra` values stored under it stay hidden after the field is dropped or renamed, until a field with that name is declared again. See [Decisions on Review Questions](#decisions-on-review-questions).

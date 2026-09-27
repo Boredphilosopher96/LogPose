@@ -95,6 +95,12 @@ pub enum SchemaError {
         /// The offending id.
         id: u32,
     },
+    /// A stored schema lists a name as retired while also declaring it.
+    #[error("field name '{name}' is both declared and retired")]
+    RetiredNameDeclared {
+        /// The conflicting name.
+        name: String,
+    },
     /// The schema ran out of field ids or schema versions.
     #[error("schema {counter} counter is exhausted")]
     CounterExhausted {

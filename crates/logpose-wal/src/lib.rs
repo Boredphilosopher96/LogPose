@@ -16,6 +16,8 @@
 //! file. The active WAL treats an invalid tail as a torn write: replay ignores it and
 //! [`WalWriter::open`] truncates it before appending. Rolled WAL files are strict.
 
+pub mod codec;
+
 use crc32fast::Hasher;
 use logpose_types::{LogPoseError, Result, SeqNo, WriteOperation};
 use serde::{Deserialize, Serialize};

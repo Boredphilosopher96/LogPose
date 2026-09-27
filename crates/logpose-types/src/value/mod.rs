@@ -18,9 +18,11 @@
 //! become numbers, and booleans never become integers. `-0.0` is stored as
 //! `0.0` so equal floats have one index key.
 
+pub mod codec;
 mod ordering;
 mod timestamp;
 
+pub use codec::CodecError;
 pub use ordering::OrderedValue;
 pub use timestamp::{Timestamp, TimestampError};
 

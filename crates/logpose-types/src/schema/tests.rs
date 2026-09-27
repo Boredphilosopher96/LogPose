@@ -153,7 +153,8 @@ fn stored_schema_round_trips_with_stable_shape() {
                 "index": "inverted_and_sorted",
                 "nullable": true
             }],
-            "dynamic_fields": false
+            "dynamic_fields": false,
+            "retired_names": []
         })
     );
     let decoded: CollectionSchema =
@@ -484,4 +485,102 @@ fn rename_field_keeps_id_and_bumps_version() {
         schema.field_by_id(FieldId(2)),
         Some(FieldRef::Scalar(field)) if field.name == "cost"
     ));
+}
+
+#[test]
+fn drop_and_rename_retire_names_and_add_unretires() {
+    let mut schema = schema_with(vec![
+        ScalarFieldSpec::new("price", FieldType::Float64),
+        ScalarFieldSpec::new("color", FieldType::String),
+    ])
+    .expect("schema should be valid");
+    assert!(schema.retired_names().is_empty());
+
+    schema.drop_field("price").expect("drop should succeed");
+    assert!(schema.is_retired("price"));
+
+    schema
+        .rename_field("color", "colour")
+        .expect("rename should succeed");
+    assert!(schema.is_retired("color"));
+    assert!(!schema.is_retired("colour"));
+
+    schema
+        .add_field(ScalarFieldSpec::new("price", FieldType::Int64))
+        .expect("re-adding a retired name should succeed");
+    assert!(!schema.is_retired("price"));
+    assert_eq!(
+        schema.retired_names().iter().collect::<Vec<_>>(),
+        vec!["color"]
+    );
+
+    schema
+        .rename_field("colour", "color")
+        .expect("renaming back should succeed");
+    assert!(!schema.is_retired("color"));
+    assert!(schema.is_retired("colour"));
+}
+
+#[test]
+fn failed_changes_leave_retired_names_unchanged() {
+    let mut schema = base_schema();
+    schema.drop_field("price").expect("drop should succeed");
+    let before = schema.clone();
+    assert!(
+        schema
+            .add_field(ScalarFieldSpec {
+                nullable: false,
+                ..ScalarFieldSpec::new("price", FieldType::Int64)
+            })
+            .is_err()
+    );
+    assert!(schema.rename_field("missing", "other").is_err());
+    assert_eq!(schema, before);
+}
+
+#[test]
+fn shadowing_hides_declared_and_retired_dynamic_keys() {
+    let mut schema = schema_with(vec![ScalarFieldSpec::new("color", FieldType::String)])
+        .expect("schema should be valid");
+    assert!(schema.shadows_dynamic_key("color"));
+    assert!(schema.shadows_dynamic_key("id"));
+    assert!(schema.shadows_dynamic_key("embedding"));
+    assert!(!schema.shadows_dynamic_key("size"));
+
+    schema.drop_field("color").expect("drop should succeed");
+    assert!(
+        schema.shadows_dynamic_key("color"),
+        "a dropped name stays shadowed"
+    );
+
+    let mut extra = serde_json::Map::new();
+    extra.insert("color".to_owned(), json!("red"));
+    extra.insert("size".to_owned(), json!(3));
+    extra.insert("id".to_owned(), json!(1));
+    schema.retain_visible_dynamic(&mut extra);
+    assert_eq!(serde_json::Value::Object(extra), json!({ "size": 3 }));
+}
+
+#[test]
+fn retired_names_round_trip_and_are_validated_on_decode() {
+    let mut schema = base_schema();
+    schema.drop_field("price").expect("drop should succeed");
+    let stored = serde_json::to_value(&schema).expect("schema should serialize");
+    assert_eq!(stored["retired_names"], json!(["price"]));
+    let decoded: CollectionSchema =
+        serde_json::from_value(stored.clone()).expect("schema should decode");
+    assert_eq!(decoded, schema);
+
+    let mut declared = stored.clone();
+    declared["retired_names"] = json!(["embedding"]);
+    assert_eq!(
+        serde_json::from_value::<CollectionSchema>(declared)
+            .expect_err("a declared name cannot be retired")
+            .to_string(),
+        "field name 'embedding' is both declared and retired"
+    );
+
+    let mut invalid = stored;
+    invalid["retired_names"] = json!(["not a name"]);
+    assert!(serde_json::from_value::<CollectionSchema>(invalid).is_err());
 }
