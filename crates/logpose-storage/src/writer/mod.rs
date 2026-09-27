@@ -847,12 +847,14 @@ impl Writer {
                 if wal.failure().is_none() {
                     // The new file could not be created; the writer stays on the old one.
                     self.wal = Some(wal);
-                } else {
-                    self.wal_failed(IoFailure::Rotate(WalError::WriterFailed {
-                        outcome: wal.failure().unwrap_or(WriteOutcome::NotApplied),
-                    }));
+                    return Err(error.into());
                 }
-                Err(error.into())
+                // Hand over the rotation's own error: an unfenced rollback failure of the new
+                // file's checkpoint group must reach the fatal handler, exactly as it does for
+                // a rotation before a group.
+                drop(wal);
+                self.wal_failed(IoFailure::Rotate(error));
+                Err(self.handle.unavailable())
             }
             Err(error) => {
                 self.poison(

@@ -24,12 +24,15 @@ use std::{
     collections::BTreeMap,
     fmt,
     ops::Deref,
+    panic::Location,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard,
+        RwLockWriteGuard,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    time::{Duration, Instant},
 };
 
 /// Suffix of a collection directory whose drop is committed but whose files are not yet removed.
@@ -347,6 +350,7 @@ impl Engine {
     }
 
     /// A tracked reference to the engine state for an engine task.
+    #[track_caller]
     pub(crate) fn core(&self) -> CoreRef {
         CoreRef::new(&self.shared.core)
     }
@@ -514,8 +518,19 @@ impl EngineCore {
     }
 
     /// Remember a started writer task, so that shutdown stops it.
+    ///
+    /// A create that an engine task finishes while the engine is already shutting down starts
+    /// its writer after shutdown sent `Shutdown` to the registered ones, so that writer is told
+    /// to stop right away; otherwise it would hold its engine reference forever and the
+    /// engine's drop would never return. The shutdown flag is set before the list is taken, and
+    /// both sides look at them under this lock, so every writer is either in the list shutdown
+    /// takes or sees the flag here.
     pub(crate) fn register_writer(&self, control: tokio::sync::mpsc::UnboundedSender<ControlMsg>) {
         let mut writers = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.is_shutting_down() {
+            let _ = control.send(ControlMsg::Shutdown);
+            return;
+        }
         writers.retain(|writer| !writer.is_closed());
         writers.push(control);
     }
@@ -845,7 +860,8 @@ struct RetireFailure {
     error: LogPoseError,
 }
 
-/// A reference to the engine state held by an engine task (an I/O pool job, a maintenance job).
+/// A reference to the engine state held by an engine task (an I/O pool job, a maintenance job,
+/// a collection's writer task).
 ///
 /// The engine's drop waits until every `CoreRef` is gone, so no task can touch the storage root
 /// after the engine released its lock.
@@ -856,16 +872,21 @@ pub(crate) struct CoreRef {
 }
 
 impl CoreRef {
+    #[track_caller]
     pub(crate) fn new(core: &Arc<EngineCore>) -> Self {
-        core.tasks.enter();
+        let id = core.tasks.enter(Location::caller());
         Self {
             core: Arc::clone(core),
-            _task: TaskGuard(Arc::clone(&core.tasks)),
+            _task: TaskGuard {
+                tracker: Arc::clone(&core.tasks),
+                id,
+            },
         }
     }
 }
 
 impl Clone for CoreRef {
+    #[track_caller]
     fn clone(&self) -> Self {
         Self::new(&self.core)
     }
@@ -879,39 +900,108 @@ impl Deref for CoreRef {
     }
 }
 
-/// Counts live [`CoreRef`]s so that shutdown can wait for them.
+/// How often the engine's drop reports the tasks it still waits for.
+const SHUTDOWN_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a debug build's engine drop waits before it panics with that report instead of
+/// hanging, so that a leaked task fails a test loudly.
+#[cfg(debug_assertions)]
+const SHUTDOWN_DEBUG_LIMIT: Duration = Duration::from_secs(120);
+
+/// Counts live [`CoreRef`]s so that shutdown can wait for them, and remembers where each was
+/// created, so that a shutdown that waits too long can say which tasks it waits for.
 #[derive(Default)]
 struct TaskTracker {
-    live: Mutex<usize>,
+    live: Mutex<LiveTasks>,
     idle: Condvar,
 }
 
+#[derive(Default)]
+struct LiveTasks {
+    next_id: u64,
+    /// Where each live `CoreRef` was created, by id.
+    sites: BTreeMap<u64, &'static Location<'static>>,
+}
+
 impl TaskTracker {
-    fn enter(&self) {
-        *self.live.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    fn lock(&self) -> MutexGuard<'_, LiveTasks> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn exit(&self) {
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        *live = live.saturating_sub(1);
-        if *live == 0 {
+    fn enter(&self, site: &'static Location<'static>) -> u64 {
+        let mut live = self.lock();
+        let id = live.next_id;
+        live.next_id += 1;
+        live.sites.insert(id, site);
+        id
+    }
+
+    fn exit(&self, id: u64) {
+        let mut live = self.lock();
+        live.sites.remove(&id);
+        if live.sites.is_empty() {
             self.idle.notify_all();
         }
     }
 
+    /// Wait until no task is live. Every [`SHUTDOWN_REPORT_INTERVAL`] it logs where the tasks it
+    /// still waits for were created; a debug build panics with that list after
+    /// `SHUTDOWN_DEBUG_LIMIT`.
     fn wait_idle(&self) {
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        while *live > 0 {
-            live = self.idle.wait(live).unwrap_or_else(PoisonError::into_inner);
+        let started = Instant::now();
+        let mut live = self.lock();
+        while !live.sites.is_empty() {
+            let (guard, waited) = self
+                .idle
+                .wait_timeout(live, SHUTDOWN_REPORT_INTERVAL)
+                .unwrap_or_else(PoisonError::into_inner);
+            live = guard;
+            if !waited.timed_out() || live.sites.is_empty() {
+                continue;
+            }
+            let outstanding = live.outstanding();
+            tracing::error!(
+                waited_secs = started.elapsed().as_secs(),
+                %outstanding,
+                "engine shutdown is still waiting for its tasks"
+            );
+            #[cfg(debug_assertions)]
+            assert!(
+                started.elapsed() < SHUTDOWN_DEBUG_LIMIT,
+                "engine shutdown waited {:?} for tasks that never finished: {outstanding}",
+                started.elapsed()
+            );
         }
+    }
+
+    /// Where the live tasks were created, with counts, for diagnostics.
+    #[cfg(test)]
+    fn outstanding(&self) -> String {
+        self.lock().outstanding()
     }
 }
 
-struct TaskGuard(Arc<TaskTracker>);
+impl LiveTasks {
+    fn outstanding(&self) -> String {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for site in self.sites.values() {
+            *counts.entry(site.to_string()).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(site, count)| format!("{count} from {site}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+struct TaskGuard {
+    tracker: Arc<TaskTracker>,
+    id: u64,
+}
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        self.0.exit();
+        self.tracker.exit(self.id);
     }
 }
 

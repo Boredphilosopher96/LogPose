@@ -152,6 +152,11 @@ impl ControlledVfs {
     pub(crate) fn fail_renames_to(&self, fragment: &str, count: u32) {
         self.state().fail_renames = Some((fragment.to_owned(), count));
     }
+
+    /// Let every later rename through.
+    pub(crate) fn stop_failing_renames(&self) {
+        self.state().fail_renames = None;
+    }
 }
 
 impl Control {

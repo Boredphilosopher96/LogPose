@@ -638,3 +638,163 @@ async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
         .expect("the quiet collection's flush must get a job thread")
         .expect("the flush should succeed");
 }
+
+/// Drop `engine` on another thread and fail, instead of hanging, when that takes longer than
+/// `limit`. The failure names where the tasks the drop still waits for were created.
+fn drop_within(engine: Engine, limit: Duration, context: &str) {
+    let tasks = Arc::clone(&engine.shared.core.tasks);
+    let (done, dropped) = mpsc::channel();
+    thread::spawn(move || {
+        drop(engine);
+        let _ = done.send(());
+    });
+    let finished = dropped.recv_timeout(limit).is_ok();
+    assert!(
+        finished,
+        "{context}: dropping the engine hung; it still waits for {}",
+        tasks.outstanding()
+    );
+}
+
+/// A crash at any point of a collection drop (before, at, or after its commit point) must not
+/// leave a writer task, a quiesce or a job behind that the engine's drop then waits for forever,
+/// neither in the engine that saw the crash nor in the one that recovers after it.
+#[test]
+fn the_engine_drops_promptly_after_a_crash_at_any_point_of_a_collection_drop() {
+    for k in 0..8 {
+        let context = format!("crash after {k} operations of the drop");
+        let fault = FaultVfs::new(40 + k);
+        let engine = Engine::open(fault.process(), "/storage", EngineConfig::default())
+            .expect("engine should open");
+        let handle = create(&engine, "documents");
+        write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+        drop(handle);
+        fault.set_plan(logpose_vfs::FaultPlan {
+            crash_after_ops: Some(fault.mutating_ops() + k),
+            ..logpose_vfs::FaultPlan::default()
+        });
+        let _ = engine.drop_collection(&reference("documents"));
+        drop_within(engine, Duration::from_secs(60), &context);
+
+        fault.crash();
+        let engine = Engine::open(fault.process(), "/storage", EngineConfig::default())
+            .expect("engine should reopen");
+        if let Ok(handle) = engine.collection(&reference("documents")) {
+            write(&engine, &handle, vec![put("beta", vec![0.0, 1.0])]);
+            engine
+                .core()
+                .flush_collection(&handle)
+                .expect("flush should succeed");
+        }
+        drop_within(engine, Duration::from_secs(60), &context);
+    }
+}
+
+/// Two directories that hold the same collection: the second is not served, but recovery
+/// already started its writer task. The engine's drop must stop that writer too.
+#[test]
+fn the_engine_drop_stops_the_writer_of_a_collection_it_does_not_serve() {
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("directory should be created");
+        for entry in fs::read_dir(from).expect("directory should list") {
+            let entry = entry.expect("entry should read");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("type should read").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).expect("file should copy");
+            }
+        }
+    }
+
+    let root = unique_temp_dir("engine-duplicate-collection");
+    let engine = open(&root).expect("engine should open");
+    let handle = create(&engine, "documents");
+    write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+    let dir = handle.meta().dir.clone();
+    drop(handle);
+    drop(engine);
+    let mut copy = dir.clone().into_os_string();
+    copy.push("-copy");
+    copy_dir(&dir, Path::new(&copy));
+
+    let engine = open(&root).expect("engine should open");
+    let served = engine
+        .collection(&reference("documents"))
+        .expect("one of the two directories is served");
+    assert_eq!(served.visible_seq_no(), 1);
+    drop(served);
+    drop_within(
+        engine,
+        Duration::from_secs(60),
+        "a duplicate collection directory",
+    );
+    open(&root).expect("the root is released");
+}
+
+/// A create that an engine task (such as an async create on the I/O pool) finishes after the
+/// last engine clone was dropped starts its writer after shutdown already stopped the others.
+/// That writer must stop too, or the engine's drop waits for it forever.
+#[test]
+fn a_create_that_finishes_during_shutdown_does_not_hang_the_engine_drop() {
+    let fault = FaultVfs::new(50);
+    let vfs = crate::test_support::ControlledVfs::wrap(fault.process());
+    let engine =
+        Engine::open(vfs.clone(), "/storage", EngineConfig::default()).expect("engine should open");
+    let descriptor = engine
+        .core()
+        .plan_collection_descriptor(&request("late"))
+        .expect("descriptor should plan");
+
+    // Hold the create inside its first fsync, on an engine task.
+    vfs.hold_syncs();
+    let (created, create_result) = mpsc::channel();
+    {
+        let core = engine.core();
+        thread::spawn(move || {
+            let result = core.create_collection(descriptor, None).map(|_| ());
+            let _ = created.send(result);
+        });
+    }
+    assert!(vfs.wait_for_held_sync(Duration::from_secs(10)));
+
+    // Drop the last engine clone; it waits for the create's engine reference.
+    let core = Arc::clone(&engine.shared.core);
+    let tasks = Arc::clone(&core.tasks);
+    let (done, dropped) = mpsc::channel();
+    thread::spawn(move || {
+        drop(engine);
+        let _ = done.send(());
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !core.is_shutting_down() {
+        assert!(Instant::now() < deadline, "the engine drop never started");
+        thread::sleep(Duration::from_millis(1));
+    }
+    // Let the drop stop the writers it knows about before the create registers its own.
+    thread::sleep(Duration::from_millis(100));
+    vfs.release_syncs();
+
+    create_result
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the create finishes")
+        .expect("the create succeeds");
+    let finished = dropped.recv_timeout(Duration::from_secs(60)).is_ok();
+    assert!(
+        finished,
+        "dropping the engine hung; it still waits for {}",
+        tasks.outstanding()
+    );
+}
+
+/// The shutdown diagnostics name the creation site of every live engine task.
+#[test]
+fn the_task_tracker_names_where_live_tasks_were_created() {
+    let root = unique_temp_dir("engine-task-sites");
+    let engine = open(&root).expect("engine should open");
+    let core = engine.core();
+    let report = engine.shared.core.tasks.outstanding();
+    assert!(report.contains("engine/tests.rs"), "{report}");
+    drop(core);
+    assert_eq!(engine.shared.core.tasks.outstanding(), "");
+}

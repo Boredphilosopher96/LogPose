@@ -369,6 +369,232 @@ async fn an_unfenced_rollback_failure_stops_the_process() {
     assert!(calls[0].contains("must stop"), "{calls:?}");
 }
 
+/// Group N's fsync fails while group N+1 (large enough to be prepared on the query pool, and
+/// holding a schema change) is prepared behind it. A reader polling throughout never sees
+/// anything past the last acknowledged write, no write of either group is acknowledged, and a
+/// reopen in process, then a crash, recover exactly the acknowledged prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
+    let fault = FaultVfs::new(13);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    let handle = create(&engine, "prefix");
+    let schema_version = handle.current().schema.schema_version();
+    let kept = write(&handle, "kept").await.expect("write should succeed");
+
+    let seen = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let handle = Arc::clone(&handle);
+        let seen = Arc::clone(&seen);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                let version = handle.current();
+                seen.fetch_max(version.visible_seq_no, Ordering::AcqRel);
+                seen.fetch_max(version.delta.len() as u64, Ordering::AcqRel);
+            }
+        })
+    };
+
+    vfs.hold_syncs();
+    vfs.fail_next_syncs(1);
+    let failed = spawn_write(&handle, "n".to_owned());
+    assert!(vfs.wait_for_held_sync(Duration::from_secs(10)));
+    let altered = {
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            handle
+                .alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
+                    "price",
+                    FieldType::Int64,
+                )))
+                .await
+        })
+    };
+    let large = {
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            let rows = (0..2 * INLINE_PREPARE_ROWS)
+                .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
+                .collect();
+            handle.write(ops(&handle, rows)).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    vfs.release_syncs();
+
+    let results = [
+        ("n", failed.await.expect("task should join")),
+        ("alter", altered.await.expect("task should join")),
+        ("large", large.await.expect("task should join")),
+    ];
+    for (name, result) in results {
+        let error = result.expect_err("nothing in or behind the failed group is acknowledged");
+        assert!(
+            matches!(
+                error,
+                LogPoseError::WalWriteFailed {
+                    outcome: WriteOutcome::NotApplied,
+                    ..
+                }
+            ),
+            "{name}: {error}"
+        );
+    }
+    done.store(true, Ordering::Release);
+    reader.join().expect("reader should join");
+    assert_eq!(
+        seen.load(Ordering::Acquire),
+        kept.last_seq_no,
+        "no reader saw anything past the last acknowledged write (I14)"
+    );
+    assert!(handle.is_poisoned());
+    assert_eq!(handle.current().schema.schema_version(), schema_version);
+
+    drop(handle);
+    drop(engine);
+    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should reopen");
+    let handle = engine
+        .collection(&reference("prefix"))
+        .expect("collection should reopen");
+    assert_eq!(handle.visible_seq_no(), kept.last_seq_no);
+    assert_eq!(handle.current().schema.schema_version(), schema_version);
+    assert_eq!(visible(&handle).keys().collect::<Vec<_>>(), vec!["kept"]);
+    let after = write(&handle, "after").await.expect("write should succeed");
+    assert_eq!(after.last_seq_no, kept.last_seq_no + 1);
+
+    drop(handle);
+    drop(engine);
+    fault.crash();
+    let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should reopen");
+    let handle = engine
+        .collection(&reference("prefix"))
+        .expect("collection should reopen");
+    assert_eq!(handle.visible_seq_no(), after.last_seq_no);
+    assert_eq!(handle.current().schema.schema_version(), schema_version);
+    assert_eq!(
+        visible(&handle).keys().collect::<Vec<_>>(),
+        vec!["after", "kept"]
+    );
+}
+
+/// A drop that begins while a group is prepared behind the group in flight fails that group
+/// (it was never appended) and puts the writer's private state back. When the drop then does
+/// not commit, the collection serves again exactly where its log is: the next write reuses the
+/// abandoned group's sequence numbers, and nothing of that group ever becomes visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_prepared_during_a_drop_that_does_not_commit_is_forgotten() {
+    let fault = FaultVfs::new(14);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    let handle = create(&engine, "undropped");
+    write(&handle, "kept").await.expect("write should succeed");
+
+    vfs.hold_syncs();
+    let first = spawn_write(&handle, "first".to_owned());
+    assert!(vfs.wait_for_held_sync(Duration::from_secs(10)));
+    // Collected and prepared while `first`'s fsync is held.
+    let behind = spawn_write(&handle, "behind".to_owned());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
+    let dropped = {
+        let engine = engine.clone();
+        tokio::task::spawn_blocking(move || engine.drop_collection(&reference("undropped")))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_dropped() {
+        assert!(Instant::now() < deadline, "the drop never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    vfs.release_syncs();
+
+    let first = first
+        .await
+        .expect("task should join")
+        .expect("the group in flight commits");
+    assert_eq!(first.last_seq_no, 2);
+    behind
+        .await
+        .expect("task should join")
+        .expect_err("the group prepared during the drop is not appended");
+    dropped
+        .await
+        .expect("drop should join")
+        .expect_err("the drop's rename fails");
+    vfs.stop_failing_renames();
+    assert!(!handle.is_dropped(), "the collection serves again");
+    assert_eq!(
+        visible(&handle).keys().collect::<Vec<_>>(),
+        ["first", "kept"]
+    );
+
+    let after = write(&handle, "after").await.expect("write should succeed");
+    assert_eq!(
+        after.last_seq_no, 3,
+        "the abandoned group's sequence numbers are reused"
+    );
+    let expected = ["after", "first", "kept"];
+    assert_eq!(visible(&handle).keys().collect::<Vec<_>>(), expected);
+
+    drop(handle);
+    drop(engine);
+    fault.crash();
+    let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should reopen");
+    let handle = engine
+        .collection(&reference("undropped"))
+        .expect("collection should reopen");
+    assert_eq!(handle.visible_seq_no(), 3);
+    assert_eq!(visible(&handle).keys().collect::<Vec<_>>(), expected);
+}
+
+/// The WAL rotation a flush begins with appends and syncs a checkpoint group to the new file.
+/// When that fails, the rollback of the new file fails, and the fence cannot be written, the
+/// engine must stop the process exactly as for a failed group append; a same-boot reopen would
+/// otherwise trust a page cache that already lied once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfenced_rotation_failure_before_a_flush_stops_the_process() {
+    let fault = FaultVfs::new(11);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let fatal = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&fatal);
+    let engine = Engine::open(
+        vfs.clone(),
+        ROOT,
+        EngineConfig {
+            on_fatal: Some(Arc::new(move |error: &LogPoseError| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(error.to_string());
+            })),
+            ..config("boot")
+        },
+    )
+    .expect("engine should open");
+    let handle = create(&engine, "rotation");
+    write(&handle, "a").await.expect("write should succeed");
+
+    // The new file's checkpoint sync, then the sync of its rollback to empty.
+    vfs.fail_next_syncs(2);
+    vfs.fail_creates_containing("FSYNC_FAILED");
+    let begin = std::thread::scope(|scope| {
+        scope
+            .spawn(|| handle.begin_job(JobKind::Flush).map(|_| ()))
+            .join()
+            .expect("thread should join")
+    });
+    let error = begin.expect_err("the flush cannot begin");
+    assert!(
+        matches!(error, LogPoseError::CollectionPoisoned { .. }),
+        "{error}"
+    );
+    assert!(handle.is_poisoned());
+    let calls = fatal.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("must stop"), "{calls:?}");
+}
+
 use std::sync::PoisonError;
 
 /// Visibility never runs ahead of durability (I14): while a group's fsync has not returned,
