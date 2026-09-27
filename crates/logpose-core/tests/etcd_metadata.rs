@@ -5,7 +5,7 @@
 //! running (the skip message shows with `--nocapture`). When the variable is
 //! set, an unreachable etcd is a failure, and under CI a missing variable is too.
 
-use etcd_client::{Client, DeleteOptions};
+use etcd_client::{Client, DeleteOptions, PutOptions};
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
@@ -17,7 +17,7 @@ use logpose_query::{ExplainMode, QueryRequest};
 use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest;
 use logpose_storage_etcd::{
-    EtcdCatalogStore, EtcdCoordinationClient, LeadershipRecord, PromotionResult,
+    EtcdCatalogStore, EtcdCoordinationClient, LeadershipRecord, LeaseKeepAlive, PromotionResult,
 };
 use logpose_types::{
     CollectionAssignment, CollectionRef, DistanceMetric, EtcdMetadataConfig, MetadataBackend,
@@ -1732,166 +1732,516 @@ async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachab
 }
 
 #[tokio::test]
-async fn etcd_runtime_status_drops_ready_flags_after_external_lease_revocation() {
-    let Some(endpoints) = etcd_endpoints_or_skip(
-        "etcd_runtime_status_drops_ready_flags_after_external_lease_revocation",
-    )
-    .await
+async fn etcd_keep_alive_reports_revoked_leases_as_expired() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_keep_alive_reports_revoked_leases_as_expired").await
     else {
         return;
     };
-    let key_prefix = unique_etcd_prefix("runtime-status-lease-revocation");
+    let key_prefix = unique_etcd_prefix("keep-alive-reports-expired");
     cleanup_prefix(&endpoints, &key_prefix).await;
-    let cluster_name = "core-etcd-runtime-status-lease-revocation";
+    let config = test_config(
+        "keep-alive-node",
+        unique_temp_dir("etcd-keep-alive-reports-expired"),
+        &endpoints,
+        &key_prefix,
+        "core-etcd-keep-alive-reports-expired",
+    );
+    let coordination = EtcdCoordinationClient::new(config.metadata.etcd.clone())
+        .expect("coordination client should build");
+    let membership = coordination
+        .register_membership("keep-alive-node", NodeRole::Combined)
+        .await
+        .expect("membership should register");
+    let leadership = coordination
+        .try_acquire_leadership("keep-alive-node")
+        .await
+        .expect("leadership campaign should run")
+        .expect("an empty cluster should grant leadership");
 
-    let mut config = test_config(
-        "coordinator-a",
-        unique_temp_dir("etcd-runtime-status-lease-revocation"),
+    assert!(matches!(
+        coordination.keep_alive(membership.lease_id).await,
+        Ok(LeaseKeepAlive::Alive { ttl_secs }) if ttl_secs > 0
+    ));
+
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .lease_revoke(leadership.lease_id)
+        .await
+        .expect("leadership lease should be revocable out of band");
+    client
+        .lease_revoke(membership.lease_id)
+        .await
+        .expect("membership lease should be revocable out of band");
+
+    assert_eq!(
+        coordination
+            .keep_alive(leadership.lease_id)
+            .await
+            .expect("keep-alive on a revoked lease should not be a transport error"),
+        LeaseKeepAlive::Expired
+    );
+    assert_eq!(
+        coordination
+            .keep_alive(membership.lease_id)
+            .await
+            .expect("keep-alive on a revoked lease should not be a transport error"),
+        LeaseKeepAlive::Expired
+    );
+    // With the session gone, a later keep-alive reopens the stream and still
+    // reports the lease as dead.
+    assert_eq!(
+        coordination
+            .keep_alive(membership.lease_id)
+            .await
+            .expect("keep-alive on an unknown lease should not be a transport error"),
+        LeaseKeepAlive::Expired
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_node_recampaigns_after_leadership_lease_revocation() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_node_recampaigns_after_leadership_lease_revocation").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("recampaign-after-leadership-revocation");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-recampaign-after-leadership-revocation";
+    let config = short_ttl_config(
+        "leader-a",
+        "etcd-recampaign-after-leadership-revocation",
         &endpoints,
         &key_prefix,
         cluster_name,
     );
-    config.node_role = NodeRole::Combined;
-    config.metadata.etcd.membership_ttl_secs = 15;
-    config.metadata.etcd.leadership_ttl_secs = 15;
-    let state = Arc::new(AppState::new(config.clone()));
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, leadership_lease_id) = wait_for_local_leadership(&state).await;
 
-    let ready = wait_for_runtime_status(&state, |status| {
+    revoke_lease_out_of_band(&endpoints, leadership_lease_id).await;
+
+    let recovered = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.is_local_leader
+                && coordination
+                    .leadership_lease_id
+                    .is_some_and(|lease_id| lease_id != leadership_lease_id)
+        }) && status.control_plane_ready
+    })
+    .await;
+    let coordination = recovered
+        .coordination
+        .expect("coordination state should be present");
+
+    assert_eq!(coordination.leader_node.as_deref(), Some("leader-a"));
+    assert_eq!(
+        coordination.membership_lease_id,
+        Some(membership_lease_id),
+        "losing leadership must not disturb a healthy membership lease"
+    );
+    assert_eq!(
+        visible_leader(&endpoints, &key_prefix, cluster_name).await,
+        Some(LeadershipRecord {
+            node_id: "leader-a".to_owned(),
+            lease_id: coordination
+                .leadership_lease_id
+                .expect("re-acquired leadership lease should be visible"),
+        })
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_node_recampaigns_when_leader_key_disappears() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_node_recampaigns_when_leader_key_disappears").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("recampaign-after-leader-key-delete");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-recampaign-after-leader-key-delete";
+    let config = short_ttl_config(
+        "leader-a",
+        "etcd-recampaign-after-leader-key-delete",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, leadership_lease_id) = wait_for_local_leadership(&state).await;
+
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .delete(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            None,
+        )
+        .await
+        .expect("leader key should be removable without revoking its lease");
+
+    let recovered = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.is_local_leader
+                && coordination
+                    .leadership_lease_id
+                    .is_some_and(|lease_id| lease_id != leadership_lease_id)
+        }) && status.control_plane_ready
+    })
+    .await;
+    let coordination = recovered
+        .coordination
+        .expect("coordination state should be present");
+
+    assert_eq!(coordination.membership_lease_id, Some(membership_lease_id));
+    assert!(
+        !lease_is_granted(&endpoints, leadership_lease_id).await,
+        "the orphaned leadership lease should be revoked"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_node_re_registers_after_membership_lease_revocation() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_node_re_registers_after_membership_lease_revocation").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("re-register-after-membership-revocation");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-re-register-after-membership-revocation";
+    let config = short_ttl_config(
+        "leader-a",
+        "etcd-re-register-after-membership-revocation",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, leadership_lease_id) = wait_for_local_leadership(&state).await;
+
+    revoke_lease_out_of_band(&endpoints, membership_lease_id).await;
+
+    let recovered = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination
+                    .membership_lease_id
+                    .is_some_and(|lease_id| lease_id != membership_lease_id)
+                && coordination.is_local_leader
+        }) && status.control_plane_ready
+            && status.data_plane_ready
+    })
+    .await;
+    let coordination = recovered
+        .coordination
+        .expect("coordination state should be present");
+
+    assert_eq!(coordination.registered_members, vec!["leader-a".to_owned()]);
+    assert_ne!(
+        coordination.leadership_lease_id,
+        Some(leadership_lease_id),
+        "membership loss should give up the old leadership claim before re-campaigning"
+    );
+    assert!(!lease_is_granted(&endpoints, leadership_lease_id).await);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_node_re_registers_when_membership_record_disappears() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_node_re_registers_when_membership_record_disappears").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("re-register-after-membership-key-delete");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-re-register-after-membership-key-delete";
+    let config = short_ttl_config(
+        "leader-a",
+        "etcd-re-register-after-membership-key-delete",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, leadership_lease_id) = wait_for_local_leadership(&state).await;
+
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .delete(
+            format!("{key_prefix}/clusters/{cluster_name}/members/leader-a"),
+            None,
+        )
+        .await
+        .expect("membership record should be removable without revoking the lease");
+
+    let recovered = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && coordination
+                    .membership_lease_id
+                    .is_some_and(|lease_id| lease_id != membership_lease_id)
+                && coordination.is_local_leader
+        }) && status.control_plane_ready
+    })
+    .await;
+    let coordination = recovered
+        .coordination
+        .expect("coordination state should be present");
+
+    assert_eq!(coordination.registered_members, vec!["leader-a".to_owned()]);
+    assert!(
+        !lease_is_granted(&endpoints, membership_lease_id).await,
+        "the membership lease without a record should be revoked"
+    );
+    assert!(
+        !lease_is_granted(&endpoints, leadership_lease_id).await,
+        "a node that lost membership should give up its old leadership lease"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_follower_takes_over_after_leader_loses_leadership_lease() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_follower_takes_over_after_leader_loses_leadership_lease")
+            .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("follower-takeover-after-leadership-revocation");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-follower-takeover-after-leadership-revocation";
+    let leader = Arc::new(AppState::new(short_ttl_config(
+        "leader-a",
+        "etcd-follower-takeover-a",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let (_, leadership_lease_id) = wait_for_local_leadership(&leader).await;
+    let follower = Arc::new(AppState::new(short_ttl_config(
+        "leader-b",
+        "etcd-follower-takeover-b",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    wait_for_runtime_status(&follower, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered
+                && !coordination.is_local_leader
+                && coordination.leader_node.as_deref() == Some("leader-a")
+        })
+    })
+    .await;
+
+    revoke_lease_out_of_band(&endpoints, leadership_lease_id).await;
+
+    // Whichever node wins the new campaign, the cluster must converge on
+    // exactly one leader backed by a fresh lease, and both nodes must agree.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_status = leader
+            .control
+            .runtime_status()
+            .await
+            .expect("leader runtime status should load");
+        let follower_status = follower
+            .control
+            .runtime_status()
+            .await
+            .expect("follower runtime status should load");
+        let a = leader_status
+            .coordination
+            .as_ref()
+            .expect("leader coordination state should be present");
+        let b = follower_status
+            .coordination
+            .as_ref()
+            .expect("follower coordination state should be present");
+        let new_lease = a.leadership_lease_id.or(b.leadership_lease_id);
+        if a.is_local_leader != b.is_local_leader
+            && a.leader_node.is_some()
+            && a.leader_node == b.leader_node
+            && new_lease.is_some_and(|lease_id| lease_id != leadership_lease_id)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for a new leader: leader={a:?} follower={b:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_restarted_node_waits_out_its_stale_leader_key_then_leads")
+            .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("restart-waits-out-stale-leader-key");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-restart-waits-out-stale-leader-key";
+
+    // Leave a leader key from a previous process of the same node, backed by a
+    // lease that the new process does not hold.
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("raw etcd client should connect");
+    let stale_lease_id = client
+        .lease_grant(60, None)
+        .await
+        .expect("stale leadership lease should be granted")
+        .id();
+    client
+        .put(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            serde_json::to_string(&LeadershipRecord {
+                node_id: "leader-a".to_owned(),
+                lease_id: stale_lease_id,
+            })
+            .expect("leader record should encode"),
+            Some(PutOptions::new().with_lease(stale_lease_id)),
+        )
+        .await
+        .expect("stale leader key should be written");
+
+    let state = Arc::new(AppState::new(short_ttl_config(
+        "leader-a",
+        "etcd-restart-waits-out-stale-leader-key",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let waiting = wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            coordination.membership_registered && coordination.leader_node.is_some()
+        })
+    })
+    .await;
+    let waiting = waiting
+        .coordination
+        .expect("coordination state should be present");
+    assert!(
+        !waiting.is_local_leader,
+        "a leader key backed by another lease must not count as local leadership"
+    );
+    assert_eq!(waiting.leader_node.as_deref(), Some("leader-a"));
+
+    revoke_lease_out_of_band(&endpoints, stale_lease_id).await;
+
+    let (_, leadership_lease_id) = wait_for_local_leadership(&state).await;
+    assert_ne!(leadership_lease_id, stale_lease_id);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+/// Config with TTLs short enough that the coordination loop ticks every second.
+fn short_ttl_config(
+    node_name: &str,
+    temp_label: &str,
+    endpoints: &[String],
+    key_prefix: &str,
+    cluster_name: &str,
+) -> LogPoseConfig {
+    let mut config = test_config(
+        node_name,
+        unique_temp_dir(temp_label),
+        endpoints,
+        key_prefix,
+        cluster_name,
+    );
+    config.node_role = NodeRole::Combined;
+    config.metadata.etcd.membership_ttl_secs = 3;
+    config.metadata.etcd.leadership_ttl_secs = 3;
+    config
+}
+
+/// Wait until the node leads and return its (membership, leadership) lease ids.
+async fn wait_for_local_leadership(state: &AppState) -> (i64, i64) {
+    let status = wait_for_runtime_status(state, |status| {
         status.coordination.as_ref().is_some_and(|coordination| {
             coordination.membership_registered
                 && coordination.is_local_leader
                 && coordination.membership_lease_id.is_some()
                 && coordination.leadership_lease_id.is_some()
         }) && status.control_plane_ready
-            && status.data_plane_ready
     })
     .await;
-    let coordination = ready
+    let coordination = status
         .coordination
-        .as_ref()
         .expect("coordination state should be present");
-    let revoker = EtcdCoordinationClient::new(config.metadata.etcd.clone())
-        .expect("coordination client should build");
-    revoker
-        .revoke_lease(
-            coordination
-                .leadership_lease_id
-                .expect("leadership lease id should be present"),
-        )
-        .await
-        .expect("leadership lease should be revocable");
-    revoker
-        .revoke_lease(
-            coordination
-                .membership_lease_id
-                .expect("membership lease id should be present"),
-        )
-        .await
-        .expect("membership lease should be revocable");
-
-    let degraded = wait_for_runtime_status(&state, |status| {
-        status.coordination.as_ref().is_some_and(|coordination| {
-            !coordination.membership_registered
-                && !coordination.is_local_leader
-                && coordination.membership_lease_id.is_none()
-                && coordination.leadership_lease_id.is_none()
-        }) && !status.control_plane_ready
-            && !status.data_plane_ready
-    })
-    .await;
-    let degraded_coordination = degraded
-        .coordination
-        .expect("coordination state should remain present");
-
-    assert!(!degraded_coordination.membership_registered);
-    assert!(!degraded_coordination.is_local_leader);
-
-    cleanup_prefix(&endpoints, &key_prefix).await;
+    (
+        coordination
+            .membership_lease_id
+            .expect("membership lease id should be present"),
+        coordination
+            .leadership_lease_id
+            .expect("leadership lease id should be present"),
+    )
 }
 
-#[tokio::test]
-async fn etcd_runtime_revokes_stale_leadership_when_membership_record_disappears() {
-    let Some(endpoints) = etcd_endpoints_or_skip(
-        "etcd_runtime_revokes_stale_leadership_when_membership_record_disappears",
-    )
-    .await
-    else {
-        return;
-    };
-    let key_prefix = unique_etcd_prefix("runtime-status-membership-loss-revokes-leader");
-    cleanup_prefix(&endpoints, &key_prefix).await;
-    let cluster_name = "core-etcd-runtime-status-membership-loss-revokes-leader";
-
-    let mut leader_config = test_config(
-        "leader-a",
-        unique_temp_dir("etcd-runtime-status-membership-loss-leader-a"),
-        &endpoints,
-        &key_prefix,
-        cluster_name,
-    );
-    leader_config.node_role = NodeRole::Combined;
-    leader_config.metadata.etcd.membership_ttl_secs = 3;
-    leader_config.metadata.etcd.leadership_ttl_secs = 30;
-    let leader = Arc::new(AppState::new(leader_config.clone()));
-
-    wait_for_runtime_status(&leader, |status| {
-        status.coordination.as_ref().is_some_and(|coordination| {
-            coordination.membership_registered
-                && coordination.is_local_leader
-                && coordination.membership_lease_id.is_some()
-                && coordination.leadership_lease_id.is_some()
-        })
-    })
-    .await;
-
-    let membership_key = format!(
-        "{}/clusters/{}/members/{}",
-        key_prefix, cluster_name, leader_config.node_name
-    );
-    let mut client = Client::connect(endpoints.clone(), None)
+async fn revoke_lease_out_of_band(endpoints: &[String], lease_id: i64) {
+    let mut client = Client::connect(endpoints.to_vec(), None)
         .await
-        .expect("etcd client should connect");
+        .expect("raw etcd client should connect");
     client
-        .delete(membership_key, None)
+        .lease_revoke(lease_id)
         .await
-        .expect("membership record should be removable without revoking the lease");
+        .expect("lease should be revocable out of band");
+}
 
-    let degraded = wait_for_runtime_status(&leader, |status| {
-        status.coordination.as_ref().is_some_and(|coordination| {
-            !coordination.membership_registered
-                && !coordination.is_local_leader
-                && coordination.membership_lease_id.is_none()
-                && coordination.leadership_lease_id.is_none()
-        })
-    })
-    .await;
-    assert!(!degraded.control_plane_ready);
+async fn lease_is_granted(endpoints: &[String], lease_id: i64) -> bool {
+    let mut client = Client::connect(endpoints.to_vec(), None)
+        .await
+        .expect("raw etcd client should connect");
+    client
+        .lease_time_to_live(lease_id, None)
+        .await
+        .is_ok_and(|response| response.ttl() > 0)
+}
 
-    drop(leader);
-
-    let mut follower_config = test_config(
-        "leader-b",
-        unique_temp_dir("etcd-runtime-status-membership-loss-leader-b"),
-        &endpoints,
-        &key_prefix,
-        cluster_name,
-    );
-    follower_config.node_role = NodeRole::Combined;
-    follower_config.metadata.etcd.membership_ttl_secs = 3;
-    follower_config.metadata.etcd.leadership_ttl_secs = 30;
-    let follower = Arc::new(AppState::new(follower_config));
-
-    let follower_status = wait_for_runtime_status(&follower, |status| {
-        status.coordination.as_ref().is_some_and(|coordination| {
-            coordination.membership_registered
-                && coordination.is_local_leader
-                && coordination.leader_node.as_deref() == Some("leader-b")
-        })
-    })
-    .await;
-    assert!(follower_status.control_plane_ready);
-
-    cleanup_prefix(&endpoints, &key_prefix).await;
+async fn visible_leader(
+    endpoints: &[String],
+    key_prefix: &str,
+    cluster_name: &str,
+) -> Option<LeadershipRecord> {
+    let mut client = Client::connect(endpoints.to_vec(), None)
+        .await
+        .expect("raw etcd client should connect");
+    let response = client
+        .get(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            None,
+        )
+        .await
+        .expect("leader key should be readable");
+    response
+        .kvs()
+        .first()
+        .map(|kv| serde_json::from_slice(kv.value()).expect("leader record should decode"))
 }
 
 fn test_config(
@@ -1976,7 +2326,7 @@ async fn wait_for_runtime_status(
     state: &AppState,
     ready: impl Fn(&logpose_types::NodeRuntimeStatus) -> bool,
 ) -> logpose_types::NodeRuntimeStatus {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let status = state
             .control
