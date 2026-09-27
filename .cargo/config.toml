@@ -1,0 +1,6 @@
+# etcd-client generates its gRPC bindings with protoc in its build script and
+# offers no vendored option. Point it at a wrapper that runs the
+# protoc-bin-vendored binary so the build needs no system protoc. An explicit
+# `PROTOC` in the environment still wins because `force` is not set.
+[env]
+PROTOC = { value = "scripts/protoc.sh", relative = true }

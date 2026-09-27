@@ -1626,8 +1626,11 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
         .await
         .expect("first write should succeed");
 
+    // Under load the first flush can start and finish between two polls, so a
+    // completed run also counts; waiting for `in_progress` alone can miss it.
     wait_for_condition(&engine, "events", |stats| {
         stats.maintenance.in_progress.as_deref() == Some("flush")
+            || stats.maintenance.completed_runs >= 1
     })
     .await;
 
@@ -2033,7 +2036,10 @@ async fn wait_for_condition<F>(engine: &LocalStorageEngine, collection_name: &st
 where
     F: Fn(&logpose_types::CollectionStats) -> bool,
 {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous because each poll replays the WAL and can block behind a flush,
+    // which takes seconds for large vectors on a loaded machine. Passing tests
+    // return as soon as the predicate holds.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stats = engine
             .stats(collection_name)

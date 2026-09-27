@@ -1,4 +1,9 @@
 //! End-to-end etcd metadata integration coverage for `AppState`.
+//!
+//! Tests that need a live etcd run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` is
+//! set, for example to `http://127.0.0.1:2379`; otherwise they pass without
+//! running (the skip message shows with `--nocapture`). When the variable is
+//! set, an unreachable etcd is a failure, and under CI a missing variable is too.
 
 use etcd_client::{Client, DeleteOptions};
 use logpose_auth::{
@@ -28,9 +33,17 @@ use std::{
 };
 use tokio::time::{Instant, sleep};
 
+/// Environment variable that enables the etcd integration tests.
+const ETCD_ENDPOINTS_ENV: &str = "LOGPOSE_TEST_ETCD_ENDPOINTS";
+
 #[tokio::test]
 async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_metadata_backend_surfaces_remote_collections_across_nodes")
+            .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("remote-discovery");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let root_a = unique_temp_dir("etcd-node-a");
@@ -128,7 +141,11 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
 
 #[tokio::test]
 async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_metadata_backend_shares_database_policies_across_nodes").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("shared-database-policies");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let root_a = unique_temp_dir("etcd-policy-node-a");
@@ -221,7 +238,13 @@ async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
 
 #[tokio::test]
 async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_metadata_backend_reads_shared_principal_overrides_across_nodes",
+    )
+    .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("shared-principal-overrides");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let root_a = unique_temp_dir("etcd-principal-node-a");
@@ -284,7 +307,11 @@ async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
 
 #[tokio::test]
 async fn etcd_collection_creation_seeds_shared_database_metadata() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_collection_creation_seeds_shared_database_metadata").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("shared-database-seeding");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let root_a = unique_temp_dir("etcd-seeded-database-node-a");
@@ -344,7 +371,11 @@ async fn etcd_collection_creation_seeds_shared_database_metadata() {
 
 #[tokio::test]
 async fn etcd_data_only_nodes_reject_catalog_mutations() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_data_only_nodes_reject_catalog_mutations").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("data-node-catalog-mutations");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-data-node-mutations";
@@ -420,7 +451,12 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
 
 #[tokio::test]
 async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_runtime_status_surfaces_membership_and_controller_leader")
+            .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("runtime-status-coordination");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-runtime-status";
@@ -488,7 +524,11 @@ async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
 
 #[tokio::test]
 async fn etcd_new_node_registration_updates_visible_membership() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_new_node_registration_updates_visible_membership").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("node-registration");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-node-registration";
@@ -598,7 +638,11 @@ async fn etcd_new_node_registration_updates_visible_membership() {
 
 #[tokio::test]
 async fn etcd_membership_leases_expire_after_state_drop() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_membership_leases_expire_after_state_drop").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("membership-expiry-after-drop");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-membership-expiry";
@@ -651,7 +695,11 @@ async fn etcd_membership_leases_expire_after_state_drop() {
 
 #[tokio::test]
 async fn etcd_rejoining_node_re_registers_membership_after_restart() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_rejoining_node_re_registers_membership_after_restart").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("membership-rejoin");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-membership-rejoin";
@@ -761,7 +809,11 @@ async fn etcd_rejoining_node_re_registers_membership_after_restart() {
 
 #[tokio::test]
 async fn etcd_follower_nodes_reject_control_plane_mutations() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_follower_nodes_reject_control_plane_mutations").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("follower-control-plane-gate");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-leader-gate";
@@ -851,7 +903,13 @@ async fn etcd_follower_nodes_reject_control_plane_mutations() {
 
 #[tokio::test]
 async fn etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves",
+    )
+    .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("stale-leader-catalog-fence");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-stale-leader-catalog-fence";
@@ -991,7 +1049,10 @@ async fn etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves()
 
 #[tokio::test]
 async fn etcd_owner_promotion_fences_the_old_owner() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip("etcd_owner_promotion_fences_the_old_owner").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("owner-promotion-fence");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion";
@@ -1183,7 +1244,13 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
 
 #[tokio::test]
 async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata",
+    )
+    .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("owner-promotion-read-barrier");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion-barrier";
@@ -1359,7 +1426,12 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
 
 #[tokio::test]
 async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_missing_owner_metadata_rejects_reads_until_reconciliation")
+            .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("missing-owner-read-fence");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-missing-owner-read-fence";
@@ -1440,7 +1512,11 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
 
 #[tokio::test]
 async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_owner_promotion_conflicts_while_descriptor_is_pending").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("owner-promotion-pending");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-metadata";
@@ -1537,7 +1613,11 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
 
 #[tokio::test]
 async fn etcd_owner_promotion_conflicts_for_control_only_members() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_owner_promotion_conflicts_for_control_only_members").await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("owner-promotion-control-only");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion-control-only";
@@ -1653,7 +1733,13 @@ async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachab
 
 #[tokio::test]
 async fn etcd_runtime_status_drops_ready_flags_after_external_lease_revocation() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_runtime_status_drops_ready_flags_after_external_lease_revocation",
+    )
+    .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("runtime-status-lease-revocation");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-runtime-status-lease-revocation";
@@ -1725,7 +1811,13 @@ async fn etcd_runtime_status_drops_ready_flags_after_external_lease_revocation()
 
 #[tokio::test]
 async fn etcd_runtime_revokes_stale_leadership_when_membership_record_disappears() {
-    let endpoints = test_etcd_endpoints();
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_runtime_revokes_stale_leadership_when_membership_record_disappears",
+    )
+    .await
+    else {
+        return;
+    };
     let key_prefix = unique_etcd_prefix("runtime-status-membership-loss-revokes-leader");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-runtime-status-membership-loss-revokes-leader";
@@ -1840,9 +1932,14 @@ fn test_config_with_auth(
     config
 }
 
-fn test_etcd_endpoints() -> Vec<String> {
-    std::env::var("LOGPOSE_TEST_ETCD_ENDPOINTS")
-        .ok()
+/// Returns the etcd endpoints for an integration test, or `None` to skip it.
+///
+/// The etcd tests run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` names one or more
+/// comma-separated endpoints. When it does, an unreachable etcd fails the test
+/// instead of skipping it. Under CI (`CI` is set, as on GitHub Actions) a
+/// missing variable also fails, so CI cannot silently lose this coverage.
+async fn etcd_endpoints_or_skip(test_name: &str) -> Option<Vec<String>> {
+    let endpoints = std::env::var(ETCD_ENDPOINTS_ENV)
         .map(|value| {
             value
                 .split(',')
@@ -1851,8 +1948,28 @@ fn test_etcd_endpoints() -> Vec<String> {
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
         })
-        .filter(|endpoints| !endpoints.is_empty())
-        .unwrap_or_else(|| vec!["http://127.0.0.1:2379".to_owned()])
+        .unwrap_or_default();
+    if endpoints.is_empty() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{test_name}: CI is set but {ETCD_ENDPOINTS_ENV} is not; set it so the etcd integration tests run in CI"
+        );
+        eprintln!(
+            "skipping {test_name}: set {ETCD_ENDPOINTS_ENV} (for example http://127.0.0.1:2379) to run the etcd integration tests"
+        );
+        return None;
+    }
+
+    let probe = async {
+        let mut client = Client::connect(endpoints.clone(), None).await?;
+        client.status().await.map(|_| ())
+    };
+    let reachable = tokio::time::timeout(Duration::from_secs(5), probe).await;
+    assert!(
+        matches!(reachable, Ok(Ok(()))),
+        "{ETCD_ENDPOINTS_ENV} is set to {endpoints:?} but etcd is unreachable: {reachable:?}; start etcd or unset {ETCD_ENDPOINTS_ENV} to skip the etcd tests"
+    );
+    Some(endpoints)
 }
 
 async fn wait_for_runtime_status(
