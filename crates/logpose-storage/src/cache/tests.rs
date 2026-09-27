@@ -967,3 +967,27 @@ fn stress_stays_within_budget_beyond_pins_and_never_deadlocks() {
     );
     assert!(stats.evictions > 0, "the budget was small enough to churn");
 }
+
+#[test]
+fn invalidating_a_file_releases_its_clock_slots() {
+    // Far under budget, so eviction never runs to skip dead slots.
+    let cache = cache(budget_for(10_000));
+    let kept = FileId::next();
+    insert(&cache, key(kept, 0), ArtifactClass::PkIndex);
+    for _ in 0..50 {
+        let file = FileId::next();
+        for section in 0..20 {
+            insert(&cache, key(file, section), ArtifactClass::PkIndex);
+        }
+        assert_eq!(cache.invalidate_file(file), 20);
+    }
+    let slots: usize = cache
+        .inner
+        .clocks
+        .iter()
+        .map(|ring| super::lock(ring).len())
+        .sum();
+    assert_eq!(slots, 1, "only the live entry keeps a ring slot");
+    assert_eq!(cache.used(), charge_for(UNIT));
+    hit(&cache, key(kept, 0), ArtifactClass::PkIndex);
+}

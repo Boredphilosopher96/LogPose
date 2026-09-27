@@ -418,6 +418,15 @@ impl BufferCache {
                 }
             });
         }
+        if removed > 0 {
+            // The removed entries' ring slots are dead now. Eviction would
+            // skip them, but it runs only over budget, so without this a
+            // cache that never fills keeps one slot (and the entry's
+            // allocation) for every unit ever loaded from a dropped file.
+            for ring in &inner.clocks {
+                lock(ring).retain(|slot| slot.strong_count() > 0);
+            }
+        }
         inner
             .counters
             .invalidated
