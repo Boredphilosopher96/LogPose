@@ -1,16 +1,12 @@
 //! On-disk layout: where the local engine keeps each root, descriptor, WAL, manifest and index file.
 
-use crate::LocalStorageEngine;
+use crate::engine::EngineCore;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::SeqNo;
 use logpose_wal::ACTIVE_WAL_FILE_NAME;
 use std::path::PathBuf;
 
-impl LocalStorageEngine {
-    pub(crate) fn collections_root(&self) -> PathBuf {
-        self.root.join("collections")
-    }
-
+impl EngineCore {
     pub(crate) fn databases_root(&self) -> PathBuf {
         self.root.join("databases")
     }
@@ -79,10 +75,6 @@ impl LocalStorageEngine {
             .root_path
             .join("manifests")
             .join(format!("{generation:020}.json"))
-    }
-
-    pub(crate) fn maintenance_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
-        descriptor.root_path.join("maintenance.json")
     }
 
     pub(crate) fn placement_file_path(descriptor: &CollectionDescriptor) -> PathBuf {

@@ -1,8 +1,8 @@
 //! Manifest v1: the JSON manifest generations, the `CURRENT` pointer, and per-segment metadata.
 
 use crate::{
-    LocalStorageEngine,
     durable_fs::read_file,
+    engine::EngineCore,
     error::json_message,
     fs_util::{AtomicWritePoints, atomic_write_with_points, read_json},
 };
@@ -12,7 +12,7 @@ use logpose_vfs::CrashPoint;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-impl LocalStorageEngine {
+impl EngineCore {
     pub(crate) fn load_manifest(
         &self,
         descriptor: &CollectionDescriptor,

@@ -1,33 +1,35 @@
-//! Collection descriptors on disk: planning, creation, placement assignment, lookup and listing.
+//! Collection descriptors on disk: planning, durable creation, placement assignment, and the
+//! descriptor-directory listing the catalog uses.
 
 use crate::{
-    CreateCollectionRequest, LocalStorageEngine,
+    CreateCollectionRequest,
     durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir},
+    engine::{CoreRef, EngineCore, already_exists},
     error::{io_message, json_message},
     fs_util::{atomic_write, cleanup_dir, read_json},
+    handle::{CollectionHandle, CollectionMeta},
+    maintenance::MaintenanceState,
     manifest::Manifest,
+    version::{DeltaLog, Version},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionAssignment, CollectionRef, LogPoseError, MaintenanceStatus, Result};
+use logpose_types::{CollectionAssignment, CollectionRef, MaintenanceStatus, Result};
 use logpose_wal::WalWriter;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-impl LocalStorageEngine {
+impl EngineCore {
     /// Build the descriptor that would be persisted for one collection request.
-    pub fn plan_collection_descriptor(
+    pub(crate) fn plan_collection_descriptor(
         &self,
         request: &CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
         let request = request.clone().with_defaults();
         let collection = CollectionRef::new(request.database_name.clone(), request.name.clone());
-        if self.find_collection_descriptor_ref(&collection).is_ok() {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}/{}' already exists",
-                collection.database_name, collection.collection_name
-            )));
+        if self.contains(&collection) {
+            return Err(already_exists(&collection));
         }
 
         let descriptor = CollectionDescriptor::new_in_database(
@@ -41,64 +43,16 @@ impl LocalStorageEngine {
         Ok(descriptor)
     }
 
-    /// Persist a collection using a previously planned descriptor.
-    pub fn create_collection_from_descriptor(
-        &self,
-        descriptor: CollectionDescriptor,
-        assignment: Option<&CollectionAssignment>,
-    ) -> Result<CollectionDescriptor> {
-        create_dir_all_synced(self.vfs.as_ref(), &self.collections_root())?;
-        if self
-            .find_collection_descriptor_ref(&descriptor.collection_ref())
-            .is_ok()
-        {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}/{}' already exists",
-                descriptor.database_name, descriptor.name
-            )));
-        }
-
-        descriptor.validate()?;
-        let result = (|| -> Result<()> {
-            self.ensure_database_descriptor(&descriptor.database_name)?;
-            self.create_collection_directories(&descriptor)?;
-            if let Some(assignment) = assignment {
-                self.persist_collection_assignment(&descriptor, assignment)?;
-            }
-            self.publish_manifest(&descriptor, &Manifest::empty(0))?;
-            self.persist_maintenance_status(&descriptor, &MaintenanceStatus::default())?;
-            let mut wal_writer =
-                WalWriter::open(Arc::clone(&self.vfs), Self::active_wal_path(&descriptor))?;
-            wal_writer.truncate()?;
-            sync_parent_dir(self.vfs.as_ref(), &Self::active_wal_path(&descriptor))?;
-            atomic_write(
-                self.vfs.as_ref(),
-                &Self::descriptor_path(&descriptor),
-                serde_json::to_vec_pretty(&descriptor).map_err(json_message)?,
-            )?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Ok(descriptor),
-            Err(error) => {
-                cleanup_dir(self.vfs.as_ref(), &descriptor.root_path);
-                Err(error)
-            }
-        }
-    }
-
+    /// The persisted placement assignment, if the collection has one.
     pub(crate) fn load_collection_assignment(
         &self,
         descriptor: &CollectionDescriptor,
-    ) -> Result<CollectionAssignment> {
+    ) -> Result<Option<CollectionAssignment>> {
         let path = Self::placement_file_path(descriptor);
         if !self.exists(&path)? {
-            return Err(LogPoseError::Message(format!(
-                "collection '{}' is missing placement metadata",
-                descriptor.name
-            )));
+            return Ok(None);
         }
-        read_json(self.vfs.as_ref(), &path)
+        read_json(self.vfs.as_ref(), &path).map(Some)
     }
 
     fn persist_collection_assignment(
@@ -113,24 +67,6 @@ impl LocalStorageEngine {
         )
     }
 
-    pub(crate) fn create_collection_internal(
-        &self,
-        request: CreateCollectionRequest,
-        assignment: Option<&CollectionAssignment>,
-    ) -> Result<CollectionDescriptor> {
-        let descriptor = self.plan_collection_descriptor(&request)?;
-        self.create_collection_from_descriptor(descriptor, assignment)
-    }
-
-    /// Open a collection descriptor using an explicit database namespace.
-    pub async fn open_collection_in_database(
-        &self,
-        database_name: &str,
-        name: &str,
-    ) -> Result<CollectionDescriptor> {
-        self.find_collection_descriptor_ref(&CollectionRef::new(database_name, name))
-    }
-
     fn create_collection_directories(&self, descriptor: &CollectionDescriptor) -> Result<()> {
         create_dir_all_synced(self.vfs.as_ref(), &descriptor.root_path)?;
         for child in ["manifests", "wal", "segments", "indexes", "tmp"] {
@@ -139,6 +75,32 @@ impl LocalStorageEngine {
                 .map_err(|error| io_message("failed to create collection directories", error))?;
         }
         sync_dir(self.vfs.as_ref(), &descriptor.root_path)
+    }
+
+    /// Write every file of a new collection; `descriptor.json` last, so a crash before it
+    /// leaves a directory that the next open removes. Returns the open active WAL.
+    fn write_collection_files(
+        &self,
+        descriptor: &CollectionDescriptor,
+        assignment: Option<&CollectionAssignment>,
+    ) -> Result<WalWriter> {
+        self.ensure_database_descriptor(&descriptor.database_name)?;
+        self.create_collection_directories(descriptor)?;
+        if let Some(assignment) = assignment {
+            self.persist_collection_assignment(descriptor, assignment)?;
+        }
+        self.publish_manifest(descriptor, &Manifest::empty(0))?;
+        self.persist_maintenance_status(descriptor, &MaintenanceStatus::default())?;
+        let mut wal_writer =
+            WalWriter::open(Arc::clone(&self.vfs), Self::active_wal_path(descriptor))?;
+        wal_writer.truncate()?;
+        sync_parent_dir(self.vfs.as_ref(), &Self::active_wal_path(descriptor))?;
+        atomic_write(
+            self.vfs.as_ref(),
+            &Self::descriptor_path(descriptor),
+            serde_json::to_vec_pretty(descriptor).map_err(json_message)?,
+        )?;
+        Ok(wal_writer)
     }
 
     /// Paths of `<root>/<entry>/descriptor.json` for every subdirectory of `root` that has one,
@@ -161,51 +123,46 @@ impl LocalStorageEngine {
         }
         Ok(paths)
     }
+}
 
-    pub(crate) fn find_collection_descriptor(&self, name: &str) -> Result<CollectionDescriptor> {
-        self.find_collection_descriptor_ref(&Self::collection_ref_from_lookup(name))
-    }
-
-    fn find_collection_descriptor_ref(
+impl CoreRef {
+    /// Durably create a collection from a planned descriptor and register it.
+    ///
+    /// The name is reserved in the collection map first, so concurrent creates of one name
+    /// resolve to exactly one success; the files are written outside any lock.
+    pub(crate) fn create_collection(
         &self,
-        collection: &CollectionRef,
-    ) -> Result<CollectionDescriptor> {
-        for path in self.descriptor_files_under(&self.collections_root())? {
-            let descriptor = read_json::<CollectionDescriptor>(self.vfs.as_ref(), &path)?;
-            if descriptor.database_name == collection.database_name
-                && descriptor.name == collection.collection_name
-            {
-                descriptor.validate()?;
-                return Ok(descriptor);
+        descriptor: CollectionDescriptor,
+        assignment: Option<&CollectionAssignment>,
+    ) -> Result<Arc<CollectionHandle>> {
+        descriptor.validate()?;
+        let reservation = self.reserve(&descriptor.collection_ref())?;
+        create_dir_all_synced(self.vfs.as_ref(), &self.collections_root())?;
+        let wal = match self.write_collection_files(&descriptor, assignment) {
+            Ok(wal) => wal,
+            Err(error) => {
+                cleanup_dir(self.vfs.as_ref(), &descriptor.root_path);
+                return Err(error);
             }
-        }
-
-        Err(LogPoseError::Message(format!(
-            "collection '{}/{}' does not exist",
-            collection.database_name, collection.collection_name
-        )))
+        };
+        let meta = Arc::new(CollectionMeta::new(descriptor, assignment.cloned()));
+        let version = Version::initial(meta, Manifest::empty(0), DeltaLog::default());
+        let handle = Arc::new(CollectionHandle::new(
+            version,
+            Some(wal),
+            MaintenanceState::default(),
+        ));
+        reservation.commit(Arc::clone(&handle));
+        Ok(handle)
     }
+}
 
-    pub(crate) fn list_collection_descriptors(&self) -> Result<Vec<CollectionDescriptor>> {
-        let mut descriptors = Vec::new();
-        for path in self.descriptor_files_under(&self.collections_root())? {
-            let descriptor = read_json::<CollectionDescriptor>(self.vfs.as_ref(), &path)?;
-            descriptor.validate()?;
-            descriptors.push(descriptor);
-        }
-
-        descriptors.sort_by(|left, right| {
-            (&left.database_name, &left.name).cmp(&(&right.database_name, &right.name))
-        });
-        Ok(descriptors)
-    }
-
-    fn collection_ref_from_lookup(name: &str) -> CollectionRef {
-        let parts = name.split('/').collect::<Vec<_>>();
-        if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
-            CollectionRef::new(parts[0], parts[1])
-        } else {
-            CollectionRef::new_default(name)
-        }
+/// Parse a `database/collection` lookup name; a bare name is in the default database.
+pub(crate) fn collection_ref_from_lookup(name: &str) -> CollectionRef {
+    let parts = name.split('/').collect::<Vec<_>>();
+    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
+        CollectionRef::new(parts[0], parts[1])
+    } else {
+        CollectionRef::new_default(name)
     }
 }

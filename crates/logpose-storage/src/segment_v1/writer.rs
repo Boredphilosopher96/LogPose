@@ -1,8 +1,8 @@
 //! Segment v1 encoding and publication of the segment file with its flat and HNSW sidecars.
 
 use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader, SegmentPurpose};
+use crate::engine::EngineCore;
 use crate::{
-    LocalStorageEngine,
     durable_fs::{create_dir_all_synced, sync_parent_dir, write_file_synced},
     error::{io_message, json_message},
     fs_util::{cleanup_file, crash_point},
@@ -21,7 +21,7 @@ use logpose_wal::WalRecord;
 use std::{collections::BTreeSet, io, path::Path};
 use uuid::Uuid;
 
-impl LocalStorageEngine {
+impl EngineCore {
     pub(crate) fn write_segment_file(
         &self,
         descriptor: &CollectionDescriptor,
@@ -390,7 +390,9 @@ fn visible_hnsw_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CreateCollectionRequest, StorageEngine, test_support::unique_temp_dir};
+    use crate::{
+        CreateCollectionRequest, LocalStorageEngine, StorageEngine, test_support::unique_temp_dir,
+    };
     use logpose_types::{DistanceMetric, PutRecord, RecordId};
     use serde_json::json;
     use std::fs;
@@ -456,7 +458,7 @@ mod tests {
                 .await
                 .expect("collection should be created");
 
-            engine.write_segment_file(
+            engine.engine().core().write_segment_file(
                 &descriptor,
                 &[WalRecord {
                     seq_no: 1,

@@ -1,5 +1,6 @@
 //! Integration tests for `logpose-storage` workflows.
 
+use arc_swap as _;
 use async_trait as _;
 use crc32c as _;
 use crc32fast as _;
@@ -11,6 +12,7 @@ use logpose_vfs as _;
 use logpose_wal as _;
 use postcard as _;
 use rand as _;
+use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
@@ -216,6 +218,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
         policy
     );
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     assert_eq!(
         reopened
@@ -496,6 +499,7 @@ async fn flush_persists_visible_records_for_reopen() {
         .await
         .expect("flush should succeed");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
@@ -592,6 +596,7 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
         .await
         .expect("second write should succeed");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
@@ -647,6 +652,7 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
     fs::write(&rolled_wal_path, b"corrupt checkpointed wal")
         .expect("corrupted rolled wal should be written");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let visible = reopened
         .scan_exact("documents", None)
@@ -705,6 +711,7 @@ async fn checkpointed_frames_left_in_active_wal_do_not_reenter_the_delta() {
     )
     .expect("active wal should be repopulated");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
@@ -760,6 +767,7 @@ async fn corrupted_checkpointed_active_wal_is_ignored_when_rotation_was_pending(
     )
     .expect("pending rotation marker should be written");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let stats = reopened
         .stats("documents")
@@ -842,6 +850,7 @@ async fn older_snapshots_do_not_double_count_rotated_wal_when_rotation_marker_su
     )
     .expect("pending rotation marker should be recreated");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let old_snapshot_stats = reopened
         .stats_snapshot("documents", Some(pre_flush_snapshot.clone()))
@@ -934,6 +943,7 @@ async fn older_snapshots_preserve_pre_compaction_history_during_pending_rotation
     )
     .expect("pending rotation marker should be recreated");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let old_snapshot_stats = reopened
         .stats_snapshot("documents", Some(old_snapshot.clone()))
@@ -1013,6 +1023,7 @@ async fn recovery_errors_if_pending_rotation_marker_cannot_be_cleared() {
         return;
     }
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let result = reopened.stats("documents").await;
 
@@ -1265,15 +1276,14 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     let root = support::unique_temp_dir("storage-background-maintenance");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-    configure_thresholds(&descriptor.root_path, 1, 1024, 2);
+    create_with_thresholds(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+        1,
+        1024,
+        2,
+    )
+    .expect("collection should be created");
 
     engine
         .write(
@@ -1335,16 +1345,14 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
         ))
         .await
         .expect("default namespace collection should be created");
-    let analytics_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_database(
-            "analytics",
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("database namespace collection should be created");
-    configure_thresholds(&analytics_descriptor.root_path, 1, 1024, 2);
+    create_with_thresholds(
+        &engine,
+        CreateCollectionRequest::in_database("analytics", "events", 2, DistanceMetric::Dot),
+        1,
+        1024,
+        2,
+    )
+    .expect("database namespace collection should be created");
 
     engine
         .write(
@@ -1671,15 +1679,14 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
     let root = support::unique_temp_dir("storage-manual-background-race");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-    configure_thresholds(&descriptor.root_path, 1, 1024, 2);
+    create_with_thresholds(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+        1,
+        1024,
+        2,
+    )
+    .expect("collection should be created");
 
     let writer = engine.clone();
     let manual = engine.clone();
@@ -1728,15 +1735,14 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     let root = support::unique_temp_dir("storage-follow-up-background-flush");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            65_536,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-    configure_thresholds(&descriptor.root_path, 1, usize::MAX, 99);
+    create_with_thresholds(
+        &engine,
+        CreateCollectionRequest::new("events", 65_536, DistanceMetric::Dot),
+        1,
+        usize::MAX,
+        99,
+    )
+    .expect("collection should be created");
 
     engine
         .write(
@@ -1823,6 +1829,7 @@ async fn reopening_resumes_persisted_background_maintenance() {
     )
     .expect("maintenance status should be updated");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     reopened
         .open_collection("events")
@@ -1956,6 +1963,7 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     )
     .expect("descriptor should be rewritten");
 
+    drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
     let error = reopened
         .open_collection("events")
@@ -2135,25 +2143,19 @@ async fn dimension_error_batch_rejects_without_committing_anything() {
     assert!(visible.is_empty(), "invalid batch should commit nothing");
 }
 
-fn configure_thresholds(
-    root_path: &std::path::Path,
+/// Create a collection whose maintenance thresholds are set before it is created.
+fn create_with_thresholds(
+    engine: &LocalStorageEngine,
+    request: CreateCollectionRequest,
     flush_ops: usize,
     flush_bytes: usize,
     compact_segments: usize,
-) {
-    let descriptor_path = root_path.join("descriptor.json");
-    let mut descriptor = serde_json::from_slice::<Value>(
-        &fs::read(&descriptor_path).expect("descriptor should exist"),
-    )
-    .expect("descriptor should parse");
-    descriptor["flush_threshold_ops"] = json!(flush_ops);
-    descriptor["flush_threshold_bytes"] = json!(flush_bytes);
-    descriptor["compaction_threshold_segments"] = json!(compact_segments);
-    fs::write(
-        &descriptor_path,
-        serde_json::to_vec_pretty(&descriptor).expect("descriptor should serialize"),
-    )
-    .expect("descriptor should be updated");
+) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+    let mut descriptor = engine.plan_collection_descriptor(&request)?;
+    descriptor.flush_threshold_ops = flush_ops;
+    descriptor.flush_threshold_bytes = flush_bytes;
+    descriptor.compaction_threshold_segments = compact_segments;
+    engine.create_collection_from_descriptor(descriptor, None)
 }
 
 async fn wait_for_condition<F>(engine: &LocalStorageEngine, collection_name: &str, predicate: F)

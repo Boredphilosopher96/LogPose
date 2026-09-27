@@ -1,10 +1,8 @@
 //! Latest-visible resolution over the mutable delta and immutable segments, and the exact scan built on it.
 
 use crate::{
-    LocalStorageEngine,
-    manifest::Manifest,
-    segment_v1::read_segment_file,
-    state::{CollectionState, resolve_snapshot},
+    engine::EngineCore, handle::CollectionHandle, manifest::Manifest,
+    segment_v1::read_segment_file, state::CollectionState,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation};
@@ -20,6 +18,7 @@ pub(crate) enum ResolvedState {
 
 pub(crate) fn resolve_latest_state_selected(
     vfs: &dyn Vfs,
+    descriptor: &CollectionDescriptor,
     state: &CollectionState,
     visible_seq_no: SeqNo,
     include_mutable: bool,
@@ -45,8 +44,7 @@ pub(crate) fn resolve_latest_state_selected(
     }) {
         let records = read_segment_file(
             vfs,
-            &state
-                .descriptor
+            &descriptor
                 .root_path
                 .join("segments")
                 .join(&segment.file_name),
@@ -86,6 +84,7 @@ pub(crate) fn resolve_latest_from_segments(
 
 pub(crate) fn resolve_latest_state_for_ids_selected(
     vfs: &dyn Vfs,
+    descriptor: &CollectionDescriptor,
     state: &CollectionState,
     visible_seq_no: SeqNo,
     wanted_ids: &BTreeSet<RecordId>,
@@ -117,8 +116,7 @@ pub(crate) fn resolve_latest_state_for_ids_selected(
     }) {
         let records = read_segment_file(
             vfs,
-            &state
-                .descriptor
+            &descriptor
                 .root_path
                 .join("segments")
                 .join(&segment.file_name),
@@ -168,22 +166,18 @@ fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, recor
     }
 }
 
-impl LocalStorageEngine {
+impl EngineCore {
     pub(crate) fn scan_exact_internal(
         &self,
-        collection_name: &str,
+        handle: &CollectionHandle,
         snapshot: Option<Snapshot>,
         include_mutable: bool,
         immutable_unit_ids: Option<std::collections::BTreeSet<String>>,
     ) -> Result<Vec<VisibleRecord>> {
-        let state = self.load_collection_state(
-            collection_name,
-            snapshot.as_ref().map(|value| value.manifest_generation),
-        )?;
-        let snapshot = resolve_snapshot(&state, snapshot)?;
-
+        let (state, snapshot) = self.read_state(handle, snapshot)?;
         let resolved = resolve_latest_state_selected(
             self.vfs.as_ref(),
+            handle.descriptor(),
             &state,
             snapshot.visible_seq_no,
             include_mutable,

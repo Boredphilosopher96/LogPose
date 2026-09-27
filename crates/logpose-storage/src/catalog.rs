@@ -3,6 +3,7 @@
 use crate::{
     LocalStorageEngine,
     durable_fs::create_dir_all_synced,
+    engine::EngineCore,
     error::{json_message, string_message},
     fs_util::{atomic_write, read_json},
 };
@@ -10,7 +11,7 @@ use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_types::{DEFAULT_DATABASE_NAME, LogPoseError, Result};
 
-impl LocalStorageEngine {
+impl EngineCore {
     pub(crate) fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
         if database_name.trim().is_empty() {
             return Err(LogPoseError::Message(
@@ -66,7 +67,7 @@ impl LocalStorageEngine {
     }
 }
 
-impl CatalogStore for LocalStorageEngine {
+impl CatalogStore for EngineCore {
     fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
         let mut descriptor = descriptor;
         descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
@@ -164,6 +165,45 @@ impl CatalogStore for LocalStorageEngine {
         let policy = read_json::<DatabaseAccessPolicy>(self.vfs.as_ref(), &path)?;
         policy.validate().map_err(string_message)?;
         Ok(policy)
+    }
+}
+
+impl CatalogStore for LocalStorageEngine {
+    fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        self.engine().core().put_database(descriptor)
+    }
+
+    fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        self.engine().core().get_database(database_name)
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        self.engine().core().list_databases()
+    }
+
+    fn put_principal(&self, principal: Principal) -> Result<Principal> {
+        self.engine().core().put_principal(principal)
+    }
+
+    fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+        self.engine().core().get_principal(principal_name)
+    }
+
+    fn list_principals(&self) -> Result<Vec<Principal>> {
+        self.engine().core().list_principals()
+    }
+
+    fn put_database_access_policy(
+        &self,
+        policy: DatabaseAccessPolicy,
+    ) -> Result<DatabaseAccessPolicy> {
+        self.engine().core().put_database_access_policy(policy)
+    }
+
+    fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
+        self.engine()
+            .core()
+            .get_database_access_policy(database_name)
     }
 }
 

@@ -47,13 +47,16 @@ enum Backend {
 
 impl Backend {
     fn open_engine(&self) -> LocalStorageEngine {
+        self.try_open_engine().expect("storage engine should open")
+    }
+
+    fn try_open_engine(&self) -> logpose_types::Result<LocalStorageEngine> {
         match self {
             Self::Std { root } => LocalStorageEngine::new(root),
             Self::Fault { process, .. } => {
                 LocalStorageEngine::with_vfs(Arc::clone(process), FAULT_ROOT, None)
             }
         }
-        .expect("storage engine should open")
     }
 
     fn allows_crashes(&self) -> bool {
@@ -497,7 +500,8 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 assert_segment_inspect_matches(&engine, &model, seed, &trace).await;
             }
             StorageAction::Reopen => {
-                // The same process reopens its root, so it shares the root claim.
+                // One engine owns a root at a time: the old one releases it before the reopen.
+                drop(engine);
                 engine = backend.open_engine();
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
@@ -614,10 +618,9 @@ async fn crash_and_recover(
             tear: crash.tear,
             ..FaultPlan::default()
         });
-        let recovering = backend.open_engine();
-        // Recovery runs on the first load; it may crash part-way.
-        let _ = recovering.stats(COLLECTION_NAME).await;
-        drop(recovering);
+        // Recovery runs inside `open`; it may crash part-way, failing the open or leaving the
+        // collection registered as failed.
+        drop(backend.try_open_engine());
         let Backend::Fault { fault, process } = backend else {
             panic_with_context(seed, trace, "backend changed during a crash".to_owned());
         };
