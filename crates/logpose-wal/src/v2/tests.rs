@@ -1138,3 +1138,13 @@ impl VfsFile for FlakyFile {
         self.inner.set_len(len)
     }
 }
+
+#[test]
+fn writer_and_recovery_can_move_to_the_io_pool() {
+    // PR 5 runs recovery and every group's I/O on the I/O pool, moving these across threads.
+    fn assert_send<T: Send + 'static>() {}
+    assert_send::<WalWriter>();
+    assert_send::<WalRecovery>();
+    assert_send::<WalFrame>();
+    assert_send::<WalError>();
+}
