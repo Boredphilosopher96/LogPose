@@ -1,6 +1,6 @@
 //! Segment v1 (`LPS1`) file format: header, entry table and footer types shared by the reader and writer.
 
-use logpose_types::SeqNo;
+use logpose_types::{SeqNo, WriteOperation};
 use logpose_vfs::CrashPoint;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +8,16 @@ mod reader;
 mod writer;
 
 pub(crate) use reader::read_segment_file;
+
+/// One record of a v1 segment: an operation in the v1 data model and its sequence number. Also
+/// the shape legacy readers see the mutable delta in (see `legacy_view`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SegmentRecord {
+    /// Sequence number of the operation.
+    pub(crate) seq_no: SeqNo,
+    /// The operation.
+    pub(crate) op: WriteOperation,
+}
 
 /// Why a segment is written; selects the crash points reported while publishing it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

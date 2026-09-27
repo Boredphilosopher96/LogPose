@@ -1,14 +1,14 @@
 //! Segment v1 decoding.
 
 use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader};
+use crate::segment_v1::SegmentRecord;
 use crate::{durable_fs::read_file, error::json_message};
 use crc32fast::hash;
 use logpose_types::{LogPoseError, PutRecord, RecordId, Result, WriteOperation};
 use logpose_vfs::Vfs;
-use logpose_wal::WalRecord;
 use std::path::Path;
 
-pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<WalRecord>> {
+pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<SegmentRecord>> {
     let bytes = read_file(vfs, path, "failed to read segment file")?;
     if bytes.len() < 4 || &bytes[..4] != b"LPS1" {
         return Err(LogPoseError::Message(format!(
@@ -115,7 +115,7 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<WalRec
             SegmentEntryKind::Delete => WriteOperation::Delete(logpose_types::DeleteRecord { id }),
         };
 
-        records.push(WalRecord {
+        records.push(SegmentRecord {
             seq_no: entry.seq_no,
             op,
         });

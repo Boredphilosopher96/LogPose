@@ -1,62 +1,55 @@
 //! Compaction: rewrite every immutable segment into one replacement segment.
+//!
+//! The job begins through the collection's writer (which serializes it with flushes), builds
+//! the replacement from the segments of the `Version` it was given while writes continue, and
+//! has the writer publish the manifest that swaps it in.
 
 use crate::{
     engine::{CoreRef, EngineCore},
     handle::CollectionHandle,
-    manifest::Manifest,
+    manifest::{Manifest, SegmentMeta},
     resolve::{ResolvedState, resolve_latest_from_segments},
-    segment_v1::SegmentPurpose,
+    segment_v1::{SegmentPurpose, SegmentRecord},
+    writer::{JobCommit, JobKind},
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{PutRecord, Result, Snapshot, WriteOperation};
-use logpose_wal::WalRecord;
 use std::sync::Arc;
 
 impl CoreRef {
-    /// Compact the collection's segments into one.
-    ///
-    /// Holds the maintenance slot for the whole job, so no flush publishes a manifest in
-    /// between, but takes the writer slot only to publish: writes continue while the
-    /// replacement segment is built, and the published `Version` keeps their delta.
+    /// Compact the collection's segments into one. Blocking; runs on a job thread.
     pub(crate) fn compact_collection(&self, handle: &Arc<CollectionHandle>) -> Result<Snapshot> {
-        handle.ensure_writable()?;
-        let _maintenance = handle.lock_maintenance()?;
-        handle.ensure_writable()?;
-        let base = handle.current();
+        let (ticket, base) = handle.begin_job(JobKind::Compact)?;
         if base.manifest.segments.len() <= 1 {
             return Ok(base.snapshot());
         }
-
-        let descriptor = handle.descriptor();
-        // Nothing durable changes until the manifest is published, so a failure here leaves
-        // the published state valid; the replacement's files are orphans.
-        let next_manifest = self.compact_manifest(descriptor, &base.manifest)?;
-        let published = self.publish_manifest(descriptor, &next_manifest);
-        let mut writer = handle.lock_writer()?;
-        match published {
-            Ok(()) => {
-                let latest = handle.current();
-                let version = handle.publish(&writer, latest.with_manifest(next_manifest));
-                Ok(version.snapshot())
-            }
-            Err(error) => Err(self.reload_after_failure(handle, &mut writer, error)),
-        }
+        // Nothing durable changes until the writer publishes the manifest, so a failure here
+        // leaves the published state valid; the replacement's files are orphans.
+        let output = self.compact_segments(handle.descriptor(), &base.manifest)?;
+        ticket.commit(JobCommit::Compact {
+            inputs: base
+                .manifest
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id.clone())
+                .collect(),
+            output,
+        })
     }
 }
 
 impl EngineCore {
-    /// Write the replacement segment for every segment of `manifest` and return the manifest
-    /// that swaps it in.
-    fn compact_manifest(
+    /// Write the replacement segment for every segment of `manifest`.
+    fn compact_segments(
         &self,
         descriptor: &CollectionDescriptor,
         manifest: &Manifest,
-    ) -> Result<Manifest> {
+    ) -> Result<SegmentMeta> {
         let resolved = resolve_latest_from_segments(self.vfs.as_ref(), descriptor, manifest)?;
         let mut compacted_records = resolved
             .into_values()
             .map(|state| match state {
-                ResolvedState::Visible(record) => WalRecord {
+                ResolvedState::Visible(record) => SegmentRecord {
                     seq_no: record.seq_no,
                     op: WriteOperation::Put(PutRecord {
                         id: record.id,
@@ -64,20 +57,13 @@ impl EngineCore {
                         metadata: record.metadata,
                     }),
                 },
-                ResolvedState::Deleted { id, seq_no } => WalRecord {
+                ResolvedState::Deleted { id, seq_no } => SegmentRecord {
                     seq_no,
                     op: WriteOperation::Delete(logpose_types::DeleteRecord { id }),
                 },
             })
             .collect::<Vec<_>>();
         compacted_records.sort_by_key(|record| record.seq_no);
-
-        let replacement =
-            self.write_segment_file(descriptor, &compacted_records, SegmentPurpose::Compaction)?;
-        Ok(Manifest {
-            generation: manifest.generation + 1,
-            checkpoint_seq_no: manifest.checkpoint_seq_no,
-            segments: vec![replacement],
-        })
+        self.write_segment_file(descriptor, &compacted_records, SegmentPurpose::Compaction)
     }
 }

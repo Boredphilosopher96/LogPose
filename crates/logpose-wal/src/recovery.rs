@@ -1,6 +1,6 @@
 //! Opening a WAL directory: fence check, durability barrier, tail repair and replay.
 
-use super::{
+use crate::{
     FenceMarker, FrameHeader, WalConfig, WalError, WalFrame, WalWriter, data_range,
     fence::{fence_path, read_marker},
     files::{WalFile, list_dir, wal_file_name},
@@ -79,7 +79,8 @@ pub struct WalRecovery {
 struct Cursor {
     /// Index into `files` of the file being read.
     file_index: usize,
-    file: Option<(Arc<dyn VfsFile>, Arc<Path>, u64)>,
+    /// The open file, its path, its length and its salt (the first sequence number in its name).
+    file: Option<(Arc<dyn VfsFile>, Arc<Path>, u64, SeqNo)>,
     offset: u64,
     continuity: Continuity,
     finished: bool,
@@ -241,7 +242,7 @@ impl WalRecovery {
             if self.cursor.finished {
                 return Ok(None);
             }
-            let Some((file, path, len)) = self.cursor.file.clone() else {
+            let Some((file, path, len, salt)) = self.cursor.file.clone() else {
                 if !self.open_next_file()? {
                     self.cursor.finished = true;
                     return Ok(None);
@@ -250,7 +251,7 @@ impl WalRecovery {
             };
             let offset = self.cursor.offset;
             let mut payload = Vec::new();
-            match probe(file.as_ref(), &path, offset, len, &mut payload)? {
+            match probe(file.as_ref(), &path, salt, offset, len, &mut payload)? {
                 Probe::End => {
                     self.cursor.file = None;
                     self.cursor.file_index += 1;
@@ -328,7 +329,7 @@ impl WalRecovery {
                 .map_err(|error| WalError::io("failed to stat WAL file", &wal_file.path, error))?;
             (file, len)
         };
-        self.cursor.file = Some((file, path, len));
+        self.cursor.file = Some((file, path, len, wal_file.first_seq_no));
         self.cursor.offset = 0;
         Ok(true)
     }
@@ -365,7 +366,7 @@ impl WalRecovery {
             .map_or(0, |(group_no, _)| group_no.wrapping_add(1));
 
         if self.report.stale_fence.is_some() {
-            super::clear_fence(self.vfs.as_ref(), &self.dir)?;
+            crate::clear_fence(self.vfs.as_ref(), &self.dir)?;
         }
 
         let Some((file, len)) = self.active.take() else {
@@ -434,16 +435,16 @@ impl WalRecovery {
 }
 
 /// Everything a writer needs to continue a recovered log.
-pub(super) struct ResumeState {
-    pub(super) vfs: Arc<dyn Vfs>,
-    pub(super) dir: PathBuf,
-    pub(super) config: WalConfig,
-    pub(super) files: Vec<WalFile>,
-    pub(super) file: Arc<dyn VfsFile>,
-    pub(super) len: u64,
-    pub(super) next_seq_no: SeqNo,
-    pub(super) next_group_no: u32,
-    pub(super) active_has_data: bool,
+pub(crate) struct ResumeState {
+    pub(crate) vfs: Arc<dyn Vfs>,
+    pub(crate) dir: PathBuf,
+    pub(crate) config: WalConfig,
+    pub(crate) files: Vec<WalFile>,
+    pub(crate) file: Arc<dyn VfsFile>,
+    pub(crate) len: u64,
+    pub(crate) next_seq_no: SeqNo,
+    pub(crate) next_group_no: u32,
+    pub(crate) active_has_data: bool,
 }
 
 /// Tail repair of the highest-named file. Returns its length afterwards.
@@ -488,7 +489,7 @@ fn repair_tail(
 }
 
 /// Create `dir` and make it durable in its parent.
-pub(super) fn create_wal_dir(vfs: &dyn Vfs, dir: &Path) -> Result<(), WalError> {
+pub(crate) fn create_wal_dir(vfs: &dyn Vfs, dir: &Path) -> Result<(), WalError> {
     vfs.create_dir_all(dir)
         .map_err(|error| WalError::io("failed to create WAL directory", dir, error))?;
     let parent = parent_dir(dir);
@@ -497,6 +498,6 @@ pub(super) fn create_wal_dir(vfs: &dyn Vfs, dir: &Path) -> Result<(), WalError> 
 }
 
 /// Path of the WAL file starting at `first_seq_no`.
-pub(super) fn wal_path(dir: &Path, first_seq_no: SeqNo) -> PathBuf {
+pub(crate) fn wal_path(dir: &Path, first_seq_no: SeqNo) -> PathBuf {
     dir.join(wal_file_name(first_seq_no))
 }

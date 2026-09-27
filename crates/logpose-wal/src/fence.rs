@@ -9,7 +9,7 @@
 //! cleared by the reboot, so the on-disk bytes are the truth and recovery proceeds and removes
 //! the marker.
 
-use super::WalError;
+use crate::WalError;
 use logpose_types::SeqNo;
 use logpose_vfs::{OpenMode, Vfs, parent_dir, read_file};
 use std::{
@@ -143,14 +143,14 @@ fn is_marker_token(value: &str) -> bool {
 /// reported as [`WalError::FenceUnreadable`], which callers must treat like a marker from the
 /// current boot.
 pub fn read_fence(vfs: &dyn Vfs, dir: &Path) -> Result<Option<FenceMarker>, WalError> {
-    let listing = super::files::list_dir(vfs, dir)?;
+    let listing = crate::files::list_dir(vfs, dir)?;
     match listing.fence_len {
         None => Ok(None),
         Some(len) => read_marker(vfs, dir, len).map(Some),
     }
 }
 
-pub(super) fn read_marker(vfs: &dyn Vfs, dir: &Path, len: u64) -> Result<FenceMarker, WalError> {
+pub(crate) fn read_marker(vfs: &dyn Vfs, dir: &Path, len: u64) -> Result<FenceMarker, WalError> {
     let marker = dir.join(FENCE_FILE_NAME);
     if len > MAX_FENCE_BYTES {
         return Err(WalError::FenceUnreadable {
@@ -165,7 +165,7 @@ pub(super) fn read_marker(vfs: &dyn Vfs, dir: &Path, len: u64) -> Result<FenceMa
 
 /// Durably write the fence marker: write a temp file, sync it, rename it over the marker and
 /// sync the directory. Any existing marker is replaced.
-pub(super) fn write_fence(vfs: &dyn Vfs, dir: &Path, marker: &FenceMarker) -> io::Result<()> {
+pub(crate) fn write_fence(vfs: &dyn Vfs, dir: &Path, marker: &FenceMarker) -> io::Result<()> {
     let temp = dir.join(FENCE_TEMP_NAME);
     match vfs.remove_file(&temp) {
         Ok(()) => {}
@@ -202,7 +202,7 @@ pub fn clear_fence(vfs: &dyn Vfs, dir: &Path) -> Result<bool, WalError> {
 }
 
 /// Path of the fence marker in `dir`.
-pub(super) fn fence_path(dir: &Path) -> PathBuf {
+pub(crate) fn fence_path(dir: &Path) -> PathBuf {
     dir.join(FENCE_FILE_NAME)
 }
 

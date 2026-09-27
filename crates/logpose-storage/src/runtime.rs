@@ -29,6 +29,10 @@ pub struct RuntimeConfig {
     pub query_threads: usize,
     /// Threads of the `maintenance` rayon pool. Default `max(1, available_parallelism / 4)`.
     pub maintenance_threads: usize,
+    /// Worker threads of the tokio runtime the collections' writer tasks run on. Writer tasks
+    /// only orchestrate (their CPU and I/O work goes to the pools above), so a few suffice.
+    /// Default 2.
+    pub writer_threads: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -39,6 +43,7 @@ impl Default for RuntimeConfig {
             io_queue_depth: 1024,
             query_threads: parallelism,
             maintenance_threads: (parallelism / 4).max(1),
+            writer_threads: 2,
         }
     }
 }

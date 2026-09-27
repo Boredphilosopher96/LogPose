@@ -13,9 +13,13 @@
 //!
 //! Recovery must never panic and never return a frame that differs from what was written.
 //! `LOGPOSE_WAL_FUZZ_TRIALS` raises the number of trials.
+//!
+//! Some payloads embed the raw bytes of a checksummed frame written for another WAL file, at an
+//! 8-byte aligned offset, as user data can (a vector's raw `f32` bytes, say). Frame checksums are
+//! salted with their file, so the tail search after damage must never take such bytes for a
+//! durable later group; the predictions below assume exactly that.
 
 use crc32c as _;
-use crc32fast as _;
 use logpose_types as _;
 use postcard as _;
 use serde as _;
@@ -25,8 +29,8 @@ use tracing as _;
 
 use logpose_vfs::{FaultVfs, OpenMode, Vfs, read_file};
 use logpose_wal::{
+    BootId, FRAME_HEADER_LEN, WalConfig, WalError, WalFrame, WalRecovery, WalWriter,
     codec::PayloadKind,
-    v2::{BootId, FRAME_HEADER_LEN, WalConfig, WalError, WalFrame, WalRecovery, WalWriter},
 };
 use std::{
     io::IoSlice,
@@ -126,7 +130,27 @@ fn payload(rng: &mut Rng) -> Vec<u8> {
         6..=8 => rng.below(400),
         _ => rng.below(5000),
     };
+    if rng.chance(15) {
+        return embedded_frame_payload(rng, len);
+    }
     rng.bytes(len)
+}
+
+/// User data holding a checksummed frame from another WAL file (whose name is never one of
+/// this log's) at an 8-byte aligned offset, with a plausible group number and `GROUP_END`.
+fn embedded_frame_payload(rng: &mut Rng, len: u64) -> Vec<u8> {
+    let prefix = rng.below(4) * 8;
+    let mut bytes = rng.bytes(prefix);
+    let seq = 1 + rng.below(40);
+    let foreign_file = u64::MAX - rng.below(1000);
+    let group_no = u32::try_from(rng.below(40)).unwrap_or(0);
+    let body_len = rng.below(24);
+    let body = rng.bytes(body_len);
+    if let Ok(frame) = WalFrame::write_batch(seq, seq, body) {
+        bytes.extend(frame.encode(foreign_file, 0, group_no, true));
+    }
+    bytes.extend(rng.bytes(len % 64));
+    bytes
 }
 
 fn span(start: u64, payload_len: usize) -> FrameSpan {

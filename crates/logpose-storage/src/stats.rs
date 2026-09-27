@@ -1,8 +1,10 @@
 //! Collection and query-unit statistics and the size estimates behind them.
 
+use crate::segment_v1::SegmentRecord;
 use crate::{
     engine::EngineCore,
     handle::CollectionHandle,
+    legacy_view::legacy_record,
     manifest::SegmentMeta,
     resolve::{ResolvedState, resolve_latest_state_selected},
 };
@@ -10,7 +12,6 @@ use logpose_index::{FlatIndexEntrySource, HnswIndexSidecar, build_flat_index};
 use logpose_types::{
     CollectionStats, QueryUnitArtifactStats, QueryUnitStats, Result, Snapshot, WriteOperation,
 };
-use logpose_wal::WalRecord;
 use std::collections::BTreeMap;
 
 impl EngineCore {
@@ -38,12 +39,16 @@ impl EngineCore {
             }
         }
         let maintenance = self.maintenance_status(handle);
-        let delta_records = state
+        let visible_delta = state
             .delta
             .iter()
             .filter(|record| record.seq_no <= effective_snapshot.visible_seq_no)
-            .cloned()
             .collect::<Vec<_>>();
+        let mutable_op_count = visible_delta.len();
+        let mut delta_records = Vec::with_capacity(visible_delta.len());
+        for record in visible_delta {
+            delta_records.extend(legacy_record(&state.schema, record)?);
+        }
         let mut query_units = vec![mutable_query_unit(&delta_records)];
         query_units.extend(state.manifest.segments.iter().map(QueryUnitStats::from));
 
@@ -53,7 +58,7 @@ impl EngineCore {
             collection_name: descriptor.name.clone(),
             manifest_generation: effective_snapshot.manifest_generation,
             visible_seq_no: effective_snapshot.visible_seq_no,
-            mutable_op_count: delta_records.len(),
+            mutable_op_count,
             segment_count: state.manifest.segments.len(),
             live_record_count,
             deleted_record_count,
@@ -81,7 +86,7 @@ impl From<&SegmentMeta> for QueryUnitStats {
     }
 }
 
-fn mutable_query_unit(delta: &[WalRecord]) -> QueryUnitStats {
+fn mutable_query_unit(delta: &[SegmentRecord]) -> QueryUnitStats {
     let sidecar = build_flat_index(
         "mutable-delta",
         &delta

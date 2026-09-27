@@ -9,10 +9,12 @@ use crate::{
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
+    writer::{ControlMsg, GroupCommitConfig},
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{CollectionAssignment, CollectionRef, LogPoseError, Result};
 use logpose_vfs::{Vfs, VfsLock};
+use logpose_wal::{BootId, DEFAULT_WAL_FILE_BYTES, WalConfig};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -28,13 +30,40 @@ use std::{
 /// Suffix of a collection directory whose drop is committed but whose files are not yet removed.
 pub(crate) const DROPPED_DIR_SUFFIX: &str = ".dropped";
 
+/// Called when the engine can no longer guarantee durability for the rest of the process (a
+/// WAL fsync and its rollback failed, and the fence marker that makes a restart in this boot
+/// refuse the collection could not be written either). The default logs and aborts the process.
+pub type FatalHandler = Arc<dyn Fn(&LogPoseError) + Send + Sync>;
+
 /// Engine configuration.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EngineConfig {
     /// Thread pool sizes.
     pub runtime: RuntimeConfig,
     /// Remote blob store that flushed segments are marked for upload to, if any.
     pub blob_store: Option<Arc<dyn BlobStore>>,
+    /// Group commit settings of every collection's writer.
+    pub group: GroupCommitConfig,
+    /// Size at which a collection's active WAL file is rotated. Default 64 MiB.
+    pub wal_file_bytes: u64,
+    /// Identity of this boot for the WAL fence. `None` reads [`BootId::current`]; tests inject
+    /// distinct ids to simulate reboots.
+    pub boot_id: Option<BootId>,
+    /// What to do when durability can no longer be guaranteed; `None` aborts the process.
+    pub on_fatal: Option<FatalHandler>,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeConfig::default(),
+            blob_store: None,
+            group: GroupCommitConfig::default(),
+            wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
+            boot_id: None,
+            on_fatal: None,
+        }
+    }
 }
 
 impl fmt::Debug for EngineConfig {
@@ -43,6 +72,10 @@ impl fmt::Debug for EngineConfig {
             .debug_struct("EngineConfig")
             .field("runtime", &self.runtime)
             .field("blob_store", &self.blob_store.is_some())
+            .field("group", &self.group)
+            .field("wal_file_bytes", &self.wal_file_bytes)
+            .field("boot_id", &self.boot_id)
+            .field("on_fatal", &self.on_fatal.is_some())
             .finish()
     }
 }
@@ -62,12 +95,30 @@ pub struct Engine {
 /// Owned by user-facing clones only. Its drop is the engine's shutdown.
 struct EngineShared {
     core: Arc<EngineCore>,
+    /// The runtime every collection's writer task runs on. Shut down last, and never dropped
+    /// in place, so that dropping the engine inside an async context does not panic.
+    writers: Option<tokio::runtime::Runtime>,
 }
 
 impl Drop for EngineShared {
     fn drop(&mut self) {
         self.core.shutdown.store(true, Ordering::Release);
+        // Writer tasks finish the group they have in flight, fail what is queued, and exit,
+        // releasing their engine references.
+        let writers = std::mem::take(
+            &mut *self
+                .core
+                .writers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for writer in writers {
+            let _ = writer.send(ControlMsg::Shutdown);
+        }
         self.core.tasks.wait_idle();
+        if let Some(writers) = self.writers.take() {
+            writers.shutdown_background();
+        }
     }
 }
 
@@ -82,6 +133,16 @@ pub(crate) struct EngineCore {
     /// Collection directories whose descriptor could not be read at open.
     unreadable: OnceLock<Vec<UnreadableCollection>>,
     runtime: Runtime,
+    /// Handle to the runtime the writer tasks run on (owned by [`EngineShared`]).
+    writer_runtime: tokio::runtime::Handle,
+    /// Group commit settings of every writer.
+    pub(crate) group_commit: GroupCommitConfig,
+    wal_file_bytes: u64,
+    boot_id: BootId,
+    on_fatal: Option<FatalHandler>,
+    /// Control channels of every writer task started, so that shutdown reaches each one,
+    /// including those of collections that are being dropped or failed to register.
+    writers: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ControlMsg>>>,
     /// Threads that run legacy flush and compaction jobs, which interleave CPU and blocking
     /// I/O and so can run on neither the I/O pool nor a rayon pool.
     pub(crate) jobs: IoPool,
@@ -132,6 +193,12 @@ impl Engine {
             config.runtime.maintenance_threads,
             config.runtime.io_queue_depth,
         )?;
+        let writers = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(config.runtime.writer_threads.max(1))
+            .thread_name("logpose-writer")
+            .enable_time()
+            .build()
+            .map_err(|error| io_message("failed to start the writer runtime", error))?;
         let core = Arc::new(EngineCore {
             root,
             vfs,
@@ -139,15 +206,24 @@ impl Engine {
             collections: RwLock::new(BTreeMap::new()),
             unreadable: OnceLock::new(),
             runtime,
+            writer_runtime: writers.handle().clone(),
+            group_commit: config.group,
+            wal_file_bytes: config.wal_file_bytes,
+            boot_id: config.boot_id.unwrap_or_else(BootId::current),
+            on_fatal: config.on_fatal,
+            writers: Mutex::new(Vec::new()),
             jobs,
             tasks: Arc::new(TaskTracker::default()),
             shutdown: AtomicBool::new(false),
             _root_lock: root_lock,
         });
+        // From here on, dropping `shared` shuts down whatever recovery started.
+        let shared = Arc::new(EngineShared {
+            core: Arc::clone(&core),
+            writers: Some(writers),
+        });
         core.recover_collections()?;
-        Ok(Self {
-            shared: Arc::new(EngineShared { core }),
-        })
+        Ok(Self { shared })
     }
 
     /// The storage root.
@@ -259,6 +335,42 @@ impl EngineCore {
         self.root.join("collections")
     }
 
+    /// The engine's thread pools.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// The runtime writer tasks run on.
+    pub(crate) fn writer_runtime(&self) -> &tokio::runtime::Handle {
+        &self.writer_runtime
+    }
+
+    /// The WAL settings every collection's WAL is opened with.
+    pub(crate) fn wal_config(&self) -> WalConfig {
+        WalConfig {
+            file_bytes: self.wal_file_bytes,
+            epoch: 0,
+            boot_id: self.boot_id.clone(),
+        }
+    }
+
+    /// Durability can no longer be guaranteed for this process: report it, then run the
+    /// configured handler, which aborts by default.
+    pub(crate) fn fatal(&self, error: &LogPoseError) {
+        tracing::error!(%error, "fatal storage error; the process must stop");
+        match &self.on_fatal {
+            Some(handler) => handler(error),
+            None => std::process::abort(),
+        }
+    }
+
+    /// Remember a started writer task, so that shutdown stops it.
+    pub(crate) fn register_writer(&self, control: tokio::sync::mpsc::UnboundedSender<ControlMsg>) {
+        let mut writers = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
+        writers.retain(|writer| !writer.is_closed());
+        writers.push(control);
+    }
+
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
@@ -345,6 +457,7 @@ impl EngineCore {
     }
 
     /// Recover every collection directory, in parallel on the I/O pool, and register each one.
+    /// Each recovered collection's writer task is already running.
     fn recover_collections(self: &Arc<Self>) -> Result<()> {
         let collections_root = self.collections_root();
         let dirs = self.collection_dirs_to_recover(&collections_root)?;
@@ -531,23 +644,23 @@ impl CoreRef {
     /// Stop an open collection and retire its directory.
     fn retire_open_collection(&self, handle: &Arc<CollectionHandle>) -> Result<()> {
         handle.mark_dropped();
-        // Wait for the in-flight maintenance job and write; both check the state again under
-        // these locks, so nothing starts after them. The lock order is maintenance, then writer.
-        let _maintenance = handle
-            .maintenance
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut writer = handle.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        writer.wal = None;
-        self.retire_collection_dir(&handle.meta().dir)
-            .map_err(|failure| {
+        // The writer finishes the group in flight and waits for the active maintenance job to
+        // end; it refuses everything else once the handle is dropped, so nothing is written
+        // to the directory after this returns.
+        handle.quiesce();
+        match self.retire_collection_dir(&handle.meta().dir) {
+            Ok(()) => {
+                handle.stop_writer();
+                Ok(())
+            }
+            Err(failure) => {
                 if !failure.renamed {
-                    // Nothing on disk changed, so the collection serves again; the next write
-                    // reopens its WAL.
+                    // Nothing on disk changed, so the collection serves again.
                     handle.mark_open();
                 }
-                failure.error
-            })
+                Err(failure.error)
+            }
+        }
     }
 
     /// Durably rename `dir` to `<dir>.dropped`, which commits the drop, then remove it. A crash

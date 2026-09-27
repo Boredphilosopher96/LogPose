@@ -1,13 +1,17 @@
 //! Latest-visible resolution over the mutable delta and immutable segments, and the exact scan built on it.
 
+use crate::segment_v1::SegmentRecord;
 use crate::{
-    engine::EngineCore, handle::CollectionHandle, manifest::Manifest,
-    segment_v1::read_segment_file, state::CollectionState,
+    engine::EngineCore,
+    handle::CollectionHandle,
+    legacy_view::{delta_key, legacy_id, legacy_record},
+    manifest::Manifest,
+    segment_v1::read_segment_file,
+    state::CollectionState,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation};
 use logpose_vfs::Vfs;
-use logpose_wal::WalRecord;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug)]
@@ -27,14 +31,7 @@ pub(crate) fn resolve_latest_state_selected(
     let mut resolved = BTreeMap::new();
 
     if include_mutable {
-        for record in state
-            .delta
-            .iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no)
-        {
-            apply_resolved_record(&mut resolved, record.clone());
-        }
+        resolve_delta(&mut resolved, state, visible_seq_no, |_| true)?;
     }
 
     for segment in state.manifest.segments.iter().rev().filter(|segment| {
@@ -59,6 +56,34 @@ pub(crate) fn resolve_latest_state_selected(
     }
 
     Ok(resolved)
+}
+
+/// Resolve the delta newest first: the latest operation per key at or below `visible_seq_no`
+/// wins. Only the winning operation of each wanted key is read with the state's schema.
+fn resolve_delta(
+    resolved: &mut BTreeMap<RecordId, ResolvedState>,
+    state: &CollectionState,
+    visible_seq_no: SeqNo,
+    wanted: impl Fn(&RecordId) -> bool,
+) -> Result<()> {
+    for record in state
+        .delta
+        .iter()
+        .rev()
+        .filter(|record| record.seq_no <= visible_seq_no)
+    {
+        let Some(key) = delta_key(&record.op) else {
+            continue;
+        };
+        let id = legacy_id(key);
+        if resolved.contains_key(&id) || !wanted(&id) {
+            continue;
+        }
+        if let Some(record) = legacy_record(&state.schema, record)? {
+            apply_resolved_record(resolved, record);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_latest_from_segments(
@@ -94,18 +119,11 @@ pub(crate) fn resolve_latest_state_for_ids_selected(
     let mut resolved = BTreeMap::new();
 
     if include_mutable {
-        for record in state
-            .delta
-            .iter()
-            .rev()
-            .filter(|record| record.seq_no <= visible_seq_no)
-        {
-            if wanted_ids.contains(record.op.id()) {
-                apply_resolved_record(&mut resolved, record.clone());
-            }
-            if resolved.len() == wanted_ids.len() {
-                return Ok(resolved);
-            }
+        resolve_delta(&mut resolved, state, visible_seq_no, |id| {
+            wanted_ids.contains(id)
+        })?;
+        if resolved.len() == wanted_ids.len() {
+            return Ok(resolved);
         }
     }
 
@@ -136,7 +154,7 @@ pub(crate) fn resolve_latest_state_for_ids_selected(
     Ok(resolved)
 }
 
-fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, record: WalRecord) {
+fn apply_resolved_record(resolved: &mut BTreeMap<RecordId, ResolvedState>, record: SegmentRecord) {
     let id = record.op.id().clone();
     if resolved.contains_key(&id) {
         return;

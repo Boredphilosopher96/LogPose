@@ -16,6 +16,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
+use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
@@ -38,6 +39,8 @@ fn put(id: &str) -> WriteOperation {
     })
 }
 
+/// Create the collection and return the path of its first WAL file, which receives every write
+/// until the first flush rotates the WAL.
 async fn create(engine: &LocalStorageEngine) -> PathBuf {
     engine
         .create_collection(CreateCollectionRequest::new(
@@ -49,7 +52,7 @@ async fn create(engine: &LocalStorageEngine) -> PathBuf {
         .expect("collection should be created")
         .root_path
         .join("wal")
-        .join("active.wal")
+        .join(format!("{:020}.wal", 1))
 }
 
 async fn visible_ids(engine: &LocalStorageEngine) -> Vec<String> {
@@ -198,7 +201,7 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
 }
 
 #[tokio::test]
-async fn garbage_tail_is_truncated_by_the_next_write() {
+async fn garbage_tail_is_truncated_before_the_next_write() {
     let root = support::unique_temp_dir("storage-wal-garbage-tail");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
@@ -317,7 +320,7 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
 }
 
 #[tokio::test]
-async fn flush_after_a_torn_tail_rolls_a_clean_wal() {
+async fn a_flush_after_a_torn_tail_leaves_a_clean_older_wal_file() {
     let root = support::unique_temp_dir("storage-wal-torn-flush");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let active = create(&engine).await;
@@ -338,11 +341,14 @@ async fn flush_after_a_torn_tail_rolls_a_clean_wal() {
         .expect("flush should succeed");
     assert_eq!(flushed.visible_seq_no, 2);
 
-    let rolled = active.with_file_name(format!("{:020}.wal", flushed.visible_seq_no));
-    let rolled_bytes = fs::read(&rolled).expect("rolled wal should exist");
-    assert_eq!(rolled_bytes, bytes[..bytes.len() - b"torn".len()]);
+    // Recovery repaired the tail, and the flush rotated to a new file named for the next
+    // sequence number, so the old file keeps exactly the committed groups.
+    let old_bytes = fs::read(&active).expect("old wal file should exist");
+    assert_eq!(old_bytes, bytes[..bytes.len() - b"torn".len()]);
+    let rotated = active.with_file_name(format!("{:020}.wal", flushed.visible_seq_no + 1));
+    assert!(rotated.exists(), "the flush rotated the WAL");
 
-    // Older snapshots replay the rolled file strictly, which only works if it is clean.
+    // Older snapshots replay the old file strictly, which only works if it is clean.
     let old = reopened
         .scan_exact(
             "documents",

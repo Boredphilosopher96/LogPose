@@ -2,8 +2,11 @@
 //! its persisted status.
 //!
 //! The queue and status live on the [`CollectionHandle`]; jobs run on the engine's job threads,
-//! at most one per collection at a time. `maintenance.json` persists the status so that a job
-//! interrupted by a crash or a shutdown resumes when the engine reopens.
+//! at most one queue loop per collection at a time, and the collection's writer task serializes
+//! the jobs themselves (an explicit flush or compaction waits behind a queued one).
+//! `maintenance.json` persists the status so that a job interrupted by a crash or a shutdown
+//! resumes when the engine reopens. The file is written without holding the queue lock, so a
+//! status read never waits for its fsync.
 
 use crate::{
     durable_fs::path_exists,
@@ -52,6 +55,9 @@ pub(crate) struct MaintenanceState {
     queue: VecDeque<MaintenanceOperation>,
     /// Whether a job loop is scheduled or running for the collection.
     running: bool,
+    /// Bumped on every status change, so a persist can tell whether a newer status was already
+    /// written.
+    version: u64,
 }
 
 impl MaintenanceState {
@@ -135,13 +141,28 @@ impl EngineCore {
         lock_jobs(handle).status.clone()
     }
 
-    /// Persist `state.status`. A failure is recorded in the status rather than returned: the
-    /// in-memory queue is authoritative while the engine runs, and the file only matters for
-    /// resuming after a restart.
-    fn persist_locked(&self, handle: &CollectionHandle, state: &mut MaintenanceState) {
-        if let Err(error) = self.persist_maintenance_status(handle.descriptor(), &state.status) {
-            state.status.last_error =
-                Some(format!("failed to persist maintenance status: {error}"));
+    /// Persist the handle's status if a newer one was not written yet. The queue lock is held
+    /// only to copy the status, never across the file's fsync. A failure is recorded in the
+    /// status rather than returned: the in-memory queue is authoritative while the engine runs,
+    /// and the file only matters for resuming after a restart.
+    fn persist_status(&self, handle: &CollectionHandle) {
+        let mut written = handle
+            .status_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (status, version) = {
+            let state = lock_jobs(handle);
+            (state.status.clone(), state.version)
+        };
+        if version <= *written {
+            return;
+        }
+        match self.persist_maintenance_status(handle.descriptor(), &status) {
+            Ok(()) => *written = version,
+            Err(error) => {
+                lock_jobs(handle).status.last_error =
+                    Some(format!("failed to persist maintenance status: {error}"));
+            }
         }
     }
 }
@@ -168,14 +189,15 @@ impl CoreRef {
                     && !state.status.pending.iter().any(|pending| pending == label)
                 {
                     state.status.pending.push(label.to_owned());
+                    state.version += 1;
                 }
                 if !state.queue.contains(operation) {
                     state.queue.push_back(*operation);
                 }
             }
-            self.persist_locked(handle, &mut state);
             !std::mem::replace(&mut state.running, true)
         };
+        self.persist_status(handle);
         if start {
             let core = self.clone();
             let loop_handle = Arc::clone(handle);
@@ -235,9 +257,10 @@ impl CoreRef {
             let label = operation.as_str();
             state.status.pending.retain(|pending| pending != label);
             state.status.in_progress = Some(label.to_owned());
-            self.persist_locked(handle, &mut state);
+            state.version += 1;
             operation
         };
+        self.persist_status(handle);
 
         let result = self.perform_maintenance(handle, operation);
         let follow_up = if result.is_ok() {
@@ -265,9 +288,10 @@ impl CoreRef {
                 }
                 Err(error) => state.status.last_error = Some(error.to_string()),
             }
-            if !handle.is_dropped() {
-                self.persist_locked(handle, &mut state);
-            }
+            state.version += 1;
+        }
+        if !handle.is_dropped() {
+            self.persist_status(handle);
         }
         // This job still owns the queue (`running` is set), so this only queues.
         self.enqueue_maintenance(handle, follow_up);

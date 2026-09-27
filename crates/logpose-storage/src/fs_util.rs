@@ -35,19 +35,34 @@ pub(crate) struct AtomicWritePoints {
 /// fsync the parent directory so the rename survives power loss.
 pub(crate) fn atomic_write(vfs: &dyn Vfs, path: &Path, bytes: Vec<u8>) -> Result<()> {
     atomic_write_with_points(vfs, path, bytes, AtomicWritePoints::default())
+        .map_err(|failure| failure.error)
 }
 
-/// [`atomic_write`] that reports a named crash point after each durable step.
+/// Why [`atomic_write_with_points`] failed, and whether it got as far as the rename.
+#[derive(Debug)]
+pub(crate) struct AtomicWriteFailure {
+    /// What failed.
+    pub(crate) error: LogPoseError,
+    /// Whether the rename was attempted, so that the destination may hold either version until
+    /// its directory is synced.
+    pub(crate) renamed: bool,
+}
+
+/// [`atomic_write`] that reports a named crash point after each durable step, and on failure
+/// whether the destination may have changed.
 pub(crate) fn atomic_write_with_points(
     vfs: &dyn Vfs,
     path: &Path,
     bytes: Vec<u8>,
     points: AtomicWritePoints,
-) -> Result<()> {
+) -> std::result::Result<(), AtomicWriteFailure> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_dir_all_synced(vfs, parent)?;
+        create_dir_all_synced(vfs, parent).map_err(|error| AtomicWriteFailure {
+            error,
+            renamed: false,
+        })?;
     }
     replace_atomically(vfs, path, bytes, points)
 }
@@ -60,6 +75,7 @@ pub(crate) fn atomic_write_in_existing_dir(
     bytes: Vec<u8>,
 ) -> Result<()> {
     replace_atomically(vfs, path, bytes, AtomicWritePoints::default())
+        .map_err(|failure| failure.error)
 }
 
 fn replace_atomically(
@@ -67,7 +83,15 @@ fn replace_atomically(
     path: &Path,
     bytes: Vec<u8>,
     points: AtomicWritePoints,
-) -> Result<()> {
+) -> std::result::Result<(), AtomicWriteFailure> {
+    let before = |error| AtomicWriteFailure {
+        error,
+        renamed: false,
+    };
+    let after = |error| AtomicWriteFailure {
+        error,
+        renamed: true,
+    };
     static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let temp_path = path.with_file_name(format!(
         ".{}.{}.{}.tmp",
@@ -79,16 +103,16 @@ fn replace_atomically(
     ));
     if let Err(error) = write_file_synced(vfs, &temp_path, &bytes) {
         cleanup_file(vfs, &temp_path);
-        return Err(error);
+        return Err(before(error));
     }
-    crash_point(vfs, points.after_temp_sync)?;
+    crash_point(vfs, points.after_temp_sync).map_err(before)?;
     if let Err(error) = vfs.rename(&temp_path, path) {
         cleanup_file(vfs, &temp_path);
-        return Err(io_message("failed to atomically rename file", error));
+        return Err(after(io_message("failed to atomically rename file", error)));
     }
-    crash_point(vfs, points.after_rename)?;
-    sync_parent_dir(vfs, path)?;
-    crash_point(vfs, points.after_dir_sync)
+    crash_point(vfs, points.after_rename).map_err(after)?;
+    sync_parent_dir(vfs, path).map_err(after)?;
+    crash_point(vfs, points.after_dir_sync).map_err(after)
 }
 
 /// Report `point` if there is one. A crash there halts the operation with an error.
@@ -107,12 +131,4 @@ pub(crate) fn cleanup_file(vfs: &dyn Vfs, path: &Path) {
 
 pub(crate) fn cleanup_dir(vfs: &dyn Vfs, path: &Path) {
     let _ = vfs.remove_dir_all(path);
-}
-
-pub(crate) fn remove_file_if_exists(vfs: &dyn Vfs, path: &Path, context: &str) -> Result<()> {
-    match vfs.remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_message(context, error)),
-    }
 }

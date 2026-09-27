@@ -1,6 +1,6 @@
 //! WAL file naming and directory listing.
 
-use super::{FENCE_FILE_NAME, WalError};
+use crate::{FENCE_FILE_NAME, WalError};
 use logpose_types::SeqNo;
 use logpose_vfs::Vfs;
 use std::{
@@ -31,25 +31,25 @@ pub fn parse_wal_file_name(name: &str) -> Option<SeqNo> {
 
 /// One WAL file, identified by the first sequence number in its name.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct WalFile {
-    pub(super) first_seq_no: SeqNo,
-    pub(super) path: PathBuf,
+pub(crate) struct WalFile {
+    pub(crate) first_seq_no: SeqNo,
+    pub(crate) path: PathBuf,
 }
 
 /// What a WAL directory holds.
 #[derive(Debug, Default)]
-pub(super) struct DirListing {
+pub(crate) struct DirListing {
     /// WAL files sorted by first sequence number.
-    pub(super) files: Vec<WalFile>,
+    pub(crate) files: Vec<WalFile>,
     /// Length of the fence marker, if one exists.
-    pub(super) fence_len: Option<u64>,
+    pub(crate) fence_len: Option<u64>,
     /// Whether the directory exists.
-    pub(super) exists: bool,
+    pub(crate) exists: bool,
 }
 
 /// List a WAL directory. A missing directory lists as empty. Files that do not end in `.wal`
 /// are ignored, except the fence marker; a `.wal` file with a malformed name is an error.
-pub(super) fn list_dir(vfs: &dyn Vfs, dir: &Path) -> Result<DirListing, WalError> {
+pub(crate) fn list_dir(vfs: &dyn Vfs, dir: &Path) -> Result<DirListing, WalError> {
     let entries = match vfs.list(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DirListing::default()),

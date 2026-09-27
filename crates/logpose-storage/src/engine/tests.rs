@@ -429,7 +429,7 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
                         version.id,
                         version.visible_seq_no,
                         version.manifest_generation,
-                        version.delta.to_vec().len(),
+                        version.delta.iter().count(),
                     );
                     pinned.push((version, summary));
                     if pinned.len() > 64 {
@@ -442,7 +442,7 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
                         version.id,
                         version.visible_seq_no,
                         version.manifest_generation,
-                        version.delta.to_vec().len(),
+                        version.delta.iter().count(),
                     );
                     assert_eq!(now, summary);
                     version.check_invariants().expect("still consistent");
@@ -599,7 +599,13 @@ async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
         .create_collection(descriptor, None)
         .expect("collection should be created");
     let quiet = create(&engine, "quiet");
-    write(&engine, &quiet, vec![put("alpha", vec![1.0, 0.0])]);
+    {
+        let quiet = Arc::clone(&quiet);
+        engine
+            .io(move |core| core.write(&quiet, vec![put("alpha", vec![1.0, 0.0])]))
+            .await
+            .expect("write should succeed");
+    }
 
     // Every write of the busy collection queues a flush for it.
     let done = Arc::new(AtomicBool::new(false));

@@ -1,11 +1,11 @@
-//! The v1 logical state a read runs against (manifest plus replayed delta), and snapshot
+//! The logical state a read runs against (manifest, schema, and replayed delta), and snapshot
 //! validation against it.
 
 use crate::{
     manifest::Manifest,
     version::{DeltaLog, Version, visible_seq_no},
 };
-use logpose_types::{LogPoseError, Result, SeqNo, Snapshot};
+use logpose_types::{LogPoseError, Result, SeqNo, Snapshot, schema::CollectionSchema};
 use std::sync::Arc;
 
 /// A manifest and the WAL delta above its checkpoint: the current state (from the published
@@ -13,6 +13,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionState {
     pub(crate) manifest: Arc<Manifest>,
+    /// The schema as of the state's last operation; rows are read with it.
+    pub(crate) schema: Arc<CollectionSchema>,
     pub(crate) delta: DeltaLog,
 }
 
@@ -27,6 +29,7 @@ impl Version {
     pub(crate) fn state(&self) -> CollectionState {
         CollectionState {
             manifest: Arc::clone(&self.manifest),
+            schema: Arc::clone(&self.schema),
             delta: self.delta.clone(),
         }
     }

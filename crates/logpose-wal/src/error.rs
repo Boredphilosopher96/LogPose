@@ -1,26 +1,10 @@
-//! Typed WAL v2 errors.
+//! Typed WAL errors.
 
-use logpose_types::{LogPoseError, SeqNo};
+use logpose_types::{CorruptionKind, LogPoseError, SeqNo, WriteOutcome};
 use std::{io, path::PathBuf};
 use thiserror::Error;
 
-/// What a failed [`append_group`](super::WalWriter::append_group) or
-/// [`rotate`](super::WalWriter::rotate) means for the frames it tried to write.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WriteOutcome {
-    /// The file was truncated back to the last synced group and the truncation was synced: the
-    /// failed frames are absent after any crash and will never be replayed.
-    NotApplied,
-    /// The rollback failed, so the failed frames may or may not be replayed later. Clients must
-    /// treat this like a timeout.
-    Unknown {
-        /// Whether the `FSYNC_FAILED` fence marker was written durably. When it was not, a later
-        /// open in the same boot cannot notice the hazard, so the process must stop.
-        fenced: bool,
-    },
-}
-
-/// Errors of the WAL v2 frame layer.
+/// Errors of the WAL.
 #[derive(Debug, Error)]
 pub enum WalError {
     /// A filesystem operation failed outside the append path.
@@ -68,7 +52,7 @@ pub enum WalError {
     },
     /// The WAL directory is fenced by an `FSYNC_FAILED` marker from the current boot: a WAL
     /// fsync and its rollback failed, so the page cache may hold frames that never reached the
-    /// device. Restart the host, or clear the marker with [`clear_fence`](super::clear_fence)
+    /// device. Restart the host, or clear the marker with [`clear_fence`](crate::clear_fence)
     /// after checking the device.
     #[error(
         "WAL '{}' is fenced: an fsync and its rollback failed in this boot ({boot_id}) for sequence numbers {first_seq_no}..={last_seq_no}",
@@ -114,7 +98,7 @@ pub enum WalError {
         /// What is wrong.
         reason: String,
     },
-    /// A frame payload exceeds [`MAX_FRAME_PAYLOAD`](super::MAX_FRAME_PAYLOAD).
+    /// A frame payload exceeds [`MAX_FRAME_PAYLOAD`](crate::MAX_FRAME_PAYLOAD).
     #[error("WAL frame payload of {len} bytes exceeds the {max}-byte limit")]
     FrameTooLarge {
         /// Payload length.
@@ -125,7 +109,7 @@ pub enum WalError {
 }
 
 impl WalError {
-    pub(super) fn io(context: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
+    pub(crate) fn io(context: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             context,
             path: path.into(),
@@ -133,7 +117,7 @@ impl WalError {
         }
     }
 
-    pub(super) fn corrupt(
+    pub(crate) fn corrupt(
         file: impl Into<PathBuf>,
         offset: u64,
         reason: impl Into<String>,
@@ -145,7 +129,7 @@ impl WalError {
         }
     }
 
-    pub(super) fn invalid(reason: impl Into<String>) -> Self {
+    pub(crate) fn invalid(reason: impl Into<String>) -> Self {
         Self::InvalidFrame {
             reason: reason.into(),
         }
@@ -172,6 +156,88 @@ impl WalError {
 
 impl From<WalError> for LogPoseError {
     fn from(error: WalError) -> Self {
-        LogPoseError::Message(error.to_string())
+        let message = error.to_string();
+        match error {
+            WalError::Corrupt { file, .. }
+            | WalError::UnsupportedFormatVersion { file, .. }
+            | WalError::UnexpectedFile { path: file } => LogPoseError::Corrupt {
+                kind: CorruptionKind::Wal,
+                location: Some(file.display().to_string()),
+                message,
+            },
+            WalError::FenceUnreadable { marker, .. } => LogPoseError::Corrupt {
+                kind: CorruptionKind::Wal,
+                location: Some(marker.display().to_string()),
+                message,
+            },
+            WalError::Io {
+                context,
+                path,
+                source,
+            } => LogPoseError::io(
+                format!("WAL I/O error: {context} '{}'", path.display()),
+                source,
+            ),
+            WalError::WriteFailed { source, .. } => LogPoseError::io(
+                message
+                    .strip_suffix(&format!(": {source}"))
+                    .unwrap_or("WAL write failed")
+                    .to_owned(),
+                source,
+            ),
+            WalError::FrameTooLarge { len, max } => LogPoseError::TooLarge {
+                what: "WAL frame payload".to_owned(),
+                size: u64::try_from(len).ok(),
+                limit: u64::from(max),
+            },
+            WalError::FsyncFailedSameBoot { .. }
+            | WalError::WriterFailed { .. }
+            | WalError::InvalidFrame { .. } => LogPoseError::internal(message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wal_errors_map_to_typed_engine_errors() {
+        let corrupt = LogPoseError::from(WalError::corrupt("/w/1.wal", 64, "bad"));
+        assert!(matches!(
+            corrupt,
+            LogPoseError::Corrupt {
+                kind: CorruptionKind::Wal,
+                location: Some(ref location),
+                ..
+            } if location == "/w/1.wal"
+        ));
+        let v1 = LogPoseError::from(WalError::UnexpectedFile {
+            path: "/w/active.wal".into(),
+        });
+        assert!(
+            matches!(
+                v1,
+                LogPoseError::Corrupt {
+                    kind: CorruptionKind::Wal,
+                    ..
+                }
+            ),
+            "{v1}"
+        );
+        let failed = LogPoseError::from(WalError::WriteFailed {
+            outcome: WriteOutcome::Unknown { fenced: true },
+            source: io::Error::other("eio"),
+        });
+        assert!(matches!(failed, LogPoseError::Io { .. }), "{failed}");
+        let large = LogPoseError::from(WalError::FrameTooLarge { len: 10, max: 5 });
+        assert!(matches!(
+            large,
+            LogPoseError::TooLarge {
+                size: Some(10),
+                limit: 5,
+                ..
+            }
+        ));
     }
 }

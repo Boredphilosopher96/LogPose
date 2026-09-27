@@ -14,6 +14,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use thiserror as _;
+use tracing as _;
 use twox_hash as _;
 use uuid as _;
 

@@ -5,7 +5,7 @@
 //! ```text
 //! offset size field
 //!      0    4 magic          0x3257_504C ("LPW2")
-//!      4    4 header_crc     crc32c(bytes 8..48)
+//!      4    4 header_crc     crc32c(file salt || bytes 8..48), see below
 //!      8    4 payload_len    bytes of payload, <= MAX_FRAME_PAYLOAD (64 MiB)
 //!     12    1 frame_type     1 = WriteBatch, 2 = SchemaChange, 3 = Checkpoint
 //!     13    1 flags          bit 0 reserved for compression (0); bit 1 GROUP_END
@@ -18,9 +18,16 @@
 //!     48    n payload        opaque to this layer
 //!   48+n    p padding        zeros so the next frame starts 8-byte aligned (not CRC-covered)
 //! ```
+//!
+//! The header checksum is salted with the file: it covers the first sequence number in the
+//! file's name (8 bytes, little-endian) followed by header bytes 8..48. A frame is therefore
+//! only valid in the file it was written to. Without the salt, the resync scan after a torn
+//! header could find a checksum-valid frame inside user data (a payload that holds the raw bytes
+//! of a frame from another WAL, for example as vector components), take it for a durable later
+//! group, and fail a crash-recovery open with a spurious corruption error.
 
-use super::{Epoch, WalError};
 use crate::codec::PayloadKind;
+use crate::{Epoch, WalError};
 use logpose_types::SeqNo;
 
 /// Frame magic, `"LPW2"` in little-endian byte order.
@@ -39,8 +46,8 @@ const FLAG_COMPRESSED: u8 = 1 << 0;
 /// Set on the last frame of every fsync group.
 const FLAG_GROUP_END: u8 = 1 << 1;
 
-pub(super) const MAGIC_BYTES: [u8; 4] = FRAME_MAGIC.to_le_bytes();
-pub(super) const ZERO_PADDING: [u8; FRAME_ALIGN as usize] = [0; FRAME_ALIGN as usize];
+pub(crate) const MAGIC_BYTES: [u8; 4] = FRAME_MAGIC.to_le_bytes();
+pub(crate) const ZERO_PADDING: [u8; FRAME_ALIGN as usize] = [0; FRAME_ALIGN as usize];
 
 /// Total on-disk length of a frame with a `payload_len`-byte payload, including padding.
 #[must_use]
@@ -49,13 +56,19 @@ pub fn frame_len(payload_len: u32) -> u64 {
 }
 
 /// Padding bytes after a `payload_len`-byte payload.
-pub(super) fn padding_len(payload_len: usize) -> usize {
+pub(crate) fn padding_len(payload_len: usize) -> usize {
     payload_len.next_multiple_of(FRAME_ALIGN as usize) - payload_len
 }
 
 /// CRC-32C (Castagnoli), hardware accelerated where available.
-pub(super) fn crc32c(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     crc32c::crc32c(bytes)
+}
+
+/// The header checksum: CRC-32C over `salt` (little-endian) followed by header bytes 8..48.
+/// `salt` is the first sequence number in the name of the file that holds the frame.
+pub(crate) fn header_crc(salt: SeqNo, bytes: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c(&salt.to_le_bytes()), bytes)
 }
 
 /// A decoded, validated frame header.
@@ -81,7 +94,7 @@ pub struct FrameHeader {
 
 /// Why header bytes did not decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum HeaderDefect {
+pub(crate) enum HeaderDefect {
     /// The magic does not match: not a frame start, or a torn write.
     BadMagic,
     /// The header checksum does not match: a torn or damaged header.
@@ -105,9 +118,10 @@ impl FrameHeader {
         frame_len(self.payload_len)
     }
 
-    /// Encode the header, computing `header_crc`.
+    /// Encode the header for the file named `salt` (its first sequence number), computing the
+    /// salted `header_crc`.
     #[must_use]
-    pub fn encode(&self) -> [u8; FRAME_HEADER_LEN] {
+    pub fn encode(&self, salt: SeqNo) -> [u8; FRAME_HEADER_LEN] {
         let mut bytes = [0u8; FRAME_HEADER_LEN];
         bytes[0..4].copy_from_slice(&MAGIC_BYTES);
         bytes[8..12].copy_from_slice(&self.payload_len.to_le_bytes());
@@ -119,17 +133,21 @@ impl FrameHeader {
         bytes[32..40].copy_from_slice(&self.last_seq_no.to_le_bytes());
         bytes[40..44].copy_from_slice(&self.payload_crc.to_le_bytes());
         bytes[44..48].copy_from_slice(&self.group_no.to_le_bytes());
-        let header_crc = crc32c(&bytes[8..]);
-        bytes[4..8].copy_from_slice(&header_crc.to_le_bytes());
+        let crc = header_crc(salt, &bytes[8..]);
+        bytes[4..8].copy_from_slice(&crc.to_le_bytes());
         bytes
     }
 
-    /// Decode and validate header bytes. The checksum is verified before any field is trusted.
-    pub(super) fn decode(bytes: &[u8; FRAME_HEADER_LEN]) -> Result<Self, HeaderDefect> {
+    /// Decode and validate header bytes read from the file named `salt`. The checksum is
+    /// verified before any field is trusted.
+    pub(crate) fn decode(
+        bytes: &[u8; FRAME_HEADER_LEN],
+        salt: SeqNo,
+    ) -> Result<Self, HeaderDefect> {
         if bytes[0..4] != MAGIC_BYTES {
             return Err(HeaderDefect::BadMagic);
         }
-        if u32_at(bytes, 4) != crc32c(&bytes[8..]) {
+        if u32_at(bytes, 4) != header_crc(salt, &bytes[8..]) {
             return Err(HeaderDefect::BadChecksum);
         }
         let version = u16::from_le_bytes([bytes[14], bytes[15]]);
@@ -212,7 +230,7 @@ fn u64_at(bytes: &[u8; FRAME_HEADER_LEN], at: usize) -> u64 {
 ///
 /// Building frames (and their payload checksums) is CPU work the engine does while the previous
 /// group's I/O is in flight. The group number and `GROUP_END` flag are assigned by
-/// [`WalWriter::append_group`](super::WalWriter::append_group), which also builds the header.
+/// [`WalWriter::append_group`](crate::WalWriter::append_group), which also builds the header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalFrame {
     kind: PayloadKind,
@@ -314,7 +332,7 @@ impl WalFrame {
     }
 
     /// The header this frame gets as a member of group `group_no`.
-    pub(super) fn header(&self, epoch: Epoch, group_no: u32, group_end: bool) -> FrameHeader {
+    pub(crate) fn header(&self, epoch: Epoch, group_no: u32, group_end: bool) -> FrameHeader {
         FrameHeader {
             kind: self.kind,
             group_end,
@@ -328,11 +346,11 @@ impl WalFrame {
         }
     }
 
-    /// Encode the whole frame into one buffer. Used by tests and golden files; the writer uses
-    /// vectored appends instead.
+    /// Encode the whole frame for the file named `salt` (its first sequence number) into one
+    /// buffer. Used by tests and golden files; the writer uses vectored appends instead.
     #[must_use]
-    pub fn encode(&self, epoch: Epoch, group_no: u32, group_end: bool) -> Vec<u8> {
-        let header = self.header(epoch, group_no, group_end).encode();
+    pub fn encode(&self, salt: SeqNo, epoch: Epoch, group_no: u32, group_end: bool) -> Vec<u8> {
+        let header = self.header(epoch, group_no, group_end).encode(salt);
         let mut bytes = Vec::with_capacity(usize::try_from(self.encoded_len()).unwrap_or(0));
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&self.payload);
@@ -345,15 +363,18 @@ impl WalFrame {
 mod tests {
     use super::*;
 
+    /// The salt of the file the test frames live in.
+    const SALT: SeqNo = 1;
+
     fn header_bytes(frame: &WalFrame) -> [u8; FRAME_HEADER_LEN] {
-        frame.header(7, 42, true).encode()
+        frame.header(7, 42, true).encode(SALT)
     }
 
     #[test]
     fn header_round_trips_through_encode_and_decode() -> Result<(), WalError> {
         let frame = WalFrame::write_batch(5, 9, b"hello".to_vec())?;
         let header = frame.header(7, 42, true);
-        let decoded = FrameHeader::decode(&header.encode());
+        let decoded = FrameHeader::decode(&header.encode(SALT), SALT);
         assert_eq!(decoded, Ok(header));
         assert_eq!(header.frame_len(), 48 + 8);
         Ok(())
@@ -362,7 +383,7 @@ mod tests {
     #[test]
     fn encoding_matches_golden_bytes() -> Result<(), WalError> {
         let frame = WalFrame::write_batch(1, 2, vec![0xAB, 0xCD, 0xEF])?;
-        let bytes = frame.encode(0, 3, true);
+        let bytes = frame.encode(77, 0, 3, true);
         let payload_crc = crc32c(&[0xAB, 0xCD, 0xEF]);
         let mut expected = Vec::new();
         expected.extend_from_slice(b"LPW2");
@@ -375,11 +396,21 @@ mod tests {
         expected.extend_from_slice(&2u64.to_le_bytes());
         expected.extend_from_slice(&payload_crc.to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
-        let header_crc = crc32c(&expected[8..48]);
+        // The header checksum covers the file's salt (77, the first sequence number in its
+        // name) and then header bytes 8..48.
+        let mut salted = 77u64.to_le_bytes().to_vec();
+        salted.extend_from_slice(&expected[8..48]);
+        let header_crc = crc32c(&salted);
         expected[4..8].copy_from_slice(&header_crc.to_le_bytes());
         expected.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0, 0, 0, 0, 0]);
         assert_eq!(bytes, expected);
         assert_eq!(bytes.len() as u64, frame.encoded_len());
+        // Pin the exact bytes too, so a change to the salt or the layout is deliberate.
+        assert_eq!(
+            bytes[..8],
+            [0x4C, 0x50, 0x57, 0x32, 0xFC, 0xA6, 0x91, 0x83],
+            "magic and salted header checksum"
+        );
         // Pin the checksum algorithm itself: CRC-32C of "123456789" is 0xE3069283.
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         Ok(())
@@ -389,7 +420,7 @@ mod tests {
     fn frames_are_padded_to_eight_bytes() -> Result<(), WalError> {
         for len in 0..=17 {
             let frame = WalFrame::write_batch(1, 1, vec![1; len])?;
-            let bytes = frame.encode(0, 0, true);
+            let bytes = frame.encode(SALT, 0, 0, true);
             assert_eq!(bytes.len() % 8, 0);
             assert_eq!(bytes.len() as u64, frame_len(len as u32));
         }
@@ -405,7 +436,7 @@ mod tests {
                 let mut damaged = bytes;
                 damaged[byte] ^= 1 << bit;
                 assert!(
-                    FrameHeader::decode(&damaged).is_err(),
+                    FrameHeader::decode(&damaged, SALT).is_err(),
                     "flip of byte {byte} bit {bit} went unnoticed"
                 );
             }
@@ -414,9 +445,25 @@ mod tests {
     }
 
     fn resealed(mut bytes: [u8; FRAME_HEADER_LEN]) -> [u8; FRAME_HEADER_LEN] {
-        let crc = crc32c(&bytes[8..]);
+        let crc = header_crc(SALT, &bytes[8..]);
         bytes[4..8].copy_from_slice(&crc.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn a_header_only_validates_in_the_file_it_was_written_for() {
+        let frame = WalFrame::write_batch(3, 3, b"x".to_vec());
+        assert!(frame.is_ok());
+        let Ok(frame) = frame else { return };
+        let bytes = frame.header(0, 5, true).encode(40);
+        assert!(FrameHeader::decode(&bytes, 40).is_ok());
+        for other in [0, 1, 39, 41, u64::MAX] {
+            assert_eq!(
+                FrameHeader::decode(&bytes, other),
+                Err(HeaderDefect::BadChecksum),
+                "a frame from file 40 must not validate in file {other}"
+            );
+        }
     }
 
     #[test]
@@ -425,7 +472,7 @@ mod tests {
         let mut bytes = header_bytes(&frame);
         bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
-            FrameHeader::decode(&resealed(bytes)),
+            FrameHeader::decode(&resealed(bytes), SALT),
             Err(HeaderDefect::Invalid(_))
         ));
         Ok(())
@@ -439,14 +486,14 @@ mod tests {
         let mut version = base;
         version[14] = 2;
         assert_eq!(
-            FrameHeader::decode(&resealed(version)),
+            FrameHeader::decode(&resealed(version), SALT),
             Err(HeaderDefect::UnsupportedVersion(2))
         );
 
         let mut kind = base;
         kind[12] = 9;
         assert!(matches!(
-            FrameHeader::decode(&resealed(kind)),
+            FrameHeader::decode(&resealed(kind), SALT),
             Err(HeaderDefect::Invalid(_))
         ));
 
@@ -454,7 +501,7 @@ mod tests {
             let mut flagged = base;
             flagged[13] = flags;
             assert!(matches!(
-                FrameHeader::decode(&resealed(flagged)),
+                FrameHeader::decode(&resealed(flagged), SALT),
                 Err(HeaderDefect::Invalid(_))
             ));
         }

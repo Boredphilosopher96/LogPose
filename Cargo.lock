@@ -1471,6 +1471,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "twox-hash",
  "uuid",
 ]
@@ -1519,7 +1520,6 @@ name = "logpose-wal"
 version = "0.1.0"
 dependencies = [
  "crc32c",
- "crc32fast",
  "logpose-types",
  "logpose-vfs",
  "postcard",

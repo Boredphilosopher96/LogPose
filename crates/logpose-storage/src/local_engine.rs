@@ -1,9 +1,9 @@
 //! `LocalStorageEngine`: the `StorageEngine` implementation over an [`Engine`].
 //!
 //! Every trait method resolves its collection with a map lookup and runs its blocking work on
-//! the engine's I/O pool (reads and writes) or maintenance job threads (flush and compaction),
-//! never on a tokio worker. Reads of the current state use the published `Version` and read no
-//! metadata files.
+//! the engine's I/O pool (reads) or maintenance job threads (flush and compaction), never on a
+//! tokio worker. Writes go to the collection's writer task, which does its own I/O on the I/O
+//! pool. Reads of the current state use the published `Version` and read no metadata files.
 
 use crate::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
@@ -12,6 +12,7 @@ use crate::{
     engine::{CoreRef, Engine, EngineConfig, EngineCore, not_found},
     error::{io_message, json_message},
     handle::CollectionHandle,
+    legacy_view::{legacy_ops, legacy_record},
     maintenance::MaintenanceOperation,
     manifest::{SegmentMeta, segment_artifact_file_name},
     metric::{storage_metric_compare, storage_metric_value},
@@ -123,6 +124,21 @@ impl LocalStorageEngine {
         self.engine
             .create_collection(descriptor, assignment)
             .map(|handle| handle.descriptor().clone())
+    }
+
+    /// [`LocalStorageEngine::create_collection_from_descriptor`] on the I/O pool, for async
+    /// callers.
+    pub async fn create_collection_from_descriptor_async(
+        &self,
+        descriptor: CollectionDescriptor,
+        assignment: Option<CollectionAssignment>,
+    ) -> Result<CollectionDescriptor> {
+        self.engine
+            .io(move |core| {
+                core.create_collection(descriptor, assignment.as_ref())
+                    .map(|handle| handle.descriptor().clone())
+            })
+            .await
     }
 
     /// Open a collection descriptor using an explicit database namespace.
@@ -279,8 +295,18 @@ impl StorageEngine for LocalStorageEngine {
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
         let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| core.write(handle, operations))
-            .await
+        if handle.take_maintenance_resume() {
+            let core = self.engine.core();
+            let resumed = Arc::clone(&handle);
+            // Resuming persists the maintenance status: blocking I/O, so not on this worker.
+            let _ = self
+                .engine
+                .runtime()
+                .io
+                .execute(move || core.resume_maintenance(&resumed));
+        }
+        let ops = legacy_ops(handle.descriptor(), operations)?;
+        handle.write(ops).await
     }
 
     async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
@@ -414,6 +440,20 @@ impl StorageEngine for LocalStorageEngine {
         let handle = self.handle(collection_name)?;
         self.data_io(handle, move |core, handle| core.inspect(handle, target))
             .await
+    }
+}
+
+impl CoreRef {
+    /// Commit v1 `operations` as one batch through the collection's writer. Blocking; for
+    /// threads outside any async runtime (tests, job threads).
+    #[cfg(test)]
+    pub(crate) fn write(
+        &self,
+        handle: &Arc<CollectionHandle>,
+        operations: Vec<WriteOperation>,
+    ) -> Result<CommitAck> {
+        let ops = legacy_ops(handle.descriptor(), operations)?;
+        handle.write_blocking(ops)
     }
 }
 
@@ -572,13 +612,20 @@ impl EngineCore {
                 target: "manifest".to_owned(),
                 payload: serde_json::to_value(&*version.manifest).map_err(json_message)?,
             }),
-            InspectTarget::Wal => Ok(InspectReport {
-                target: "wal".to_owned(),
-                payload: json!({
-                    "checkpoint_seq_no": version.checkpoint_seq_no,
-                    "records": version.delta,
-                }),
-            }),
+            InspectTarget::Wal => {
+                let mut records = Vec::with_capacity(version.delta.len());
+                for record in version.delta.iter() {
+                    records.extend(legacy_record(&version.schema, record)?);
+                }
+                Ok(InspectReport {
+                    target: "wal".to_owned(),
+                    payload: json!({
+                        "checkpoint_seq_no": version.checkpoint_seq_no,
+                        "schema_version": version.schema.schema_version(),
+                        "records": records,
+                    }),
+                })
+            }
             InspectTarget::Maintenance => Ok(InspectReport {
                 target: "maintenance".to_owned(),
                 payload: serde_json::to_value(self.maintenance_status(handle))

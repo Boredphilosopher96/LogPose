@@ -1,10 +1,10 @@
 //! Frame scanning: reading one frame, the sequence and group rules, and tail classification.
 
-use super::{
+use crate::codec::PayloadKind;
+use crate::{
     WalError,
     frame::{FRAME_ALIGN, FRAME_HEADER_LEN, FrameHeader, HeaderDefect, MAGIC_BYTES, crc32c},
 };
-use crate::codec::PayloadKind;
 use logpose_types::SeqNo;
 use logpose_vfs::VfsFile;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::path::Path;
 /// Why the bytes at an offset are not a complete, checksummed frame. Each of these is what a
 /// torn write can leave behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TornDefect {
+pub(crate) enum TornDefect {
     /// Fewer than 48 bytes remain.
     ShortHeader,
     /// The magic does not match.
@@ -34,7 +34,7 @@ pub(super) enum TornDefect {
 }
 
 impl TornDefect {
-    pub(super) fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             Self::ShortHeader => "short frame header",
             Self::BadMagic => "bad frame magic",
@@ -57,7 +57,7 @@ impl TornDefect {
 
 /// What is at an offset of a file.
 #[derive(Debug)]
-pub(super) enum Probe {
+pub(crate) enum Probe {
     /// The offset is the end of the file.
     End,
     /// A complete frame whose header and payload checksums match. Its payload is in the buffer
@@ -73,9 +73,10 @@ pub(super) enum Probe {
 /// only after the header checksum matched, `payload_len` is at most the frame limit, and the
 /// frame fits in the file. A header whose checksum matches but whose fields break the frame
 /// rules is an error, never a torn frame: a crash cannot produce it.
-pub(super) fn probe(
+pub(crate) fn probe(
     file: &dyn VfsFile,
     path: &Path,
+    salt: u64,
     offset: u64,
     len: u64,
     payload: &mut Vec<u8>,
@@ -89,7 +90,7 @@ pub(super) fn probe(
     let mut bytes = [0u8; FRAME_HEADER_LEN];
     file.read_exact_at(&mut bytes, offset)
         .map_err(|error| WalError::io("failed to read WAL frame header", path, error))?;
-    let header = match FrameHeader::decode(&bytes) {
+    let header = match FrameHeader::decode(&bytes, salt) {
         Ok(header) => header,
         Err(HeaderDefect::BadMagic) => return Ok(Probe::Torn(TornDefect::BadMagic)),
         Err(HeaderDefect::BadChecksum) => return Ok(Probe::Torn(TornDefect::BadHeaderChecksum)),
@@ -127,11 +128,11 @@ pub(super) fn probe(
 
 /// The sequence and group rules between consecutive checksummed frames, across files.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Continuity {
+pub(crate) struct Continuity {
     /// Last sequence number of the last data frame seen.
-    pub(super) last_data_seq: Option<SeqNo>,
+    pub(crate) last_data_seq: Option<SeqNo>,
     /// `(group_no, group_end)` of the last frame seen.
-    pub(super) last_frame: Option<(u32, bool)>,
+    pub(crate) last_frame: Option<(u32, bool)>,
     /// First sequence number in the current file's name.
     file_first_seq: SeqNo,
     /// Whether the current file had a data frame yet.
@@ -147,7 +148,7 @@ impl Continuity {
     /// ended and the previous file must end on a group boundary. A file followed by another one
     /// must hold a data frame: rotation never leaves one without, so an older file with none has
     /// lost the operations between its name and the next file's.
-    pub(super) fn start_file(&mut self, first_seq_no: SeqNo) -> Result<(), String> {
+    pub(crate) fn start_file(&mut self, first_seq_no: SeqNo) -> Result<(), String> {
         if let Some((group_no, false)) = self.last_frame {
             return Err(format!(
                 "the previous WAL file ends inside fsync group {group_no}"
@@ -174,7 +175,7 @@ impl Continuity {
     }
 
     /// Whether the current file has a data frame so far.
-    pub(super) fn file_has_data(&self) -> bool {
+    pub(crate) fn file_has_data(&self) -> bool {
         self.file_has_data
     }
 
@@ -183,7 +184,7 @@ impl Continuity {
     /// Every file starts with a checkpoint frame that is a group of its own, synced before
     /// anything else is appended. Tail repair relies on this: damage at offset 0 is then damage
     /// to a durable group, never part of a torn one.
-    pub(super) fn frame(&mut self, header: &FrameHeader) -> Result<(), String> {
+    pub(crate) fn frame(&mut self, header: &FrameHeader) -> Result<(), String> {
         if !self.file_has_frame && (header.kind != PayloadKind::Checkpoint || !header.group_end) {
             return Err(format!(
                 "the first frame of a WAL file must be a checkpoint frame that ends its own group, got a {} frame{}",
@@ -236,14 +237,14 @@ impl Continuity {
 
 /// The result of scanning the highest-named file for tail repair.
 #[derive(Debug)]
-pub(super) struct TailScan {
+pub(crate) struct TailScan {
     /// End offset of the last complete group: everything after it is discarded.
-    pub(super) committed_end: u64,
+    pub(crate) committed_end: u64,
     /// Checksummed frames after `committed_end` that are discarded with it: the frames of an
     /// incomplete last group, and frames of the damaged group found past the damage.
-    pub(super) discarded: Vec<FrameHeader>,
+    pub(crate) discarded: Vec<FrameHeader>,
     /// The first damaged frame, if the scan stopped before the end of the file.
-    pub(super) damage: Option<(u64, TornDefect)>,
+    pub(crate) damage: Option<(u64, TornDefect)>,
 }
 
 /// Scan the highest-named WAL file and classify its tail.
@@ -256,7 +257,7 @@ pub(super) struct TailScan {
 /// `GROUP_END`. When the damaged frame is the file's first frame, its checkpoint group, any
 /// later checksummed frame at all is corruption. Anything else means a later group was durably
 /// written after the damage, so it is corruption and the caller must not truncate.
-pub(super) fn scan_tail(
+pub(crate) fn scan_tail(
     file: &dyn VfsFile,
     path: &Path,
     first_seq_no: SeqNo,
@@ -271,7 +272,7 @@ pub(super) fn scan_tail(
     let mut committed_end = 0;
     let mut open_group = Vec::new();
     let damage = loop {
-        match probe(file, path, offset, len, &mut payload)? {
+        match probe(file, path, first_seq_no, offset, len, &mut payload)? {
             Probe::End => break None,
             Probe::Torn(defect) => break Some((offset, defect)),
             Probe::Frame(header) => {
@@ -307,7 +308,7 @@ pub(super) fn scan_tail(
         // The first frame that breaks the rule ends the search, so a damaged frame early in a
         // large file costs one pass, not one per frame.
         let mut seen_group_end = false;
-        find_frames_after(file, path, search_from, len, |at, header| {
+        find_frames_after(file, path, first_seq_no, search_from, len, |at, header| {
             if Some(header.group_no) != damaged_group || seen_group_end {
                 return Err(WalError::corrupt(
                     path,
@@ -342,6 +343,7 @@ pub(super) fn scan_tail(
 fn find_frames_after(
     file: &dyn VfsFile,
     path: &Path,
+    salt: u64,
     from: u64,
     len: u64,
     mut visit: impl FnMut(u64, FrameHeader) -> Result<(), WalError>,
@@ -361,7 +363,7 @@ fn find_frames_after(
         while index + MAGIC_BYTES.len() <= window.len() {
             if window[index..index + MAGIC_BYTES.len()] == MAGIC_BYTES {
                 let at = base + index as u64;
-                if let Probe::Frame(header) = probe(file, path, at, len, &mut payload)? {
+                if let Probe::Frame(header) = probe(file, path, salt, at, len, &mut payload)? {
                     visit(at, header)?;
                     let end = at + header.frame_len();
                     // Frames are 8-byte aligned and sized, so `end - base` stays aligned.
@@ -387,7 +389,7 @@ fn find_frames_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::WalFrame;
+    use crate::WalFrame;
     use logpose_vfs::{FaultVfs, OpenMode, Vfs};
     use std::{io::IoSlice, sync::Arc};
 
@@ -400,19 +402,19 @@ mod tests {
 
     #[test]
     fn probe_reports_each_torn_defect() -> Result<(), Box<dyn std::error::Error>> {
-        let frame = WalFrame::write_batch(1, 1, vec![7; 20])?.encode(0, 0, true);
+        let frame = WalFrame::write_batch(1, 1, vec![7; 20])?.encode(1, 0, 0, true);
         let path = Path::new("/f.wal");
         let mut payload = Vec::new();
 
         let file = file_with(&frame[..40])?;
         assert!(matches!(
-            probe(file.as_ref(), path, 0, 40, &mut payload)?,
+            probe(file.as_ref(), path, 1, 0, 40, &mut payload)?,
             Probe::Torn(TornDefect::ShortHeader)
         ));
 
         let file = file_with(&frame[..60])?;
         assert!(matches!(
-            probe(file.as_ref(), path, 0, 60, &mut payload)?,
+            probe(file.as_ref(), path, 1, 0, 60, &mut payload)?,
             Probe::Torn(TornDefect::PastEndOfFile { frame_len: 72 })
         ));
 
@@ -421,7 +423,7 @@ mod tests {
         let file = file_with(&damaged)?;
         let len = damaged.len() as u64;
         assert!(matches!(
-            probe(file.as_ref(), path, 0, len, &mut payload)?,
+            probe(file.as_ref(), path, 1, 0, len, &mut payload)?,
             Probe::Torn(TornDefect::BadPayloadChecksum { frame_len: 72 })
         ));
 
@@ -429,18 +431,18 @@ mod tests {
         damaged[20] ^= 1;
         let file = file_with(&damaged)?;
         assert!(matches!(
-            probe(file.as_ref(), path, 0, len, &mut payload)?,
+            probe(file.as_ref(), path, 1, 0, len, &mut payload)?,
             Probe::Torn(TornDefect::BadHeaderChecksum)
         ));
 
         let file = file_with(&frame)?;
         assert!(matches!(
-            probe(file.as_ref(), path, 0, len, &mut payload)?,
+            probe(file.as_ref(), path, 1, 0, len, &mut payload)?,
             Probe::Frame(_)
         ));
         assert_eq!(payload, vec![7; 20]);
         assert!(matches!(
-            probe(file.as_ref(), path, len, len, &mut payload)?,
+            probe(file.as_ref(), path, 1, len, len, &mut payload)?,
             Probe::End
         ));
         Ok(())
@@ -461,11 +463,11 @@ mod tests {
             payload_crc: 0,
             group_no: 0,
         }
-        .encode();
+        .encode(1);
         let file = file_with(&header)?;
         let mut payload = Vec::new();
         assert!(matches!(
-            probe(file.as_ref(), Path::new("/f.wal"), 0, 48, &mut payload)?,
+            probe(file.as_ref(), Path::new("/f.wal"), 1, 0, 48, &mut payload)?,
             Probe::Torn(TornDefect::PastEndOfFile { .. })
         ));
         assert_eq!(payload.capacity(), 0);
@@ -523,7 +525,7 @@ mod tests {
     /// form one group whose first frame's magic is destroyed (a torn group); otherwise every
     /// frame is its own group and the first one's magic is destroyed (mid-log damage).
     fn damaged_log(frames: u64, one_group: bool) -> Result<CountingFile, WalError> {
-        let mut bytes = WalFrame::checkpoint(0, Vec::new())?.encode(0, 0, true);
+        let mut bytes = WalFrame::checkpoint(0, Vec::new())?.encode(1, 0, 0, true);
         let damaged_at = bytes.len();
         for seq in 1..=frames {
             let (group_no, group_end) = if one_group {
@@ -532,7 +534,7 @@ mod tests {
                 (u32::try_from(seq).unwrap_or(u32::MAX), true)
             };
             bytes.extend(
-                WalFrame::write_batch(seq, seq, vec![7; 8])?.encode(0, group_no, group_end),
+                WalFrame::write_batch(seq, seq, vec![7; 8])?.encode(1, 0, group_no, group_end),
             );
         }
         bytes[damaged_at..damaged_at + 4].copy_from_slice(b"XXXX");

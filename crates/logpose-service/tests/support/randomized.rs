@@ -119,7 +119,14 @@ impl ExpectedModel {
     fn record_write(&mut self, operations: &[WriteOperation]) {
         for operation in operations {
             self.next_seq_no += 1;
-            self.history.push((self.next_seq_no, operation.clone()));
+            let mut operation = operation.clone();
+            // Storage keeps cosine vectors normalized to unit length, so the model does too.
+            if self.metric == Some(DistanceMetric::Cosine)
+                && let WriteOperation::Put(put) = &mut operation
+            {
+                normalize(&mut put.vector);
+            }
+            self.history.push((self.next_seq_no, operation));
         }
     }
 
@@ -1971,6 +1978,22 @@ fn scalar_matches_value(expected: &ScalarMetadataValue, actual: &Value) -> bool 
         (ScalarMetadataValue::Bool(expected), Value::Bool(actual)) => expected == actual,
         (ScalarMetadataValue::Null, Value::Null) => true,
         _ => false,
+    }
+}
+
+/// Scale a vector to unit length the way storage does: the norm in `f64`, each component
+/// divided in `f64` and rounded to `f32`.
+fn normalize(vector: &mut [f32]) {
+    let norm = vector
+        .iter()
+        .map(|component| f64::from(*component) * f64::from(*component))
+        .sum::<f64>()
+        .sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return;
+    }
+    for component in vector.iter_mut() {
+        *component = (f64::from(*component) / norm) as f32;
     }
 }
 

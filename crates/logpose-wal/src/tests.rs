@@ -117,7 +117,7 @@ fn fresh_directory_creates_the_first_file_durably() -> TestResult {
     let bytes = file_bytes(vfs.as_ref(), &dir().join(wal_file_name(1)))?;
     assert_eq!(
         bytes,
-        WalFrame::checkpoint(0, Vec::new())?.encode(0, 0, true)
+        WalFrame::checkpoint(0, Vec::new())?.encode(1, 0, 0, true)
     );
     Ok(())
 }
@@ -213,7 +213,7 @@ fn torn_partial_frame_at_the_tail_is_truncated_on_open() -> TestResult {
     let (writer, commits) = three_groups(vfs.process())?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    let torn = WalFrame::write_batch(5, 5, payload(5, 100))?.encode(0, 4, true);
+    let torn = WalFrame::write_batch(5, 5, payload(5, 100))?.encode(1, 0, 4, true);
     append_raw(vfs.as_ref(), &path, &torn[..70])?;
 
     let (frames, writer, report) = recover(vfs.process(), "boot-a", 0)?;
@@ -238,6 +238,32 @@ fn torn_partial_frame_at_the_tail_is_truncated_on_open() -> TestResult {
     Ok(())
 }
 
+/// Regression test for a spurious corruption error found in review: after a torn header, the tail
+/// search used to accept a checksummed frame embedded in the damaged frame's user data (here
+/// the raw bytes of a frame from another WAL file, group 5 with `GROUP_END`) as a durable later
+/// group, and fail the open. Frame checksums are salted with their file, so the embedded frame
+/// is just bytes and the torn group is repaired.
+#[test]
+fn a_frame_from_another_file_inside_user_data_does_not_block_tail_repair() -> TestResult {
+    let vfs = new_vfs(21);
+    let (writer, commits) = three_groups(vfs.process())?;
+    let path = writer.active_path().to_path_buf();
+    drop(writer);
+    let foreign = WalFrame::write_batch(9, 9, payload(9, 16))?.encode(4_000, 0, 5, true);
+    let mut user_data = vec![0x11; 8];
+    user_data.extend_from_slice(&foreign);
+    let mut torn = WalFrame::write_batch(5, 5, user_data)?.encode(1, 0, 4, true);
+    torn[6] ^= 0xFF; // the torn header: its checksum no longer matches
+    append_raw(vfs.as_ref(), &path, &torn)?;
+
+    let (frames, _, report) = recover(vfs.process(), "boot-a", 0)?;
+    assert_eq!(seqs(&frames), vec![1, 2, 3, 4]);
+    let repair = report.tail_repair.ok_or("expected a tail repair")?;
+    assert_eq!(repair.repaired_len, commits[2].end_offset);
+    assert_eq!(repair.discarded_frames, 0);
+    Ok(())
+}
+
 #[test]
 fn incomplete_last_group_is_discarded_as_a_unit() -> TestResult {
     let vfs = new_vfs(6);
@@ -245,8 +271,8 @@ fn incomplete_last_group_is_discarded_as_a_unit() -> TestResult {
     let path = writer.active_path().to_path_buf();
     drop(writer);
     // Two complete, checksummed frames of group 4 whose GROUP_END frame never made it.
-    let mut raw = WalFrame::write_batch(5, 5, payload(5, 9))?.encode(0, 4, false);
-    raw.extend(WalFrame::write_batch(6, 7, payload(6, 17))?.encode(0, 4, false));
+    let mut raw = WalFrame::write_batch(5, 5, payload(5, 9))?.encode(1, 0, 4, false);
+    raw.extend(WalFrame::write_batch(6, 7, payload(6, 17))?.encode(1, 0, 4, false));
     append_raw(vfs.as_ref(), &path, &raw)?;
 
     let (frames, writer, report) = recover(vfs.process(), "boot-a", 0)?;
@@ -436,7 +462,7 @@ fn a_file_that_does_not_start_with_a_checkpoint_group_is_corruption() -> TestRes
     append_raw(
         vfs.as_ref(),
         &path,
-        &WalFrame::write_batch(1, 1, payload(1, 8))?.encode(0, 0, true),
+        &WalFrame::write_batch(1, 1, payload(1, 8))?.encode(1, 0, 0, true),
     )?;
     let error = recover(vfs.process(), "boot-a", 0)
         .err()
@@ -492,7 +518,7 @@ fn checksummed_frames_that_break_the_sequence_are_corruption() -> TestResult {
     let path = writer.active_path().to_path_buf();
     drop(writer);
     // A complete, checksummed group with a sequence gap is never a torn write.
-    let gap = WalFrame::write_batch(9, 9, Vec::new())?.encode(0, 3, true);
+    let gap = WalFrame::write_batch(9, 9, Vec::new())?.encode(1, 0, 3, true);
     append_raw(vfs.as_ref(), &path, &gap)?;
     let error = recover(vfs.process(), "boot-a", 0)
         .err()
@@ -506,7 +532,7 @@ fn checksummed_frames_that_break_the_sequence_are_corruption() -> TestResult {
     let (writer, _) = three_groups(vfs.process())?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    let wrong_group = WalFrame::write_batch(5, 5, Vec::new())?.encode(0, 7, true);
+    let wrong_group = WalFrame::write_batch(5, 5, Vec::new())?.encode(1, 0, 7, true);
     append_raw(vfs.as_ref(), &path, &wrong_group)?;
     assert!(matches!(
         recover(vfs.process(), "boot-a", 0),
@@ -521,9 +547,9 @@ fn unsupported_format_version_is_a_typed_error() -> TestResult {
     let (writer, _) = three_groups(vfs.process())?;
     let path = writer.active_path().to_path_buf();
     drop(writer);
-    let mut header = WalFrame::write_batch(5, 5, Vec::new())?.encode(0, 3, true);
+    let mut header = WalFrame::write_batch(5, 5, Vec::new())?.encode(1, 0, 3, true);
     header[14] = 9;
-    let crc = frame::crc32c(&header[8..48]);
+    let crc = frame::header_crc(1, &header[8..48]);
     header[4..8].copy_from_slice(&crc.to_le_bytes());
     append_raw(vfs.as_ref(), &path, &header)?;
     assert!(matches!(
