@@ -10,7 +10,7 @@ use axum::{
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, MetadataFilter, Predicate, QueryRequest, ScalarMetadataValue};
+use logpose_query::{ExplainMode, FilterExpr, MetadataFilter, QueryRequest, ScalarMetadataValue};
 use logpose_service::ServiceError;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
@@ -445,7 +445,7 @@ struct QueryCollectionBody {
     #[serde(default)]
     filters: Map<String, Value>,
     #[serde(default)]
-    predicate: Option<Predicate>,
+    predicate: Option<FilterExpr>,
     #[serde(default)]
     explain: ExplainMode,
 }

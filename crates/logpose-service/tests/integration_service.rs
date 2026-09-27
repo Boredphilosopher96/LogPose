@@ -14,7 +14,7 @@ use logpose_catalog as _;
 use logpose_config as _;
 use logpose_core as _;
 use logpose_query::{
-    ExplainMode, MetadataFilter, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryPlanKind,
     QueryRequest, ScalarMetadataValue,
 };
 use logpose_service::{LogPoseDataService, ServiceError};
@@ -750,9 +750,9 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .await
         .expect("flush should succeed");
 
-    let predicate = Predicate::Comparison(PredicateComparison {
+    let predicate = FilterExpr::Comparison(FilterComparison {
         field: "kind".to_owned(),
-        operator: PredicateOperator::Eq,
+        operator: FilterOperator::Eq,
         value: Some(ScalarMetadataValue::String("keep".to_owned())),
     });
 
@@ -975,9 +975,9 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
         .await
         .expect("flush should succeed");
 
-    let predicate = Predicate::Comparison(PredicateComparison {
+    let predicate = FilterExpr::Comparison(FilterComparison {
         field: "kind".to_owned(),
-        operator: PredicateOperator::Eq,
+        operator: FilterOperator::Eq,
         value: Some(ScalarMetadataValue::String("keep".to_owned())),
     });
 

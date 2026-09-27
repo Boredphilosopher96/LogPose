@@ -1925,10 +1925,10 @@ fn proto_plan_kind(plan: QueryPlanKind) -> proto::QueryPlanKind {
     }
 }
 
-fn keep_only_predicate() -> logpose_query::Predicate {
-    logpose_query::Predicate::Comparison(logpose_query::PredicateComparison {
+fn keep_only_predicate() -> logpose_query::FilterExpr {
+    logpose_query::FilterExpr::Comparison(logpose_query::FilterComparison {
         field: "kind".to_owned(),
-        operator: logpose_query::PredicateOperator::Eq,
+        operator: logpose_query::FilterOperator::Eq,
         value: Some(ScalarMetadataValue::String("keep".to_owned())),
     })
 }

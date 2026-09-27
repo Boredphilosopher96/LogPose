@@ -4,7 +4,7 @@ use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_query::{
-    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryError, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryError, QueryRequest,
     query_exact,
 };
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
@@ -374,9 +374,9 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "details".to_owned(),
-                operator: PredicateOperator::Exists,
+                operator: FilterOperator::Exists,
                 value: None,
             })),
             explain: ExplainMode::Plan,

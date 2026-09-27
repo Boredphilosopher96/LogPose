@@ -4,7 +4,7 @@ use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_query::{
-    ExplainMode, Predicate, PredicateComparison, PredicateOperator, QueryPlanKind, QueryRequest,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
     ScalarMetadataValue, query_exact,
 };
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
@@ -145,9 +145,9 @@ async fn uses_cooperative_filtered_ann_for_selective_immutable_predicates() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
@@ -244,9 +244,9 @@ async fn hybrid_query_prefers_latest_mutable_version_over_stale_immutable_candid
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
@@ -332,9 +332,9 @@ async fn tiny_population_fallback_stays_correct_after_compaction_and_reopen() {
             snapshot: None,
             read_barrier: None,
             filters: Vec::new(),
-            predicate: Some(Predicate::Comparison(PredicateComparison {
+            predicate: Some(FilterExpr::Comparison(FilterComparison {
                 field: "kind".to_owned(),
-                operator: PredicateOperator::Eq,
+                operator: FilterOperator::Eq,
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Plan,
