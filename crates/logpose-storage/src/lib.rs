@@ -16,6 +16,7 @@
 //! - `recovery`, `wal_rotation`, `state`: recovering a collection's manifest and WAL delta.
 //! - `manifest`, `segment_v1`: the v1 manifest and segment file formats.
 //! - `segment_v2`: the v2 segment file format, builder, and reader (not yet wired in).
+//! - `cache`: the buffer cache of segment section bytes that segment v2 readers load through.
 //! - `flush`, `compaction`, `maintenance`: maintenance jobs and each collection's queue.
 //! - `resolve`, `stats`, `metric`: latest-visible resolution, statistics and scoring.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
@@ -25,6 +26,7 @@ use logpose_query as _;
 #[cfg(test)]
 use rand as _;
 
+pub mod cache;
 mod catalog;
 mod collections;
 mod compaction;

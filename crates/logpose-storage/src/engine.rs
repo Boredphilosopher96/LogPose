@@ -3,6 +3,7 @@
 
 use crate::{
     BlobStore,
+    cache::{BufferCache, CacheConfig},
     durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     error::io_message,
     handle::CollectionHandle,
@@ -35,6 +36,8 @@ pub(crate) const DROPPED_DIR_SUFFIX: &str = ".dropped";
 pub struct EngineConfig {
     /// Thread pool sizes.
     pub runtime: RuntimeConfig,
+    /// Buffer cache budget and class floors.
+    pub cache: CacheConfig,
     /// Remote blob store that flushed segments are marked for upload to, if any.
     pub blob_store: Option<Arc<dyn BlobStore>>,
 }
@@ -44,6 +47,7 @@ impl fmt::Debug for EngineConfig {
         formatter
             .debug_struct("EngineConfig")
             .field("runtime", &self.runtime)
+            .field("cache", &self.cache)
             .field("blob_store", &self.blob_store.is_some())
             .finish()
     }
@@ -84,6 +88,8 @@ pub(crate) struct EngineCore {
     /// Collection directories whose descriptor could not be read at open.
     unreadable: OnceLock<Vec<UnreadableCollection>>,
     runtime: Runtime,
+    /// The engine-wide buffer cache of segment units. Misses load on `runtime.io`.
+    cache: BufferCache,
     /// Threads that run legacy flush and compaction jobs, which interleave CPU and blocking
     /// I/O and so can run on neither the I/O pool nor a rayon pool.
     pub(crate) jobs: IoPool,
@@ -141,6 +147,7 @@ impl Engine {
             collections: RwLock::new(BTreeMap::new()),
             unreadable: OnceLock::new(),
             runtime,
+            cache: BufferCache::new(config.cache),
             jobs,
             tasks: Arc::new(TaskTracker::default()),
             shutdown: AtomicBool::new(false),
@@ -168,6 +175,13 @@ impl Engine {
     #[must_use]
     pub fn runtime(&self) -> &Runtime {
         &self.shared.core.runtime
+    }
+
+    /// The engine-wide buffer cache. Its misses run on [`Runtime::io`], which implements
+    /// [`LoadExecutor`](crate::cache::LoadExecutor).
+    #[must_use]
+    pub fn cache(&self) -> &BufferCache {
+        &self.shared.core.cache
     }
 
     /// Look up an open collection. A map lookup; never touches the filesystem.
@@ -252,6 +266,7 @@ impl fmt::Debug for Engine {
             .field("root", &self.shared.core.root)
             .field("collections", &self.shared.core.read_collections().len())
             .field("runtime", &self.shared.core.runtime)
+            .field("cache", &self.shared.core.cache)
             .finish()
     }
 }

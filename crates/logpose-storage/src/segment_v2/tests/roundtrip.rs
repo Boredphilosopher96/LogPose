@@ -38,7 +38,7 @@ fn build(schema: &Arc<CollectionSchema>, rows: &[(u64, RowImage)]) -> Vec<u8> {
 }
 
 /// Build a random segment for `seed`: rows plus opaque index sections.
-fn random_segment(
+pub(super) fn random_segment(
     seed: u64,
     max_rows: usize,
 ) -> (
