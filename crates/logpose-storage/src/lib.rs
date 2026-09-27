@@ -31,18 +31,19 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-    },
+    sync::{Arc, Mutex, OnceLock},
     thread,
 };
 use uuid::Uuid;
 
 mod durable_fs;
+mod error;
+mod fs_util;
 mod root_lock;
 
 use durable_fs::{create_dir_all_synced, sync_dir, sync_parent_dir, write_file_synced};
+use error::{io_message, json_message, string_message};
+use fs_util::{atomic_write, cleanup_dir, cleanup_file, read_json, remove_file_if_exists};
 use root_lock::StorageRootLock;
 
 /// Durable storage surface for future engine implementations.
@@ -1683,22 +1684,6 @@ fn ensure_active_wal_is_checkpointed(
     )))
 }
 
-fn cleanup_file(path: &Path) {
-    let _ = fs::remove_file(path);
-}
-
-fn cleanup_dir(path: &Path) {
-    let _ = fs::remove_dir_all(path);
-}
-
-fn remove_file_if_exists(path: &Path, context: &str) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_message(context, error)),
-    }
-}
-
 impl CatalogStore for LocalStorageEngine {
     fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
         let mut descriptor = descriptor;
@@ -2933,42 +2918,6 @@ fn approximate_record_bytes(operation: &WriteOperation) -> usize {
     }
 }
 
-fn read_json<T>(path: &Path) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let bytes = fs::read(path).map_err(|error| io_message("failed to read JSON file", error))?;
-    serde_json::from_slice(&bytes).map_err(json_message)
-}
-
-/// Durably replace `path` with `bytes`: write a temp file, fsync it, rename it into place, and
-/// fsync the parent directory so the rename survives power loss.
-fn atomic_write(path: &Path, bytes: Vec<u8>) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_dir_all_synced(parent)?;
-    }
-    static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temp_path = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_owned()),
-        std::process::id(),
-        ATOMIC_WRITE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed),
-    ));
-    if let Err(error) = write_file_synced(&temp_path, &bytes) {
-        cleanup_file(&temp_path);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temp_path, path) {
-        cleanup_file(&temp_path);
-        return Err(io_message("failed to atomically rename file", error));
-    }
-    sync_parent_dir(path)
-}
-
 fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> Result<&'a [u8]> {
     let end = start
         .checked_add(len)
@@ -2980,18 +2929,6 @@ fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> 
         )));
     }
     Ok(&bytes[start..end])
-}
-
-fn io_message(context: &str, error: std::io::Error) -> LogPoseError {
-    LogPoseError::Message(format!("{context}: {error}"))
-}
-
-fn string_message(error: String) -> LogPoseError {
-    LogPoseError::Message(error)
-}
-
-fn json_message(error: serde_json::Error) -> LogPoseError {
-    LogPoseError::Message(format!("failed to serialize or deserialize JSON: {error}"))
 }
 
 fn validate_principal_name(value: &str) -> Result<()> {
