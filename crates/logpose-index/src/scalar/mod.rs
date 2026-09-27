@@ -12,10 +12,10 @@
 //! - [`SortedIndex`]: immutable, distinct sorted keys plus the rows of each
 //!   key in one flat array. Best for ranges, prefixes, `ORDER BY ... LIMIT`
 //!   scans, zone maps, and histograms.
-//! - [`MutableInvertedIndex`] and [`MutableSortedIndex`]: memtable indexes
-//!   keyed by `BTreeMap<ScalarKey, RoaringBitmap>`, supporting insert and
-//!   remove, and frozen into the immutable forms on flush with a row-id
-//!   remapping.
+//! - [`MutableInvertedIndex`] (`BTreeMap<ScalarKey, RoaringBitmap>`) and
+//!   [`MutableSortedIndex`] (ordered `(key, row)` set): memtable indexes
+//!   supporting insert and remove, frozen into the immutable forms on flush
+//!   with a row-id remapping (memtable slot to segment row).
 //! - [`ScalarIndexBuilder`]: builds the immutable forms from `(row, key)`
 //!   pairs.
 //!
@@ -188,5 +188,53 @@ pub trait OrderedScalarIndex: ScalarIndex {
         allow: Option<&'a RoaringBitmap>,
     ) -> Box<dyn Iterator<Item = (ScalarKeyRef<'a>, u32)> + 'a> {
         self.scan_range(Bound::Unbounded, Bound::Unbounded, direction, allow)
+    }
+}
+
+/// Density, as rows per bitset bit, above which [`bitmap_from_rows`] fills a
+/// dense bitset instead of sorting.
+const DENSE_ROWS_PER_BIT: u64 = 64;
+
+/// Average bitmap size below which [`union_bitmaps`] gathers rows instead of
+/// merging bitmaps one by one.
+const SMALL_BITMAP_ROWS: u64 = 32;
+
+/// Build a bitmap from unsorted row ids, which may repeat.
+///
+/// Dense inputs fill a byte bitset and bulk-load it, which is linear; sparse
+/// inputs are sorted.
+pub(crate) fn bitmap_from_rows(rows: &[u32]) -> RoaringBitmap {
+    let Some(&max) = rows.iter().max() else {
+        return RoaringBitmap::new();
+    };
+    if rows.len() as u64 * DENSE_ROWS_PER_BIT >= u64::from(max) {
+        let mut bits = vec![0u8; max as usize / 8 + 1];
+        for &row in rows {
+            bits[row as usize / 8] |= 1 << (row % 8);
+        }
+        return RoaringBitmap::from_lsb0_bytes(0, &bits);
+    }
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    RoaringBitmap::from_sorted_iter(sorted).unwrap_or_default()
+}
+
+/// Union `bitmaps`, which hold `entries` rows in total across `count`
+/// bitmaps. Many tiny bitmaps (a high-cardinality key range) are gathered
+/// into one row list, because merging them one at a time is far slower.
+pub(crate) fn union_bitmaps<'a>(
+    bitmaps: impl Iterator<Item = &'a RoaringBitmap>,
+    count: u64,
+    entries: u64,
+) -> RoaringBitmap {
+    if entries < count.saturating_mul(SMALL_BITMAP_ROWS) {
+        let mut rows = Vec::with_capacity(usize::try_from(entries).unwrap_or(0));
+        for bitmap in bitmaps {
+            rows.extend(bitmap);
+        }
+        bitmap_from_rows(&rows)
+    } else {
+        bitmaps.union()
     }
 }

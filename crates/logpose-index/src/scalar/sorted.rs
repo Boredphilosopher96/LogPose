@@ -3,7 +3,7 @@
 
 use super::{
     Direction, KeyKind, OrderedScalarIndex, RoaringBitmap, ScalarError, ScalarIndex,
-    ScalarIndexStats, ScalarKey, ScalarKeyRef, key::KeyColumn,
+    ScalarIndexStats, ScalarKey, ScalarKeyRef, bitmap_from_rows, key::KeyColumn,
 };
 use std::ops::{Bound, Range};
 
@@ -80,7 +80,7 @@ impl SortedIndex {
             RoaringBitmap::from_sorted_iter(rows.iter().copied())
                 .map_err(|_| ScalarError::Corrupt("row run is not ascending"))?
         } else {
-            sorted_bitmap(rows.clone())
+            bitmap_from_rows(&rows)
         };
         if let Some(row) = (&present & &nulls).min() {
             return Err(ScalarError::NullConflict { row });
@@ -175,10 +175,10 @@ impl SortedIndex {
             outside.extend_from_slice(&self.rows[..positions.start]);
             outside.extend_from_slice(&self.rows[positions.end..]);
             let mut result = self.present.clone();
-            result -= sorted_bitmap(outside);
+            result -= bitmap_from_rows(&outside);
             return result;
         }
-        sorted_bitmap(self.rows[positions].to_vec())
+        bitmap_from_rows(&self.rows[positions])
     }
 
     /// Lazily yield `(key, row)` entries in key order, keeping only rows in
@@ -283,7 +283,7 @@ impl ScalarIndex for SortedIndex {
             // Zero or one run: already ascending and duplicate-free.
             return RoaringBitmap::from_sorted_iter(rows).unwrap_or_default();
         }
-        sorted_bitmap(rows)
+        bitmap_from_rows(&rows)
     }
 
     fn range(&self, lower: Bound<&ScalarKey>, upper: Bound<&ScalarKey>) -> RoaringBitmap {
@@ -396,11 +396,4 @@ impl<'a> Iterator for OrderedIter<'a> {
             Some(_) => (0, Some(remaining)),
         }
     }
-}
-
-/// Sort, deduplicate and bulk-load row ids.
-pub(crate) fn sorted_bitmap(mut rows: Vec<u32>) -> RoaringBitmap {
-    rows.sort_unstable();
-    rows.dedup();
-    RoaringBitmap::from_sorted_iter(rows).unwrap_or_default()
 }

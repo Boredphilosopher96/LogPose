@@ -2,7 +2,7 @@
 
 use super::{
     KeyKind, RoaringBitmap, ScalarError, ScalarIndex, ScalarIndexStats, ScalarKey, SortedIndex,
-    key::KeyColumn,
+    key::KeyColumn, union_bitmaps,
 };
 use roaring::MultiOps;
 use std::ops::{Bound, Range};
@@ -92,7 +92,7 @@ impl InvertedIndex {
         if total > u64::from(u32::MAX) {
             return Err(ScalarError::TooManyEntries);
         }
-        let present = bitmaps.iter().union();
+        let present = union_bitmaps(bitmaps.iter(), bitmaps.len() as u64, total);
         if let Some(row) = (&present & &nulls).min() {
             return Err(ScalarError::NullConflict { row });
         }
@@ -162,15 +162,19 @@ impl InvertedIndex {
         // With one key per row, a wide interval is cheaper as a complement.
         let total = self.total();
         if self.present.len() == total && entries * 2 > total {
-            let outside = self.bitmaps[..keys.start]
-                .iter()
-                .chain(&self.bitmaps[keys.end..])
-                .union();
+            let outside = union_bitmaps(
+                self.bitmaps[..keys.start]
+                    .iter()
+                    .chain(&self.bitmaps[keys.end..]),
+                (self.bitmaps.len() - keys.len()) as u64,
+                total - entries,
+            );
             let mut result = self.present.clone();
             result -= outside;
             return result;
         }
-        self.bitmaps[keys].iter().union()
+        let count = keys.len() as u64;
+        union_bitmaps(self.bitmaps[keys].iter(), count, entries)
     }
 }
 
