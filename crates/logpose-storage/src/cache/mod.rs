@@ -588,21 +588,29 @@ impl Inner {
     /// The lowest-priority class whose usage exceeds its floor; if none,
     /// the lowest-priority non-empty class. Classes already swept without
     /// result are skipped.
+    ///
+    /// The fallback applies only when no class exceeds its floor (floors
+    /// that add up to more than the budget). When the classes over their
+    /// floors are all pinned, the pass ends overcommitted instead: evicting
+    /// a class below its floor would let pressure from a higher class take
+    /// the share the floor reserves.
     fn victim_class(
         &self,
         budget: u64,
         exhausted: &[bool; ArtifactClass::COUNT],
     ) -> Option<ArtifactClass> {
-        let candidates = || {
-            ArtifactClass::ALL
-                .into_iter()
-                .rev()
-                .filter(|class| !exhausted[class.index()])
-        };
         let used = |class: ArtifactClass| self.used[class.index()].load(Ordering::Relaxed);
-        candidates()
-            .find(|class| used(*class) > self.floor_bytes(*class, budget))
-            .or_else(|| candidates().find(|class| used(*class) > 0))
+        let over_floor = |class: &ArtifactClass| used(*class) > self.floor_bytes(*class, budget);
+        let lowest_first = || ArtifactClass::ALL.into_iter().rev();
+        if lowest_first().any(|class| over_floor(&class)) {
+            lowest_first()
+                .filter(|class| !exhausted[class.index()])
+                .find(over_floor)
+        } else {
+            lowest_first()
+                .filter(|class| !exhausted[class.index()])
+                .find(|class| used(*class) > 0)
+        }
     }
 
     /// Advance `class`'s CLOCK hand until one entry is evicted. Returns

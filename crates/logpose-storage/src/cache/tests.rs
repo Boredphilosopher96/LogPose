@@ -991,3 +991,66 @@ fn invalidating_a_file_releases_its_clock_slots() {
     assert_eq!(cache.used(), charge_for(UNIT));
     hit(&cache, key(kept, 0), ArtifactClass::PkIndex);
 }
+
+#[test]
+fn pinned_higher_classes_do_not_evict_a_class_below_its_floor() {
+    // Dynamic JSON keeps 4 of 16 units; it holds 3.
+    let mut floors = [0.0; ArtifactClass::COUNT];
+    floors[ArtifactClass::DynamicJson.index()] = 0.25;
+    let cache = BufferCache::new(CacheConfig {
+        budget: budget_for(16),
+        floors,
+    });
+    let file = FileId::next();
+    for section in 0..3 {
+        insert(&cache, key(file, section), ArtifactClass::DynamicJson);
+    }
+    // Twenty pinned graph units overflow the budget with nothing of theirs
+    // evictable.
+    let pins: Vec<_> = (100..120)
+        .map(|section| {
+            cache
+                .get_or_load_blocking(
+                    key(file, section),
+                    ArtifactClass::GraphAndCodes,
+                    CacheMode::Normal,
+                    || Ok(bytes(UNIT, 2)),
+                )
+                .expect("loads")
+                .0
+        })
+        .collect();
+    let stats = cache.stats();
+    assert_eq!(
+        stats.used_by(ArtifactClass::DynamicJson),
+        budget_for(3),
+        "the floor holds"
+    );
+    assert!(stats.overcommits > 0);
+    assert_eq!(stats.overcommit_bytes, budget_for(7));
+    // Released pins make the graph units evictable again.
+    drop(pins);
+    cache.trim();
+    let stats = cache.stats();
+    assert!(stats.used_total() <= cache.budget());
+    assert_eq!(stats.used_by(ArtifactClass::DynamicJson), budget_for(3));
+}
+
+#[test]
+fn floors_that_exceed_the_budget_still_evict() {
+    // Every class claims the whole budget, so none is ever over its floor
+    // and the lowest-priority non-empty class gives way.
+    let cache = BufferCache::new(CacheConfig {
+        budget: budget_for(4),
+        floors: [1.0; ArtifactClass::COUNT],
+    });
+    let file = FileId::next();
+    for section in 0..4 {
+        insert(&cache, key(file, section), ArtifactClass::GraphAndCodes);
+    }
+    for section in 10..12 {
+        insert(&cache, key(file, section), ArtifactClass::DynamicJson);
+    }
+    assert!(cache.used() <= cache.budget());
+    assert_eq!(cache.stats().overcommits, 0);
+}
