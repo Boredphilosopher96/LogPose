@@ -45,8 +45,8 @@ pub(crate) fn encode(values: &VarBuf) -> Result<Vec<u8>, super::SegmentError> {
     let blocks_start = padded(HEADER_LEN + usize_from(block_count) * INDEX_ENTRY_LEN, 8);
     for block in 0..block_count {
         pad_to(&mut blocks, 8);
-        let start = usize_from(block * DYNAMIC_BLOCK_ROWS);
-        let end = usize_from(row_count.min((block + 1) * DYNAMIC_BLOCK_ROWS));
+        let rows = block_row_range(block, row_count);
+        let (start, end) = (usize_from(rows.start), usize_from(rows.end));
         let block_start = blocks.len();
         let mut used = 0_usize;
         put_u32(&mut blocks, 0);
@@ -73,6 +73,14 @@ pub(crate) fn encode(values: &VarBuf) -> Result<Vec<u8>, super::SegmentError> {
     pad_to(&mut out, 8);
     out.extend_from_slice(&blocks);
     Ok(out)
+}
+
+/// Rows of `block` in a section of `row_count` rows. The end is computed
+/// without `u32` overflow: the last block of a segment near `u32::MAX` rows
+/// starts at `u32::MAX - 4095`.
+fn block_row_range(block: u32, row_count: u32) -> Range<u32> {
+    let start = block.saturating_mul(DYNAMIC_BLOCK_ROWS).min(row_count);
+    start..start + (row_count - start).min(DYNAMIC_BLOCK_ROWS)
 }
 
 /// Where one block lives inside the section.
@@ -205,8 +213,7 @@ impl DynamicIndex {
         if usize_from(block) >= self.blocks.len() {
             return None;
         }
-        let start = block * DYNAMIC_BLOCK_ROWS;
-        Some(start..self.row_count.min(start + DYNAMIC_BLOCK_ROWS))
+        Some(block_row_range(block, self.row_count))
     }
 
     /// Offset where the block area starts (after the index and padding).
@@ -271,5 +278,20 @@ pub(crate) fn decode_object(bytes: &[u8]) -> DecodeResult<Map<String, JsonValue>
         Ok(JsonValue::Object(map)) => Ok(map),
         Ok(_) => Err(Malformed::new("dynamic value is not a JSON object")),
         Err(error) => Err(Malformed::new(format!("dynamic value: {error}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DYNAMIC_BLOCK_ROWS, block_row_range};
+
+    #[test]
+    fn block_rows_do_not_overflow_at_the_largest_segment() {
+        let rows = u32::MAX - 1;
+        let last = rows.div_ceil(DYNAMIC_BLOCK_ROWS) - 1;
+        assert_eq!(block_row_range(last, rows), 4_294_963_200..rows);
+        assert_eq!(block_row_range(0, 10), 0..10);
+        assert_eq!(block_row_range(1, 8192), 4096..8192);
+        assert_eq!(block_row_range(2, 8193), 8192..8193);
     }
 }
