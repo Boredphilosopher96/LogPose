@@ -3,6 +3,7 @@
 
 use crate::{
     BlobStore,
+    cache::{BufferCache, CacheConfig},
     durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     error::io_message,
     handle::CollectionHandle,
@@ -40,6 +41,8 @@ pub type FatalHandler = Arc<dyn Fn(&LogPoseError) + Send + Sync>;
 pub struct EngineConfig {
     /// Thread pool sizes.
     pub runtime: RuntimeConfig,
+    /// Buffer cache budget and class floors.
+    pub cache: CacheConfig,
     /// Remote blob store that flushed segments are marked for upload to, if any.
     pub blob_store: Option<Arc<dyn BlobStore>>,
     /// Group commit settings of every collection's writer.
@@ -57,6 +60,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             runtime: RuntimeConfig::default(),
+            cache: CacheConfig::default(),
             blob_store: None,
             group: GroupCommitConfig::default(),
             wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
@@ -71,6 +75,7 @@ impl fmt::Debug for EngineConfig {
         formatter
             .debug_struct("EngineConfig")
             .field("runtime", &self.runtime)
+            .field("cache", &self.cache)
             .field("blob_store", &self.blob_store.is_some())
             .field("group", &self.group)
             .field("wal_file_bytes", &self.wal_file_bytes)
@@ -133,6 +138,8 @@ pub(crate) struct EngineCore {
     /// Collection directories whose descriptor could not be read at open.
     unreadable: OnceLock<Vec<UnreadableCollection>>,
     runtime: Runtime,
+    /// The engine-wide buffer cache of segment units. Misses load on `runtime.io`.
+    cache: BufferCache,
     /// Handle to the runtime the writer tasks run on (owned by [`EngineShared`]).
     writer_runtime: tokio::runtime::Handle,
     /// Group commit settings of every writer.
@@ -206,6 +213,7 @@ impl Engine {
             collections: RwLock::new(BTreeMap::new()),
             unreadable: OnceLock::new(),
             runtime,
+            cache: BufferCache::new(config.cache),
             writer_runtime: writers.handle().clone(),
             group_commit: config.group,
             wal_file_bytes: config.wal_file_bytes,
@@ -242,6 +250,13 @@ impl Engine {
     #[must_use]
     pub fn runtime(&self) -> &Runtime {
         &self.shared.core.runtime
+    }
+
+    /// The engine-wide buffer cache. Its misses run on [`Runtime::io`], which implements
+    /// [`LoadExecutor`](crate::cache::LoadExecutor).
+    #[must_use]
+    pub fn cache(&self) -> &BufferCache {
+        &self.shared.core.cache
     }
 
     /// Look up an open collection. A map lookup; never touches the filesystem.
@@ -326,6 +341,7 @@ impl fmt::Debug for Engine {
             .field("root", &self.shared.core.root)
             .field("collections", &self.shared.core.read_collections().len())
             .field("runtime", &self.shared.core.runtime)
+            .field("cache", &self.shared.core.cache)
             .finish()
     }
 }

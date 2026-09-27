@@ -147,10 +147,15 @@ impl DynamicIndex {
         if crc_append(crc(&bytes[..INDEX_CRC_AT]), &bytes[HEADER_LEN..]) != stored {
             return Err(IndexError::Checksum);
         }
-        Self::parse(bytes, row_count, section_len).map_err(IndexError::Malformed)
+        Self::decode_verified(bytes, row_count, section_len).map_err(IndexError::Malformed)
     }
 
-    fn parse(bytes: &[u8], row_count: u32, section_len: u64) -> DecodeResult<Self> {
+    /// Decode a header and index whose CRC was already checked (a cached unit).
+    pub(crate) fn decode_verified(
+        bytes: &[u8],
+        row_count: u32,
+        section_len: u64,
+    ) -> DecodeResult<Self> {
         let mut cursor = Cursor::new(bytes);
         let stored_rows = cursor.u32()?;
         let block_rows = cursor.u32()?;
