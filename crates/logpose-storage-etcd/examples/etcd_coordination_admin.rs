@@ -9,6 +9,7 @@ use logpose_catalog as _;
 use logpose_storage as _;
 use logpose_storage_etcd::{EtcdCoordinationClient, PromotionResult};
 use logpose_types::{CollectionRef, EtcdMetadataConfig};
+use protoc_bin_vendored as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{process::ExitCode, time::Duration};

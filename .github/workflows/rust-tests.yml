@@ -9,6 +9,9 @@ on:
 jobs:
   rust-tests:
     runs-on: ubuntu-latest
+    env:
+      # Enables the etcd integration tests; they fail if etcd is unreachable.
+      LOGPOSE_TEST_ETCD_ENDPOINTS: http://127.0.0.1:2379
     services:
       etcd:
         image: quay.io/coreos/etcd:v3.5.18
@@ -27,9 +30,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -41,12 +41,12 @@ jobs:
       - name: Wait for etcd readiness
         run: |
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:2379/health >/dev/null; then
+            if curl -fsS "${LOGPOSE_TEST_ETCD_ENDPOINTS}/health" >/dev/null; then
               exit 0
             fi
             sleep 1
           done
-          echo "etcd did not become ready at http://127.0.0.1:2379" >&2
+          echo "etcd did not become ready at ${LOGPOSE_TEST_ETCD_ENDPOINTS}" >&2
           exit 1
 
       - name: Run workspace tests
