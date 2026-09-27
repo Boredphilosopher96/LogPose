@@ -167,6 +167,11 @@ const HNSW_VERSION: u16 = 2;
 /// Upper bound on node levels. With `M >= 2`, a level this high has probability at most
 /// `2^-16` per node, and clamping the rare outlier only costs it a little extra reach.
 const MAX_HNSW_LEVEL: u8 = 16;
+/// Fewest bytes one encoded node can occupy besides its vector components: level, entry
+/// offset, sequence number, the record id, vector, and metadata length prefixes, one byte of
+/// metadata JSON, the neighbor list count, and the layer 0 neighbor count. Bounds preallocation
+/// when a length field is corrupt.
+const MIN_ENCODED_HNSW_NODE_BYTES: usize = 1 + 4 + 8 + 4 + 4 + 4 + 1 + 4 + 4;
 
 /// Deterministic build parameters for the persisted HNSW sidecar.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,7 +539,10 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
     let max_level = read_u8(&bytes, &mut cursor)?;
     let entry_point = read_optional_u32(&bytes, &mut cursor)?;
     let node_count = read_u32(&bytes, &mut cursor)? as usize;
-    let mut nodes = Vec::with_capacity(node_count.min(bytes.len()));
+    // Size buffers from the bytes left rather than the claimed counts, so a corrupt count
+    // fails on the truncated read instead of reserving memory far beyond the file size.
+    let min_node_bytes = MIN_ENCODED_HNSW_NODE_BYTES.saturating_add(dimensions.saturating_mul(4));
+    let mut nodes = Vec::with_capacity(node_count.min(remaining(&bytes, cursor) / min_node_bytes));
     for _ in 0..node_count {
         let level = read_u8(&bytes, &mut cursor)?;
         let entry_offset_index = read_u32(&bytes, &mut cursor)? as usize;
@@ -555,10 +563,12 @@ pub fn read_hnsw_index(path: &Path) -> io::Result<HnswIndexSidecar> {
             ));
         }
         let level_count = read_u32(&bytes, &mut cursor)? as usize;
-        let mut neighbors_by_level = Vec::with_capacity(level_count.min(bytes.len()));
+        let mut neighbors_by_level =
+            Vec::with_capacity(level_count.min(usize::from(MAX_HNSW_LEVEL) + 1));
         for _ in 0..level_count {
             let neighbor_count = read_u32(&bytes, &mut cursor)? as usize;
-            let mut neighbors = Vec::with_capacity(neighbor_count.min(bytes.len()));
+            let mut neighbors =
+                Vec::with_capacity(neighbor_count.min(remaining(&bytes, cursor) / 4));
             for _ in 0..neighbor_count {
                 neighbors.push(read_u32(&bytes, &mut cursor)?);
             }
@@ -1190,7 +1200,7 @@ fn read_string(bytes: &[u8], cursor: &mut usize) -> io::Result<String> {
 
 fn read_f32_slice(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<f32>> {
     let len = read_u32(bytes, cursor)? as usize;
-    let mut values = Vec::with_capacity(len.min(bytes.len()));
+    let mut values = Vec::with_capacity(len.min(remaining(bytes, *cursor) / 4));
     for _ in 0..len {
         values.push(f32::from_le_bytes(
             read_bytes(bytes, cursor, 4)?
@@ -1199,6 +1209,10 @@ fn read_f32_slice(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<f32>> {
         ));
     }
     Ok(values)
+}
+
+fn remaining(bytes: &[u8], cursor: usize) -> usize {
+    bytes.len().saturating_sub(cursor)
 }
 
 fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize, len: usize) -> io::Result<&'a [u8]> {
@@ -1539,6 +1553,42 @@ mod tests {
 
         let error = read_hnsw_index(&path).expect_err("truncated payload should fail");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_hnsw_index_rejects_corrupt_counts_as_truncated() {
+        let path = temp_file_path("hnsw-corrupt-counts.bin");
+        let index = build_hnsw_index(
+            "s",
+            DistanceMetric::L2,
+            HnswBuildParams::default(),
+            &[HnswIndexEntrySource {
+                entry_offset_index: 0,
+                record_id: RecordId::new("alpha"),
+                seq_no: 1,
+                vector: vec![1.0, 0.0],
+                metadata: json!(null),
+            }],
+        )
+        .expect("index should build");
+        write_hnsw_index(&path, &index).expect("index should write");
+        let pristine = fs::read(&path).expect("sidecar should read");
+        // Magic, version, segment id "s", kind, metric, dimensions, three params, max level,
+        // and the present entry point come before the node count.
+        let node_count_at = 4 + 2 + (4 + 1) + 1 + 1 + 4 + 3 * 4 + 1 + (1 + 4);
+        // The node's level, entry offset, sequence number, id "alpha", and vector length.
+        let vector_len_at = node_count_at + 4 + 1 + 4 + 8 + (4 + 5);
+        for at in [node_count_at, vector_len_at] {
+            let mut corrupt = pristine.clone();
+            corrupt[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            fs::write(&path, &corrupt).expect("corrupt sidecar should write");
+            // Preallocation is bounded by the bytes left, so this fails on the short read
+            // instead of reserving memory for four billion entries.
+            let error = read_hnsw_index(&path).expect_err("corrupt count should fail");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "offset {at}");
+        }
 
         let _ = fs::remove_file(path);
     }
