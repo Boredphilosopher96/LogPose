@@ -1,0 +1,103 @@
+//! On-disk layout: where the local engine keeps each root, descriptor, WAL, manifest and index file.
+
+use crate::LocalStorageEngine;
+use logpose_catalog::CollectionDescriptor;
+use logpose_types::SeqNo;
+use logpose_wal::ACTIVE_WAL_FILE_NAME;
+use std::path::PathBuf;
+
+impl LocalStorageEngine {
+    pub(crate) fn collections_root(&self) -> PathBuf {
+        self.root.join("collections")
+    }
+
+    pub(crate) fn databases_root(&self) -> PathBuf {
+        self.root.join("databases")
+    }
+
+    pub(crate) fn database_descriptor_path(&self, database_name: &str) -> PathBuf {
+        self.databases_root()
+            .join(database_name)
+            .join("descriptor.json")
+    }
+
+    pub(crate) fn database_policy_path(&self, database_name: &str) -> PathBuf {
+        self.databases_root()
+            .join(database_name)
+            .join("policy.json")
+    }
+
+    pub(crate) fn principals_root(&self) -> PathBuf {
+        self.root.join("principals")
+    }
+
+    pub(crate) fn principal_descriptor_path(&self, principal_name: &str) -> PathBuf {
+        self.principals_root()
+            .join(principal_name)
+            .join("descriptor.json")
+    }
+
+    pub(crate) fn active_wal_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("wal").join(ACTIVE_WAL_FILE_NAME)
+    }
+
+    pub(crate) fn rolled_wal_path(
+        descriptor: &CollectionDescriptor,
+        checkpoint_seq_no: SeqNo,
+    ) -> PathBuf {
+        descriptor
+            .root_path
+            .join("wal")
+            .join(format!("{checkpoint_seq_no:020}.wal"))
+    }
+
+    pub(crate) fn flat_index_file_path(
+        descriptor: &CollectionDescriptor,
+        segment_id: &str,
+    ) -> PathBuf {
+        descriptor
+            .root_path
+            .join("indexes")
+            .join(format!("{segment_id}.flat.json"))
+    }
+
+    pub(crate) fn hnsw_index_file_path(
+        descriptor: &CollectionDescriptor,
+        segment_id: &str,
+    ) -> PathBuf {
+        descriptor
+            .root_path
+            .join("indexes")
+            .join(format!("{segment_id}.hnsw.bin"))
+    }
+
+    pub(crate) fn manifest_file_path(
+        descriptor: &CollectionDescriptor,
+        generation: u64,
+    ) -> PathBuf {
+        descriptor
+            .root_path
+            .join("manifests")
+            .join(format!("{generation:020}.json"))
+    }
+
+    pub(crate) fn maintenance_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("maintenance.json")
+    }
+
+    pub(crate) fn placement_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("placement.json")
+    }
+
+    pub(crate) fn current_manifest_pointer(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("CURRENT")
+    }
+
+    pub(crate) fn pending_rotation_file_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("wal").join("PENDING_ROTATION")
+    }
+
+    pub(crate) fn descriptor_path(descriptor: &CollectionDescriptor) -> PathBuf {
+        descriptor.root_path.join("descriptor.json")
+    }
+}
