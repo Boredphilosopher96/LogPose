@@ -5,6 +5,7 @@ members = [
     "crates/logpose-api-grpc",
     "crates/logpose-api-rest",
     "crates/logpose-auth",
+    "crates/logpose-bench",
     "crates/logpose-catalog",
     "crates/logpose-client",
     "crates/logpose-config",

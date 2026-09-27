@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-LogPose is a Rust workspace. Application entrypoints live in `apps/logpose-server` and `apps/logpose-cli`. Shared libraries live under `crates/` by domain, such as `logpose-storage`, `logpose-index`, and `logpose-api-rest`. The root `Cargo.toml` is a virtual manifest, so there is no root `tests/` or `benches/` directory: integration tests live in each crate's or app's `tests/` directory, and benchmarks live in each crate's `benches/` directory, such as `crates/logpose-query/benches/`. API contracts are in `proto/` and `openapi/`. Contributor docs for mdBook live in `docs/src/`.
+LogPose is a Rust workspace. Application entrypoints live in `apps/logpose-server` and `apps/logpose-cli`. Shared libraries live under `crates/` by domain, such as `logpose-storage`, `logpose-index`, and `logpose-api-rest`. The root `Cargo.toml` is a virtual manifest, so there is no root `tests/` directory and no root bench targets: integration tests live in each crate's or app's `tests/` directory, and criterion benchmarks live in each crate's `benches/` directory, such as `crates/logpose-query/benches/`. The workload harness is the `crates/logpose-bench` binary, and its committed baseline reports live in the root `benches/baselines/` data directory. API contracts are in `proto/` and `openapi/`. Contributor docs for mdBook live in `docs/src/`.
 
 ## Build, Test, and Development Commands
 
