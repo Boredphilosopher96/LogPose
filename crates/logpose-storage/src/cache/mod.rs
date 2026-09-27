@@ -425,7 +425,12 @@ impl BufferCache {
         removed
     }
 
-    /// Warm the cache: see [`warm`](mod@warm).
+    /// Warm the cache after open: load `items` class by class, highest
+    /// priority first, with at most [`WARM_UP_IN_FLIGHT`] loads on
+    /// `executor` at once. A class stops at the first item that would take
+    /// the cache past [`WARM_UP_FILL`] of its budget (counting loads in
+    /// flight); the next class gets what room is left. Resident items are
+    /// skipped and failures are counted, never fatal.
     pub async fn warm_up(
         &self,
         items: Vec<WarmUpItem>,
