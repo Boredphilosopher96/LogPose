@@ -231,19 +231,23 @@ impl Harness {
         }
     }
 
-    fn restart(&mut self) {
-        *self = Self::new(self.config.clone());
+    fn restart(self) -> Self {
+        let config = self.config.clone();
+        // One engine owns a storage root at a time: the old node shuts down before the new one
+        // opens the root.
+        drop(self);
+        Self::new(config)
     }
 
-    fn restart_with_role(&mut self, node_role: NodeRole) {
+    fn restart_with_role(mut self, node_role: NodeRole) -> Self {
         self.config.node_role = node_role;
-        self.restart();
+        self.restart()
     }
 
-    fn restart_with_identity(&mut self, node_name: &str, node_role: NodeRole) {
+    fn restart_with_identity(mut self, node_name: &str, node_role: NodeRole) -> Self {
         self.config.node_name = node_name.to_owned();
         self.config.node_role = node_role;
-        self.restart();
+        self.restart()
     }
 }
 
@@ -325,13 +329,13 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
                     "trace: {trace:?}, error: {error}"
                 );
             }
-            Step::Restart => harness.restart(),
+            Step::Restart => harness = harness.restart(),
             Step::RestartAs(node_role) => {
-                harness.restart_with_role(node_role);
+                harness = harness.restart_with_role(node_role);
                 model.set_role(node_role);
             }
             Step::RestartAsNamed(node_name, node_role) => {
-                harness.restart_with_identity(node_name, node_role);
+                harness = harness.restart_with_identity(node_name, node_role);
                 model.set_identity(node_name, node_role);
             }
         }
