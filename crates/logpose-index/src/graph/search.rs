@@ -363,7 +363,9 @@ where
                     // are still short. The matching subgraph is locally
                     // disconnected, so keep the bridges as navigation-only
                     // candidates; the distance-ordered frontier then crosses
-                    // the gap toward the next matching region.
+                    // the gap toward the next matching region. Doing this
+                    // once the results are full costs far more distance
+                    // work for little recall, so it stops there.
                     if found == 0 && queues.results.len() < self.ef {
                         for &hop in hops.iter() {
                             self.evaluate(hop, false, queues, stats);
