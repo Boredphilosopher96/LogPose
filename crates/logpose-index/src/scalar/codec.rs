@@ -48,13 +48,28 @@ impl InvertedIndex {
     /// Returns [`ScalarError::KeyTooLong`] for a string key over `u32::MAX`
     /// bytes and [`ScalarError::Encode`] if a bitmap fails to serialize.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ScalarError> {
-        let mut body = Vec::new();
-        write_bitmap(&mut body, self.nulls())?;
-        write_keys(&mut body, self.key_column())?;
-        for bitmap in self.bitmaps() {
-            write_bitmap(&mut body, bitmap)?;
-        }
-        Ok(seal(TYPE_INVERTED, self.key_column().kind(), &body))
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Append the checksummed binary layout to `out`, for example a segment
+    /// section being assembled, without an intermediate buffer.
+    ///
+    /// On error `out` is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// See [`InvertedIndex::to_bytes`].
+    pub fn write_to(&self, out: &mut Vec<u8>) -> Result<(), ScalarError> {
+        sealed(out, TYPE_INVERTED, self.key_column().kind(), |body| {
+            write_bitmap(body, self.nulls())?;
+            write_keys(body, self.key_column())?;
+            for bitmap in self.bitmaps() {
+                write_bitmap(body, bitmap)?;
+            }
+            Ok(())
+        })
     }
 
     /// Load from bytes written by [`InvertedIndex::to_bytes`].
@@ -89,17 +104,34 @@ impl SortedIndex {
     /// Returns [`ScalarError::KeyTooLong`] for a string key over `u32::MAX`
     /// bytes and [`ScalarError::Encode`] if a bitmap fails to serialize.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ScalarError> {
-        let mut body = Vec::with_capacity(self.rows().len() * 4 + self.offsets().len() * 4);
-        write_bitmap(&mut body, self.nulls())?;
-        write_keys(&mut body, self.key_column())?;
-        for offset in self.offsets() {
-            body.extend_from_slice(&offset.to_le_bytes());
-        }
-        body.extend_from_slice(&(self.rows().len() as u64).to_le_bytes());
-        for row in self.rows() {
-            body.extend_from_slice(&row.to_le_bytes());
-        }
-        Ok(seal(TYPE_SORTED, self.key_column().kind(), &body))
+        let mut bytes = Vec::with_capacity(
+            HEADER_LEN + CRC_LEN + self.rows().len() * 4 + self.offsets().len() * 4,
+        );
+        self.write_to(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Append the checksummed binary layout to `out`, for example a segment
+    /// section being assembled, without an intermediate buffer.
+    ///
+    /// On error `out` is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// See [`SortedIndex::to_bytes`].
+    pub fn write_to(&self, out: &mut Vec<u8>) -> Result<(), ScalarError> {
+        sealed(out, TYPE_SORTED, self.key_column().kind(), |body| {
+            write_bitmap(body, self.nulls())?;
+            write_keys(body, self.key_column())?;
+            for offset in self.offsets() {
+                body.extend_from_slice(&offset.to_le_bytes());
+            }
+            body.extend_from_slice(&(self.rows().len() as u64).to_le_bytes());
+            for row in self.rows() {
+                body.extend_from_slice(&row.to_le_bytes());
+            }
+            Ok(())
+        })
     }
 
     /// Load from bytes written by [`SortedIndex::to_bytes`].
@@ -144,18 +176,30 @@ impl SortedIndex {
     }
 }
 
-/// Wrap a body in the header and checksum trailer.
-fn seal(index_type: u8, kind: KeyKind, body: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HEADER_LEN + body.len() + CRC_LEN);
-    bytes.extend_from_slice(&MAGIC);
-    bytes.extend_from_slice(&VERSION.to_le_bytes());
-    bytes.push(index_type);
-    bytes.push(kind.tag());
-    bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(body);
-    let crc = crc32fast::hash(&bytes);
-    bytes.extend_from_slice(&crc.to_le_bytes());
-    bytes
+/// Append the header, the body that `write_body` appends, and the checksum
+/// trailer to `out`. On error `out` is truncated back to its original length.
+fn sealed(
+    out: &mut Vec<u8>,
+    index_type: u8,
+    kind: KeyKind,
+    write_body: impl FnOnce(&mut Vec<u8>) -> Result<(), ScalarError>,
+) -> Result<(), ScalarError> {
+    let start = out.len();
+    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.push(index_type);
+    out.push(kind.tag());
+    // Body length, patched once the body is written.
+    out.extend_from_slice(&0u64.to_le_bytes());
+    if let Err(error) = write_body(out) {
+        out.truncate(start);
+        return Err(error);
+    }
+    let body_len = (out.len() - start - HEADER_LEN) as u64;
+    out[start + 8..start + HEADER_LEN].copy_from_slice(&body_len.to_le_bytes());
+    let crc = crc32fast::hash(&out[start..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// Validate the header and checksum; return the key kind and the body.

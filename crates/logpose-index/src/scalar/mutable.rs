@@ -223,7 +223,7 @@ impl MutableInvertedIndex {
 
     /// Build the immutable index, renumbering rows with `remap` (memtable slot
     /// to segment row id). Slots mapped to `None` are dropped. `remap` must be
-    /// a pure function; it is called once per entry. The index stays
+    /// a pure function; it may be called more than once per slot. The index stays
     /// readable, so queries can continue while a flush runs.
     ///
     /// # Errors
@@ -401,7 +401,7 @@ impl MutableSortedIndex {
 
     /// Build the immutable index, renumbering rows with `remap` (memtable slot
     /// to segment row id). Slots mapped to `None` are dropped. `remap` must be
-    /// a pure function; it is called once per entry. The index stays
+    /// a pure function; it may be called more than once per slot. The index stays
     /// readable, so queries can continue while a flush runs.
     ///
     /// # Errors

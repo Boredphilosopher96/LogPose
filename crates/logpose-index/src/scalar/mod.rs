@@ -39,9 +39,10 @@
 //! # Serialization
 //!
 //! [`InvertedIndex::to_bytes`] and [`SortedIndex::to_bytes`] write a
-//! versioned, CRC32-protected layout (see the `codec` module docs). Loading
-//! validates the checksum and the structure and returns an error on any
-//! corruption.
+//! versioned, CRC32-protected layout (see the `codec` module docs);
+//! `write_to` appends the same bytes to an existing buffer. Loading
+//! (`from_bytes`) validates the checksum and the structure, returns an error
+//! on any corruption, and decodes into an owned index.
 
 mod builder;
 mod codec;
@@ -131,8 +132,11 @@ pub trait ScalarIndex {
     fn stats(&self) -> ScalarIndexStats;
 
     /// Rows with a value that is not in `keys` (SQL `NOT IN`): existing rows
-    /// minus [`ScalarIndex::in_set`]. Null rows are excluded. For arrays this
-    /// is "no element is in `keys`".
+    /// minus [`ScalarIndex::in_set`]. For arrays this is "at least one
+    /// element, and no element is in `keys`", so `[a, b] NOT IN {a}` is
+    /// false. Null rows and empty-array rows are never in
+    /// [`ScalarIndex::exists`], so they never match; a caller that wants
+    /// `NOT (field IN keys)` instead computes `live - in_set(keys)`.
     fn not_in_set(&self, keys: &[ScalarKey]) -> RoaringBitmap {
         let mut rows = self.exists().clone();
         rows -= self.in_set(keys);
@@ -152,7 +156,8 @@ pub trait ScalarIndex {
     }
 
     /// Rows whose array holds every one of `keys`. With no keys, every
-    /// existing row matches.
+    /// existing row matches; empty-array rows are not existing rows, so they
+    /// do not match even then.
     fn contains_all(&self, keys: &[ScalarKey]) -> RoaringBitmap {
         if keys.is_empty() {
             return self.exists().clone();

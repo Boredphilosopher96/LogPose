@@ -824,3 +824,158 @@ fn resealed_random_corruption_never_panics() {
         }
     }
 }
+
+#[test]
+fn write_to_appends_the_same_bytes_as_to_bytes() {
+    let (inverted, sorted) = sample_bytes();
+    let (inverted_index, sorted_index) = (
+        InvertedIndex::from_bytes(&inverted).expect("decodes"),
+        SortedIndex::from_bytes(&sorted).expect("decodes"),
+    );
+    let mut out = b"prefix".to_vec();
+    inverted_index.write_to(&mut out).expect("encodes");
+    let split = out.len();
+    sorted_index.write_to(&mut out).expect("encodes");
+    assert_eq!(&out[..6], b"prefix");
+    assert_eq!(&out[6..split], inverted.as_slice());
+    assert_eq!(&out[split..], sorted.as_slice());
+}
+
+/// Every index kind, probed through the trait.
+fn all_four(kind: KeyKind, pairs: &[(u32, ScalarKey)]) -> Vec<Box<dyn ScalarIndex>> {
+    let sorted = SortedIndex::from_entries(kind, pairs.iter().cloned()).expect("builds");
+    let inverted = InvertedIndex::from_sorted(&sorted);
+    let mut mutable_inverted = MutableInvertedIndex::new(kind);
+    let mut mutable_sorted = MutableSortedIndex::new(kind);
+    for (row, key) in pairs {
+        mutable_inverted.insert(*row, key.clone()).expect("insert");
+        mutable_sorted.insert(*row, key.clone()).expect("insert");
+    }
+    vec![
+        Box::new(sorted),
+        Box::new(inverted),
+        Box::new(mutable_inverted),
+        Box::new(mutable_sorted),
+    ]
+}
+
+#[test]
+fn integer_extremes_and_degenerate_bounds() {
+    use Bound::{Excluded, Included, Unbounded};
+    let (min, max) = (ScalarKey::Int(i64::MIN), ScalarKey::Int(i64::MAX));
+    let pairs = [(0, min.clone()), (1, max.clone()), (2, ScalarKey::Int(0))];
+    let rows = |rows: &[u32]| RoaringBitmap::from_iter(rows.iter().copied());
+    for index in all_four(KeyKind::Int, &pairs) {
+        assert_eq!(index.range(Excluded(&max), Unbounded), rows(&[]));
+        assert_eq!(index.range(Unbounded, Excluded(&min)), rows(&[]));
+        assert_eq!(
+            index.range(Included(&min), Included(&max)),
+            rows(&[0, 1, 2])
+        );
+        assert_eq!(index.range(Excluded(&min), Excluded(&max)), rows(&[2]));
+        assert_eq!(index.range(Included(&max), Included(&max)), rows(&[1]));
+        assert_eq!(index.range(Included(&max), Excluded(&max)), rows(&[]));
+        assert_eq!(index.range(Excluded(&max), Excluded(&max)), rows(&[]));
+        assert_eq!(index.range(Included(&max), Included(&min)), rows(&[]));
+        assert_eq!(index.count_range(Excluded(&max), Included(&min)), 0);
+        let zero = float(0.0);
+        assert_eq!(index.range(Included(&zero), Unbounded), rows(&[]));
+        assert_eq!(index.not_in_set(&[zero]), rows(&[0, 1, 2]));
+    }
+}
+
+#[test]
+fn prefixes_respect_multibyte_utf8() {
+    let words = [
+        "",
+        "a",
+        "é",
+        "éa",
+        "\u{7FF}",
+        "\u{800}",
+        "\u{FFFF}",
+        "\u{10000}",
+        "\u{10FFFF}",
+        "\u{10FFFF}\u{10FFFF}",
+        "\u{10FFFF}a",
+    ];
+    let pairs: Vec<(u32, ScalarKey)> = (0u32..)
+        .zip(words)
+        .map(|(row, word)| (row, ScalarKey::from(word)))
+        .collect();
+    for index in all_four(KeyKind::Str, &pairs) {
+        for prefix in [
+            "",
+            "é",
+            "\u{7FF}",
+            "\u{FFFF}",
+            "\u{10FFFF}",
+            "\u{10FFFF}\u{10FFFF}",
+        ] {
+            let expected: RoaringBitmap = (0u32..)
+                .zip(words)
+                .filter(|(_, word)| word.starts_with(prefix))
+                .map(|(row, _)| row)
+                .collect();
+            assert_eq!(index.prefix(prefix), expected, "prefix {prefix:?}");
+        }
+    }
+}
+
+#[test]
+fn array_not_in_and_contains_all_semantics() {
+    // Row 0 holds [a, b] and row 1 holds [b]. A null row or an empty array
+    // is never an existing row, so it matches none of these.
+    let pairs = [
+        (0, ScalarKey::from("a")),
+        (0, ScalarKey::from("b")),
+        (1, ScalarKey::from("b")),
+    ];
+    let rows = |rows: &[u32]| RoaringBitmap::from_iter(rows.iter().copied());
+    for index in all_four(KeyKind::Str, &pairs) {
+        assert_eq!(index.not_in_set(&["a".into()]), rows(&[1]));
+        assert_eq!(index.not_in_set(&[]), rows(&[0, 1]));
+        assert_eq!(index.contains_all(&["a".into(), "b".into()]), rows(&[0]));
+        assert_eq!(index.contains_all(&["a".into(), "a".into()]), rows(&[0]));
+        assert_eq!(index.contains_all(&["a".into(), "z".into()]), rows(&[]));
+        assert_eq!(index.contains_all(&[]), rows(&[0, 1]));
+    }
+}
+
+#[test]
+fn arbitrary_sealed_bodies_never_panic() {
+    let mut rng = Rng(4242);
+    let seal = |index_type: u8, kind: u8, body: &[u8]| {
+        let mut bytes = b"LPSX".to_vec();
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&[index_type, kind]);
+        bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&[0; 4]);
+        reseal(&mut bytes);
+        bytes
+    };
+    for round in 0..20_000u64 {
+        let len = rng.below(120) as usize;
+        let mut body: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        // Plant huge counts and lengths where a reader is likely to find them.
+        if len >= 16 {
+            let at = rng.below(len as u64 - 8) as usize;
+            let huge = if round % 2 == 0 {
+                u64::MAX
+            } else {
+                u64::from(u32::MAX)
+            };
+            body[at..at + 8].copy_from_slice(&huge.to_le_bytes());
+        }
+        let kind = rng.below(6) as u8;
+        if let Ok(index) = InvertedIndex::from_bytes(&seal(1, kind, &body)) {
+            let _ = index.range(Bound::Unbounded, Bound::Unbounded);
+        }
+        if let Ok(index) = SortedIndex::from_bytes(&seal(2, kind, &body)) {
+            let _ = index.iter_ordered(Direction::Descending, None).count();
+        }
+        assert!(InvertedIndex::from_bytes(&body).is_err());
+        assert!(SortedIndex::from_bytes(&body).is_err());
+    }
+}
