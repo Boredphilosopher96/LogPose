@@ -120,7 +120,7 @@ impl WalBatch {
 pub enum WalFileKind {
     /// The file that receives appends. An invalid tail is a torn write and is ignored.
     Active,
-    /// A rotated file. Only a truncated final frame is tolerated; any other defect errors.
+    /// A rotated file. Rotation repairs the tail before renaming, so any defect errors.
     Rolled,
 }
 
@@ -143,6 +143,8 @@ impl WalFileKind {
 pub struct WalWriter {
     file: File,
     path: PathBuf,
+    /// Length of the fully valid, synced frame prefix. A failed append rolls back to it.
+    len: u64,
 }
 
 impl WalWriter {
@@ -150,8 +152,8 @@ impl WalWriter {
     ///
     /// Any bytes after the last fully valid frame are a torn write from a crash. They are
     /// truncated and synced before the writer is returned, so the next append never lands
-    /// after garbage. A corrupt frame that is followed by a valid frame is not a torn
-    /// tail; that is reported as an error instead of discarding acknowledged batches.
+    /// after garbage. A defect with any valid frame after it is not a torn tail; that is
+    /// reported as an error instead of discarding acknowledged batches.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -184,7 +186,11 @@ impl WalWriter {
             );
         }
 
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            len: valid_len as u64,
+        })
     }
 
     /// Return the active WAL path.
@@ -194,20 +200,38 @@ impl WalWriter {
     }
 
     /// Append a batch as one frame and sync it to the local filesystem.
+    ///
+    /// If the write or the fsync fails, the file is truncated back to its length before the
+    /// append, so a batch reported as failed is never replayed later.
     pub fn append_batch(&mut self, batch: &WalBatch) -> Result<()> {
         let payload = serde_json::to_vec(batch).map_err(|error| {
             LogPoseError::Message(format!("failed to serialize WAL batch: {error}"))
         })?;
         let frame = encode_frame(&payload);
 
-        self.file
-            .write_all(&frame)
-            .map_err(|error| io_message("failed to append WAL frame", error))?;
-        self.file
-            .sync_data()
-            .map_err(|error| io_message("failed to fsync WAL data", error))?;
+        if let Err(error) = self.file.write_all(&frame) {
+            return Err(self.roll_back_failed_append("failed to append WAL frame", error));
+        }
+        if let Err(error) = self.file.sync_data() {
+            return Err(self.roll_back_failed_append("failed to fsync WAL data", error));
+        }
+        self.len += frame.len() as u64;
 
         Ok(())
+    }
+
+    fn roll_back_failed_append(&mut self, context: &str, error: std::io::Error) -> LogPoseError {
+        match self
+            .file
+            .set_len(self.len)
+            .and_then(|()| self.file.sync_all())
+        {
+            Ok(()) => io_message(context, error),
+            Err(rollback_error) => LogPoseError::Message(format!(
+                "{context}: {error}; rolling the WAL back to {} bytes also failed: {rollback_error}",
+                self.len
+            )),
+        }
     }
 
     /// Truncate the active WAL after a successful checkpoint.
@@ -221,6 +245,7 @@ impl WalWriter {
         self.file
             .sync_all()
             .map_err(|error| io_message("failed to fsync truncated WAL", error))?;
+        self.len = 0;
         Ok(())
     }
 }
@@ -252,8 +277,9 @@ pub fn replay_dir(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
 /// Replay the records above the manifest checkpoint from every relevant WAL file.
 ///
 /// Batches at or below the checkpoint are dropped whole. A batch whose sequence range
-/// straddles the checkpoint means the checkpoint split an atomic batch, which is an
-/// invariant violation and is reported as an error.
+/// straddles the checkpoint means the checkpoint split an atomic batch, and a batch that
+/// does not start above the previous replayed batch means a sequence number was written
+/// twice. Both are invariant violations and are reported as errors.
 pub fn replay_dir_after_checkpoint(
     path: impl AsRef<Path>,
     checkpoint_seq_no: SeqNo,
@@ -282,6 +308,16 @@ pub fn replay_dir_after_checkpoint(
             if batch.first_seq_no() <= checkpoint_seq_no {
                 return Err(LogPoseError::Message(format!(
                     "WAL batch {}..={} in {} straddles checkpoint {checkpoint_seq_no}",
+                    batch.first_seq_no(),
+                    batch.last_seq_no(),
+                    entry.display()
+                )));
+            }
+            if let Some(previous) = replayed.last().map(|record: &WalRecord| record.seq_no)
+                && batch.first_seq_no() <= previous
+            {
+                return Err(LogPoseError::Message(format!(
+                    "WAL batch {}..={} in {} does not follow sequence number {previous}",
                     batch.first_seq_no(),
                     batch.last_seq_no(),
                     entry.display()
@@ -331,8 +367,11 @@ enum FrameDefect {
 struct ScanStop {
     offset: usize,
     defect: FrameDefect,
-    /// True when a fully valid frame follows the defective one, which rules out a torn
-    /// tail: appends are sequential, so only the final frame can be torn.
+    /// True when a fully valid frame starts anywhere after the defect, which rules out a
+    /// torn tail: appends are sequential and a torn tail is truncated before the next
+    /// append, so only the final frame can be torn. The search is not limited to the
+    /// defective frame's declared end, because a corrupt magic or length gives no
+    /// trustworthy end.
     followed_by_valid_frame: bool,
 }
 
@@ -350,10 +389,7 @@ impl FrameScan<'_> {
         let Some(stop) = self.stop else {
             return Ok(self.valid_len);
         };
-        let acceptable = match kind {
-            WalFileKind::Active => !stop.followed_by_valid_frame,
-            WalFileKind::Rolled => stop.defect == FrameDefect::Truncated,
-        };
+        let acceptable = kind == WalFileKind::Active && !stop.followed_by_valid_frame;
         if acceptable {
             return Ok(self.valid_len);
         }
@@ -376,14 +412,8 @@ impl FrameScan<'_> {
 }
 
 enum ParsedFrame<'a> {
-    Valid {
-        payload: &'a [u8],
-        end: usize,
-    },
-    Invalid {
-        defect: FrameDefect,
-        end: Option<usize>,
-    },
+    Valid { payload: &'a [u8], end: usize },
+    Invalid(FrameDefect),
 }
 
 /// The single frame scanner shared by replay and by tail repair in [`WalWriter::open`].
@@ -396,10 +426,9 @@ fn scan_frames(bytes: &[u8]) -> FrameScan<'_> {
                 payloads.push(payload);
                 offset = end;
             }
-            ParsedFrame::Invalid { defect, end } => {
-                let followed_by_valid_frame = end.is_some_and(|end| {
-                    end < bytes.len()
-                        && matches!(parse_frame(bytes, end), ParsedFrame::Valid { .. })
+            ParsedFrame::Invalid(defect) => {
+                let followed_by_valid_frame = (offset + 1..bytes.len()).any(|candidate| {
+                    matches!(parse_frame(bytes, candidate), ParsedFrame::Valid { .. })
                 });
                 return FrameScan {
                     payloads,
@@ -421,18 +450,12 @@ fn scan_frames(bytes: &[u8]) -> FrameScan<'_> {
 }
 
 fn parse_frame(bytes: &[u8], offset: usize) -> ParsedFrame<'_> {
-    let truncated = ParsedFrame::Invalid {
-        defect: FrameDefect::Truncated,
-        end: None,
-    };
+    let truncated = ParsedFrame::Invalid(FrameDefect::Truncated);
     let Some(magic) = read_array::<MAGIC_BYTES>(bytes, offset).map(u32::from_le_bytes) else {
         return truncated;
     };
     if magic != WAL_MAGIC {
-        return ParsedFrame::Invalid {
-            defect: FrameDefect::BadMagic,
-            end: None,
-        };
+        return ParsedFrame::Invalid(FrameDefect::BadMagic);
     }
     let length_offset = offset + MAGIC_BYTES;
     let Some(length_bytes) = read_array::<LENGTH_BYTES>(bytes, length_offset) else {
@@ -455,10 +478,7 @@ fn parse_frame(bytes: &[u8], offset: usize) -> ParsedFrame<'_> {
     };
     let payload = &bytes[payload_start..payload_end];
     if frame_checksum(&length_bytes, payload) != stored_checksum {
-        return ParsedFrame::Invalid {
-            defect: FrameDefect::BadChecksum,
-            end: Some(end),
-        };
+        return ParsedFrame::Invalid(FrameDefect::BadChecksum);
     }
     ParsedFrame::Valid { payload, end }
 }
@@ -706,6 +726,128 @@ mod tests {
             fs::read(&path).expect("wal file should exist"),
             bytes,
             "the file must be left untouched"
+        );
+    }
+
+    /// Three acknowledged frames; `corrupt` damages the first one in place.
+    fn corrupt_first_of_three(prefix: &str, corrupt: impl Fn(&mut Vec<u8>)) -> (PathBuf, Vec<u8>) {
+        let dir = unique_temp_dir(prefix);
+        let path = dir.join(ACTIVE_WAL_FILE_NAME);
+        append(&path, vec![put(1, "a")]);
+        append(&path, vec![put(2, "b")]);
+        append(&path, vec![put(3, "c")]);
+        let mut bytes = fs::read(&path).expect("wal file should exist");
+        corrupt(&mut bytes);
+        fs::write(&path, &bytes).expect("corruption write should succeed");
+        (path, bytes)
+    }
+
+    fn assert_refuses_to_discard_later_frames(path: &Path, bytes: &[u8]) {
+        let replay_error = replay_file(path, WalFileKind::Active)
+            .expect_err("replay must not silently drop acknowledged frames");
+        assert!(
+            replay_error
+                .to_string()
+                .contains("before later valid frames"),
+            "{replay_error}"
+        );
+        assert!(
+            WalWriter::open(path).is_err(),
+            "writer must not truncate acknowledged frames"
+        );
+        assert_eq!(
+            fs::read(path).expect("wal file should exist"),
+            bytes,
+            "the file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn corrupt_magic_before_valid_frames_is_not_a_torn_tail() {
+        let (path, bytes) = corrupt_first_of_three("wal-mid-magic", |bytes| bytes[0] ^= 0xFF);
+        assert_refuses_to_discard_later_frames(&path, &bytes);
+    }
+
+    #[test]
+    fn corrupt_length_before_valid_frames_is_not_a_torn_tail() {
+        // A flipped high bit makes the first frame claim to run past the end of the file.
+        let (path, bytes) = corrupt_first_of_three("wal-mid-length", |bytes| {
+            bytes[MAGIC_BYTES + LENGTH_BYTES - 1] ^= 0x80;
+        });
+        assert_refuses_to_discard_later_frames(&path, &bytes);
+    }
+
+    #[test]
+    fn two_corrupt_frames_before_a_valid_frame_are_not_a_torn_tail() {
+        let dir = unique_temp_dir("wal-two-corrupt");
+        let path = dir.join(ACTIVE_WAL_FILE_NAME);
+        append(&path, vec![put(1, "a")]);
+        let first_end = fs::metadata(&path).expect("metadata").len() as usize;
+        append(&path, vec![put(2, "b")]);
+        let second_end = fs::metadata(&path).expect("metadata").len() as usize;
+        append(&path, vec![put(3, "c")]);
+        let mut bytes = fs::read(&path).expect("wal file should exist");
+        bytes[first_end - 1] ^= 0xFF;
+        bytes[second_end - 1] ^= 0xFF;
+        fs::write(&path, &bytes).expect("corruption write should succeed");
+        assert_refuses_to_discard_later_frames(&path, &bytes);
+    }
+
+    #[test]
+    fn rolled_replay_rejects_a_truncated_final_frame() {
+        let dir = unique_temp_dir("wal-rolled-truncated");
+        let path = dir.join("00000000000000000002.wal");
+        append(&path, vec![put(1, "a")]);
+        append(&path, vec![put(2, "b")]);
+        let bytes = fs::read(&path).expect("wal file should exist");
+        fs::write(&path, &bytes[..bytes.len() - 1]).expect("truncation should succeed");
+
+        let error = replay_file(&path, WalFileKind::Rolled)
+            .expect_err("rotation only rolls repaired files, so a torn rolled file is corrupt");
+        assert!(error.to_string().contains("truncated frame"), "{error}");
+    }
+
+    #[test]
+    fn failed_append_rolls_back_to_the_last_synced_frame() {
+        let dir = unique_temp_dir("wal-append-rollback");
+        let path = dir.join(ACTIVE_WAL_FILE_NAME);
+        append(&path, vec![put(1, "a")]);
+        let committed = fs::read(&path).expect("wal file should exist");
+
+        let mut writer = WalWriter::open(&path).expect("writer should open");
+        // Stand in for a frame whose write succeeded but whose fsync then failed.
+        writer
+            .file
+            .write_all(&encode_frame(b"{\"records\":[]}"))
+            .expect("write should succeed");
+        let error = writer
+            .roll_back_failed_append("failed to fsync WAL data", std::io::Error::other("EIO"));
+
+        assert!(
+            error.to_string().contains("failed to fsync WAL data: EIO"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).expect("wal file should exist"), committed);
+        writer
+            .append_batch(&batch(vec![put(2, "b")]))
+            .expect("append after rollback should succeed");
+        let replayed = replay_file(&path, WalFileKind::Rolled).expect("replay should succeed");
+        assert_eq!(seq_nos(&replayed), vec![vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn replay_dir_rejects_a_sequence_number_written_twice() {
+        let dir = unique_temp_dir("wal-duplicate-seq");
+        let active_path = dir.join(ACTIVE_WAL_FILE_NAME);
+        append(&active_path, vec![put(1, "a"), put(2, "b")]);
+        append(&active_path, vec![put(2, "again")]);
+
+        let error = replay_dir(&dir).expect_err("a reused sequence number should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not follow sequence number 2"),
+            "{error}"
         );
     }
 
