@@ -66,6 +66,10 @@ pub const DEFAULT_FLOORS: [f32; ArtifactClass::COUNT] = [0.0, 0.0, 0.0, 0.02, 0.
 pub struct FileId(u64);
 
 impl FileId {
+    /// The id of loads that belong to no file registration (never
+    /// allocated by [`next`](Self::next)).
+    pub(crate) const DETACHED: Self = Self(0);
+
     /// Allocate a new id.
     #[must_use]
     pub fn next() -> Self {

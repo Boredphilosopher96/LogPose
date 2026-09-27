@@ -9,7 +9,7 @@
 //! it itself, so a blocking caller on an I/O thread can never wait for a job
 //! queued behind it on the same pool.
 
-use super::{AlignedBytes, ArtifactClass, CacheKey, Fetched, Inner, lock};
+use super::{AlignedBytes, ArtifactClass, CacheKey, Fetched, FileId, Inner, lock};
 use crate::segment_v2::SegmentError;
 use std::{
     fmt,
@@ -148,7 +148,8 @@ struct AbortOnDrop<'a> {
 
 impl Drop for AbortOnDrop<'_> {
     fn drop(&mut self) {
-        self.inner.finish(self.flight, Err(SegmentError::LoadAborted));
+        self.inner
+            .finish(self.flight, Err(SegmentError::LoadAborted));
     }
 }
 
@@ -273,12 +274,8 @@ impl Fetch {
 
     /// Run `load` on `executor` outside any cache: nothing is looked up,
     /// shared, or inserted. Used by readers that have no cache attached.
-    pub fn detached(
-        executor: &dyn LoadExecutor,
-        key: CacheKey,
-        class: ArtifactClass,
-        load: Loader,
-    ) -> Self {
+    pub fn detached(executor: &dyn LoadExecutor, class: ArtifactClass, load: Loader) -> Self {
+        let key = CacheKey::section(FileId::DETACHED, 0);
         let flight = Flight::new(key, class, false, Some(load));
         executor.execute(LoadJob::new(None, Arc::clone(&flight)));
         Self::waiting(flight, true)
@@ -316,7 +313,10 @@ impl fmt::Debug for Fetch {
             FetchState::Waiting { .. } => "waiting",
             FetchState::Finished => "finished",
         };
-        formatter.debug_struct("Fetch").field("state", &state).finish()
+        formatter
+            .debug_struct("Fetch")
+            .field("state", &state)
+            .finish()
     }
 }
 

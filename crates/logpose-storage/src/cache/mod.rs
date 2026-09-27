@@ -226,9 +226,13 @@ impl BufferCache {
     /// An empty cache.
     #[must_use]
     pub fn new(config: CacheConfig) -> Self {
-        let floors = config
-            .floors
-            .map(|floor| if floor.is_finite() { floor.clamp(0.0, 1.0) } else { 0.0 });
+        let floors = config.floors.map(|floor| {
+            if floor.is_finite() {
+                floor.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        });
         Self {
             inner: Arc::new(Inner {
                 budget: AtomicU64::new(config.budget),

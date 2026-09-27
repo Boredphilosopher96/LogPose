@@ -23,9 +23,10 @@ use super::{
     format::{crc, crc_append},
     le::{Cursor, align_up, pad_to, put_u32, put_u64, usize_from, usize_from_u64},
 };
+use crate::cache::AlignedBytes;
 use logpose_types::schema::FieldId;
 use roaring::RoaringBitmap;
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 pub(crate) const VECTOR_ENCODING_F32: u16 = 1;
 const PREFIX_HEADER_LEN: usize = 64;
@@ -126,15 +127,34 @@ impl VectorBuf {
 }
 
 /// The decoded prefix of a `VectorF32` section.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// The page CRCs are not copied out: the prefix keeps the verified bytes it
+/// was decoded from (the cached prefix unit, or the whole section) and reads
+/// each page's CRC from them, so holding a prefix pins those bytes.
+#[derive(Clone, Debug)]
 pub struct VectorPrefix {
     dim: u32,
     row_count: u32,
     page_rows: u32,
+    page_count: u32,
     nulls: RoaringBitmap,
-    page_crcs: Vec<u32>,
+    /// The bytes the prefix was decoded from; they may extend past it.
+    bytes: Arc<AlignedBytes>,
+    /// Offset of the page CRC array in `bytes`.
+    crcs_at: usize,
     /// Offset of the data from the start of the section.
     data_offset: u64,
+}
+
+impl PartialEq for VectorPrefix {
+    fn eq(&self, other: &Self) -> bool {
+        self.dim == other.dim
+            && self.row_count == other.row_count
+            && self.page_rows == other.page_rows
+            && self.nulls == other.nulls
+            && self.data_offset == other.data_offset
+            && self.crc_bytes() == other.crc_bytes()
+    }
 }
 
 impl VectorPrefix {
@@ -156,33 +176,44 @@ impl VectorPrefix {
         usize_from_u64(len)
     }
 
-    /// Decode and verify a whole prefix for a field of `dim` dimensions in a
-    /// segment of `row_count` rows.
+    /// Decode and verify the prefix at the start of `bytes` (which may
+    /// extend past it) for a field of `dim` dimensions in a segment of
+    /// `row_count` rows.
     pub(crate) fn decode(
-        bytes: &[u8],
+        bytes: &Arc<AlignedBytes>,
         dim: u32,
         row_count: u32,
         section_len: u64,
     ) -> Result<Self, PrefixError> {
-        if bytes.len() < PREFIX_HEADER_LEN {
-            return Err(PrefixError::Malformed(Malformed::new(
-                "vector prefix is truncated",
-            )));
-        }
+        let len = Self::prefix_len(bytes, section_len).map_err(PrefixError::Malformed)?;
+        let prefix = bytes
+            .get(..len)
+            .filter(|prefix| prefix.len() >= PREFIX_HEADER_LEN)
+            .ok_or_else(|| PrefixError::Malformed(Malformed::new("vector prefix is truncated")))?;
         let stored = u32::from_le_bytes([
-            bytes[PREFIX_CRC_AT],
-            bytes[PREFIX_CRC_AT + 1],
-            bytes[PREFIX_CRC_AT + 2],
-            bytes[PREFIX_CRC_AT + 3],
+            prefix[PREFIX_CRC_AT],
+            prefix[PREFIX_CRC_AT + 1],
+            prefix[PREFIX_CRC_AT + 2],
+            prefix[PREFIX_CRC_AT + 3],
         ]);
-        if crc_append(crc(&bytes[..PREFIX_CRC_AT]), &bytes[PREFIX_CRC_AT + 4..]) != stored {
+        if crc_append(crc(&prefix[..PREFIX_CRC_AT]), &prefix[PREFIX_CRC_AT + 4..]) != stored {
             return Err(PrefixError::Checksum);
         }
-        Self::parse(bytes, dim, row_count, section_len).map_err(PrefixError::Malformed)
+        Self::decode_verified(bytes, dim, row_count, section_len).map_err(PrefixError::Malformed)
     }
 
-    fn parse(bytes: &[u8], dim: u32, row_count: u32, section_len: u64) -> DecodeResult<Self> {
-        let mut cursor = Cursor::new(bytes);
+    /// Decode a prefix whose CRC was already checked (a cached unit).
+    pub(crate) fn decode_verified(
+        bytes: &Arc<AlignedBytes>,
+        dim: u32,
+        row_count: u32,
+        section_len: u64,
+    ) -> DecodeResult<Self> {
+        let len = Self::prefix_len(bytes, section_len)?;
+        let prefix = bytes
+            .get(..len)
+            .ok_or_else(|| Malformed::new("vector prefix is truncated"))?;
+        let mut cursor = Cursor::new(prefix);
         let stored_dim = cursor.u32()?;
         let stored_rows = cursor.u32()?;
         let page_rows = cursor.u32()?;
@@ -218,11 +249,11 @@ impl VectorPrefix {
             return Err(Malformed::new("null bitmap names a row out of range"));
         }
         cursor.align(8)?;
-        let page_crcs = cursor.u32s(usize_from(page_count))?;
+        let crcs_at = cursor.position();
+        cursor.take(usize_from(page_count) * 4)?;
         cursor.finish()?;
-        let prefix_end = bytes.len() as u64;
         let data_offset =
-            align_up(prefix_end, 64).ok_or_else(|| Malformed::new("vector prefix overflows"))?;
+            align_up(len as u64, 64).ok_or_else(|| Malformed::new("vector prefix overflows"))?;
         let data_len = u64::from(row_count)
             .checked_mul(u64::from(dim) * 4)
             .and_then(|len| len.checked_add(data_offset));
@@ -235,10 +266,25 @@ impl VectorPrefix {
             dim,
             row_count,
             page_rows,
+            page_count,
             nulls,
-            page_crcs,
+            bytes: Arc::clone(bytes),
+            crcs_at,
             data_offset,
         })
+    }
+
+    fn crc_bytes(&self) -> &[u8] {
+        let end = self.crcs_at + usize_from(self.page_count) * 4;
+        self.bytes.get(self.crcs_at..end).unwrap_or_default()
+    }
+
+    /// The stored CRC of `page`.
+    #[must_use]
+    pub fn page_crc(&self, page: u32) -> Option<u32> {
+        let at = usize_from(page).checked_mul(4)?;
+        let bytes = self.crc_bytes().get(at..at + 4)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// Number of dimensions.
@@ -262,7 +308,7 @@ impl VectorPrefix {
     /// Number of pages.
     #[must_use]
     pub fn page_count(&self) -> u32 {
-        u32::try_from(self.page_crcs.len()).unwrap_or(u32::MAX)
+        self.page_count
     }
 
     /// Rows whose vector is null (stored as zeros).
@@ -304,9 +350,8 @@ impl VectorPrefix {
     /// Whether `bytes` match the stored CRC of `page`.
     #[must_use]
     pub fn page_matches(&self, page: u32, bytes: &[u8]) -> bool {
-        self.page_crcs
-            .get(usize_from(page))
-            .is_some_and(|expected| crc(bytes) == *expected)
+        self.page_crc(page)
+            .is_some_and(|expected| crc(bytes) == expected)
     }
 
     /// Check that the data holds zeros for null rows and matches every page

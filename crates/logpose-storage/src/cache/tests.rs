@@ -634,7 +634,10 @@ fn invalidating_a_file_drops_its_entries_and_detaches_its_loads() {
     }
     let (bytes, _) = block_on(in_flight).expect("waiters still get the bytes");
     assert_eq!(bytes.len(), UNIT);
-    assert!(!cache.residency(&key(dead, 9)), "a detached load is not cached");
+    assert!(
+        !cache.residency(&key(dead, 9)),
+        "a detached load is not cached"
+    );
     assert_eq!(cache.stats().invalidated, 3);
     assert_eq!(cache.used(), budget_for(3));
 }
@@ -671,13 +674,19 @@ fn fetch_reports_count_hits_misses_waits_and_bytes() {
     assert_eq!(report.waits, 1);
     assert_eq!(report.bytes_read, 200);
     assert_eq!(report.by_class[ArtifactClass::RawVectors.index()].misses, 2);
-    assert_eq!(report.by_class[ArtifactClass::RawVectors.index()].bytes, 100);
+    assert_eq!(
+        report.by_class[ArtifactClass::RawVectors.index()].bytes,
+        100
+    );
     assert!(report.is_cold());
     let mut total = FetchReport::default();
     total.merge(&report);
     total.merge(&report);
     assert_eq!(total.misses, 6);
-    assert_eq!(total.by_class[ArtifactClass::GraphAndCodes.index()].bytes, 200);
+    assert_eq!(
+        total.by_class[ArtifactClass::GraphAndCodes.index()].bytes,
+        200
+    );
     let stats = cache.stats();
     assert_eq!((stats.hits, stats.misses), (1, 3));
 }
@@ -714,7 +723,12 @@ fn warm_up_loads_by_class_priority_and_stops_at_the_fill_limit() {
         items.push(warm_item(file, section, ArtifactClass::PkIndex, &order));
     }
     for section in 0..3 {
-        items.push(warm_item(file, section, ArtifactClass::GraphAndCodes, &order));
+        items.push(warm_item(
+            file,
+            section,
+            ArtifactClass::GraphAndCodes,
+            &order,
+        ));
     }
     insert(&cache, key(file, 1), ArtifactClass::GraphAndCodes);
     let report = block_on(cache.warm_up(items, &InlineExecutor));
@@ -789,7 +803,10 @@ fn budget_is_the_memory_limit_minus_every_reservation() {
         memtable_bytes: 2_000,
         maintenance_bytes: 3_000,
     };
-    assert_eq!(inputs.cache_budget(), 16_000 - 1_000 - 2_000 - 1_600 - 3_000);
+    assert_eq!(
+        inputs.cache_budget(),
+        16_000 - 1_000 - 2_000 - 1_600 - 3_000
+    );
     let starved = BudgetInputs {
         memory_limit: 1_000,
         pk_index_bytes: 5_000,
@@ -875,13 +892,7 @@ fn stress_stays_within_budget_beyond_pins_and_never_deadlocks() {
                 let result = if thread_index < BLOCKING_THREADS {
                     cache.get_or_load_blocking(key, class, CacheMode::Normal, load)
                 } else {
-                    block_on(cache.get_or_load(
-                        key,
-                        class,
-                        CacheMode::Normal,
-                        &SpawnExecutor,
-                        load,
-                    ))
+                    block_on(cache.get_or_load(key, class, CacheMode::Normal, &SpawnExecutor, load))
                 };
                 if let Ok((bytes, _)) = result {
                     assert_eq!(bytes.len(), len, "a key always maps to its own bytes");

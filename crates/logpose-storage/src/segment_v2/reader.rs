@@ -8,6 +8,13 @@
 //! has. Every other section is read and verified only when asked for. Every
 //! read is bounds-checked against the validated file length before a buffer
 //! is allocated, so a corrupt length can never cause a large allocation.
+//!
+//! With a [`BufferCache`] attached ([`SegmentReader::with_cache`]), every
+//! lazy load goes through it as a [`SegmentUnit`]: whole sections, vector
+//! prefixes and pages, and dynamic block indexes and blocks. Point accessors
+//! use the cache normally; [`SegmentReader::read_rows`] (a full scan) uses
+//! [`CacheMode::Bypass`] so it does not flush the hot set, and
+//! [`SegmentReader::verify`] always reads the file itself.
 
 use super::{
     builder::{IndexSectionKind, ROW_META_U32_DELTA, ROW_META_U64, SCHEMA_ENCODING_POSTCARD},
@@ -22,7 +29,12 @@ use super::{
     pk::{PkColumn, PkFilter, PkSorted},
     source::SectionSource,
     stats::{STATS_ENCODING_POSTCARD, SegmentStats},
-    vector::{PrefixError, VECTOR_ENCODING_F32, VectorPrefix},
+    unit::{Part, SegmentUnit, prefix_error, read_range, section_region},
+    vector::{VECTOR_ENCODING_F32, VectorPrefix},
+};
+use crate::cache::{
+    AlignedBytes, ArtifactClass, BufferCache, CacheKey, CacheMode, Fetch, Fetched, FileId,
+    LoadExecutor, WarmUpItem,
 };
 use logpose_types::{
     SeqNo,
@@ -30,8 +42,15 @@ use logpose_types::{
     schema::{CollectionSchema, FieldId, FieldRef, FieldType},
 };
 use logpose_wal::codec::{F32Bytes, RowImage, ValueBytes, WirePk};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 use twox_hash::XxHash3_64;
+
+/// Classes warm-up loads, in its priority order.
+const WARM_CLASSES: [ArtifactClass; 3] = [
+    ArtifactClass::GraphAndCodes,
+    ArtifactClass::PkIndex,
+    ArtifactClass::ScalarIndex,
+];
 
 /// Sections every segment must have.
 const REQUIRED: [SectionKind; 6] = [
@@ -63,6 +82,22 @@ impl VectorHandle {
     pub fn prefix(&self) -> &VectorPrefix {
         &self.prefix
     }
+
+    /// The load unit of `page`; `None` past the last page.
+    #[must_use]
+    pub fn page_unit(&self, page: u32) -> Option<SegmentUnit> {
+        let range = self.prefix.page_byte_range(page)?;
+        Some(SegmentUnit {
+            index: self.index,
+            entry: self.entry,
+            part: Part::VectorPage {
+                page,
+                start: range.start,
+                end: range.end,
+                crc: self.prefix.page_crc(page)?,
+            },
+        })
+    }
 }
 
 /// A `DynamicJson` section with its verified block index.
@@ -85,6 +120,19 @@ impl DynamicHandle {
     pub fn blocks(&self) -> &DynamicIndex {
         &self.blocks
     }
+
+    /// The load unit of `block`; `None` past the last block.
+    #[must_use]
+    pub fn block_unit(&self, block: u32) -> Option<SegmentUnit> {
+        Some(SegmentUnit {
+            index: self.index,
+            entry: self.entry,
+            part: Part::DynamicBlock {
+                block,
+                location: self.blocks.block(block)?,
+            },
+        })
+    }
 }
 
 /// One row read back from a segment.
@@ -105,6 +153,67 @@ pub struct SegmentReader<S> {
     footer: Footer,
     sections: Arc<[SectionEntry]>,
     schema: Arc<CollectionSchema>,
+    cache: Option<CacheLink>,
+}
+
+/// A reader's registration with a cache. Dropping it (with the reader)
+/// invalidates the file's entries.
+#[derive(Debug)]
+struct CacheLink {
+    cache: BufferCache,
+    file: FileId,
+}
+
+impl Drop for CacheLink {
+    fn drop(&mut self) {
+        self.cache.invalidate_file(self.file);
+    }
+}
+
+/// How a load reaches the bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Via {
+    /// Through the cache (if attached), inserting what is loaded.
+    Cache,
+    /// Through the cache without inserting: full scans.
+    Bypass,
+    /// Straight from the file, ignoring the cache: `verify`.
+    Disk,
+}
+
+impl<S> SegmentReader<S> {
+    /// Route this reader's lazy loads through `cache`, under a new
+    /// [`FileId`]. Dropping the reader invalidates its entries, so a
+    /// segment that is dropped from the collection leaves the cache with
+    /// its last reader.
+    #[must_use]
+    pub fn with_cache(mut self, cache: &BufferCache) -> Self {
+        self.cache = Some(CacheLink {
+            cache: cache.clone(),
+            file: FileId::next(),
+        });
+        self
+    }
+
+    /// The id this reader's units are cached under, if a cache is attached.
+    #[must_use]
+    pub fn cache_file(&self) -> Option<FileId> {
+        self.cache.as_ref().map(|link| link.file)
+    }
+
+    /// The key of `unit` in the attached cache.
+    #[must_use]
+    pub fn unit_key(&self, unit: &SegmentUnit) -> Option<CacheKey> {
+        self.cache.as_ref().map(|link| unit.key(link.file))
+    }
+
+    /// Whether `unit` is resident in the attached cache.
+    #[must_use]
+    pub fn residency(&self, unit: &SegmentUnit) -> bool {
+        self.cache
+            .as_ref()
+            .is_some_and(|link| link.cache.residency(&unit.key(link.file)))
+    }
 }
 
 impl<S: SectionSource> SegmentReader<S> {
@@ -189,6 +298,7 @@ impl<S: SectionSource> SegmentReader<S> {
             footer,
             sections: sections.into(),
             schema: Arc::new(schema),
+            cache: None,
         };
         reader.check_fields()?;
         Ok(reader)
@@ -245,6 +355,88 @@ impl<S: SectionSource> SegmentReader<S> {
             .position(|entry| entry.kind == kind.code() && entry.field == field)
     }
 
+    /// The whole-section unit of section `index`.
+    #[must_use]
+    pub fn section_unit(&self, index: usize) -> Option<SegmentUnit> {
+        Some(SegmentUnit {
+            index,
+            entry: *self.sections.get(index)?,
+            part: Part::Whole,
+        })
+    }
+
+    /// The prefix unit of `field`'s `VectorF32` section.
+    #[must_use]
+    pub fn vector_prefix_unit(&self, field: FieldId) -> Option<SegmentUnit> {
+        let index = self.find_section(SectionKind::VectorF32, Some(field))?;
+        Some(SegmentUnit {
+            index,
+            entry: *self.sections.get(index)?,
+            part: Part::VectorPrefix {
+                rows: self.header.row_count,
+            },
+        })
+    }
+
+    /// The block-index unit of the `DynamicJson` section.
+    #[must_use]
+    pub fn dynamic_index_unit(&self) -> Option<SegmentUnit> {
+        let index = self.find_section(SectionKind::DynamicJson, None)?;
+        Some(SegmentUnit {
+            index,
+            entry: *self.sections.get(index)?,
+            part: Part::DynamicIndex {
+                rows: self.header.row_count,
+            },
+        })
+    }
+
+    /// Load `unit` on the calling thread (an I/O thread), through the cache
+    /// if one is attached, and pin it.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors; a unit that fails to verify is not cached.
+    pub fn load(&self, unit: &SegmentUnit) -> Result<(Arc<AlignedBytes>, Fetched), SegmentError> {
+        self.load_via(unit, Via::Cache)
+    }
+
+    fn load_via(
+        &self,
+        unit: &SegmentUnit,
+        via: Via,
+    ) -> Result<(Arc<AlignedBytes>, Fetched), SegmentError> {
+        match &self.cache {
+            Some(link) if via != Via::Disk => {
+                let mode = if via == Via::Cache && unit.cacheable() {
+                    CacheMode::Normal
+                } else {
+                    CacheMode::Bypass
+                };
+                link.cache
+                    .get_or_load_blocking(unit.key(link.file), unit.class(), mode, || {
+                        unit.load(&self.source, self.file_len)
+                    })
+            }
+            _ => {
+                let start = Instant::now();
+                let bytes = unit.load(&self.source, self.file_len)?;
+                let fetched = Fetched::Loaded {
+                    bytes: bytes.len() as u64,
+                    micros: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
+                };
+                Ok((Arc::new(bytes), fetched))
+            }
+        }
+    }
+
+    fn section_via(&self, index: usize, via: Via) -> Result<Arc<AlignedBytes>, SegmentError> {
+        let unit = self.section_unit(index).ok_or_else(|| {
+            SegmentError::corrupt(Region::SectionTable, format!("no section {index}"))
+        })?;
+        self.load_via(&unit, via).map(|(bytes, _)| bytes)
+    }
+
     fn entry(&self, index: usize) -> Result<SectionEntry, SegmentError> {
         self.sections.get(index).copied().ok_or_else(|| {
             SegmentError::corrupt(Region::SectionTable, format!("no section {index}"))
@@ -255,43 +447,14 @@ impl<S: SectionSource> SegmentReader<S> {
         required(&self.sections, kind)
     }
 
-    /// Read bytes `[offset, offset + len)` of section `index`.
-    fn read_in_section(
-        &self,
-        index: usize,
-        entry: &SectionEntry,
-        offset: u64,
-        len: u64,
-        region: Region,
-    ) -> Result<Vec<u8>, SegmentError> {
-        let in_bounds = offset
-            .checked_add(len)
-            .is_some_and(|end| end <= entry.length);
-        if !in_bounds {
-            return Err(SegmentError::corrupt(
-                region,
-                format!("range {offset}+{len} exceeds section {index}"),
-            ));
-        }
-        read_range(
-            &self.source,
-            self.file_len,
-            entry.offset + offset,
-            len,
-            region,
-        )
-    }
-
-    /// Read the whole payload of section `index` and verify its CRC.
-    ///
-    /// This is the loader for whole-section cache units and the accessor
-    /// for opaque index payloads.
+    /// The whole payload of section `index`, CRC-checked, through the
+    /// cache if one is attached.
     ///
     /// # Errors
     ///
     /// [`SegmentError::Io`], or [`SegmentError::Checksum`] on a mismatch.
-    pub fn read_section(&self, index: usize) -> Result<Vec<u8>, SegmentError> {
-        read_verified(&self.source, self.file_len, index, &self.entry(index)?)
+    pub fn read_section(&self, index: usize) -> Result<Arc<AlignedBytes>, SegmentError> {
+        self.section_via(index, Via::Cache)
     }
 
     /// Per-field sections must name a field of the right family, and every
@@ -353,9 +516,13 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn row_meta(&self) -> Result<Vec<SeqNo>, SegmentError> {
+        self.row_meta_via(Via::Cache)
+    }
+
+    fn row_meta_via(&self, via: Via) -> Result<Vec<SeqNo>, SegmentError> {
         let (index, entry) = self.required(SectionKind::RowMeta)?;
         let region = section_region(index, &entry);
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         self.decode_row_meta(&bytes, &entry)
             .map_err(|error| error.at(region))
     }
@@ -400,9 +567,13 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn pk_column(&self) -> Result<PkColumn, SegmentError> {
+        self.pk_column_via(Via::Cache)
+    }
+
+    fn pk_column_via(&self, via: Via) -> Result<PkColumn, SegmentError> {
         let (index, entry) = self.required(SectionKind::PkColumn)?;
         let region = section_region(index, &entry);
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         self.check_pk_encoding(&entry, region)?;
         PkColumn::decode(&bytes, entry.encoding, usize_from(self.header.row_count))
             .map_err(|error| error.at(region))
@@ -425,9 +596,13 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn pk_sorted(&self) -> Result<PkSorted, SegmentError> {
+        self.pk_sorted_via(Via::Cache)
+    }
+
+    fn pk_sorted_via(&self, via: Via) -> Result<PkSorted, SegmentError> {
         let (index, entry) = self.required(SectionKind::PkSorted)?;
         let region = section_region(index, &entry);
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         self.check_pk_encoding(&entry, region)?;
         PkSorted::decode(&bytes, entry.encoding, usize_from(self.header.row_count))
             .map_err(|error| error.at(region))
@@ -439,14 +614,19 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn pk_filter(&self) -> Result<PkFilter, SegmentError> {
+        self.pk_filter_via(Via::Cache)
+    }
+
+    fn pk_filter_via(&self, via: Via) -> Result<PkFilter, SegmentError> {
         let (index, entry) = self.required(SectionKind::PkFilter)?;
         let region = section_region(index, &entry);
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         PkFilter::decode(&bytes, entry.encoding).map_err(|error| error.at(region))
     }
 
     /// The row holding `pk`, if any: a filter probe, then a binary search.
-    /// Loads the pk sections on every call; the engine caches them.
+    /// Loads the pk sections through the cache when one is attached, and
+    /// decodes them on every call.
     ///
     /// # Errors
     ///
@@ -469,9 +649,13 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn stats(&self) -> Result<SegmentStats, SegmentError> {
+        self.stats_via(Via::Cache)
+    }
+
+    fn stats_via(&self, via: Via) -> Result<SegmentStats, SegmentError> {
         let (index, entry) = self.required(SectionKind::Stats)?;
         let region = section_region(index, &entry);
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         if entry.encoding != STATS_ENCODING_POSTCARD {
             return Err(SegmentError::corrupt(region, "unknown stats encoding"));
         }
@@ -496,10 +680,18 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn scalar_column(&self, field: FieldId) -> Result<Option<ScalarColumn>, SegmentError> {
+        self.scalar_column_via(field, Via::Cache)
+    }
+
+    fn scalar_column_via(
+        &self,
+        field: FieldId,
+        via: Via,
+    ) -> Result<Option<ScalarColumn>, SegmentError> {
         let Some(index) = self.find_section(SectionKind::ScalarColumn, Some(field)) else {
             return Ok(None);
         };
-        let bytes = self.read_section(index)?;
+        let bytes = self.section_via(index, via)?;
         self.decode_scalar(index, &self.entry(index)?, &bytes)
             .map(Some)
     }
@@ -542,42 +734,67 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn vector(&self, field: FieldId) -> Result<Option<VectorHandle>, SegmentError> {
-        let Some(index) = self.find_section(SectionKind::VectorF32, Some(field)) else {
-            return Ok(None);
-        };
-        let entry = self.entry(index)?;
-        let region = Region::VectorPrefix { index };
-        let head =
-            self.read_in_section(index, &entry, 0, VectorPrefix::HEADER_LEN as u64, region)?;
-        let len =
-            VectorPrefix::prefix_len(&head, entry.length).map_err(|error| error.at(region))?;
-        let bytes = self.read_in_section(index, &entry, 0, len as u64, region)?;
-        self.decode_vector_prefix(index, entry, &bytes).map(Some)
+        self.vector_via(field, Via::Cache)
     }
 
-    /// Decode a vector prefix; `bytes` may extend past its end.
+    fn vector_via(&self, field: FieldId, via: Via) -> Result<Option<VectorHandle>, SegmentError> {
+        let Some(unit) = self.vector_prefix_unit(field) else {
+            return Ok(None);
+        };
+        let (bytes, _) = self.load_via(&unit, via)?;
+        self.vector_handle(&unit, &bytes).map(Some)
+    }
+
+    /// The handle for a loaded prefix unit (from
+    /// [`vector_prefix_unit`](Self::vector_prefix_unit)). The handle pins
+    /// `bytes`: it reads page CRCs from them.
+    ///
+    /// # Errors
+    ///
+    /// A corruption error if `unit` is not a vector prefix unit of this
+    /// reader or `bytes` do not decode.
+    pub fn vector_handle(
+        &self,
+        unit: &SegmentUnit,
+        bytes: &Arc<AlignedBytes>,
+    ) -> Result<VectorHandle, SegmentError> {
+        let index = unit.index;
+        let region = Region::VectorPrefix { index };
+        if !matches!(unit.part, Part::VectorPrefix { .. })
+            || self.sections.get(index) != Some(&unit.entry)
+        {
+            return Err(SegmentError::corrupt(
+                region,
+                "not a vector prefix unit of this segment",
+            ));
+        }
+        let prefix = VectorPrefix::decode_verified(
+            bytes,
+            unit.entry.aux32,
+            self.header.row_count,
+            unit.entry.length,
+        )
+        .map_err(|error| error.at(region))?;
+        Ok(VectorHandle {
+            index,
+            entry: unit.entry,
+            prefix,
+        })
+    }
+
+    /// Decode and verify a vector prefix from the whole section payload.
     fn decode_vector_prefix(
         &self,
         index: usize,
         entry: SectionEntry,
-        bytes: &[u8],
+        bytes: &Arc<AlignedBytes>,
     ) -> Result<VectorHandle, SegmentError> {
         let region = Region::VectorPrefix { index };
         if entry.encoding != VECTOR_ENCODING_F32 {
             return Err(SegmentError::corrupt(region, "unknown vector encoding"));
         }
-        let len =
-            VectorPrefix::prefix_len(bytes, entry.length).map_err(|error| error.at(region))?;
-        let prefix_bytes = bytes
-            .get(..len)
-            .ok_or_else(|| SegmentError::corrupt(region, "vector prefix is truncated"))?;
-        let prefix = VectorPrefix::decode(
-            prefix_bytes,
-            entry.aux32,
-            self.header.row_count,
-            entry.length,
-        )
-        .map_err(|error| prefix_error(error, index, region))?;
+        let prefix = VectorPrefix::decode(bytes, entry.aux32, self.header.row_count, entry.length)
+            .map_err(|error| prefix_error(error, index, region))?;
         Ok(VectorHandle {
             index,
             entry,
@@ -592,24 +809,16 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O errors, or [`SegmentError::Checksum`] for the page.
     pub fn vector_page(&self, handle: &VectorHandle, page: u32) -> Result<Vec<f32>, SegmentError> {
-        let region = Region::VectorPage {
-            index: handle.index,
-            page,
-        };
-        let range = handle
-            .prefix
-            .page_byte_range(page)
-            .ok_or_else(|| SegmentError::corrupt(region, "no such page"))?;
-        let bytes = self.read_in_section(
-            handle.index,
-            &handle.entry,
-            range.start,
-            range.end - range.start,
-            region,
-        )?;
-        if !handle.prefix.page_matches(page, &bytes) {
-            return Err(SegmentError::Checksum { region });
-        }
+        let unit = handle.page_unit(page).ok_or_else(|| {
+            SegmentError::corrupt(
+                Region::VectorPage {
+                    index: handle.index,
+                    page,
+                },
+                "no such page",
+            )
+        })?;
+        let (bytes, _) = self.load(&unit)?;
         Ok(f32s_from_le(&bytes))
     }
 
@@ -643,11 +852,11 @@ impl<S: SectionSource> SegmentReader<S> {
 
     /// All vectors of the section as little-endian bytes (`row_count * dim
     /// * 4`), checked against the whole-section CRC.
-    fn vector_data(&self, handle: &VectorHandle) -> Result<Vec<u8>, SegmentError> {
-        let mut bytes = self.read_section(handle.index)?;
+    fn vector_data(&self, handle: &VectorHandle, via: Via) -> Result<VectorData, SegmentError> {
+        let bytes = self.section_via(handle.index, via)?;
         let start = usize_from_u64(handle.prefix.data_offset())
             .map_err(|error| error.at(section_region(handle.index, &handle.entry)))?;
-        Ok(bytes.split_off(start.min(bytes.len())))
+        Ok(VectorData { bytes, start })
     }
 
     /// The `DynamicJson` section with its verified block index; `None` if
@@ -657,16 +866,46 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn dynamic(&self) -> Result<Option<DynamicHandle>, SegmentError> {
-        let Some(index) = self.find_section(SectionKind::DynamicJson, None) else {
+        self.dynamic_via(Via::Cache)
+    }
+
+    fn dynamic_via(&self, via: Via) -> Result<Option<DynamicHandle>, SegmentError> {
+        let Some(unit) = self.dynamic_index_unit() else {
             return Ok(None);
         };
-        let entry = self.entry(index)?;
+        let (bytes, _) = self.load_via(&unit, via)?;
+        self.dynamic_handle(&unit, &bytes).map(Some)
+    }
+
+    /// The handle for a loaded block-index unit (from
+    /// [`dynamic_index_unit`](Self::dynamic_index_unit)).
+    ///
+    /// # Errors
+    ///
+    /// A corruption error if `unit` is not the dynamic index unit of this
+    /// reader or `bytes` do not decode.
+    pub fn dynamic_handle(
+        &self,
+        unit: &SegmentUnit,
+        bytes: &[u8],
+    ) -> Result<DynamicHandle, SegmentError> {
+        let index = unit.index;
         let region = Region::DynamicIndex { index };
-        let head =
-            self.read_in_section(index, &entry, 0, DynamicIndex::HEADER_LEN as u64, region)?;
-        let len = DynamicIndex::index_len(&head, entry.length).map_err(|error| error.at(region))?;
-        let bytes = self.read_in_section(index, &entry, 0, len as u64, region)?;
-        self.decode_dynamic_index(index, entry, &bytes).map(Some)
+        if !matches!(unit.part, Part::DynamicIndex { .. })
+            || self.sections.get(index) != Some(&unit.entry)
+        {
+            return Err(SegmentError::corrupt(
+                region,
+                "not a dynamic index unit of this segment",
+            ));
+        }
+        let blocks = DynamicIndex::decode_verified(bytes, self.header.row_count, unit.entry.length)
+            .map_err(|error| error.at(region))?;
+        Ok(DynamicHandle {
+            index,
+            entry: unit.entry,
+            blocks,
+        })
     }
 
     /// Decode a dynamic header and block index; `bytes` may extend past it.
@@ -706,25 +945,24 @@ impl<S: SectionSource> SegmentReader<S> {
         handle: &DynamicHandle,
         block: u32,
     ) -> Result<DynamicBlock, SegmentError> {
+        self.dynamic_block_via(handle, block, Via::Cache)
+    }
+
+    fn dynamic_block_via(
+        &self,
+        handle: &DynamicHandle,
+        block: u32,
+        via: Via,
+    ) -> Result<DynamicBlock, SegmentError> {
         let region = Region::DynamicBlock {
             index: handle.index,
             block,
         };
-        let (location, rows) = handle
-            .blocks
-            .block(block)
+        let (unit, rows) = handle
+            .block_unit(block)
             .zip(handle.blocks.block_rows(block))
             .ok_or_else(|| SegmentError::corrupt(region, "no such block"))?;
-        let bytes = self.read_in_section(
-            handle.index,
-            &handle.entry,
-            location.offset,
-            u64::from(location.len),
-            region,
-        )?;
-        if crc(&bytes) != location.crc32c {
-            return Err(SegmentError::Checksum { region });
-        }
+        let (bytes, _) = self.load_via(&unit, via)?;
         DynamicBlock::decode(&bytes, rows).map_err(|error| error.at(region))
     }
 
@@ -767,7 +1005,10 @@ impl<S: SectionSource> SegmentReader<S> {
         let Some(index) = self.find_section(kind.section_kind(), Some(field)) else {
             return Ok(None);
         };
-        Ok(Some((self.entry(index)?, self.read_section(index)?)))
+        Ok(Some((
+            self.entry(index)?,
+            self.read_section(index)?.to_vec(),
+        )))
     }
 
     /// Read every row back as a WAL row image. Used by compaction-style
@@ -777,16 +1018,17 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// I/O or corruption errors.
     pub fn read_rows(&self) -> Result<Vec<SegmentRow>, SegmentError> {
+        let via = Via::Bypass;
         let rows = usize_from(self.header.row_count);
-        let seqs = self.row_meta()?;
-        let pks = self.pk_column()?;
+        let seqs = self.row_meta_via(via)?;
+        let pks = self.pk_column_via(via)?;
         let mut vectors = Vec::new();
         let mut vector_fields: Vec<_> =
             self.schema.vectors().iter().map(|field| field.id).collect();
         vector_fields.sort_unstable();
         for field in vector_fields {
-            if let Some(handle) = self.vector(field)? {
-                let data = self.vector_data(&handle)?;
+            if let Some(handle) = self.vector_via(field, via)? {
+                let data = self.vector_data(&handle, via)?;
                 vectors.push((field, handle, data));
             }
         }
@@ -794,13 +1036,13 @@ impl<S: SectionSource> SegmentReader<S> {
         let mut scalar_fields: Vec<_> = self.schema.fields().iter().map(|field| field.id).collect();
         scalar_fields.sort_unstable();
         for field in scalar_fields {
-            if let Some(column) = self.scalar_column(field)? {
+            if let Some(column) = self.scalar_column_via(field, via)? {
                 columns.push((field, column));
             }
         }
-        let dynamic = match self.dynamic()? {
+        let dynamic = match self.dynamic_via(via)? {
             Some(handle) => (0..handle.blocks.block_count())
-                .map(|block| self.dynamic_block(&handle, block))
+                .map(|block| self.dynamic_block_via(&handle, block, via))
                 .collect::<Result<Vec<_>, _>>()?,
             None => Vec::new(),
         };
@@ -822,7 +1064,7 @@ impl<S: SectionSource> SegmentReader<S> {
                     continue;
                 }
                 let stride = usize_from(handle.prefix.dim()) * 4;
-                let bytes = data.get(row * stride..(row + 1) * stride).ok_or_else(|| {
+                let bytes = data.row(row, stride).ok_or_else(|| {
                     SegmentError::corrupt(section_region(handle.index, &handle.entry), "short data")
                 })?;
                 let vector = F32Bytes::from_le_bytes(bytes.to_vec()).ok_or_else(|| {
@@ -859,18 +1101,19 @@ impl<S: SectionSource> SegmentReader<S> {
     ///
     /// The first I/O or corruption error found.
     pub fn verify(&self) -> Result<(), SegmentError> {
+        let via = Via::Disk;
         self.verify_padding()?;
-        let seqs = self.row_meta()?;
-        let pks = self.pk_column()?;
+        let seqs = self.row_meta_via(via)?;
+        let pks = self.pk_column_via(via)?;
         let (sorted_index, sorted_entry) = self.required(SectionKind::PkSorted)?;
-        self.pk_sorted()?
+        self.pk_sorted_via(via)?
             .check_against(&pks)
             .map_err(|error| error.at(section_region(sorted_index, &sorted_entry)))?;
         let (filter_index, filter_entry) = self.required(SectionKind::PkFilter)?;
-        self.pk_filter()?
+        self.pk_filter_via(via)?
             .check_against(&pks)
             .map_err(|error| error.at(section_region(filter_index, &filter_entry)))?;
-        let stats = self.stats()?;
+        let stats = self.stats_via(via)?;
         for (index, entry) in self.sections.iter().enumerate() {
             let region = section_region(index, entry);
             let kind = entry.section_kind();
@@ -878,7 +1121,7 @@ impl<S: SectionSource> SegmentReader<S> {
                 // Read and checked above, or at open for the schema.
                 continue;
             }
-            let bytes = self.read_section(index)?;
+            let bytes = self.section_via(index, via)?;
             match kind {
                 Some(SectionKind::VectorF32) => {
                     let handle = self.decode_vector_prefix(index, *entry, &bytes)?;
@@ -1028,48 +1271,69 @@ impl<S: SectionSource> SegmentReader<S> {
     }
 }
 
+impl<S: SectionSource + Clone + 'static> SegmentReader<S> {
+    /// Load `unit` on `executor` (the engine's `IoPool`), through the cache
+    /// if one is attached. The returned future only waits: the lookup and
+    /// the hand-off to the executor happen before this returns.
+    pub fn fetch(&self, unit: &SegmentUnit, executor: &dyn LoadExecutor) -> Fetch {
+        let source = self.source.clone();
+        let file_len = self.file_len;
+        let owned = unit.clone();
+        let load = move || owned.load(&source, file_len);
+        match &self.cache {
+            Some(link) => {
+                let mode = if unit.cacheable() {
+                    CacheMode::Normal
+                } else {
+                    CacheMode::Bypass
+                };
+                link.cache
+                    .get_or_load(unit.key(link.file), unit.class(), mode, executor, load)
+            }
+            None => Fetch::detached(executor, unit.class(), Box::new(load)),
+        }
+    }
+
+    /// Warm-up items for this segment: every whole section of the classes
+    /// warm-up loads (`GraphAndCodes`, `PkIndex`, `ScalarIndex`). Empty
+    /// without a cache.
+    #[must_use]
+    pub fn warm_up_items(&self) -> Vec<WarmUpItem> {
+        let Some(link) = &self.cache else {
+            return Vec::new();
+        };
+        (0..self.sections.len())
+            .filter_map(|index| self.section_unit(index))
+            .filter(|unit| unit.cacheable() && WARM_CLASSES.contains(&unit.class()))
+            .map(|unit| {
+                let source = self.source.clone();
+                let file_len = self.file_len;
+                WarmUpItem {
+                    key: unit.key(link.file),
+                    class: unit.class(),
+                    bytes: unit.entry.length,
+                    load: Box::new(move || unit.load(&source, file_len)),
+                }
+            })
+            .collect()
+    }
+}
+
 fn column_encoding_code(bytes: &[u8]) -> u8 {
     bytes.first().copied().unwrap_or(0)
 }
 
-fn section_region(index: usize, entry: &SectionEntry) -> Region {
-    Region::Section {
-        index,
-        kind: entry.kind,
-    }
+/// The data area of a whole `VectorF32` section.
+struct VectorData {
+    bytes: Arc<AlignedBytes>,
+    start: usize,
 }
 
-fn prefix_error(error: PrefixError, index: usize, region: Region) -> SegmentError {
-    match error {
-        PrefixError::Checksum => SegmentError::Checksum { region },
-        PrefixError::Page(page) => SegmentError::Checksum {
-            region: Region::VectorPage { index, page },
-        },
-        PrefixError::Malformed(error) => error.at(region),
+impl VectorData {
+    fn row(&self, row: usize, stride: usize) -> Option<&[u8]> {
+        let begin = self.start.checked_add(row.checked_mul(stride)?)?;
+        self.bytes.get(begin..begin.checked_add(stride)?)
     }
-}
-
-/// Read `[offset, offset + len)`, refusing ranges past `file_len` before
-/// allocating.
-fn read_range<S: SectionSource>(
-    source: &S,
-    file_len: u64,
-    offset: u64,
-    len: u64,
-    region: Region,
-) -> Result<Vec<u8>, SegmentError> {
-    let fits = offset.checked_add(len).is_some_and(|end| end <= file_len);
-    if !fits {
-        return Err(SegmentError::corrupt(
-            region,
-            format!("range {offset}+{len} exceeds the file length {file_len}"),
-        ));
-    }
-    let len = usize::try_from(len)
-        .map_err(|_| SegmentError::corrupt(region, "range does not fit in memory"))?;
-    let mut buf = vec![0_u8; len];
-    source.read_exact_at(&mut buf, offset)?;
-    Ok(buf)
 }
 
 /// Sections are in file order, 64-byte aligned, back to back with only
@@ -1153,13 +1417,13 @@ fn read_verified<S: SectionSource>(
     file_len: u64,
     index: usize,
     entry: &SectionEntry,
-) -> Result<Vec<u8>, SegmentError> {
-    let region = section_region(index, entry);
-    let bytes = read_range(source, file_len, entry.offset, entry.length, region)?;
-    if crc(&bytes) != entry.crc32c {
-        return Err(SegmentError::Checksum { region });
+) -> Result<AlignedBytes, SegmentError> {
+    SegmentUnit {
+        index,
+        entry: *entry,
+        part: Part::Whole,
     }
-    Ok(bytes)
+    .load(source, file_len)
 }
 
 /// Read, verify, and decode the schema snapshot.
