@@ -12,5 +12,10 @@ Before opening a pull request, run:
 scripts/check.sh
 ```
 
-The full workspace verification flow now expects etcd to be reachable at
-`http://127.0.0.1:2379` unless you override `LOGPOSE_TEST_ETCD_ENDPOINTS`.
+The etcd integration tests run only when `LOGPOSE_TEST_ETCD_ENDPOINTS` is set,
+for example to `http://127.0.0.1:2379`. When it is set, an unreachable etcd
+fails those tests. When it is unset, they pass without running (run with
+`--nocapture` to see the skip message), except when `CI` is set, where they
+fail so CI cannot silently drop them. The Rust Tests workflow sets it.
+`scripts/check.sh` builds the mdBook only when `mdbook` and `mdbook-toc` are
+installed.
