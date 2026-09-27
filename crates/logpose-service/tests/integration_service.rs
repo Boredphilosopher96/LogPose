@@ -1427,6 +1427,61 @@ async fn service_maps_missing_collections_to_not_found() {
     assert!(matches!(error, ServiceError::NotFound(message) if message.contains("missing")));
 }
 
+#[tokio::test]
+async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
+    let root = unique_temp_dir("service-invalid-records");
+    let service = LogPoseDataService::local(&root).expect("data service should open");
+
+    service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "documents".to_owned(),
+            dimensions: 2,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect("collection should be created");
+
+    let put = |id: String, vector: Vec<f32>, metadata: Value| {
+        WriteOperation::Put(PutRecord {
+            id: RecordId::new(id),
+            vector,
+            metadata,
+        })
+    };
+    for operation in [
+        put("a".to_owned(), vec![1.0, 0.0], json!("text")),
+        put("a".to_owned(), vec![1.0, 0.0], json!({"id": "x"})),
+        put("a".to_owned(), vec![1.0, 0.0], json!({"vector": 1})),
+        put("a".to_owned(), vec![f32::INFINITY, 0.0], Value::Null),
+        put("a".repeat(1_025), vec![1.0, 0.0], Value::Null),
+        put(String::new(), vec![1.0, 0.0], Value::Null),
+    ] {
+        let error = service
+            .write("documents", vec![operation.clone()])
+            .await
+            .expect_err("invalid record should be rejected");
+        assert!(
+            matches!(error, ServiceError::InvalidArgument(_)),
+            "{operation:?} should be an invalid argument, got {error:?}"
+        );
+    }
+
+    let error = service
+        .create_collection(CreateCollectionRequest {
+            database_name: "default".to_owned(),
+            name: "huge".to_owned(),
+            dimensions: 65_537,
+            metric: DistanceMetric::Dot,
+        })
+        .await
+        .expect_err("too many dimensions should be rejected");
+    assert!(
+        matches!(error, ServiceError::InvalidArgument(_)),
+        "too many dimensions should be an invalid argument, got {error:?}"
+    );
+}
+
 fn unique_temp_dir(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
