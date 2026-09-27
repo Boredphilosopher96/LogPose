@@ -1338,9 +1338,17 @@ impl From<LogPoseError> for ServiceError {
     fn from(error: LogPoseError) -> Self {
         match error {
             LogPoseError::Message(message) => classify_message(message),
-            error @ LogPoseError::StorageRootLocked { .. } => {
+            error @ (LogPoseError::StorageRootLocked { .. }
+            | LogPoseError::CollectionPoisoned { .. }) => {
                 ServiceError::FailedPrecondition(error.to_string())
             }
+            error @ LogPoseError::TooLarge { .. } => {
+                ServiceError::InvalidArgument(error.to_string())
+            }
+            error @ (LogPoseError::Corrupt { .. }
+            | LogPoseError::WalWriteFailed { .. }
+            | LogPoseError::Io { .. }
+            | LogPoseError::Internal { .. }) => ServiceError::Internal(error.to_string()),
         }
     }
 }

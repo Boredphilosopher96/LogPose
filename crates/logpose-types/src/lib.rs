@@ -45,6 +45,151 @@ pub enum LogPoseError {
         /// Process id recorded in the lock file by the holder, if readable.
         holder_pid: Option<String>,
     },
+
+    // Storage health and the write path: an operator or the client has to act.
+    /// Stored data is corrupt: a WAL that no crash can produce, an undecodable payload, or a
+    /// checkpoint frame the manifest has not reached.
+    #[error("{message}")]
+    Corrupt {
+        /// Which structure is damaged.
+        kind: CorruptionKind,
+        /// The file or key, when known.
+        location: Option<String>,
+        /// What is wrong.
+        message: String,
+    },
+    /// A collection refuses writes and maintenance until it is reopened, after a WAL write or
+    /// a manifest publish failed. It keeps serving reads of its last published state.
+    #[error("collection '{collection}' is read-only until it is reopened: {reason}")]
+    CollectionPoisoned {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// The failure that poisoned it.
+        reason: String,
+    },
+    /// The WAL group holding this write could not be made durable, so the write was not
+    /// acknowledged. `outcome` says whether it can still appear after recovery: treat
+    /// [`WriteOutcome::Unknown`] like a timeout.
+    #[error("WAL write to collection '{collection}' failed ({outcome}): {reason}")]
+    WalWriteFailed {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Whether the failed group can reappear after recovery.
+        outcome: WriteOutcome,
+        /// What failed.
+        reason: String,
+    },
+    /// A filesystem operation failed.
+    #[error("{context}: {source}")]
+    Io {
+        /// What LogPose was doing.
+        context: String,
+        /// The underlying error.
+        #[source]
+        source: std::sync::Arc<std::io::Error>,
+    },
+    /// A request, message, or batch exceeds a size limit.
+    #[error(
+        "{what}{} exceeds the {limit}-byte limit",
+        size.map(|size| format!(" of {size} bytes")).unwrap_or_default()
+    )]
+    TooLarge {
+        /// What was too large, such as `WAL frame payload`.
+        what: String,
+        /// Its size in bytes, when known.
+        size: Option<u64>,
+        /// The limit in bytes.
+        limit: u64,
+    },
+    /// An unexpected failure that no other variant describes.
+    #[error("{message}")]
+    Internal {
+        /// What went wrong.
+        message: String,
+    },
+}
+
+/// Which stored structure a [`LogPoseError::Corrupt`] error found damaged.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CorruptionKind {
+    /// A write-ahead log file.
+    Wal,
+    /// A segment file.
+    Segment,
+    /// A manifest or the `CURRENT` pointer.
+    Manifest,
+    /// An index sidecar file.
+    Index,
+    /// A descriptor file: collection, database, principal, or policy.
+    Descriptor,
+    /// A record in the distributed metadata store.
+    Metadata,
+}
+
+impl CorruptionKind {
+    /// Stable machine name, reported as `corruption_kind` in error metadata.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wal => "wal",
+            Self::Segment => "segment",
+            Self::Manifest => "manifest",
+            Self::Index => "index",
+            Self::Descriptor => "descriptor",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
+impl fmt::Display for CorruptionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl LogPoseError {
+    /// A filesystem operation failed while doing `context`.
+    pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            context: context.into(),
+            source: std::sync::Arc::new(source),
+        }
+    }
+
+    /// An unexpected failure.
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+}
+
+/// What a failed WAL group append means for the writes it held.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcome {
+    /// The WAL was truncated back to the last synced group and the truncation was synced: the
+    /// writes are absent after any crash and will never be replayed.
+    NotApplied,
+    /// The rollback failed, so the writes may or may not be replayed later. Clients must treat
+    /// this like a timeout.
+    Unknown {
+        /// Whether the `FSYNC_FAILED` fence marker was written durably. When it was not, a
+        /// later open in the same boot cannot notice the hazard, so the process must stop.
+        fenced: bool,
+    },
+}
+
+impl fmt::Display for WriteOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotApplied => formatter.write_str("not applied"),
+            Self::Unknown { fenced: true } => formatter.write_str("outcome unknown, WAL fenced"),
+            Self::Unknown { fenced: false } => {
+                formatter.write_str("outcome unknown, WAL not fenced")
+            }
+        }
+    }
 }
 
 /// Build metadata surfaced by service entrypoints.
