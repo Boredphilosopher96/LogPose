@@ -460,14 +460,14 @@ anything is written, and one invalid operation rejects the whole batch:
   fields, so they cannot be named `id` or `vector`, the collection's
   declared key and vector fields, or `$extra`, which is reserved.
 
-| Status | Meaning                                     |
-|--------|---------------------------------------------|
-| `200`  | Write committed                             |
-| `400`  | Invalid request; see `field_violations`     |
-| `404`  | Collection not found                        |
+| Status | Meaning                                                                                       |
+|--------|-----------------------------------------------------------------------------------------------|
+| `200`  | Write committed                                                                               |
+| `400`  | Invalid request; see `field_violations`                                                       |
+| `404`  | Collection not found                                                                          |
 | `409`  | Wrong node role, or collection read-only until the engine is reopened (`COLLECTION_POISONED`) |
-| `413`  | Request body too large                      |
-| `503`  | Not the owner (`NOT_OWNER`)                 |
+| `413`  | Request body too large                                                                        |
+| `503`  | Not the owner (`NOT_OWNER`)                                                                   |
 
 gRPC equivalent:
 
