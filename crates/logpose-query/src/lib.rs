@@ -201,7 +201,7 @@ pub enum QueryError {
         /// Actual stored dimensionality.
         actual: usize,
     },
-    /// FilterExpr structure is malformed for the requested operators.
+    /// Filter structure is malformed for the requested operators.
     #[error("{0}")]
     InvalidPredicate(String),
     /// Storage failures are surfaced directly from the read path.
