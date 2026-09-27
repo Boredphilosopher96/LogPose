@@ -12,6 +12,8 @@ use std::{
     path::Path,
 };
 
+mod durable;
+
 /// Index family available for a queryable unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,16 +133,14 @@ pub fn build_flat_index(
     }
 }
 
-/// Persist a flat exact sidecar to disk.
+/// Durably persist a flat exact sidecar to disk.
+///
+/// The write is atomic: readers see either the previous file or the complete new one, and the
+/// contents and directory entry are fsynced before this returns.
 pub fn write_flat_index(path: &Path, sidecar: &FlatIndexSidecar) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(sidecar)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
-    )
+    let bytes = serde_json::to_vec_pretty(sidecar)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    durable::write_atomic(path, &bytes)
 }
 
 /// Load a flat exact sidecar from disk.
@@ -325,12 +325,11 @@ pub fn build_hnsw_index(
     Ok(index)
 }
 
-/// Persist an HNSW sidecar to disk as a binary artifact.
+/// Durably persist an HNSW sidecar to disk as a binary artifact.
+///
+/// The write is atomic: readers see either the previous file or the complete new one, and the
+/// contents and directory entry are fsynced before this returns.
 pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let mut bytes = Vec::new();
     bytes.extend_from_slice(HNSW_MAGIC);
     write_u16(&mut bytes, sidecar.version);
@@ -371,7 +370,7 @@ pub fn write_hnsw_index(path: &Path, sidecar: &HnswIndexSidecar) -> io::Result<(
             }
         }
     }
-    fs::write(path, bytes)
+    durable::write_atomic(path, &bytes)
 }
 
 /// Load an HNSW sidecar from disk.
