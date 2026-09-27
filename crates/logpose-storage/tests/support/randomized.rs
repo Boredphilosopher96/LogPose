@@ -249,7 +249,7 @@ pub fn current_exact_query_request_for_test(vector: Vec<f32>) -> QueryRequest {
 
 async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
     let root = fs_support::unique_temp_dir(&format!("storage-random-{seed}"));
-    let mut engine = LocalStorageEngine::new(&root);
+    let mut engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     let mut rng = StdRng::seed_from_u64(seed);
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
@@ -428,7 +428,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize) {
                 assert_segment_inspect_matches(&engine, &model, seed, &trace).await;
             }
             StorageAction::Reopen => {
-                engine = LocalStorageEngine::new(&root);
+                engine = LocalStorageEngine::new(&root).expect("storage engine should open");
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, None, seed, &trace).await;
