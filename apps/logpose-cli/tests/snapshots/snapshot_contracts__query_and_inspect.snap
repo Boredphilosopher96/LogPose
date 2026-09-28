@@ -94,20 +94,20 @@ expression: snapshot
       "records": [
         {
           "deleted": false,
-          "id": "alpha",
           "op": "put",
+          "pk": "alpha",
           "seq_no": 1
         },
         {
           "deleted": false,
-          "id": "beta",
           "op": "put",
+          "pk": "beta",
           "seq_no": 2
         },
         {
           "deleted": false,
-          "id": "gamma",
           "op": "put",
+          "pk": "gamma",
           "seq_no": 3
         }
       ],
@@ -139,20 +139,20 @@ expression: snapshot
       "records": [
         {
           "deleted": false,
-          "id": "alpha",
           "op": "put",
+          "pk": "alpha",
           "seq_no": 1
         },
         {
           "deleted": false,
-          "id": "beta",
           "op": "put",
+          "pk": "beta",
           "seq_no": 2
         },
         {
           "deleted": false,
-          "id": "gamma",
           "op": "put",
+          "pk": "gamma",
           "seq_no": 3
         }
       ]
