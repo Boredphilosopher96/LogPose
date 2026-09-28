@@ -35,9 +35,19 @@ pub(crate) struct PreparedRequests {
     pub(crate) rows: usize,
 }
 
-/// Groups with fewer rows than this are prepared inline on the writer task; larger ones on the
-/// query pool.
+/// Groups with fewer rows than this, and fewer approximate bytes than [`INLINE_PREPARE_BYTES`],
+/// are prepared inline on the writer task; larger ones on the query pool.
 pub(crate) const INLINE_PREPARE_ROWS: usize = 64;
+/// Approximate request bytes at which a group is prepared on the query pool however few rows it
+/// has: validating, normalizing and encoding a few very large rows (high-dimensional vectors,
+/// big documents) is more CPU than the writer runtime may spend inline.
+pub(crate) const INLINE_PREPARE_BYTES: usize = 256 * 1024;
+
+/// Whether a group of `rows` row operations and about `bytes` request bytes is prepared inline
+/// on the writer task.
+pub(crate) fn prepares_inline(rows: usize, bytes: usize) -> bool {
+    rows < INLINE_PREPARE_ROWS && bytes < INLINE_PREPARE_BYTES
+}
 
 /// Prepare `requests` in order against `state`, whose next sequence number is `next_seq_no`.
 /// A request that fails validation is acknowledged with its error right away and consumes no

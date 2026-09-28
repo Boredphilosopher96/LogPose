@@ -417,7 +417,7 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
     let behind = {
         let handle = Arc::clone(&handle);
         tokio::spawn(async move {
-            let rows = (0..2 * INLINE_PREPARE_ROWS)
+            let rows = (0..2 * super::prepare::INLINE_PREPARE_ROWS)
                 .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
                 .collect();
             let large = handle.write(ops(&handle, rows));
@@ -1050,4 +1050,123 @@ fn a_version_1_wal_is_an_unsupported_format() {
         .collection(&reference("legacy"))
         .expect_err("a v1 WAL is refused");
     assert!(error.to_string().contains("unexpected WAL file"), "{error}");
+}
+
+/// A group is prepared inline only when it is small in rows and in bytes: a few very large rows
+/// go to the query pool too.
+#[test]
+fn inline_preparation_is_bounded_by_rows_and_by_bytes() {
+    use super::prepare::{INLINE_PREPARE_BYTES, INLINE_PREPARE_ROWS, prepares_inline};
+    assert!(prepares_inline(1, 64));
+    assert!(prepares_inline(
+        INLINE_PREPARE_ROWS - 1,
+        INLINE_PREPARE_BYTES - 1
+    ));
+    assert!(!prepares_inline(INLINE_PREPARE_ROWS, 64));
+    assert!(!prepares_inline(1, INLINE_PREPARE_BYTES));
+    // Four rows of 32k-dimension vectors are half a megabyte: not inline.
+    let rows = (0..4)
+        .map(|index| put(&format!("wide-{index}"), vec![0.5; 32 * 1024]))
+        .collect::<Vec<_>>();
+    let request = WriteRequest::Batch {
+        ops: legacy_ops(
+            &logpose_catalog::CollectionDescriptor::new(
+                "wide",
+                32 * 1024,
+                DistanceMetric::Dot,
+                std::path::Path::new("/c"),
+            ),
+            rows,
+        )
+        .expect("rows map"),
+        ack: tokio::sync::oneshot::channel().0,
+    };
+    assert!(!prepares_inline(
+        request.rows(),
+        request.approximate_bytes()
+    ));
+}
+
+/// A drop voids the maintenance requests outstanding when it starts. When the drop does not
+/// commit, a later write over the flush threshold requests a flush again: the request that the
+/// drop refused must not leave the writer believing one is still queued.
+#[test]
+fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
+    let fault = FaultVfs::new(15);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    let mut descriptor = engine
+        .core()
+        .plan_collection_descriptor(&CreateCollectionRequest::new(
+            "requests",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .expect("descriptor should plan");
+    descriptor.flush_threshold_ops = 2;
+    descriptor.flush_threshold_bytes = usize::MAX;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    let handle = engine
+        .create_collection(descriptor, None)
+        .expect("collection should be created");
+    let core = engine.core();
+    let status = || core.maintenance_status(&handle);
+    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    // Hold the job slot, so the flush the threshold requests waits in the writer's queue.
+    let (ticket, _) = handle
+        .begin_job(JobKind::Compact)
+        .expect("the slot is free");
+    for id in ["a", "b"] {
+        core.write(&handle, vec![put(id, vec![1.0, 0.0])])
+            .expect("write");
+    }
+    wait_for("the requested flush to begin", &|| {
+        status().in_progress.as_deref() == Some("flush")
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    // A drop that fails its rename: the waiting flush is refused.
+    vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
+    let dropped = {
+        let engine = engine.clone();
+        std::thread::spawn(move || engine.drop_collection(&reference("requests")))
+    };
+    wait_for("the drop to start", &|| handle.is_dropped());
+    std::thread::sleep(Duration::from_millis(100));
+    drop(ticket);
+    dropped
+        .join()
+        .expect("drop should join")
+        .expect_err("the rename fails");
+    vfs.stop_failing_renames();
+    assert!(!handle.is_dropped());
+    assert_eq!(
+        handle.current().manifest_generation,
+        0,
+        "nothing was flushed"
+    );
+    wait_for("the refused flush to end", &|| {
+        status().in_progress.is_none()
+    });
+
+    // Over the threshold again: a flush is requested and runs.
+    for id in ["c", "d"] {
+        core.write(&handle, vec![put(id, vec![1.0, 0.0])])
+            .expect("write");
+    }
+    wait_for("a flush after the failed drop", &|| {
+        handle.current().manifest_generation > 0
+    });
+    assert_eq!(
+        visible(&handle).len(),
+        0,
+        "the flush checkpointed every write"
+    );
 }

@@ -60,7 +60,7 @@ use logpose_wal::{
     WalError, WalFrame, WalWriter,
     codec::{CheckpointPayload, WalPayload},
 };
-use prepare::{INLINE_PREPARE_ROWS, Pending, PreparedRequests};
+use prepare::{Pending, PreparedRequests, prepares_inline};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -494,7 +494,11 @@ impl Writer {
         };
         let next_seq_no = self.next_seq_no;
         let rows = requests.iter().map(WriteRequest::rows).sum::<usize>();
-        let (state, prepared, next_seq_no) = if rows < INLINE_PREPARE_ROWS {
+        let bytes = requests
+            .iter()
+            .map(WriteRequest::approximate_bytes)
+            .sum::<usize>();
+        let (state, prepared, next_seq_no) = if prepares_inline(rows, bytes) {
             let (prepared, next) = prepare::prepare(&mut state, next_seq_no, requests);
             (state, prepared, next)
         } else {
@@ -767,6 +771,11 @@ impl Writer {
             }
             ControlMsg::EndJob { wrote_files } => self.end_job(wrote_files).await,
             ControlMsg::Quiesce { reply } => {
+                // A drop voids every outstanding maintenance request: waiting jobs fail below,
+                // and a job that has not begun is refused. Should the drop not commit, the
+                // next publish over a threshold requests again, instead of a flag left set by a
+                // request that never began blocking every later one.
+                self.requested = [false; 2];
                 if self.active_job.is_none() {
                     let _ = reply.try_send(());
                 } else {
