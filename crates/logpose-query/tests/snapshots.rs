@@ -475,3 +475,102 @@ fn find_segment(root: &std::path::Path) -> std::path::PathBuf {
     }
     unreachable!("no segment under {}", root.display())
 }
+
+/// A scroll that fits in one page pins nothing: it returns no cursor, so nobody could use or
+/// release a token. Pinning up front leaked one token per such scroll until its TTL, and the
+/// 65th refused to start with `TooManySnapshots`. A scroll with more pages pins once.
+#[tokio::test]
+async fn a_scroll_that_fits_in_one_page_pins_nothing() {
+    let fixture = Fixture::new(
+        "one-page-scroll",
+        8,
+        DistanceMetric::L2,
+        IndexPolicy::default(),
+        &[("group", FieldType::Int64)],
+    )
+    .await;
+    let mut rng = Rng::new(21);
+    rows(&fixture, &mut rng, 0, 30).await;
+    let page = |limit: u32, cursor| ScrollRequest {
+        filter: None,
+        order: ScrollOrder::Pk,
+        limit,
+        projection: Projection::scalars(),
+        cursor,
+    };
+    for _ in 0..70 {
+        let whole = scroll(&fixture.engine, &fixture.reference, page(100, None))
+            .await
+            .expect("a one-page scroll");
+        assert_eq!(whole.rows.len(), 30);
+        assert!(whole.next.is_none());
+    }
+    assert_eq!(fixture.handle.pinned_snapshots(), 0);
+
+    let first = scroll(&fixture.engine, &fixture.reference, page(20, None))
+        .await
+        .expect("the first of two pages");
+    assert_eq!(first.rows.len(), 20);
+    assert_eq!(fixture.handle.pinned_snapshots(), 1);
+    let second = scroll(&fixture.engine, &fixture.reference, page(20, first.next))
+        .await
+        .expect("the second page");
+    assert_eq!(second.rows.len(), 10);
+    assert!(second.next.is_none());
+    assert_eq!(
+        fixture.handle.pinned_snapshots(),
+        1,
+        "the cursor's token only"
+    );
+}
+
+/// A read barrier holds for the state a request reads: a token that pins a state before the
+/// barrier fails with `ReadBarrierNotSatisfied` instead of passing because the current state
+/// satisfies it and then reading the older, pinned one.
+#[tokio::test]
+async fn a_read_barrier_holds_for_the_pinned_state_a_token_reads() {
+    let fixture = Fixture::new(
+        "token-barrier",
+        8,
+        DistanceMetric::L2,
+        IndexPolicy::default(),
+        &[("group", FieldType::Int64)],
+    )
+    .await;
+    let mut rng = Rng::new(5);
+    rows(&fixture, &mut rng, 0, 10).await;
+    let probe = rng.vector(8);
+    let pinned = query(&fixture.engine, request(probe.clone(), None, true))
+        .await
+        .expect("pinning query");
+    let token = pinned.snapshot_token.clone().expect("token");
+    rows(&fixture, &mut rng, 10, 10).await;
+    let barrier = fixture.handle.current().snapshot();
+    assert!(barrier.visible_seq_no > pinned.snapshot.visible_seq_no);
+
+    let mut behind = request(probe.clone(), Some(token.clone()), false);
+    behind.read_barrier = Some(barrier.clone());
+    let error = query(&fixture.engine, behind)
+        .await
+        .expect_err("the pinned state is behind the barrier");
+    assert!(
+        matches!(
+            error,
+            logpose_query::QueryError::Storage(LogPoseError::ReadBarrierNotSatisfied { .. })
+        ),
+        "{error:?}"
+    );
+
+    let mut met = request(probe.clone(), Some(token), false);
+    met.read_barrier = Some(pinned.snapshot.clone());
+    let reply = query(&fixture.engine, met)
+        .await
+        .expect("the barrier is met");
+    assert_eq!(reply.snapshot, pinned.snapshot);
+    let mut current = request(probe, None, false);
+    current.read_barrier = Some(barrier.clone());
+    let reply = query(&fixture.engine, current)
+        .await
+        .expect("the current state meets it");
+    assert_eq!(reply.snapshot, barrier);
+}

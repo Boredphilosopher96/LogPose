@@ -3,9 +3,10 @@
 //! - **Get** walks units newest to oldest per key ([`ReadView::get`]).
 //! - **Count** sums `|B AND NOT deleted|` over units; without a filter it is the view's live
 //!   row counter.
-//! - **Scroll by key** merges each unit's ascending key order restricted to its `B`. A scroll
-//!   without a cursor pins its view under a snapshot token, which every later page reads, so
-//!   every live row appears exactly once across pages even under concurrent writes.
+//! - **Scroll by key** merges each unit's ascending key order restricted to its `B`. The first
+//!   page of a scroll that has more pins its view under a snapshot token, which every later page
+//!   reads, so every live row appears exactly once across pages even under concurrent writes.
+//!   A scroll that fits in one page pins nothing.
 //! - **Order by a field** yields each unit's rows in `(value, key)` order, from the field's
 //!   sorted index when the unit has one and from its column otherwise, and merges them. Ties
 //!   are broken by key ascending in both directions, and rows without a value come last.
@@ -74,7 +75,8 @@ pub struct ScrollRequest {
     pub limit: u32,
     /// What to read of each row.
     pub projection: Projection,
-    /// `None` starts a scroll (and pins a snapshot); `Some` continues one.
+    /// `None` starts a scroll (pinning a snapshot when rows are left after the page); `Some`
+    /// continues one.
     pub cursor: Option<Cursor>,
 }
 
@@ -170,8 +172,9 @@ pub async fn resolve_view(
         .collect())
 }
 
-/// One page of a scroll. A request without a cursor pins the view it reads; its page's
-/// cursor carries that token, and later pages read exactly that snapshot.
+/// One page of a scroll. A request without a cursor reads the current state and, when rows are
+/// left after its page, pins the view it read; the page's cursor carries that token, and later
+/// pages read exactly that snapshot. A scroll that fits in one page pins nothing.
 ///
 /// # Errors
 ///
@@ -198,13 +201,7 @@ pub async fn scroll(
                 Some(cursor.after.clone()),
             )
         }
-        None => (
-            ReadOptions {
-                pin: true,
-                ..ReadOptions::default()
-            },
-            None,
-        ),
+        None => (ReadOptions::default(), None),
     };
     let view = reader.read_view(collection, options).await?;
     let (rows, last) = scroll_view(
@@ -216,12 +213,20 @@ pub async fn scroll(
         after.as_ref(),
     )
     .await?;
-    let next = match (last, view.token()) {
-        (Some(after), Some(token)) if rows.len() >= request.limit.max(1) as usize => Some(Cursor {
-            token: token.clone(),
-            order: request.order.clone(),
-            after,
-        }),
+    let next = match last {
+        Some(after) if rows.len() >= request.limit.max(1) as usize => {
+            // Pinned only now that a later page will read it: a scroll that fits in one page
+            // holds no token.
+            let pinned = view.pinned()?;
+            let token = pinned.token().cloned().ok_or_else(|| {
+                QueryError::Storage(LogPoseError::internal("a pinned view has no token"))
+            })?;
+            Some(Cursor {
+                token,
+                order: request.order.clone(),
+                after,
+            })
+        }
         _ => None,
     };
     Ok(ScrollPage { rows, next })

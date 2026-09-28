@@ -268,6 +268,35 @@ impl ReadView {
         self.token.as_ref()
     }
 
+    /// This view pinned under a new snapshot token, or the view itself when it already
+    /// carries one, so later requests read exactly its state. A request that decides only after
+    /// reading whether a later one needs its state (a scroll page with rows after it) pins
+    /// then, so a request that needs no token holds none.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` once the engine shut down, `NotFound` when the collection was dropped, or
+    /// `TooManySnapshots`.
+    pub fn pinned(&self) -> Result<ReadView> {
+        if self.token.is_some() {
+            return Ok(self.clone());
+        }
+        let core = self
+            .core
+            .upgrade()
+            .ok_or_else(|| LogPoseError::unavailable("the storage engine is shut down"))?;
+        let reference = &self.version.meta.reference;
+        let handle = core.collection(reference)?;
+        if handle.meta().id != self.version.meta.id {
+            return Err(crate::engine::not_found(reference));
+        }
+        let token = handle.pin_version(Arc::clone(&self.version))?;
+        Ok(Self {
+            token: Some(token),
+            ..self.clone()
+        })
+    }
+
     /// Row counters: live rows are `total_rows - deleted_rows`.
     #[must_use]
     pub fn counters(&self) -> VersionCounters {
@@ -1595,15 +1624,17 @@ impl EngineCore {
                 (version, None)
             }
         };
+        // The barrier holds for the state the view reads, not the current one: a token pins an
+        // older state, which must not pass a barrier only a later state satisfies.
         if let Some(barrier) = &options.read_barrier {
-            let current = handle.current().snapshot();
-            if !current.satisfies_read_barrier(barrier) {
+            let read = version.snapshot();
+            if !read.satisfies_read_barrier(barrier) {
                 return Err(LogPoseError::ReadBarrierNotSatisfied {
                     collection: handle.descriptor().lookup_name(),
                     required_manifest_generation: barrier.manifest_generation,
                     required_seq_no: barrier.visible_seq_no,
-                    visible_manifest_generation: current.manifest_generation,
-                    visible_seq_no: current.visible_seq_no,
+                    visible_manifest_generation: read.manifest_generation,
+                    visible_seq_no: read.visible_seq_no,
                 });
             }
         }
