@@ -121,8 +121,12 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 ### Now
 
-- a seeded, replayable state-machine harness at the storage boundary, run both on the real filesystem and on the fault-injecting in-memory `FaultVfs` (`crates/logpose-vfs`), where it power-cycles the engine at seeded points, optionally crashes again inside recovery, and checks that acknowledged writes survive, interrupted batches are all-or-nothing, and earlier snapshots still read the same state
-- exhaustive crash enumeration on `FaultVfs` (`crates/logpose-storage/tests/crash_recovery.rs`): a small write, flush, rotation and compaction scenario crashed before every mutating filesystem operation under every tear mode, crashes inside the recovery that follows, crashes while creating a collection, a failed WAL fsync followed by more writes and then a crash, plus one test per named crash point
+- storage harness v2 (`crates/logpose-storage/tests/harness`, run with `cargo test -p logpose-storage --test harness`), which checks the engine against a model of the logical state:
+  - randomized model checking over the full action table (upserts, partial updates, deletes, filter writes, schema changes, get, count, scroll, order by, search, snapshot tokens and a manual clock, flushes, compactions, job phases stepped by hand or through the paused scheduler, crashes in every tear mode including inside recovery, failed file and directory syncs, and in-process reopens), on `FaultVfs` and on the real filesystem; a failure prints its seed and a replay command and is shrunk to a short trace
+  - exhaustive crash enumeration of the engine design's scenarios (a group commit, a flush, a compaction with concurrent deletes, a flush during a compaction, a checkpoint-only flush, a schema change and a flush, a failed manifest publish and its retry, GC after a token release): the recovered state is a prefix holding every acknowledged request, never behind what a concurrent reader saw, and the same as a clean recovery of the same disk image when that recovery is itself crashed at every operation
+  - every interleaving of job phases with a short write sequence, and a time-bounded stress test of concurrent writers with invariant-checking readers
+  - golden storage files (WAL, manifests, segments, a deletion-vector file) under `crates/logpose-storage/tests/golden`
+- crash tests on `FaultVfs` (`crates/logpose-storage/tests/crash_recovery.rs`) for creating and dropping a collection, one test per named crash point, and failed WAL fsyncs
 - seeded service and transport harnesses that exercise planner-controlled ANN, hybrid merge, and profile diagnostics paths
 - deterministic service-boundary simulation scenarios for control-plane/runtime status, placement diagnostics, persistence/recovery behavior, recorded placement, and wrong-plane rejection, with REST and gRPC parity checks focused on the same read-side operator contracts
 - continued explicit regression coverage for storage atomicity and corruption cases
@@ -130,7 +134,7 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 - deterministic exact-vs-ANN regression suites and recall checks for immutable HNSW units
 - reproducible Criterion benchmarks that pair exact baselines with planner-selected unfiltered ANN, filtered ANN, and tiny exact-fallback queries on fixed corpora
 - snapshot-style CLI contract tests for runtime status, placement diagnostics, query explain/profile output, and selected inspect surfaces (`wal`, `manifest`, and `segment`)
-- dedicated CI execution for randomized storage, randomized service, and CLI operator-contract suites so runtime failures stay attributable even though workspace compilation is still shared
+- dedicated CI execution for randomized storage (time-bounded, with new seeds every run and a longer nightly run), randomized service, and CLI operator-contract suites so runtime failures stay attributable even though workspace compilation is still shared
 - clearer separation between inline unit tests and external integration/harness tests
 
 ### Near-Term
