@@ -22,6 +22,8 @@ fn config() -> CompactionConfig {
         max_output_rows: 1_000_000,
         max_output_bytes: u64::MAX,
         deleted_ratio: 0.2,
+        small_deleted_ratio: 0.5,
+        small_deleted_rows: 64,
         max_jobs_per_collection: 2,
     }
 }
@@ -119,17 +121,75 @@ fn a_segment_past_the_deleted_ratio_is_rewritten_with_the_smallest_lower_tier_se
     assert!(units(&plans[1]).contains(&8));
 }
 
+/// A segment of at least `base_rows` rows is rewritten once `deleted_ratio` of it is deleted.
 #[test]
-fn a_tier_0_segment_is_never_rewritten_for_its_deletions_alone() {
+fn a_segment_of_base_rows_is_rewritten_at_the_deleted_ratio() {
     let policy = policy(config(), u64::MAX);
-    // 90 of 99 rows deleted, but below base_rows: the tiers merge it with its peers instead.
-    let segments = [segment(1, 99, 90), segment(2, 10, 0)];
-    assert!(policy.plan(&segments, &BTreeSet::new(), 2).is_empty());
-    let segments = [segment(1, 100, 90), segment(2, 10, 0)];
-    let plans = policy.plan(&segments, &BTreeSet::new(), 2);
+    let below = [segment(1, 100, 19), segment(2, 10, 0)];
+    assert!(policy.plan(&below, &BTreeSet::new(), 2).is_empty());
+    let at = [segment(1, 100, 20), segment(2, 10, 0)];
+    let plans = policy.plan(&at, &BTreeSet::new(), 2);
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].reason, PlanReason::Deletions);
     assert_eq!(units(&plans[0]), [1, 2]);
+}
+
+/// A segment below `base_rows` is rewritten for its deletions alone only once at least
+/// `small_deleted_rows` rows and `small_deleted_ratio` of it are deleted: a few deletes never
+/// rewrite a small collection, and dead rows cannot linger in it without bound.
+#[test]
+fn a_small_segment_is_rewritten_at_half_deleted_and_the_deleted_row_floor() {
+    // Everything below 1,000 rows is small.
+    let policy = policy(
+        CompactionConfig {
+            base_rows: 1_000,
+            ..config()
+        },
+        u64::MAX,
+    );
+    let planned = |rows, deleted| {
+        let plans = policy.plan(&[segment(1, rows, deleted)], &BTreeSet::new(), 2);
+        assert!(plans.len() <= 1, "{plans:?}");
+        plans.first().is_some_and(|plan| {
+            assert_eq!(plan.reason, PlanReason::Deletions);
+            assert_eq!(units(plan), [1]);
+            true
+        })
+    };
+    // The ratio: 99 of 200 deleted is just under half.
+    assert!(!planned(200, 99));
+    assert!(planned(200, 100));
+    // The floor: 63 deleted rows are too few even at 63 percent.
+    assert!(!planned(100, 63));
+    assert!(planned(128, 64));
+    // The ratio of the large rule is not enough for a small segment.
+    assert!(!planned(999, 400));
+    assert!(!planned(10, 9));
+}
+
+/// An explicit compaction rewrites a lone segment when it has deleted rows, so the rows are
+/// reclaimed, and leaves one without any alone.
+#[test]
+fn an_explicit_compaction_rewrites_a_single_segment_only_for_its_deletions() {
+    let policy = policy(config(), u64::MAX);
+    assert!(
+        policy
+            .plan_explicit(&[segment(1, 10, 0)], &BTreeSet::new())
+            .is_none()
+    );
+    let plan = policy
+        .plan_explicit(&[segment(1, 10, 1)], &BTreeSet::new())
+        .expect("one deleted row is worth an explicit rewrite");
+    assert_eq!(units(&plan), [1]);
+    assert_eq!(plan.reason, PlanReason::Explicit);
+    assert_eq!(plan.build_bytes, 9 * 100 + 1_000);
+
+    // The only unreserved segment is rewritten alone.
+    let reserved = [UnitId(2)].into_iter().collect::<BTreeSet<_>>();
+    let plan = policy
+        .plan_explicit(&[segment(1, 10, 3), segment(2, 10, 0)], &reserved)
+        .expect("plan");
+    assert_eq!(units(&plan), [1]);
 }
 
 #[test]
@@ -367,4 +427,43 @@ fn write_amplification_is_one_rewrite_per_tier_climbed() {
             "{flushes} flushes: {per_tier:?}"
         );
     }
+}
+
+/// Deletes landing one at a time on a small segment that never fills its tier: it is rewritten
+/// only at half deleted (and at least `small_deleted_rows`), each rewrite copies no more rows
+/// than it drops, and the dead rows left never pass that bound.
+#[test]
+fn write_amplification_of_deletions_in_a_small_segment_is_at_most_one_row_per_deleted_row() {
+    let small = policy(
+        CompactionConfig {
+            base_rows: 1_000,
+            ..config()
+        },
+        u64::MAX,
+    );
+    let mut current = segment(1, 900, 0);
+    let mut rewrites = Vec::new();
+    let mut copied = 0;
+    for _ in 0..900 {
+        if current.live() == 0 {
+            break;
+        }
+        current.deleted += 1;
+        for plan in small.plan(&[current], &BTreeSet::new(), 2) {
+            assert_eq!(units(&plan), [current.unit.0]);
+            assert!(current.live() <= current.deleted, "{current:?}");
+            copied += current.live();
+            rewrites.push(current.rows);
+            let live = u32::try_from(current.live()).expect("fits");
+            current = segment(current.unit.0 + 1, live, 0);
+        }
+        assert!(
+            current.deleted < 64 || current.deleted * 2 < u64::from(current.rows),
+            "{current:?}"
+        );
+    }
+    // 900 -> 450 -> 225 -> 112 -> 48 rows: halving until fewer than 64 can be deleted.
+    assert_eq!(rewrites, [900, 450, 225, 112]);
+    assert_eq!(copied, 450 + 225 + 112 + 48);
+    assert!(copied <= 900);
 }
