@@ -1316,13 +1316,12 @@ fn unit_candidates(
         dims,
         query: &sq8_query,
     };
-    let estimate = |row: RowId| -> f32 { codes.estimate(row) };
 
     let mut report = UnitReport::new(unit, UnitStrategy::ExactSq8, matched, &decision.reason);
     let (candidates, scan_node) = match (decision.chosen.choice, usable_graph) {
         (Choice::GraphAdmit | Choice::GraphAcorn, Some(graph)) => {
             let started = Instant::now();
-            let walked = walk(graph, &allowed, unit, &estimate, &decision, &shape, context);
+            let walked = walk(graph, &allowed, unit, &codes, &decision, &shape, context);
             let walk_micros = micros_since(started);
             report.strategy = if decision.chosen.choice == Choice::GraphAcorn {
                 UnitStrategy::GraphAcorn
@@ -1711,7 +1710,7 @@ fn walk(
     graph: &logpose_storage::segment_v2::SegmentGraph,
     allowed: &RoaringBitmap,
     unit: &UnitView<'_>,
-    estimate: &impl Fn(RowId) -> f32,
+    codes: &Codes<'_>,
     decision: &Decision,
     shape: &SegmentShape,
     context: &Context,
@@ -1732,7 +1731,8 @@ fn walk(
     };
     let distance = NodeDistance {
         nodes: &graph.nodes,
-        estimate,
+        codes,
+        rows: RefCell::new(Vec::new()),
     };
     let cost = &context.tuning.cost;
     let bound = (!context.tuning.force.walks()).then(|| cost.walk_budget(decision));
@@ -1842,16 +1842,37 @@ impl RowFilter for NodeFilter<'_> {
 }
 
 /// SQ8 distance from the query to a node's vector (its first row's code).
-struct NodeDistance<'a, F: Fn(RowId) -> f32> {
+struct NodeDistance<'a> {
     nodes: &'a NodeMap,
-    estimate: &'a F,
+    codes: &'a Codes<'a>,
+    /// The first rows of a batch of nodes, when nodes are not rows.
+    rows: RefCell<Vec<u32>>,
 }
 
-impl<F: Fn(RowId) -> f32> QueryDistance for NodeDistance<'_, F> {
+impl QueryDistance for NodeDistance<'_> {
     fn distance(&self, node: u32) -> f32 {
         self.nodes
             .first_row(node)
-            .map_or(f32::MAX, |row| (self.estimate)(row))
+            .map_or(f32::MAX, |row| self.codes.estimate(row))
+    }
+
+    fn distances(&self, nodes: &[u32], out: &mut [f32]) {
+        if self.nodes.is_identity() {
+            self.codes.query.estimate_rows(self.codes.codes, nodes, out);
+        } else {
+            let mut rows = self.rows.borrow_mut();
+            rows.clear();
+            // A node without rows scores past the codes, as infinitely far.
+            rows.extend(
+                nodes
+                    .iter()
+                    .map(|node| self.nodes.first_row(*node).unwrap_or(u32::MAX)),
+            );
+            self.codes.query.estimate_rows(self.codes.codes, &rows, out);
+        }
+        for slot in out.iter_mut() {
+            *slot = self.codes.distance(*slot);
+        }
     }
 }
 

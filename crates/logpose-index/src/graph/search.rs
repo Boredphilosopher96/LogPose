@@ -200,6 +200,9 @@ pub(super) struct BeamState {
     pub(super) neighbors: Vec<u32>,
     hop_neighbors: Vec<u32>,
     hops: Vec<u32>,
+    /// An expansion's newly visited neighbors and their distances, scored in one call.
+    fresh: Vec<u32>,
+    fresh_distances: Vec<f32>,
     /// Two-hop bridges skipped because an expansion hit its budget.
     deferred_hops: Vec<u32>,
 }
@@ -302,6 +305,8 @@ where
             neighbors,
             hop_neighbors,
             hops,
+            fresh,
+            fresh_distances,
             deferred_hops,
         } = state;
         while let Some(&Reverse(current)) = queues.frontier.peek() {
@@ -314,16 +319,21 @@ where
                 .neighbors_into(current.row, self.level, neighbors);
             match self.mode {
                 Mode::Admit => {
-                    for &row in neighbors.iter() {
-                        if !visited.insert(row) {
-                            continue;
-                        }
+                    // Score the new neighbors in one call, then offer them in link order:
+                    // the same offers as scoring each in turn.
+                    fresh.clear();
+                    fresh.extend(neighbors.iter().copied().filter(|row| visited.insert(*row)));
+                    fresh_distances.clear();
+                    fresh_distances.resize(fresh.len(), 0.0);
+                    self.query.distances(fresh, fresh_distances);
+                    stats.distance_computations += fresh.len() as u64;
+                    for (&row, &dist) in fresh.iter().zip(fresh_distances.iter()) {
                         stats.visited += 1;
                         let admitted = self.filter.contains(row);
                         if !admitted {
                             stats.filtered_out += 1;
                         }
-                        self.evaluate(row, admitted, queues, stats);
+                        queues.offer(Scored { dist, row }, admitted, self.ef);
                     }
                 }
                 Mode::Acorn { budget } => {

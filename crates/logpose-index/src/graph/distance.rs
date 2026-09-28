@@ -26,6 +26,16 @@ pub trait VectorSource: Sync {
 pub trait QueryDistance {
     /// Distance from the query to `row`. Lower means closer.
     fn distance(&self, row: u32) -> f32;
+
+    /// Distances from the query to each of `rows`, written to `out` (of the same length).
+    /// A walk scores an expanded node's new neighbors with one call, so an implementation
+    /// whose per-call setup is significant (a SIMD dispatch) can score them together; the
+    /// default scores them one by one.
+    fn distances(&self, rows: &[u32], out: &mut [f32]) {
+        for (row, slot) in rows.iter().zip(out) {
+            *slot = self.distance(*row);
+        }
+    }
 }
 
 /// Distance function for [`F32Vectors`].
