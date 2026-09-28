@@ -50,7 +50,8 @@ fn collection_dirs(root: &Path) -> usize {
 
 #[test]
 fn a_second_engine_on_the_same_root_fails_until_every_clone_is_dropped() {
-    let root = unique_temp_dir("engine-root-exclusive");
+    let root_dir = unique_temp_dir("engine-root-exclusive");
+    let root = root_dir.path().to_path_buf();
     let first = open(&root).expect("first engine should open");
     let error = open(&root).expect_err("a second engine must not open the same root");
     assert!(
@@ -100,7 +101,8 @@ fn engines_on_one_fault_vfs_process_exclude_each_other() {
 
 #[test]
 fn dropping_the_engine_waits_for_background_maintenance_before_releasing_the_root() {
-    let root = unique_temp_dir("engine-drop-waits");
+    let root_dir = unique_temp_dir("engine-drop-waits");
+    let root = root_dir.path().to_path_buf();
     for round in 0..3 {
         let engine = open(&root).expect("engine should reopen right after the last drop");
         let handle = if round == 0 {
@@ -139,7 +141,8 @@ fn dropping_the_engine_waits_for_background_maintenance_before_releasing_the_roo
 
 #[test]
 fn concurrent_creates_of_one_name_have_exactly_one_winner() {
-    let root = unique_temp_dir("engine-create-race");
+    let root_dir = unique_temp_dir("engine-create-race");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let barrier = Arc::new(Barrier::new(8));
     let threads = (0..8)
@@ -180,7 +183,8 @@ fn concurrent_creates_of_one_name_have_exactly_one_winner() {
 
 #[test]
 fn create_and_drop_races_leave_the_map_and_the_disk_in_agreement() {
-    let root = unique_temp_dir("engine-create-drop-race");
+    let root_dir = unique_temp_dir("engine-create-drop-race");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let threads = (0..4)
         .map(|index| {
@@ -228,7 +232,8 @@ fn create_and_drop_races_leave_the_map_and_the_disk_in_agreement() {
 
 #[test]
 fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
-    let root = unique_temp_dir("engine-drop");
+    let root_dir = unique_temp_dir("engine-drop");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
@@ -274,7 +279,8 @@ fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
 
 #[test]
 fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
-    let root = unique_temp_dir("engine-drop-rename-fails");
+    let root_dir = unique_temp_dir("engine-drop-rename-fails");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
@@ -311,7 +317,8 @@ fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
 
 #[test]
 fn open_removes_retired_and_unfinished_collection_directories() {
-    let root = unique_temp_dir("engine-abandoned-dirs");
+    let root_dir = unique_temp_dir("engine-abandoned-dirs");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let kept = create(&engine, "kept");
     let retired = create(&engine, "retired");
@@ -337,7 +344,8 @@ fn open_removes_retired_and_unfinished_collection_directories() {
 
 #[test]
 fn a_collection_that_fails_recovery_does_not_fail_the_engine() {
-    let root = unique_temp_dir("engine-failed-collection");
+    let root_dir = unique_temp_dir("engine-failed-collection");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let broken = create(&engine, "broken");
     let healthy = create(&engine, "healthy");
@@ -369,7 +377,8 @@ fn a_collection_that_fails_recovery_does_not_fail_the_engine() {
 
 #[test]
 fn version_ids_increase_and_invariants_hold_across_writes_flush_and_compaction() {
-    let root = unique_temp_dir("engine-version-ids");
+    let root_dir = unique_temp_dir("engine-version-ids");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     let mut last = handle.current();
@@ -412,7 +421,8 @@ fn version_ids_increase_and_invariants_hold_across_writes_flush_and_compaction()
 
 #[test]
 fn readers_pin_a_version_while_writes_and_flushes_publish() {
-    let root = unique_temp_dir("engine-pinned-readers");
+    let root_dir = unique_temp_dir("engine-pinned-readers");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -489,7 +499,8 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
 /// reordering sequence numbers.
 #[test]
 fn compaction_keeps_every_write_that_lands_while_it_builds() {
-    let root = unique_temp_dir("engine-compaction-vs-writes");
+    let root_dir = unique_temp_dir("engine-compaction-vs-writes");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     let core = engine.core();
@@ -581,7 +592,8 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
 /// flush threshold must not monopolize them: other collections' jobs still run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
-    let root = unique_temp_dir("engine-job-fairness");
+    let root_dir = unique_temp_dir("engine-job-fairness");
+    let root = root_dir.path().to_path_buf();
     let config = EngineConfig {
         runtime: RuntimeConfig {
             maintenance_threads: 1,
@@ -696,7 +708,9 @@ fn the_engine_drop_stops_the_writer_of_a_collection_it_does_not_serve() {
         }
     }
 
-    let root = unique_temp_dir("engine-duplicate-collection");
+    let root_dir = unique_temp_dir("engine-duplicate-collection");
+
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
     write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
@@ -779,7 +793,8 @@ fn a_create_that_finishes_during_shutdown_does_not_hang_the_engine_drop() {
 /// The shutdown diagnostics name the creation site of every live engine task.
 #[test]
 fn the_task_tracker_names_where_live_tasks_were_created() {
-    let root = unique_temp_dir("engine-task-sites");
+    let root_dir = unique_temp_dir("engine-task-sites");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root).expect("engine should open");
     let core = engine.core();
     let report = engine.shared.core.tasks.outstanding();

@@ -1,15 +1,9 @@
-use std::{
-    fs,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-pub fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-    fs::create_dir_all(&dir).expect("temp dir should be created");
-    dir
+/// A fresh directory named `logpose-{prefix}-…` under the system temp directory, removed when
+/// the returned guard drops, also when the test panics. Keep the guard alive for as long as
+/// anything uses the directory, reopens after a simulated crash included.
+pub fn unique_temp_dir(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-{prefix}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }

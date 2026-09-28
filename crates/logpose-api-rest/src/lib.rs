@@ -1013,12 +1013,8 @@ mod tests {
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
     use logpose_types::DistanceMetric;
     use serde_json::{Value, json};
-    use std::{
-        collections::BTreeMap,
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::BTreeMap, path::PathBuf};
+    use tempfile::TempDir;
     use tower::util::ServiceExt;
 
     #[tokio::test]
@@ -1343,7 +1339,8 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
-        let app = router(Arc::new(AppState::new(test_config("rest-health"))));
+        let (config, _root) = test_config("rest-health");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(&app, "GET", "/health", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ok");
@@ -1351,7 +1348,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_bodies_above_the_limit_are_rejected_with_a_typed_413() {
-        let mut config = test_config("rest-body-limit");
+        let (mut config, _root) = test_config("rest-body-limit");
         config.limits.max_rest_body_bytes = 256;
         let app = router(Arc::new(AppState::new(config)));
         let mut spec = documents_spec(2, "dot");
@@ -1390,7 +1387,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_json_and_query_strings_are_typed_invalid_arguments() {
-        let app = router(Arc::new(AppState::new(test_config("rest-malformed"))));
+        let (config, _root) = test_config("rest-malformed");
+        let app = router(Arc::new(AppState::new(config)));
         let response = app
             .clone()
             .oneshot(
@@ -1439,9 +1437,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_barriers_ahead_only_in_manifest_generation_name_the_generation() {
-        let app = router(Arc::new(AppState::new(test_config(
-            "rest-barrier-generation",
-        ))));
+        let (config, _root) = test_config("rest-barrier-generation");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
 
         // Sequence 0 is visible; manifest generation 9 is not.
@@ -1471,7 +1468,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_return_a_typed_not_found() {
-        let app = router(Arc::new(AppState::new(test_config("rest-unknown-route"))));
+        let (config, _root) = test_config("rest-unknown-route");
+        let app = router(Arc::new(AppState::new(config)));
         for path in ["/v2/nothing", "/v1/collections/documents"] {
             let (status, body) = call(&app, "GET", path, None).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1486,7 +1484,8 @@ mod tests {
 
     #[tokio::test]
     async fn unserved_methods_on_known_paths_return_a_typed_not_found() {
-        let app = router(Arc::new(AppState::new(test_config("rest-unserved-method"))));
+        let (config, _root) = test_config("rest-unserved-method");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(&app, "POST", DOCS, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "NOT_FOUND");
@@ -1499,7 +1498,8 @@ mod tests {
 
     #[tokio::test]
     async fn undecodable_path_parameters_are_typed_invalid_arguments() {
-        let app = router(Arc::new(AppState::new(test_config("rest-bad-path"))));
+        let (config, _root) = test_config("rest-bad-path");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(&app, "GET", "/v2/databases/default/collections/%FF", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "INVALID_ARGUMENT");
@@ -1508,7 +1508,8 @@ mod tests {
 
     #[tokio::test]
     async fn write_validation_errors_name_the_offending_field() {
-        let app = router(Arc::new(AppState::new(test_config("rest-field-path"))));
+        let (config, _root) = test_config("rest-field-path");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
 
         let (status, body) = upsert(
@@ -1557,9 +1558,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_status_requires_bearer_token_when_auth_is_configured() {
-        let app = router(Arc::new(AppState::new(auth_test_config(
-            "rest-auth-runtime",
-        ))));
+        let (config, _root) = auth_test_config("rest-auth-runtime");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, _) = call(&app, "GET", "/v2/runtime/status", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _, _) = send(
@@ -1575,9 +1575,8 @@ mod tests {
 
     #[tokio::test]
     async fn database_endpoints_round_trip_with_operator_auth() {
-        let app = router(Arc::new(AppState::new(auth_test_config(
-            "rest-namespace-auth",
-        ))));
+        let (config, _root) = auth_test_config("rest-namespace-auth");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, _) = call(&app, "GET", "/v2/databases", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
@@ -1631,7 +1630,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_principals_can_read_but_not_write_when_auth_is_configured() {
-        let state = Arc::new(AppState::new(auth_test_config("rest-auth-readonly")));
+        let (config, _root) = auth_test_config("rest-auth-readonly");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .set_database_access_policy(read_only_policy("default", "reader"))
@@ -1687,7 +1687,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_collection_route_checks_database_access() {
-        let state = Arc::new(AppState::new(auth_test_config("rest-auth-routes")));
+        let (config, _root) = auth_test_config("rest-auth-routes");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .set_database_access_policy(read_only_policy("default", "reader"))
@@ -1782,7 +1783,8 @@ mod tests {
 
     #[tokio::test]
     async fn data_endpoints_run_the_collection_workflow() {
-        let app = router(Arc::new(AppState::new(test_config("rest-workflow"))));
+        let (config, _root) = test_config("rest-workflow");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(
             &app,
             "POST",
@@ -1889,7 +1891,8 @@ mod tests {
 
     #[tokio::test]
     async fn data_endpoints_support_read_barriers() {
-        let app = router(Arc::new(AppState::new(test_config("rest-read-barrier"))));
+        let (config, _root) = test_config("rest-read-barrier");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
         let (status, write) = upsert(
             &app,
@@ -1950,7 +1953,8 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_supports_maintenance_target_and_rejects_empty_segment_ids() {
-        let app = router(Arc::new(AppState::new(test_config("rest-maintenance"))));
+        let (config, _root) = test_config("rest-maintenance");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
         let (status, body) = call(
             &app,
@@ -1974,7 +1978,8 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_endpoint_reports_build_identity_fields() {
-        let app = router(Arc::new(AppState::new(test_config("rest-metadata"))));
+        let (config, _root) = test_config("rest-metadata");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(&app, "GET", "/v2/metadata", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["product"], "LogPose");
@@ -1994,7 +1999,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_status_endpoint_reports_control_plane_summary() {
-        let state = Arc::new(AppState::new(test_config("rest-runtime-status")));
+        let (config, _root) = test_config("rest-runtime-status");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .create_collection(CreateCollectionRequest::new(
@@ -2067,7 +2073,8 @@ mod tests {
 
     #[tokio::test]
     async fn placement_endpoint_reports_local_assignment() {
-        let state = Arc::new(AppState::new(test_config("rest-placement")));
+        let (config, _root) = test_config("rest-placement");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .create_collection(CreateCollectionRequest::new(
@@ -2108,7 +2115,8 @@ mod tests {
 
     #[tokio::test]
     async fn routes_select_the_database_by_path() {
-        let app = router(Arc::new(AppState::new(test_config("rest-database-path"))));
+        let (config, _root) = test_config("rest-database-path");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(
             &app,
             "POST",
@@ -2160,7 +2168,8 @@ mod tests {
             ("rest-data-only", logpose_types::NodeRole::Data),
             ("rest-control-create", logpose_types::NodeRole::Control),
         ] {
-            let app = router(Arc::new(AppState::new(test_config_with_role(label, role))));
+            let (config, _root) = test_config_with_role(label, role);
+            let app = router(Arc::new(AppState::new(config)));
             let (status, body) = call(
                 &app,
                 "POST",
@@ -2231,7 +2240,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_only_nodes_reject_data_plane_rest_operations() {
-        let root = unique_temp_dir("rest-control-only");
+        let root_dir = unique_temp_dir("rest-control-only");
+        let root = root_dir.path().to_path_buf();
         let initial = Arc::new(AppState::new(test_config_with_root(
             "rest-control-only",
             logpose_types::NodeRole::Combined,
@@ -2268,7 +2278,8 @@ mod tests {
 
     #[tokio::test]
     async fn recorded_remote_assignments_reject_data_plane_rest_operations() {
-        let root = unique_temp_dir("rest-recorded-route");
+        let root_dir = unique_temp_dir("rest-recorded-route");
+        let root = root_dir.path().to_path_buf();
         let initial = Arc::new(AppState::new(test_config_with_root(
             "rest-recorded-node-a",
             logpose_types::NodeRole::Combined,
@@ -2314,7 +2325,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_collections_and_databases_return_not_found() {
-        let app = router(Arc::new(AppState::new(test_config("rest-missing"))));
+        let (config, _root) = test_config("rest-missing");
+        let app = router(Arc::new(AppState::new(config)));
         for (method, uri, body) in [
             (
                 "GET",
@@ -2347,7 +2359,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_collection_names_the_invalid_schema_field() {
-        let app = router(Arc::new(AppState::new(test_config("rest-bad-schema"))));
+        let (config, _root) = test_config("rest-bad-schema");
+        let app = router(Arc::new(AppState::new(config)));
         let cases = [
             ("vectors[0].dimensions", documents_spec(0, "dot")),
             ("vectors", {
@@ -2402,7 +2415,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_collections_are_created_described_listed_altered_and_dropped() {
-        let app = router(Arc::new(AppState::new(test_config("rest-collections"))));
+        let (config, _root) = test_config("rest-collections");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, _) = call(&app, "PUT", "/v2/databases/shop", None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, created) = call(
@@ -2533,7 +2547,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_records_round_trip_as_natural_json() {
-        let app = router(Arc::new(AppState::new(test_config("rest-typed"))));
+        let (config, _root) = test_config("rest-typed");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, _) = call(
             &app,
             "POST",
@@ -2679,7 +2694,8 @@ mod tests {
 
     #[tokio::test]
     async fn typed_values_round_trip_exactly_through_segments() {
-        let app = router(Arc::new(AppState::new(test_config("rest-fidelity"))));
+        let (config, _root) = test_config("rest-fidelity");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, body) = call(
             &app,
             "POST",
@@ -2816,7 +2832,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_validation_errors_name_the_record_field() {
-        let app = router(Arc::new(AppState::new(test_config("rest-record-errors"))));
+        let (config, _root) = test_config("rest-record-errors");
+        let app = router(Arc::new(AppState::new(config)));
         let (status, _) = call(
             &app,
             "POST",
@@ -2941,7 +2958,8 @@ mod tests {
 
     #[tokio::test]
     async fn schema_changes_shadow_dynamic_keys_and_survive_a_restart() {
-        let root = unique_temp_dir("rest-schema-restart");
+        let root_dir = unique_temp_dir("rest-schema-restart");
+        let root = root_dir.path().to_path_buf();
         let config = test_config_with_root(
             "rest-schema-restart",
             logpose_types::NodeRole::Combined,
@@ -3056,12 +3074,12 @@ mod tests {
             "segments read the same as memtables"
         );
         drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn query_filters_preserve_large_integer_precision() {
-        let app = router(Arc::new(AppState::new(test_config("rest-large-integers"))));
+        let (config, _root) = test_config("rest-large-integers");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
         let (status, _) = upsert(
             &app,
@@ -3089,9 +3107,8 @@ mod tests {
 
     #[tokio::test]
     async fn query_accepts_predicate_and_profile_diagnostics() {
-        let app = router(Arc::new(AppState::new(test_config(
-            "rest-predicate-profile",
-        ))));
+        let (config, _root) = test_config("rest-predicate-profile");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
         let (status, _) = upsert(
             &app,
@@ -3163,7 +3180,8 @@ mod tests {
 
     #[tokio::test]
     async fn query_rejects_malformed_requests() {
-        let app = router(Arc::new(AppState::new(test_config("rest-query-errors"))));
+        let (config, _root) = test_config("rest-query-errors");
+        let app = router(Arc::new(AppState::new(config)));
         create_documents(&app).await;
         let query = format!("{DOCS}/query");
         for (filter, path) in [
@@ -3194,7 +3212,8 @@ mod tests {
 
     #[tokio::test]
     async fn rest_database_policy_endpoints_round_trip_json_and_role_errors() {
-        let combined = router(Arc::new(AppState::new(test_config("rest-policy-combined"))));
+        let (config, _root) = test_config("rest-policy-combined");
+        let combined = router(Arc::new(AppState::new(config)));
         let (status, put) = call(
             &combined,
             "PUT",
@@ -3231,10 +3250,9 @@ mod tests {
             "the path names the database"
         );
 
-        let data_only = router(Arc::new(AppState::new(test_config_with_role(
-            "rest-policy-data-only",
-            logpose_types::NodeRole::Data,
-        ))));
+        let (config, _root) =
+            test_config_with_role("rest-policy-data-only", logpose_types::NodeRole::Data);
+        let data_only = router(Arc::new(AppState::new(config)));
         let (status, body) = call(
             &data_only,
             "PUT",
@@ -3259,12 +3277,19 @@ mod tests {
         serde_json::from_slice(&bytes).expect("body should be valid json")
     }
 
-    fn test_config(label: &str) -> LogPoseConfig {
+    /// A combined node's configuration, and its storage root's guard: keep the guard alive for
+    /// as long as a node runs on the configuration.
+    fn test_config(label: &str) -> (LogPoseConfig, TempDir) {
         test_config_with_role(label, logpose_types::NodeRole::Combined)
     }
 
-    fn test_config_with_role(label: &str, node_role: logpose_types::NodeRole) -> LogPoseConfig {
-        test_config_with_root(label, node_role, unique_temp_dir(label))
+    fn test_config_with_role(
+        label: &str,
+        node_role: logpose_types::NodeRole,
+    ) -> (LogPoseConfig, TempDir) {
+        let root = unique_temp_dir(label);
+        let config = test_config_with_root(label, node_role, root.path().to_path_buf());
+        (config, root)
     }
 
     fn test_config_with_root(
@@ -3280,8 +3305,8 @@ mod tests {
         }
     }
 
-    fn auth_test_config(label: &str) -> LogPoseConfig {
-        let mut config = test_config(label);
+    fn auth_test_config(label: &str) -> (LogPoseConfig, TempDir) {
+        let (mut config, root) = test_config(label);
         config.auth.bootstrap_tokens = vec![
             BootstrapTokenConfig {
                 token: "operator-secret".to_owned(),
@@ -3300,7 +3325,7 @@ mod tests {
                 ),
             },
         ];
-        config
+        (config, root)
     }
 
     fn read_only_policy(database_name: &str, principal_name: &str) -> DatabaseAccessPolicy {
@@ -3326,14 +3351,13 @@ mod tests {
         })
     }
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("logpose-api-rest-{label}-{suffix}"));
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        path
+    /// A fresh temp directory named `logpose-api-rest-{label}-…`, removed when the returned
+    /// guard drops, also when the test panics.
+    fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("logpose-api-rest-{label}-"))
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     // ----- Search, count, scroll, and filter writes -----
@@ -3455,7 +3479,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_responses_above_the_body_limit_are_a_typed_413() {
-        let mut config = test_config("rest-p6c-response-limit");
+        let (mut config, _root) = test_config("rest-p6c-response-limit");
         config.limits.max_rest_body_bytes = 4096;
         let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=5).await;
@@ -3499,7 +3523,8 @@ mod tests {
 
     #[tokio::test]
     async fn queries_search_a_named_vector_field_with_typed_filters_orders_and_projections() {
-        let app = router(Arc::new(AppState::new(test_config("rest-p6c-query"))));
+        let (config, _root) = test_config("rest-p6c-query");
+        let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=40).await;
         let query = format!("{ITEMS}/query");
 
@@ -3613,7 +3638,8 @@ mod tests {
 
     #[tokio::test]
     async fn counts_and_scrolls_agree_and_scroll_pages_follow_the_order() {
-        let app = router(Arc::new(AppState::new(test_config("rest-p6c-scroll"))));
+        let (config, _root) = test_config("rest-p6c-scroll");
+        let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=40).await;
 
         let (status, body) = call(
@@ -3682,7 +3708,8 @@ mod tests {
 
     #[tokio::test]
     async fn scroll_cursors_read_the_pinned_state_through_writes_flushes_and_compactions() {
-        let app = router(Arc::new(AppState::new(test_config("rest-p6c-pinned"))));
+        let (config, _root) = test_config("rest-p6c-pinned");
+        let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=40).await;
         let (status, _) = call(&app, "POST", &format!("{ITEMS}/flush"), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -3804,7 +3831,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_scroll_cursors_and_tokens_fail_with_snapshot_expired() {
-        let mut config = test_config("rest-p6c-expiry");
+        let (mut config, _root) = test_config("rest-p6c-expiry");
         config.snapshots.token_ttl_ms = 200;
         let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=10).await;
@@ -3849,9 +3876,8 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_and_updates_by_filter_commit_every_match_as_one_batch() {
-        let app = router(Arc::new(AppState::new(test_config(
-            "rest-p6c-filter-writes",
-        ))));
+        let (config, _root) = test_config("rest-p6c-filter-writes");
+        let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=40).await;
         let (_, before) = call(
             &app,
@@ -3961,7 +3987,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_count_scroll_and_filter_write_errors_name_the_request_field() {
-        let app = router(Arc::new(AppState::new(test_config("rest-p6c-errors"))));
+        let (config, _root) = test_config("rest-p6c-errors");
+        let app = router(Arc::new(AppState::new(config)));
         create_items(&app, 1..=5).await;
         let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
         let query = |extra: Value| {
@@ -4134,7 +4161,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_filter_update_too_large_for_one_wal_frame_is_too_large_and_changes_nothing() {
-        let state = Arc::new(AppState::new(test_config("rest-p6c-too-large")));
+        let (config, _root) = test_config("rest-p6c-too-large");
+        let state = Arc::new(AppState::new(config));
         let app = router(Arc::clone(&state));
         // 2,048 dimensions: each updated row image carries its 8 KiB vector, so 9,000 rows
         // exceed a 64 MiB frame.

@@ -326,7 +326,8 @@ mod tests {
 
     #[test]
     fn list_databases_bootstraps_the_default_database_descriptor() {
-        let root = unique_temp_dir("storage-default-database-bootstrap");
+        let root_dir = unique_temp_dir("storage-default-database-bootstrap");
+        let root = root_dir.path().to_path_buf();
         let engine =
             Engine::open_local(&root, crate::EngineConfig::default()).expect("engine should open");
 

@@ -1662,20 +1662,14 @@ fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPo
 mod tests {
     use super::*;
     use logpose_types::DistanceMetric;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
-    fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "logpose-service-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ))
+    /// A fresh temp directory named `logpose-service-{label}-…`, removed when the returned
+    /// guard drops, also when the test panics.
+    fn temp_root(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("logpose-service-{label}-"))
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     #[test]
@@ -1779,7 +1773,8 @@ mod tests {
     /// failing, and lists no collections.
     #[tokio::test]
     async fn runtime_status_surfaces_metadata_unready_without_failing() {
-        let root = temp_root("metadata-unavailable");
+        let root_dir = temp_root("metadata-unavailable");
+        let root = root_dir.path().to_path_buf();
         let engine =
             Engine::open_local(&root, EngineConfig::default()).expect("engine should open");
         let data = Arc::new(
@@ -1811,14 +1806,14 @@ mod tests {
         assert_eq!(status.collection_count, 0);
         assert!(status.collections.is_empty());
         drop(control);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// With etcd metadata, a collection create is fenced by the control-plane leader's lease:
     /// without a fence it is refused before it touches etcd or the engine.
     #[tokio::test]
     async fn etcd_metadata_refuses_an_unfenced_create() {
-        let root = temp_root("etcd-unfenced");
+        let root_dir = temp_root("etcd-unfenced");
+        let root = root_dir.path().to_path_buf();
         let engine =
             Engine::open_local(&root, EngineConfig::default()).expect("engine should open");
         let data = LogPoseDataService::with_etcd(
@@ -1845,7 +1840,6 @@ mod tests {
             "nothing was created locally"
         );
         drop((data, engine));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Stats behind a read barrier come from one published state that satisfies it: a newer
@@ -1853,7 +1847,8 @@ mod tests {
     /// barrier together with an exact snapshot is refused.
     #[tokio::test]
     async fn stats_behind_a_read_barrier_describe_one_state_that_satisfies_it() {
-        let root = temp_root("barrier-stats");
+        let root_dir = temp_root("barrier-stats");
+        let root = root_dir.path().to_path_buf();
         let service = LogPoseDataService::local(&root).expect("service should open");
         service
             .create_collection(CreateCollectionRequest::new(
@@ -1910,7 +1905,6 @@ mod tests {
         assert!(error.to_string().contains("read_barrier"), "{error}");
 
         drop(service);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The runtime status sums each local collection's maintenance status: collections with
@@ -1955,7 +1949,8 @@ mod tests {
     /// handle: a flush waiting on one of them shows up once, and only for that collection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_status_reports_every_local_collection() {
-        let root = temp_root("runtime-status");
+        let root_dir = temp_root("runtime-status");
+        let root = root_dir.path().to_path_buf();
         let data = Arc::new(LogPoseDataService::local(&root).expect("service should open"));
         let engine = data.engine().clone();
         let control = LogPoseControlService::new(
@@ -2036,7 +2031,6 @@ mod tests {
         assert_eq!(runtime.maintenance, MaintenanceBacklog::default());
 
         drop((control, analytics, data, engine));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A dropped collection is gone for every call, including calls holding its old
@@ -2044,7 +2038,8 @@ mod tests {
     /// id) and starts empty.
     #[tokio::test]
     async fn a_dropped_collection_can_be_recreated_empty_under_the_same_name() {
-        let root = temp_root("drop-recreate");
+        let root_dir = temp_root("drop-recreate");
+        let root = root_dir.path().to_path_buf();
         let service = LogPoseDataService::local(&root).expect("service should open");
         let request = || CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot);
         let first = service
@@ -2101,7 +2096,6 @@ mod tests {
             .expect("the new collection takes writes");
 
         drop(service);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A drop while writes are in flight waits for them: each write either commits before the
@@ -2109,7 +2103,8 @@ mod tests {
     /// again under the name holds none of them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_drop_during_writes_fails_them_cleanly() {
-        let root = temp_root("drop-during-writes");
+        let root_dir = temp_root("drop-during-writes");
+        let root = root_dir.path().to_path_buf();
         let service = Arc::new(LogPoseDataService::local(&root).expect("service should open"));
         let request = || CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot);
         service
@@ -2160,6 +2155,5 @@ mod tests {
         assert_eq!(stats.live_record_count, 0);
 
         drop(service);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

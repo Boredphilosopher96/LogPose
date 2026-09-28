@@ -24,5 +24,6 @@ tower-http.workspace = true
 [dev-dependencies]
 http-body-util = "~0.1"
 logpose-config = { path = "../logpose-config" }
+tempfile.workspace = true
 tower.workspace = true
 yaml-rust2 = { version = "~0.13", default-features = false }

@@ -11,13 +11,7 @@ use logpose_types::{
 };
 use serde as _;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tonic::Request;
 use tower::util::ServiceExt;
 
@@ -280,7 +274,7 @@ pub async fn run_control_plane_scenarios() {
 }
 
 async fn run_scenario(name: &str, steps: Vec<Step>) {
-    let config = test_config(name);
+    let (config, _root) = test_config(name);
     let mut harness = Harness::new(config.clone());
     let mut model = ExpectedModel::new(&config.node_name, config.node_role);
     let mut trace = Vec::new();
@@ -1151,22 +1145,25 @@ fn panic_with_context(trace: &[String], message: String) -> ! {
     panic!("{message}\ntrace:\n{}", trace.join("\n"));
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-control-sim-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-control-sim-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-control-sim-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
-fn test_config(label: &str) -> logpose_config::LogPoseConfig {
-    logpose_config::LogPoseConfig {
+/// A node configuration, and its storage root's guard: keep the guard alive for as long as a
+/// node runs on the configuration, restarts included.
+fn test_config(label: &str) -> (logpose_config::LogPoseConfig, tempfile::TempDir) {
+    let root = unique_temp_dir(label);
+    let config = logpose_config::LogPoseConfig {
         node_name: label.to_owned(),
-        storage_root: unique_temp_dir(label),
+        storage_root: root.path().to_path_buf(),
         ..logpose_config::LogPoseConfig::default()
-    }
+    };
+    (config, root)
 }
 
 fn proto_node_role(role: NodeRole) -> proto::NodeRole {

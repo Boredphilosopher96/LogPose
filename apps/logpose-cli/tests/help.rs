@@ -20,6 +20,7 @@ use ratatui as _;
 use serde as _;
 use serde_json as _;
 use std::process::Command;
+use tempfile as _;
 use tokio as _;
 use walkdir as _;
 

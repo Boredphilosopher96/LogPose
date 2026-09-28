@@ -96,7 +96,8 @@ impl Setup {
 pub struct Session {
     pub setup: Setup,
     pub fault: Option<Arc<FaultVfs>>,
-    std_root: Option<PathBuf>,
+    /// The `Std` backend's storage root, removed when the session drops.
+    std_root: Option<tempfile::TempDir>,
     pub clock: Arc<ManualClock>,
     /// Calls of the engine's fatal handler (which must never abort the test process).
     pub fatal: Arc<AtomicUsize>,
@@ -115,7 +116,7 @@ impl Session {
     pub fn create(setup: Setup, seed: u64) -> Result<Self, String> {
         let (fault, std_root) = match setup.backend {
             Backend::Fault => (Some(FaultVfs::new(seed)), None),
-            Backend::Std => (None, Some(unique_temp_dir(seed))),
+            Backend::Std => (None, Some(unique_temp_dir(seed)?)),
         };
         let mut session = Self::detached(setup, fault, std_root)?;
         let engine = session.open_engine()?;
@@ -149,7 +150,7 @@ impl Session {
     fn detached(
         setup: Setup,
         fault: Option<Arc<FaultVfs>>,
-        std_root: Option<PathBuf>,
+        std_root: Option<tempfile::TempDir>,
     ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -185,7 +186,9 @@ impl Session {
     }
 
     fn root(&self) -> PathBuf {
-        self.std_root.clone().unwrap_or_else(|| PathBuf::from(ROOT))
+        self.std_root
+            .as_ref()
+            .map_or_else(|| PathBuf::from(ROOT), |root| root.path().to_path_buf())
     }
 
     /// The engine configuration: small pools, strict invariants, the manual clock, tokens that
@@ -505,10 +508,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Close before the fields drop, so the engine is gone before `std_root` removes its
+        // directory.
         self.close();
-        if let Some(root) = &self.std_root {
-            let _ = std::fs::remove_dir_all(root);
-        }
     }
 }
 
@@ -516,12 +518,9 @@ pub fn reference() -> CollectionRef {
     CollectionRef::new_default(NAME)
 }
 
-fn unique_temp_dir(seed: u64) -> PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    std::env::temp_dir().join(format!(
-        "logpose-harness-{seed}-{}-{unique}",
-        std::process::id()
-    ))
+fn unique_temp_dir(seed: u64) -> Result<tempfile::TempDir, String> {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-harness-{seed}-"))
+        .tempdir()
+        .map_err(|error| format!("temp dir: {error}"))
 }

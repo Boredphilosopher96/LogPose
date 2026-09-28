@@ -12,6 +12,7 @@ use logpose_types::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use tempfile as _;
 use tokio as _;
 
 fn schema() -> Arc<CollectionSchema> {

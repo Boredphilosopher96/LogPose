@@ -15,7 +15,7 @@ use logpose_types::{
 };
 use serde_json::Value;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -100,28 +100,36 @@ pub struct LocalEngineTarget {
     runtime: Runtime,
     engine: Engine,
     root: PathBuf,
-    remove_on_drop: bool,
     collection: Option<(CollectionSpec, Arc<CollectionHandle>)>,
+    /// The temporary engine root, when the caller named none. Declared after the engine and
+    /// the runtime, so both are gone before it removes the directory.
+    _temp_root: Option<TempRoot>,
 }
 
 impl LocalEngineTarget {
     /// Open an engine rooted at `root`, or at a fresh temporary directory.
     ///
-    /// A temporary directory is deleted when the target is dropped.
+    /// A caller-named `root` is left in place. A temporary directory is deleted when the
+    /// target is dropped (after the engine closes), or right away if opening fails.
     pub fn open(root: Option<PathBuf>) -> Result<Self> {
-        let remove_on_drop = root.is_none();
-        let root = match root {
-            Some(root) => root,
+        let (root, temp_root) = match root {
+            Some(root) => {
+                std::fs::create_dir_all(&root)
+                    .with_context(|| format!("creating engine root {}", root.display()))?;
+                (root, None)
+            }
             None => {
                 let nanos = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_nanos())
                     .unwrap_or_default();
-                std::env::temp_dir().join(format!("logpose-bench-{}-{nanos}", std::process::id()))
+                let temp_root = TempRoot::create(
+                    std::env::temp_dir()
+                        .join(format!("logpose-bench-{}-{nanos}", std::process::id())),
+                )?;
+                (temp_root.path().to_path_buf(), Some(temp_root))
             }
         };
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("creating engine root {}", root.display()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -132,8 +140,8 @@ impl LocalEngineTarget {
             runtime,
             engine,
             root,
-            remove_on_drop,
             collection: None,
+            _temp_root: temp_root,
         })
     }
 
@@ -189,11 +197,26 @@ impl LocalEngineTarget {
     }
 }
 
-impl Drop for LocalEngineTarget {
+/// A directory the harness created for the engine, removed when this drops.
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn create(path: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("creating engine root {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
     fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 

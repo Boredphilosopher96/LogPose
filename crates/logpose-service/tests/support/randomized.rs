@@ -20,9 +20,8 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tonic::Request;
 use tower::util::ServiceExt;
@@ -535,7 +534,8 @@ pub async fn run_regression_seeds() {
 /// once four manual flushes reached the default compaction threshold and a background
 /// compaction published a generation the model never saw.
 pub async fn run_background_maintenance_stays_off() {
-    let root = unique_temp_dir("service-maintenance-off");
+    let root_dir = unique_temp_dir("service-maintenance-off");
+    let root = root_dir.path().to_path_buf();
     let (state, _) = open_state_without_background_maintenance(&root, 0).await;
     let segments = DEFAULT_COMPACTION_THRESHOLD_SEGMENTS as u64;
     let put = |slot: u64| {
@@ -585,7 +585,8 @@ pub async fn run_background_maintenance_stays_off() {
 }
 
 async fn run_seeded_service_scenario(seed: u64, steps: usize) {
-    let root = unique_temp_dir(&format!("service-random-{seed}"));
+    let root_dir = unique_temp_dir(&format!("service-random-{seed}"));
+    let root = root_dir.path().to_path_buf();
     let (state, descriptor) = open_state_without_background_maintenance(&root, seed).await;
     let rest = logpose_api_rest::router(Arc::clone(&state));
     let grpc = GrpcLogPoseService::new(Arc::clone(&state));
@@ -2461,14 +2462,13 @@ fn test_config(root: &Path) -> logpose_config::LogPoseConfig {
     }
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-service-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-service-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-service-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 fn assert_eq_with_context<T>(

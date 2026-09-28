@@ -371,7 +371,7 @@ fn large_segment_spans_many_pages_and_dynamic_blocks() {
 fn file_source_reads_what_the_builder_wrote() {
     let (_, rows, _, bytes) = random_segment(99, 200);
     let dir = unique_temp_dir("segment-v2");
-    let path = dir.join("00000007.seg");
+    let path = dir.path().join("00000007.seg");
     std::fs::write(&path, &bytes).expect("segment written");
     let reader = SegmentReader::open(FileSource::open(&path).expect("file opens")).expect("opens");
     reader.verify().expect("verifies");
@@ -382,7 +382,6 @@ fn file_source_reads_what_the_builder_wrote() {
         .map(|row| (row.seq_no, row.image))
         .collect();
     assert_eq!(read, rows);
-    std::fs::remove_dir_all(dir).expect("temp dir removed");
 }
 
 /// `for_each_row` visits exactly the rows it is asked for, in row order, each equal to what

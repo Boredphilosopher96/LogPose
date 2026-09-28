@@ -23,12 +23,7 @@ use logpose_types::{
 use rand as _;
 use serde as _;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, sync::Arc};
 use thiserror as _;
 use tonic as _;
 use tonic::Request;
@@ -71,7 +66,8 @@ use tower::util::ServiceExt;
 
 #[tokio::test]
 async fn service_runs_filtered_query_and_storage_workflow() {
-    let root = unique_temp_dir("service-workflow");
+    let root_dir = unique_temp_dir("service-workflow");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     let descriptor = service
@@ -179,7 +175,8 @@ async fn service_runs_filtered_query_and_storage_workflow() {
 
 #[tokio::test]
 async fn service_write_ack_returns_immediate_read_snapshot() {
-    let root = unique_temp_dir("service-write-ack-session-snapshot");
+    let root_dir = unique_temp_dir("service-write-ack-session-snapshot");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -264,7 +261,8 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
 
 #[tokio::test]
 async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
-    let root = unique_temp_dir("service-write-ack-snapshot-after-rotation");
+    let root_dir = unique_temp_dir("service-write-ack-snapshot-after-rotation");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -368,7 +366,8 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
 
 #[tokio::test]
 async fn service_query_read_barrier_advances_to_latest_snapshot() {
-    let root = unique_temp_dir("service-query-read-barrier-advances");
+    let root_dir = unique_temp_dir("service-query-read-barrier-advances");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -428,7 +427,8 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
 
 #[tokio::test]
 async fn service_rejects_unsatisfied_query_read_barrier() {
-    let root = unique_temp_dir("service-query-read-barrier-unsatisfied");
+    let root_dir = unique_temp_dir("service-query-read-barrier-unsatisfied");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -481,7 +481,8 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
 
 #[tokio::test]
 async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
-    let root = unique_temp_dir("service-query-read-barrier-conflict");
+    let root_dir = unique_temp_dir("service-query-read-barrier-conflict");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -531,7 +532,8 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
 
 #[tokio::test]
 async fn service_stats_read_barrier_advances_to_latest_snapshot() {
-    let root = unique_temp_dir("service-stats-read-barrier-advances");
+    let root_dir = unique_temp_dir("service-stats-read-barrier-advances");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -569,7 +571,8 @@ async fn service_stats_read_barrier_advances_to_latest_snapshot() {
 
 #[tokio::test]
 async fn service_rejects_unsatisfied_stats_read_barrier() {
-    let root = unique_temp_dir("service-stats-read-barrier-unsatisfied");
+    let root_dir = unique_temp_dir("service-stats-read-barrier-unsatisfied");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -610,7 +613,8 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
 
 #[tokio::test]
 async fn service_rejects_impossible_snapshots() {
-    let root = unique_temp_dir("service-invalid-snapshot");
+    let root_dir = unique_temp_dir("service-invalid-snapshot");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -664,7 +668,8 @@ async fn service_rejects_impossible_snapshots() {
 
 #[tokio::test]
 async fn service_rejects_snapshots_below_manifest_checkpoint() {
-    let root = unique_temp_dir("service-below-checkpoint-snapshot");
+    let root_dir = unique_temp_dir("service-below-checkpoint-snapshot");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -723,9 +728,8 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
 
 #[tokio::test]
 async fn app_state_accepts_database_qualified_collection_references() {
-    let state = Arc::new(logpose_core::AppState::new(test_config(
-        "service-qualified-default-namespace",
-    )));
+    let (config, _root) = test_config("service-qualified-default-namespace");
+    let state = Arc::new(logpose_core::AppState::new(config));
 
     state
         .control
@@ -795,9 +799,8 @@ async fn app_state_accepts_database_qualified_collection_references() {
 
 #[tokio::test]
 async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
-    let state = Arc::new(logpose_core::AppState::new(test_config(
-        "service-query-diagnostics",
-    )));
+    let (config, _root) = test_config("service-query-diagnostics");
+    let state = Arc::new(logpose_core::AppState::new(config));
     let rest = logpose_api_rest::router(Arc::clone(&state));
     let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
 
@@ -1010,9 +1013,8 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
 
 #[tokio::test]
 async fn service_rest_and_grpc_surface_filtered_segment_scans() {
-    let state = Arc::new(logpose_core::AppState::new(test_config(
-        "service-filtered-segment-scan",
-    )));
+    let (config, _root) = test_config("service-filtered-segment-scan");
+    let state = Arc::new(logpose_core::AppState::new(config));
     let rest = logpose_api_rest::router(Arc::clone(&state));
     let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
 
@@ -1306,7 +1308,8 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
 
 #[tokio::test]
 async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
-    let root = unique_temp_dir("service-inspect");
+    let root_dir = unique_temp_dir("service-inspect");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -1412,7 +1415,8 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
 
 #[tokio::test]
 async fn service_maps_missing_collections_to_not_found() {
-    let root = unique_temp_dir("service-missing");
+    let root_dir = unique_temp_dir("service-missing");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     let error = service
@@ -1428,7 +1432,8 @@ async fn service_maps_missing_collections_to_not_found() {
 
 #[tokio::test]
 async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
-    let root = unique_temp_dir("service-invalid-records");
+    let root_dir = unique_temp_dir("service-invalid-records");
+    let root = root_dir.path().to_path_buf();
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
@@ -1511,20 +1516,23 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
     );
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-service-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-service-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-service-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
-fn test_config(label: &str) -> logpose_config::LogPoseConfig {
-    logpose_config::LogPoseConfig {
+/// A node configuration, and its storage root's guard: keep the guard alive for as long as a
+/// node runs on the configuration.
+fn test_config(label: &str) -> (logpose_config::LogPoseConfig, tempfile::TempDir) {
+    let root = unique_temp_dir(label);
+    let config = logpose_config::LogPoseConfig {
         node_name: label.to_owned(),
-        storage_root: unique_temp_dir(label),
+        storage_root: root.path().to_path_buf(),
         ..logpose_config::LogPoseConfig::default()
-    }
+    };
+    (config, root)
 }

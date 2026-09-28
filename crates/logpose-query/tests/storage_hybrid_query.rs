@@ -20,12 +20,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use serde_json::json;
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc};
 use thiserror as _;
 
 /// Rows per test collection: enough that an unfiltered walk costs less than an exact scan of
@@ -138,7 +133,8 @@ async fn query(
 
 #[tokio::test]
 async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
-    let root = unique_temp_dir("query-graph-unfiltered");
+    let root_dir = unique_temp_dir("query-graph-unfiltered");
+    let root = root_dir.path().to_path_buf();
     let engine = engine(&root);
     create(&engine, "documents").await;
     fill(&engine, "documents").await;
@@ -161,7 +157,8 @@ async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
 
 #[tokio::test]
 async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
-    let root = unique_temp_dir("query-graph-filtered");
+    let root_dir = unique_temp_dir("query-graph-filtered");
+    let root = root_dir.path().to_path_buf();
     let engine = engine(&root);
     create(&engine, "documents").await;
     fill(&engine, "documents").await;
@@ -219,7 +216,8 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
 
 #[tokio::test]
 async fn memtable_rows_merge_with_segment_walks_and_supersede_stale_rows() {
-    let root = unique_temp_dir("query-graph-hybrid");
+    let root_dir = unique_temp_dir("query-graph-hybrid");
+    let root = root_dir.path().to_path_buf();
     let engine = engine(&root);
     create(&engine, "profiles").await;
     fill(&engine, "profiles").await;
@@ -260,7 +258,8 @@ async fn memtable_rows_merge_with_segment_walks_and_supersede_stale_rows() {
 
 #[tokio::test]
 async fn small_filtered_populations_stay_exact_after_compaction_and_reopen() {
-    let root = unique_temp_dir("query-graph-reopen");
+    let root_dir = unique_temp_dir("query-graph-reopen");
+    let root = root_dir.path().to_path_buf();
     let engine = engine(&root);
     create(&engine, "events").await;
     fill(&engine, "events").await;
@@ -307,16 +306,13 @@ fn ids(response: &QueryResponse) -> Vec<String> {
         .collect()
 }
 
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-{name}-{unique}"));
-    if path.exists() {
-        fs::remove_dir_all(&path).expect("stale temp dir should be removable");
-    }
-    path
+/// A fresh temp directory named `logpose-{name}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-{name}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 /// Ids of every live row whose `kind` passes `keep`, by exact dot product with `query`

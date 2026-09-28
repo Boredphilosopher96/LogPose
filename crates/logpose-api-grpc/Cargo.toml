@@ -39,4 +39,5 @@ tonic-prost-build = "~0.14"
 [dev-dependencies]
 logpose-config = { path = "../logpose-config" }
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true

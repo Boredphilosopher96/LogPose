@@ -94,23 +94,14 @@ pub(crate) fn read_file(vfs: &dyn Vfs, path: &Path, context: &str) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::unique_temp_dir;
     use logpose_vfs::{FaultVfs, StdVfs};
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::fs;
 
     #[test]
     fn create_dir_all_synced_creates_every_missing_ancestor() {
-        let base = std::env::temp_dir().join(format!(
-            "logpose-durable-fs-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        let nested = base.join("a").join("b").join("c");
+        let base = unique_temp_dir("durable-fs");
+        let nested = base.path().join("a").join("b").join("c");
 
         create_dir_all_synced(&StdVfs, &nested).expect("nested directories should be created");
         assert!(nested.is_dir());
@@ -124,8 +115,6 @@ mod tests {
             fs::read(&file).expect("file should be readable"),
             b"replaced".to_vec()
         );
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

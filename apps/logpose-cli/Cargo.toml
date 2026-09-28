@@ -31,3 +31,4 @@ insta = { version = "1.43", features = ["json"] }
 logpose-api-grpc = { path = "../../crates/logpose-api-grpc" }
 logpose-api-rest = { path = "../../crates/logpose-api-rest" }
 logpose-core = { path = "../../crates/logpose-core" }
+tempfile.workspace = true

@@ -21,6 +21,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile.workspace = true
 tokio.workspace = true
 
 [[bench]]
