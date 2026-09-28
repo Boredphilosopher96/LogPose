@@ -46,7 +46,7 @@ fn row_for(index: u64) -> Row {
             },
             2 => Row {
                 x: Some(json!(1)),
-                y: index % 3 == 0,
+                y: index.is_multiple_of(3),
             },
             _ => Row {
                 x: Some(json!("a")),
