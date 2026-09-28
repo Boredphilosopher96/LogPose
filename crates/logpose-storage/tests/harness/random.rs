@@ -13,10 +13,11 @@
 //! - `LOGPOSE_HARNESS_MINIMIZE=0`: report a failure without shrinking it.
 
 use crate::{
-    actions::{Action, Runner, Stats},
-    generate::Generator,
+    actions::{Action, Read, Runner, Stats},
+    generate::{Generator, key},
     session::{Backend, Maintenance, Session, Setup},
 };
+use logpose_types::record::{ClientOp, Record};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     time::{Duration, Instant},
@@ -27,6 +28,9 @@ use std::{
 const REGRESSIONS: &[(Maintenance, u64)] = &[
     // Exact search broke ties at a candidate cut by row instead of by key.
     (Maintenance::Stepped, 1072),
+    // The retry of a failed flush, released by a clock advance, raced the explicit compaction
+    // after it and left a second segment (a harness race, not an engine bug).
+    (Maintenance::Stepped, 231_000_153),
 ];
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -257,10 +261,10 @@ fn report(failure: &Failure) -> ! {
             }
         }
     };
-    // Hand-stepped runs on `FaultVfs` replay exactly (in practice: the engine's own flush of a
-    // memtable an abandoned flush left frozen runs in the background). With background jobs,
-    // or on the real filesystem, timing varies, so a replay usually, but not always, fails
-    // the same way.
+    // Hand-stepped runs on `FaultVfs` replay exactly: the runner settles what the engine does
+    // in the background after every action (see `Session::settle`). With background jobs, or
+    // on the real filesystem, timing varies, so a replay usually, but not always, fails the
+    // same way.
     let exact = if failure.setup.maintenance == Maintenance::Stepped
         && failure.setup.backend == Backend::Fault
     {
@@ -318,4 +322,101 @@ fn random_actions_racing_free_background_jobs_match_the_model() {
 fn random_actions_on_the_real_filesystem_match_the_model() {
     let stats = run_seeds(Backend::Std, Maintenance::Stepped, 3);
     assert!(stats.jobs_committed > 0, "{stats:?}");
+}
+
+/// A hand-stepped run of the case seed 231000153 found. An explicit flush fails at a segment
+/// sync and leaves its memtable frozen; the engine retries it in the background once the flush
+/// backoff (1 s) passed on the engine clock. The retry used to be requested at whichever
+/// real-time writer tick came first, so after the clock advance it raced the explicit
+/// compaction that followed: the compaction took the two segments present when it was planned,
+/// the retry committed a third, and the check that an explicit compaction leaves at most one
+/// segment failed, or passed, by timing. Now the runner settles after every action: the clock
+/// moves only when an action moves it, the retry runs at the advance that releases it, and the
+/// compaction then merges all three. Two runs agree on every count.
+#[test]
+fn a_flush_retry_runs_at_the_clock_advance_that_releases_it() {
+    let first = flush_retry_scenario();
+    assert!(first.is_ok(), "{first:?}");
+    assert_eq!(
+        first,
+        flush_retry_scenario(),
+        "two runs of the scenario agree"
+    );
+}
+
+/// Run the scenario and describe what it did: the runner's counts and the permits granted.
+fn flush_retry_scenario() -> Result<String, String> {
+    let (mut runner, nth) = failed_flush()?;
+    let segments = |runner: &Runner| runner.session.handle().current().counters.segment_count;
+    let memtable_rows = |runner: &Runner| runner.session.handle().current().counters.memtable_rows;
+    // Inside the backoff nothing happens, however long the actions take.
+    runner.execute(&Action::AdvanceClock(Duration::from_millis(500)))?;
+    runner.execute(&Action::Read(Read::Scan { limit: 2 }))?;
+    if segments(&runner) != 2 || memtable_rows(&runner) != 1 {
+        return Err(format!(
+            "the retry ran inside its backoff: {} segments, {} memtable rows",
+            segments(&runner),
+            memtable_rows(&runner)
+        ));
+    }
+    // The advance past the backoff runs the retry before the next action.
+    runner.execute(&Action::AdvanceClock(Duration::from_secs(61)))?;
+    let status = runner.session.handle().maintenance_status();
+    if segments(&runner) != 3 || memtable_rows(&runner) != 0 || status.last_error.is_some() {
+        return Err(format!(
+            "the retry did not settle at the advance: {} segments, {} memtable rows, {status:?}",
+            segments(&runner),
+            memtable_rows(&runner)
+        ));
+    }
+    // The compaction merges all three segments (the runner checks that it leaves one).
+    runner.execute(&Action::Compact)?;
+    Ok(format!(
+        "failed file sync {nth}: {:?}, permits {:?}",
+        runner.stats(),
+        runner.session.permits_granted()
+    ))
+}
+
+/// Two segments, one row in the memtable, and an explicit flush of it that failed at the
+/// `nth` file sync after its freeze, leaving the memtable frozen with the collection
+/// writable. The first `nth` that does so is found by probing.
+fn failed_flush() -> Result<(Runner, u64), String> {
+    for nth in 0..8 {
+        let setup = Setup {
+            backend: Backend::Fault,
+            maintenance: Maintenance::Stepped,
+            metric: logpose_types::DistanceMetric::L2,
+            indexed: false,
+        };
+        let mut runner = Runner::new(Session::create(setup, 7)?);
+        for index in 0..5 {
+            let vector = runner.model.vector_name();
+            let record =
+                Record::new(key(index)).with_vector(vector, vec![index as f32, 1.0, 0.0, 0.0]);
+            runner.execute(&Action::Write(vec![ClientOp::Upsert(record)]))?;
+            if index % 2 == 1 {
+                runner.execute(&Action::Flush)?;
+            }
+        }
+        runner.execute(&Action::FailSync {
+            during: Box::new(Action::Flush),
+            nth,
+            dir: false,
+        })?;
+        let handle = runner.session.handle();
+        let version = handle.current();
+        let failed = handle
+            .maintenance_status()
+            .last_error
+            .is_some_and(|error| error.job == "flush");
+        if failed
+            && !runner.poisoned
+            && version.counters.segment_count == 2
+            && version.counters.memtable_rows == 1
+        {
+            return Ok((runner, nth));
+        }
+    }
+    Err("no file sync of the flush fails it and leaves its memtable frozen".to_owned())
 }
