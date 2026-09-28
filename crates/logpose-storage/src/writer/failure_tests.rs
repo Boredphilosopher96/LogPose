@@ -4,6 +4,7 @@
 //! lone or small segment are reclaimed.
 
 use super::*;
+use crate::handle::JobTicket;
 use crate::{
     CompactionConfig, CreateCollectionRequest, Engine, EngineConfig, ManualClock, MemtableConfig,
     RuntimeConfig,
@@ -257,6 +258,253 @@ fn a_flush_on_a_full_device_poisons_the_collection_at_once() {
         .expect_err("a poisoned collection refuses writes");
     assert_poisoned(&error);
     assert_eq!(live(&handle), ["a", "b"]);
+}
+
+/// Two segments, a third row in a hand-stepped flush that has begun, then two explicit
+/// requests: a compaction of the two segments, whose job waits for a permit (the scheduler is
+/// paused), and a flush, which waits for the running flush. Returns the flush's ticket and
+/// start, and the compaction's and the flush's replies.
+fn stepped_flush_with_waiters(
+    engine: &Engine,
+    handle: &Arc<CollectionHandle>,
+) -> (
+    JobTicket,
+    JobStart,
+    oneshot::Receiver<Result<Snapshot>>,
+    oneshot::Receiver<Result<Snapshot>>,
+) {
+    for (id, x) in [("a", 1.0), ("b", 2.0)] {
+        write(handle, vec![upsert(id, x)]);
+        handle.flush_blocking().expect("the flush commits");
+    }
+    write(handle, vec![upsert("c", 3.0)]);
+    engine.scheduler().pause();
+    let (ticket, start) = handle.begin_job(JobKind::Flush).expect("the flush begins");
+    let (compact_reply, compacted) = oneshot::channel();
+    let (flush_reply, flushed) = oneshot::channel();
+    let control = handle.control_sender();
+    control
+        .send(ControlMsg::Compact {
+            reply: compact_reply,
+        })
+        .expect("the writer runs");
+    control
+        .send(ControlMsg::Flush {
+            reply: Some(flush_reply),
+        })
+        .expect("the writer runs");
+    // The writer handles control messages in order: once this tick returns, both requests
+    // wait.
+    handle
+        .tick_writer(Duration::from_secs(30))
+        .expect("the writer ticks");
+    assert_eq!(
+        handle.maintenance_status().pending,
+        ["compact"],
+        "the compaction waits for its permit"
+    );
+    (ticket, start, compacted, flushed)
+}
+
+/// `error` is `expected` (the error type has no `PartialEq`).
+fn assert_same(error: &LogPoseError, expected: &LogPoseError, what: &str) {
+    assert_eq!(format!("{error:?}"), format!("{expected:?}"), "{what}");
+}
+
+/// The `CollectionPoisoned` a request that waited on another job gets: its reason names the
+/// flush failure `cause`.
+fn assert_poisoned_by(error: &LogPoseError, cause: &LogPoseError) {
+    assert_poisoned(error);
+    let LogPoseError::CollectionPoisoned { reason, .. } = error else {
+        unreachable!("checked above");
+    };
+    assert!(
+        reason.contains(&cause.to_string()),
+        "the reason {reason:?} names the cause {cause}"
+    );
+}
+
+/// A flush whose own failure poisons the collection (the device is full) answers the requests
+/// waiting on it, the explicit flush and its hand-stepped commit, with that failure, as a
+/// failed freeze does. A request waiting on another job, the explicit compaction, gets
+/// `CollectionPoisoned`, whose reason names the flush's failure.
+#[test]
+fn a_flush_that_poisons_answers_its_waiters_with_its_own_error() {
+    let vfs = ControlledVfs::wrap(FaultVfs::new(4).process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(&vfs, config(&clock));
+    let handle = create(&engine, usize::MAX, usize::MAX);
+    let (mut ticket, start, compacted, flushed) = stepped_flush_with_waiters(&engine, &handle);
+
+    // Segment files cannot be created: ENOSPC, which no retry can fix.
+    vfs.fail_creates_containing(".seg");
+    let JobWork::Flush(work) = &start.work else {
+        unreachable!("the flush has a memtable to write");
+    };
+    let cause = engine
+        .core()
+        .build_flush(&handle, &start.version, start.unit, work, &mut ticket)
+        .err()
+        .expect("the segment cannot be created");
+    assert!(
+        !matches!(cause, LogPoseError::CollectionPoisoned { .. }),
+        "the build reports its own failure: {cause:?}"
+    );
+    let job = start.job;
+    drop(start);
+    let (done_reply, done) = oneshot::channel();
+    handle
+        .control_sender()
+        .send(ControlMsg::JobDone {
+            job,
+            result: Err(cause.clone()),
+            wrote_files: false,
+            reply: Some(done_reply),
+        })
+        .expect("the writer runs");
+
+    let answer = |reply: oneshot::Receiver<Result<Snapshot>>| {
+        reply
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the request fails")
+    };
+    assert_same(&answer(done), &cause, "the job's own reply");
+    assert_same(&answer(flushed), &cause, "the explicit flush");
+    assert!(handle.is_poisoned());
+    assert_poisoned_by(&answer(compacted), &cause);
+    drop(ticket);
+    engine.scheduler().resume();
+}
+
+/// A flush whose commit poisons the collection (the rename of `CURRENT` may or may not be
+/// durable) answers the explicit flush waiting on it with the publish's failure, although the
+/// poisoning comes before the flush ends. The explicit compaction gets `CollectionPoisoned`,
+/// whose reason names that failure.
+#[test]
+fn a_flush_whose_commit_poisons_answers_its_waiters_with_its_own_error() {
+    let vfs = ControlledVfs::wrap(FaultVfs::new(5).process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(&vfs, config(&clock));
+    let handle = create(&engine, usize::MAX, usize::MAX);
+    let (mut ticket, start, compacted, flushed) = stepped_flush_with_waiters(&engine, &handle);
+
+    let JobWork::Flush(work) = &start.work else {
+        unreachable!("the flush has a memtable to write");
+    };
+    let commit = engine
+        .core()
+        .build_flush(&handle, &start.version, start.unit, work, &mut ticket)
+        .expect("the flush builds");
+    drop(start);
+    vfs.fail_crash_point(Some(CrashPoint::CurrentAfterRename));
+    let cause = ticket
+        .commit(commit)
+        .expect_err("the manifest publish fails after the rename");
+    assert!(
+        !matches!(cause, LogPoseError::CollectionPoisoned { .. }),
+        "the commit reports its own failure: {cause:?}"
+    );
+    assert!(handle.is_poisoned());
+
+    let answer = |reply: oneshot::Receiver<Result<Snapshot>>| {
+        reply
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the request fails")
+    };
+    assert_same(&answer(flushed), &cause, "the explicit flush");
+    assert_poisoned_by(&answer(compacted), &cause);
+    engine.scheduler().resume();
+}
+
+/// A step of an explicit compaction whose commit poisons the collection (the `CURRENT` rename
+/// fails) answers the compaction with its own error, as a flush answers its explicit flushes,
+/// and later requests get `CollectionPoisoned` naming it. Both kinds of step: a merge of two
+/// segments, and the index build of a lone segment that follows once nothing more merges.
+#[test]
+fn an_explicit_compaction_step_that_poisons_answers_it_with_its_own_error() {
+    for merge in [true, false] {
+        let vfs = ControlledVfs::wrap(FaultVfs::new(11).process());
+        let clock = Arc::new(ManualClock::new());
+        let config = EngineConfig {
+            index: crate::IndexPolicy {
+                graph_min_rows: 2,
+                sq8_min_rows: 2,
+                ..crate::IndexPolicy::default()
+            },
+            ..config(&clock)
+        };
+        let engine = open(&vfs, config);
+        let handle = create(&engine, usize::MAX, usize::MAX);
+        for round in 0..if merge { 2_u8 } else { 1 } {
+            write(
+                &handle,
+                (0..4_u8)
+                    .map(|row| upsert(&format!("r{round}{row}"), f32::from(round * 4 + row)))
+                    .collect(),
+            );
+            handle.flush_blocking().expect("the flush commits");
+        }
+        assert_eq!(handle.current().indexed_segments(), (0, 0));
+
+        vfs.fail_crash_point(Some(CrashPoint::CurrentAfterRename));
+        let cause = handle
+            .compact_blocking()
+            .expect_err("the step's manifest publish fails after the rename");
+        assert!(
+            !matches!(cause, LogPoseError::CollectionPoisoned { .. }),
+            "merge {merge}: the compaction gets its step's own failure: {cause:?}"
+        );
+        assert!(handle.is_poisoned(), "merge {merge}");
+        let later = handle
+            .write_blocking(vec![upsert("z", 9.0)])
+            .expect_err("the collection is poisoned");
+        assert_poisoned_by(&later, &cause);
+    }
+}
+
+/// A failure unrelated to a running flush (a WAL fsync) poisons the collection: the explicit
+/// compaction fails at once, and the explicit flush is left to the running flush, which
+/// answers it with `CollectionPoisoned` when it ends, so it never waits for a flush that does
+/// not run.
+#[test]
+fn an_unrelated_poisoning_leaves_the_explicit_flush_to_the_running_flush() {
+    let vfs = ControlledVfs::wrap(FaultVfs::new(7).process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(&vfs, config(&clock));
+    let handle = create(&engine, usize::MAX, usize::MAX);
+    let (ticket, start, compacted, mut flushed) = stepped_flush_with_waiters(&engine, &handle);
+
+    vfs.fail_file_syncs_containing(".wal", 1);
+    let cause = handle
+        .write_blocking(vec![upsert("d", 4.0)])
+        .expect_err("the WAL fsync fails");
+    assert!(handle.is_poisoned(), "{cause:?}");
+    assert_poisoned(
+        &compacted
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the compaction fails"),
+    );
+    handle
+        .tick_writer(Duration::from_secs(30))
+        .expect("the writer ticks");
+    assert!(
+        matches!(flushed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the explicit flush waits for the running flush"
+    );
+
+    // The running flush ends without committing: its waiter gets the refusal.
+    drop(start);
+    drop(ticket);
+    assert_poisoned(
+        &flushed
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the flush fails"),
+    );
+    engine.scheduler().resume();
 }
 
 /// Only failures in a row poison: a flush that succeeds resets the count and clears the error,

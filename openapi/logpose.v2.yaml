@@ -2175,11 +2175,11 @@ components:
       properties:
         pending:
           type: array
-          description: Jobs (`flush`, `compact`) waiting for a maintenance permit.
+          description: Jobs (`flush`, `compact`, `index`) waiting for a maintenance permit.
           items:
             type: string
         in_progress:
-          description: "`flush` while a flush runs, otherwise `compact` while a compaction runs."
+          description: "`flush` while a flush runs, otherwise `compact` while a compaction runs, otherwise `index` while an index build (a segment's vector graphs) runs."
           oneOf:
             - type: "null"
             - type: string
@@ -2190,7 +2190,7 @@ components:
             - $ref: "#/components/schemas/MaintenanceError"
         completed_runs:
           type: integer
-          description: Flushes and compactions that completed since the node opened the collection.
+          description: Flushes, compactions, and index builds that completed since the node opened the collection.
     MaintenanceError:
       type: object
       description: A failed maintenance job.
@@ -2198,7 +2198,7 @@ components:
       properties:
         job:
           type: string
-          description: The job that failed, `flush` or `compact`.
+          description: The job that failed, `flush`, `compact`, or `index`.
         message:
           type: string
           description: What failed.

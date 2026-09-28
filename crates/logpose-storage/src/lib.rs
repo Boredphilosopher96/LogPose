@@ -18,8 +18,9 @@
 //! - `segment`: the engine's handle on one segment v2 file, and writing one.
 //! - `inspect`: collection statistics (O(units), from counters and zone maps) and `inspect`
 //!   reports.
-//! - `collections`, `catalog`: collection create requests, collection, database and principal
-//!   descriptor files, and the [`CatalogStore`](logpose_catalog::CatalogStore) over them.
+//! - `collections`, `catalog`: collection create requests, and collection, database, principal,
+//!   and access-policy descriptor files, which `Engine`'s catalog calls read and write on the
+//!   I/O pool.
 //! - `paths`: the on-disk layout.
 //! - `recovery`: the durability barrier, loading the manifest `CURRENT` names, orphan cleanup,
 //!   and replaying the WAL above its checkpoint.
@@ -31,7 +32,8 @@
 //! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
 //! - `segment_v2`: the segment file format, builder, and reader.
 //! - `cache`: the buffer cache of segment section bytes that segment readers load through.
-//! - `flush`, `compaction`, `maintenance`, `scheduler`: maintenance jobs, the size-tiered
+//! - `flush`, `compaction`, `index_build`, `maintenance`, `scheduler`: maintenance jobs (the
+//!   index build adds a segment's vector graphs after it is written), the size-tiered
 //!   compaction policy, flush triggers, and the engine-wide scheduler of job permits.
 //! - `stepped`: maintenance jobs whose begin, build, and commit the caller runs one at a time,
 //!   for deterministic-interleaving tests.
@@ -55,6 +57,7 @@ mod flush;
 mod fs_util;
 mod gc;
 mod handle;
+mod index_build;
 mod inspect;
 mod maintenance;
 mod manifest;

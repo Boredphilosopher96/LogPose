@@ -243,6 +243,12 @@ pub struct Stats {
     /// Scheduler permits granted over the run (background jobs and explicit requests).
     pub flushes_granted: u64,
     pub compactions_granted: u64,
+    pub index_builds_granted: u64,
+    /// Hand-stepped index builds that had a segment to index and committed.
+    pub indexes_committed: u64,
+    /// Index sidecar bytes that committed index builds wrote (scheduled and hand-stepped), so
+    /// a background mode shows its builds commit, not only that they were granted.
+    pub index_bytes_written: u64,
     /// Segment files checked to exist for a live version (I7).
     pub files_checked: u64,
     /// The most maintenance jobs seen running at once after an action.
@@ -272,6 +278,9 @@ impl Stats {
         self.explicit_compactions += other.explicit_compactions;
         self.flushes_granted += other.flushes_granted;
         self.compactions_granted += other.compactions_granted;
+        self.index_builds_granted += other.index_builds_granted;
+        self.indexes_committed += other.indexes_committed;
+        self.index_bytes_written += other.index_bytes_written;
         self.files_checked += other.files_checked;
         self.peak_jobs = self.peak_jobs.max(other.peak_jobs);
     }
@@ -334,10 +343,12 @@ impl Runner {
 
     /// The run's stats, with the scheduler permits granted so far.
     pub fn stats(&self) -> Stats {
-        let (flushes, compactions) = self.session.permits_granted();
+        let (flushes, compactions, indexes) = self.session.permits_granted();
         Stats {
             flushes_granted: flushes,
             compactions_granted: compactions,
+            index_builds_granted: indexes,
+            index_bytes_written: self.session.index_bytes_written(),
             ..self.stats
         }
     }
@@ -517,11 +528,13 @@ impl Runner {
                     return Ok(());
                 };
                 let job = self.jobs.remove(index);
+                let indexing = job.kind() == JobKind::Index && job.has_work();
                 let result = self
                     .session
                     .call("commit", move || job.commit().map(drop))?;
                 if result.is_ok() {
                     self.stats.jobs_committed += 1;
+                    self.stats.indexes_committed += u64::from(indexing);
                 }
                 self.maintenance_result("commit", result, armed)
             }
@@ -1248,8 +1261,8 @@ impl Runner {
         self.check_files()
     }
 
-    /// I7: every segment of the current version and of every version a live token pins is on
-    /// disk.
+    /// I7: every segment file, and every index sidecar, of the current version and of every
+    /// version a live token pins is on disk.
     fn check_files(&mut self) -> Check {
         let current = self
             .session
@@ -1264,6 +1277,7 @@ impl Runner {
                     wanted.insert(format!("{:08x}.seg", unit.id().0));
                 }
             }
+            wanted.extend(view.segment_file_names());
         }
         let present = self.session.segment_files()?;
         if let Some(missing) = wanted.iter().find(|name| !present.contains(*name)) {

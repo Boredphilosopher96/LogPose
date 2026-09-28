@@ -505,7 +505,7 @@ pub struct MaintenanceStatus {
 /// A failed maintenance job, as a collection's [`MaintenanceStatus`] reports it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceError {
-    /// The job that failed: `flush` or `compact`.
+    /// The job that failed: `flush`, `compact`, or `index`.
     pub job: String,
     /// What failed.
     pub message: String,

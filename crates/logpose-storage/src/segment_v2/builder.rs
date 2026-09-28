@@ -6,8 +6,8 @@ use super::{
     dynamic::{self, DYNAMIC_ENCODING_BLOCKS, decode_object},
     error::SegmentError,
     format::{
-        ENTRY_LEN, FOOTER_LEN, Footer, HEADER_LEN, SECTION_ALIGN, SectionEntry, SectionKind,
-        SegmentHeader, crc, crc_append,
+        ENTRY_LEN, FOOTER_LEN, Footer, HEADER_FLAG_INDEX_SIDECAR, HEADER_LEN, SECTION_ALIGN,
+        SectionEntry, SectionKind, SegmentHeader, crc, crc_append,
     },
     le::{align_up, put_u32, put_u64},
     pk::{self, FILTER_ENCODING_FUSE8, PkColumn, PkFilter},
@@ -402,6 +402,7 @@ impl SegmentBuilder {
             schema_hash: XxHash3_64::oneshot(&self.schema_bytes),
             min_seq_no: stats.min_seq_no,
             max_seq_no: stats.max_seq_no,
+            flags: 0,
         };
         let rows = u64::from(header.row_count);
         let pk_encoding = pk::encoding_for(self.schema.primary_key_type());
@@ -665,6 +666,96 @@ impl RowWriter<'_> {
     pub fn declares(&self, field: FieldId) -> bool {
         self.builder.slots.contains_key(&field)
     }
+}
+
+/// What [`write_index_sidecar`] wrote: everything a manifest's index reference needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrittenSidecar {
+    /// Total file length.
+    pub file_len: u64,
+    /// The footer's CRC.
+    pub footer_crc: u32,
+    /// The section table.
+    pub sections: Vec<SectionEntry>,
+}
+
+/// Write the index sidecar of the segment whose header is `segment` to `out`, in one forward
+/// pass: the segment's header with [`HEADER_FLAG_INDEX_SIDECAR`] set, the segment's
+/// `SchemaSnapshot` payload (`schema_bytes`, which must hash to the header's `schema_hash`),
+/// then `sections`, which must be vector graphs of distinct fields. A sidecar with no section
+/// records that the segment's index build ran and found nothing to build. The caller syncs the
+/// file.
+///
+/// # Errors
+///
+/// [`SegmentError::Encode`] for a header that already is a sidecar's, a schema snapshot that
+/// does not match it, or a section that is not a vector graph;
+/// [`SegmentError::DuplicateIndexSection`] for two graphs of one field; and
+/// [`SegmentError::Io`] from the sink.
+pub fn write_index_sidecar<W: Write>(
+    segment: &SegmentHeader,
+    schema_bytes: &[u8],
+    sections: &[IndexSection],
+    out: W,
+) -> Result<WrittenSidecar, SegmentError> {
+    if segment.is_index_sidecar() {
+        return Err(SegmentError::Encode(
+            "an index sidecar indexes a segment, not another sidecar".to_owned(),
+        ));
+    }
+    if XxHash3_64::oneshot(schema_bytes) != segment.schema_hash {
+        return Err(SegmentError::Encode(
+            "the schema snapshot does not match the segment's header".to_owned(),
+        ));
+    }
+    let mut ordered = sections.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|section| (section.kind, section.field));
+    for pair in ordered.windows(2) {
+        if (pair[0].kind, pair[0].field) == (pair[1].kind, pair[1].field) {
+            return Err(SegmentError::DuplicateIndexSection {
+                kind: pair[0].kind.section_kind(),
+                field: pair[0].field,
+            });
+        }
+    }
+    if let Some(section) = ordered
+        .iter()
+        .find(|section| section.kind != IndexSectionKind::VectorGraph)
+    {
+        return Err(SegmentError::Encode(format!(
+            "a {:?} section cannot go in an index sidecar",
+            section.kind
+        )));
+    }
+    let header = SegmentHeader {
+        flags: HEADER_FLAG_INDEX_SIDECAR,
+        ..segment.clone()
+    };
+    let mut file = FileWriter::new(out);
+    let (header_bytes, header_crc) = header.encode();
+    file.write(&header_bytes)?;
+    file.section(
+        SectionSpec::global(SectionKind::SchemaSnapshot, SCHEMA_ENCODING_POSTCARD),
+        &[schema_bytes],
+    )?;
+    for section in ordered {
+        file.section(
+            SectionSpec {
+                kind: section.kind.section_kind().code(),
+                encoding: section.encoding,
+                field: Some(section.field),
+                aux32: section.aux32,
+                aux64: section.aux64,
+            },
+            &[&section.payload],
+        )?;
+    }
+    let (file_len, footer_crc, sections) = file.finish(header_crc)?;
+    Ok(WrittenSidecar {
+        file_len,
+        footer_crc,
+        sections,
+    })
 }
 
 /// Where a section goes in the table.

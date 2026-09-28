@@ -16,8 +16,9 @@
 //!
 //! Scenarios: one group commit of concurrent batches, a flush, a compaction with concurrent
 //! deletes, a flush during a compaction (committing in either order), a checkpoint-only flush,
-//! a schema change followed by a flush, a failed manifest publish followed by a retry, and GC
-//! after a pinned token is released.
+//! a schema change followed by a flush, a failed manifest publish followed by a retry, GC
+//! after a pinned token is released, an index build beside writes, and an index build that a
+//! compaction of its segment cancels (both over segments with SQ8 codes).
 //!
 //! `LOGPOSE_CRASH_I11_STRIDE` sets which crash states also check I11 (every `n`-th `k`;
 //! default 3, `1` checks all); `LOGPOSE_CRASH_I11_TEARS=all` crashes each recovery in every tear
@@ -49,12 +50,12 @@ use std::{
     time::Duration,
 };
 
-fn setup() -> Setup {
+fn setup(indexed: bool) -> Setup {
     Setup {
         backend: Backend::Fault,
         maintenance: Maintenance::Stepped,
         metric: DistanceMetric::Dot,
-        indexed: false,
+        indexed,
     }
 }
 
@@ -164,7 +165,12 @@ impl Drop for Ctx {
 
 impl Ctx {
     pub fn new(seed: u64) -> Result<Self, String> {
-        let session = Session::create(setup(), seed)?;
+        Self::with_indexes(seed, false)
+    }
+
+    /// A context whose segments get SQ8 codes and graphs (from a few rows) when `indexed`.
+    pub fn with_indexes(seed: u64, indexed: bool) -> Result<Self, String> {
+        let session = Session::create(setup(indexed), seed)?;
         let model = Runner::new_model(&session);
         Ok(Self {
             session,
@@ -268,16 +274,31 @@ impl Ctx {
     }
 
     pub fn begin(&mut self, kind: JobKind) -> Step {
+        if self.begin_if_due(kind)? {
+            Ok(())
+        } else {
+            Err(format!("the {kind:?} job has nothing to do"))
+        }
+    }
+
+    /// Begin a job of `kind` if it has work, and say whether it had: an index build begun while
+    /// a compaction holds every segment has none.
+    pub fn begin_if_due(&mut self, kind: JobKind) -> Result<bool, String> {
         let job = self
             .session
             .engine()
             .begin_job(self.session.handle(), kind)
             .map_err(|error| format!("begin {kind:?}: {error}"))?;
         if !job.has_work() {
-            return Err(format!("the {kind:?} job has nothing to do"));
+            return Ok(false);
         }
         self.jobs.push(job);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether a job of `kind` is open.
+    pub fn has_job(&self, kind: JobKind) -> bool {
+        self.jobs.iter().any(|job| job.kind() == kind)
     }
 
     fn job(&mut self, kind: JobKind) -> Result<usize, String> {
@@ -351,6 +372,8 @@ impl Ctx {
 /// candidate.
 pub struct Scenario {
     pub name: &'static str,
+    /// Whether segments get SQ8 codes and graphs.
+    pub indexed: bool,
     pub setup: fn(&mut Ctx) -> Step,
     pub body: fn(&mut Ctx) -> Step,
 }
@@ -529,7 +552,8 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
     let context = |detail: String| format!("scenario {}: {detail}", scenario.name);
     // A clean run counts the body's operations.
     let ops = {
-        let mut ctx = Ctx::new(seed).unwrap_or_else(|error| fail(context(error)));
+        let mut ctx =
+            Ctx::with_indexes(seed, scenario.indexed).unwrap_or_else(|error| fail(context(error)));
         (scenario.setup)(&mut ctx).unwrap_or_else(|error| fail(context(format!("setup: {error}"))));
         let start = ctx.fault().mutating_ops();
         (scenario.body)(&mut ctx).unwrap_or_else(|error| fail(context(format!("body: {error}"))));
@@ -552,7 +576,8 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
             let detail =
                 |message: String| context(format!("crash after {k} ops, {tear:?}: {message}"));
             let run_seed = seed.wrapping_mul(1_000_003) ^ (k * 4 + tear as u64);
-            let mut ctx = Ctx::new(run_seed).unwrap_or_else(|error| fail(detail(error)));
+            let mut ctx = Ctx::with_indexes(run_seed, scenario.indexed)
+                .unwrap_or_else(|error| fail(detail(error)));
             (scenario.setup)(&mut ctx)
                 .unwrap_or_else(|error| fail(detail(format!("setup: {error}"))));
             let fault = ctx.fault();
@@ -857,51 +882,104 @@ fn no_setup(_: &mut Ctx) -> Step {
 pub fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
+            indexed: false,
             name: "flush",
             setup: rows_in_a_segment_and_the_memtable,
             body: flush_body,
         },
         Scenario {
+            indexed: false,
             name: "compaction with concurrent deletes",
             setup: three_segments,
             body: compaction_with_concurrent_deletes,
         },
         Scenario {
+            indexed: false,
             name: "flush during compaction, flush commits first",
             setup: three_segments,
             body: |ctx| flush_during_compaction(ctx, true),
         },
         Scenario {
+            indexed: false,
             name: "flush during compaction, compaction commits first",
             setup: three_segments,
             body: |ctx| flush_during_compaction(ctx, false),
         },
         Scenario {
+            indexed: false,
             name: "checkpoint-only flush",
             setup: rows_in_a_segment_and_the_memtable,
             body: checkpoint_only_flush,
         },
         Scenario {
+            indexed: false,
             name: "schema change then flush",
             setup: rows_in_a_segment_and_the_memtable,
             body: schema_change_then_flush,
         },
         Scenario {
+            indexed: false,
             name: "failed manifest publish then retry",
             setup: rows_in_a_segment_and_the_memtable,
             body: failed_publish_then_retry,
         },
         Scenario {
+            indexed: false,
             name: "GC after token release",
             setup: pinned_retired_segments,
             body: gc_after_token_release,
         },
         Scenario {
+            indexed: false,
             name: "writes from an empty collection",
             setup: no_setup,
             body: flush_body_from_empty,
         },
+        Scenario {
+            indexed: true,
+            name: "index build beside writes",
+            setup: three_segments,
+            body: index_build_beside_writes,
+        },
+        Scenario {
+            indexed: true,
+            name: "index build cancelled by a compaction",
+            setup: three_segments,
+            body: index_build_cancelled_by_a_compaction,
+        },
     ]
+}
+
+/// An index build of one segment, with writes that delete and move its rows between its
+/// phases, then a flush that writes that segment's DV file beside its new sidecar.
+fn index_build_beside_writes(ctx: &mut Ctx) -> Step {
+    ctx.begin(JobKind::Index)?;
+    let ops = vec![ctx.delete(9), ctx.upsert(10, 100.0)];
+    ctx.write(ops)?;
+    ctx.build(JobKind::Index)?;
+    let op = ctx.update(11, 110.0);
+    ctx.write(vec![op])?;
+    ctx.commit(JobKind::Index)?;
+    let ops = vec![ctx.delete(8), ctx.upsert(12, 12.0)];
+    ctx.write(ops)?;
+    ctx.flush()
+}
+
+/// A compaction takes the segment an index build is building: the build ends without a change
+/// and removes its sidecar, the compaction commits, and its output is indexed.
+fn index_build_cancelled_by_a_compaction(ctx: &mut Ctx) -> Step {
+    ctx.begin(JobKind::Index)?;
+    ctx.build(JobKind::Index)?;
+    ctx.begin(JobKind::Compact)?;
+    let op = ctx.delete(3);
+    ctx.write(vec![op])?;
+    ctx.commit(JobKind::Index)?;
+    ctx.build(JobKind::Compact)?;
+    ctx.commit(JobKind::Compact)?;
+    ctx.begin(JobKind::Index)?;
+    ctx.commit(JobKind::Index)?;
+    let op = ctx.upsert(12, 12.0);
+    ctx.write(vec![op])
 }
 
 fn flush_body_from_empty(ctx: &mut Ctx) -> Step {
@@ -1061,6 +1139,16 @@ fn every_crash_point_of_a_failed_publish_and_its_retry_recovers_a_prefix() {
 #[test]
 fn every_crash_point_of_gc_after_a_token_release_recovers_a_prefix() {
     enumerate(&scenarios()[7], 18);
+}
+
+#[test]
+fn every_crash_point_of_an_index_build_recovers_a_prefix() {
+    enumerate(&scenarios()[9], 20);
+}
+
+#[test]
+fn every_crash_point_of_an_index_build_a_compaction_cancels_recovers_a_prefix() {
+    enumerate(&scenarios()[10], 21);
 }
 
 #[test]

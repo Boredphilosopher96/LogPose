@@ -1350,7 +1350,6 @@ dependencies = [
 name = "logpose-catalog"
 version = "0.1.0"
 dependencies = [
- "logpose-auth",
  "logpose-types",
  "serde",
  "serde_json",
@@ -1549,6 +1548,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

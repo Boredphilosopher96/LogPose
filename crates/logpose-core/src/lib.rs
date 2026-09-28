@@ -3,7 +3,7 @@
 #[cfg(test)]
 use etcd_client as _;
 use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
-use logpose_catalog::{CatalogStore, DatabaseDescriptor};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_config::{IndexConfig, LogPoseConfig};
 use logpose_query::{
     CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
@@ -120,12 +120,11 @@ impl AppState {
             },
         )?;
         let data = Arc::new(match config.metadata.backend {
-            MetadataBackend::Local => LogPoseDataService::new(engine.clone()),
+            MetadataBackend::Local => LogPoseDataService::new(engine),
             MetadataBackend::Etcd => {
-                LogPoseDataService::with_etcd(engine.clone(), config.metadata.etcd.clone())?
+                LogPoseDataService::with_etcd(engine, config.metadata.etcd.clone())?
             }
         });
-        let catalog: Arc<dyn CatalogStore> = Arc::new(engine);
         let shared_catalog = match config.metadata.backend {
             MetadataBackend::Local => SharedCatalog::Local,
             MetadataBackend::Etcd => {
@@ -134,7 +133,6 @@ impl AppState {
         };
         let control = Arc::new(LogPoseControlService::new(
             Arc::clone(&data),
-            catalog,
             config.clone(),
             build.clone(),
         ));
@@ -324,7 +322,7 @@ impl AppState {
                     .delete_database(database_name, &leader_fence.node_id, leader_fence.lease_id)
                     .await?;
                 // The local catalog caches the database for local collections; drop it too.
-                match self.control.catalog_store().delete_database(database_name) {
+                match self.control.catalog().delete_database(database_name).await {
                     Ok(()) | Err(LogPoseError::NotFound { .. }) => Ok(()),
                     Err(error) => Err(error),
                 }
@@ -1182,12 +1180,13 @@ mod tests {
         let state = AppState::new(config);
         state
             .control
-            .catalog_store()
+            .catalog()
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,
                 AccessTier::Observer,
             ))
+            .await
             .expect("persisted principal should override bootstrap tier");
 
         let error = state
@@ -1222,12 +1221,13 @@ mod tests {
         let state = AppState::new(config.clone());
         state
             .control
-            .catalog_store()
+            .catalog()
             .put_principal(Principal::new_with_access_tier(
                 "ops-admin",
                 PrincipalKind::User,
                 AccessTier::Observer,
             ))
+            .await
             .expect("persisted principal should be updated before restart");
         drop(state);
 

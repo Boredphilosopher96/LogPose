@@ -1,4 +1,7 @@
-//! Database, principal and access-policy descriptor files, served through [`CatalogStore`].
+//! Database, principal and access-policy descriptor files: the catalog under the engine's root.
+//!
+//! The descriptor calls do blocking file I/O. [`Engine`] runs them on its I/O pool, so async
+//! callers (the service's request handlers) never block a runtime worker on them.
 
 use crate::{
     Engine,
@@ -8,7 +11,7 @@ use crate::{
     fs_util::{atomic_write, read_json},
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
-use logpose_catalog::{CatalogStore, DatabaseDescriptor};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_types::{CorruptionKind, DEFAULT_DATABASE_NAME, LogPoseError, ResourceKind, Result};
 use serde::de::DeserializeOwned;
 use std::path::Path;
@@ -68,8 +71,11 @@ impl EngineCore {
     }
 }
 
-impl CatalogStore for EngineCore {
-    fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+impl EngineCore {
+    pub(crate) fn put_database(
+        &self,
+        descriptor: DatabaseDescriptor,
+    ) -> Result<DatabaseDescriptor> {
         let mut descriptor = descriptor;
         descriptor.is_default = descriptor.name == DEFAULT_DATABASE_NAME;
         match self.get_database(&descriptor.name) {
@@ -88,7 +94,7 @@ impl CatalogStore for EngineCore {
         Ok(descriptor)
     }
 
-    fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+    pub(crate) fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
         validate_namespace_segment("database name", database_name)?;
         let path = self.database_descriptor_path(database_name);
         if database_name == DEFAULT_DATABASE_NAME && !self.exists(&path)? {
@@ -104,12 +110,12 @@ impl CatalogStore for EngineCore {
         read_stored(self, &path, DatabaseDescriptor::validate)
     }
 
-    fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+    pub(crate) fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
         self.ensure_database_descriptor(DEFAULT_DATABASE_NAME)?;
         self.list_database_descriptors()
     }
 
-    fn delete_database(&self, database_name: &str) -> Result<()> {
+    pub(crate) fn delete_database(&self, database_name: &str) -> Result<()> {
         validate_namespace_segment("database name", database_name)?;
         if database_name == DEFAULT_DATABASE_NAME {
             return Err(LogPoseError::failed_precondition(
@@ -145,7 +151,7 @@ impl CatalogStore for EngineCore {
         })
     }
 
-    fn put_principal(&self, principal: Principal) -> Result<Principal> {
+    pub(crate) fn put_principal(&self, principal: Principal) -> Result<Principal> {
         validate_principal(&principal)?;
         atomic_write(
             self.vfs.as_ref(),
@@ -155,7 +161,7 @@ impl CatalogStore for EngineCore {
         Ok(principal)
     }
 
-    fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+    pub(crate) fn get_principal(&self, principal_name: &str) -> Result<Principal> {
         validate_principal_name(principal_name)?;
         let path = self.principal_descriptor_path(principal_name);
         if !self.exists(&path)? {
@@ -168,11 +174,11 @@ impl CatalogStore for EngineCore {
         read_stored(self, &path, validate_principal)
     }
 
-    fn list_principals(&self) -> Result<Vec<Principal>> {
+    pub(crate) fn list_principals(&self) -> Result<Vec<Principal>> {
         self.list_principal_descriptors()
     }
 
-    fn put_database_access_policy(
+    pub(crate) fn put_database_access_policy(
         &self,
         policy: DatabaseAccessPolicy,
     ) -> Result<DatabaseAccessPolicy> {
@@ -186,7 +192,10 @@ impl CatalogStore for EngineCore {
         Ok(policy)
     }
 
-    fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
+    pub(crate) fn get_database_access_policy(
+        &self,
+        database_name: &str,
+    ) -> Result<DatabaseAccessPolicy> {
         validate_namespace_segment("database name", database_name)?;
         let path = self.database_policy_path(database_name);
         if !self.exists(&path)? {
@@ -203,44 +212,124 @@ impl CatalogStore for EngineCore {
 }
 
 /// The catalog of database, principal, and access-policy descriptors under the engine's root.
-impl CatalogStore for Engine {
-    fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
-        self.core().put_database(descriptor)
+///
+/// Each call does blocking file I/O on the engine's I/O pool. The `_blocking` forms are for
+/// threads outside any async runtime, such as bootstrap before the server serves requests.
+impl Engine {
+    /// Create or replace a database descriptor, keeping the stored database id of one that
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// An invalid descriptor, a damaged stored one, or I/O errors.
+    pub async fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+        self.io(move |core| core.put_database(descriptor)).await
     }
 
-    fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        self.core().get_database(database_name)
+    /// Read one database descriptor, creating the default database's on first use.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, an invalid name, a damaged stored descriptor (`DATA_LOSS`), or I/O errors.
+    pub async fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
+        let database_name = database_name.to_owned();
+        self.io(move |core| core.get_database(&database_name)).await
     }
 
-    fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.core().list_databases()
+    /// Every database descriptor, ordered by name, the default database's included.
+    ///
+    /// # Errors
+    ///
+    /// A damaged stored descriptor (`DATA_LOSS`), or I/O errors.
+    pub async fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
+        self.io(|core| core.list_databases()).await
     }
 
-    fn delete_database(&self, database_name: &str) -> Result<()> {
-        self.core().delete_database(database_name)
+    /// Delete a database descriptor and its access policy.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` for the default database and for a database that still holds a
+    /// collection, `NOT_FOUND` when the database does not exist, and I/O errors.
+    pub async fn delete_database(&self, database_name: &str) -> Result<()> {
+        let database_name = database_name.to_owned();
+        self.io(move |core| core.delete_database(&database_name))
+            .await
     }
 
-    fn put_principal(&self, principal: Principal) -> Result<Principal> {
+    /// Create or replace a principal descriptor.
+    ///
+    /// # Errors
+    ///
+    /// An invalid principal, or I/O errors.
+    pub async fn put_principal(&self, principal: Principal) -> Result<Principal> {
+        self.io(move |core| core.put_principal(principal)).await
+    }
+
+    /// [`Engine::put_principal`] for threads outside any async runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::put_principal`].
+    pub fn put_principal_blocking(&self, principal: Principal) -> Result<Principal> {
         self.core().put_principal(principal)
     }
 
-    fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+    /// Read one principal descriptor.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, an invalid name, a damaged stored descriptor (`DATA_LOSS`), or I/O errors.
+    pub async fn get_principal(&self, principal_name: &str) -> Result<Principal> {
+        let principal_name = principal_name.to_owned();
+        self.io(move |core| core.get_principal(&principal_name))
+            .await
+    }
+
+    /// [`Engine::get_principal`] for threads outside any async runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::get_principal`].
+    pub fn get_principal_blocking(&self, principal_name: &str) -> Result<Principal> {
         self.core().get_principal(principal_name)
     }
 
-    fn list_principals(&self) -> Result<Vec<Principal>> {
-        self.core().list_principals()
+    /// Every stored principal descriptor, ordered by name.
+    ///
+    /// # Errors
+    ///
+    /// A damaged stored descriptor (`DATA_LOSS`), or I/O errors.
+    pub async fn list_principals(&self) -> Result<Vec<Principal>> {
+        self.io(|core| core.list_principals()).await
     }
 
-    fn put_database_access_policy(
+    /// Create or replace one database's access policy, creating the database's descriptor if
+    /// it has none.
+    ///
+    /// # Errors
+    ///
+    /// An invalid policy, or I/O errors.
+    pub async fn put_database_access_policy(
         &self,
         policy: DatabaseAccessPolicy,
     ) -> Result<DatabaseAccessPolicy> {
-        self.core().put_database_access_policy(policy)
+        self.io(move |core| core.put_database_access_policy(policy))
+            .await
     }
 
-    fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
-        self.core().get_database_access_policy(database_name)
+    /// Read one database's access policy.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, an invalid name, a damaged stored policy (`DATA_LOSS`), or I/O errors.
+    pub async fn get_database_access_policy(
+        &self,
+        database_name: &str,
+    ) -> Result<DatabaseAccessPolicy> {
+        let database_name = database_name.to_owned();
+        self.io(move |core| core.get_database_access_policy(&database_name))
+            .await
     }
 }
 
@@ -322,10 +411,15 @@ fn validate_namespace_segment(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::unique_temp_dir;
+    use crate::test_support::{ControlledVfs, unique_temp_dir};
+    use logpose_vfs::FaultVfs;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
-    #[test]
-    fn list_databases_bootstraps_the_default_database_descriptor() {
+    #[tokio::test]
+    async fn list_databases_bootstraps_the_default_database_descriptor() {
         let root_dir = unique_temp_dir("storage-default-database-bootstrap");
         let root = root_dir.path().to_path_buf();
         let engine =
@@ -333,11 +427,70 @@ mod tests {
 
         let databases = engine
             .list_databases()
+            .await
             .expect("database listing should bootstrap the default database");
 
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].name, DEFAULT_DATABASE_NAME);
         assert!(databases[0].is_default);
+    }
+
+    /// A catalog write whose file sync blocks does not block the async runtime awaiting it:
+    /// the write runs on the engine's I/O pool, so a runtime with a single worker thread keeps
+    /// running its other tasks while the sync is held.
+    #[test]
+    fn catalog_file_io_runs_off_the_async_runtime() {
+        let vfs = ControlledVfs::wrap(FaultVfs::new(3).process());
+        let engine = Engine::open(vfs.clone(), "/storage", crate::EngineConfig::default())
+            .expect("engine should open");
+        let (done, finished) = mpsc::channel();
+        // The runtime runs on a thread of its own, so a regression fails the test at the
+        // deadline below instead of hanging it.
+        let runner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should build");
+            runtime.block_on(async move {
+                vfs.hold_syncs();
+                let put = tokio::spawn({
+                    let engine = engine.clone();
+                    async move {
+                        engine
+                            .put_database(DatabaseDescriptor::new("analytics"))
+                            .await
+                    }
+                });
+                // The put reaches its held sync while this runtime's only worker still runs
+                // this task.
+                let held = tokio::task::spawn_blocking({
+                    let vfs = Arc::clone(&vfs);
+                    move || vfs.wait_for_held_sync(Duration::from_secs(30))
+                })
+                .await
+                .expect("the wait should not panic");
+                assert!(held, "the put should reach its sync");
+                assert!(!put.is_finished(), "the put waits for its sync");
+                vfs.release_syncs();
+                let stored = put
+                    .await
+                    .expect("the put should not panic")
+                    .expect("the put should succeed");
+                assert_eq!(
+                    engine
+                        .get_database("analytics")
+                        .await
+                        .expect("the database should be stored"),
+                    stored
+                );
+            });
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "a catalog call blocked the runtime's only worker thread"
+        );
+        runner.join().expect("the runtime thread should not panic");
     }
 
     #[test]

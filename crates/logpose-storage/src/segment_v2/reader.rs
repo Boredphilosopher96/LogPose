@@ -305,7 +305,7 @@ impl<S: SectionSource> SegmentReader<S> {
             .map(SectionEntry::decode)
             .collect::<Result<Vec<_>, _>>()?;
         check_layout(&sections, footer.table_offset)?;
-        check_kinds(&sections)?;
+        check_kinds(&sections, header.is_index_sidecar())?;
         let schema = load_schema(&source, file_len, &header, &sections)?;
         let reader = Self {
             source,
@@ -1139,6 +1139,61 @@ impl<S: SectionSource> SegmentReader<S> {
         DynamicBlock::decode(bytes, rows).map_err(|error| error.at(region))
     }
 
+    /// The `SchemaSnapshot` payload as stored, read from the file (CRC-checked), for an index
+    /// sidecar of this segment.
+    ///
+    /// # Errors
+    ///
+    /// I/O errors or [`SegmentError::Checksum`].
+    pub fn schema_snapshot_bytes(&self) -> Result<Vec<u8>, SegmentError> {
+        let (index, _) = self.required(SectionKind::SchemaSnapshot)?;
+        Ok(self.section_via(index, Via::Disk)?.to_vec())
+    }
+
+    /// Every row's vector of `field`, row-major (`row_count * dim` floats, zeros for null
+    /// rows), with the null rows; `None` if the segment has no such section. Reads the prefix
+    /// and then one verified page at a time around the cache, so it holds the vectors once, as
+    /// f32, plus one page.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors.
+    pub fn vectors_uncached(
+        &self,
+        field: FieldId,
+    ) -> Result<Option<(Vec<f32>, roaring::RoaringBitmap)>, SegmentError> {
+        let Some(handle) = self.vector_via(field, Via::Bypass)? else {
+            return Ok(None);
+        };
+        let dim = usize_from(handle.prefix.dim());
+        let rows = usize_from(handle.prefix.row_count());
+        let mut values = Vec::with_capacity(rows.saturating_mul(dim));
+        for page in 0..handle.prefix.page_count() {
+            let unit = handle.page_unit(page).ok_or_else(|| {
+                SegmentError::out_of_range(format!(
+                    "{}",
+                    Region::VectorPage {
+                        index: handle.index,
+                        page,
+                    }
+                ))
+            })?;
+            let (bytes, _) = self.load_via(&unit, Via::Bypass)?;
+            values.extend(
+                bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+            );
+        }
+        if values.len() != rows.saturating_mul(dim) {
+            return Err(SegmentError::corrupt(
+                section_region(handle.index, &handle.entry),
+                "vector pages do not cover every row",
+            ));
+        }
+        Ok(Some((values, handle.prefix.nulls().clone())))
+    }
+
     /// The payload of an opaque index section, CRC-checked, with its table
     /// entry; `None` if the segment has none.
     ///
@@ -1394,6 +1449,14 @@ impl<S: SectionSource> SegmentReader<S> {
     pub fn verify(&self) -> Result<(), SegmentError> {
         let via = Via::Disk;
         self.verify_padding()?;
+        if self.header.is_index_sidecar() {
+            // The schema was checked at open; every other section is a graph, checked against
+            // its CRC here and decoded when a search loads it.
+            for index in 0..self.sections.len() {
+                self.section_via(index, via)?;
+            }
+            return Ok(());
+        }
         let seqs = self.row_meta_via(via)?;
         let pks = self.pk_column_via(via)?;
         let (sorted_index, sorted_entry) = self.required(SectionKind::PkSorted)?;
@@ -1683,13 +1746,21 @@ fn check_layout(sections: &[SectionEntry], table_offset: u64) -> Result<(), Segm
 
 /// Known kinds: per-field kinds name a field and others do not, no kind and
 /// field repeats, and every required section is present.
-fn check_kinds(sections: &[SectionEntry]) -> Result<(), SegmentError> {
+/// Every known section fits its kind (per field or not) and appears once. A segment has every
+/// [`REQUIRED`] section; an index sidecar has its `SchemaSnapshot` and vector graphs only.
+fn check_kinds(sections: &[SectionEntry], sidecar: bool) -> Result<(), SegmentError> {
     let mut seen = BTreeSet::new();
     for (index, entry) in sections.iter().enumerate() {
         let Some(kind) = entry.section_kind() else {
             continue;
         };
         let region = section_region(index, entry);
+        if sidecar && !matches!(kind, SectionKind::SchemaSnapshot | SectionKind::VectorGraph) {
+            return Err(SegmentError::corrupt(
+                region,
+                "an index sidecar holds only its schema snapshot and vector graphs",
+            ));
+        }
         if kind.is_per_field() != entry.field.is_some() {
             return Err(SegmentError::corrupt(
                 region,
@@ -1700,7 +1771,12 @@ fn check_kinds(sections: &[SectionEntry]) -> Result<(), SegmentError> {
             return Err(SegmentError::corrupt(region, "duplicate section"));
         }
     }
-    for kind in REQUIRED {
+    let required: &[SectionKind] = if sidecar {
+        &[SectionKind::SchemaSnapshot]
+    } else {
+        &REQUIRED
+    };
+    for kind in required {
         if !seen.contains(&(kind.code(), None)) {
             return Err(SegmentError::corrupt(
                 Region::SectionTable,

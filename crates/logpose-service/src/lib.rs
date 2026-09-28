@@ -30,7 +30,7 @@ use tonic as _;
 use tower as _;
 
 use logpose_auth::{DatabaseAccessPolicy, Principal};
-use logpose_catalog::{CatalogStore, DatabaseDescriptor};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_config::LogPoseConfig;
 use logpose_query::{
     CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
@@ -42,7 +42,7 @@ use logpose_storage::{
 };
 use logpose_storage_etcd::{
     EtcdCollectionCatalog, EtcdCoordinationClient, LeadershipLease, LeadershipRecord,
-    LeaseKeepAlive, MembershipRecord, ShardOwnership,
+    LeaseKeepAlive, MembershipFence, MembershipRecord, ShardOwnership,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
@@ -58,12 +58,13 @@ use std::{
     net::IpAddr,
     path::Path,
     sync::{
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::{
     runtime::Handle,
+    task::JoinHandle,
     time::{Duration, Instant, interval, sleep},
 };
 
@@ -101,7 +102,11 @@ impl Drop for EtcdRuntime {
 }
 
 impl CoordinationRuntime {
-    fn new(config: &LogPoseConfig) -> Self {
+    /// Start the coordination loop with etcd metadata. While the node is a registered member,
+    /// the loop has `reconciler` resolve the pending metadata of the collections placed on it;
+    /// it holds the catalog weakly, so the loop never keeps the engine open after the service
+    /// is dropped.
+    fn new(config: &LogPoseConfig, reconciler: Option<Weak<EtcdCollectionCatalog>>) -> Self {
         if config.metadata.backend != MetadataBackend::Etcd {
             return Self::Local;
         }
@@ -129,8 +134,10 @@ impl CoordinationRuntime {
         match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    run_coordination_loop(client, snapshot, shutdown, node_name, node_role, tick)
-                        .await;
+                    run_coordination_loop(
+                        client, snapshot, shutdown, node_name, node_role, tick, reconciler,
+                    )
+                    .await;
                 });
             }
             Err(error) => {
@@ -158,13 +165,75 @@ fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
     Duration::from_secs((ttl_secs / 3).max(1))
 }
 
+/// How often a node resolves the pending metadata of the collections placed on it, after the
+/// pass it runs on registering its membership.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// When a node resolves the pending metadata of the collections placed on it (creates that
+/// stopped between their steps): once it registers its membership, then every
+/// [`RECONCILE_INTERVAL`] while it stays registered, whether or not it leads. Only the node a
+/// collection is placed on sees whether its local step happened, so a create interrupted by a
+/// lost leadership converges while another node leads. A pass runs as a task of its own, one
+/// at a time, so it never delays the lease keep-alives.
+#[derive(Default)]
+struct Reconciliation {
+    /// The membership lease the last pass ran under; another lease is a new registration.
+    lease_id: Option<i64>,
+    last_started: Option<Instant>,
+    running: Option<JoinHandle<()>>,
+}
+
+impl Reconciliation {
+    /// Stop the pass that is running, if any.
+    fn stop(&mut self) {
+        if let Some(pass) = self.running.take() {
+            pass.abort();
+        }
+    }
+
+    /// Start a pass if one is due and `fence`, the node's current membership, is set.
+    fn tick(&mut self, reconciler: &Weak<EtcdCollectionCatalog>, fence: Option<MembershipFence>) {
+        let Some(fence) = fence else {
+            self.lease_id = None;
+            return;
+        };
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|pass| !pass.is_finished())
+        {
+            return;
+        }
+        let gained = self.lease_id != Some(fence.lease_id);
+        let due = gained
+            || self
+                .last_started
+                .is_none_or(|started| started.elapsed() >= RECONCILE_INTERVAL);
+        if !due {
+            return;
+        }
+        // The catalog is gone once the service is dropped.
+        let Some(catalog) = reconciler.upgrade() else {
+            return;
+        };
+        self.lease_id = Some(fence.lease_id);
+        self.last_started = Some(Instant::now());
+        // The pass reports what it did and why it failed itself; the next one retries.
+        self.running = Some(tokio::spawn(async move {
+            let _ = catalog.reconcile_pending(&fence).await;
+        }));
+    }
+}
+
 /// Drive etcd membership and controller leadership for this node.
 ///
 /// Each tick refreshes the leases the node holds, drops any claim etcd no
 /// longer backs (a dead lease, or a membership or leader key that is missing
 /// or owned by someone else), and re-acquires what is missing in the same
 /// tick. Losing membership also gives up leadership, because a node that is
-/// not a registered member must not lead.
+/// not a registered member must not lead. While the node is a member, it has
+/// `reconciler` resolve the pending metadata of the collections placed on it
+/// (see [`Reconciliation`]).
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
     snapshot: Arc<RwLock<CoordinationStatus>>,
@@ -172,10 +241,12 @@ async fn run_coordination_loop(
     node_name: String,
     node_role: NodeRole,
     tick: Duration,
+    reconciler: Option<Weak<EtcdCollectionCatalog>>,
 ) {
     let campaigns = matches!(node_role, NodeRole::Combined | NodeRole::Control);
     let mut membership_lease_id: Option<i64> = None;
     let mut leadership_lease: Option<LeadershipLease> = None;
+    let mut reconciliation = Reconciliation::default();
     let mut ticker = interval(tick);
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -283,8 +354,19 @@ async fn run_coordination_loop(
             &leader,
             pending_error,
         );
+        if let Some(reconciler) = &reconciler {
+            let fence = membership_lease_id.map(|lease_id| MembershipFence {
+                node_id: node_name.clone(),
+                lease_id,
+            });
+            reconciliation.tick(reconciler, fence);
+        }
     }
 
+    // A pass still running holds the catalog, and so the engine, open. Stopping it between its
+    // steps is safe: each etcd change is one guarded transaction, and whatever it leaves
+    // pending the next pass resolves.
+    reconciliation.stop();
     if let Some(lease) = leadership_lease.take() {
         let _ = client.revoke_lease(lease.lease_id).await;
     }
@@ -434,7 +516,7 @@ enum CollectionCatalog {
     /// The engine's own descriptors are authoritative (a single node).
     Local,
     /// Etcd is authoritative; the engine serves the collections this node owns.
-    Etcd(EtcdCollectionCatalog),
+    Etcd(Arc<EtcdCollectionCatalog>),
 }
 
 /// The data plane: collection lifecycle, writes, reads, and maintenance over the storage
@@ -472,7 +554,10 @@ impl LogPoseDataService {
     /// An invalid etcd configuration.
     pub fn with_etcd(engine: Engine, config: EtcdMetadataConfig) -> Result<Self> {
         Ok(Self {
-            catalog: CollectionCatalog::Etcd(EtcdCollectionCatalog::new(engine.clone(), config)?),
+            catalog: CollectionCatalog::Etcd(Arc::new(EtcdCollectionCatalog::new(
+                engine.clone(),
+                config,
+            )?)),
             engine,
         })
     }
@@ -498,6 +583,14 @@ impl LogPoseDataService {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The etcd collection catalog, with etcd metadata.
+    fn etcd_catalog(&self) -> Option<&Arc<EtcdCollectionCatalog>> {
+        match &self.catalog {
+            CollectionCatalog::Local => None,
+            CollectionCatalog::Etcd(catalog) => Some(catalog),
+        }
     }
 
     /// Create a collection placed on this node as a data node.
@@ -1010,7 +1103,6 @@ impl LogPoseDataService {
 #[derive(Clone)]
 pub struct LogPoseControlService {
     data: Arc<LogPoseDataService>,
-    catalog: Arc<dyn CatalogStore>,
     config: LogPoseConfig,
     build: BuildInfo,
     coordination: CoordinationRuntime,
@@ -1022,7 +1114,6 @@ impl fmt::Debug for LogPoseControlService {
         formatter
             .debug_struct("LogPoseControlService")
             .field("data_service", &"<LogPoseDataService>")
-            .field("catalog_store", &"<dyn CatalogStore>")
             .field("node_name", &self.config.node_name)
             .field("node_role", &self.config.node_role)
             .field(
@@ -1037,15 +1128,12 @@ impl fmt::Debug for LogPoseControlService {
 }
 
 impl LogPoseControlService {
-    /// Build a control-plane service over a shared data service and runtime config.
+    /// Build a control-plane service over a shared data service and runtime config. The
+    /// database, principal, and access-policy catalog is the data service's engine's.
     #[must_use]
-    pub fn new(
-        data: Arc<LogPoseDataService>,
-        catalog: Arc<dyn CatalogStore>,
-        config: LogPoseConfig,
-        build: BuildInfo,
-    ) -> Self {
-        let coordination = CoordinationRuntime::new(&config);
+    pub fn new(data: Arc<LogPoseDataService>, config: LogPoseConfig, build: BuildInfo) -> Self {
+        let coordination =
+            CoordinationRuntime::new(&config, data.etcd_catalog().map(Arc::downgrade));
         let coordination_client = if config.metadata.backend == MetadataBackend::Etcd {
             Some(
                 EtcdCoordinationClient::new(config.metadata.etcd.clone())
@@ -1056,7 +1144,6 @@ impl LogPoseControlService {
         };
         Self {
             data,
-            catalog,
             config,
             build,
             coordination,
@@ -1064,10 +1151,11 @@ impl LogPoseControlService {
         }
     }
 
-    /// The catalog store behind this control plane.
+    /// The engine whose database, principal, and access-policy catalog this control plane
+    /// serves. Its catalog calls run on the engine's I/O pool.
     #[must_use]
-    pub fn catalog_store(&self) -> &Arc<dyn CatalogStore> {
-        &self.catalog
+    pub fn catalog(&self) -> &Engine {
+        self.data.engine()
     }
 
     /// Create a collection through the control-plane surface.
@@ -1115,7 +1203,7 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.delete_database(database_name)
+        self.catalog().delete_database(database_name).await
     }
 
     fn require_collection_lifecycle_role(&self) -> Result<()> {
@@ -1145,7 +1233,7 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.put_database_access_policy(policy)
+        self.catalog().put_database_access_policy(policy).await
     }
 
     /// Create or replace one database descriptor.
@@ -1161,17 +1249,17 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.put_database(descriptor)
+        self.catalog().put_database(descriptor).await
     }
 
     /// Read one database descriptor.
     pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        self.catalog.get_database(database_name)
+        self.catalog().get_database(database_name).await
     }
 
     /// List every database descriptor.
     pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.catalog.list_databases()
+        self.catalog().list_databases().await
     }
 
     /// Read one database-scoped access policy.
@@ -1179,12 +1267,14 @@ impl LogPoseControlService {
         &self,
         database_name: &str,
     ) -> Result<DatabaseAccessPolicy> {
-        self.catalog.get_database_access_policy(database_name)
+        self.catalog()
+            .get_database_access_policy(database_name)
+            .await
     }
 
     /// Read one persisted principal descriptor.
     pub async fn principal(&self, principal_name: &str) -> Result<Principal> {
-        self.catalog.get_principal(principal_name)
+        self.catalog().get_principal(principal_name).await
     }
 
     /// Return the placement summary for one collection.
@@ -1281,13 +1371,15 @@ impl LogPoseControlService {
         })
     }
 
-    /// Persist configured bootstrap principals into the catalog store.
+    /// Persist the configured bootstrap principals that the catalog does not hold yet. Runs
+    /// at bootstrap, outside any request, so it uses the catalog's blocking calls.
     pub fn sync_bootstrap_principals(&self) -> Result<()> {
         for token in &self.config.auth.bootstrap_tokens {
-            match self.catalog.get_principal(&token.principal.name) {
+            match self.catalog().get_principal_blocking(&token.principal.name) {
                 Ok(_) => {}
                 Err(LogPoseError::NotFound { .. }) => {
-                    self.catalog.put_principal(token.principal.clone())?;
+                    self.catalog()
+                        .put_principal_blocking(token.principal.clone())?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1788,12 +1880,8 @@ mod tests {
             )
             .expect("the etcd catalog should build"),
         );
-        let control = LogPoseControlService::new(
-            data,
-            Arc::new(engine),
-            LogPoseConfig::default(),
-            BuildInfo::current(),
-        );
+        let control =
+            LogPoseControlService::new(data, LogPoseConfig::default(), BuildInfo::current());
 
         let status = control
             .runtime_status()
@@ -1955,7 +2043,6 @@ mod tests {
         let engine = data.engine().clone();
         let control = LogPoseControlService::new(
             Arc::clone(&data),
-            Arc::new(engine.clone()),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );

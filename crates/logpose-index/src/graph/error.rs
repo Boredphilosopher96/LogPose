@@ -28,6 +28,9 @@ pub enum GraphError {
     /// The graph would exceed the supported row count or memory budget.
     #[error("graph exceeds the maximum supported size")]
     TooLarge,
+    /// The build was cancelled before it finished.
+    #[error("the graph build was cancelled")]
+    Cancelled,
     /// Serialized input ended early.
     #[error("serialized graph is truncated")]
     Truncated,

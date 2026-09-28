@@ -1,4 +1,4 @@
-//! Metadata and collection catalog abstractions.
+//! Database and collection descriptors, the metadata the catalog holds.
 
 use logpose_types::{
     CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, LogPoseError,
@@ -6,8 +6,6 @@ use logpose_types::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-use logpose_auth::{DatabaseAccessPolicy, Principal};
 
 /// Default mutable-op threshold before the engine should flush.
 pub const DEFAULT_FLUSH_THRESHOLD_OPS: usize = 10_000;
@@ -221,48 +219,6 @@ fn validate_namespace_segment(label: &str, value: &str) -> logpose_types::Result
         ));
     }
     Ok(())
-}
-
-/// Catalog metadata surface for databases, principals, and policies.
-pub trait CatalogStore: Send + Sync {
-    /// Create or replace a database descriptor.
-    fn put_database(
-        &self,
-        descriptor: DatabaseDescriptor,
-    ) -> logpose_types::Result<DatabaseDescriptor>;
-
-    /// Read one database descriptor by database name.
-    fn get_database(&self, database_name: &str) -> logpose_types::Result<DatabaseDescriptor>;
-
-    /// List every database descriptor.
-    fn list_databases(&self) -> logpose_types::Result<Vec<DatabaseDescriptor>>;
-
-    /// Delete a database descriptor and its access policy.
-    ///
-    /// Fails with `FAILED_PRECONDITION` for the default database and for a database that still
-    /// holds a collection, and with `NOT_FOUND` when the database does not exist.
-    fn delete_database(&self, database_name: &str) -> logpose_types::Result<()>;
-
-    /// Create or replace a principal descriptor.
-    fn put_principal(&self, principal: Principal) -> logpose_types::Result<Principal>;
-
-    /// Read one principal descriptor by name.
-    fn get_principal(&self, principal_name: &str) -> logpose_types::Result<Principal>;
-
-    /// List every stored principal descriptor.
-    fn list_principals(&self) -> logpose_types::Result<Vec<Principal>>;
-
-    /// Create or replace one database access policy.
-    fn put_database_access_policy(
-        &self,
-        policy: DatabaseAccessPolicy,
-    ) -> logpose_types::Result<DatabaseAccessPolicy>;
-
-    /// Read one database access policy.
-    fn get_database_access_policy(
-        &self,
-        database_name: &str,
-    ) -> logpose_types::Result<DatabaseAccessPolicy>;
 }
 
 #[cfg(test)]

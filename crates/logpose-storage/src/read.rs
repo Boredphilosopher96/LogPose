@@ -28,7 +28,7 @@ use crate::{
     engine::{CoreRef, Engine, EngineCore},
     handle::CollectionHandle,
     memtable::{IndexFlavor, MemScalarIndex, MemtableData, index_keys},
-    segment::{SegmentHandle, segment_error},
+    segment::{OpenFile, SegmentHandle, index_error, segment_error},
     segment_v2::{
         DecodedScalarIndex, DynamicBlock, DynamicHandle, PkColumn, PkFilter, PkSorted,
         ScalarColumn, SectionKind, SegmentGraph, SegmentUnit, VectorHandle,
@@ -317,6 +317,14 @@ impl ReadView {
         self.version.counters
     }
 
+    /// The names of the files in `segments/` the view reads (its segments and their index
+    /// sidecars), for tests that check that no file a live view reads is removed (I7).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn segment_file_names(&self) -> Vec<String> {
+        self.version.segment_file_names()
+    }
+
     /// Segments ascending by unit, then frozen memtables oldest first, then the active
     /// memtable. Correctness never depends on the order (I5).
     #[must_use]
@@ -377,9 +385,7 @@ impl ReadView {
             let Some(segment) = segments.get(unit) else {
                 continue;
             };
-            for (unit, decoded) in stage_one_units(segment, need) {
-                first.push((Arc::clone(segment), unit, decoded));
-            }
+            first.extend(stage_one_units(segment, need));
         }
         load_units(&core, first, &mut pins, &mut report).await?;
 
@@ -389,9 +395,7 @@ impl ReadView {
             let Some(segment) = segments.get(unit) else {
                 continue;
             };
-            for unit in stage_two_units(segment, need, &pins)? {
-                second.push((Arc::clone(segment), unit, false));
-            }
+            second.extend(stage_two_units(segment, need, &pins)?);
         }
         load_units(&core, second, &mut pins, &mut report).await?;
         Ok((pins, report))
@@ -418,13 +422,10 @@ impl ReadView {
             let Some(segment) = segments.get(unit) else {
                 continue;
             };
-            let first = stage_one_units(segment, need)
-                .into_iter()
-                .map(|(unit, _)| unit);
-            let mut complete = pin_resident(segment, first, &mut pins, &mut report);
+            let mut complete = pin_resident(stage_one_units(segment, need), &mut pins, &mut report);
             if complete {
                 let second = stage_two_units(segment, need, &pins)?;
-                complete = pin_resident(segment, second, &mut pins, &mut report);
+                complete = pin_resident(second, &mut pins, &mut report);
             }
             if !complete {
                 missing.push(*unit, need.clone());
@@ -725,32 +726,36 @@ impl ReadView {
         // The units a fetch of the need would load: whole sections, directories, and (when
         // their directory is resident, so they can be located without I/O) pages and blocks.
         // A directory that is itself cold stands for its whole section.
-        let reader = segment.reader();
         let mut cold = 0;
         let mut pins = PinSet::new();
         let mut directory_cold = false;
-        for (unit, _) in stage_one_units(segment, need) {
-            match reader.resident(&unit) {
+        for load in stage_one_units(segment, need) {
+            let Some(reader) = load.file().map(OpenFile::reader) else {
+                continue;
+            };
+            match reader.resident(&load.unit) {
                 Some(bytes) => {
-                    if let Some(key) = reader.unit_key(&unit) {
+                    if let Some(key) = reader.unit_key(&load.unit) {
                         pins.insert(key, bytes);
                     }
                 }
                 None => {
                     directory_cold = true;
-                    cold += unit.len_hint().unwrap_or_else(|| {
+                    cold += load.unit.len_hint().unwrap_or_else(|| {
                         reader
                             .sections()
-                            .get(unit.section_index())
+                            .get(load.unit.section_index())
                             .map_or(0, |entry| entry.length)
                     });
                 }
             }
         }
-        if !directory_cold && let Ok(units) = stage_two_units(segment, need, &pins) {
-            for unit in units {
-                if !reader.residency(&unit) {
-                    cold += unit.len_hint().unwrap_or(0);
+        if !directory_cold && let Ok(loads) = stage_two_units(segment, need, &pins) {
+            for load in loads {
+                if let Some(reader) = load.file().map(OpenFile::reader)
+                    && !reader.residency(&load.unit)
+                {
+                    cold += load.unit.len_hint().unwrap_or(0);
                 }
             }
         }
@@ -762,17 +767,57 @@ impl ReadView {
     }
 }
 
-/// The units a fetch of `need` loads first: whole sections, vector prefixes, and dynamic block
-/// indexes, each with whether its loader decodes it.
-fn stage_one_units(segment: &SegmentHandle, need: &SectionNeed) -> Vec<(SegmentUnit, bool)> {
+/// One unit a fetch loads: from the segment file, or from its index sidecar (vector graphs).
+struct Load {
+    segment: Arc<SegmentHandle>,
+    unit: SegmentUnit,
+    /// Decode the unit as it loads (index and key sections).
+    decoded: bool,
+    /// The unit is in the segment's index sidecar.
+    sidecar: bool,
+}
+
+impl Load {
+    /// A unit of the segment file, loaded as bytes.
+    fn data(segment: &Arc<SegmentHandle>, unit: SegmentUnit) -> Self {
+        Self {
+            segment: Arc::clone(segment),
+            unit,
+            decoded: false,
+            sidecar: false,
+        }
+    }
+
+    /// The file holding the unit; `None` for a sidecar unit of a segment without one.
+    fn file(&self) -> Option<&OpenFile> {
+        if self.sidecar {
+            self.segment.index_file()
+        } else {
+            Some(self.segment.data_file())
+        }
+    }
+}
+
+/// The units a fetch of `need` loads first: whole sections (from the segment file, or vector
+/// graphs from its index sidecar), vector prefixes, and dynamic block indexes.
+fn stage_one_units(segment: &Arc<SegmentHandle>, need: &SectionNeed) -> Vec<Load> {
     let reader = segment.reader();
     let mut units = Vec::new();
     let mut section = |kind: SectionKind, field: Option<FieldId>, decoded: bool| {
-        if let Some(unit) = reader
+        let Some(file) = segment.section_file(kind, field) else {
+            return;
+        };
+        let source = file.reader();
+        if let Some(unit) = source
             .find_section(kind, field)
-            .and_then(|index| reader.section_unit(index))
+            .and_then(|index| source.section_unit(index))
         {
-            units.push((unit, decoded));
+            units.push(Load {
+                segment: Arc::clone(segment),
+                unit,
+                decoded,
+                sidecar: kind == SectionKind::VectorGraph,
+            });
         }
     };
     match need {
@@ -792,12 +837,12 @@ fn stage_one_units(segment: &SegmentHandle, need: &SectionNeed) -> Vec<(SegmentU
         }
         SectionNeed::DynamicBlocks(_) => {
             if let Some(unit) = reader.dynamic_index_unit() {
-                units.push((unit, false));
+                units.push(Load::data(segment, unit));
             }
         }
         SectionNeed::VectorRows(field, _) => {
             if let Some(unit) = reader.vector_prefix_unit(*field) {
-                units.push((unit, false));
+                units.push(Load::data(segment, unit));
             }
         }
     }
@@ -805,12 +850,12 @@ fn stage_one_units(segment: &SegmentHandle, need: &SectionNeed) -> Vec<(SegmentU
 }
 
 /// The units a fetch of `need` loads second, located through the stage-one units in `pins`:
-/// the vector pages and dynamic blocks holding the need's rows.
+/// the vector pages and dynamic blocks holding the need's rows (all in the segment file).
 fn stage_two_units(
     segment: &Arc<SegmentHandle>,
     need: &SectionNeed,
     pins: &PinSet,
-) -> Result<Vec<SegmentUnit>> {
+) -> Result<Vec<Load>> {
     let view = UnitView {
         kind: UnitKind::Segment(segment),
         deleted: None,
@@ -827,7 +872,9 @@ fn stage_two_units(
                         continue;
                     }
                     last = Some(page);
-                    units.extend(handle.page_unit(page));
+                    if let Some(unit) = handle.page_unit(page) {
+                        units.push(Load::data(segment, unit));
+                    }
                 }
             }
         }
@@ -840,7 +887,9 @@ fn stage_two_units(
                         continue;
                     }
                     last = Some(block);
-                    units.extend(handle.block_unit(block));
+                    if let Some(unit) = handle.block_unit(block) {
+                        units.push(Load::data(segment, unit));
+                    }
                 }
             }
         }
@@ -851,24 +900,26 @@ fn stage_two_units(
 
 /// Pin the resident ones of `units`; `false` when any is not resident.
 fn pin_resident(
-    segment: &SegmentHandle,
-    units: impl IntoIterator<Item = SegmentUnit>,
+    units: impl IntoIterator<Item = Load>,
     pins: &mut PinSet,
     report: &mut FetchReport,
 ) -> bool {
-    let reader = segment.reader();
     let mut complete = true;
-    for unit in units {
-        let Some(key) = reader.unit_key(&unit) else {
+    for load in units {
+        let Some(reader) = load.file().map(OpenFile::reader) else {
+            complete = false;
+            continue;
+        };
+        let Some(key) = reader.unit_key(&load.unit) else {
             complete = false;
             continue;
         };
         if pins.contains(&key) {
             continue;
         }
-        match reader.resident(&unit) {
+        match reader.resident(&load.unit) {
             Some(bytes) => {
-                report.record(unit.class(), Fetched::Hit);
+                report.record(load.unit.class(), Fetched::Hit);
                 pins.insert(key, bytes);
             }
             None => complete = false,
@@ -881,13 +932,20 @@ fn pin_resident(
 /// await) and pin them.
 async fn load_units(
     core: &CoreRef,
-    units: Vec<(Arc<SegmentHandle>, SegmentUnit, bool)>,
+    units: Vec<Load>,
     pins: &mut PinSet,
     report: &mut FetchReport,
 ) -> Result<()> {
     let mut pending = Vec::with_capacity(units.len());
-    for (segment, unit, decoded) in units {
-        let Some(key) = segment.reader().unit_key(&unit) else {
+    for load in units {
+        let file = if load.sidecar {
+            load.segment.index_file().ok_or_else(|| {
+                LogPoseError::internal("a unit of a missing index sidecar was fetched")
+            })?
+        } else {
+            load.segment.data_file()
+        };
+        let Some(key) = file.reader().unit_key(&load.unit) else {
             return Err(LogPoseError::internal(
                 "a segment of a read view has no cache registration",
             ));
@@ -896,17 +954,27 @@ async fn load_units(
             continue;
         }
         let io = &core.runtime().io;
-        let fetch = if decoded {
-            segment.reader().fetch_decoded(&unit, io)
+        let fetch = if load.decoded {
+            file.reader().fetch_decoded(&load.unit, io)
         } else {
-            segment.reader().fetch(&unit, io)
+            file.reader().fetch(&load.unit, io)
         };
-        pending.push((segment, unit.class(), key, fetch));
+        pending.push((
+            file.path().to_path_buf(),
+            load.sidecar,
+            load.unit.class(),
+            key,
+            fetch,
+        ));
     }
-    for (segment, class, key, fetch) in pending {
-        let (bytes, fetched): (Arc<AlignedBytes>, Fetched) = fetch
-            .await
-            .map_err(|error| segment_error(segment.path(), error))?;
+    for (path, sidecar, class, key, fetch) in pending {
+        let (bytes, fetched): (Arc<AlignedBytes>, Fetched) = fetch.await.map_err(|error| {
+            if sidecar {
+                index_error(&path, error)
+            } else {
+                segment_error(&path, error)
+            }
+        })?;
         report.record(class, fetched);
         pins.insert(key, bytes);
     }
@@ -1046,12 +1114,14 @@ impl<'v> UnitView<'v> {
         match self.kind {
             UnitKind::Memtable(_) => false,
             UnitKind::Segment(segment) => {
-                let kind = if graph {
-                    SectionKind::VectorGraph
+                if graph {
+                    segment.graph_file(field).is_some()
                 } else {
-                    SectionKind::VectorSq8
-                };
-                segment.reader().find_section(kind, Some(field)).is_some()
+                    segment
+                        .reader()
+                        .find_section(SectionKind::VectorSq8, Some(field))
+                        .is_some()
+                }
             }
         }
     }
@@ -1093,7 +1163,10 @@ impl<'v> UnitView<'v> {
         let UnitKind::Segment(segment) = self.kind else {
             return Ok(None);
         };
-        let reader = segment.reader();
+        let Some(file) = segment.section_file(kind, field) else {
+            return Ok(None);
+        };
+        let reader = file.reader();
         let Some(unit) = reader
             .find_section(kind, field)
             .and_then(|index| reader.section_unit(index))
@@ -1352,13 +1425,18 @@ impl<'v> UnitView<'v> {
             return Ok(VectorIndexRef::default());
         };
         let rows = segment.row_count();
-        let reader = segment.reader();
         let region = |kind: SectionKind| crate::segment_v2::Region::Section {
-            index: reader.find_section(kind, Some(field)).unwrap_or(0),
+            index: segment
+                .section_file(kind, Some(field))
+                .and_then(|file| file.reader().find_section(kind, Some(field)))
+                .unwrap_or(0),
             kind: kind.code(),
         };
-        let graph = match self.pinned(SectionKind::VectorGraph, Some(field), pins)? {
-            Some(bytes) => Some(
+        let graph = match (
+            self.pinned(SectionKind::VectorGraph, Some(field), pins)?,
+            segment.graph_file(field),
+        ) {
+            (Some(bytes), Some(file)) => Some(
                 bytes
                     .decoded(|raw| {
                         SegmentGraph::decode(raw, rows)
@@ -1371,9 +1449,9 @@ impl<'v> UnitView<'v> {
                                 detail,
                             })
                     })
-                    .map_err(|error| segment_error(segment.path(), error))?,
+                    .map_err(|error| index_error(file.path(), error))?,
             ),
-            None => None,
+            _ => None,
         };
         let sq8 = match self.pinned(SectionKind::VectorSq8, Some(field), pins)? {
             Some(bytes) => {

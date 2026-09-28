@@ -73,7 +73,8 @@ pub struct Setup {
 
 impl Setup {
     /// The setup of seed `seed` on `backend` with `maintenance`: the metric alternates, and
-    /// every fourth pair of seeds writes index sections.
+    /// every fourth pair of seeds writes index sections (every other pair with background
+    /// maintenance, whose index builds wait behind every flush and compaction).
     pub fn for_seed(seed: u64, backend: Backend, maintenance: Maintenance) -> Self {
         Self {
             backend,
@@ -83,7 +84,11 @@ impl Setup {
             } else {
                 DistanceMetric::L2
             },
-            indexed: (seed / 2) % 4 == 3,
+            indexed: if maintenance == Maintenance::Stepped {
+                (seed / 2) % 4 == 3
+            } else {
+                (seed / 2) % 2 == 1
+            },
         }
     }
 
@@ -106,8 +111,10 @@ pub struct Session {
     engine: Option<Engine>,
     handle: Option<Arc<CollectionHandle>>,
     runtime: tokio::runtime::Runtime,
-    /// Flush and compaction permits granted by engines already closed.
-    granted: (u64, u64),
+    /// Flush, compaction, and index-build permits granted by engines already closed.
+    granted: (u64, u64, u64),
+    /// Index sidecar bytes that committed index builds wrote, in engines already closed.
+    index_bytes: u64,
 }
 
 impl Session {
@@ -166,7 +173,8 @@ impl Session {
             engine: None,
             handle: None,
             runtime,
-            granted: (0, 0),
+            granted: (0, 0, 0),
+            index_bytes: 0,
         })
     }
 
@@ -297,22 +305,44 @@ impl Session {
             let stats = engine.scheduler().stats();
             self.granted.0 += stats.flushes_granted;
             self.granted.1 += stats.compactions_granted;
+            self.granted.2 += stats.index_builds_granted;
         }
+        self.index_bytes += self.index_bytes_now();
         self.handle = None;
         self.engine = None;
     }
 
-    /// Flush and compaction permits the scheduler granted over every engine this session
-    /// opened.
-    pub fn permits_granted(&self) -> (u64, u64) {
-        let now = self.engine.as_ref().map_or((0, 0), |engine| {
+    /// Flush, compaction, and index-build permits the scheduler granted over every engine this
+    /// session opened.
+    pub fn permits_granted(&self) -> (u64, u64, u64) {
+        let now = self.engine.as_ref().map_or((0, 0, 0), |engine| {
             let stats = engine.scheduler().stats();
-            (stats.flushes_granted, stats.compactions_granted)
+            (
+                stats.flushes_granted,
+                stats.compactions_granted,
+                stats.index_builds_granted,
+            )
         });
-        (self.granted.0 + now.0, self.granted.1 + now.1)
+        (
+            self.granted.0 + now.0,
+            self.granted.1 + now.1,
+            self.granted.2 + now.2,
+        )
     }
 
-    /// The names of every segment file under the storage root.
+    /// Index sidecar bytes that committed index builds (scheduled or hand-stepped) wrote over
+    /// every engine this session opened.
+    pub fn index_bytes_written(&self) -> u64 {
+        self.index_bytes + self.index_bytes_now()
+    }
+
+    fn index_bytes_now(&self) -> u64 {
+        self.handle
+            .as_ref()
+            .map_or(0, |handle| handle.maintenance_written().index_bytes)
+    }
+
+    /// The names of every segment file and index sidecar under the storage root.
     pub fn segment_files(&self) -> Result<std::collections::BTreeSet<String>, String> {
         let vfs = self.vfs();
         let mut names = std::collections::BTreeSet::new();
@@ -324,7 +354,7 @@ impl Session {
             for entry in entries {
                 if entry.is_dir {
                     dirs.push(dir.join(&entry.name));
-                } else if entry.name.ends_with(".seg") {
+                } else if entry.name.ends_with(".seg") || entry.name.contains(".idx.") {
                     names.insert(entry.name);
                 }
             }

@@ -63,10 +63,14 @@ pub struct MemtableConfig {
     /// together; past it the engine flushes the largest. Default 0.125.
     pub global_fraction: f64,
     /// Most memtables frozen and waiting for their flush at once. With this many frozen, an
-    /// active memtable that reaches a trigger stalls writes until a flush commits. Default 2.
+    /// active memtable that reaches a trigger stalls writes until a flush commits. Default 2:
+    /// a flush builds no graph, so it costs about one pass over its memtable plus the file's
+    /// syncs, and one memtable in flight plus one waiting covers a sync that runs slow.
     pub max_frozen: usize,
-    /// How long a write may wait through a write stall before it fails with
-    /// `WriteStalled`. Default 30 seconds.
+    /// How long a write may wait through a write stall before it fails with `WriteStalled`
+    /// (and a retry hint). Default 10 seconds: a flush of a full default memtable takes about
+    /// a second, so a write that waited ten flushes long is facing a device that cannot keep up
+    /// with the ingest rate, and its client should back off rather than hold the request.
     pub write_stall_timeout: Duration,
     /// Flushes of a collection that may fail in a row before it is poisoned: it then refuses
     /// writes with `CollectionPoisoned` until the engine is reopened, instead of stalling them
@@ -83,7 +87,7 @@ impl Default for MemtableConfig {
             max_age: Duration::from_secs(10 * 60),
             global_fraction: 0.125,
             max_frozen: 2,
-            write_stall_timeout: Duration::from_secs(30),
+            write_stall_timeout: Duration::from_secs(10),
             max_flush_failures: 5,
         }
     }

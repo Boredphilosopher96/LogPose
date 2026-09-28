@@ -5,8 +5,8 @@
 //! A job's life:
 //!
 //! 1. **Plan.** A frozen memtable is due a flush; the compaction policy picks a set of
-//!    unreserved segments (and reserves them). The writer asks the scheduler for a permit
-//!    (`Phase::Waiting`).
+//!    unreserved segments (and reserves them); a segment lacks its vector graphs (an index
+//!    build). The writer asks the scheduler for a permit (`Phase::Waiting`).
 //! 2. **Begin**, on `PermitGranted`, with the pipeline drained: allocate the output unit,
 //!    capture the inputs from the private state (which equals the published, durable state),
 //!    and start the build on a job thread (`Phase::Running`).
@@ -21,30 +21,51 @@
 //! stops taking requests (the bounded channel pushes back on clients) until a flush commits; a
 //! request that waits longer than `write_stall_timeout` fails with `WriteStalled`.
 //!
+//! Index builds add the vector graphs flush and compaction no longer build: after every commit
+//! the writer plans one build per collection for the largest segment that has SQ8 codes, no
+//! index sidecar yet, and at least `graph_min_rows` non-null vectors (any number once the
+//! collection is quiet). A build is never reserved against compaction: a compaction that takes
+//! its segment cancels it, since the graph would be merged away. The commit publishes a
+//! manifest in which the segment names its sidecar, and a `Version` in which its handle gains
+//! the graphs; until then searches use the segment's SQ8 codes.
+//!
+//! An explicit compaction waits for background compactions, then merges the segments present
+//! when it was asked (and the outputs they become), smallest first, one job at a time, until
+//! one is left or no two fit the maintenance-memory pool; then it builds every graph those
+//! segments lack, and answers.
+//!
 //! A failed job is retried in the background after a backoff of its own kind, so a failing
-//! compaction never holds back a freeze or a flush: flushes wait `FLUSH_RETRY_BACKOFF`, and
-//! compactions wait twice as long after each further failure in a row, up to
-//! `COMPACTION_RETRY_BACKOFF_MAX`. Once `max_flush_failures` flushes fail in a row, or one fails
+//! compaction or index build never holds back a freeze or a flush: flushes wait
+//! `FLUSH_RETRY_BACKOFF`, and compactions and index builds wait twice as long after each
+//! further failure in a row, up to `COMPACTION_RETRY_BACKOFF_MAX`. Once `max_flush_failures` flushes fail in a row, or one fails
 //! in a way no retry can fix (corrupt data, a full or read-only device), the collection is
 //! poisoned: writes, stalled ones included, fail at once with `CollectionPoisoned` instead of
-//! stalling against a device that cannot take a flush, and reads keep serving.
+//! stalling against a device that cannot take a flush, and reads keep serving. The explicit
+//! requests the failing job answers (its explicit flushes, or the compactions it runs for) get
+//! the job's own error; every other waiting request gets `CollectionPoisoned`, whose reason
+//! names that error.
 
 use super::*;
 use crate::{
-    compaction::{Candidate, RowShape, flush_build_bytes},
+    compaction::{Candidate, RowShape, flush_build_bytes, index_build_bytes},
     dv::{DvFile, dv_path, write_dv_file},
     fs_util::crash_point,
     handle::JobTicket,
     manifest::{DvRef, MANIFEST_FORMAT_VERSION, manifest_path, publish_manifest},
-    paths::SEGMENTS_DIR,
+    paths::{SEGMENTS_DIR, index_path},
 };
 use logpose_types::MaintenanceError;
 use logpose_vfs::CrashPoint;
 use std::{
     collections::HashMap,
     io,
+    sync::atomic::Ordering,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// An explicit flush: the sequence number it waits for the checkpoint to reach, and its reply
+/// (`None` for the memtable-budget trigger's).
+type FlushWaiter = (SeqNo, Option<SnapshotReply>);
 
 /// How long background flushes wait after a failed flush (or freeze) before they are tried
 /// again.
@@ -132,6 +153,17 @@ fn lasting_failure(error: &LogPoseError) -> bool {
     }
 }
 
+/// Whether `segment` needs its index build: it has none yet, and it has SQ8 codes for a vector
+/// field with at least `min_rows` (and two) non-null vectors, so a graph can be walked.
+fn needs_index(segment: &SegmentHandle, min_rows: u32) -> bool {
+    segment.entry.index.is_none()
+        && segment
+            .entry
+            .vectors
+            .iter()
+            .any(|vector| vector.has_sq8 && vector.non_null >= min_rows.max(2))
+}
+
 /// Wall-clock milliseconds since the Unix epoch, for operators reading a failure's time.
 fn unix_ms_now() -> u64 {
     SystemTime::now()
@@ -140,6 +172,23 @@ fn unix_ms_now() -> u64 {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         })
 }
+
+/// An explicit compaction in progress: who waits for it, and the segments it settles.
+pub(super) struct ExplicitCompaction {
+    /// The explicit compactions to answer once it settles.
+    waiters: Vec<SnapshotReply>,
+    /// The segments present when it was asked (widened by later requests), and the outputs
+    /// they were merged into.
+    scope: BTreeSet<UnitId>,
+    /// Compaction jobs it planned so far: only the first one's refusal is an error; later ones
+    /// stop merging where the pool ends.
+    merges: usize,
+    /// Whether it rewrote a lone segment for its deleted rows, which it does once.
+    rewrote_lone: bool,
+}
+
+/// An answer to send once the maintenance status is updated.
+type Settled = Vec<(SnapshotReply, Result<Snapshot>)>;
 
 /// How a job ended.
 enum Outcome {
@@ -210,6 +259,19 @@ impl Writer {
     /// access since it was opened, and no compaction failed within the compaction backoff.
     fn compaction_allowed(&self) -> bool {
         self.handle.maintenance_armed() && self.compaction_retry.ready(self.clock_now())
+    }
+
+    /// Whether background index builds may be planned now: the collection had a data-plane
+    /// access, its background maintenance is on, and no index build failed within the backoff.
+    fn index_allowed(&self) -> bool {
+        self.handle.maintenance_armed()
+            && self.policy.background
+            && self.index_retry.ready(self.clock_now())
+    }
+
+    /// Whether the collection is quiet: no write request for `quiet_after`.
+    fn quiet(&self) -> bool {
+        self.clock_now().saturating_sub(self.last_write_at) >= self.core.compaction.quiet_after
     }
 
     /// Whether the active memtable reached a flush trigger.
@@ -339,13 +401,20 @@ impl Writer {
         Ok(())
     }
 
-    /// Plan what is due: a flush of the oldest frozen memtable, then compactions.
+    /// Plan what is due: a flush of the oldest frozen memtable, then compactions (or the next
+    /// step of an explicit compaction), then an index build. An explicit compaction that
+    /// settled is answered after the status is updated.
     pub(super) fn schedule(&mut self) {
+        let mut settled = Settled::new();
         if self.refusal().is_none() && self.state.is_some() {
             self.request_flush();
-            self.schedule_compactions();
+            self.schedule_compactions(&mut settled);
+            self.schedule_indexes();
         }
         self.update_status();
+        for (reply, result) in settled {
+            let _ = reply.send(result);
+        }
     }
 
     /// Ask for a flush permit if a memtable is frozen and no flush is planned or running.
@@ -376,7 +445,7 @@ impl Writer {
                 )
             })
         });
-        if let Err(error) = self.request_job(JobKind::Flush, bytes, Vec::new()) {
+        if let Err(error) = self.request_job(JobKind::Flush, bytes, Vec::new(), None, false) {
             tracing::warn!(%error, "the scheduler refused a flush");
         }
         self.update_status();
@@ -406,43 +475,19 @@ impl Writer {
         }
     }
 
-    /// Plan compactions: an explicit one once no background compaction runs, otherwise what
-    /// the size-tiered policy picks for the free job slots.
-    fn schedule_compactions(&mut self) {
+    /// Plan compactions: the next step of an explicit compaction once no background
+    /// compaction runs, otherwise what the size-tiered policy (and, once the collection is
+    /// quiet, the quiet rule) picks for the free job slots.
+    fn schedule_compactions(&mut self, settled: &mut Settled) {
         let compactions = self
             .jobs
             .values()
             .filter(|job| job.kind == JobKind::Compact)
             .count();
-        if !self.compact_waiters.is_empty() {
-            if compactions > 0 {
-                // Background compactions finish first; the explicit one then takes every
-                // segment it can.
-                return;
-            }
-            let plan = self
-                .policy()
-                .plan_explicit(&self.candidates(), &self.reserved);
-            let Some(plan) = plan else {
-                let snapshot = self.handle.current().snapshot();
-                for reply in self.compact_waiters.drain(..) {
-                    let _ = reply.send(Ok(snapshot.clone()));
-                }
-                return;
-            };
-            // The job answers the requests made so far; later ones wait for the next job.
-            let waiters = std::mem::take(&mut self.compact_waiters);
-            match self.request_job(JobKind::Compact, plan.build_bytes, plan.inputs) {
-                Ok(job) => {
-                    if let Some(entry) = self.jobs.get_mut(&job) {
-                        entry.waiters = waiters;
-                    }
-                }
-                Err(error) => {
-                    for reply in waiters {
-                        let _ = reply.send(Err(error.clone()));
-                    }
-                }
+        if self.explicit.is_some() {
+            if compactions == 0 {
+                // Background compactions finish first; their outputs are merged too.
+                self.schedule_explicit(settled);
             }
             return;
         }
@@ -457,9 +502,14 @@ impl Writer {
         if slots == 0 {
             return;
         }
-        let plans = self
-            .policy()
-            .plan(&self.candidates(), &self.reserved, slots);
+        let candidates = self.candidates();
+        let policy = self.policy();
+        let mut plans = policy.plan(&candidates, &self.reserved, slots);
+        if plans.len() < slots && self.quiet() {
+            let mut reserved = self.reserved.clone();
+            reserved.extend(plans.iter().flat_map(|plan| plan.inputs.iter().copied()));
+            plans.extend(policy.plan_quiet(&candidates, &reserved, slots - plans.len()));
+        }
         for plan in plans {
             tracing::debug!(
                 collection = %self.handle.descriptor().lookup_name(),
@@ -468,7 +518,9 @@ impl Writer {
                 build_bytes = plan.build_bytes,
                 "planned a compaction"
             );
-            if let Err(error) = self.request_job(JobKind::Compact, plan.build_bytes, plan.inputs) {
+            if let Err(error) =
+                self.request_job(JobKind::Compact, plan.build_bytes, plan.inputs, None, false)
+            {
                 tracing::warn!(%error, "the scheduler declined a compaction");
                 let now = self.clock_now();
                 self.compaction_retry.failed(now);
@@ -477,8 +529,196 @@ impl Writer {
         }
     }
 
-    /// Ask the scheduler for a permit for a new job; the grant arrives as `PermitGranted`.
-    fn request_job(&mut self, kind: JobKind, bytes: u64, inputs: Vec<UnitId>) -> Result<JobId> {
+    /// The next step of the explicit compaction: merge the smallest segments of its scope that
+    /// fit one job, or, once nothing more merges, build the graphs its segments lack, or, once
+    /// none is missing, answer its waiters. No compaction runs.
+    fn schedule_explicit(&mut self, settled: &mut Settled) {
+        let Some(mut explicit) = self.explicit.take() else {
+            return;
+        };
+        let candidates = self
+            .candidates()
+            .into_iter()
+            .filter(|candidate| explicit.scope.contains(&candidate.unit))
+            .collect::<Vec<_>>();
+        let policy = self.policy();
+        let plan = policy
+            .plan_explicit(&candidates, &self.reserved)
+            .filter(|plan| plan.inputs.len() >= 2 || !explicit.rewrote_lone);
+        if let Some(plan) = plan {
+            let first = explicit.merges == 0;
+            // The first job asks for its permit whatever it needs, so a compaction larger than
+            // the pool fails with `TooLarge`. After it, a merge that does not fit the pool, or
+            // whose output's graph would not, is where the compaction stops merging.
+            if (first && plan.build_bytes > self.core.scheduler.pool_bytes())
+                || policy.fits_pool(&plan)
+            {
+                explicit.merges += 1;
+                explicit.rewrote_lone |= plan.inputs.len() == 1;
+                match self.request_job(JobKind::Compact, plan.build_bytes, plan.inputs, None, true)
+                {
+                    Ok(_) => {
+                        self.explicit = Some(explicit);
+                        return;
+                    }
+                    Err(error) if first => {
+                        for reply in explicit.waiters {
+                            settled.push((reply, Err(error.clone())));
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "an explicit compaction stops merging");
+                    }
+                }
+            }
+        }
+        // Merged as far as it goes: every segment of the scope gets its graphs.
+        let indexing = self.jobs.values().any(|job| {
+            (job.explicit && job.kind == JobKind::Index)
+                || job
+                    .target
+                    .is_some_and(|target| explicit.scope.contains(&target))
+        });
+        if indexing {
+            self.explicit = Some(explicit);
+            return;
+        }
+        if let Some((target, bytes)) = self.next_index_target(Some(&explicit.scope), 0) {
+            match self.request_job(JobKind::Index, bytes, Vec::new(), Some(target), true) {
+                Ok(_) => {
+                    self.explicit = Some(explicit);
+                    return;
+                }
+                Err(error) => {
+                    for reply in explicit.waiters {
+                        settled.push((reply, Err(error.clone())));
+                    }
+                    return;
+                }
+            }
+        }
+        let snapshot = self.handle.current().snapshot();
+        for reply in explicit.waiters {
+            settled.push((reply, Ok(snapshot.clone())));
+        }
+    }
+
+    /// Plan a background index build: one per collection at a time, for the largest segment
+    /// that needs its graphs (at least `graph_min_rows` non-null vectors, or any once the
+    /// collection is quiet).
+    fn schedule_indexes(&mut self) {
+        if !self.index_allowed()
+            || self
+                .jobs
+                .values()
+                .any(|job| job.kind == JobKind::Index && !job.explicit)
+        {
+            return;
+        }
+        let min_rows = if self.quiet() {
+            0
+        } else {
+            self.policy.graph_min_rows
+        };
+        let Some((target, bytes)) = self.next_index_target(None, min_rows) else {
+            return;
+        };
+        tracing::debug!(
+            collection = %self.handle.descriptor().lookup_name(),
+            segment = %target,
+            build_bytes = bytes,
+            "planned an index build"
+        );
+        if let Err(error) = self.request_job(JobKind::Index, bytes, Vec::new(), Some(target), false)
+        {
+            tracing::warn!(%error, "the scheduler declined an index build");
+            let now = self.clock_now();
+            self.index_retry.failed(now);
+        }
+    }
+
+    /// The segment an index build should take next, with the memory its build reserves: the
+    /// largest segment (in `scope`, if given) that has SQ8 codes for a vector field with at
+    /// least `min_rows` non-null vectors and no index sidecar, that no compaction holds and no
+    /// index build takes, and whose build fits the maintenance-memory pool.
+    fn next_index_target(
+        &self,
+        scope: Option<&BTreeSet<UnitId>>,
+        min_rows: u32,
+    ) -> Option<(UnitId, u64)> {
+        let state = self.state.as_ref()?;
+        let shape = RowShape::of(&state.schema);
+        let pool = self.core.scheduler.pool_bytes();
+        let taken = self
+            .jobs
+            .values()
+            .filter_map(|job| job.target)
+            .collect::<BTreeSet<_>>();
+        state
+            .segments
+            .iter()
+            .filter(|segment| {
+                scope.is_none_or(|scope| scope.contains(&segment.unit))
+                    && !self.reserved.contains(&segment.unit)
+                    && !taken.contains(&segment.unit)
+                    && needs_index(segment, min_rows)
+                    && index_build_bytes(segment.row_count(), shape) <= pool
+            })
+            .max_by_key(|segment| (segment.row_count(), std::cmp::Reverse(segment.unit)))
+            .map(|segment| (segment.unit, index_build_bytes(segment.row_count(), shape)))
+    }
+
+    /// Stop every index build of one of `segments`, which a compaction is taking: a waiting
+    /// one is withdrawn, a running one is told to stop (it then ends without committing).
+    fn cancel_indexing(&mut self, segments: &[UnitId]) {
+        let doomed = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.target.is_some_and(|target| segments.contains(&target)))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in doomed {
+            let Some(job) = self.jobs.get(&id) else {
+                continue;
+            };
+            match &job.phase {
+                Phase::Waiting(request) => {
+                    self.core.scheduler.cancel(*request);
+                    self.jobs.remove(&id);
+                }
+                Phase::Running(running) => {
+                    if let Some(cancel) = &running.cancel {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tell every running index build to stop: the collection is being dropped, poisoned, or
+    /// shut down, and a graph build can take minutes.
+    fn cancel_running_indexes(&self) {
+        for job in self.jobs.values() {
+            if let Phase::Running(running) = &job.phase
+                && let Some(cancel) = &running.cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Ask the scheduler for a permit for a new job; the grant arrives as `PermitGranted`. A
+    /// compaction reserves its `inputs` and cancels the index builds of any of them; an index
+    /// build names its `target`.
+    fn request_job(
+        &mut self,
+        kind: JobKind,
+        bytes: u64,
+        inputs: Vec<UnitId>,
+        target: Option<UnitId>,
+        explicit: bool,
+    ) -> Result<JobId> {
         let job = JobId(self.next_job);
         self.next_job += 1;
         let control = self.handle.control_sender();
@@ -486,22 +726,24 @@ impl Writer {
             // A writer that is gone drops the permit, which releases it.
             let _ = control.send(ControlMsg::PermitGranted { job, permit });
         })?;
+        self.cancel_indexing(&inputs);
         self.reserved.extend(inputs.iter().copied());
         self.jobs.insert(
             job,
             Job {
                 kind,
                 inputs,
-                waiters: Vec::new(),
+                target,
+                explicit,
                 phase: Phase::Waiting(request),
             },
         );
         Ok(job)
     }
 
-    /// Withdraw every job still waiting for a permit. The explicit compactions they would have
-    /// answered wait for the next one. A permit already on its way is dropped when it arrives
-    /// for a job that no longer exists.
+    /// Withdraw every job still waiting for a permit (an explicit compaction plans its step
+    /// again). A permit already on its way is dropped when it arrives for a job that no longer
+    /// exists.
     fn cancel_waiting_jobs(&mut self) {
         let waiting = self
             .jobs
@@ -517,7 +759,6 @@ impl Writer {
                 for unit in &entry.inputs {
                     self.reserved.remove(unit);
                 }
-                self.compact_waiters.extend(entry.waiters);
             }
         }
         self.update_status();
@@ -528,17 +769,21 @@ impl Writer {
         let mut pending = Vec::new();
         let mut flushing = false;
         let mut compacting = false;
+        let mut indexing = false;
         for job in self.jobs.values() {
             match (&job.phase, job.kind) {
                 (Phase::Waiting(_), kind) => pending.push(kind.label().to_owned()),
                 (Phase::Running(_), JobKind::Flush) => flushing = true,
                 (Phase::Running(_), JobKind::Compact) => compacting = true,
+                (Phase::Running(_), JobKind::Index) => indexing = true,
             }
         }
         let in_progress = if flushing || !self.manual_flushes.is_empty() {
             Some(JobKind::Flush.label().to_owned())
         } else if compacting {
             Some(JobKind::Compact.label().to_owned())
+        } else if indexing {
+            Some(JobKind::Index.label().to_owned())
         } else {
             None
         };
@@ -557,7 +802,13 @@ impl Writer {
                 wrote_files,
                 reply,
             } => {
+                let cancelled = self.jobs.get(&job).is_some_and(|entry| match &entry.phase {
+                    Phase::Running(running) => running.cancelled(),
+                    Phase::Waiting(_) => false,
+                });
                 let outcome = match result {
+                    // A cancelled index build ends without a change, whatever it built.
+                    _ if cancelled => Outcome::Abandoned,
                     Ok(commit) => match self.commit_job(job, commit).await {
                         Ok(snapshot) => Outcome::Committed(snapshot),
                         Err(error) => Outcome::Failed(error),
@@ -576,7 +827,19 @@ impl Writer {
                     let _ = reply.send(Err(refusal.clone_error()));
                 } else {
                     self.handle.arm_maintenance();
-                    self.compact_waiters.push(reply);
+                    let present = self
+                        .state
+                        .as_ref()
+                        .map(|state| state.segments.iter().map(|segment| segment.unit).collect())
+                        .unwrap_or_default();
+                    let explicit = self.explicit.get_or_insert_with(|| ExplicitCompaction {
+                        waiters: Vec::new(),
+                        scope: BTreeSet::new(),
+                        merges: 0,
+                        rewrote_lone: false,
+                    });
+                    explicit.waiters.push(reply);
+                    explicit.scope.extend::<BTreeSet<UnitId>>(present);
                     self.schedule();
                 }
             }
@@ -591,9 +854,10 @@ impl Writer {
                 let _ = reply.try_send(());
             }
             ControlMsg::Quiesce { reply } => {
-                // A drop voids every job that has not begun. Should the drop not commit, the
-                // next tick plans them again.
+                // A drop voids every job that has not begun, and stops the index builds that
+                // run. Should the drop not commit, the next tick plans them again.
                 self.cancel_waiting_jobs();
+                self.cancel_running_indexes();
                 if self.handle.is_dropped() {
                     self.fail_waiters();
                 }
@@ -682,18 +946,16 @@ impl Writer {
                 return;
             }
         };
+        let target = self.jobs.get(&job).and_then(|entry| entry.target);
+        let running = self.running(kind, unit, target, Some(permit));
         if let Some(entry) = self.jobs.get_mut(&job) {
-            entry.phase = Phase::Running(Running {
-                unit,
-                dv_files: Vec::new(),
-                owns_files: true,
-                permit: Some(permit),
-            });
+            entry.phase = Phase::Running(running);
         }
         self.update_status();
         let work = match kind {
             JobKind::Flush => self.begin_flush(job).await,
             JobKind::Compact => self.begin_compaction(&inputs),
+            JobKind::Index => self.begin_index(job, target),
         };
         let work = match work {
             Ok(JobWork::Nothing) => {
@@ -730,6 +992,9 @@ impl Writer {
                         work,
                         &mut ticket,
                     ),
+                    JobWork::Index(work) => {
+                        core.build_index(&handle, &start.version, start.unit, work, &mut ticket)
+                    }
                     JobWork::Nothing => Err(LogPoseError::internal("a job with nothing to do")),
                 }
             };
@@ -779,6 +1044,11 @@ impl Writer {
                 .plan_explicit(&self.candidates(), &self.reserved)
                 .map(|plan| plan.inputs)
                 .unwrap_or_default(),
+            JobKind::Index => Vec::new(),
+        };
+        let target = match kind {
+            JobKind::Index => self.next_index_target(None, 0).map(|(target, _)| target),
+            _ => None,
         };
         let job = JobId(self.next_job);
         self.next_job += 1;
@@ -789,19 +1059,17 @@ impl Writer {
                 return;
             }
         };
+        self.cancel_indexing(&inputs);
         self.reserved.extend(inputs.iter().copied());
+        let running = self.running(kind, unit, target, None);
         self.jobs.insert(
             job,
             Job {
                 kind,
                 inputs: inputs.clone(),
-                waiters: Vec::new(),
-                phase: Phase::Running(Running {
-                    unit,
-                    dv_files: Vec::new(),
-                    owns_files: true,
-                    permit: None,
-                }),
+                target,
+                explicit: false,
+                phase: Phase::Running(running),
             },
         );
         self.update_status();
@@ -809,6 +1077,7 @@ impl Writer {
             JobKind::Flush => self.begin_flush(job).await,
             JobKind::Compact if inputs.is_empty() => Ok(JobWork::Nothing),
             JobKind::Compact => self.begin_compaction(&inputs),
+            JobKind::Index => self.begin_index(job, target),
         };
         let work = match work {
             Ok(work) => work,
@@ -926,6 +1195,56 @@ impl Writer {
             return Ok(JobWork::Nothing);
         }
         Ok(JobWork::Compact(CompactStart { inputs: captured }))
+    }
+
+    /// Capture an index build's input: the segment it targets, if it is still a segment
+    /// without an index sidecar (a compaction may have merged it since it was planned), and the
+    /// build's cancellation flag. The pipeline is drained.
+    fn begin_index(&self, job: JobId, target: Option<UnitId>) -> Result<JobWork> {
+        let Some(state) = self.state.as_ref() else {
+            return Err(self.handle.unavailable());
+        };
+        let segment = target.and_then(|target| {
+            state
+                .segments
+                .iter()
+                .find(|segment| segment.unit == target && segment.entry.index.is_none())
+        });
+        let cancel = self.jobs.get(&job).and_then(|entry| match &entry.phase {
+            Phase::Running(running) => running.cancel.clone(),
+            Phase::Waiting(_) => None,
+        });
+        match (segment, cancel) {
+            (Some(segment), Some(cancel)) => Ok(JobWork::Index(IndexStart {
+                segment: Arc::clone(segment),
+                cancel,
+            })),
+            _ => Ok(JobWork::Nothing),
+        }
+    }
+
+    /// The running state of a job of `kind` allocated `unit`: where its output goes, and an
+    /// index build's cancellation flag.
+    fn running(
+        &self,
+        kind: JobKind,
+        unit: UnitId,
+        target: Option<UnitId>,
+        permit: Option<Permit>,
+    ) -> Running {
+        let dir = &self.handle.meta().dir;
+        let output = match (kind, target) {
+            (JobKind::Index, Some(target)) => index_path(dir, target, unit),
+            _ => segment_path(dir, unit),
+        };
+        Running {
+            unit,
+            output,
+            dv_files: Vec::new(),
+            owns_files: true,
+            permit,
+            cancel: (kind == JobKind::Index).then(|| Arc::new(AtomicBool::new(false))),
+        }
     }
 
     fn running_mut(&mut self, job: JobId) -> Option<&mut Running> {
@@ -1189,6 +1508,48 @@ impl Writer {
                     },
                 )
             }
+            JobCommit::Index { segment, index } => {
+                if kind != JobKind::Index || index.reference.unit != unit {
+                    return Err(LogPoseError::internal(format!(
+                        "the index build of segment {segment} is not the job's (unit {unit})"
+                    )));
+                }
+                let durable_entry = durable
+                    .segments
+                    .iter()
+                    .find(|entry| entry.unit == segment && entry.index.is_none());
+                let present = state.segments.iter().any(|handle| handle.unit == segment);
+                let Some(durable_entry) = durable_entry.filter(|_| present) else {
+                    // A compaction merged the segment away (or another build indexed it) since
+                    // the build began: its sidecar is of no use, and no manifest names it.
+                    self.abandon_job_files(job);
+                    return Ok(self.handle.current().snapshot());
+                };
+                let mut entry = durable_entry.clone();
+                entry.index = Some(index.reference);
+                for vector in &mut entry.vectors {
+                    vector.has_graph |= index.graphs.iter().any(|field| field.0 == vector.field_id);
+                }
+                let segments = durable
+                    .segments
+                    .iter()
+                    .map(|current| {
+                        if current.unit == segment {
+                            entry.clone()
+                        } else {
+                            current.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    (segments, durable.checkpoint_seq_no),
+                    Install::Index {
+                        segment,
+                        file: index.file,
+                        entry,
+                    },
+                )
+            }
         };
         let (segments, checkpoint) = manifest;
         let generation = self.next_manifest_gen;
@@ -1301,6 +1662,15 @@ impl Writer {
                 let retired = state.install_compaction(&inputs, output, reconciled);
                 (retired, superseded_dvs, None, written.0, written.1)
             }
+            Install::Index {
+                segment,
+                file,
+                entry,
+            } => {
+                let bytes = entry.index.map_or(0, |index| index.file_len);
+                state.install_index(segment, file, entry);
+                (Vec::new(), Vec::new(), None, 0, bytes)
+            }
         };
         self.handle.record_written(kind, rows, bytes);
         let Some(version) = self.candidate() else {
@@ -1329,11 +1699,10 @@ impl Writer {
 
     /// Remove every file job `job` may have written: no durable manifest names them.
     fn abandon_job_files(&mut self, job: JobId) {
-        let dir = self.handle.meta().dir.clone();
         let files = match self.running_mut(job) {
             Some(running) if running.owns_files => {
                 running.owns_files = false;
-                running.files(&dir)
+                running.files()
             }
             _ => return,
         };
@@ -1398,24 +1767,71 @@ impl Writer {
         for unit in &entry.inputs {
             self.reserved.remove(unit);
         }
+        let mut output = None;
         if let Phase::Running(running) = entry.phase {
             if running.owns_files && wrote_files {
-                self.core.gc.remove(running.files(&self.handle.meta().dir));
+                self.core.gc.remove(running.files());
             }
+            output = Some(running.unit);
             // Dropping the permit releases its slot and memory to the next waiting job.
             drop(running.permit);
         }
+        // A flush settles the explicit flushes. They are taken before the failure is reported,
+        // so that when it poisons the collection they still get this flush's own error, as the
+        // job's other waiters do, and not the `CollectionPoisoned` that other waiters get.
+        let flush_waiters = if entry.kind == JobKind::Flush {
+            std::mem::take(&mut self.flush_waiters)
+        } else {
+            Vec::new()
+        };
         match &outcome {
             Outcome::Committed(_) | Outcome::Nothing => self.job_succeeded(entry.kind),
             Outcome::Failed(error) => self.job_failed(entry.kind, error),
             Outcome::Abandoned => {}
         }
+        // The explicit compaction follows its segments into the outputs they are merged into,
+        // and ends with the first failure of one of its steps.
+        let mut explicit_failed = Vec::new();
+        if let Some(explicit) = self.explicit.as_mut() {
+            if let (Outcome::Committed(_), JobKind::Compact) = (&outcome, entry.kind)
+                && entry
+                    .inputs
+                    .iter()
+                    .any(|unit| explicit.scope.contains(unit))
+            {
+                for unit in &entry.inputs {
+                    explicit.scope.remove(unit);
+                }
+                explicit.scope.extend(output);
+            }
+            if let (Outcome::Failed(_), true) = (&outcome, entry.explicit) {
+                explicit_failed = std::mem::take(&mut explicit.waiters);
+                self.explicit = None;
+            }
+        }
+        // A step that ended without failing, once the writer refuses work, leaves the explicit
+        // compaction nothing more to plan: its waiters get the refusal (`fail_waiters` left them
+        // to this step).
+        let mut explicit_refused = Vec::new();
+        if let Some(refusal) = self.refusal().map(|refusal| refusal.clone_error())
+            && !self.explicit_step_running()
+            && let Some(explicit) = self.explicit.take()
+        {
+            explicit_refused = explicit
+                .waiters
+                .into_iter()
+                .map(|reply| (reply, refusal.clone()))
+                .collect();
+        }
         self.update_status();
-        for reply in reply.into_iter().chain(entry.waiters) {
+        for reply in reply.into_iter().chain(explicit_failed) {
             let _ = reply.send(self.answer(&outcome));
         }
+        for (reply, refusal) in explicit_refused {
+            let _ = reply.send(Err(refusal));
+        }
         if entry.kind == JobKind::Flush {
-            self.settle_flush_waiters(&outcome);
+            self.settle_flush_waiters(flush_waiters, &outcome);
         }
         if self.running_jobs() == 0 {
             for waiter in self.quiesce_waiters.drain(..) {
@@ -1451,6 +1867,7 @@ impl Writer {
         match kind {
             JobKind::Flush => self.flush_retry.succeeded(),
             JobKind::Compact => self.compaction_retry.succeeded(),
+            JobKind::Index => self.index_retry.succeeded(),
         }
         self.handle.update_maintenance_status(|status| {
             status.completed_runs += 1;
@@ -1486,6 +1903,7 @@ impl Writer {
         let failures = match kind {
             JobKind::Flush => self.flush_retry.failed(now),
             JobKind::Compact => self.compaction_retry.failed(now),
+            JobKind::Index => self.index_retry.failed(now),
         };
         tracing::warn!(
             collection = %self.handle.descriptor().lookup_name(),
@@ -1517,11 +1935,13 @@ impl Writer {
         self.poison(PoisonKind::ReadOnly, reason);
     }
 
-    /// After a flush ended: answer the explicit flushes the checkpoint now covers, or fail them
-    /// all if the flush failed.
-    fn settle_flush_waiters(&mut self, outcome: &Outcome) {
+    /// After a flush ended: answer the explicit flushes `waiters` (taken from `flush_waiters`)
+    /// with the flush's own error if it failed, and otherwise those the checkpoint now covers.
+    /// The rest wait for the next flush, unless the writer refuses work by now: no flush runs
+    /// again, so they get the refusal.
+    fn settle_flush_waiters(&mut self, waiters: Vec<FlushWaiter>, outcome: &Outcome) {
         if let Outcome::Failed(error) = outcome {
-            for (_, reply) in self.flush_waiters.drain(..) {
+            for (_, reply) in waiters {
                 if let Some(reply) = reply {
                     let _ = reply.send(Err(error.clone()));
                 }
@@ -1530,37 +1950,84 @@ impl Writer {
         }
         let checkpoint = self.manifest.checkpoint_seq_no;
         let snapshot = self.handle.current().snapshot();
-        let mut waiting = Vec::new();
-        for (target, reply) in self.flush_waiters.drain(..) {
+        let refusal = self.refusal();
+        for (target, reply) in waiters {
             if target <= checkpoint {
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(snapshot.clone()));
                 }
+            } else if let Some(refusal) = &refusal {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(refusal.clone_error()));
+                }
             } else {
-                waiting.push((target, reply));
+                self.flush_waiters.push((target, reply));
             }
         }
-        self.flush_waiters = waiting;
     }
 
     /// Fail every explicit request and cancel every job that has not begun: the collection was
-    /// dropped or poisoned.
+    /// dropped or poisoned. The requests get the refusal (`CollectionPoisoned`, whose reason
+    /// names the failure that poisoned the collection, or `NotFound`).
+    ///
+    /// The explicit flushes are the exception while a flush runs: that flush answers them when
+    /// it ends, so when its own failure is what poisoned the collection (a manifest publish or a
+    /// WAL rotation that failed), they get that failure, as its other waiters do. A flush that
+    /// ends after an unrelated poisoning fails on the refusal and answers them with it. The
+    /// explicit compaction is the same while one of its steps (a compaction or an index build)
+    /// runs: that step answers it when it ends, with its own failure if it failed, and with the
+    /// refusal otherwise.
     pub(super) fn fail_waiters(&mut self) {
         self.cancel_waiting_jobs();
+        self.cancel_running_indexes();
         let error = self.handle.unavailable();
-        self.fail_explicit_requests(&error);
+        let flushing = self
+            .jobs
+            .values()
+            .any(|job| job.kind == JobKind::Flush && matches!(job.phase, Phase::Running(_)));
+        if !flushing {
+            self.fail_flush_waiters(&error);
+        }
+        if !self.explicit_step_running() {
+            self.fail_explicit_compaction(&error);
+        }
+        self.fail_manual_flushes(&error);
+    }
+
+    /// Whether a step of the explicit compaction runs: it answers the compaction's waiters.
+    fn explicit_step_running(&self) -> bool {
+        self.jobs
+            .values()
+            .any(|job| job.explicit && matches!(job.phase, Phase::Running(_)))
     }
 
     /// Answer every explicit flush and compaction still waiting with `error`.
     fn fail_explicit_requests(&mut self, error: &LogPoseError) {
+        self.fail_flush_waiters(error);
+        self.fail_explicit_compaction(error);
+        self.fail_manual_flushes(error);
+    }
+
+    /// Answer every explicit flush still waiting with `error`.
+    fn fail_flush_waiters(&mut self, error: &LogPoseError) {
         for (_, reply) in std::mem::take(&mut self.flush_waiters) {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(error.clone()));
             }
         }
-        for reply in std::mem::take(&mut self.compact_waiters) {
-            let _ = reply.send(Err(error.clone()));
+    }
+
+    /// Answer the explicit compaction's waiters with `error`, and end it.
+    fn fail_explicit_compaction(&mut self, error: &LogPoseError) {
+        if let Some(explicit) = self.explicit.take() {
+            for reply in explicit.waiters {
+                let _ = reply.send(Err(error.clone()));
+            }
         }
+    }
+
+    /// Answer every hand-stepped flush still waiting with `error`.
+    fn fail_manual_flushes(&mut self, error: &LogPoseError) {
         for reply in std::mem::take(&mut self.manual_flushes) {
             let _ = reply.send(Err(error.clone()));
         }
@@ -1580,6 +2047,7 @@ impl Writer {
         self.requests.close();
         self.control.close();
         self.cancel_waiting_jobs();
+        self.cancel_running_indexes();
         if let Some(held) = self.held.take() {
             let _ = held.request.ack().send(Err(shutting_down()));
         }
@@ -1611,9 +2079,6 @@ impl Writer {
                 | ControlMsg::Tick { .. }
                 | ControlMsg::Shutdown => {}
             }
-        }
-        for job in self.jobs.values_mut() {
-            self.compact_waiters.append(&mut job.waiters);
         }
         self.fail_explicit_requests(&shutting_down());
         for waiter in self.quiesce_waiters.drain(..) {

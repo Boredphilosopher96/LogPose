@@ -53,14 +53,18 @@ mod tests;
 
 pub use builder::{
     IndexSection, IndexSectionKind, MAX_SEGMENT_ROWS, RowWriter, SegmentBuilder, SegmentIdentity,
-    WrittenSegment,
+    WrittenSegment, WrittenSidecar, write_index_sidecar,
 };
 pub use column::{ColumnEncoding, ScalarColumn};
 pub use dynamic::{DYNAMIC_BLOCK_ROWS, DynamicBlock, DynamicBlockRef, DynamicIndex};
 pub use error::{Region, SegmentError};
-pub use format::{FORMAT_VERSION, Footer, NO_FIELD, SectionEntry, SectionKind, SegmentHeader};
+pub use format::{
+    FORMAT_VERSION, Footer, HEADER_FLAG_INDEX_SIDECAR, NO_FIELD, SectionEntry, SectionKind,
+    SegmentHeader,
+};
 pub use index::{
-    DecodedScalarIndex, INDEX_ENCODING_V1, IndexBuildReport, IndexPolicy, NodeMap, SegmentGraph,
+    DecodedScalarIndex, GraphInput, INDEX_ENCODING_V1, IndexBuildReport, IndexPolicy, NodeMap,
+    SegmentGraph, build_graph_section,
 };
 pub use pk::{PkColumn, PkFilter, PkSorted, canonical_pk_hash};
 pub use reader::{DynamicHandle, SegmentReader, SegmentRow, VectorHandle};

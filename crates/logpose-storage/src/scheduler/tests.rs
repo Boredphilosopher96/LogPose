@@ -80,12 +80,17 @@ fn compactions_never_take_the_slot_kept_for_flushes() {
 fn a_slot_freed_while_both_wait_goes_to_the_flush() {
     let scheduler = MaintenanceScheduler::new(3, 1000);
     let (granted, received) = mpsc::channel();
-    // Fill all three slots: two compactions and one flush.
+    // Fill all four slots (three, plus the index-build slot, which flushes may use too): two
+    // compactions and two flushes.
     ask(&scheduler, JobKind::Compact, 1, "compact-1", &granted).expect("request");
     ask(&scheduler, JobKind::Compact, 1, "compact-2", &granted).expect("request");
     ask(&scheduler, JobKind::Flush, 0, "flush-1", &granted).expect("request");
+    ask(&scheduler, JobKind::Flush, 0, "flush-0", &granted).expect("request");
     let mut running = drain(&received);
-    assert_eq!(labels(&running), ["compact-1", "compact-2", "flush-1"]);
+    assert_eq!(
+        labels(&running),
+        ["compact-1", "compact-2", "flush-1", "flush-0"]
+    );
     // A compaction, then a flush, wait.
     ask(&scheduler, JobKind::Compact, 1, "compact-3", &granted).expect("request");
     ask(&scheduler, JobKind::Flush, 0, "flush-2", &granted).expect("request");
@@ -211,11 +216,70 @@ fn a_cancelled_request_is_never_granted_and_an_undelivered_permit_is_released() 
 }
 
 #[test]
-fn one_thread_still_gets_a_flush_slot_and_a_compaction_slot() {
+fn one_thread_still_gets_a_flush_slot_a_compaction_slot_and_an_index_slot() {
     let scheduler = MaintenanceScheduler::new(1, 100);
-    assert_eq!(scheduler.slots(), 2);
+    assert_eq!(scheduler.slots(), 3);
     let (granted, received) = mpsc::channel();
     ask(&scheduler, JobKind::Compact, 1, "compact", &granted).expect("request");
     ask(&scheduler, JobKind::Flush, 0, "flush", &granted).expect("request");
-    assert_eq!(labels(&drain(&received)), ["compact", "flush"]);
+    ask(&scheduler, JobKind::Index, 1, "index", &granted).expect("request");
+    assert_eq!(labels(&drain(&received)), ["compact", "flush", "index"]);
+    assert_eq!(scheduler.stats().index_builds_granted, 1);
+}
+
+/// Index builds come last: a waiting compaction goes first even when the build asked earlier,
+/// and one build at a time runs, in its own slot, so a long graph build never holds back a
+/// compaction's slot.
+#[test]
+fn index_builds_wait_for_compactions_and_run_in_their_own_slot() {
+    let scheduler = MaintenanceScheduler::new(2, 1000);
+    let (granted, received) = mpsc::channel();
+    scheduler.pause();
+    ask(&scheduler, JobKind::Index, 10, "index-1", &granted).expect("request");
+    ask(&scheduler, JobKind::Index, 10, "index-2", &granted).expect("request");
+    ask(&scheduler, JobKind::Compact, 10, "compact-1", &granted).expect("request");
+    scheduler.step(1);
+    let compaction = drain(&received);
+    assert_eq!(labels(&compaction), ["compact-1"]);
+    scheduler.resume();
+    let index = drain(&received);
+    assert_eq!(labels(&index), ["index-1"], "one index build at a time");
+    ask(&scheduler, JobKind::Compact, 10, "compact-2", &granted).expect("request");
+    assert!(drain(&received).is_empty(), "the compaction slot is taken");
+    // The compaction ends while the build runs: the next compaction takes its slot at once.
+    drop(compaction);
+    let compaction = drain(&received);
+    assert_eq!(labels(&compaction), ["compact-2"]);
+    assert_eq!(scheduler.stats().running, 2);
+    drop(index);
+    assert_eq!(labels(&drain(&received)), ["index-2"]);
+    drop(compaction);
+}
+
+/// A waiting compaction holds back index builds even when it waits for memory, so builds never
+/// starve it; an index build waits for its memory too, and one larger than the pool is declined.
+#[test]
+fn index_builds_reserve_maintenance_memory_after_compactions() {
+    let scheduler = MaintenanceScheduler::new(4, 100);
+    let (granted, received) = mpsc::channel();
+    ask(&scheduler, JobKind::Compact, 60, "compact-1", &granted).expect("request");
+    let first = drain(&received);
+    ask(&scheduler, JobKind::Compact, 50, "compact-2", &granted).expect("request");
+    ask(&scheduler, JobKind::Index, 10, "index", &granted).expect("request");
+    assert!(
+        drain(&received).is_empty(),
+        "the index build waits behind the compaction that waits for memory"
+    );
+    drop(first);
+    let running = drain(&received);
+    assert_eq!(labels(&running), ["compact-2", "index"]);
+    assert_eq!(scheduler.stats().reserved_bytes, 60);
+    drop(running);
+
+    let error = ask(&scheduler, JobKind::Index, 101, "huge", &granted)
+        .expect_err("more than the whole pool");
+    assert!(
+        matches!(&error, LogPoseError::TooLarge { what, .. } if what == "index build memory"),
+        "{error:?}"
+    );
 }
