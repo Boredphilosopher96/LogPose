@@ -475,3 +475,197 @@ fn waiting_for_gc_covers_the_versions_the_reaper_releases_in_the_background() {
     }
     unblocker.join().expect("unblocker should join");
 }
+
+/// I7 under load: readers pin tokens and read through them (and through the exact snapshots
+/// they name) while a writer and a maintenance thread flush and compact without pause, the
+/// reaper expires idle pins, and the collector removes what they release. No read ever fails
+/// with anything but `SnapshotExpired`, every file of every `Version` a reader holds is on
+/// disk, two reads through one token agree (I12), and once everything is released the files
+/// on disk are exactly those the durable manifest references.
+#[test]
+fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run() {
+    use crate::{TokenConfig, clock::ManualClock, manifest::MANIFESTS_DIR};
+    use logpose_types::{DeleteRecord, RecordId, WriteOperation};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        time::Duration,
+    };
+
+    let fault = FaultVfs::new(34);
+    let clock = Arc::new(ManualClock::new());
+    let engine = Engine::open(
+        fault.process(),
+        ROOT,
+        EngineConfig {
+            clock: Some(Arc::clone(&clock) as Arc<dyn crate::Clock>),
+            tokens: TokenConfig {
+                ttl: Duration::from_secs(10),
+                max_per_collection: 16,
+                ..TokenConfig::default()
+            },
+            ..config()
+        },
+    )
+    .expect("engine should open");
+    let handle = create(&engine, "stress");
+    let done = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+
+    let writer = {
+        let engine = engine.clone();
+        let handle = Arc::clone(&handle);
+        std::thread::spawn(move || {
+            let core = engine.core();
+            for round in 0..400_u32 {
+                let id = format!("k{}", round % 37);
+                let operation = if round % 5 == 4 {
+                    WriteOperation::Delete(DeleteRecord {
+                        id: RecordId::new(&id),
+                    })
+                } else {
+                    put(&id, vec![round as f32, 1.0])
+                };
+                core.write(&handle, vec![operation]).expect("write");
+            }
+        })
+    };
+    let maintenance = {
+        let engine = engine.clone();
+        let handle = Arc::clone(&handle);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let core = engine.core();
+            let mut round = 0_u32;
+            while !done.load(AtomicOrdering::Acquire) {
+                core.flush_collection(&handle).expect("flush");
+                if round % 3 == 2 {
+                    core.compact_collection(&handle).expect("compact");
+                }
+                round += 1;
+            }
+        })
+    };
+    let reaper = {
+        let engine = engine.clone();
+        let clock = Arc::clone(&clock);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(AtomicOrdering::Acquire) {
+                clock.advance(Duration::from_secs(1));
+                engine.reap_snapshots();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let readers = (0..3)
+        .map(|reader| {
+            let engine = engine.clone();
+            let handle = Arc::clone(&handle);
+            let done = Arc::clone(&done);
+            let reads = Arc::clone(&reads);
+            let vfs = fault.process();
+            std::thread::spawn(move || {
+                let core = engine.core();
+                let mut held = Vec::new();
+                let mut round = 0_usize;
+                while !done.load(AtomicOrdering::Acquire) {
+                    round += 1;
+                    let current = handle.current();
+                    match handle.pin_version(Arc::clone(&current)) {
+                        Ok(token) => held.push((token, current.snapshot(), None)),
+                        Err(LogPoseError::TooManySnapshots { .. }) => {}
+                        Err(error) => panic!("pin: {error}"),
+                    }
+                    drop(current);
+                    for (token, snapshot, first) in &mut held {
+                        let version = match handle.snapshot_version(token) {
+                            Ok(version) => version,
+                            Err(LogPoseError::SnapshotExpired { .. }) => continue,
+                            Err(error) => panic!("resolve: {error}"),
+                        };
+                        for file in version.files.iter() {
+                            for path in UnitFiles::new(&handle.meta().dir, file.unit()).published()
+                            {
+                                assert!(
+                                    exists_at(vfs.as_ref(), &path),
+                                    "{} is gone while a version holds it",
+                                    path.display()
+                                );
+                            }
+                        }
+                        match core.scan_exact_internal(&handle, token.clone(), true, None) {
+                            Ok(records) => match first {
+                                Some(first) => {
+                                    assert_eq!(*first, records, "reads through one token agree");
+                                }
+                                None => *first = Some(records),
+                            },
+                            // The reaper may expire the token between two uses.
+                            Err(LogPoseError::SnapshotExpired { .. }) => {}
+                            Err(error) => panic!("read through a token: {error}"),
+                        }
+                        match core.scan_exact_internal(&handle, Some(snapshot.clone()), true, None)
+                        {
+                            Ok(_) | Err(LogPoseError::SnapshotExpired { .. }) => {}
+                            Err(error) => panic!("read at an exact snapshot: {error}"),
+                        }
+                        drop(version);
+                        reads.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    core.scan_exact_internal(&handle, None, true, None)
+                        .expect("a read of the current state never fails");
+                    if held.len() > 4 || round % 7 == reader {
+                        if !held.is_empty() {
+                            let (token, _, _) = held.remove(0);
+                            handle.release_snapshot(&token);
+                        }
+                    }
+                }
+                for (token, _, _) in held {
+                    handle.release_snapshot(&token);
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    writer.join().expect("writer should join");
+    done.store(true, AtomicOrdering::Release);
+    maintenance.join().expect("maintenance should join");
+    reaper.join().expect("reaper should join");
+    for reader in readers {
+        reader.join().expect("reader should join");
+    }
+    assert!(reads.load(AtomicOrdering::Relaxed) > 0, "the readers read");
+    clock.advance(Duration::from_secs(3600));
+    engine.reap_snapshots();
+    assert_eq!(handle.pinned_snapshots(), 0);
+    let core = engine.core();
+    core.flush_collection(&handle).expect("flush");
+    core.compact_collection(&handle).expect("compact");
+    engine.wait_for_gc();
+
+    // Exactly the durable manifest's files are left, with it and the previous generation.
+    let vfs = fault.process();
+    let dir = handle.meta().dir.clone();
+    let current = handle.current();
+    let mut expected = current
+        .manifest
+        .units()
+        .flat_map(|unit| UnitFiles::new(&dir, unit).published())
+        .collect::<BTreeSet<_>>();
+    let generation = current.manifest_generation;
+    drop(current);
+    expected.insert(manifest_path(&dir, generation));
+    // No publish failed, so generations are consecutive.
+    if let Some(previous) = generation.checked_sub(1) {
+        expected.insert(manifest_path(&dir, previous));
+    }
+    let mut found = BTreeSet::new();
+    for child in [SEGMENTS_DIR, INDEXES_DIR, TMP_DIR, MANIFESTS_DIR] {
+        for name in files_in(vfs.as_ref(), &dir.join(child)).expect("list") {
+            found.insert(dir.join(child).join(name));
+        }
+    }
+    assert_eq!(found, expected, "no leaked and no missing files");
+    assert!(engine.gc_removed_files() > 0);
+}
