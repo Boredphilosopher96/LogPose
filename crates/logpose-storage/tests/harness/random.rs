@@ -323,7 +323,9 @@ fn random_actions_racing_free_background_jobs_match_the_model() {
         stats.compactions_granted > stats.explicit_compactions,
         "{stats:?}"
     );
+    // Index builds were granted, and builds committed their sidecars (not only began).
     assert!(stats.index_builds_granted > 0, "{stats:?}");
+    assert!(stats.index_bytes_written > 0, "{stats:?}");
 }
 
 #[test]

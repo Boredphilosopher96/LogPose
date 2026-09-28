@@ -113,6 +113,8 @@ pub struct Session {
     runtime: tokio::runtime::Runtime,
     /// Flush, compaction, and index-build permits granted by engines already closed.
     granted: (u64, u64, u64),
+    /// Index sidecar bytes that committed index builds wrote, in engines already closed.
+    index_bytes: u64,
 }
 
 impl Session {
@@ -172,6 +174,7 @@ impl Session {
             handle: None,
             runtime,
             granted: (0, 0, 0),
+            index_bytes: 0,
         })
     }
 
@@ -304,6 +307,7 @@ impl Session {
             self.granted.1 += stats.compactions_granted;
             self.granted.2 += stats.index_builds_granted;
         }
+        self.index_bytes += self.index_bytes_now();
         self.handle = None;
         self.engine = None;
     }
@@ -324,6 +328,18 @@ impl Session {
             self.granted.1 + now.1,
             self.granted.2 + now.2,
         )
+    }
+
+    /// Index sidecar bytes that committed index builds (scheduled or hand-stepped) wrote over
+    /// every engine this session opened.
+    pub fn index_bytes_written(&self) -> u64 {
+        self.index_bytes + self.index_bytes_now()
+    }
+
+    fn index_bytes_now(&self) -> u64 {
+        self.handle
+            .as_ref()
+            .map_or(0, |handle| handle.maintenance_written().index_bytes)
     }
 
     /// The names of every segment file and index sidecar under the storage root.

@@ -246,6 +246,9 @@ pub struct Stats {
     pub index_builds_granted: u64,
     /// Hand-stepped index builds that had a segment to index and committed.
     pub indexes_committed: u64,
+    /// Index sidecar bytes that committed index builds wrote (scheduled and hand-stepped), so
+    /// a background mode shows its builds commit, not only that they were granted.
+    pub index_bytes_written: u64,
     /// Segment files checked to exist for a live version (I7).
     pub files_checked: u64,
     /// The most maintenance jobs seen running at once after an action.
@@ -277,6 +280,7 @@ impl Stats {
         self.compactions_granted += other.compactions_granted;
         self.index_builds_granted += other.index_builds_granted;
         self.indexes_committed += other.indexes_committed;
+        self.index_bytes_written += other.index_bytes_written;
         self.files_checked += other.files_checked;
         self.peak_jobs = self.peak_jobs.max(other.peak_jobs);
     }
@@ -344,6 +348,7 @@ impl Runner {
             flushes_granted: flushes,
             compactions_granted: compactions,
             index_builds_granted: indexes,
+            index_bytes_written: self.session.index_bytes_written(),
             ..self.stats
         }
     }
