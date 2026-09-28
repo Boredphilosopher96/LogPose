@@ -558,6 +558,17 @@ fn range_bound(
         if !float.is_finite() {
             return Err("a float64 operand must be finite".to_owned());
         }
+        // Past the integer range a bound excludes everything or nothing: no integer lies above
+        // a lower bound past `i64::MAX` or below an upper bound under `i64::MIN`. The cast below
+        // would saturate those to the extreme integer, which would then match.
+        #[allow(clippy::cast_precision_loss)]
+        let (min, max) = (i64::MIN as f64, i64::MAX as f64);
+        if lower && *float >= max {
+            return Ok(Bound::Excluded(ScalarKey::Int(i64::MAX)));
+        }
+        if !lower && *float < min {
+            return Ok(Bound::Excluded(ScalarKey::Int(i64::MIN)));
+        }
         #[allow(clippy::cast_possible_truncation)]
         let rounded = if lower { float.ceil() } else { float.floor() } as i64;
         return Ok(Bound::Included(ScalarKey::Int(rounded)));
@@ -1164,5 +1175,57 @@ mod tests {
             }
         )));
         assert_eq!(FILTER_PATH, "filter");
+    }
+
+    #[test]
+    fn integer_range_bounds_past_the_int64_range_do_not_saturate() {
+        let schema = schema();
+        let matches = |stock: i64, filter: FilterExpr| {
+            CompiledFilter::compile(&schema, &filter)
+                .expect("filter should compile")
+                .matches_record(&Record::new(1_i64).with_field("stock", Value::Int64(stock)))
+        };
+        // 2^63 is one past i64::MAX; 1e30 far past it.
+        for bound in [9_223_372_036_854_775_808.0, 1e30] {
+            assert!(!matches(
+                i64::MAX,
+                FilterExpr::gt("stock", Value::Float64(bound))
+            ));
+            assert!(!matches(
+                i64::MAX,
+                FilterExpr::gte("stock", Value::Float64(bound))
+            ));
+            assert!(matches(
+                i64::MAX,
+                FilterExpr::lt("stock", Value::Float64(bound))
+            ));
+            assert!(matches(
+                i64::MAX,
+                FilterExpr::lte("stock", Value::Float64(bound))
+            ));
+        }
+        for bound in [-9_223_372_036_854_777_856.0, -1e30] {
+            assert!(!matches(
+                i64::MIN,
+                FilterExpr::lt("stock", Value::Float64(bound))
+            ));
+            assert!(!matches(
+                i64::MIN,
+                FilterExpr::lte("stock", Value::Float64(bound))
+            ));
+            assert!(matches(
+                i64::MIN,
+                FilterExpr::gt("stock", Value::Float64(bound))
+            ));
+            assert!(matches(
+                i64::MIN,
+                FilterExpr::gte("stock", Value::Float64(bound))
+            ));
+        }
+        // i64::MIN itself is exactly -2^63, an integral bound.
+        assert!(matches(
+            i64::MIN,
+            FilterExpr::lte("stock", Value::Float64(-9_223_372_036_854_775_808.0))
+        ));
     }
 }
