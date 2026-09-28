@@ -1,7 +1,9 @@
 //! Compaction v2 and maintenance scheduling at the writer: the size-tiered policy picking
 //! segments as flushes land, flush priority over compaction, the write stall, the
 //! maintenance-memory reservation, background compaction beside writes, deletes, and flushes,
-//! a randomized run with tiny thresholds (crashes included), and write amplification.
+//! a randomized run with tiny thresholds (crashes included), write amplification, several
+//! compactions of one collection at once beside concurrent clients and crashes, and what a
+//! collection drop and an engine drop release and answer.
 
 use super::*;
 use crate::{
@@ -222,6 +224,7 @@ fn a_flush_is_granted_before_a_compaction_that_asked_first() {
     let flushed = flush(&handle);
     wait_for("the flush to ask", || scheduler.stats().waiting == 2);
     scheduler.step(1);
+    wait_for("the flush to be granted first", || flushed.is_finished());
     flushed
         .join()
         .expect("flush thread")
@@ -274,6 +277,7 @@ fn writes_stall_at_max_frozen_and_resume_once_a_flush_commits() {
 
     // The flush of a and b commits; c and d freeze in turn, and the write goes through.
     scheduler.step(1);
+    wait_for("the stall to end", || stalled.is_finished());
     let ack = stalled
         .join()
         .expect("writer thread")
@@ -752,5 +756,449 @@ fn randomized_background_maintenance_with_tiny_thresholds_matches_the_model() {
         compactions >= seeds.len() as u64,
         "compaction must run constantly: {compactions} over {} seeds",
         seeds.len()
+    );
+}
+
+/// Dropping a collection releases everything it holds at the scheduler: the permit and the
+/// maintenance memory of a compaction granted just before the drop (the drop waits for it to
+/// end), and the request of a flush still waiting for a permit, so other collections' jobs are
+/// never held back by a dropped one.
+#[test]
+fn a_dropped_collection_releases_its_permits_and_maintenance_memory() {
+    let fault = FaultVfs::new(10);
+    let engine = open(
+        &fault,
+        EngineConfig {
+            compaction: tiny_tiers(),
+            ..config()
+        },
+    );
+    let scheduler = engine.scheduler().clone();
+    let handle = create(&engine, usize::MAX, 2);
+    scheduler.pause();
+    for id in ["a", "b"] {
+        write(&handle, vec![upsert(id, 1.0)]);
+        let flushed = {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || handle.flush_blocking())
+        };
+        wait_for("the flush to ask", || scheduler.stats().waiting == 1);
+        scheduler.step(1);
+        flushed
+            .join()
+            .expect("flush thread")
+            .expect("flush should commit");
+    }
+    wait_for("the compaction to ask", || {
+        handle.maintenance_status().pending == ["compact"]
+    });
+    scheduler.step(1);
+    // A frozen memtable whose flush waits for a permit the paused scheduler never grants.
+    write(&handle, vec![upsert("c", 1.0)]);
+    let flushed = {
+        let handle = Arc::clone(&handle);
+        std::thread::spawn(move || handle.flush_blocking())
+    };
+    wait_for("the flush to ask", || {
+        handle.maintenance_status().pending == ["flush"]
+    });
+    assert_eq!(scheduler.stats().compactions_granted, 1);
+
+    engine
+        .drop_collection(&CollectionRef::new_default(NAME))
+        .expect("drop");
+    assert!(
+        flushed.join().expect("flush thread").is_err(),
+        "the explicit flush fails with the drop"
+    );
+    let stats = scheduler.stats();
+    assert_eq!(
+        (stats.waiting, stats.running, stats.reserved_bytes),
+        (0, 0, 0),
+        "{stats:?}"
+    );
+    scheduler.resume();
+}
+
+/// Engine drop answers every request a writer holds: a write held back by a stall, an
+/// explicit flush waiting for a permit the paused scheduler never grants, and the permit
+/// requests themselves; none of them is applied, and the drop returns.
+#[test]
+fn engine_drop_answers_stalled_writes_and_waiting_maintenance() {
+    let fault = FaultVfs::new(11);
+    let engine = open(
+        &fault,
+        EngineConfig {
+            memtable: MemtableConfig {
+                max_frozen: 1,
+                ..MemtableConfig::default()
+            },
+            ..config()
+        },
+    );
+    let scheduler = engine.scheduler().clone();
+    let handle = create(&engine, 2, usize::MAX);
+    scheduler.pause();
+    write(&handle, vec![upsert("a", 1.0), upsert("b", 2.0)]);
+    wait_for("the freeze", || handle.current().frozen.len() == 1);
+    write(&handle, vec![upsert("c", 3.0), upsert("d", 4.0)]);
+    let stalled = (0..3)
+        .map(|index| {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                handle.write_blocking(vec![upsert(&format!("late{index}"), 5.0)])
+            })
+        })
+        .collect::<Vec<_>>();
+    let flushed = {
+        let handle = Arc::clone(&handle);
+        std::thread::spawn(move || handle.flush_blocking())
+    };
+    std::thread::sleep(TICK_INTERVAL * 3);
+    assert!(stalled.iter().all(|thread| !thread.is_finished()));
+    assert!(!flushed.is_finished());
+    assert_eq!(
+        scheduler.stats().waiting,
+        1,
+        "the flush waits for its permit"
+    );
+
+    let dropped = std::thread::spawn(move || {
+        drop(handle);
+        drop(engine);
+    });
+    wait_for("the engine drop", || dropped.is_finished());
+    dropped.join().expect("drop thread");
+    wait_for("every waiting call to be answered", || {
+        stalled.iter().all(std::thread::JoinHandle::is_finished) && flushed.is_finished()
+    });
+    for thread in stalled {
+        let error = thread
+            .join()
+            .expect("writer thread")
+            .expect_err("a write held by the stall is refused at shutdown");
+        assert!(
+            matches!(error, LogPoseError::Unavailable { .. }),
+            "{error:?}"
+        );
+    }
+    flushed
+        .join()
+        .expect("flush thread")
+        .expect_err("the explicit flush is refused at shutdown");
+    assert_eq!(scheduler.stats().waiting, 0);
+
+    fault.crash();
+    let engine = open(&fault, config());
+    let rows = live(&reopen(&engine));
+    assert_eq!(rows.len(), 4, "no stalled write was applied: {rows:?}");
+}
+
+/// Concurrent clients, several compactions of one collection at once, and crashes: a model of
+/// every key that each client owns (so the model is exact under concurrency) and that crashes
+/// widen only for writes that failed.
+mod concurrent {
+    use super::*;
+    use std::sync::{Mutex, atomic::AtomicU64};
+
+    /// The values a key may hold: one after an acknowledged write, and the old and new ones
+    /// after a write that failed during a crash window, until recovery shows which.
+    type Possible = Vec<Option<f32>>;
+
+    /// One client's keys, locked while the client writes so that a check between its writes
+    /// sees every write it had acknowledged, and none in flight.
+    #[derive(Default)]
+    pub(super) struct Client {
+        keys: Mutex<BTreeMap<String, Possible>>,
+    }
+
+    /// Writes refused with `WriteStalled`, which must never be applied.
+    pub(super) static STALLED: AtomicU64 = AtomicU64::new(0);
+
+    /// Three compactions of one collection may run beside its flush; tiers of two rows and
+    /// merges of two or three, so compactions run all the time; and a short stall timeout, so
+    /// writes that a crashed disk stalls fail quickly.
+    fn engine_config(threads: usize) -> EngineConfig {
+        EngineConfig {
+            runtime: RuntimeConfig {
+                maintenance_threads: threads,
+                writer_threads: 2,
+                ..config().runtime
+            },
+            memtable: MemtableConfig {
+                max_frozen: 2,
+                write_stall_timeout: Duration::from_millis(200),
+                ..MemtableConfig::default()
+            },
+            compaction: CompactionConfig {
+                base_rows: 2,
+                tier_ratio: 2,
+                min_merge: 2,
+                max_merge: 3,
+                deleted_ratio: 0.3,
+                max_jobs_per_collection: 3,
+                ..CompactionConfig::default()
+            },
+            ..config()
+        }
+    }
+
+    fn client_rows(
+        handle: &CollectionHandle,
+        client: usize,
+        context: &str,
+    ) -> BTreeMap<String, f32> {
+        let prefix = format!("c{client}-");
+        let version = handle.current();
+        version
+            .check_invariants()
+            .map_err(|error| format!("{context}: {error}"))
+            .expect("invariants hold");
+        version
+            .live_images()
+            .into_iter()
+            .map(|(_, image)| {
+                let put = legacy_put(&version.schema, &image).expect("row should read");
+                (put.id.as_str().to_owned(), put.vector[0])
+            })
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .collect()
+    }
+
+    /// Check `client`'s keys against the model; with `settle`, pin each to what it holds.
+    pub(super) fn check(
+        handle: &CollectionHandle,
+        client: usize,
+        state: &Client,
+        settle: bool,
+        context: &str,
+    ) {
+        let mut keys = state.keys.lock().expect("model lock");
+        let rows = client_rows(handle, client, context);
+        for (key, possible) in keys.iter_mut() {
+            let actual = rows.get(key).copied();
+            assert!(
+                possible.contains(&actual),
+                "{context}: key {key} holds {actual:?}, expected one of {possible:?}"
+            );
+            if settle {
+                *possible = vec![actual];
+            }
+        }
+        for key in rows.keys() {
+            assert!(keys.contains_key(key), "{context}: unknown key {key}");
+        }
+    }
+
+    /// Each client writes `steps` random batches of upserts, partial updates, and deletes over
+    /// its own ten keys. Outside a crash window every write must succeed or be refused with
+    /// `WriteStalled` (which leaves the model alone); inside one, any failure is uncertain.
+    pub(super) fn run_clients(
+        handle: &Arc<CollectionHandle>,
+        clients: &Arc<Vec<Client>>,
+        seed: u64,
+        round: u64,
+        steps: u64,
+        crashing: bool,
+    ) {
+        let threads = (0..clients.len())
+            .map(|client| {
+                let handle = Arc::clone(handle);
+                let clients = Arc::clone(clients);
+                std::thread::spawn(move || {
+                    let mut rng = StdRng::seed_from_u64(
+                        seed.wrapping_mul(1_000) + round * 10 + client as u64,
+                    );
+                    let state = &clients[client];
+                    for step in 0..steps {
+                        let mut keys = state.keys.lock().expect("model lock");
+                        let mut ops = Vec::new();
+                        let mut effects = Vec::<(String, Option<f32>)>::new();
+                        for _ in 0..rng.random_range(1..=3) {
+                            let id = format!("c{client}-{}", rng.random_range(0..10));
+                            if effects.iter().any(|(key, _)| *key == id) {
+                                continue;
+                            }
+                            // Every value is written once, so a stray write is recognizable.
+                            let x = (round * 100_000 + step * 10 + ops.len() as u64) as f32;
+                            let present = keys
+                                .get(&id)
+                                .is_some_and(|possible| possible.iter().all(Option::is_some));
+                            match rng.random_range(0..10) {
+                                0..=4 => {
+                                    ops.push(upsert(&id, x));
+                                    effects.push((id, Some(x)));
+                                }
+                                5..=6 if present => {
+                                    let mut update = PartialUpdate::new(id.as_str());
+                                    update.vectors.insert("vector".to_owned(), vec![x, 1.0]);
+                                    ops.push(ClientOp::Update(update));
+                                    effects.push((id, Some(x)));
+                                }
+                                _ => {
+                                    ops.push(delete(&id));
+                                    effects.push((id, None));
+                                }
+                            }
+                        }
+                        match handle.write_blocking(ops) {
+                            Ok(_) => {
+                                for (id, value) in effects {
+                                    keys.insert(id, vec![value]);
+                                }
+                            }
+                            Err(LogPoseError::WriteStalled { .. }) => {
+                                STALLED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                assert!(
+                                    crashing,
+                                    "seed {seed}, round {round}, client {client}, step {step}: \
+                                     {error}"
+                                );
+                                for (id, value) in effects {
+                                    let possible = keys.entry(id).or_insert_with(|| vec![None]);
+                                    if !possible.contains(&value) {
+                                        possible.push(value);
+                                    }
+                                }
+                            }
+                        }
+                        drop(keys);
+                        if !crashing && step % 7 == 0 {
+                            check(
+                                &handle,
+                                client,
+                                state,
+                                false,
+                                &format!(
+                                    "seed {seed}, round {round}, client {client}, step {step}"
+                                ),
+                            );
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("client thread");
+        }
+    }
+
+    /// One seed: four rounds of concurrent writes beside a reader and explicit flushes and
+    /// compactions, each ending in a crash while writes and background jobs run.
+    pub(super) fn run(seed: u64) -> u64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let fault = FaultVfs::new(seed);
+        let threads = rng.random_range(2..6);
+        let mut engine = open(&fault, engine_config(threads));
+        let mut handle = create(&engine, 3, 2);
+        let clients = Arc::new((0..3).map(|_| Client::default()).collect::<Vec<_>>());
+        let mut compactions = 0;
+        for round in 0..4 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = {
+                let handle = Arc::clone(&handle);
+                let stop = Arc::clone(&stop);
+                let scheduler = engine.scheduler().clone();
+                std::thread::spawn(move || {
+                    let mut last = 0;
+                    while !stop.load(Ordering::Acquire) {
+                        let version = handle.current();
+                        version
+                            .check_invariants()
+                            .expect("every version is consistent");
+                        assert!(version.visible_seq_no >= last, "visibility went back");
+                        last = version.visible_seq_no;
+                        let stats = scheduler.stats();
+                        assert!(stats.reserved_bytes <= stats.pool_bytes, "{stats:?}");
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            let explicit = {
+                let handle = Arc::clone(&handle);
+                let mut rng = StdRng::seed_from_u64(rng.random());
+                std::thread::spawn(move || {
+                    for _ in 0..3 {
+                        std::thread::sleep(Duration::from_millis(rng.random_range(0..30)));
+                        if rng.random_bool(0.5) {
+                            handle.flush_blocking().expect("explicit flush");
+                        } else {
+                            handle.compact_blocking().expect("explicit compaction");
+                        }
+                    }
+                })
+            };
+            run_clients(&handle, &clients, seed, round, 60, false);
+            explicit.join().expect("explicit thread");
+            stop.store(true, Ordering::Release);
+            reader.join().expect("reader thread");
+            for (client, state) in clients.iter().enumerate() {
+                check(
+                    &handle,
+                    client,
+                    state,
+                    false,
+                    &format!("seed {seed}, round {round}"),
+                );
+            }
+            compactions += engine.scheduler().stats().compactions_granted;
+
+            let tear = TearMode::ALL[rng.random_range(0..TearMode::ALL.len())];
+            let ops = rng.random_range(0..80);
+            fault.set_plan(FaultPlan {
+                crash_after_ops: Some(fault.mutating_ops() + ops),
+                tear,
+                ..FaultPlan::default()
+            });
+            run_clients(&handle, &clients, seed, round + 50, 15, true);
+            std::thread::sleep(Duration::from_millis(rng.random_range(0..20)));
+            drop(handle);
+            drop(engine);
+            fault.crash();
+            fault.set_plan(FaultPlan::default());
+            engine = open(&fault, engine_config(threads));
+            handle = reopen(&engine);
+            handle.arm_maintenance();
+            for (client, state) in clients.iter().enumerate() {
+                check(
+                    &handle,
+                    client,
+                    state,
+                    true,
+                    &format!("seed {seed}, after crash {round} ({tear:?} after {ops} ops)"),
+                );
+            }
+        }
+        compactions += engine.scheduler().stats().compactions_granted;
+        compactions
+    }
+}
+
+/// Several compactions of one collection at once, beside its flushes, three clients writing
+/// upserts, partial updates, and deletes, a reader checking every version, explicit flushes and
+/// compactions, and crashes (every tear mode) while writes and jobs run. Every key holds what
+/// its client's model allows after every round and every recovery: nothing acknowledged is
+/// lost, nothing refused with `WriteStalled` is applied, and nothing else appears.
+/// `LOGPOSE_CONCURRENT_COMPACTION_SEEDS` sets the number of seeds (default 6) and
+/// `LOGPOSE_CONCURRENT_COMPACTION_FIRST_SEED` the first.
+#[test]
+fn concurrent_compactions_flushes_writes_and_crashes_match_the_model() {
+    let count = std::env::var("LOGPOSE_CONCURRENT_COMPACTION_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(6);
+    let first = std::env::var("LOGPOSE_CONCURRENT_COMPACTION_FIRST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| rand::rng().random_range(0..1_000_000_u64));
+    let mut compactions = 0;
+    for seed in first..first + count {
+        compactions += concurrent::run(seed);
+    }
+    assert!(
+        compactions >= count,
+        "compactions must run (first seed {first}): {compactions}"
     );
 }
