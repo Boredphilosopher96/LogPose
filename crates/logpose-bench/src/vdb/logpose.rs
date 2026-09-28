@@ -216,9 +216,13 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
                     );
                     break;
                 }
-                // A write stall (memtables waiting for flushes) is backpressure: the batch
-                // was not applied, and upserts by key are idempotent anyway, so retry it.
-                Err(status) if status.code() == Code::Unavailable => {
+                // A write stall (memtables waiting for flushes) is backpressure the server
+                // marks with a retry hint: the batch was not applied, and upserts by key
+                // are idempotent anyway, so retry it after the hint. An `UNAVAILABLE`
+                // without a hint (the server is gone) fails the load.
+                Err(status)
+                    if status.code() == Code::Unavailable && retry_hint(&status).is_some() =>
+                {
                     write_retries += 1;
                     ensure!(
                         write_retries <= MAX_WRITE_RETRIES,
@@ -228,7 +232,7 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
                         "rows {start}..{end} refused, retrying: {}",
                         status.message()
                     ));
-                    tokio::time::sleep(retry_delay(&status)).await;
+                    tokio::time::sleep(retry_hint(&status).unwrap_or_default()).await;
                 }
                 Err(status) => bail!("upserting rows {start}..{end}: {status}"),
             }
@@ -275,14 +279,14 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
     })
 }
 
-/// The server's retry hint (the `retry-after-ms` trailer), or one second.
-fn retry_delay(status: &tonic::Status) -> Duration {
+/// The server's retry hint: the `retry-after-ms` trailer it sends with backpressure.
+fn retry_hint(status: &tonic::Status) -> Option<Duration> {
     status
         .metadata()
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .map_or(Duration::from_secs(1), Duration::from_millis)
+        .map(Duration::from_millis)
 }
 
 fn record(prepared: &Prepared, row: usize) -> Record {
@@ -680,4 +684,24 @@ async fn throughput(
         latency: LatencySummary::from_durations(&latencies),
         recall: recall_sum / queries.max(1) as f64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_hint;
+    use std::time::Duration;
+    use tonic::{Code, Status, metadata::MetadataValue};
+
+    #[test]
+    fn only_statuses_with_a_retry_hint_are_retried() {
+        let mut stalled = Status::new(Code::Unavailable, "write stalled");
+        stalled
+            .metadata_mut()
+            .insert("retry-after-ms", MetadataValue::from_static("250"));
+        assert_eq!(retry_hint(&stalled), Some(Duration::from_millis(250)));
+        assert_eq!(
+            retry_hint(&Status::new(Code::Unavailable, "connection refused")),
+            None
+        );
+    }
 }
