@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use logpose_query::{ExplainMode, FilterExpr, QueryRequest, VectorQuery, query};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{
-    CollectionRef, DistanceMetric, PutRecord, RecordId, WriteOperation,
+    CollectionRef, DistanceMetric, LogPoseError, PutRecord, RecordId, WriteOperation,
     legacy::LEGACY_PRIMARY_KEY_FIELD,
 };
 use serde_json::{Map, Value};
@@ -240,10 +240,20 @@ impl BenchTarget for LocalEngineTarget {
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.runtime
-            .block_on(self.engine.write(self.collection()?, operations))
-            .context("writing batch")?;
-        Ok(())
+        // A stalled write is backpressure (flushes are behind), not a failure: retry it, as
+        // a client would, so ingest measures sustained throughput instead of aborting.
+        loop {
+            match self
+                .runtime
+                .block_on(self.engine.write(self.collection()?, operations.clone()))
+            {
+                Err(LogPoseError::WriteStalled { .. }) => continue,
+                result => {
+                    result.context("writing batch")?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     fn flush_if_supported(&self) -> Result<bool> {
