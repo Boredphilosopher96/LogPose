@@ -365,16 +365,25 @@ async fn qps_100k_top10_ef64() {
     )
     .await;
     let started = Instant::now();
+    let mut stages = [0_u64; 4];
     for query in &queries {
         let request = SearchRequest {
             ef: Some(64),
             ..SearchRequest::new(query.clone(), K)
         };
-        search(&view, &request)
+        let outcome = search(&view, &request)
             .await
             .expect("search should succeed");
+        for (total, micros) in stages.iter_mut().zip(outcome.micros) {
+            *total += micros;
+        }
     }
     let seconds = started.elapsed().as_secs_f64();
+    let per_query = stages.map(|total| total / queries.len() as u64);
+    println!(
+        "mean stage micros: plan+fetch {}, walk {}, fetch+rerank {}, project {}",
+        per_query[0], per_query[1], per_query[2], per_query[3]
+    );
     let recall = measure(
         &view,
         &rows,
