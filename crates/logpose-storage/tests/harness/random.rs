@@ -142,13 +142,31 @@ pub fn replay(setup: Setup, seed: u64, actions: &[Action]) -> Result<(), String>
     }
 }
 
+/// A failure message without numbers or the index of the failing action, so that two runs
+/// failing the same check compare equal.
+fn signature(message: &str) -> String {
+    let message = message
+        .strip_prefix("action ")
+        .and_then(|rest| rest.split_once(": ").map(|(_, rest)| rest))
+        .unwrap_or(message);
+    message
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .take(48)
+        .collect()
+}
+
 /// Shrink a failing action list: drop chunks of actions, halving the chunk size, while the
-/// replay still fails. Bounded by a time budget, since background modes do not always
-/// reproduce.
+/// replay still fails the same check. Bounded by a time budget, since background modes do not
+/// always reproduce.
 pub fn minimize(failure: &Failure) -> Option<(Vec<Action>, String)> {
     let deadline = Instant::now() + Duration::from_secs(120);
+    let wanted = signature(&failure.message);
+    let same = |error: &String| signature(error) == wanted;
     let mut actions = failure.actions.clone();
-    let mut message = replay(failure.setup, failure.seed, &actions).err()?;
+    let mut message = replay(failure.setup, failure.seed, &actions)
+        .err()
+        .filter(same)?;
     let mut chunk = actions.len().div_ceil(2);
     while chunk >= 1 && Instant::now() < deadline {
         let mut start = 0;
@@ -158,12 +176,12 @@ pub fn minimize(failure: &Failure) -> Option<(Vec<Action>, String)> {
             let mut candidate = actions.clone();
             candidate.drain(start..end);
             match replay(failure.setup, failure.seed, &candidate) {
-                Err(error) => {
+                Err(error) if same(&error) => {
                     actions = candidate;
                     message = error;
                     shrunk = true;
                 }
-                Ok(()) => start = end,
+                _ => start = end,
             }
         }
         if !shrunk {

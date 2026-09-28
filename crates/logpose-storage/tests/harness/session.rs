@@ -4,7 +4,7 @@
 
 use logpose_storage::{
     CollectionHandle, CompactionConfig, CreateCollectionRequest, Engine, EngineConfig,
-    IndexPolicy, ManualClock, MemtableConfig, ReadOptions, ReadView, RuntimeConfig, SchemaChange,
+    GroupCommitConfig, IndexPolicy, ManualClock, MemtableConfig, ReadOptions, ReadView, RuntimeConfig, SchemaChange,
     TokenConfig,
 };
 use logpose_types::{
@@ -95,6 +95,8 @@ pub struct Session {
     pub clock: Arc<ManualClock>,
     /// Calls of the engine's fatal handler (which must never abort the test process).
     pub fatal: Arc<AtomicUsize>,
+    /// Group commit settings for later opens (the default when `None`).
+    pub group: Option<GroupCommitConfig>,
     engine: Option<Engine>,
     handle: Option<Arc<CollectionHandle>>,
     runtime: tokio::runtime::Runtime,
@@ -108,20 +110,7 @@ impl Session {
             Backend::Fault => (Some(FaultVfs::new(seed)), None),
             Backend::Std => (None, Some(unique_temp_dir(seed))),
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        let mut session = Self {
-            setup,
-            fault,
-            std_root,
-            clock: Arc::new(ManualClock::new()),
-            fatal: Arc::new(AtomicUsize::new(0)),
-            engine: None,
-            handle: None,
-            runtime,
-        };
+        let mut session = Self::detached(setup, fault, std_root)?;
         let engine = session.open_engine()?;
         let mut descriptor = engine
             .plan_collection_descriptor(&CreateCollectionRequest::new(NAME, DIMS, setup.metric))
@@ -147,6 +136,36 @@ impl Session {
         }
         session.engine = Some(engine);
         session.handle = Some(handle);
+        Ok(session)
+    }
+
+    fn detached(
+        setup: Setup,
+        fault: Option<Arc<FaultVfs>>,
+        std_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            setup,
+            fault,
+            std_root,
+            clock: Arc::new(ManualClock::new()),
+            fatal: Arc::new(AtomicUsize::new(0)),
+            group: None,
+            engine: None,
+            handle: None,
+            runtime,
+        })
+    }
+
+    /// A closed session over an existing `FaultVfs` image (a fork of another session's disk),
+    /// with the same setup and group commit settings; [`open`](Self::open) recovers it.
+    pub fn attach(&self, fault: Arc<FaultVfs>) -> Result<Self, String> {
+        let mut session = Self::detached(self.setup, Some(fault), None)?;
+        session.group = self.group.clone();
         Ok(session)
     }
 
@@ -209,6 +228,7 @@ impl Session {
                     ..IndexPolicy::default()
                 }
             },
+            group: self.group.clone().unwrap_or_default(),
             resolver: Some(logpose_query::resolver()),
             on_fatal: Some(Arc::new(move |_| {
                 fatal.fetch_add(1, Ordering::Relaxed);

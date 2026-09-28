@@ -290,11 +290,7 @@ fn fail<T>(message: impl Into<String>) -> Result<T, String> {
 
 impl Runner {
     pub fn new(session: Session) -> Self {
-        let model = Model {
-            schema: (*session.handle().current().schema).clone(),
-            rows: BTreeMap::new(),
-            visible_seq_no: session.handle().visible_seq_no(),
-        };
+        let model = Self::new_model(&session);
         Self {
             session,
             model,
@@ -473,7 +469,7 @@ impl Runner {
                     .view(&ReadOptions::default())
                     .map_err(|error| format!("read view: {error}"))?;
                 let model = self.model.clone();
-                self.check_read(&view, &model, read)
+                self.checker().check_read(&view, &model, read)
                     .map_err(|error| format!("{read:?} at the current state: {error}"))
             }
             Action::ReadAt(id, read) => self.read_at(*id, read),
@@ -496,9 +492,25 @@ impl Runner {
         match result {
             Ok(()) => Ok(()),
             Err(_) if armed => Ok(()),
-            Err(LogPoseError::CollectionPoisoned { .. }) if self.poisoned => Ok(()),
+            Err(error) if self.refused_after_fault(&error) => Ok(()),
             Err(error) => fail(format!("{what} failed: {error}")),
         }
+    }
+
+    /// Whether `error` is the refusal of a collection that an injected failure poisoned. A
+    /// failure injected into one action can poison the collection after that action returned
+    /// (a freeze's WAL rotation or a background job ran into it), so the next request may be
+    /// the first to see it.
+    fn refused_after_fault(&mut self, error: &LogPoseError) -> bool {
+        let refused = matches!(error, LogPoseError::CollectionPoisoned { .. });
+        if refused && (self.poisoned || self.faulted) {
+            if !self.poisoned {
+                self.poisoned = true;
+                self.stats.poisoned += 1;
+            }
+            return true;
+        }
+        false
     }
 
     /// The outcome of a write-like request against the model's prediction.
@@ -508,6 +520,11 @@ impl Runner {
         expected: Result<(Model, usize), Refusal>,
         armed: bool,
     ) -> Check {
+        if let Err(error) = &result {
+            if !armed && self.refused_after_fault(error) {
+                return Ok(());
+            }
+        }
         match (result, expected) {
             (Ok(ack), Ok((next, applied))) => {
                 if ack.applied_ops != applied {
@@ -604,7 +621,7 @@ impl Runner {
                 self.model.visible_seq_no
             ));
         }
-        self.check_get(&view, &self.model, &keys)
+        self.checker().check_get(&view, &self.model, &keys)
             .map_err(|error| format!("I1: {error}"))
     }
 
@@ -723,7 +740,7 @@ impl Runner {
                         model.visible_seq_no
                     ));
                 }
-                self.check_read(&view, &model, read)
+                self.checker().check_read(&view, &model, read)
                     .map_err(|error| format!("I12: {read:?} at token {id}: {error}"))
             }
             Err(LogPoseError::SnapshotExpired { .. }) if !live => {
@@ -986,7 +1003,7 @@ impl Runner {
     /// scrolls are gone, and the collection is writable again.
     fn after_restart(&mut self) -> Check {
         let had_pending = self.pending.is_some();
-        match self.state_equals(&self.model.clone()) {
+        match self.checker().state_equals(&self.model.clone()) {
             Ok(()) => {
                 if had_pending {
                     self.stats.unacked_lost += 1;
@@ -994,7 +1011,7 @@ impl Runner {
             }
             Err(error) => match self.pending.clone() {
                 Some(pending) => {
-                    self.state_equals(&pending).map_err(|pending_error| {
+                    self.checker().state_equals(&pending).map_err(|pending_error| {
                         format!(
                             "I8: the recovered state is neither the acknowledged prefix ({error}) \
                              nor the prefix with the unacknowledged write ({pending_error})"
@@ -1024,7 +1041,36 @@ impl Runner {
         if self.session.fatal.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             return fail("the engine called its fatal handler");
         }
-        self.state_equals(&self.model)
+        self.checker().state_equals(&self.model)
+    }
+
+    /// Checks over this runner's session.
+    pub fn checker(&self) -> Checker<'_> {
+        Checker {
+            session: &self.session,
+        }
+    }
+
+    /// The model of the collection `session` holds now, with no rows: the schema and sequence
+    /// number of a collection that was just created.
+    pub fn new_model(session: &Session) -> Model {
+        Model {
+            schema: (*session.handle().current().schema).clone(),
+            rows: BTreeMap::new(),
+            visible_seq_no: session.handle().visible_seq_no(),
+        }
+    }
+
+}
+
+/// Checks of what the engine serves against a model, over one session.
+pub struct Checker<'a> {
+    session: &'a Session,
+}
+
+impl<'a> Checker<'a> {
+    pub fn new(session: &'a Session) -> Self {
+        Self { session }
     }
 
     /// Whether the visible state is exactly `model`: invariants, sequence number, schema, live

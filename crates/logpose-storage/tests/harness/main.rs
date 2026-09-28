@@ -32,6 +32,7 @@ use twox_hash as _;
 use uuid as _;
 
 mod actions;
+mod crash;
 mod generate;
 mod model;
 mod random;
