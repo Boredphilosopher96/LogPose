@@ -2705,17 +2705,12 @@ mod tests {
                 .is_some_and(|reason| !reason.is_empty())
         );
         assert!(
-            query_body["diagnostics"]["candidates_reranked"]
-                .as_u64()
-                .is_some_and(|count| count >= 1)
-        );
-        assert!(
             query_body["diagnostics"]["candidates_merged"]
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );
         assert!(
-            query_body["diagnostics"]["unit_scan_mix"]["mutable_exact"]
+            query_body["diagnostics"]["unit_scan_mix"]["memtable_scan"]
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );

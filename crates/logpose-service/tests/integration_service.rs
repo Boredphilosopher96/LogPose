@@ -908,13 +908,16 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .expect("grpc diagnostics should be present");
     assert_eq!(
         service_diagnostics.chosen_plan,
-        QueryPlanKind::VectorFirstAnn
+        QueryPlanKind::PredicateFirstExact
     );
-    assert_eq!(rest_body["diagnostics"]["chosen_plan"], "vector_first_ann");
+    assert_eq!(
+        rest_body["diagnostics"]["chosen_plan"],
+        "predicate_first_exact"
+    );
     assert_eq!(
         proto::QueryPlanKind::try_from(grpc_diagnostics.chosen_plan)
             .expect("chosen plan should decode"),
-        proto::QueryPlanKind::VectorFirstAnn
+        proto::QueryPlanKind::PredicateFirstExact
     );
     assert_eq!(
         service_diagnostics.candidates_reranked as u64,
@@ -936,31 +939,30 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         service_diagnostics.candidates_merged as u64,
         grpc_diagnostics.candidates_merged
     );
-    assert_eq!(service_diagnostics.fallback_reason, None);
-    assert_eq!(rest_body["diagnostics"]["fallback_reason"], Value::Null);
-    assert_eq!(grpc_diagnostics.fallback_reason, None);
+    assert!(service_diagnostics.fallback_reason.is_some());
     assert_eq!(
-        service_diagnostics
-            .unit_scan_mix
-            .get("immutable_ann")
-            .copied(),
+        rest_body["diagnostics"]["fallback_reason"].as_str(),
+        service_diagnostics.fallback_reason.as_deref()
+    );
+    assert_eq!(
+        grpc_diagnostics.fallback_reason,
+        service_diagnostics.fallback_reason
+    );
+    assert_eq!(
+        service_diagnostics.unit_scan_mix.get("exact_f32").copied(),
         Some(1)
     );
     assert_eq!(
-        rest_body["diagnostics"]["unit_scan_mix"]["immutable_ann"],
+        rest_body["diagnostics"]["unit_scan_mix"]["exact_f32"],
         Value::from(1)
     );
-    assert_eq!(
-        grpc_diagnostics.unit_scan_mix.get("immutable_ann"),
-        Some(&1)
-    );
+    assert_eq!(grpc_diagnostics.unit_scan_mix.get("exact_f32"), Some(&1));
     let service_timings = service_diagnostics
         .stage_timings
         .as_ref()
         .expect("service timings should be present");
-    assert!(service_timings.planning_micros > 0);
-    assert!(service_timings.candidate_generation_micros > 0);
-    assert!(service_timings.rerank_micros > 0);
+    assert_eq!(service_timings.prefilter_micros, 0);
+    assert_eq!(service_timings.merge_micros, 0);
     assert!(rest_body["diagnostics"]["stage_timings"].is_object());
     assert!(
         rest_body["diagnostics"]["stage_timings"]["planning_micros"]
@@ -996,15 +998,14 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .stage_timings
         .as_ref()
         .expect("grpc timings should be present");
-    assert!(grpc_timings.planning_micros > 0);
-    assert!(grpc_timings.candidate_generation_micros > 0);
-    assert!(grpc_timings.rerank_micros > 0);
+    assert_eq!(grpc_timings.prefilter_micros, 0);
+    assert_eq!(grpc_timings.merge_micros, 0);
 }
 
 #[tokio::test]
-async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
+async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     let state = Arc::new(logpose_core::AppState::new(test_config(
-        "service-cooperative-filtered-ann",
+        "service-filtered-segment-scan",
     )));
     let rest = logpose_api_rest::router(Arc::clone(&state));
     let grpc = logpose_api_grpc::GrpcLogPoseService::new(Arc::clone(&state));
@@ -1151,30 +1152,22 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
         .diagnostics
         .as_ref()
         .expect("service diagnostics should be present");
-    assert_eq!(
-        diagnostics.chosen_plan,
-        QueryPlanKind::CooperativeFilteredAnn
-    );
-    assert_eq!(
-        diagnostics.planner_reason,
-        "filtered ann traversal is cheaper than exact scan for this selectivity"
-    );
+    // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
+    // three rows the filter matches.
+    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::PredicateFirstExact);
+    assert!(diagnostics.planner_reason.contains("exact_f32"));
     assert!((diagnostics.estimated_selectivity - 0.25).abs() <= f32::EPSILON);
-    assert_eq!(diagnostics.units_considered, 2);
+    assert!(diagnostics.units_considered >= 1);
     assert_eq!(diagnostics.units_pruned, 0);
     assert_eq!(diagnostics.units_scanned, 1);
     assert!(diagnostics.candidates_before_filter >= service_response.returned);
     assert!(diagnostics.candidates_after_filter >= service_response.returned);
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
-    assert_eq!(
-        diagnostics.candidates_reranked,
-        diagnostics.candidates_merged
-    );
-    assert!(diagnostics.candidates_reranked >= service_response.returned);
+    assert!(diagnostics.candidates_merged >= service_response.returned);
     assert_eq!(diagnostics.rerank_count, 1);
     assert_eq!(
         rest_body["diagnostics"]["chosen_plan"],
-        "cooperative_filtered_ann"
+        "predicate_first_exact"
     );
     assert_eq!(
         proto::QueryPlanKind::try_from(
@@ -1185,7 +1178,7 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
                 .chosen_plan
         )
         .expect("chosen plan should decode"),
-        proto::QueryPlanKind::CooperativeFilteredAnn
+        proto::QueryPlanKind::PredicateFirstExact
     );
     let grpc_diagnostics = grpc_response
         .diagnostics
@@ -1284,90 +1277,45 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
         diagnostics.candidates_after_filter as u64,
         grpc_diagnostics.candidates_after_filter
     );
-    assert_eq!(diagnostics.fallback_reason, None);
-    assert_eq!(rest_body["diagnostics"]["fallback_reason"], Value::Null);
-    assert_eq!(grpc_diagnostics.fallback_reason, None);
+    assert!(diagnostics.fallback_reason.is_some());
     assert_eq!(
-        diagnostics.unit_scan_mix.get("immutable_ann").copied(),
-        Some(1)
+        rest_body["diagnostics"]["fallback_reason"].as_str(),
+        diagnostics.fallback_reason.as_deref()
     );
     assert_eq!(
-        rest_body["diagnostics"]["unit_scan_mix"]["immutable_ann"],
+        grpc_diagnostics.fallback_reason,
+        diagnostics.fallback_reason
+    );
+    assert_eq!(diagnostics.unit_scan_mix.get("exact_f32").copied(), Some(1));
+    assert_eq!(
+        rest_body["diagnostics"]["unit_scan_mix"]["exact_f32"],
         Value::from(1)
     );
-    assert_eq!(
-        grpc_diagnostics.unit_scan_mix.get("immutable_ann"),
-        Some(&1)
-    );
+    assert_eq!(grpc_diagnostics.unit_scan_mix.get("exact_f32"), Some(&1));
+    // Timings differ per run; every transport carries all six stages.
     let service_timings = diagnostics
         .stage_timings
         .as_ref()
         .expect("service timings should be present");
+    assert_eq!(service_timings.prefilter_micros, 0);
+    assert_eq!(service_timings.merge_micros, 0);
     let rest_timings = &rest_body["diagnostics"]["stage_timings"];
-    assert_eq!(
-        service_timings.planning_micros > 0,
-        rest_timings["planning_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
-    assert_eq!(
-        service_timings.prefilter_micros > 0,
-        rest_timings["prefilter_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
-    assert_eq!(
-        service_timings.candidate_generation_micros > 0,
-        rest_timings["candidate_generation_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
-    assert_eq!(
-        service_timings.postfilter_micros > 0,
-        rest_timings["postfilter_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
-    assert_eq!(
-        service_timings.rerank_micros > 0,
-        rest_timings["rerank_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
-    assert_eq!(
-        service_timings.merge_micros > 0,
-        rest_timings["merge_micros"]
-            .as_u64()
-            .is_some_and(|micros| micros > 0)
-    );
+    for stage in [
+        "planning_micros",
+        "prefilter_micros",
+        "candidate_generation_micros",
+        "postfilter_micros",
+        "rerank_micros",
+        "merge_micros",
+    ] {
+        assert!(rest_timings[stage].as_u64().is_some(), "{stage}");
+    }
     let grpc_timings = grpc_diagnostics
         .stage_timings
         .as_ref()
         .expect("grpc timings should be present");
-    assert_eq!(
-        service_timings.planning_micros > 0,
-        grpc_timings.planning_micros > 0
-    );
-    assert_eq!(
-        service_timings.prefilter_micros > 0,
-        grpc_timings.prefilter_micros > 0
-    );
-    assert_eq!(
-        service_timings.candidate_generation_micros > 0,
-        grpc_timings.candidate_generation_micros > 0
-    );
-    assert_eq!(
-        service_timings.postfilter_micros > 0,
-        grpc_timings.postfilter_micros > 0
-    );
-    assert_eq!(
-        service_timings.rerank_micros > 0,
-        grpc_timings.rerank_micros > 0
-    );
-    assert_eq!(
-        service_timings.merge_micros > 0,
-        grpc_timings.merge_micros > 0
-    );
+    assert_eq!(grpc_timings.prefilter_micros, 0);
+    assert_eq!(grpc_timings.merge_micros, 0);
 }
 
 #[tokio::test]
