@@ -18,7 +18,7 @@ use crate::{
     writer::{JobCommit, JobStart, JobWork},
 };
 use logpose_types::{LogPoseError, Result, Snapshot};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 pub use crate::writer::JobKind;
 
@@ -89,16 +89,16 @@ impl Engine {
     /// compaction policy. Whatever it plans is requested from the scheduler before this
     /// returns. A test on a manual clock calls it after advancing the clock, so the retry a
     /// failed flush was waiting for is requested at that point of the test rather than at
-    /// whichever real-time tick comes first. Blocking.
+    /// whichever real-time tick comes first. Blocking, for at most `timeout`.
     ///
     /// Test support, hidden from the documented API, like [`Engine::begin_job`].
     ///
     /// # Errors
     ///
-    /// The collection's writer stopped.
+    /// The collection's writer stopped, or did not run the tick within `timeout`.
     #[doc(hidden)]
-    pub fn tick_writer(&self, handle: &Arc<CollectionHandle>) -> Result<()> {
-        handle.tick_writer()
+    pub fn tick_writer(&self, handle: &Arc<CollectionHandle>, timeout: Duration) -> Result<()> {
+        handle.tick_writer(timeout)
     }
 }
 

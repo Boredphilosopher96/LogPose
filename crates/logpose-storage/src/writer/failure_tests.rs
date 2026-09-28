@@ -536,7 +536,9 @@ fn a_tick_past_the_flush_backoff_requests_the_retry_before_it_returns() {
     let granted = engine.scheduler().stats().flushes_granted;
 
     clock.advance(FLUSH_RETRY_BACKOFF - Duration::from_millis(1));
-    engine.tick_writer(&handle).expect("the writer ticks");
+    engine
+        .tick_writer(&handle, Duration::from_secs(30))
+        .expect("the writer ticks");
     std::thread::sleep(TICK_INTERVAL * 2);
     assert_eq!(
         engine.scheduler().stats().flushes_granted,
@@ -546,7 +548,9 @@ fn a_tick_past_the_flush_backoff_requests_the_retry_before_it_returns() {
     assert_eq!(handle.current().frozen.len(), 1);
 
     clock.advance(Duration::from_millis(1));
-    engine.tick_writer(&handle).expect("the writer ticks");
+    engine
+        .tick_writer(&handle, Duration::from_secs(30))
+        .expect("the writer ticks");
     assert_eq!(
         engine.scheduler().stats().flushes_granted,
         granted + 1,

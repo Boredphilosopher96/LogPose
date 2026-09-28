@@ -592,7 +592,7 @@ impl Writer {
                 if std::mem::take(&mut self.freeze_pending) {
                     self.freeze_if_due().await;
                 }
-                let _ = reply.send(());
+                let _ = reply.try_send(());
             }
             ControlMsg::Quiesce { reply } => {
                 // A drop voids every job that has not begun. Should the drop not commit, the

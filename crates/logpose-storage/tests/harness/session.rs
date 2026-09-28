@@ -450,12 +450,14 @@ impl Session {
     /// were removed before it; orphan cleanup at the next open removes the rest, so the
     /// recovered collection is the same.
     pub fn settle(&self) -> Result<(), String> {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + CALL_DEADLINE;
         let crashed = || self.fault.as_ref().is_some_and(|fault| fault.is_crashed());
         loop {
-            let engine = self.engine().clone();
-            let handle = Arc::clone(self.handle());
-            self.call("tick", move || engine.tick_writer(&handle))?
+            // On this thread, since a `call` per action made hand-stepped runs about a third
+            // slower: the tick bounds its own wait, so a writer that never answers still fails
+            // the run with its seed.
+            self.engine()
+                .tick_writer(self.handle(), CALL_DEADLINE)
                 .map_err(|error| format!("writer tick: {error}"))?;
             if crashed() {
                 return Ok(());
@@ -466,7 +468,8 @@ impl Session {
             }
             if Instant::now() > deadline {
                 return Err(format!(
-                    "background jobs did not settle: {} running, {} waiting",
+                    "background jobs did not settle within {CALL_DEADLINE:?}: {} running, {} \
+                     waiting",
                     stats.running, stats.waiting
                 ));
             }
@@ -476,11 +479,9 @@ impl Session {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        let engine = self.engine().clone();
-        self.call("gc", move || {
-            engine.reap_snapshots();
-            engine.wait_for_gc();
-        })
+        self.engine().reap_snapshots();
+        self.engine().wait_for_gc();
+        Ok(())
     }
 
     /// Wait until no maintenance job runs, or the planned crash has happened.
