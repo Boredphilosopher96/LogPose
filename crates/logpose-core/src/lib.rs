@@ -12,7 +12,10 @@ use logpose_query::{
 use logpose_service::{
     FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
-use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
+use logpose_storage::{
+    CreateCollectionRequest, EngineConfig, InspectReport, InspectTarget, LocalStorageEngine,
+    TokenConfig,
+};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
@@ -103,8 +106,18 @@ impl AppState {
         })?;
         let build = BuildInfo::current();
         // One engine owns the storage root; the data plane and the catalog share it.
-        let local =
-            LocalStorageEngine::with_resolver(&config.storage_root, logpose_query::resolver())?;
+        let local = LocalStorageEngine::with_config(
+            &config.storage_root,
+            EngineConfig {
+                resolver: Some(logpose_query::resolver()),
+                tokens: TokenConfig {
+                    ttl: std::time::Duration::from_millis(config.snapshots.token_ttl_ms),
+                    max_per_collection: config.snapshots.max_tokens_per_collection,
+                    ..TokenConfig::default()
+                },
+                ..EngineConfig::default()
+            },
+        )?;
         let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
             MetadataBackend::Local => Arc::new(local.clone()),
             MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::with_local(

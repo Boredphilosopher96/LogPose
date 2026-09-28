@@ -1231,11 +1231,11 @@ mod tests {
     }
 
     fn match_ids(body: &Value) -> Vec<&str> {
-        body["matches"]
+        body["hits"]
             .as_array()
-            .expect("matches should be an array")
+            .expect("hits should be an array")
             .iter()
-            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+            .map(|hit| hit["record"]["id"].as_str().expect("id should be a string"))
             .collect()
     }
 
@@ -1616,7 +1616,7 @@ mod tests {
             (
                 "POST",
                 "/query".to_owned(),
-                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1})),
                 true,
             ),
             (
@@ -1712,7 +1712,7 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/query"),
-            Some(json!({"vector": [1.0, 0.0], "top_k": 3, "filters": {"kind": "keep"}})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 3, "filter": {"eq": {"kind": "keep"}}})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1802,7 +1802,7 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/query"),
-            Some(json!({"vector": [1.0, 0.0], "top_k": 1, "read_barrier": write["snapshot"]})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1, "read_barrier": write["snapshot"]})),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1811,7 +1811,7 @@ mod tests {
             flush["manifest_generation"]
         );
         assert_eq!(body["snapshot"]["visible_seq_no"], flush["visible_seq_no"]);
-        assert_eq!(body["matches"][0]["id"], "alpha");
+        assert_eq!(body["hits"][0]["record"]["id"], "alpha");
 
         let (status, body) = call(
             &app,
@@ -1831,7 +1831,7 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 1,
                 "read_barrier": {"manifest_generation": 0, "visible_seq_no": 2}
             })),
@@ -2113,7 +2113,7 @@ mod tests {
                 "query",
                 "POST",
                 format!("{DOCS}/query"),
-                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1})),
             ),
             ("stats", "GET", format!("{DOCS}/stats"), None),
             ("flush", "POST", format!("{DOCS}/flush"), None),
@@ -2955,9 +2955,9 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 5,
-                "filters": {"score": 9_007_199_254_740_993_u64}
+                "filter": {"eq": {"score": 9_007_199_254_740_993_u64}}
             })),
         )
         .await;
@@ -2988,9 +2988,9 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 1,
-                "predicate": {"kind": "comparison", "field": "kind", "operator": "eq", "value": "keep"},
+                "filter": {"eq": {"kind": "keep"}},
                 "explain": "profile"
             })),
         )
@@ -3034,19 +3034,21 @@ mod tests {
         let app = router(Arc::new(AppState::new(test_config("rest-query-errors"))));
         create_documents(&app).await;
         let query = format!("{DOCS}/query");
-        for request in [
-            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "comparison", "field": "kind", "operator": "eq"}}),
-            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "and", "children": []}}),
-            json!({"vector": [1.0, 0.0], "top_k": 1, "filters": {"kind": {"nested": true}}}),
+        for (filter, path) in [
+            (json!({"eq": {}}), "filter.eq"),
+            (json!({"and": []}), "filter.and"),
+            (json!({"eq": {"kind": {"nested": true}}}), "filter.eq.kind"),
         ] {
+            let request = json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1, "filter": filter});
             let (status, body) = call(&app, "POST", &query, Some(request)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(violation(&body), path, "{body}");
         }
         let (status, body) = call(
             &app,
             "POST",
             &query,
-            Some(json!({"vector": [1.0, 0.0], "top_k": 0})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 0})),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3054,7 +3056,7 @@ mod tests {
         assert!(
             body["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("top_k must be greater than 0"))
+                .is_some_and(|message| message.contains("top_k must be 1 to"))
         );
     }
 
@@ -3200,5 +3202,812 @@ mod tests {
         let path = std::env::temp_dir().join(format!("logpose-api-rest-{label}-{suffix}"));
         fs::create_dir_all(&path).expect("temp dir should be created");
         path
+    }
+
+    // ----- Search, count, scroll, and filter writes -----
+
+    const ITEMS: &str = "/v2/databases/default/collections/items";
+
+    /// Two vector fields, typed scalar fields, and dynamic fields.
+    fn items_spec() -> Value {
+        json!({
+            "name": "items",
+            "primary_key": {"name": "sku", "type": "int64"},
+            "vectors": [
+                {"name": "embedding", "dimensions": 3, "metric": "dot"},
+                {"name": "thumb", "dimensions": 2, "metric": "l2"}
+            ],
+            "fields": [
+                {"name": "tenant", "type": "string"},
+                {"name": "price", "type": "float64"},
+                {"name": "stock", "type": "int64"},
+                {"name": "tags", "type": "array<string>"}
+            ],
+            "dynamic_fields": true
+        })
+    }
+
+    /// Item `sku`: even skus belong to `acme` and odd ones to `globex`, the price is
+    /// `1.5 * sku`, the stock `sku % 7` (none for multiples of 5), the tag `t{sku % 3}`, the
+    /// `$extra` color red for multiples of 4 and blue otherwise, and the embedding's dot product
+    /// with `[1, 0, 0]` is `sku`.
+    fn item(sku: i64) -> Value {
+        let mut item = json!({
+            "sku": sku,
+            "embedding": [sku as f64, 1.0, 0.0],
+            "thumb": [0.0, sku as f64],
+            "tenant": if sku % 2 == 0 { "acme" } else { "globex" },
+            "price": sku as f64 * 1.5,
+            "tags": [format!("t{}", sku % 3)],
+            "color": if sku % 4 == 0 { "red" } else { "blue" }
+        });
+        if sku % 5 != 0 {
+            item["stock"] = json!(sku % 7);
+        }
+        item
+    }
+
+    async fn create_items(app: &Router, skus: std::ops::RangeInclusive<i64>) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(items_spec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        upsert_items(app, skus).await;
+    }
+
+    async fn upsert_items(app: &Router, skus: std::ops::RangeInclusive<i64>) {
+        let records = skus.map(item).collect::<Vec<_>>();
+        let (status, body) = call(
+            app,
+            "POST",
+            &format!("{ITEMS}/records/upsert"),
+            Some(json!({ "records": records })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn hit_skus(body: &Value) -> Vec<i64> {
+        body["hits"]
+            .as_array()
+            .expect("hits should be an array")
+            .iter()
+            .map(|hit| {
+                hit["record"]["sku"]
+                    .as_i64()
+                    .expect("sku should be an integer")
+            })
+            .collect()
+    }
+
+    fn record_skus(body: &Value) -> Vec<i64> {
+        body["records"]
+            .as_array()
+            .expect("records should be an array")
+            .iter()
+            .map(|record| record["sku"].as_i64().expect("sku should be an integer"))
+            .collect()
+    }
+
+    /// Every page of a scroll with `request` (a first page), and the skus it returned.
+    async fn scroll_all(app: &Router, request: Value) -> (Vec<Value>, Vec<i64>) {
+        let mut pages = Vec::new();
+        let mut skus = Vec::new();
+        let mut request = request;
+        loop {
+            let (status, page) = call(
+                app,
+                "POST",
+                &format!("{ITEMS}/records/scroll"),
+                Some(request.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            skus.extend(record_skus(&page));
+            let next = page["next_cursor"].clone();
+            pages.push(page);
+            if next.is_null() {
+                break;
+            }
+            request["cursor"] = next;
+            if let Some(object) = request.as_object_mut() {
+                object.remove("snapshot_token");
+            }
+        }
+        (pages, skus)
+    }
+
+    #[tokio::test]
+    async fn queries_search_a_named_vector_field_with_typed_filters_orders_and_projections() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-query"))));
+        create_items(&app, 1..=40).await;
+        let query = format!("{ITEMS}/query");
+
+        // A vector search: acme items with 15 <= price < 45 are skus 10 to 28, best first.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "embedding", "values": [1.0, 0.0, 0.0]},
+                "filter": {"and": [
+                    {"eq": {"tenant": "acme"}},
+                    {"range": {"price": {"gte": 15, "lt": 45}}}
+                ]},
+                "top_k": 3,
+                "output_fields": ["price"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["vector_field"], "embedding");
+        assert_eq!(body["metric"], "dot");
+        assert_eq!(body["returned"], 3);
+        assert_eq!(
+            body["hits"],
+            json!([
+                {"score": 28.0, "record": {"sku": 28, "price": 42.0}},
+                {"score": 26.0, "record": {"sku": 26, "price": 39.0}},
+                {"score": 24.0, "record": {"sku": 24, "price": 36.0}}
+            ])
+        );
+
+        // The other vector field, by name: L2 distance to [0, 3] is smallest for sku 3.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "thumb", "values": [0.0, 3.0]},
+                "top_k": 2,
+                "output_fields": ["sku"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["metric"], "l2");
+        assert_eq!(hit_skus(&body)[0], 3);
+        assert_eq!(body["hits"][0]["record"], json!({"sku": 3}));
+
+        // No vector: a filtered scan in `order_by` order, without scores.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "filter": {"contains": {"tags": "t0"}},
+                "order_by": [{"field": "price", "direction": "desc"}],
+                "top_k": 4,
+                "output_fields": ["price"],
+                "explain": "plan"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![39, 36, 33, 30]);
+        assert!(body["hits"][0].get("score").is_none(), "{body}");
+        assert!(body.get("vector_field").is_none(), "{body}");
+        assert_eq!(body["diagnostics"]["chosen_plan"], "ordered_scan");
+
+        // With a vector, `order_by` reorders the hits: stock ascending, no stock last.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "embedding", "values": [1.0, 0.0, 0.0]},
+                "order_by": [{"field": "stock"}],
+                "top_k": 5,
+                "output_fields": ["stock"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![36, 37, 38, 39, 40]);
+
+        // `$extra` keys filter by path, and `in` and `not_in` take lists.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "filter": {"and": [
+                    {"eq": {"$extra.color": "red"}},
+                    {"not_in": {"sku": [4, 8]}},
+                    {"in": {"tenant": ["acme", "initech"]}}
+                ]},
+                "top_k": 100,
+                "output_fields": ["sku"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![12, 16, 20, 24, 28, 32, 36, 40]);
+
+        // A pinned query returns the token of the state it read.
+        let (status, body) =
+            call(&app, "POST", &query, Some(json!({"top_k": 1, "pin": true}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["snapshot_token"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn counts_and_scrolls_agree_and_scroll_pages_follow_the_order() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-scroll"))));
+        create_items(&app, 1..=40).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": {"eq": {"tenant": "globex"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "items");
+        assert_eq!(body["count"], 20);
+        assert!(body.get("snapshot_token").is_none(), "{body}");
+        let (_, all) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(all["count"], 40);
+
+        let (pages, skus) = scroll_all(
+            &app,
+            json!({
+                "filter": {"eq": {"tenant": "globex"}},
+                "page_size": 6,
+                "output_fields": ["tenant"]
+            }),
+        )
+        .await;
+        assert_eq!(skus, (1..=39).step_by(2).collect::<Vec<_>>());
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page["records"].as_array().map_or(0, Vec::len))
+                .collect::<Vec<_>>(),
+            vec![6, 6, 6, 2]
+        );
+        assert_eq!(
+            pages[0]["records"][0],
+            json!({"sku": 1, "tenant": "globex"})
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| page["snapshot"] == pages[0]["snapshot"])
+        );
+
+        // Ordered by price descending, in pages of 15, and a scroll that fits one page.
+        let (pages, skus) = scroll_all(
+            &app,
+            json!({
+                "order_by": [{"field": "price", "direction": "desc"}],
+                "page_size": 15,
+                "output_fields": ["sku"]
+            }),
+        )
+        .await;
+        assert_eq!(skus, (1..=40).rev().collect::<Vec<_>>());
+        assert_eq!(pages.len(), 3);
+        let (pages, skus) = scroll_all(&app, json!({"page_size": 40})).await;
+        assert_eq!((pages.len(), skus.len()), (1, 40));
+    }
+
+    #[tokio::test]
+    async fn scroll_cursors_read_the_pinned_state_through_writes_flushes_and_compactions() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-pinned"))));
+        create_items(&app, 1..=40).await;
+        let (status, _) = call(&app, "POST", &format!("{ITEMS}/flush"), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let acme = json!({"eq": {"tenant": "acme"}});
+        let (status, counted) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme, "pin": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{counted}");
+        assert_eq!(counted["count"], 20);
+        let token = counted["snapshot_token"].clone();
+        assert!(token.is_string(), "{counted}");
+
+        let first = json!({
+            "filter": acme,
+            "page_size": 7,
+            "snapshot_token": token,
+            "output_fields": ["price"]
+        });
+        let (status, page) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(first.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(record_skus(&page), vec![2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(page["snapshot"], counted["snapshot"]);
+        let cursor = page["next_cursor"].clone();
+        assert!(cursor.is_string(), "{page}");
+
+        // Change what the pinned state holds: deletes, updates, new rows, a flush, a compaction.
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"range": {"sku": {"gte": 16, "lte": 24}}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 9);
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({"filter": acme, "patch": {"price": 0.5}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        upsert_items(&app, 41..=60).await;
+        for step in ["flush", "compact"] {
+            let (status, body) = call(&app, "POST", &format!("{ITEMS}/{step}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{step}: {body}");
+        }
+
+        // A cursor with another filter, or with a token, is refused.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"filter": {"eq": {"tenant": "globex"}}, "cursor": cursor})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "cursor");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"filter": acme, "cursor": cursor, "snapshot_token": token})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "snapshot_token");
+
+        // The rest of the pages read exactly the pinned state.
+        let (pages, rest) = scroll_all(
+            &app,
+            json!({"filter": acme, "page_size": 7, "cursor": cursor, "output_fields": ["price"]}),
+        )
+        .await;
+        let mut scrolled = record_skus(&page);
+        scrolled.extend(rest);
+        assert_eq!(scrolled, (2..=40).step_by(2).collect::<Vec<_>>());
+        assert_eq!(
+            scrolled.len() as u64,
+            counted["count"].as_u64().unwrap_or_default()
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|next| next["snapshot"] == counted["snapshot"])
+        );
+        assert_eq!(pages[0]["records"][0], json!({"sku": 16, "price": 24.0}));
+
+        // The current state shows the changes.
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme})),
+        )
+        .await;
+        assert_eq!(now["count"], 25);
+        let (_, through_token) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme, "snapshot_token": token})),
+        )
+        .await;
+        assert_eq!(through_token["count"], 20);
+    }
+
+    #[tokio::test]
+    async fn expired_scroll_cursors_and_tokens_fail_with_snapshot_expired() {
+        let mut config = test_config("rest-p6c-expiry");
+        config.snapshots.token_ttl_ms = 200;
+        let app = router(Arc::new(AppState::new(config)));
+        create_items(&app, 1..=10).await;
+        let (status, page) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"page_size": 3})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let cursor = page["next_cursor"].clone();
+        assert!(cursor.is_string(), "{page}");
+        let (_, counted) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"pin": true})),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"page_size": 3, "cursor": cursor})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["details"]["reason"], "SNAPSHOT_EXPIRED");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"snapshot_token": counted["snapshot_token"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["details"]["reason"], "SNAPSHOT_EXPIRED");
+    }
+
+    #[tokio::test]
+    async fn deletes_and_updates_by_filter_commit_every_match_as_one_batch() {
+        let app = router(Arc::new(AppState::new(test_config(
+            "rest-p6c-filter-writes",
+        ))));
+        create_items(&app, 1..=40).await;
+        let (_, before) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"pin": true})),
+        )
+        .await;
+
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"range": {"price": {"lt": 15}}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 9);
+        // One batch: the nine deletes take consecutive sequence numbers and become visible
+        // together.
+        assert_eq!(
+            ack["last_seq_no"].as_u64(),
+            before["snapshot"]["visible_seq_no"]
+                .as_u64()
+                .map(|seq| seq + 9)
+        );
+        assert_eq!(ack["snapshot"]["visible_seq_no"], ack["last_seq_no"]);
+        let (_, got) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/get"),
+            Some(json!({"keys": (1..=10).collect::<Vec<_>>(), "output_fields": ["sku"]})),
+        )
+        .await;
+        assert_eq!(got["missing_keys"], json!([1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(now["count"], 31);
+        let (_, then) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"snapshot_token": before["snapshot_token"]})),
+        )
+        .await;
+        assert_eq!(then["count"], 40);
+
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({
+                "filter": {"eq": {"tenant": "acme"}},
+                "patch": {"stock": 100, "color": "green"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 16);
+        for filter in [
+            json!({"eq": {"stock": 100}}),
+            json!({"eq": {"$extra.color": "green"}}),
+        ] {
+            let (_, counted) = call(
+                &app,
+                "POST",
+                &format!("{ITEMS}/records/count"),
+                Some(json!({ "filter": filter })),
+            )
+            .await;
+            assert_eq!(counted["count"], 16, "{filter}");
+        }
+
+        // An invalid patch changes nothing, and a filter without a match commits nothing.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({"filter": {"eq": {"tenant": "acme"}}, "patch": {"price": "free"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "patch.price");
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"eq": {"tenant": "initech"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 0);
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(now["count"], 31);
+    }
+
+    #[tokio::test]
+    async fn search_count_scroll_and_filter_write_errors_name_the_request_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-errors"))));
+        create_items(&app, 1..=5).await;
+        let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
+        let query = |extra: Value| {
+            let mut body = json!({"vector": vector, "top_k": 3});
+            if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+                body.extend(extra);
+            }
+            body
+        };
+        let cases = [
+            ("query", query(json!({"top_k": 0})), "top_k"),
+            ("query", query(json!({"top_k": 10_001})), "top_k"),
+            (
+                "query",
+                json!({"vector": {"values": [1.0, 0.0, 0.0]}, "top_k": 1}),
+                "vector.field",
+            ),
+            (
+                "query",
+                json!({"vector": {"field": "tenant", "values": [1.0]}, "top_k": 1}),
+                "vector.field",
+            ),
+            ("query", json!({"top_k": 1, "ef": 16}), "ef"),
+            ("query", query(json!({"ef": 0})), "ef"),
+            (
+                "query",
+                query(json!({"order_by": [{"field": "tags"}]})),
+                "order_by[0].field",
+            ),
+            (
+                "query",
+                query(json!({"order_by": [{"field": "price"}, {"field": "stock"}]})),
+                "order_by[1]",
+            ),
+            (
+                "query",
+                query(json!({"output_fields": ["$extra", "embedding", 7]})),
+                "",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"price": "cheap"}}})),
+                "filter.eq.price",
+            ),
+            ("query", query(json!({"filter": {"and": []}})), "filter.and"),
+            (
+                "query",
+                query(json!({"filter": {"or": [{"in": {"tags": ["a", 3]}}]}})),
+                "filter.or[0].in.tags[1]",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"range": {"stock": {"gt": 1, "gte": 2}}}})),
+                "filter.range.stock",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"contains": {"tenant": "acme"}}})),
+                "filter.contains.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"not": {"exists": "embedding"}}})),
+                "filter.not.exists",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"$extra.tenant": "acme"}}})),
+                "filter.eq.$extra.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"tenant": null}}})),
+                "filter.eq.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"like": {"tenant": "a%"}}})),
+                "filter",
+            ),
+            (
+                "records/count",
+                json!({"filter": {"range": {"price": {"above": 3}}}}),
+                "filter.range.price.above",
+            ),
+            (
+                "records/count",
+                json!({"snapshot_token": "not-a-token"}),
+                "snapshot_token",
+            ),
+            ("records/scroll", json!({"page_size": 0}), "page_size"),
+            (
+                "records/scroll",
+                json!({"cursor": "not-a-cursor"}),
+                "cursor",
+            ),
+            (
+                "records/scroll",
+                json!({"order_by": [{"field": "sku"}]}),
+                "order_by[0].field",
+            ),
+            (
+                "records/delete",
+                json!({"keys": [1], "filter": {"eq": {"sku": 1}}}),
+                "keys",
+            ),
+            ("records/delete", json!({}), "keys"),
+            (
+                "records/delete",
+                json!({"filter": {"eq": {"sku": "one"}}}),
+                "filter.eq.sku",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}}),
+                "patch",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}, "patch": {"sku": 2}}),
+                "patch.sku",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}, "patch": {"embedding": [1.0]}}),
+                "patch.embedding",
+            ),
+        ];
+        for (operation, body, field) in cases {
+            let (status, reply) = call(
+                &app,
+                "POST",
+                &format!("{ITEMS}/{operation}"),
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{operation} {body}: {reply}"
+            );
+            if !field.is_empty() {
+                assert_eq!(violation(&reply), field, "{operation} {body}: {reply}");
+            }
+        }
+
+        // A query vector of the wrong length is a dimension mismatch at `vector.values`.
+        let (status, reply) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/query"),
+            Some(json!({"vector": {"field": "embedding", "values": [1.0]}, "top_k": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_eq!(reply["details"]["reason"], "DIMENSION_MISMATCH");
+        assert_eq!(violation(&reply), "vector.values");
+    }
+
+    #[tokio::test]
+    async fn a_filter_update_too_large_for_one_wal_frame_is_too_large_and_changes_nothing() {
+        let state = Arc::new(AppState::new(test_config("rest-p6c-too-large")));
+        let app = router(Arc::clone(&state));
+        // 2,048 dimensions: each updated row image carries its 8 KiB vector, so 9,000 rows
+        // exceed a 64 MiB frame.
+        let dims = 2048;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(json!({
+                "name": "wide",
+                "primary_key": {"name": "id", "type": "int64"},
+                "vectors": [{"name": "vector", "dimensions": dims, "metric": "l2"}],
+                "fields": [{"name": "group", "type": "int64"}]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for batch in 0..9_i64 {
+            let records = (batch * 1000..(batch + 1) * 1000)
+                .map(|id| {
+                    Record::new(id)
+                        .with_vector("vector", vec![(id % 97) as f32; dims])
+                        .with_field("group", TypedValue::Int64(1))
+                })
+                .collect();
+            state
+                .upsert_records_with_auth(&RequestAuth::default(), "default/wide", records)
+                .await
+                .expect("seed batch should commit");
+        }
+        let wide = "/v2/databases/default/collections/wide";
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/update"),
+            Some(json!({"filter": {"eq": {"group": 1}}, "patch": {"group": 2}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["details"]["reason"], "TOO_LARGE");
+        let (_, counted) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/count"),
+            Some(json!({"filter": {"eq": {"group": 1}}})),
+        )
+        .await;
+        assert_eq!(counted["count"], 9000);
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/delete"),
+            Some(json!({"filter": {"eq": {"group": 1}}})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a delete of the same rows fits: {ack}"
+        );
+        assert_eq!(ack["applied_ops"], 9000);
     }
 }

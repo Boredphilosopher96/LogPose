@@ -915,9 +915,13 @@ pub fn parse_query_filter(value: &str) -> Result<QueryFilter, String> {
     if field.is_empty() {
         return Err("filter field must not be empty".to_owned());
     }
+    let value = parse_literal(raw_value.trim())?;
+    if value.is_object() || value.is_array() || value.is_null() {
+        return Err("query filters must contain only scalar JSON values".to_owned());
+    }
     Ok(QueryFilter {
         field: field.to_owned(),
-        value: parse_literal(raw_value.trim())?,
+        value,
     })
 }
 

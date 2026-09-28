@@ -260,6 +260,13 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::RecordDelete(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Deleting records...");
+            // Local filter input errors surface before a connection is made.
+            action.filter.document()?;
+            match (&action.id, action.filter.is_empty()) {
+                (Some(_), false) => bail!("delete either a record id or a filter, not both"),
+                (None, true) => bail!("delete needs a record id or a filter"),
+                _ => {}
+            }
             let client = connect_client(config, auth_token).await?;
             let schema = client
                 .collection(&action.collection)
@@ -287,6 +294,8 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::Count(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Counting records...");
+            // Local filter input errors surface before a connection is made.
+            action.filter.document()?;
             let client = connect_client(config, auth_token).await?;
             let schema = client
                 .collection(&action.collection)
@@ -303,6 +312,8 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::Scroll(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Reading a page...");
+            // Local filter input errors surface before a connection is made.
+            action.filter.document()?;
             let client = connect_client(config, auth_token).await?;
             let schema = client
                 .collection(&action.collection)
@@ -339,6 +350,8 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::Query(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Running query...");
+            // Local filter input errors surface before a connection is made.
+            action.filter.document()?;
             let client = connect_client(config, auth_token).await?;
             let schema = client
                 .collection(&action.collection)

@@ -12,14 +12,18 @@ expression: snapshot
       "units_pruned": 0,
       "units_scanned": 1
     },
-    "matches": [
+    "hits": [
       {
-        "id": "alpha",
-        "metadata": {
+        "record": {
           "color": "red",
-          "kind": "keep"
+          "id": "alpha",
+          "kind": "keep",
+          "vector": [
+            1.0,
+            0.0
+          ]
         },
-        "value": 1.0
+        "score": 1.0
       }
     ],
     "metric": "dot",
@@ -28,7 +32,8 @@ expression: snapshot
       "manifest_generation": 0,
       "visible_seq_no": 3
     },
-    "top_k": 1
+    "top_k": 1,
+    "vector_field": "vector"
   },
   "manifest": {
     "collection_name": "colors",
@@ -67,14 +72,18 @@ expression: snapshot
       "units_pruned": 0,
       "units_scanned": 1
     },
-    "matches": [
+    "hits": [
       {
-        "id": "alpha",
-        "metadata": {
+        "record": {
           "color": "red",
-          "kind": "keep"
+          "id": "alpha",
+          "kind": "keep",
+          "vector": [
+            1.0,
+            0.0
+          ]
         },
-        "value": 1.0
+        "score": 1.0
       }
     ],
     "metric": "dot",
@@ -83,7 +92,8 @@ expression: snapshot
       "manifest_generation": 1,
       "visible_seq_no": 3
     },
-    "top_k": 1
+    "top_k": 1,
+    "vector_field": "vector"
   },
   "segment": {
     "collection_name": "colors",

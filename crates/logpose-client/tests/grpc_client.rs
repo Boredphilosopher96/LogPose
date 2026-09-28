@@ -978,6 +978,7 @@ fn test_config_with_role(
         metadata: Default::default(),
         auth: Default::default(),
         limits: Default::default(),
+        snapshots: Default::default(),
     }
 }
 

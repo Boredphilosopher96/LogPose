@@ -37,6 +37,54 @@ pub struct LogPoseConfig {
     /// Request size limits for the REST and gRPC listeners.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Snapshot tokens: how long a pinned state lives and how many a collection holds.
+    #[serde(default)]
+    pub snapshots: SnapshotConfig,
+}
+
+/// Default for [`SnapshotConfig::token_ttl_ms`]: 5 minutes.
+pub const DEFAULT_SNAPSHOT_TOKEN_TTL_MS: u64 = 5 * 60 * 1000;
+/// Default for [`SnapshotConfig::max_tokens_per_collection`].
+pub const DEFAULT_MAX_SNAPSHOT_TOKENS_PER_COLLECTION: usize = 64;
+
+/// Snapshot token settings (engine plan decision D7).
+///
+/// A snapshot token pins one state of a collection for repeatable reads: a pinned query or
+/// count returns one, and every scroll cursor carries one. A token expires `token_ttl_ms` after
+/// its last use (each use extends it), after which reads through it, and scroll pages after it,
+/// fail with `SNAPSHOT_EXPIRED`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotConfig {
+    /// How long a token lives after its last use, in milliseconds.
+    pub token_ttl_ms: u64,
+    /// Most pinned states per collection; a pin past it fails with `TOO_MANY_SNAPSHOTS`.
+    pub max_tokens_per_collection: usize,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            token_ttl_ms: DEFAULT_SNAPSHOT_TOKEN_TTL_MS,
+            max_tokens_per_collection: DEFAULT_MAX_SNAPSHOT_TOKENS_PER_COLLECTION,
+        }
+    }
+}
+
+impl SnapshotConfig {
+    fn validate(&self) -> Result<()> {
+        if self.token_ttl_ms == 0 {
+            return Err(LogPoseError::invalid_config(
+                "invalid LOGPOSE_CONFIG: snapshots.token_ttl_ms must be greater than 0",
+            ));
+        }
+        if self.max_tokens_per_collection == 0 {
+            return Err(LogPoseError::invalid_config(
+                "invalid LOGPOSE_CONFIG: snapshots.max_tokens_per_collection must be greater than 0",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Default for [`LimitsConfig::max_rest_body_bytes`]: 16 MiB.
@@ -153,6 +201,7 @@ impl Default for LogPoseConfig {
             metadata: MetadataConfig::default(),
             auth: AuthConfig::default(),
             limits: LimitsConfig::default(),
+            snapshots: SnapshotConfig::default(),
         }
     }
 }
@@ -173,6 +222,7 @@ impl LogPoseConfig {
         }
         self.auth.validate()?;
         self.limits.validate()?;
+        self.snapshots.validate()?;
         Ok(())
     }
 
@@ -230,6 +280,37 @@ max_rest_body_bytes = 1024
             config.limits.max_grpc_message_bytes,
             DEFAULT_MAX_GRPC_MESSAGE_BYTES
         );
+    }
+
+    #[test]
+    fn snapshot_settings_default_to_five_minutes_and_parse_from_toml() {
+        assert_eq!(
+            LogPoseConfig::default().snapshots,
+            SnapshotConfig {
+                token_ttl_ms: 300_000,
+                max_tokens_per_collection: 64,
+            }
+        );
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "127.0.0.1"
+rest_port = 8080
+grpc_host = "127.0.0.1"
+grpc_port = 50051
+log_filter = "info"
+storage_root = ".logpose"
+
+[snapshots]
+token_ttl_ms = 1500
+"#,
+        )
+        .expect("snapshot settings should parse");
+        assert_eq!(config.snapshots.token_ttl_ms, 1500);
+        assert_eq!(config.snapshots.max_tokens_per_collection, 64);
+        let mut config = LogPoseConfig::default();
+        config.snapshots.token_ttl_ms = 0;
+        let error = config.validate().expect_err("a zero TTL is invalid");
+        assert!(error.to_string().contains("snapshots.token_ttl_ms"));
     }
 
     #[test]

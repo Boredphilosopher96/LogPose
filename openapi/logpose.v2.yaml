@@ -560,7 +560,7 @@ paths:
   /v2/databases/{database}/collections/{collection}/records/update:
     post:
       summary: Update records
-      description: "Changes some fields of existing records as one atomic batch. Each document holds the primary key and the fields to change: a value replaces the field, `null` clears it, and vectors not sent are kept. A key without a live record fails the whole batch with `NOT_FOUND` (resource type `record`)."
+      description: "Changes some fields of records as one atomic batch. By key (`records`): each document holds the primary key and the fields to change: a value replaces the field, `null` clears it, and vectors not sent are kept; a key without a live record fails the whole batch with `NOT_FOUND` (resource type `record`). By filter (`filter` and `patch`): the filter is resolved once against the latest state and `patch` is applied to every live record it matches, in one atomic batch; `applied_ops` is the number updated. The matching records must fit one WAL frame (64 MiB); a larger match fails with `TOO_LARGE` (413) and updates nothing."
       operationId: updateRecords
       security:
         - bearerAuth: []
@@ -609,7 +609,7 @@ paths:
   /v2/databases/{database}/collections/{collection}/records/delete:
     post:
       summary: Delete records
-      description: "Deletes records by primary key as one atomic batch. A key without a live record is a no-op."
+      description: "Deletes records as one atomic batch: by primary key (`keys`; a key without a live record is a no-op), or every live record `filter` matches, resolved once against the latest state; `applied_ops` is the number deleted. The matching keys must fit one WAL frame (64 MiB); a larger match fails with `TOO_LARGE` (413) and deletes nothing."
       operationId: deleteRecords
       security:
         - bearerAuth: []
@@ -704,10 +704,112 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/records/count:
+    post:
+      summary: Count records
+      description: "Counts the live records matching `filter` (every live record without one). With `pin`, the state counted is pinned and its `snapshot_token` returned, so a scroll or query can read exactly that state."
+      operationId: countRecords
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CountRecordsRequest"
+      responses:
+        "200":
+          description: The count and the state it read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionCount"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/records/scroll:
+    post:
+      summary: Scroll records
+      description: "Returns one page of the live records matching `filter`, in `order_by` order (primary key by default). A first page reads the current state, or the state `snapshot_token` pins; when records are left after it, the server pins that state and returns a `next_cursor` that carries the pin. Later pages send the same filter and order with the cursor and read exactly that state, so every matching record appears exactly once across the pages, whatever is written meanwhile. The last page has a null `next_cursor`. A cursor expires after the snapshot token TTL (5 minutes by default) without a page, and a page after that fails with `SNAPSHOT_EXPIRED` (409)."
+      operationId: scrollRecords
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScrollRecordsRequest"
+      responses:
+        "200":
+          description: One page of records and the cursor of the next
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionScrollPage"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v2/databases/{database}/collections/{collection}/query:
     post:
-      summary: Execute a planner-controlled vector query
-      description: "Searches the first vector field of the collection."
+      summary: Search or scan a collection
+      description: "Returns the `top_k` records nearest `vector.values` in the vector field `vector.field` that match `filter`, best first, or without a vector the first `top_k` matching records in `order_by` order (a filtered scan). `order_by` reorders the hits of a vector search. Hits are projected to `output_fields`. Filter errors name the offending node, such as `filter.and[1].range.price.gte`."
       operationId: queryCollection
       security:
         - bearerAuth: []
@@ -749,6 +851,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/Internal"
         "503":
@@ -1501,22 +1605,32 @@ components:
     UpdateRecordsRequest:
       type: object
       additionalProperties: false
-      required: [records]
+      description: "Either `records` (update by key), or `filter` and `patch` together (update by filter)."
       properties:
         records:
           type: array
           description: Partial documents; each holds the primary key and the fields to change. A value replaces a field and `null` clears it (or removes a dynamic key).
           items:
             $ref: "#/components/schemas/Record"
+        filter:
+          $ref: "#/components/schemas/Filter"
+        patch:
+          $ref: "#/components/schemas/RecordPatch"
+    RecordPatch:
+      type: object
+      description: "The fields to change on every record a filter matches, as in a partial document but without the primary key: a value replaces a field, `null` clears it (or removes a dynamic key), and a vector replaces the vector. Errors name `patch.<field>`."
+      additionalProperties: true
     DeleteRecordsRequest:
       type: object
       additionalProperties: false
-      required: [keys]
+      description: "Either `keys` (delete by key) or `filter` (delete every live record the filter matches)."
       properties:
         keys:
           type: array
           items:
             $ref: "#/components/schemas/PrimaryKey"
+        filter:
+          $ref: "#/components/schemas/Filter"
     GetRecordsRequest:
       type: object
       additionalProperties: false
@@ -1590,15 +1704,12 @@ components:
         - type: number
         - type: boolean
         - type: "null"
-    PredicateOperator:
-      type: string
-      enum: [eq, ne, lt, lte, gt, gte, exists, is_null]
     ExplainMode:
       type: string
       enum: [none, plan, profile]
     QueryPlanKind:
       type: string
-      description: "The plan a search used, summarized over its units: `unfiltered_exact_scan` and `predicate_first_exact` when every unit was scanned exactly (without and with a filter), `vector_first_ann` when segments walked their graphs, `cooperative_filtered_ann` when they walked them under a filter (ACORN-1 style or admit-only), and `hybrid_exact_ann_merge` when graph walks merged with memtable scans. `vector_first_exact` and `tiny_population_exact_fallback` are no longer produced."
+      description: "The plan a query used, summarized over its units: `unfiltered_exact_scan` and `predicate_first_exact` when every unit was scanned exactly (without and with a filter), `vector_first_ann` when segments walked their graphs, `cooperative_filtered_ann` when they walked them under a filter (ACORN-1 style or admit-only), `hybrid_exact_ann_merge` when graph walks merged with memtable scans, and `ordered_scan` for a query without a vector. `vector_first_exact` and `tiny_population_exact_fallback` are no longer produced."
       enum:
         - unfiltered_exact_scan
         - predicate_first_exact
@@ -1607,74 +1718,162 @@ components:
         - vector_first_ann
         - cooperative_filtered_ann
         - hybrid_exact_ann_merge
-    Predicate:
+        - ordered_scan
+    FieldPath:
+      type: string
+      description: "A declared field name (the primary key or a scalar field; vector fields cannot be filtered), `$extra.<key>` for the dynamic key `<key>`, or, with dynamic fields on, any other name for the dynamic key of that name. A dynamic key the schema declares or retired is hidden and cannot be filtered."
+    FilterOperand:
+      description: "A value typed like a record value of the field it compares (an array field's like one element): a string, number, or boolean, or an RFC 3339 string or microseconds for a timestamp. Numbers convert between int64 and float64 when exact; a fractional bound of an int64 or timestamp range rounds to the matching integer range. A dynamic key or `json` field compares with the JSON scalar. Never null."
       oneOf:
-        - $ref: "#/components/schemas/AndPredicate"
-        - $ref: "#/components/schemas/OrPredicate"
-        - $ref: "#/components/schemas/NotPredicate"
-        - $ref: "#/components/schemas/ComparisonPredicate"
-    AndPredicate:
+        - type: string
+        - type: number
+        - type: boolean
+    FieldOperand:
       type: object
-      required: [kind, children]
+      description: "One entry: the field path and its operand, such as `{\"tenant\": \"acme\"}`."
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties:
+        $ref: "#/components/schemas/FilterOperand"
+    FieldOperands:
+      type: object
+      description: "One entry: the field path and a non-empty array of operands, such as `{\"tags\": [\"a\", \"b\"]}`."
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties:
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/components/schemas/FilterOperand"
+    RangeBounds:
+      type: object
+      description: "At least one bound, and not both `gt` and `gte` (or `lt` and `lte`). Not for bool fields."
+      additionalProperties: false
+      minProperties: 1
       properties:
-        kind:
-          type: string
-          const: and
-        children:
+        gt:
+          $ref: "#/components/schemas/FilterOperand"
+        gte:
+          $ref: "#/components/schemas/FilterOperand"
+        lt:
+          $ref: "#/components/schemas/FilterOperand"
+        lte:
+          $ref: "#/components/schemas/FilterOperand"
+    Filter:
+      type: object
+      description: "A boolean filter over record fields (engine plan decision D11): an object with exactly one operator key. `eq` and `contains` hold when the field (an array field: some element) equals the operand, `in` and `contains_any` when it is one of the operands, `range` when it lies within every bound; `ne` and `not_in` hold when the field has a value and it is none of the operands, so null never matches them; `exists` holds when the field has a value (a dynamic key: is present), `is_null` when it has none (a dynamic key: is present and JSON null); `not` holds for every live record its child does not match, nulls included. `contains` and `contains_any` need an array field. Errors name the offending node by its path, such as `filter.and[1].range.price.gte`."
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties: false
+      properties:
+        and:
           type: array
+          minItems: 1
           items:
-            $ref: "#/components/schemas/Predicate"
-    OrPredicate:
-      type: object
-      required: [kind, children]
-      properties:
-        kind:
-          type: string
-          const: or
-        children:
+            $ref: "#/components/schemas/Filter"
+        or:
           type: array
+          minItems: 1
           items:
-            $ref: "#/components/schemas/Predicate"
-    NotPredicate:
+            $ref: "#/components/schemas/Filter"
+        not:
+          $ref: "#/components/schemas/Filter"
+        eq:
+          $ref: "#/components/schemas/FieldOperand"
+        ne:
+          $ref: "#/components/schemas/FieldOperand"
+        contains:
+          $ref: "#/components/schemas/FieldOperand"
+        in:
+          $ref: "#/components/schemas/FieldOperands"
+        not_in:
+          $ref: "#/components/schemas/FieldOperands"
+        contains_any:
+          $ref: "#/components/schemas/FieldOperands"
+        range:
+          type: object
+          description: "One entry: the field path and its bounds, such as `{\"price\": {\"gte\": 10, \"lt\": 50}}`."
+          minProperties: 1
+          maxProperties: 1
+          additionalProperties:
+            $ref: "#/components/schemas/RangeBounds"
+        exists:
+          $ref: "#/components/schemas/FieldPath"
+        is_null:
+          $ref: "#/components/schemas/FieldPath"
+    OrderBy:
       type: object
-      required: [kind, child]
+      description: Order by a declared scalar field that is not an array or json. Ties are broken by primary key ascending, and records without a value come last in both directions.
+      additionalProperties: false
+      required: [field]
       properties:
-        kind:
-          type: string
-          const: not
-        child:
-          $ref: "#/components/schemas/Predicate"
-    ComparisonPredicate:
-      type: object
-      required: [kind, field, operator]
-      properties:
-        kind:
-          type: string
-          const: comparison
         field:
           type: string
-        operator:
-          $ref: "#/components/schemas/PredicateOperator"
-        value:
-          $ref: "#/components/schemas/ScalarMetadataValue"
-    QueryCollectionRequest:
+        direction:
+          type: string
+          enum: [asc, desc]
+          default: asc
+    VectorQuery:
       type: object
-      required: [vector, top_k]
+      additionalProperties: false
+      required: [values]
       properties:
-        vector:
+        field:
+          description: The vector field to search; omitted searches the collection's only vector field, and is `INVALID_ARGUMENT` for a collection with several.
+          oneOf:
+            - type: "null"
+            - type: string
+        values:
           type: array
+          description: The query vector, of the field's dimensions, with finite components.
           items:
             type: number
+    QueryCollectionRequest:
+      type: object
+      additionalProperties: false
+      description: "One search (engine plan decision D11): the `top_k` records nearest `vector` that match `filter`, or without a vector the first `top_k` records matching `filter` in `order_by` order (a filtered scan; `records/scroll` pages through the rest). At most one of `snapshot` and `snapshot_token`, and at most one of `snapshot` and `read_barrier`."
+      required: [top_k]
+      properties:
+        vector:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/VectorQuery"
+        filter:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Filter"
+        order_by:
+          type: array
+          maxItems: 1
+          description: With a vector it reorders the `top_k` hits; without one it is the scan order (primary key ascending when empty).
+          items:
+            $ref: "#/components/schemas/OrderBy"
         top_k:
           type: integer
           minimum: 1
+          maximum: 10000
+        output_fields:
+          type: array
+          default: []
+          description: "Fields each hit returns, as `records/get` projects them; empty returns every field, vectors included. Name only the primary key to return keys and scores alone."
+          items:
+            type: string
+        ef:
+          description: Beam width of graph walks, 1 to 4,096, with a vector only. Defaults to 64, and at least four candidates per result.
+          oneOf:
+            - type: "null"
+            - type: integer
+              minimum: 1
+              maximum: 4096
+        explain:
+          $ref: "#/components/schemas/ExplainMode"
         snapshot:
           description: Read exactly this state. It must be the current state, one of the latest states of the current manifest generation, or a state a snapshot token pins; any other fails with `SNAPSHOT_EXPIRED`. Repeatable reads pin a token instead.
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/Snapshot"
         snapshot_token:
-          description: Read exactly the state this snapshot token pins, and extend the token's expiry. An expired, released, or unknown token fails with `SNAPSHOT_EXPIRED` (409); a malformed one is `INVALID_ARGUMENT`. Cannot be combined with `snapshot`.
+          description: Read exactly the state this snapshot token pins, and extend the token's expiry. An expired, released, or unknown token fails with `SNAPSHOT_EXPIRED` (409); a malformed one is `INVALID_ARGUMENT`.
           oneOf:
             - type: "null"
             - type: string
@@ -1683,33 +1882,19 @@ components:
           default: false
           description: Pin the state the query reads under a snapshot token, returned as `snapshot_token`, for repeatable reads. Fails with `TOO_MANY_SNAPSHOTS` (429) past the pin limits.
         read_barrier:
-          description: Lower-bound snapshot that the server must already satisfy or reject. Cannot be combined with `snapshot`.
+          description: Fail with `READ_BARRIER_NOT_SATISFIED` unless the state read is at or past this snapshot.
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/Snapshot"
-        filters:
-          type: object
-          description: Legacy top-level AND-only equality filters over scalar metadata values.
-          additionalProperties:
-            $ref: "#/components/schemas/ScalarMetadataValue"
-        predicate:
-          oneOf:
-            - type: "null"
-            - $ref: "#/components/schemas/Predicate"
-        explain:
-          $ref: "#/components/schemas/ExplainMode"
-    QueryMatch:
+    QueryHit:
       type: object
-      required: [id, value, metadata]
+      required: [record]
       properties:
-        id:
-          type: string
-          description: The primary key as text.
-        value:
+        score:
           type: number
-        metadata:
-          type: object
-          description: The record's scalar fields and visible `$extra` keys, as JSON.
+          description: "The metric value of a vector search: similarity for cosine and dot (higher is better), Euclidean distance for l2 (lower is better). Absent for a scan."
+        record:
+          $ref: "#/components/schemas/Record"
     QueryStageTimings:
       type: object
       required:
@@ -1784,8 +1969,11 @@ components:
             - $ref: "#/components/schemas/QueryStageTimings"
     QueryResponse:
       type: object
-      required: [metric, top_k, returned, snapshot, matches]
+      required: [top_k, returned, snapshot, hits]
       properties:
+        vector_field:
+          type: string
+          description: The vector field searched; absent for a scan.
         metric:
           $ref: "#/components/schemas/DistanceMetric"
         top_k:
@@ -1794,14 +1982,13 @@ components:
           type: integer
         snapshot:
           $ref: "#/components/schemas/Snapshot"
-        matches:
+        hits:
           type: array
+          description: Best first (a scan, in order).
           items:
-            $ref: "#/components/schemas/QueryMatch"
+            $ref: "#/components/schemas/QueryHit"
         diagnostics:
-          oneOf:
-            - type: "null"
-            - $ref: "#/components/schemas/QueryDiagnostics"
+          $ref: "#/components/schemas/QueryDiagnostics"
         snapshot_token:
           description: The token pinning the state read, present when the request pinned or named a token.
           type: string
@@ -1817,6 +2004,101 @@ components:
       allOf:
         - $ref: "#/components/schemas/CollectionContext"
         - $ref: "#/components/schemas/QueryResponse"
+    CountRecordsRequest:
+      type: object
+      additionalProperties: false
+      description: At most one of `snapshot` and `snapshot_token`, and at most one of `snapshot` and `read_barrier`.
+      properties:
+        filter:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Filter"
+        snapshot:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Snapshot"
+        read_barrier:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Snapshot"
+        snapshot_token:
+          oneOf:
+            - type: "null"
+            - type: string
+        pin:
+          type: boolean
+          default: false
+          description: Pin the state counted under a snapshot token, returned as `snapshot_token`, so a scroll or query can read exactly that state.
+    CountRecordsResponse:
+      type: object
+      required: [count, snapshot]
+      properties:
+        count:
+          type: integer
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+        snapshot_token:
+          type: string
+    CollectionCount:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/CountRecordsResponse"
+    ScrollRecordsRequest:
+      type: object
+      additionalProperties: false
+      description: "One page. A later page sends the same `filter` and `order_by` with the previous page's `next_cursor` (`INVALID_ARGUMENT` otherwise), and no `snapshot_token`."
+      properties:
+        filter:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Filter"
+        order_by:
+          type: array
+          maxItems: 1
+          description: Primary key ascending when empty.
+          items:
+            $ref: "#/components/schemas/OrderBy"
+        page_size:
+          description: Records per page, 1 to 10,000; 100 when omitted.
+          oneOf:
+            - type: "null"
+            - type: integer
+              minimum: 1
+              maximum: 10000
+        output_fields:
+          type: array
+          default: []
+          items:
+            type: string
+        cursor:
+          description: Continue after the page that returned this cursor. An expired cursor fails with `SNAPSHOT_EXPIRED` (409); restart the scroll.
+          oneOf:
+            - type: "null"
+            - type: string
+        snapshot_token:
+          description: A first page reads the state this token pins, from a pinned count or query.
+          oneOf:
+            - type: "null"
+            - type: string
+    ScrollRecordsResponse:
+      type: object
+      required: [records, next_cursor, snapshot]
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/Record"
+        next_cursor:
+          description: The cursor of the next page; null after the last page.
+          oneOf:
+            - type: "null"
+            - type: string
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+    CollectionScrollPage:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/ScrollRecordsResponse"
     MaintenanceStatus:
       type: object
       description: Runtime maintenance state of a collection since the node opened it; nothing of it is persisted.

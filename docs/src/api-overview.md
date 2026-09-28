@@ -62,7 +62,7 @@ collection-scoped route names its collection below it:
 /v2/databases/{database}/policy
 /v2/databases/{database}/collections
 /v2/databases/{database}/collections/{collection}
-/v2/databases/{database}/collections/{collection}/records/{upsert,update,delete,get}
+/v2/databases/{database}/collections/{collection}/records/{upsert,update,delete,get,count,scroll}
 /v2/databases/{database}/collections/{collection}/{placement,query,stats,flush,compact,inspect}
 ```
 
@@ -246,16 +246,18 @@ pins. Every flush and compaction publishes a new generation; after that, a read
 of an unpinned snapshot from an older generation fails with
 `FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`, HTTP 409).
 
-For repeatable reads, pin the state: a query with `"pin": true` returns a
-`snapshot_token` (an opaque 48-character string), and later queries that pass
-it as `snapshot_token` read exactly that state, whatever was written, flushed,
-or compacted since. Each use extends the token's expiry (five minutes by
-default); an expired, released, or unknown token fails with
-`SNAPSHOT_EXPIRED`. Tokens do not survive a restart. Pinning more snapshots
-than a collection allows, or more retired memory than the engine allows, fails
-with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`, HTTP 429).
+For repeatable reads, pin the state: a query or count with `"pin": true`
+returns a `snapshot_token` (an opaque 48-character string), and later queries,
+counts, and first scroll pages that pass it as `snapshot_token` read exactly
+that state, whatever was written, flushed, or compacted since. Each use extends
+the token's expiry (`snapshots.token_ttl_ms`, five minutes by default); an
+expired, released, or unknown token fails with `SNAPSHOT_EXPIRED`. Tokens do
+not survive a restart. Pinning more snapshots than a collection allows
+(`snapshots.max_tokens_per_collection`, 64 by default), or more retired memory
+than the engine allows, fails with `RESOURCE_EXHAUSTED` (reason
+`TOO_MANY_SNAPSHOTS`, HTTP 429). A scroll cursor carries a token of its own.
 
-A query that names no snapshot reads one consistent state from its first stage
+A read that names no snapshot reads one consistent state from its first stage
 to its last: a flush or compaction that publishes while it runs never fails it.
 
 Collection-scoped record, query, flush, compact, and inspect responses flatten
@@ -589,12 +591,18 @@ as JSON and returned at the top level on reads. In gRPC a `Record` holds `pk`,
 `vectors` (a map of `Vector`), `fields` (a map of typed `Value`), and `extra`
 (a `JsonObject`).
 
-| Operation          | REST (`POST .../collections/{collection}` +) | gRPC            | Body                                      |
-|--------------------|----------------------------------------------|-----------------|-------------------------------------------|
-| Insert or replace  | `/records/upsert`                            | `UpsertRecords` | `{"records": [...]}`                      |
-| Change some fields | `/records/update`                            | `UpdateRecords` | `{"records": [...]}` (partial)            |
-| Delete by key      | `/records/delete`                            | `DeleteRecords` | `{"keys": [...]}`                         |
-| Read by key        | `/records/get`                               | `GetRecords`    | `{"keys": [...], "output_fields": [...]}` |
+<!-- markdownlint-disable MD060 -->
+| Operation            | REST (`POST .../collections/{collection}` +) | gRPC            | Body                                      |
+|----------------------|----------------------------------------------|-----------------|-------------------------------------------|
+| Insert or replace    | `/records/upsert`                            | `UpsertRecords` | `{"records": [...]}`                      |
+| Change some fields   | `/records/update`                            | `UpdateRecords` | `{"records": [...]}` (partial)            |
+| Change by filter     | `/records/update`                            | `UpdateRecords` | `{"filter": {...}, "patch": {...}}`       |
+| Delete by key        | `/records/delete`                            | `DeleteRecords` | `{"keys": [...]}`                         |
+| Delete by filter     | `/records/delete`                            | `DeleteRecords` | `{"filter": {...}}`                       |
+| Read by key          | `/records/get`                               | `GetRecords`    | `{"keys": [...], "output_fields": [...]}` |
+| Count matches        | `/records/count`                             | `CountRecords`  | `{"filter": {...}}`                       |
+| Page through matches | `/records/scroll`                            | `ScrollRecords` | `{"filter": {...}, "cursor": "..."}`      |
+<!-- markdownlint-enable MD060 -->
 
 Each write request is one batch that is validated in full and commits
 atomically: one invalid record rejects the whole batch, and a key may appear
@@ -660,6 +668,171 @@ or `keys[0]` for a key of the wrong type. A vector of the wrong length is
 | `413`  | Request body too large                                                                        |
 | `503`  | Not the owner (`NOT_OWNER`), or writes stalled behind maintenance (`WRITE_STALLED`)           |
 
+### Filters
+
+Queries, counts, scrolls, and deletes and updates by filter take one filter
+language (engine plan decision D11). In REST a filter is natural JSON: an
+object with exactly one operator key.
+
+```json
+{ "and": [
+  { "eq": { "tenant": "acme" } },
+  { "range": { "price": { "gte": 10, "lt": 50 } } },
+  { "contains": { "tags": "outdoor" } },
+  { "not": { "exists": "$extra.archived" } }
+] }
+```
+
+<!-- markdownlint-disable MD060 -->
+| Operator       | Form                                  | Matches a record when                                                 |
+|----------------|---------------------------------------|-----------------------------------------------------------------------|
+| `and`, `or`    | `{"and": [filter, ...]}`              | every (some) child matches; at least one child                        |
+| `not`          | `{"not": filter}`                     | the child does not match, records where its field is null included    |
+| `eq`           | `{"eq": {field: value}}`              | the field equals the value (an array field: some element does)        |
+| `ne`           | `{"ne": {field: value}}`              | the field has a value and it is not the value (no element is)         |
+| `range`        | `{"range": {field: {"gte": 1, ...}}}` | the field (some element) lies within every bound: `gt`, `gte`, `lt`, `lte` |
+| `in`           | `{"in": {field: [value, ...]}}`       | the field (some element) is one of the values                         |
+| `not_in`       | `{"not_in": {field: [value, ...]}}`   | the field has a value and it (every element) is none of the values    |
+| `contains`     | `{"contains": {field: value}}`        | an array field has an element equal to the value                      |
+| `contains_any` | `{"contains_any": {field: [...]}}`    | an array field has an element equal to one of the values              |
+| `exists`       | `{"exists": field}`                   | the field has a value; a dynamic key is present                       |
+| `is_null`      | `{"is_null": field}`                  | the field has no value; a dynamic key is present and JSON `null`     |
+<!-- markdownlint-enable MD060 -->
+
+A field is named by a path, resolved with the schema of the state the request
+reads:
+
+- a declared name: the primary key or a scalar field (vector fields cannot be
+  filtered);
+- `$extra.<key>`: the dynamic key `<key>`, everything after the first dot;
+- with dynamic fields on, any other name: the dynamic key of that name.
+
+A dynamic key the schema declares or retired is hidden, so filtering it is an
+error, as is an undeclared name when dynamic fields are off and a dropped or
+renamed field's old name. Nested JSON paths are not supported: a dynamic key
+or `json` field compares as a whole.
+
+Values are typed like record values of the field they compare, and an array
+field's like one element: a string for a `string` field, an RFC 3339 string or
+integer microseconds for a `timestamp`, and so on. Numbers convert between
+`int64` and `float64` when exact, and a fractional bound of an `int64` or
+`timestamp` range rounds to the matching integer range (`{"lt": 3.5}` is
+`{"lte": 3}`). A dynamic key or `json` field compares by JSON scalar equality,
+and its range bounds compare two strings or two numbers. A value is never
+`null`: use `exists` and `is_null`. `range` needs an ordered field (not
+`bool`), and not both `gt` and `gte` (or `lt` and `lte`); `contains` and
+`contains_any` need an array field.
+
+In gRPC a filter is the `Filter` message, a `oneof` with the same operators:
+`FilterList` for `and` and `or`, `FieldValue` (`field` and a typed `Value`) for
+`eq`, `ne`, and `contains`, `FieldValues` for `in`, `not_in`, and
+`contains_any`, `FieldRange` for `range`, and the field path string for
+`exists` and `is_null`.
+
+Filter errors are `INVALID_ARGUMENT` naming the offending node by its path in
+the REST form, the same in both transports: `filter.and[1].range.price.gte`,
+`filter.in.tags[2]`, `filter.not.exists`, or `filter.eq.colour` for a field
+the schema does not have.
+
+Declared fields are served by their scalar indexes (inverted for equality and
+`exists`, sorted for ranges) and zone maps prune segments; dynamic keys and
+`json` fields are scanned.
+
+### Delete and Update by Filter
+
+`POST .../records/delete` with `{"filter": {...}}` deletes every live record
+the filter matches, and `POST .../records/update` with
+`{"filter": {...}, "patch": {...}}` applies the patch to each of them. A patch
+is a partial document without the primary key: a value replaces a field,
+`null` clears it (or removes a dynamic key), and a vector replaces the vector.
+Patch errors name `patch.<field>`.
+
+The filter is resolved once, against the latest state (every earlier write
+included), to a fixed set of keys that commits as one atomic batch in one WAL
+frame: all of the matches change or none do, and the reply's `applied_ops` is
+the number changed. A filter that matches nothing commits nothing and returns
+`applied_ops: 0`. The keys (and, for an update, the rewritten records) must
+fit one WAL frame of 64 MiB, a few million keys; a larger match fails with
+`RESOURCE_EXHAUSTED` (reason `TOO_LARGE`, HTTP 413) and changes nothing.
+Narrow the filter, for example by a range of keys, and repeat. The server does
+not split a large match into several batches, because a failure between them
+would leave it half applied.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v2/databases/analytics/collections/products/records/delete \
+  -H "Content-Type: application/json" \
+  -d '{ "filter": { "and": [ { "eq": { "tenant": "acme" } }, { "range": { "price": { "lt": 1 } } } ] } }'
+```
+
+### Count Records
+
+`POST .../records/count` (gRPC `CountRecords`) counts the live records
+matching `filter`, or every live record without one. It takes the snapshot
+fields of a query (`snapshot`, `read_barrier`, `snapshot_token`, `pin`).
+
+```json
+{ "filter": { "eq": { "tenant": "acme" } }, "pin": true }
+```
+
+```json
+{
+  "database_name": "analytics",
+  "collection_name": "products",
+  "count": 1284,
+  "snapshot": { "manifest_generation": 3, "visible_seq_no": 5120 },
+  "snapshot_token": "AbC..."
+}
+```
+
+A count with `pin` returns the token of the state it counted; scrolling that
+token returns exactly `count` records.
+
+### Scroll Records
+
+`POST .../records/scroll` (gRPC `ScrollRecords`) returns one page of the live
+records matching `filter`, in `order_by` order:
+
+| Field            | Type     | Description                                                             |
+|------------------|----------|-------------------------------------------------------------------------|
+| `filter`         | object   | Only matching records                                                   |
+| `order_by`       | array    | At most one `{"field": "price", "direction": "desc"}`; key by default   |
+| `page_size`      | integer  | Records per page, 1 to 10,000; 100 by default                           |
+| `output_fields`  | string[] | Fields to return, as `records/get` projects them                        |
+| `cursor`         | string   | Continue after the page that returned it                                |
+| `snapshot_token` | string   | A first page reads the state this token pins                            |
+
+```json
+{
+  "database_name": "analytics",
+  "collection_name": "products",
+  "records": [{ "sku": 7, "price": 24.5 }],
+  "next_cursor": "AQ...",
+  "snapshot": { "manifest_generation": 3, "visible_seq_no": 5120 }
+}
+```
+
+A first page reads the current state, or the state `snapshot_token` pins. When
+records are left after it, the server pins the state it read and returns a
+`next_cursor` that carries the pin; send the same request with that cursor for
+the next page. Every page reads exactly that state, so every record matching
+the filter appears exactly once across the pages, whatever is written,
+flushed, or compacted meanwhile, and `snapshot` is the same on every page. The
+last page has `next_cursor: null`, and a scroll that fits in one page pins
+nothing.
+
+- A cursor is opaque. It must be sent with the same `filter` and `order_by` as
+  the first page, and without `snapshot_token`; anything else is
+  `INVALID_ARGUMENT` at `cursor` (or `snapshot_token`), as is a cursor that is
+  not one.
+- Its pin expires `snapshots.token_ttl_ms` (five minutes by default) after the
+  last page. A page after that fails with `FAILED_PRECONDITION` (reason
+  `SNAPSHOT_EXPIRED`, HTTP 409): start the scroll again.
+- Ordering by a field puts records without a value last in both directions and
+  breaks ties by primary key.
+- Each open scroll holds one of the collection's snapshot pins, so a client
+  that abandons many scrolls can exhaust them until they expire
+  (`TOO_MANY_SNAPSHOTS`).
+
 ### Bulk Upsert (gRPC only)
 
 `BulkUpsertRecords` is a client-streaming RPC for bulk ingest. REST has no
@@ -694,18 +867,24 @@ rpc BulkUpsertRecords(stream BulkUpsertRecordsRequest) returns (BulkUpsertRecord
 
 ### Query Collection
 
-Executes a planner-controlled vector query with optional filtering and
-explain diagnostics. The query searches the collection's first vector field,
-and filters see scalar fields and visible `$extra` keys by name. The query
-request and reply are the current search surface; a later phase redesigns them
-around typed values and named vector fields.
+One search request (engine plan decision D11) covers vector search, filters,
+an order, a limit, and a projection. With a vector it returns the `top_k`
+records nearest the query vector in the named vector field that match the
+filter, best first; without one it returns the first `top_k` matching records
+in `order_by` order, a filtered scan (use [Scroll Records](#scroll-records) to
+page through all of them).
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v2/databases/default/collections/embeddings/query \
+curl -X POST http://127.0.0.1:8080/v2/databases/analytics/collections/products/query \
   -H "Content-Type: application/json" \
   -d '{
-    "vector": [0.12, 0.45, 0.78],
+    "vector": { "field": "embedding", "values": [0.12, 0.45, 0.78] },
+    "filter": { "and": [
+      { "eq": { "tenant": "acme" } },
+      { "range": { "price": { "gte": 10, "lt": 50 } } }
+    ] },
     "top_k": 5,
+    "output_fields": ["sku", "price"],
     "explain": "profile"
   }'
 ```
@@ -713,32 +892,41 @@ curl -X POST http://127.0.0.1:8080/v2/databases/default/collections/embeddings/q
 **Request body**:
 
 <!-- markdownlint-disable MD060 -->
-| Field            | Type    | Required | Description                                                                                                 |
-|------------------|---------|----------|-------------------------------------------------------------------------------------------------------------|
-| `vector`         | float[] | yes      | Query vector                                                                                                |
-| `top_k`          | integer | yes      | Maximum results to return (>= 1)                                                                            |
-| `snapshot`       | object  | no       | Read one exact snapshot; see snapshot retention above                                                       |
-| `snapshot_token` | string  | no       | Read exactly the state this token pins; cannot be combined with `snapshot`                                 |
-| `pin`            | boolean | no       | Pin the state read and return its `snapshot_token`                                                          |
-| `read_barrier`   | object  | no       | Require a lower-bound previously observed snapshot on the current owner; cannot be combined with `snapshot` |
-| `filters`        | object  | no       | Legacy AND-only equality filters over scalar metadata                                                       |
-| `predicate`      | object  | no       | Structured predicate tree (see below)                                                                       |
-| `explain`        | string  | no       | `"none"`, `"plan"`, or `"profile"`                                                                          |
+| Field            | Type     | Required | Description                                                                                                        |
+|------------------|----------|----------|--------------------------------------------------------------------------------------------------------------------|
+| `vector`         | object   | no       | `{"field": ..., "values": [...]}`; `field` may be omitted when the collection has one vector field                 |
+| `filter`         | object   | no       | A [filter](#filters)                                                                                               |
+| `order_by`       | array    | no       | At most one `{"field": ..., "direction": "asc" or "desc"}`: reorders the vector hits, or orders the scan (key by default) |
+| `top_k`          | integer  | yes      | Results to return, 1 to 10,000                                                                                     |
+| `output_fields`  | string[] | no       | Fields each hit returns, as `records/get` projects them; empty returns every field, vectors included              |
+| `ef`             | integer  | no       | Beam width of graph walks, 1 to 4,096 (default 64, and at least four candidates per result); vector search only    |
+| `explain`        | string   | no       | `"none"`, `"plan"`, or `"profile"`                                                                                 |
+| `snapshot`       | object   | no       | Read one exact snapshot; see snapshot retention above                                                              |
+| `snapshot_token` | string   | no       | Read exactly the state this token pins; cannot be combined with `snapshot`                                        |
+| `pin`            | boolean  | no       | Pin the state read and return its `snapshot_token`                                                                 |
+| `read_barrier`   | object   | no       | Fail unless the state read is at or past this snapshot; cannot be combined with `snapshot`                         |
 <!-- markdownlint-enable MD060 -->
+
+Name only the primary key in `output_fields` to get keys and scores alone;
+the default returns whole records. A collection with several vector fields
+needs `vector.field`. Validation errors name the request field: `top_k`,
+`vector.field`, `vector.values` (`DIMENSION_MISMATCH` for the wrong length),
+`order_by[0].field`, `ef`, `output_fields[2]`, or the filter node.
 
 **Response** (`200`):
 
 ```json
 {
-  "database_name": "default",
-  "collection_name": "embeddings",
+  "database_name": "analytics",
+  "collection_name": "products",
+  "vector_field": "embedding",
   "metric": "cosine",
   "top_k": 5,
   "returned": 2,
   "snapshot": { "manifest_generation": 4, "visible_seq_no": 1023 },
-  "matches": [
-    { "id": "doc-001", "value": 0.98, "metadata": { "source": "arxiv", "year": 2025 } },
-    { "id": "doc-002", "value": 0.87, "metadata": { "source": "wiki", "year": 2024 } }
+  "hits": [
+    { "score": 0.98, "record": { "sku": 7, "price": 24.5 } },
+    { "score": 0.87, "record": { "sku": 12, "price": 31.0 } }
   ],
   "diagnostics": {
     "chosen_plan": "hybrid_exact_ann_merge",
@@ -772,7 +960,9 @@ curl -X POST http://127.0.0.1:8080/v2/databases/default/collections/embeddings/q
 | `400`  | Invalid request                                                                                                                                               |
 | `404`  | Collection not found                                                                                                                                          |
 | `409`  | Wrong node role, read barrier not visible (`READ_BARRIER_NOT_SATISFIED`), or read barriers rejected after ownership promotion until freshness metadata exists |
+| `409`  | Expired snapshot or token (`SNAPSHOT_EXPIRED`)                                                                                                                |
 | `413`  | Request body too large                                                                                                                                        |
+| `429`  | Too many pinned snapshots (`TOO_MANY_SNAPSHOTS`)                                                                                                              |
 | `503`  | Not the owner (`NOT_OWNER`)                                                                                                                                   |
 <!-- markdownlint-enable MD060 -->
 
@@ -782,35 +972,10 @@ gRPC equivalent:
 rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
 ```
 
-#### Structured Predicates
-
-The `predicate` field accepts a tree of boolean and comparison nodes for
-rich metadata filtering beyond the legacy equality-only `filters` map.
-
-**Comparison predicate**:
-
-```json
-{
-  "kind": "comparison",
-  "field": "year",
-  "operator": "gte",
-  "value": 2024
-}
-```
-
-Available operators: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `exists`, `is_null`.
-
-**Boolean combinators** (`and`, `or`, `not`):
-
-```json
-{
-  "kind": "and",
-  "children": [
-    { "kind": "comparison", "field": "source", "operator": "eq", "value": "arxiv" },
-    { "kind": "not", "child": { "kind": "comparison", "field": "year", "operator": "lt", "value": 2023 } }
-  ]
-}
-```
+The gRPC request holds the same fields: `VectorQuery vector`, `Filter filter`,
+`repeated OrderBy order_by`, `top_k`, `output_fields`, `ef` (0 for the
+default), and the snapshot fields. Each `QueryHit` holds the projected
+`Record` and an optional `score`, and `metric` is unspecified for a scan.
 
 #### Query Plan Kinds
 
@@ -834,14 +999,14 @@ merged into one top-k. `unit_scan_mix` counts units per strategy
 | `vector_first_ann`                 | Segment graph walks, no filter, no memtable rows        |
 | `cooperative_filtered_ann`         | Filtered segment graph walks (ACORN-1 or admit-only)    |
 | `hybrid_exact_ann_merge`           | Segment graph walks merged with memtable scans          |
+| `ordered_scan`                     | No vector: rows read in `order_by` order                |
 | `vector_first_exact`               | No longer produced                                      |
 | `tiny_population_exact_fallback`   | No longer produced                                      |
 
-Filter semantics: a declared field compares by its type (integers and
-timestamps as integers, floats as floats, strings bytewise, arrays by
-element); `ne` matches only rows that have a value, while `not` also matches
-rows where the field is null. Undeclared names filter `$extra` keys with JSON
-semantics, as before.
+With a vector, `order_by` sorts the `top_k` hits the search found; it does not
+search for the best records by that field. The diagnostics of a scan report
+only `ordered_scan`, the units considered, and (with `profile`) the scan's
+time.
 
 ### Collection Stats
 
@@ -1002,6 +1167,10 @@ gRPC equivalent:
 rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
 ```
 
+In gRPC the payload is a `JsonValue` document. Its shape depends on the
+target and is an operator diagnostic, not a stable contract, so it has no
+typed message.
+
 ## gRPC Service Definition
 
 The full gRPC contract is defined in `proto/logpose/v2/logpose.proto`:
@@ -1029,6 +1198,8 @@ service LogPoseService {
   rpc UpdateRecords(UpdateRecordsRequest) returns (CommitAckReply);
   rpc DeleteRecords(DeleteRecordsRequest) returns (CommitAckReply);
   rpc GetRecords(GetRecordsRequest) returns (GetRecordsReply);
+  rpc CountRecords(CountRecordsRequest) returns (CountRecordsReply);
+  rpc ScrollRecords(ScrollRecordsRequest) returns (ScrollRecordsReply);
   rpc BulkUpsertRecords(stream BulkUpsertRecordsRequest) returns (BulkUpsertRecordsReply);
 
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
@@ -1042,8 +1213,10 @@ service LogPoseService {
 Scalar values travel as the `Value` message: a `oneof` of `null_value`,
 `bool_value`, `int64_value`, `float64_value`, `string_value`,
 `timestamp_micros`, `array_value`, and `json_value`. JSON documents (`json`
-fields and `$extra`) travel as `JsonValue`, `JsonArray`, and `JsonObject`,
-which keep 64-bit integers exact. The schema is the `CollectionSchema` message,
+fields and `$extra`, statistics bounds, and inspect payloads) travel as
+`JsonValue`, `JsonArray`, and `JsonObject`, which keep 64-bit integers exact;
+no message carries JSON text. Filters are the `Filter` message (see
+[Filters](#filters)). The schema is the `CollectionSchema` message,
 and a schema change is `AlterCollectionRequest` with one of `add_field`,
 `drop_field`, or `rename_field`.
 
@@ -1079,7 +1252,8 @@ The public APIs do not yet provide:
 
 - multiple named consistency levels beyond exact snapshots and lower-bound read barriers, including read-barrier continuity across ownership promotion
 - multi-node data-plane failover orchestration and chaos-tested recovery workflows
-- delete by filter, record counts, or scroll-style record browsing
-- typed query filters and search over a named vector field
+- deletes and updates by filter larger than one WAL frame (64 MiB of keys and records); such a request fails with `TOO_LARGE`
+- nested JSON paths, prefix matching, or full-text matching in filters
+- searches over several vector fields at once, or paging through vector search results
 - browser-ready authentication or RBAC enforcement
 - remote blob-storage configuration for collection creation

@@ -557,12 +557,12 @@ fn data_commands_run_against_the_server_over_grpc() {
     let query_body: Value =
         serde_json::from_str(&query_stdout).expect("query output should be valid json");
     let query_response = query_response_body(&query_body);
-    let matches = query_response["matches"]
+    let matches = query_response["hits"]
         .as_array()
-        .expect("matches should be an array");
+        .expect("hits should be an array");
     assert_eq!(matches.len(), 2);
-    assert_eq!(matches[0]["id"], "alpha");
-    assert_eq!(matches[1]["id"], "gamma");
+    assert_eq!(matches[0]["record"]["id"], "alpha");
+    assert_eq!(matches[1]["record"]["id"], "gamma");
 
     let profiled_query = fixture.run_cli_json(&[
         "query",
@@ -581,7 +581,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
     let profiled_query_response = query_response_body(&profiled_query_body);
-    assert_eq!(profiled_query_response["matches"][0]["id"], "alpha");
+    assert_eq!(profiled_query_response["hits"][0]["record"]["id"], "alpha");
     assert!(profiled_query_response["diagnostics"].is_object());
     assert!(profiled_query_response["diagnostics"]["stage_timings"].is_object());
     assert_eq!(
@@ -775,7 +775,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     let ann_profiled_query_body: Value = serde_json::from_str(&ann_profiled_query_stdout)
         .expect("query output should be valid json");
     let ann_query_response = query_response_body(&ann_profiled_query_body);
-    assert_eq!(ann_query_response["matches"][0]["id"], "alpha");
+    assert_eq!(ann_query_response["hits"][0]["record"]["id"], "alpha");
     assert_eq!(
         ann_query_response["diagnostics"]["chosen_plan"],
         "predicate_first_exact"
@@ -880,8 +880,8 @@ fn query_and_stats_support_read_barrier_flags_against_server() {
         serde_json::from_str(&query_stdout).expect("query output should be valid json");
     let query_response = query_response_body(&query_body);
     assert_eq!(query_response["snapshot"]["visible_seq_no"], 2);
-    assert_eq!(query_response["matches"][0]["id"], "alpha");
-    assert_eq!(query_response["matches"][1]["id"], "beta");
+    assert_eq!(query_response["hits"][0]["record"]["id"], "alpha");
+    assert_eq!(query_response["hits"][1]["record"]["id"], "beta");
 
     let stats = fixture.run_cli_json(&[
         "collection",
@@ -950,8 +950,8 @@ fn profiled_query_surfaces_filtered_scan_diagnostics() {
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
     let profiled_query_response = query_response_body(&profiled_query_body);
-    assert_eq!(profiled_query_response["matches"][0]["id"], "doc-8");
-    assert_eq!(profiled_query_response["matches"][1]["id"], "doc-4");
+    assert_eq!(profiled_query_response["hits"][0]["record"]["id"], "doc-8");
+    assert_eq!(profiled_query_response["hits"][1]["record"]["id"], "doc-4");
     // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
     // three rows the filter matches.
     assert_eq!(

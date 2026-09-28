@@ -2304,7 +2304,7 @@ mod tests {
             .expect_err("zero top_k should error");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("top_k must be greater than 0"));
+        assert!(error.message().contains("top_k must be 1 to"));
     }
 
     #[tokio::test]
