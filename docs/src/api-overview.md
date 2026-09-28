@@ -162,9 +162,11 @@ opt-in policies change that:
   `COLLECTION_POISONED` and `READ_BARRIER_NOT_SATISFIED`), or any error without
   a hint. It waits the larger of the hint and its own exponential backoff, and
   returns the error instead when the hint is longer than `max_backoff`. Reads
-  are retried; writes only with `retry_writes`. Upserts and deletes by id and
-  the database and policy puts are idempotent; a repeated collection create can
-  report `RESOURCE_ALREADY_EXISTS`. Bulk streams (`BulkWriteCollection`) are
+  are retried; writes only with `retry_writes`. A lost reply carries no hint
+  and is never retried, but an etcd failure during a database, policy, or
+  collection create is hinted and may have committed. Upserts and deletes by id
+  and the database and policy puts are idempotent; a repeated collection create
+  can report `RESOURCE_ALREADY_EXISTS`. Bulk streams (`BulkWriteCollection`) are
   never retried automatically; resume from `failed_batch_index`.
 - `RedirectPolicy` follows `NOT_OWNER` to `owner_node` and `NOT_LEADER` to
   `leader_node` immediately, through a `NodeResolver` that maps node ids to
@@ -172,7 +174,9 @@ opt-in policies change that:
   errors refuse the request before applying it, so redirects apply to writes
   too. Without a resolver, or when it does not know the node, the typed error is
   returned (or retried after its hint by a `RetryPolicy`). Each request starts
-  at the configured endpoint again.
+  at the configured endpoint again. The server names only a node id; the
+  endpoint, and so where the client sends its bearer token, comes from the
+  resolver, so it should map only known node ids.
 
 The CLI prints a typed error with its reason and message, followed by its code,
 field violations, metadata, and where or when to retry:
@@ -187,10 +191,10 @@ field violations, metadata, and where or when to retry:
 
 ## Request Size Limits
 
-| Setting                         | Default | Over the limit                                                |
-| `limits.max_rest_body_bytes`    | 16 MiB  | HTTP `413`, `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`          |
-| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                 |
-| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                  |
+| Setting                         | Default | Over the limit                                       |
+|---------------------------------|---------|------------------------------------------------------|
+| `limits.max_rest_body_bytes`    | 16 MiB  | HTTP `413`, `RESOURCE_EXHAUSTED`, reason `TOO_LARGE` |
+| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`        |
 
 The gRPC limit applies to each request message, so each batch of a
 `BulkWriteCollection` stream is checked on its own. See
