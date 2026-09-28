@@ -143,7 +143,23 @@ pub async fn serve_with_listener(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
 ) -> Result<(), std::io::Error> {
-    axum::serve(listener, router(state)).await
+    axum::serve(nodelay(listener), router(state)).await
+}
+
+/// The listener, setting `TCP_NODELAY` on every accepted connection.
+///
+/// `axum::serve` leaves Nagle's algorithm on. It then holds the last small segment of a
+/// reply until the client acknowledges the previous one, and a client that delays its
+/// acknowledgements stalls the reply by about 40 ms.
+fn nodelay(
+    listener: tokio::net::TcpListener,
+) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
+    use axum::serve::ListenerExt as _;
+    fn set_nodelay(stream: &mut tokio::net::TcpStream) {
+        // Failing only costs latency, and the connection is still usable.
+        let _ = stream.set_nodelay(true);
+    }
+    listener.tap_io(set_nodelay as fn(&mut tokio::net::TcpStream))
 }
 
 /// The collection a route names in its path.
@@ -1004,6 +1020,21 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        use axum::serve::Listener as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener has an address");
+        let mut accepted = nodelay(listener);
+        let _client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        let (stream, _) = accepted.accept().await;
+        assert!(stream.nodelay().expect("nodelay is readable"));
+    }
 
     #[test]
     fn query_response_serializes_ann_diagnostics_fields() {
