@@ -307,7 +307,7 @@ curl http://127.0.0.1:8080/v2/metadata
 
 ```json
 {
-  "product": "logpose",
+  "product": "LogPose",
   "node_name": "node-alpha",
   "version": "0.1.0",
   "git_sha": "abc1234",
@@ -1048,9 +1048,9 @@ curl http://127.0.0.1:8080/v2/databases/default/collections/embeddings/stats
   "collection_id": "550e8400-e29b-41d4-a716-446655440000",
   "collection_name": "embeddings",
   "manifest_generation": 4,
-  "visible_seq_no": 1023,
-  "mutable_op_count": 150,
-  "segment_count": 3,
+  "visible_seq_no": 10500,
+  "mutable_op_count": 650,
+  "segment_count": 1,
   "live_record_count": 9500,
   "deleted_record_count": 500,
   "maintenance": {
@@ -1061,17 +1061,43 @@ curl http://127.0.0.1:8080/v2/databases/default/collections/embeddings/stats
   },
   "query_units": [
     {
-      "unit_id": "mutable",
+      "unit_id": "mutable-delta",
       "tier": "mutable",
-      "index_kind": "flat",
-      "min_seq_no": 1001,
-      "max_seq_no": 1023,
+      "index_kind": "raw",
+      "min_seq_no": 10351,
+      "max_seq_no": 10500,
       "put_count": 150,
-      "delete_count": 10,
+      "delete_count": 0,
       "approx_bytes": 245760,
       "scalar_fields": {},
-      "artifact_stats": [],
-      "component_bytes": { "vectors": 184320, "metadata": 61440 }
+      "artifact_stats": [
+        { "kind": "mutable_delta", "file_name": "", "approx_bytes": 245760 }
+      ],
+      "component_bytes": { "mutable_delta": 245760 }
+    },
+    {
+      "unit_id": "00000003",
+      "tier": "immutable",
+      "index_kind": "hnsw",
+      "min_seq_no": 1,
+      "max_seq_no": 9850,
+      "put_count": 9350,
+      "delete_count": 500,
+      "approx_bytes": 6553600,
+      "scalar_fields": {
+        "price": {
+          "present_count": 9850,
+          "null_count": 0,
+          "distinct_count": 9850,
+          "min": 1.5,
+          "max": 2248.5,
+          "value_counts": {}
+        }
+      },
+      "artifact_stats": [
+        { "kind": "segment", "file_name": "00000003.seg", "approx_bytes": 6553600 }
+      ],
+      "component_bytes": { "segment": 6553600 }
     }
   ]
 }

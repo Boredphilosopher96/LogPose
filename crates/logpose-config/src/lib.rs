@@ -43,6 +43,18 @@ pub struct LogPoseConfig {
     /// Vector index construction parameters for segments written by flush and compaction.
     #[serde(default)]
     pub index: IndexConfig,
+    /// How long a stopping server waits for the requests in flight, in milliseconds, before it
+    /// closes their connections and closes the storage engine anyway. `0` does not wait.
+    #[serde(default = "default_drain_timeout_ms")]
+    pub drain_timeout_ms: u64,
+}
+
+/// Default for [`LogPoseConfig::drain_timeout_ms`]: 20 seconds, which leaves a
+/// 30-second stop deadline (the Kubernetes default grace period) time to close the engine.
+pub const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 20_000;
+
+const fn default_drain_timeout_ms() -> u64 {
+    DEFAULT_DRAIN_TIMEOUT_MS
 }
 
 /// Default for [`IndexConfig::hnsw_m`].
@@ -254,6 +266,7 @@ impl Default for LogPoseConfig {
             limits: LimitsConfig::default(),
             snapshots: SnapshotConfig::default(),
             index: IndexConfig::default(),
+            drain_timeout_ms: DEFAULT_DRAIN_TIMEOUT_MS,
         }
     }
 }
@@ -437,6 +450,23 @@ storage_root = "tmp/logpose-data""#,
         assert_eq!(config.node_role, NodeRole::Data);
         assert_eq!(config.rest_port, 18080);
         assert_eq!(config.metadata.backend.to_string(), "local");
+        assert_eq!(config.drain_timeout_ms, DEFAULT_DRAIN_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn from_toml_str_reads_drain_timeout() {
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "0.0.0.0"
+rest_port = 18080
+grpc_host = "0.0.0.0"
+grpc_port = 15051
+log_filter = "info"
+storage_root = "tmp/logpose-data"
+drain_timeout_ms = 0"#,
+        )
+        .expect("config should load");
+        assert_eq!(config.drain_timeout_ms, 0);
     }
 
     #[test]
