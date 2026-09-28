@@ -546,6 +546,17 @@ impl ScalarMetadataValue {
         }
     }
 
+    /// The value as JSON.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::String(value) => Value::String(value.clone()),
+            Self::Number(value) => Value::Number(value.clone()),
+            Self::Bool(value) => Value::Bool(*value),
+            Self::Null => Value::Null,
+        }
+    }
+
     /// Render a stable string key for planner summaries.
     #[must_use]
     pub fn summary_key(&self) -> String {

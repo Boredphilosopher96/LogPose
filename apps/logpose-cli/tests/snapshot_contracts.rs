@@ -156,18 +156,10 @@ fn normalize_placement(mut value: Value) -> Value {
 
 fn normalize_query(value: Value) -> Value {
     let value = normalize_scoped_response(value);
-    let matches = value["matches"]
+    let hits = value["hits"]
         .as_array()
-        .expect("query matches should be an array")
-        .iter()
-        .map(|item| {
-            json!({
-                "id": item["id"],
-                "metadata": item["metadata"],
-                "value": item["value"],
-            })
-        })
-        .collect::<Vec<_>>();
+        .expect("query hits should be an array")
+        .clone();
 
     let diagnostics = value
         .get("diagnostics")
@@ -194,11 +186,12 @@ fn normalize_query(value: Value) -> Value {
     let mut projected = json!({
         "database_name": value["database_name"],
         "collection_name": value["collection_name"],
+        "vector_field": value["vector_field"],
         "metric": value["metric"],
         "top_k": value["top_k"],
         "returned": value["returned"],
         "snapshot": value["snapshot"],
-        "matches": matches,
+        "hits": hits,
     });
     if let Some(diagnostics) = diagnostics {
         projected["diagnostics"] = diagnostics;

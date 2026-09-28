@@ -557,12 +557,12 @@ fn data_commands_run_against_the_server_over_grpc() {
     let query_body: Value =
         serde_json::from_str(&query_stdout).expect("query output should be valid json");
     let query_response = query_response_body(&query_body);
-    let matches = query_response["matches"]
+    let matches = query_response["hits"]
         .as_array()
-        .expect("matches should be an array");
+        .expect("hits should be an array");
     assert_eq!(matches.len(), 2);
-    assert_eq!(matches[0]["id"], "alpha");
-    assert_eq!(matches[1]["id"], "gamma");
+    assert_eq!(matches[0]["record"]["id"], "alpha");
+    assert_eq!(matches[1]["record"]["id"], "gamma");
 
     let profiled_query = fixture.run_cli_json(&[
         "query",
@@ -581,7 +581,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
     let profiled_query_response = query_response_body(&profiled_query_body);
-    assert_eq!(profiled_query_response["matches"][0]["id"], "alpha");
+    assert_eq!(profiled_query_response["hits"][0]["record"]["id"], "alpha");
     assert!(profiled_query_response["diagnostics"].is_object());
     assert!(profiled_query_response["diagnostics"]["stage_timings"].is_object());
     assert_eq!(
@@ -775,7 +775,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     let ann_profiled_query_body: Value = serde_json::from_str(&ann_profiled_query_stdout)
         .expect("query output should be valid json");
     let ann_query_response = query_response_body(&ann_profiled_query_body);
-    assert_eq!(ann_query_response["matches"][0]["id"], "alpha");
+    assert_eq!(ann_query_response["hits"][0]["record"]["id"], "alpha");
     assert_eq!(
         ann_query_response["diagnostics"]["chosen_plan"],
         "predicate_first_exact"
@@ -802,6 +802,104 @@ fn data_commands_run_against_the_server_over_grpc() {
         serde_json::from_str(&compact_stdout).expect("compact output should be valid json");
     let compact_response = scoped_response_body(&compact_body);
     assert!(compact_response["manifest_generation"].as_u64().is_some());
+}
+
+#[test]
+fn count_scroll_scan_and_delete_by_filter_run_against_the_server() {
+    let fixture = TestServerFixture::spawn("cli-server-count-scroll");
+    let input = fixture.temp_root.join("records.jsonl");
+    fs::write(
+        &input,
+        [
+            r#"{"id":"alpha","vector":[1.0,0.0],"kind":"keep","rank":3}"#,
+            r#"{"id":"beta","vector":[0.9,0.0],"kind":"drop","rank":1}"#,
+            r#"{"id":"gamma","vector":[0.8,0.0],"kind":"keep","rank":2}"#,
+            r#"{"id":"delta","vector":[0.7,0.0],"kind":"drop","rank":5}"#,
+            r#"{"id":"epsilon","vector":[0.6,0.0],"kind":"keep","rank":4}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("jsonl input should be written");
+    fixture.run_cli([
+        "collection",
+        "create",
+        "colors",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+    fixture.run_cli([
+        "record",
+        "put",
+        "colors",
+        "--input",
+        input.to_str().expect("input path should be utf8"),
+    ]);
+    let json = |args: &[&str]| -> Value {
+        let output = fixture.run_cli_json(args);
+        serde_json::from_slice(&output.stdout).expect("output should be valid json")
+    };
+    let ids = |body: &Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .expect("an array of records")
+            .iter()
+            .map(|item| {
+                let record = item.get("record").unwrap_or(item);
+                record["id"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect()
+    };
+
+    let counted = json(&["count", "colors", "--filter", "kind=keep"]);
+    assert_eq!(scoped_response_body(&counted)["count"], 3);
+
+    let first = json(&[
+        "scroll",
+        "colors",
+        "--where",
+        "kind:eq:keep",
+        "--page-size",
+        "2",
+    ]);
+    assert_eq!(ids(&first, "records"), vec!["alpha", "epsilon"]);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a first page of two has a cursor")
+        .to_owned();
+    let second = json(&[
+        "scroll",
+        "colors",
+        "--where",
+        "kind:eq:keep",
+        "--page-size",
+        "2",
+        "--cursor",
+        &cursor,
+    ]);
+    assert_eq!(ids(&second, "records"), vec!["gamma"]);
+    assert!(second["next_cursor"].is_null(), "{second}");
+
+    // A query without a vector is a filtered scan, in primary key order by default.
+    let scanned = json(&[
+        "query",
+        "colors",
+        "--top-k",
+        "2",
+        "--where",
+        "rank:gte:json:2",
+    ]);
+    assert_eq!(
+        ids(query_response_body(&scanned), "hits"),
+        vec!["alpha", "delta"]
+    );
+    assert!(scanned["hits"][0].get("score").is_none(), "{scanned}");
+
+    let deleted = json(&["record", "delete", "colors", "--filter", "kind=drop"]);
+    assert_eq!(scoped_response_body(&deleted)["applied_ops"], 2);
+    let counted = json(&["count", "colors"]);
+    assert_eq!(counted["count"], 3);
 }
 
 #[test]
@@ -880,8 +978,8 @@ fn query_and_stats_support_read_barrier_flags_against_server() {
         serde_json::from_str(&query_stdout).expect("query output should be valid json");
     let query_response = query_response_body(&query_body);
     assert_eq!(query_response["snapshot"]["visible_seq_no"], 2);
-    assert_eq!(query_response["matches"][0]["id"], "alpha");
-    assert_eq!(query_response["matches"][1]["id"], "beta");
+    assert_eq!(query_response["hits"][0]["record"]["id"], "alpha");
+    assert_eq!(query_response["hits"][1]["record"]["id"], "beta");
 
     let stats = fixture.run_cli_json(&[
         "collection",
@@ -950,8 +1048,8 @@ fn profiled_query_surfaces_filtered_scan_diagnostics() {
     let profiled_query_body: Value =
         serde_json::from_str(&profiled_query_stdout).expect("query output should be valid json");
     let profiled_query_response = query_response_body(&profiled_query_body);
-    assert_eq!(profiled_query_response["matches"][0]["id"], "doc-8");
-    assert_eq!(profiled_query_response["matches"][1]["id"], "doc-4");
+    assert_eq!(profiled_query_response["hits"][0]["record"]["id"], "doc-8");
+    assert_eq!(profiled_query_response["hits"][1]["record"]["id"], "doc-4");
     // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
     // three rows the filter matches.
     assert_eq!(
@@ -1096,7 +1194,6 @@ fn typed_schema_commands_manage_collections_and_records() {
         fetched["records"],
         json!([{
             "sku": 7,
-            "embedding": [0.6, 0.8],
             "title": "lamp",
             "price": 12.5,
             "color": "red"
@@ -1114,6 +1211,21 @@ fn typed_schema_commands_manage_collections_and_records() {
     ]);
     let projected: Value = serde_json::from_slice(&projected.stdout).expect("get prints json");
     assert_eq!(projected["records"], json!([{"sku": 8, "price": 99.0}]));
+
+    // Vectors come back only when named.
+    let with_vector = fixture.run_cli_json(&[
+        "record",
+        "get",
+        "shop/products",
+        "7",
+        "--output-field",
+        "embedding",
+    ]);
+    let with_vector: Value = serde_json::from_slice(&with_vector.stdout).expect("get prints json");
+    assert_eq!(
+        with_vector["records"],
+        json!([{"sku": 7, "embedding": [0.6, 0.8]}])
+    );
 
     let human = fixture.run_cli(["record", "get", "shop/products", "8"]);
     let human = String::from_utf8(human.stdout).expect("stdout should be utf8");

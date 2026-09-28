@@ -5,7 +5,7 @@ use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_client::{RecordsResponse, ScopedCollectionResponse};
 use logpose_config::LogPoseConfig;
-use logpose_query::QueryResponse;
+use logpose_query::{CountRecordsResponse, QueryResponse, ScrollRecordsResponse};
 use logpose_storage::InspectReport;
 use logpose_types::{
     CollectionPlacement, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME,
@@ -37,7 +37,15 @@ pub enum ActionOutput {
         schema: CollectionSchema,
         response: ScopedCollectionResponse<RecordsResponse>,
     },
-    Query(ScopedCollectionResponse<QueryResponse>),
+    Query {
+        schema: CollectionSchema,
+        response: ScopedCollectionResponse<QueryResponse>,
+    },
+    Count(ScopedCollectionResponse<CountRecordsResponse>),
+    Scroll {
+        schema: CollectionSchema,
+        response: ScopedCollectionResponse<ScrollRecordsResponse>,
+    },
     Inspect(ScopedCollectionResponse<InspectReport>),
 }
 
@@ -115,7 +123,9 @@ impl ActionOutput {
                 ack.snapshot.visible_seq_no,
             ),
             ActionOutput::RecordsFetched { schema, response } => render_records(schema, response)?,
-            ActionOutput::Query(response) => render_query(response)?,
+            ActionOutput::Query { schema, response } => render_query(schema, response)?,
+            ActionOutput::Count(response) => render_count(response),
+            ActionOutput::Scroll { schema, response } => render_scroll(schema, response)?,
             ActionOutput::Inspect(report) => format!(
                 "Inspection: {}\nCollection: {}\n{}",
                 report.target,
@@ -157,7 +167,17 @@ impl ActionOutput {
             ActionOutput::RecordsWritten(ack) | ActionOutput::RecordDeleted(ack) => {
                 pretty_json(ack)
             }
-            ActionOutput::Query(response) => pretty_json(response),
+            ActionOutput::Query { schema, response } => pretty_json(&scoped_json(
+                &response.database_name,
+                &response.collection_name,
+                response.to_json(schema),
+            )),
+            ActionOutput::Count(response) => pretty_json(response),
+            ActionOutput::Scroll { schema, response } => pretty_json(&scoped_json(
+                &response.database_name,
+                &response.collection_name,
+                response.to_json(schema),
+            )),
             ActionOutput::Inspect(report) => pretty_json(report),
         }
     }
@@ -189,7 +209,9 @@ impl ActionOutput {
             ActionOutput::RecordsWritten(_) => "Write Completed",
             ActionOutput::RecordDeleted(_) => "Delete Completed",
             ActionOutput::RecordsFetched { .. } => "Records",
-            ActionOutput::Query(_) => "Query Results",
+            ActionOutput::Query { .. } => "Query Results",
+            ActionOutput::Count(_) => "Record Count",
+            ActionOutput::Scroll { .. } => "Records Page",
             ActionOutput::Inspect(_) => "Inspection",
         }
     }
@@ -398,32 +420,45 @@ fn render_placement(placement: &CollectionPlacement) -> String {
     )
 }
 
-fn render_query(response: &ScopedCollectionResponse<QueryResponse>) -> anyhow::Result<String> {
+fn render_query(
+    schema: &CollectionSchema,
+    response: &ScopedCollectionResponse<QueryResponse>,
+) -> anyhow::Result<String> {
     let mut lines = vec![
         "Query Results".to_owned(),
         format!(
             "Collection: {}",
             collection_identity(&response.database_name, &response.collection_name)
         ),
-        format!("Metric: {}", metric_name(response.metric)),
-        format!("Returned: {}/{}", response.returned, response.top_k),
-        format!(
-            "Snapshot: generation {}, visible seq {}",
-            response.snapshot.manifest_generation, response.snapshot.visible_seq_no
-        ),
     ];
-    if response.matches.is_empty() {
-        lines.push("Matches: none".to_owned());
+    match (&response.vector_field, response.metric) {
+        (Some(field), Some(metric)) => {
+            lines.push(format!("Vector field: {field} ({})", metric_name(metric)));
+        }
+        _ => lines.push("Scan: no query vector".to_owned()),
+    }
+    lines.push(format!(
+        "Returned: {}/{}",
+        response.hits.len(),
+        response.top_k
+    ));
+    lines.push(format!(
+        "Snapshot: generation {}, visible seq {}",
+        response.snapshot.manifest_generation, response.snapshot.visible_seq_no
+    ));
+    if let Some(token) = &response.snapshot_token {
+        lines.push(format!("Snapshot token: {token}"));
+    }
+    if response.hits.is_empty() {
+        lines.push("Hits: none".to_owned());
     } else {
-        lines.push("Matches:".to_owned());
-        for (index, item) in response.matches.iter().enumerate() {
-            lines.push(format!(
-                "  {}. {}  value={}  metadata={}",
-                index + 1,
-                item.id,
-                item.value,
-                compact_json(&item.metadata)?
-            ));
+        lines.push("Hits:".to_owned());
+        for (index, hit) in response.hits.iter().enumerate() {
+            let record = compact_json(&hit.record.to_json(schema))?;
+            lines.push(match hit.score {
+                Some(score) => format!("  {}. score={score}  {record}", index + 1),
+                None => format!("  {}. {record}", index + 1),
+            });
         }
     }
     if let Some(diagnostics) = &response.diagnostics {
@@ -436,6 +471,66 @@ fn render_query(response: &ScopedCollectionResponse<QueryResponse>) -> anyhow::R
         ));
     }
     Ok(lines.join("\n"))
+}
+
+fn render_count(response: &ScopedCollectionResponse<CountRecordsResponse>) -> String {
+    let mut lines = vec![
+        "Record Count".to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(&response.database_name, &response.collection_name)
+        ),
+        format!("Count: {}", response.count),
+        format!(
+            "Snapshot: generation {}, visible seq {}",
+            response.snapshot.manifest_generation, response.snapshot.visible_seq_no
+        ),
+    ];
+    if let Some(token) = &response.snapshot_token {
+        lines.push(format!("Snapshot token: {token}"));
+    }
+    lines.join("\n")
+}
+
+fn render_scroll(
+    schema: &CollectionSchema,
+    response: &ScopedCollectionResponse<ScrollRecordsResponse>,
+) -> anyhow::Result<String> {
+    let mut lines = vec![
+        "Records Page".to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(&response.database_name, &response.collection_name)
+        ),
+        format!("Records: {}", response.records.len()),
+        format!(
+            "Snapshot: generation {}, visible seq {}",
+            response.snapshot.manifest_generation, response.snapshot.visible_seq_no
+        ),
+        match &response.next_cursor {
+            Some(cursor) => format!("Next cursor: {cursor}"),
+            None => "Next cursor: none (last page)".to_owned(),
+        },
+    ];
+    for record in &response.records {
+        lines.push(compact_json(&record.to_json(schema))?);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// A response body with the collection it belongs to, flattened like the REST reply.
+fn scoped_json(
+    database_name: &str,
+    collection_name: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("database_name".to_owned(), database_name.into());
+    object.insert("collection_name".to_owned(), collection_name.into());
+    if let serde_json::Value::Object(body) = body {
+        object.extend(body);
+    }
+    serde_json::Value::Object(object)
 }
 
 fn compact_json<T: Serialize>(value: &T) -> anyhow::Result<String> {

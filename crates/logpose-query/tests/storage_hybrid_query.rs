@@ -6,8 +6,7 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
-    ScalarMetadataValue, query, scan_records,
+    ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, QueryResponse, VectorQuery, scan_records,
 };
 use logpose_storage::{
     CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine, ReadOptions,
@@ -91,25 +90,29 @@ async fn fill(engine: &LocalStorageEngine, name: &str) {
         .expect("write should succeed");
 }
 
-fn request(name: &str, top_k: usize, kind: Option<(&str, FilterOperator)>) -> QueryRequest {
-    QueryRequest {
-        collection_name: name.to_owned(),
-        vector: query_vector(),
-        top_k,
-        snapshot: None,
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: kind.map(|(kind, operator)| {
-            FilterExpr::Comparison(FilterComparison {
-                field: "kind".to_owned(),
-                operator,
-                value: Some(ScalarMetadataValue::String(kind.to_owned())),
-            })
-        }),
-        explain: ExplainMode::Profile,
-        snapshot_token: None,
-        pin: false,
-    }
+fn request(name: &str, top_k: usize, filter: Option<FilterExpr>) -> (CollectionRef, QueryRequest) {
+    (
+        CollectionRef::parse(name).expect("name"),
+        QueryRequest {
+            vector: Some(VectorQuery {
+                field: None,
+                values: query_vector(),
+            }),
+            top_k,
+            filter,
+            explain: ExplainMode::Profile,
+            ..QueryRequest::default()
+        },
+    )
+}
+
+async fn query(
+    engine: &LocalStorageEngine,
+    (collection, request): (CollectionRef, QueryRequest),
+) -> logpose_query::Result<QueryResponse> {
+    logpose_query::query(engine, &collection, request)
+        .await
+        .map(|result| result.value)
 }
 
 #[tokio::test]
@@ -149,7 +152,7 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
     // 750 `keep` rows are within the exact-scan limit: an exact scan over SQ8 codes.
     let selective = query(
         &engine,
-        request("documents", 5, Some(("keep", FilterOperator::Eq))),
+        request("documents", 5, Some(FilterExpr::eq("kind", "keep"))),
     )
     .await
     .expect("query should succeed");
@@ -164,7 +167,7 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
     // 2,250 rows that are not `keep` exceed it: an admit-only walk (selectivity 0.75).
     let broad = query(
         &engine,
-        request("documents", 5, Some(("keep", FilterOperator::Ne))),
+        request("documents", 5, Some(FilterExpr::ne("kind", "keep"))),
     )
     .await
     .expect("query should succeed");
@@ -204,13 +207,13 @@ async fn memtable_rows_merge_with_segment_walks_and_supersede_stale_rows() {
     let response = query(&engine, request("profiles", 3, None))
         .await
         .expect("query should succeed");
-    assert_eq!(response.matches[0].id.as_str(), "doc-01500");
-    assert_eq!(response.matches[0].metadata["version"], 2);
+    assert_eq!(response.hits[0].record.pk.label(), "doc-01500");
+    assert_eq!(response.hits[0].record.extra["version"], 2);
     assert_eq!(
         response
-            .matches
+            .hits
             .iter()
-            .filter(|matched| matched.id.as_str() == "doc-01500")
+            .filter(|hit| hit.record.pk.label() == "doc-01500")
             .count(),
         1,
         "the superseded segment row is deleted"
@@ -251,7 +254,7 @@ async fn small_filtered_populations_stay_exact_after_compaction_and_reopen() {
     let reopened = self::engine(&root);
     let response = query(
         &reopened,
-        request("events", 3, Some(("rare", FilterOperator::Eq))),
+        request("events", 3, Some(FilterExpr::eq("kind", "rare"))),
     )
     .await
     .expect("query should succeed");
@@ -261,11 +264,11 @@ async fn small_filtered_populations_stay_exact_after_compaction_and_reopen() {
     assert_eq!(diagnostics.candidates_after_filter, 1);
 }
 
-fn ids(response: &logpose_query::QueryResponse) -> Vec<String> {
+fn ids(response: &QueryResponse) -> Vec<String> {
     response
-        .matches
+        .hits
         .iter()
-        .map(|candidate| candidate.id.to_string())
+        .map(|hit| hit.record.pk.label())
         .collect()
 }
 

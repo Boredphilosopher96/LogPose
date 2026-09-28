@@ -3,8 +3,8 @@ use clap::ValueEnum;
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::DatabaseDescriptor;
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryRequest,
-    ScalarMetadataValue,
+    CountRecordsRequest, ExplainMode, FilterExpr, OrderBy, QueryRequest, ReadConsistency,
+    ScrollRecordsRequest, SortDirection, VectorQuery,
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
@@ -49,10 +49,74 @@ pub enum ExplainArg {
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryVector(pub Vec<f32>);
 
+/// An equality shorthand, `FIELD=VALUE`: the filter `{"eq": {FIELD: VALUE}}`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryFilter {
     pub field: String,
-    pub value: ScalarMetadataValue,
+    pub value: Value,
+}
+
+/// Filter inputs shared by query, count, scroll, and delete, combined with AND: equality
+/// shorthands (`--filter`), where clauses (`--where`), and a filter document (`--filter-json`).
+/// Each is the natural JSON filter of the REST API, typed by the schema when the command runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FilterInput {
+    pub filters: Vec<QueryFilter>,
+    pub where_clauses: Vec<Value>,
+    pub filter_json: Option<PathBuf>,
+}
+
+impl FilterInput {
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty() && self.where_clauses.is_empty() && self.filter_json.is_none()
+    }
+
+    /// The combined filter document: one node, or `{"and": [...]}` of every node.
+    pub fn document(&self) -> anyhow::Result<Option<Value>> {
+        let mut nodes = self
+            .filters
+            .iter()
+            .map(|filter| serde_json::json!({ "eq": { filter.field.as_str(): filter.value } }))
+            .collect::<Vec<_>>();
+        nodes.extend(self.where_clauses.iter().cloned());
+        if let Some(path) = &self.filter_json {
+            let file = File::open(path)
+                .with_context(|| format!("failed to open filter json '{}'", path.display()))?;
+            let document = serde_json::from_reader::<_, Value>(file)
+                .with_context(|| format!("failed to parse filter json '{}'", path.display()))?;
+            nodes.push(document);
+        }
+        Ok(match nodes.len() {
+            0 => None,
+            1 => nodes.pop(),
+            _ => Some(serde_json::json!({ "and": nodes })),
+        })
+    }
+
+    /// The typed filter, checked against `schema`.
+    pub fn resolve(&self, schema: &CollectionSchema) -> anyhow::Result<Option<FilterExpr>> {
+        self.document()?
+            .map(|document| {
+                FilterExpr::from_json(schema, document, "filter")
+                    .map_err(|error| anyhow::anyhow!("invalid filter: {error}"))
+            })
+            .transpose()
+    }
+
+    fn push_flags(&self, parts: &mut Vec<String>) {
+        for filter in &self.filters {
+            parts.push("--filter".to_owned());
+            parts.push(shell_quote(&format_filter(filter)));
+        }
+        for clause in &self.where_clauses {
+            parts.push("--where".to_owned());
+            parts.push(shell_quote(&format_predicate(clause)));
+        }
+        if let Some(path) = &self.filter_json {
+            parts.push("--filter-json".to_owned());
+            parts.push(shell_quote(&path.to_string_lossy()));
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,20 +174,47 @@ pub struct RecordPutAction {
     pub input: PathBuf,
 }
 
+/// Delete one record by key, or every record a filter matches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordDeleteAction {
     pub collection: CollectionRef,
-    pub id: String,
+    pub id: Option<String>,
+    pub filter: FilterInput,
+}
+
+/// Count the records matching a filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountAction {
+    pub collection: CollectionRef,
+    pub filter: FilterInput,
+    pub snapshot_token: Option<String>,
+    pub pin: bool,
+}
+
+/// One page of a scroll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollAction {
+    pub collection: CollectionRef,
+    pub filter: FilterInput,
+    pub order_by: Option<OrderBy>,
+    pub page_size: Option<u32>,
+    pub output_fields: Vec<String>,
+    pub cursor: Option<String>,
+    pub snapshot_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryAction {
     pub collection: CollectionRef,
     pub top_k: usize,
-    pub vector: QueryVector,
-    pub filters: Vec<QueryFilter>,
-    pub where_clauses: Vec<FilterExpr>,
-    pub predicate_json: Option<PathBuf>,
+    pub vector: Option<QueryVector>,
+    pub vector_field: Option<String>,
+    pub filter: FilterInput,
+    pub order_by: Option<OrderBy>,
+    pub output_fields: Vec<String>,
+    pub ef: Option<usize>,
+    pub snapshot_token: Option<String>,
+    pub pin: bool,
     pub explain: Option<ExplainArg>,
     pub snapshot_manifest_generation: Option<u64>,
     pub snapshot_visible_seq_no: Option<u64>,
@@ -162,6 +253,8 @@ pub enum Action {
     RecordPut(RecordPutAction),
     RecordDelete(RecordDeleteAction),
     RecordGet(RecordGetAction),
+    Count(CountAction),
+    Scroll(ScrollAction),
     Query(QueryAction),
     Inspect {
         collection: CollectionRef,
@@ -615,25 +708,6 @@ pub fn stats_read_barrier_from_action(
     Ok(read_barrier)
 }
 
-pub fn query_predicate_from_action(action: &QueryAction) -> anyhow::Result<Option<FilterExpr>> {
-    let mut predicates = action.where_clauses.clone();
-    if let Some(path) = &action.predicate_json {
-        let file = File::open(path)
-            .with_context(|| format!("failed to open predicate json '{}'", path.display()))?;
-        let predicate = serde_json::from_reader::<_, FilterExpr>(file)
-            .with_context(|| format!("failed to parse predicate json '{}'", path.display()))?;
-        predicates.push(predicate);
-    }
-
-    Ok(match predicates.len() {
-        0 => None,
-        1 => predicates.into_iter().next(),
-        _ => Some(FilterExpr::And {
-            children: predicates,
-        }),
-    })
-}
-
 pub fn query_explain_mode_from_action(action: &QueryAction) -> ExplainMode {
     match action.explain {
         Some(ExplainArg::Plan) => ExplainMode::Plan,
@@ -642,31 +716,80 @@ pub fn query_explain_mode_from_action(action: &QueryAction) -> ExplainMode {
     }
 }
 
-pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRequest> {
-    let snapshot = query_snapshot_from_action(action)?;
-    let read_barrier = query_read_barrier_from_action(action)?;
-    let predicate = query_predicate_from_action(action)?;
-    let explain = query_explain_mode_from_action(action);
-    let filters = action
-        .filters
-        .iter()
-        .cloned()
-        .map(|filter| MetadataFilter {
-            field: filter.field,
-            value: filter.value,
-        })
-        .collect();
+/// The query `action` describes, its filter typed by `schema`.
+pub fn query_request_from_action(
+    action: &QueryAction,
+    schema: &CollectionSchema,
+) -> anyhow::Result<QueryRequest> {
     Ok(QueryRequest {
-        collection_name: action.collection.lookup_name(),
-        vector: action.vector.0.clone(),
+        vector: action.vector.as_ref().map(|vector| VectorQuery {
+            field: action.vector_field.clone(),
+            values: vector.0.clone(),
+        }),
+        filter: action.filter.resolve(schema)?,
+        order_by: action.order_by.clone().into_iter().collect(),
         top_k: action.top_k,
-        snapshot,
-        read_barrier,
-        filters,
-        predicate,
-        explain,
-        snapshot_token: None,
-        pin: false,
+        output_fields: action.output_fields.clone(),
+        ef: action.ef,
+        explain: query_explain_mode_from_action(action),
+        read: ReadConsistency {
+            snapshot: query_snapshot_from_action(action)?,
+            read_barrier: query_read_barrier_from_action(action)?,
+            snapshot_token: action.snapshot_token.clone(),
+            pin: action.pin,
+        },
+    })
+}
+
+/// The count `action` describes, its filter typed by `schema`.
+pub fn count_request_from_action(
+    action: &CountAction,
+    schema: &CollectionSchema,
+) -> anyhow::Result<CountRecordsRequest> {
+    Ok(CountRecordsRequest {
+        filter: action.filter.resolve(schema)?,
+        read: ReadConsistency {
+            snapshot_token: action.snapshot_token.clone(),
+            pin: action.pin,
+            ..ReadConsistency::default()
+        },
+    })
+}
+
+/// The scroll page `action` describes, its filter typed by `schema`.
+pub fn scroll_request_from_action(
+    action: &ScrollAction,
+    schema: &CollectionSchema,
+) -> anyhow::Result<ScrollRecordsRequest> {
+    Ok(ScrollRecordsRequest {
+        filter: action.filter.resolve(schema)?,
+        order_by: action.order_by.clone().into_iter().collect(),
+        page_size: action.page_size,
+        output_fields: action.output_fields.clone(),
+        cursor: action.cursor.clone(),
+        snapshot_token: action.snapshot_token.clone(),
+    })
+}
+
+/// Parse `FIELD` or `FIELD:asc|desc`.
+pub fn parse_order_by(value: &str) -> Result<OrderBy, String> {
+    let (field, direction) = match value.rsplit_once(':') {
+        Some((field, "asc")) => (field, SortDirection::Asc),
+        Some((field, "desc")) => (field, SortDirection::Desc),
+        Some((_, other)) => {
+            return Err(format!(
+                "unsupported order direction '{other}'; use asc or desc"
+            ));
+        }
+        None => (value, SortDirection::Asc),
+    };
+    let field = field.trim();
+    if field.is_empty() {
+        return Err("order-by needs a field name".to_owned());
+    }
+    Ok(OrderBy {
+        field: field.to_owned(),
+        direction,
     })
 }
 
@@ -792,11 +915,13 @@ pub fn parse_query_filter(value: &str) -> Result<QueryFilter, String> {
     if field.is_empty() {
         return Err("filter field must not be empty".to_owned());
     }
-
-    let scalar = parse_scalar_metadata_value(raw_value.trim())?;
+    let value = parse_literal(raw_value.trim())?;
+    if value.is_object() || value.is_array() || value.is_null() {
+        return Err("query filters must contain only scalar JSON values".to_owned());
+    }
     Ok(QueryFilter {
         field: field.to_owned(),
-        value: scalar,
+        value,
     })
 }
 
@@ -807,7 +932,12 @@ pub fn parse_filter_list(value: &str) -> Result<Vec<QueryFilter>, String> {
         .collect()
 }
 
-pub fn parse_query_where(value: &str) -> Result<FilterExpr, String> {
+/// Operators of a where clause.
+const WHERE_OPERATORS: &str =
+    "eq, ne, lt, lte, gt, gte, in, not_in, contains, contains_any, exists, is_null";
+
+/// Parse `FIELD:OP[:VALUE]` into its natural JSON filter node.
+pub fn parse_query_where(value: &str) -> Result<Value, String> {
     let mut parts = value.splitn(3, ':');
     let field = parts
         .next()
@@ -820,37 +950,35 @@ pub fn parse_query_where(value: &str) -> Result<FilterExpr, String> {
         .filter(|operator| !operator.is_empty())
         .ok_or_else(|| "where clauses must use field:op:value syntax".to_owned())?;
     let raw_value = parts.next().map(str::trim);
-
-    let operator = parse_predicate_operator(operator)?;
-    let value = match operator {
-        FilterOperator::Exists | FilterOperator::IsNull => {
-            if raw_value.is_some() {
-                return Err(format!(
-                    "where operator '{}' does not accept a value",
-                    operator_name(operator)
-                ));
-            }
-            None
+    match (operator, raw_value) {
+        ("exists" | "is_null", None) => Ok(serde_json::json!({ operator: field })),
+        ("exists" | "is_null", Some(_)) => Err(format!(
+            "where operator '{operator}' does not accept a value"
+        )),
+        (
+            "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "in" | "not_in" | "contains"
+            | "contains_any",
+            None,
+        ) => Err(format!("where operator '{operator}' requires a value")),
+        ("eq" | "ne" | "contains", Some(raw)) => {
+            Ok(serde_json::json!({ operator: { field: parse_literal(raw)? } }))
         }
-        _ => {
-            let raw_value = raw_value.ok_or_else(|| {
-                format!(
-                    "where operator '{}' requires a value",
-                    operator_name(operator)
-                )
-            })?;
-            Some(parse_scalar_metadata_value(raw_value)?)
-        }
-    };
-
-    Ok(FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator,
-        value,
-    }))
+        ("lt" | "lte" | "gt" | "gte", Some(raw)) => Ok(serde_json::json!({
+            "range": { field: { operator: parse_literal(raw)? } }
+        })),
+        ("in" | "not_in" | "contains_any", Some(raw)) => match parse_literal(raw)? {
+            list @ Value::Array(_) => Ok(serde_json::json!({ operator: { field: list } })),
+            _ => Err(format!(
+                "where operator '{operator}' takes a JSON array, such as json:[1,2]"
+            )),
+        },
+        _ => Err(format!(
+            "unsupported where operator '{operator}'. Supported operators: {WHERE_OPERATORS}"
+        )),
+    }
 }
 
-pub fn parse_where_list(value: &str) -> Result<Vec<FilterExpr>, String> {
+pub fn parse_where_list(value: &str) -> Result<Vec<Value>, String> {
     split_multi_value(value)
         .into_iter()
         .map(|item| parse_query_where(&item))
@@ -866,53 +994,12 @@ fn split_multi_value(value: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn parse_predicate_operator(value: &str) -> Result<FilterOperator, String> {
-    match value {
-        "eq" => Ok(FilterOperator::Eq),
-        "ne" => Ok(FilterOperator::Ne),
-        "lt" => Ok(FilterOperator::Lt),
-        "lte" => Ok(FilterOperator::Lte),
-        "gt" => Ok(FilterOperator::Gt),
-        "gte" => Ok(FilterOperator::Gte),
-        "exists" => Ok(FilterOperator::Exists),
-        "is_null" => Ok(FilterOperator::IsNull),
-        _ => Err(format!(
-            "unsupported where operator '{value}'. Supported operators: eq, ne, lt, lte, gt, gte, exists, is_null"
-        )),
-    }
-}
-
-pub fn operator_name(operator: FilterOperator) -> &'static str {
-    match operator {
-        FilterOperator::Eq => "eq",
-        FilterOperator::Ne => "ne",
-        FilterOperator::Lt => "lt",
-        FilterOperator::Lte => "lte",
-        FilterOperator::Gt => "gt",
-        FilterOperator::Gte => "gte",
-        FilterOperator::Exists => "exists",
-        FilterOperator::IsNull => "is_null",
-    }
-}
-
-pub fn parse_scalar_metadata_value(value: &str) -> Result<ScalarMetadataValue, String> {
-    let json_value = if let Some(raw_json) = value.strip_prefix("json:") {
-        serde_json::from_str::<Value>(raw_json)
-            .map_err(|error| format!("invalid json filter value: {error}"))?
-    } else {
-        Value::String(value.to_owned())
-    };
-    scalar_metadata_value_from_json(&json_value)
-        .ok_or_else(|| "query filters must contain only scalar JSON values".to_owned())
-}
-
-fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue> {
-    match value {
-        Value::String(value) => Some(ScalarMetadataValue::String(value.clone())),
-        Value::Number(value) => Some(ScalarMetadataValue::Number(value.clone())),
-        Value::Bool(value) => Some(ScalarMetadataValue::Bool(*value)),
-        Value::Null => Some(ScalarMetadataValue::Null),
-        Value::Array(_) | Value::Object(_) => None,
+/// A literal: `json:<JSON>` for any JSON value, anything else a string.
+pub fn parse_literal(value: &str) -> Result<Value, String> {
+    match value.strip_prefix("json:") {
+        Some(raw_json) => serde_json::from_str::<Value>(raw_json)
+            .map_err(|error| format!("invalid json filter value: {error}")),
+        None => Ok(Value::String(value.to_owned())),
     }
 }
 
@@ -1135,7 +1222,46 @@ pub fn format_command(action: &Action) -> String {
             parts.push("delete".to_owned());
             parts.push(shell_quote(&action.collection.collection_name));
             push_database_flag(&mut parts, &action.collection.database_name);
-            parts.push(shell_quote(&action.id));
+            if let Some(id) = &action.id {
+                parts.push(shell_quote(id));
+            }
+            action.filter.push_flags(&mut parts);
+        }
+        Action::Count(action) => {
+            parts.push("count".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            action.filter.push_flags(&mut parts);
+            if let Some(token) = &action.snapshot_token {
+                parts.push("--snapshot-token".to_owned());
+                parts.push(shell_quote(token));
+            }
+            if action.pin {
+                parts.push("--pin".to_owned());
+            }
+        }
+        Action::Scroll(action) => {
+            parts.push("scroll".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            action.filter.push_flags(&mut parts);
+            push_order_by(&mut parts, action.order_by.as_ref());
+            if let Some(page_size) = action.page_size {
+                parts.push("--page-size".to_owned());
+                parts.push(page_size.to_string());
+            }
+            for field in &action.output_fields {
+                parts.push("--output-field".to_owned());
+                parts.push(shell_quote(field));
+            }
+            if let Some(cursor) = &action.cursor {
+                parts.push("--cursor".to_owned());
+                parts.push(shell_quote(cursor));
+            }
+            if let Some(token) = &action.snapshot_token {
+                parts.push("--snapshot-token".to_owned());
+                parts.push(shell_quote(token));
+            }
         }
         Action::Query(action) => {
             parts.push("query".to_owned());
@@ -1143,19 +1269,30 @@ pub fn format_command(action: &Action) -> String {
             push_database_flag(&mut parts, &action.collection.database_name);
             parts.push("--top-k".to_owned());
             parts.push(action.top_k.to_string());
-            parts.push("--vector".to_owned());
-            parts.push(shell_quote(&format_vector(&action.vector)));
-            for filter in &action.filters {
-                parts.push("--filter".to_owned());
-                parts.push(shell_quote(&format_filter(filter)));
+            if let Some(vector) = &action.vector {
+                parts.push("--vector".to_owned());
+                parts.push(shell_quote(&format_vector(vector)));
             }
-            for predicate in &action.where_clauses {
-                parts.push("--where".to_owned());
-                parts.push(shell_quote(&format_predicate(predicate)));
+            if let Some(field) = &action.vector_field {
+                parts.push("--vector-field".to_owned());
+                parts.push(shell_quote(field));
             }
-            if let Some(path) = &action.predicate_json {
-                parts.push("--predicate-json".to_owned());
-                parts.push(shell_quote(&path.to_string_lossy()));
+            action.filter.push_flags(&mut parts);
+            push_order_by(&mut parts, action.order_by.as_ref());
+            for field in &action.output_fields {
+                parts.push("--output-field".to_owned());
+                parts.push(shell_quote(field));
+            }
+            if let Some(ef) = action.ef {
+                parts.push("--ef".to_owned());
+                parts.push(ef.to_string());
+            }
+            if let Some(token) = &action.snapshot_token {
+                parts.push("--snapshot-token".to_owned());
+                parts.push(shell_quote(token));
+            }
+            if action.pin {
+                parts.push("--pin".to_owned());
             }
             if let Some(explain) = action.explain {
                 parts.push("--explain".to_owned());
@@ -1263,37 +1400,52 @@ fn format_vector(vector: &QueryVector) -> String {
 }
 
 pub fn format_filter(filter: &QueryFilter) -> String {
-    format!(
-        "{}={}",
-        filter.field,
-        scalar_value_to_cli_literal(&filter.value)
-    )
+    format!("{}={}", filter.field, literal(&filter.value))
 }
 
-pub fn format_predicate(predicate: &FilterExpr) -> String {
-    match predicate {
-        FilterExpr::Comparison(FilterComparison {
-            field,
-            operator,
-            value,
-        }) => match value {
-            Some(value) => format!(
-                "{field}:{}:{}",
-                operator_name(*operator),
-                scalar_value_to_cli_literal(value)
-            ),
-            None => format!("{field}:{}", operator_name(*operator)),
-        },
-        _ => "predicate.json".to_owned(),
+/// A where clause in its `FIELD:OP[:VALUE]` form, for the nodes [`parse_query_where`] builds;
+/// any other node as compact JSON.
+pub fn format_predicate(predicate: &Value) -> String {
+    let single = |value: &Value| -> Option<(String, Value)> {
+        let object = value.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        object
+            .iter()
+            .next()
+            .map(|(key, value)| (key.clone(), value.clone()))
+    };
+    let formatted =
+        single(predicate).and_then(|(operator, body)| match (operator.as_str(), body) {
+            ("exists" | "is_null", Value::String(field)) => Some(format!("{field}:{operator}")),
+            ("range", body) => {
+                let (field, bounds) = single(&body)?;
+                let (bound, value) = single(&bounds)?;
+                Some(format!("{field}:{bound}:{}", literal(&value)))
+            }
+            (_, body) => {
+                let (field, value) = single(&body)?;
+                Some(format!("{field}:{operator}:{}", literal(&value)))
+            }
+        });
+    formatted.unwrap_or_else(|| predicate.to_string())
+}
+
+fn literal(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        other => format!("json:{other}"),
     }
 }
 
-fn scalar_value_to_cli_literal(value: &ScalarMetadataValue) -> String {
-    match value {
-        ScalarMetadataValue::String(value) => value.clone(),
-        ScalarMetadataValue::Number(value) => format!("json:{value}"),
-        ScalarMetadataValue::Bool(value) => format!("json:{value}"),
-        ScalarMetadataValue::Null => "json:null".to_owned(),
+fn push_order_by(parts: &mut Vec<String>, order_by: Option<&OrderBy>) {
+    if let Some(order) = order_by {
+        parts.push("--order-by".to_owned());
+        parts.push(shell_quote(&match order.direction {
+            SortDirection::Asc => order.field.clone(),
+            SortDirection::Desc => format!("{}:desc", order.field),
+        }));
     }
 }
 
@@ -1330,7 +1482,7 @@ mod tests {
         let parsed = parse_query_filter("code=123").expect("filter should parse");
 
         assert_eq!(parsed.field, "code");
-        assert_eq!(parsed.value, ScalarMetadataValue::String("123".to_owned()));
+        assert_eq!(parsed.value, Value::String("123".to_owned()));
     }
 
     #[test]
@@ -1338,35 +1490,73 @@ mod tests {
         let parsed = parse_query_filter("enabled=json:true").expect("filter should parse");
 
         assert_eq!(parsed.field, "enabled");
-        assert_eq!(parsed.value, ScalarMetadataValue::Bool(true));
+        assert_eq!(parsed.value, Value::Bool(true));
     }
 
     #[test]
-    fn where_clauses_parse_scalar_comparisons() {
-        let parsed = parse_query_where("score:gte:json:7").expect("where clause should parse");
-
-        assert_eq!(
-            parsed,
-            FilterExpr::Comparison(FilterComparison {
-                field: "score".to_owned(),
-                operator: FilterOperator::Gte,
-                value: Some(ScalarMetadataValue::Number(7.into())),
-            })
-        );
+    fn where_clauses_parse_to_natural_json_filters() {
+        let cases = [
+            (
+                "score:gte:json:7",
+                serde_json::json!({ "range": { "score": { "gte": 7 } } }),
+            ),
+            (
+                "kind:eq:keep",
+                serde_json::json!({ "eq": { "kind": "keep" } }),
+            ),
+            (
+                "archived:is_null",
+                serde_json::json!({ "is_null": "archived" }),
+            ),
+            (
+                "tags:contains_any:json:[\"a\",\"b\"]",
+                serde_json::json!({ "contains_any": { "tags": ["a", "b"] } }),
+            ),
+        ];
+        for (clause, expected) in cases {
+            let parsed = parse_query_where(clause).expect("where clause should parse");
+            assert_eq!(parsed, expected, "{clause}");
+            assert_eq!(format_predicate(&parsed), clause);
+        }
+        assert!(parse_query_where("kind:in:keep").is_err());
+        assert!(parse_query_where("kind:like:keep").is_err());
+        assert!(parse_query_where("kind:exists:keep").is_err());
     }
 
     #[test]
-    fn where_clauses_parse_unary_operators_without_values() {
-        let parsed = parse_query_where("archived:is_null").expect("where clause should parse");
-
+    fn filter_inputs_combine_with_and() {
+        let input = FilterInput {
+            filters: vec![parse_query_filter("kind=keep").expect("filter")],
+            where_clauses: vec![parse_query_where("score:lt:json:3").expect("where")],
+            filter_json: None,
+        };
         assert_eq!(
-            parsed,
-            FilterExpr::Comparison(FilterComparison {
-                field: "archived".to_owned(),
-                operator: FilterOperator::IsNull,
-                value: None,
+            input.document().expect("document"),
+            Some(serde_json::json!({ "and": [
+                { "eq": { "kind": "keep" } },
+                { "range": { "score": { "lt": 3 } } }
+            ] }))
+        );
+        assert_eq!(FilterInput::default().document().expect("document"), None);
+    }
+
+    #[test]
+    fn order_by_parses_a_field_and_an_optional_direction() {
+        assert_eq!(
+            parse_order_by("price:desc"),
+            Ok(OrderBy {
+                field: "price".to_owned(),
+                direction: SortDirection::Desc,
             })
         );
+        assert_eq!(
+            parse_order_by("price"),
+            Ok(OrderBy {
+                field: "price".to_owned(),
+                direction: SortDirection::Asc,
+            })
+        );
+        assert!(parse_order_by("price:sideways").is_err());
     }
 
     #[test]
@@ -1463,12 +1653,26 @@ mod tests {
     fn format_command_emits_database_flags_for_non_default_collection_refs() {
         let command = format_command(&Action::RecordDelete(RecordDeleteAction {
             collection: CollectionRef::new("analytics", "documents"),
-            id: "alpha".to_owned(),
+            id: Some("alpha".to_owned()),
+            filter: FilterInput::default(),
         }));
 
         assert_eq!(
             command,
             "logpose record delete documents --database analytics alpha"
+        );
+        let by_filter = format_command(&Action::RecordDelete(RecordDeleteAction {
+            collection: CollectionRef::new("analytics", "documents"),
+            id: None,
+            filter: FilterInput {
+                filters: vec![parse_query_filter("kind=drop").expect("filter")],
+                where_clauses: vec![parse_query_where("score:lt:json:3").expect("where")],
+                filter_json: None,
+            },
+        }));
+        assert_eq!(
+            by_filter,
+            "logpose record delete documents --database analytics --filter kind=drop --where score:lt:json:3"
         );
     }
 

@@ -160,6 +160,12 @@ pub enum RecordError {
     /// A partial update changes nothing.
     #[error("a partial update must set at least one field or vector")]
     EmptyUpdate,
+    /// A patch applied by filter names the primary key, which it cannot change.
+    #[error("primary key field '{field}' cannot be changed by an update by filter")]
+    PatchSetsPrimaryKey {
+        /// The primary key field name.
+        field: String,
+    },
 }
 
 impl RecordError {
@@ -222,7 +228,8 @@ impl RecordError {
             | Self::InvalidField { field, .. }
             | Self::RequiredField { field }
             | Self::NotAScalarField { field }
-            | Self::UnknownField { field } => Some(field),
+            | Self::UnknownField { field }
+            | Self::PatchSetsPrimaryKey { field } => Some(field),
             Self::ReservedKey { key }
             | Self::ExtraKeyConflict { key }
             | Self::RetiredKey { key } => Some(key),

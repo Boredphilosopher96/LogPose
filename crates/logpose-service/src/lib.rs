@@ -32,7 +32,10 @@ use tower as _;
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
-use logpose_query::{QueryRequest, QueryResponse};
+use logpose_query::{
+    CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
+    ScrollRecordsResponse, WithSchema,
+};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, ReadOptions,
     StorageEngine,
@@ -46,7 +49,8 @@ use logpose_types::{
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
     MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus,
     ResourceKind, Snapshot,
-    record::{ClientOp, PartialUpdate, PrimaryKey, Projection, Record},
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate, PrimaryKey, Projection, Record, RecordPatch},
     schema::{CollectionSchema, SchemaChange},
 };
 use std::{
@@ -607,7 +611,8 @@ impl LogPoseDataService {
         .await
     }
 
-    /// Point lookups by primary key, projected to `output_fields` (every field when empty).
+    /// Point lookups by primary key, projected to `output_fields` (every scalar field and
+    /// `$extra` key, but no vector, when empty).
     pub async fn get_records(
         &self,
         collection_name: &str,
@@ -658,9 +663,86 @@ impl LogPoseDataService {
             .map_err(|error| error.with_field_prefix(field))
     }
 
-    /// Execute a filtered exact query.
-    pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse> {
-        logpose_query::query(self.storage.as_ref(), request)
+    /// Delete every live record matching `filter`, resolved against the writer's latest state
+    /// and committed as one atomic batch; `applied_ops` is the number deleted. Filter errors name
+    /// the node below `filter`. A match whose keys do not fit one WAL frame fails with
+    /// `TooLarge` and deletes nothing.
+    pub async fn delete_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+    ) -> Result<CommitAck> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.storage
+            .delete_by_filter(&descriptor.lookup_name(), filter)
+            .await
+    }
+
+    /// Apply `patch` to every live record matching `filter`, as [`delete_by_filter`] resolves
+    /// and commits them; `applied_ops` is the number updated. Patch errors name
+    /// `patch.<field>`.
+    ///
+    /// [`delete_by_filter`]: Self::delete_by_filter
+    pub async fn update_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+        patch: RecordPatch,
+    ) -> Result<CommitAck> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        let lookup_name = descriptor.lookup_name();
+        let schema = self.storage.schema(&lookup_name).await?;
+        let patch = patch
+            .validate(&schema)
+            .map_err(|error| error.to_error("patch", None))?;
+        let placeholder = match schema.primary_key_type() {
+            logpose_types::schema::PrimaryKeyType::Int64 => PrimaryKey::Int64(0),
+            logpose_types::schema::PrimaryKeyType::String => PrimaryKey::String("_".to_owned()),
+        };
+        self.storage
+            .update_by_filter(&lookup_name, filter, patch.into_update(placeholder))
+            .await
+            .map_err(|error| match &error {
+                // Filter errors already name their node below `filter`.
+                LogPoseError::InvalidArgument {
+                    field: Some(field), ..
+                } if field == "filter" || field.starts_with("filter.") => error,
+                _ => error.with_field_prefix("patch"),
+            })
+    }
+
+    /// Search a collection (or scan it in order): see [`logpose_query::query`].
+    pub async fn query_collection(
+        &self,
+        collection_name: &str,
+        request: QueryRequest,
+    ) -> Result<WithSchema<QueryResponse>> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        logpose_query::query(self.storage.as_ref(), &descriptor.collection_ref(), request)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Count the live records matching a filter: see [`logpose_query::count_records`].
+    pub async fn count_records(
+        &self,
+        collection_name: &str,
+        request: CountRecordsRequest,
+    ) -> Result<CountRecordsResponse> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        logpose_query::count_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// One page of a scroll: see [`logpose_query::scroll_records`].
+    pub async fn scroll_records(
+        &self,
+        collection_name: &str,
+        request: ScrollRecordsRequest,
+    ) -> Result<WithSchema<ScrollRecordsResponse>> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        logpose_query::scroll_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
             .await
             .map_err(Into::into)
     }

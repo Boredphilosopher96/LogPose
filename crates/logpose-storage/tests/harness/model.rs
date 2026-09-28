@@ -11,7 +11,7 @@
 //! shadow `$extra` keys the model tracks itself, from the schema changes it applies, so the
 //! schema's retired-name bookkeeping is checked rather than trusted.
 
-use logpose_query::{FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue};
+use logpose_query::FilterExpr;
 use logpose_storage::SchemaChange;
 use logpose_types::{
     DistanceMetric, SeqNo,
@@ -298,34 +298,33 @@ impl Model {
     /// strings bytewise); `ne` needs a value other than the operand; `not` is the complement
     /// over live rows, so it matches rows without a value too.
     pub fn matches(&self, filter: &FilterExpr, row: &Row) -> bool {
-        match filter {
-            FilterExpr::And { children } => children.iter().all(|c| self.matches(c, row)),
-            FilterExpr::Or { children } => children.iter().any(|c| self.matches(c, row)),
-            FilterExpr::Not { child } => !self.matches(child, row),
-            FilterExpr::Comparison(comparison) => self.compare(comparison, row),
-        }
-    }
-
-    fn compare(&self, comparison: &FilterComparison, row: &Row) -> bool {
-        let value = self.typed_value(&comparison.field, row);
-        let ordering = match (value, comparison.value.as_ref()) {
-            (Some(Value::Int64(value)), Some(ScalarMetadataValue::Number(number))) => {
-                number.as_i64().map(|wanted| value.cmp(&wanted))
-            }
-            (Some(Value::String(value)), Some(ScalarMetadataValue::String(wanted))) => {
+        let ordering = |field: &str, operand: &Value| match (self.typed_value(field, row), operand)
+        {
+            (Some(Value::Int64(value)), Value::Int64(wanted)) => Some(value.cmp(wanted)),
+            (Some(Value::String(value)), Value::String(wanted)) => {
                 Some(value.as_bytes().cmp(wanted.as_bytes()))
             }
             _ => None,
         };
-        match comparison.operator {
-            FilterOperator::Exists => value.is_some(),
-            FilterOperator::IsNull => value.is_none(),
-            FilterOperator::Eq => ordering == Some(Ordering::Equal),
-            FilterOperator::Ne => ordering.is_some_and(Ordering::is_ne),
-            FilterOperator::Lt => ordering == Some(Ordering::Less),
-            FilterOperator::Lte => ordering.is_some_and(Ordering::is_le),
-            FilterOperator::Gt => ordering == Some(Ordering::Greater),
-            FilterOperator::Gte => ordering.is_some_and(Ordering::is_ge),
+        match filter {
+            FilterExpr::And(children) => children.iter().all(|c| self.matches(c, row)),
+            FilterExpr::Or(children) => children.iter().any(|c| self.matches(c, row)),
+            FilterExpr::Not(child) => !self.matches(child, row),
+            FilterExpr::Exists { field } => self.typed_value(field, row).is_some(),
+            FilterExpr::IsNull { field } => self.typed_value(field, row).is_none(),
+            FilterExpr::Eq { field, value } => ordering(field, value) == Some(Ordering::Equal),
+            FilterExpr::Ne { field, value } => ordering(field, value).is_some_and(Ordering::is_ne),
+            FilterExpr::Range { field, bounds } => {
+                bounds.named().into_iter().all(|(name, bound)| {
+                    ordering(field, bound).is_some_and(|ordering| match name {
+                        "gt" => ordering.is_gt(),
+                        "gte" => ordering.is_ge(),
+                        "lt" => ordering.is_lt(),
+                        _ => ordering.is_le(),
+                    })
+                })
+            }
+            other => unreachable!("the harness generates no {other:?}"),
         }
     }
 

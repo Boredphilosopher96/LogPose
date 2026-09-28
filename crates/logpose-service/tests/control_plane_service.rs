@@ -3,6 +3,7 @@
 use async_trait as _;
 use axum as _;
 use http_body_util as _;
+use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
 use logpose_auth::{
@@ -11,7 +12,7 @@ use logpose_auth::{
 };
 use logpose_catalog as _;
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, QueryRequest};
+use logpose_query::ExplainMode;
 use logpose_service as _;
 use logpose_storage::{
     CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine as _,
@@ -32,6 +33,9 @@ use thiserror as _;
 use tokio as _;
 use tonic as _;
 use tower as _;
+
+#[path = "support/legacy_query.rs"]
+mod legacy_query;
 
 #[tokio::test]
 async fn control_plane_reports_runtime_status_and_local_placement() {

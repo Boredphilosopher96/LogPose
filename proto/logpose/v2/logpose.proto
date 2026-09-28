@@ -45,16 +45,23 @@ service LogPoseService {
 
   // Insert or replace whole records, as one atomic batch.
   rpc UpsertRecords(UpsertRecordsRequest) returns (CommitAckReply);
-  // Change some fields of existing records, as one atomic batch. A key without a live
-  // record fails the whole batch with NOT_FOUND.
+  // Change some fields of records, as one atomic batch: of the records `records` names by key
+  // (a key without a live record fails the whole batch with NOT_FOUND), or of every live
+  // record a filter matches. See UpdateRecordsRequest.
   rpc UpdateRecords(UpdateRecordsRequest) returns (CommitAckReply);
-  // Delete records by primary key, as one atomic batch. Missing keys are no-ops.
+  // Delete records, as one atomic batch: by primary key (missing keys are no-ops), or every
+  // live record a filter matches. See DeleteRecordsRequest.
   rpc DeleteRecords(DeleteRecordsRequest) returns (CommitAckReply);
   // Read records by primary key.
   rpc GetRecords(GetRecordsRequest) returns (GetRecordsReply);
+  // Count the live records matching a filter.
+  rpc CountRecords(CountRecordsRequest) returns (CountRecordsReply);
+  // Page through the live records matching a filter, in one pinned snapshot.
+  rpc ScrollRecords(ScrollRecordsRequest) returns (ScrollRecordsReply);
   // Stream batches of upserts into one collection. See BulkUpsertRecordsRequest.
   rpc BulkUpsertRecords(stream BulkUpsertRecordsRequest) returns (BulkUpsertRecordsReply);
 
+  // Vector search, or a filtered scan, with a filter, an order, and a projection.
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
   rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
@@ -476,16 +483,39 @@ message UpsertRecordsRequest {
   repeated Record records = 3;
 }
 
+// A change to some fields applied to every record a filter matches: a RecordUpdate without a
+// key, with the same meaning for each entry.
+message RecordPatch {
+  map<string, Vector> vectors = 1;
+  map<string, Value> fields = 2;
+  JsonObject extra = 3;
+}
+
+// Update records by key (`records`), or every live record `filter` matches with `patch`
+// (`filter` and `patch` together, without `records`).
+//
+// An update by filter resolves the filter once against the latest state (every earlier write
+// included) and commits the matching records as one atomic batch in one WAL frame;
+// `applied_ops` is the number updated, and a filter that matches nothing commits nothing. A
+// match too large for one WAL frame (64 MiB) fails with RESOURCE_EXHAUSTED (reason TOO_LARGE)
+// and updates nothing: narrow the filter and repeat.
 message UpdateRecordsRequest {
   string database_name = 1;
   string collection_name = 2;
   repeated RecordUpdate records = 3;
+  Filter filter = 4;
+  // Must not name the primary key; errors name `patch.<field>`.
+  RecordPatch patch = 5;
 }
 
+// Delete records by key (`keys`), or every live record `filter` matches (`filter`, without
+// `keys`). A delete by filter resolves and commits like an update by filter (see
+// UpdateRecordsRequest), with the same TOO_LARGE limit.
 message DeleteRecordsRequest {
   string database_name = 1;
   string collection_name = 2;
   repeated PrimaryKey keys = 3;
+  Filter filter = 4;
 }
 
 message GetRecordsRequest {
@@ -494,7 +524,8 @@ message GetRecordsRequest {
   repeated PrimaryKey keys = 3;
   // Fields to return: declared field names, `$extra` for every visible dynamic key, or (with
   // dynamic fields on) single dynamic keys. The primary key is always returned. Empty
-  // returns every field.
+  // returns every scalar field and every visible dynamic key, but no vector field: name a
+  // vector field to get it back.
   repeated string output_fields = 4;
 }
 
@@ -565,58 +596,164 @@ message SnapshotReply {
   uint64 visible_seq_no = 4;
 }
 
-// Queries
+// Filters
 
-message ScalarValue {
-  oneof kind {
-    string string_value = 1;
-    int64 int64_value = 2;
-    uint64 uint64_value = 3;
-    double double_value = 4;
-    bool bool_value = 5;
-    bool null_value = 6;
-  }
-}
-
-message MetadataFilter {
-  string field = 1;
-  ScalarValue value = 2;
-}
-
-enum PredicateOperator {
-  PREDICATE_OPERATOR_UNSPECIFIED = 0;
-  PREDICATE_OPERATOR_EQ = 1;
-  PREDICATE_OPERATOR_NE = 2;
-  PREDICATE_OPERATOR_LT = 3;
-  PREDICATE_OPERATOR_LTE = 4;
-  PREDICATE_OPERATOR_GT = 5;
-  PREDICATE_OPERATOR_GTE = 6;
-  PREDICATE_OPERATOR_EXISTS = 7;
-  PREDICATE_OPERATOR_IS_NULL = 8;
-}
-
-message PredicateComparison {
-  string field = 1;
-  PredicateOperator operator = 2;
-  ScalarValue value = 3;
-}
-
-message PredicateList {
-  repeated Predicate children = 1;
-}
-
-message PredicateNot {
-  Predicate child = 1;
-}
-
-message Predicate {
+// A boolean filter over record fields (engine plan decision D11). Exactly one node is set; an
+// empty filter is INVALID_ARGUMENT.
+//
+// A field path is a declared field name (the primary key or a scalar field; vector fields
+// cannot be filtered), `$extra.<key>` for the dynamic key `<key>`, or, with dynamic fields on,
+// any other name for the dynamic key of that name. A dynamic key that the schema declares or
+// retired is hidden and cannot be filtered.
+//
+// Operands are typed like record values of the field they compare (an array field's like one
+// element); numbers convert between int64 and float64 when exact, and a float bound of an int64
+// or timestamp range rounds to the matching integer range. A dynamic key or `json` field
+// compares with the operand's JSON form: equality by JSON scalar equality, ranges between two
+// strings or two numbers.
+//
+// Semantics: `eq` and `contains` hold when the field (an array field: some element) equals the
+// operand, `in` and `contains_any` when it is one of the operands, `range` when it lies within
+// every bound; `ne` and `not_in` hold when the field has a value and it is none of the operands,
+// so null never matches them; `exists` holds when the field has a value (a dynamic key: is
+// present), `is_null` when it has none (a dynamic key: is present and JSON null); `not` holds
+// for every live record its child does not match, nulls included.
+//
+// Errors name the offending node by its path in the REST form of the filter, the same for both
+// APIs: `filter.and[1].range.price.gte`, `filter.in.tags[2]`, `filter.not.exists`.
+message Filter {
   oneof node {
-    PredicateList and = 1;
-    PredicateList or = 2;
-    PredicateNot not = 3;
-    PredicateComparison comparison = 4;
+    // Every child matches; at least one child.
+    FilterList and = 1;
+    // Some child matches; at least one child.
+    FilterList or = 2;
+    Filter not = 3;
+    FieldValue eq = 4;
+    FieldValue ne = 5;
+    // At least one bound, and not both gt and gte (or lt and lte). Not for bool fields.
+    FieldRange range = 6;
+    // At least one value.
+    FieldValues in = 7;
+    // At least one value.
+    FieldValues not_in = 8;
+    // An array field only.
+    FieldValue contains = 9;
+    // An array field only; at least one value.
+    FieldValues contains_any = 10;
+    // The field path.
+    string exists = 11;
+    // The field path.
+    string is_null = 12;
   }
 }
+
+message FilterList {
+  repeated Filter filters = 1;
+}
+
+// A field path and one operand, never null.
+message FieldValue {
+  string field = 1;
+  Value value = 2;
+}
+
+// A field path and its operands, none null.
+message FieldValues {
+  string field = 1;
+  repeated Value values = 2;
+}
+
+// A field path and its bounds; unset bounds do not constrain.
+message FieldRange {
+  string field = 1;
+  Value gt = 2;
+  Value gte = 3;
+  Value lt = 4;
+  Value lte = 5;
+}
+
+enum SortDirection {
+  SORT_DIRECTION_ASC = 0;
+  SORT_DIRECTION_DESC = 1;
+}
+
+// Order by a declared scalar field that is not an array or json. Ties are broken by primary
+// key ascending, and records without a value come last in both directions.
+message OrderBy {
+  string field = 1;
+  SortDirection direction = 2;
+}
+
+// Counting and scrolling
+
+// Count the live records matching `filter` (every live record without one). At most one of
+// `snapshot` and `snapshot_token`, and at most one of `snapshot` and `read_barrier`.
+message CountRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  Filter filter = 3;
+  // Read exactly this snapshot.
+  Snapshot snapshot = 4;
+  // Fail with READ_BARRIER_NOT_SATISFIED unless the state read is at or past this snapshot.
+  Snapshot read_barrier = 5;
+  // Read the state this token pins, and extend its expiry. An expired, released, or unknown
+  // token is FAILED_PRECONDITION (reason SNAPSHOT_EXPIRED); a malformed one INVALID_ARGUMENT.
+  string snapshot_token = 6;
+  // Pin the state counted under a token, returned in the reply, so a scroll or query can read
+  // exactly that state.
+  bool pin = 7;
+}
+
+message CountRecordsReply {
+  string database_name = 1;
+  string collection_name = 2;
+  uint64 count = 3;
+  // The state counted.
+  Snapshot snapshot = 4;
+  // The token pinning that state: set when the request pinned or named a token.
+  string snapshot_token = 5;
+}
+
+// One page of the live records matching `filter`, in `order_by` order.
+//
+// A first page (no `cursor`) reads the current state, or the state `snapshot_token` pins. When
+// records are left after the page, the server pins the state it read and returns a
+// `next_cursor` that carries the pin; later pages send the same request with that cursor and
+// read exactly that state, so every matching record appears exactly once across the pages
+// whatever is written meanwhile. The last page has no `next_cursor`, and a scroll that fits in
+// one page pins nothing.
+//
+// A cursor is opaque. It must be sent with the same `filter` and `order_by` as the first page
+// (INVALID_ARGUMENT otherwise), and without `snapshot_token`. Its pin expires after the token
+// TTL (5 minutes by default) without a page, and every page extends it; a page after it
+// expired fails with FAILED_PRECONDITION (reason SNAPSHOT_EXPIRED): start over.
+message ScrollRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  Filter filter = 3;
+  // At most one entry; primary key ascending when empty.
+  repeated OrderBy order_by = 4;
+  // Records per page, 1 to 10,000; 0 is 100.
+  uint32 page_size = 5;
+  // Fields to return, as GetRecordsRequest projects them; empty returns every scalar field and
+  // dynamic key, no vectors.
+  repeated string output_fields = 6;
+  string cursor = 7;
+  // A first page reads the state this token pins, from a pinned count or query.
+  string snapshot_token = 8;
+}
+
+message ScrollRecordsReply {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated Record records = 3;
+  // The cursor of the next page; empty after the last page.
+  string next_cursor = 4;
+  // The state the page read; the same for every page of one scroll.
+  Snapshot snapshot = 5;
+}
+
+// Queries
 
 enum ExplainMode {
   EXPLAIN_MODE_NONE = 0;
@@ -624,32 +761,56 @@ enum ExplainMode {
   EXPLAIN_MODE_PROFILE = 2;
 }
 
-// Search the collection's first vector field.
+// The vector half of a query.
+message VectorQuery {
+  // The vector field to search; empty searches the collection's only vector field, and is
+  // INVALID_ARGUMENT for a collection with several.
+  string field = 1;
+  // The query vector: the field's dimensions, finite components.
+  repeated float values = 2;
+}
+
+// One search (engine plan decision D11): the `top_k` records nearest `vector` that match
+// `filter`, or without a vector the first `top_k` records matching `filter` in `order_by` order
+// (a filtered scan; ScrollRecords pages through the rest). At most one of `snapshot` and
+// `snapshot_token`, and at most one of `snapshot` and `read_barrier`.
 message QueryCollectionRequest {
   string database_name = 1;
   string collection_name = 2;
-  repeated float vector = 3;
-  uint64 top_k = 4;
-  Snapshot snapshot = 5;
-  Snapshot read_barrier = 6;
-  repeated MetadataFilter filters = 7;
-  Predicate predicate = 8;
+  VectorQuery vector = 3;
+  Filter filter = 4;
+  // At most one entry. With a vector it reorders the top_k hits; without one it is the scan
+  // order (primary key ascending when empty).
+  repeated OrderBy order_by = 5;
+  // Results wanted, 1 to 10,000.
+  uint64 top_k = 6;
+  // Fields each hit returns, as GetRecordsRequest projects them; empty returns every scalar
+  // field and dynamic key, no vectors. Name only the primary key to return keys and scores
+  // alone.
+  repeated string output_fields = 7;
+  // Beam width of graph walks, 1 to 4,096, with a vector only; 0 uses the default (64, and at
+  // least four candidates per result).
+  uint32 ef = 8;
   ExplainMode explain = 9;
-  // Read exactly the state this snapshot token pins, and extend its expiry. Empty reads the
-  // current state (or `snapshot`). An expired, released, or unknown token fails with
-  // `FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`); a malformed one with `INVALID_ARGUMENT`.
-  string snapshot_token = 10;
+  // Read exactly this snapshot.
+  Snapshot snapshot = 10;
+  // Fail with READ_BARRIER_NOT_SATISFIED unless the state read is at or past this snapshot.
+  Snapshot read_barrier = 11;
+  // Read exactly the state this snapshot token pins, and extend its expiry. An expired,
+  // released, or unknown token is FAILED_PRECONDITION (reason SNAPSHOT_EXPIRED); a malformed
+  // one INVALID_ARGUMENT.
+  string snapshot_token = 12;
   // Pin the state the query reads under a snapshot token, returned in the reply, for repeatable
-  // reads. Fails with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`) past the pin limits.
-  bool pin = 11;
+  // reads. Fails with RESOURCE_EXHAUSTED (reason TOO_MANY_SNAPSHOTS) past the pin limits.
+  bool pin = 13;
 }
 
-// One search hit. `id` is the primary key as text, and `metadata` holds the record's
-// scalar fields and visible `$extra` keys.
-message QueryMatch {
-  string id = 1;
-  float value = 2;
-  JsonObject metadata = 3;
+// One result: the record, projected, and its score.
+message QueryHit {
+  Record record = 1;
+  // The metric value of a vector search: similarity for cosine and dot (higher is better),
+  // Euclidean distance for l2 (lower is better). Unset for a scan.
+  optional float score = 2;
 }
 
 enum QueryPlanKind {
@@ -661,6 +822,7 @@ enum QueryPlanKind {
   QUERY_PLAN_KIND_VECTOR_FIRST_ANN = 5;
   QUERY_PLAN_KIND_COOPERATIVE_FILTERED_ANN = 6;
   QUERY_PLAN_KIND_HYBRID_EXACT_ANN_MERGE = 7;
+  QUERY_PLAN_KIND_ORDERED_SCAN = 8;
 }
 
 message QueryStageTimings {
@@ -692,14 +854,19 @@ message QueryDiagnostics {
 message QueryCollectionReply {
   string database_name = 1;
   string collection_name = 2;
-  DistanceMetric metric = 3;
-  uint64 top_k = 4;
-  uint64 returned = 5;
-  Snapshot snapshot = 6;
-  repeated QueryMatch matches = 7;
-  QueryDiagnostics diagnostics = 8;
+  // The vector field searched; empty for a scan.
+  string vector_field = 3;
+  // That field's metric; unspecified for a scan.
+  DistanceMetric metric = 4;
+  uint64 top_k = 5;
+  uint64 returned = 6;
+  // The state the query read.
+  Snapshot snapshot = 7;
+  // Best first (a scan: in order).
+  repeated QueryHit hits = 8;
+  QueryDiagnostics diagnostics = 9;
   // The token pinning the state read: set when the request pinned or named a token.
-  string snapshot_token = 9;
+  string snapshot_token = 10;
 }
 
 // Statistics and maintenance
@@ -749,13 +916,13 @@ message InspectCollectionRequest {
   string segment_id = 4;
 }
 
-// An operator diagnostic dump; `payload_json` is a JSON document whose shape depends on the
-// target and is not a stable contract.
+// An operator diagnostic dump: `payload` is a JSON document whose shape depends on the target
+// and is not a stable contract.
 message InspectCollectionReply {
   string database_name = 1;
   string collection_name = 2;
   string target = 3;
-  string payload_json = 4;
+  JsonValue payload = 4;
 }
 
 message MaintenanceStatus {
@@ -782,8 +949,9 @@ message ScalarFieldStats {
   uint64 present_count = 1;
   uint64 null_count = 2;
   map<string, uint64> value_counts = 3;
-  ScalarValue min = 4;
-  ScalarValue max = 5;
+  // The smallest and largest values as JSON scalars; unset when unknown.
+  JsonValue min = 4;
+  JsonValue max = 5;
   uint64 distinct_count = 6;
 }
 

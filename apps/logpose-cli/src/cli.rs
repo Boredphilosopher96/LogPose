@@ -1,13 +1,16 @@
 use crate::action::{
     Action, CollectionAlterAction, CollectionCreateAction, CollectionSchemaCreateAction,
-    CollectionStatsAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg, MetricArg,
-    QueryAction, QueryFilter, QueryVector, RecordDeleteAction, RecordGetAction, RecordPutAction,
-    WorkflowKind, parse_query_filter, parse_query_vector, parse_query_where, parse_schema_change,
+    CollectionStatsAction, CountAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg,
+    FilterInput, MetricArg, QueryAction, QueryFilter, QueryVector, RecordDeleteAction,
+    RecordGetAction, RecordPutAction, ScrollAction, WorkflowKind, parse_order_by,
+    parse_query_filter, parse_query_vector, parse_query_where, parse_schema_change,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use logpose_query::OrderBy;
 use logpose_storage::InspectTarget;
 use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME};
 use logpose_types::{DistanceMetric, schema::SchemaChange};
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +203,7 @@ impl Cli {
                     RecordCommand::Delete(args) => Action::RecordDelete(RecordDeleteAction {
                         collection: args.collection_ref(),
                         id: args.id,
+                        filter: args.filter.into_input(),
                     }),
                     RecordCommand::Get(args) => Action::RecordGet(RecordGetAction {
                         collection: args.namespace.collection_ref(args.collection),
@@ -213,14 +217,41 @@ impl Cli {
                     output,
                 }
             }
+            Commands::Count(args) => CommandRequest::Direct {
+                action: Action::Count(CountAction {
+                    collection: args.namespace.collection_ref(args.collection),
+                    filter: args.filter.into_input(),
+                    snapshot_token: args.snapshot_token,
+                    pin: args.pin,
+                }),
+                auth_token: auth_token.clone(),
+                output,
+            },
+            Commands::Scroll(args) => CommandRequest::Direct {
+                action: Action::Scroll(ScrollAction {
+                    collection: args.namespace.collection_ref(args.collection),
+                    filter: args.filter.into_input(),
+                    order_by: args.order_by,
+                    page_size: args.page_size,
+                    output_fields: args.output_fields,
+                    cursor: args.cursor,
+                    snapshot_token: args.snapshot_token,
+                }),
+                auth_token: auth_token.clone(),
+                output,
+            },
             Commands::Query(args) => CommandRequest::Direct {
                 action: Action::Query(QueryAction {
                     collection: args.collection_ref(),
                     top_k: args.top_k,
                     vector: args.vector,
-                    filters: args.filters,
-                    where_clauses: args.where_clauses,
-                    predicate_json: args.predicate_json,
+                    vector_field: args.vector_field,
+                    filter: args.filter.into_input(),
+                    order_by: args.order_by,
+                    output_fields: args.output_fields,
+                    ef: args.ef,
+                    snapshot_token: args.snapshot_token,
+                    pin: args.pin,
                     explain: args.explain,
                     snapshot_manifest_generation: args.snapshot_manifest_generation,
                     snapshot_visible_seq_no: args.snapshot_visible_seq_no,
@@ -305,10 +336,14 @@ pub enum Commands {
     Database(DatabaseGroup),
     /// Create, inspect, place, and maintain collections.
     Collection(CollectionGroup),
-    /// Ingest and delete records.
+    /// Ingest, read, and delete records.
     Record(RecordGroup),
-    /// Run vector search with optional filters and planner diagnostics.
+    /// Run vector search, or a filtered scan, with optional filters and planner diagnostics.
     Query(QueryArgs),
+    /// Count the records matching a filter.
+    Count(CountArgs),
+    /// Page through the records matching a filter.
+    Scroll(ScrollArgs),
     /// Inspect manifest, WAL, maintenance state, or a single segment.
     Inspect(InspectGroup),
     /// Full-screen interactive dashboard with forms, result tabs, json view, and command preview.
@@ -436,13 +471,13 @@ pub struct InteractiveArgs {
         value_name = "FIELD:OP[:VALUE]",
         help = "Prefill query predicates. Example: kind:eq:keep"
     )]
-    pub where_clauses: Vec<logpose_query::FilterExpr>,
+    pub where_clauses: Vec<Value>,
     #[arg(
         long,
         value_name = "PATH",
-        help = "Prefill predicate JSON path. Example: predicate.json"
+        help = "Prefill filter JSON path. Example: filter.json"
     )]
-    pub predicate_json: Option<PathBuf>,
+    pub filter_json: Option<PathBuf>,
     #[arg(
         long,
         value_enum,
@@ -743,7 +778,7 @@ pub struct RecordGroup {
 pub enum RecordCommand {
     /// Ingest newline-delimited JSON records into a collection.
     Put(RecordPutArgs),
-    /// Tombstone a single record id in a collection.
+    /// Delete a record by key, or every record a filter matches.
     Delete(RecordDeleteArgs),
     /// Read records by primary key.
     Get(RecordGetArgs),
@@ -771,7 +806,7 @@ pub struct RecordGetArgs {
     #[arg(
         long = "output-field",
         value_name = "FIELD",
-        help = "Return only this field; repeat for more. The primary key is always returned."
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
     )]
     pub output_fields: Vec<String>,
 }
@@ -803,24 +838,139 @@ impl RecordPutArgs {
     }
 }
 
+/// Filter flags shared by query, count, scroll, and delete; every flag given must match.
+#[derive(Debug, Args, Clone, Default)]
+pub struct FilterArgs {
+    #[arg(
+        long = "filter",
+        value_parser = parse_query_filter,
+        value_name = "FIELD=VALUE",
+        help = "Match a field or $extra key exactly. Bare values are strings; prefix json: for other JSON. Examples: kind=article, score=json:7, enabled=json:true"
+    )]
+    pub filters: Vec<QueryFilter>,
+    #[arg(
+        long = "where",
+        value_parser = parse_query_where,
+        value_name = "FIELD:OP[:VALUE]",
+        help = "Add a comparison. Operators: eq, ne, lt, lte, gt, gte, in, not_in, contains, contains_any, exists, is_null. List operators take json:[...]. Example: kind:eq:keep"
+    )]
+    pub where_clauses: Vec<Value>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Read a filter JSON document, as the REST API takes it, from disk. Example: filter.json"
+    )]
+    pub filter_json: Option<PathBuf>,
+}
+
+impl FilterArgs {
+    pub fn into_input(self) -> FilterInput {
+        FilterInput {
+            filters: self.filters,
+            where_clauses: self.where_clauses,
+            filter_json: self.filter_json,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(
-    about = "Tombstone a single record id in a collection.",
-    after_long_help = "Examples:\n  logpose record delete colors alpha\n  logpose --json record delete colors alpha\n  logpose interactive"
+    about = "Delete a record by key, or every record a filter matches, as one atomic batch.",
+    after_long_help = "Examples:\n  logpose record delete colors alpha\n  logpose record delete colors --filter kind=drop\n  logpose --json record delete colors --where score:lt:json:3\n  logpose interactive"
 )]
 pub struct RecordDeleteArgs {
     #[command(flatten)]
     pub namespace: NamespaceArgs,
     #[arg(
         value_name = "COLLECTION",
-        help = "Collection that contains the record. Example: colors"
+        help = "Collection that contains the records. Example: colors"
     )]
     pub collection: String,
     #[arg(
         value_name = "RECORD_ID",
-        help = "Record id to tombstone. Example: alpha"
+        required_unless_present_any = ["filters", "where_clauses", "filter_json"],
+        help = "Primary key of the record to delete, typed by the schema. Example: alpha"
     )]
-    pub id: String,
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub filter: FilterArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Count the records matching a filter.",
+    after_long_help = "Examples:\n  logpose count colors\n  logpose count colors --filter kind=keep\n  logpose --json count colors --where score:gte:json:7 --pin"
+)]
+pub struct CountArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(
+        value_name = "COLLECTION",
+        help = "Collection to count. Example: colors"
+    )]
+    pub collection: String,
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Count the state this snapshot token pins."
+    )]
+    pub snapshot_token: Option<String>,
+    #[arg(
+        long,
+        help = "Pin the state counted and print its snapshot token, to scroll or query exactly that state."
+    )]
+    pub pin: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Print one page of the records matching a filter, and the cursor of the next page.",
+    after_long_help = "Examples:\n  logpose scroll colors --page-size 100\n  logpose scroll colors --filter kind=keep --order-by score:desc\n  logpose --json scroll colors --cursor <CURSOR>\n\nSend the next page with the same filter and order and the printed cursor."
+)]
+pub struct ScrollArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(
+        value_name = "COLLECTION",
+        help = "Collection to scroll. Example: colors"
+    )]
+    pub collection: String,
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    #[arg(
+        long,
+        value_parser = parse_order_by,
+        value_name = "FIELD[:asc|desc]",
+        help = "Order by a scalar field; primary key order by default. Example: score:desc"
+    )]
+    pub order_by: Option<OrderBy>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        help = "Records per page, 1 to 10000. Defaults to 100."
+    )]
+    pub page_size: Option<u32>,
+    #[arg(
+        long = "output-field",
+        value_name = "FIELD",
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
+    )]
+    pub output_fields: Vec<String>,
+    #[arg(
+        long,
+        value_name = "CURSOR",
+        conflicts_with = "snapshot_token",
+        help = "Continue after the page that printed this cursor."
+    )]
+    pub cursor: Option<String>,
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Scroll the state this snapshot token pins."
+    )]
+    pub snapshot_token: Option<String>,
 }
 
 impl RecordDeleteArgs {
@@ -831,8 +981,8 @@ impl RecordDeleteArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Run vector search with optional filters, predicates, and planner diagnostics.",
-    after_long_help = "Examples:\n  logpose query colors --vector 0.12,-0.44,0.90 --top-k 3\n  logpose query colors --vector 1.0,0.0 --top-k 2 --filter kind=article\n  logpose query colors --vector 1.0,0.0 --top-k 2 --read-barrier-manifest-generation 0 --read-barrier-visible-seq-no 3\n  logpose --json query colors --vector 1.0,0.0 --top-k 1 --where kind:eq:keep --explain profile\n  logpose interactive"
+    about = "Run vector search, or without --vector a filtered scan, with optional filters, order, projection, and planner diagnostics.",
+    after_long_help = "Examples:\n  logpose query colors --vector 0.12,-0.44,0.90 --top-k 3\n  logpose query colors --vector 1.0,0.0 --top-k 2 --filter kind=article\n  logpose query colors --top-k 5 --where score:gte:json:7 --order-by score:desc\n  logpose query colors --vector 1.0,0.0 --top-k 2 --read-barrier-manifest-generation 0 --read-barrier-visible-seq-no 3\n  logpose --json query colors --vector 1.0,0.0 --top-k 1 --where kind:eq:keep --explain profile\n  logpose interactive"
 )]
 pub struct QueryArgs {
     #[command(flatten)]
@@ -845,36 +995,53 @@ pub struct QueryArgs {
     #[arg(
         long,
         value_name = "COUNT",
-        help = "Maximum number of matches to return. Example: 10"
+        help = "Maximum number of results to return. Example: 10"
     )]
     pub top_k: usize,
     #[arg(
         long,
         value_parser = parse_query_vector,
         value_name = "VECTOR",
-        help = "Comma-separated query vector. Example: 0.12,-0.44,0.90"
+        help = "Comma-separated query vector. Without one the query is a filtered scan. Example: 0.12,-0.44,0.90"
     )]
-    pub vector: QueryVector,
-    #[arg(
-        long = "filter",
-        value_parser = parse_query_filter,
-        value_name = "FIELD=VALUE",
-        help = "Match a scalar metadata field. Examples: kind=article, score=json:7, enabled=json:true"
-    )]
-    pub filters: Vec<QueryFilter>,
-    #[arg(
-        long = "where",
-        value_parser = parse_query_where,
-        value_name = "FIELD:OP[:VALUE]",
-        help = "Add a predicate comparison. Operators: eq, ne, lt, lte, gt, gte, exists, is_null. Example: kind:eq:keep"
-    )]
-    pub where_clauses: Vec<logpose_query::FilterExpr>,
+    pub vector: Option<QueryVector>,
     #[arg(
         long,
-        value_name = "PATH",
-        help = "Read an entire predicate JSON document from disk. Example: predicate.json"
+        value_name = "FIELD",
+        requires = "vector",
+        help = "Vector field to search; required when the collection has several."
     )]
-    pub predicate_json: Option<PathBuf>,
+    pub vector_field: Option<String>,
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    #[arg(
+        long,
+        value_parser = parse_order_by,
+        value_name = "FIELD[:asc|desc]",
+        help = "Order results by a scalar field: the scan order, or a reorder of the vector hits. Example: score:desc"
+    )]
+    pub order_by: Option<OrderBy>,
+    #[arg(
+        long = "output-field",
+        value_name = "FIELD",
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
+    )]
+    pub output_fields: Vec<String>,
+    #[arg(
+        long,
+        value_name = "EF",
+        requires = "vector",
+        help = "Beam width of graph walks, 1 to 4096. Example: 128"
+    )]
+    pub ef: Option<usize>,
+    #[arg(
+        long,
+        value_name = "TOKEN",
+        help = "Read the state this snapshot token pins."
+    )]
+    pub snapshot_token: Option<String>,
+    #[arg(long, help = "Pin the state read and print its snapshot token.")]
+    pub pin: bool,
     #[arg(
         long,
         value_enum,

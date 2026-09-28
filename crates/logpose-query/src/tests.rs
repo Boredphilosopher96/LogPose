@@ -5,8 +5,8 @@ use crate::{CompiledFilter, QueryError};
 use async_trait as _;
 use criterion as _;
 use logpose_types::{
-    ScalarMetadataValue,
-    filter::{FilterComparison, FilterExpr, FilterOperator},
+    LogPoseError,
+    filter::FilterExpr,
     record::Record,
     schema::{CollectionSchema, CreateCollectionSpec},
     value::{Timestamp, Value},
@@ -33,26 +33,12 @@ fn schema() -> Arc<CollectionSchema> {
     Arc::new(spec.to_schema().expect("schema should validate"))
 }
 
-fn cmp(field: &str, operator: FilterOperator, value: Option<ScalarMetadataValue>) -> FilterExpr {
-    FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator,
-        value,
-    })
+fn float(value: f64) -> Value {
+    Value::Float64(value)
 }
 
-fn number(value: f64) -> Option<ScalarMetadataValue> {
-    Some(ScalarMetadataValue::Number(
-        serde_json::Number::from_f64(value).expect("finite"),
-    ))
-}
-
-fn int(value: i64) -> Option<ScalarMetadataValue> {
-    Some(ScalarMetadataValue::Number(value.into()))
-}
-
-fn text(value: &str) -> Option<ScalarMetadataValue> {
-    Some(ScalarMetadataValue::String(value.to_owned()))
+fn seen(micros: i64) -> Value {
+    Value::Timestamp(Timestamp::from_micros(micros).expect("timestamp"))
 }
 
 fn matches(filter: &FilterExpr, record: &Record) -> bool {
@@ -65,10 +51,7 @@ fn item() -> Record {
     let mut record = Record::new("a-1")
         .with_field("count", Value::Int64(3))
         .with_field("price", Value::Float64(2.5))
-        .with_field(
-            "seen",
-            Value::Timestamp(Timestamp::from_micros(1_000_000).expect("timestamp")),
-        )
+        .with_field("seen", seen(1_000_000))
         .with_field(
             "tags",
             Value::Array(vec![
@@ -82,39 +65,18 @@ fn item() -> Record {
 }
 
 #[test]
-fn integer_fields_compare_numerically_with_integral_and_fractional_operands() {
+fn integer_fields_compare_numerically_with_integral_and_fractional_bounds() {
     let record = item();
+    assert!(matches(&FilterExpr::eq("count", float(3.0)), &record));
+    assert!(matches(&FilterExpr::lt("count", float(3.5)), &record));
+    assert!(!matches(&FilterExpr::gt("count", float(3.5)), &record));
+    assert!(matches(&FilterExpr::gte("count", float(2.1)), &record));
     assert!(matches(
-        &cmp("count", FilterOperator::Eq, number(3.0)),
+        &FilterExpr::in_values("count", vec![Value::Int64(1), Value::Int64(3)]),
         &record
     ));
     assert!(!matches(
-        &cmp("count", FilterOperator::Eq, number(3.5)),
-        &record
-    ));
-    assert!(matches(
-        &cmp("count", FilterOperator::Lt, number(3.5)),
-        &record
-    ));
-    assert!(!matches(
-        &cmp("count", FilterOperator::Gt, number(3.5)),
-        &record
-    ));
-    assert!(matches(
-        &cmp("count", FilterOperator::Gte, number(2.1)),
-        &record
-    ));
-    assert!(matches(
-        &cmp("count", FilterOperator::Ne, number(3.5)),
-        &record
-    ));
-    // A string never equals an integer, so every row with a value is "not equal".
-    assert!(!matches(
-        &cmp("count", FilterOperator::Eq, text("3")),
-        &record
-    ));
-    assert!(matches(
-        &cmp("count", FilterOperator::Ne, text("3")),
+        &FilterExpr::not_in("count", vec![Value::Int64(3)]),
         &record
     ));
 }
@@ -122,21 +84,16 @@ fn integer_fields_compare_numerically_with_integral_and_fractional_operands() {
 #[test]
 fn floats_and_timestamps_accept_their_operand_forms() {
     let record = item();
+    assert!(matches(&FilterExpr::eq("price", float(2.5)), &record));
+    assert!(matches(&FilterExpr::gt("price", Value::Int64(2)), &record));
+    assert!(matches(&FilterExpr::eq("seen", seen(1_000_000)), &record));
     assert!(matches(
-        &cmp("price", FilterOperator::Eq, number(2.5)),
+        &FilterExpr::eq("seen", Value::Int64(1_000_000)),
         &record
     ));
-    assert!(matches(&cmp("price", FilterOperator::Gt, int(2)), &record));
+    assert!(matches(&FilterExpr::lt("seen", seen(2_000_000)), &record));
     assert!(matches(
-        &cmp("seen", FilterOperator::Eq, text("1970-01-01T00:00:01Z")),
-        &record
-    ));
-    assert!(matches(
-        &cmp("seen", FilterOperator::Eq, int(1_000_000)),
-        &record
-    ));
-    assert!(matches(
-        &cmp("seen", FilterOperator::Lt, text("1970-01-01T00:00:02Z")),
+        &FilterExpr::lt("seen", float(1_000_000.5)),
         &record
     ));
 }
@@ -144,102 +101,91 @@ fn floats_and_timestamps_accept_their_operand_forms() {
 #[test]
 fn arrays_match_by_element_and_ne_excludes_rows_holding_the_value() {
     let record = item();
+    assert!(matches(&FilterExpr::eq("tags", "blue"), &record));
+    assert!(matches(&FilterExpr::contains("tags", "blue"), &record));
     assert!(matches(
-        &cmp("tags", FilterOperator::Eq, text("blue")),
+        &FilterExpr::contains_any("tags", vec![Value::from("x"), Value::from("red")]),
         &record
     ));
-    assert!(!matches(
-        &cmp("tags", FilterOperator::Ne, text("blue")),
-        &record
-    ));
-    assert!(matches(
-        &cmp("tags", FilterOperator::Ne, text("green")),
-        &record
-    ));
+    assert!(!matches(&FilterExpr::ne("tags", "blue"), &record));
+    assert!(matches(&FilterExpr::ne("tags", "green"), &record));
+    assert!(matches(&FilterExpr::gte("tags", "red"), &record));
     let empty = Record::new("a-2").with_field("tags", Value::Array(Vec::new()));
-    assert!(matches(&cmp("tags", FilterOperator::IsNull, None), &empty));
-    assert!(!matches(
-        &cmp("tags", FilterOperator::Ne, text("green")),
-        &empty
-    ));
+    assert!(matches(&FilterExpr::is_null("tags"), &empty));
+    assert!(!matches(&FilterExpr::ne("tags", "green"), &empty));
 }
 
 #[test]
 fn nulls_never_match_ne_but_not_includes_them() {
     let missing = Record::new("a-3");
-    let ne = cmp("count", FilterOperator::Ne, int(1));
-    assert!(!matches(&ne, &missing));
-    let not_eq = FilterExpr::Not {
-        child: Box::new(cmp("count", FilterOperator::Eq, int(1))),
-    };
-    assert!(matches(&not_eq, &missing));
-    assert!(matches(
-        &cmp("count", FilterOperator::IsNull, None),
+    assert!(!matches(
+        &FilterExpr::ne("count", Value::Int64(1)),
         &missing
     ));
     assert!(!matches(
-        &cmp("count", FilterOperator::Exists, None),
+        &FilterExpr::not_in("count", vec![Value::Int64(1)]),
         &missing
     ));
     assert!(matches(
-        &cmp("count", FilterOperator::Eq, Some(ScalarMetadataValue::Null)),
+        &FilterExpr::negate(FilterExpr::eq("count", Value::Int64(1))),
         &missing
     ));
+    assert!(matches(&FilterExpr::is_null("count"), &missing));
+    assert!(!matches(&FilterExpr::exists("count"), &missing));
 }
 
 #[test]
 fn dynamic_keys_keep_the_json_semantics() {
     let record = item();
+    assert!(matches(&FilterExpr::eq("color", "red"), &record));
+    assert!(matches(&FilterExpr::eq("$extra.color", "red"), &record));
     assert!(matches(
-        &cmp("color", FilterOperator::Eq, text("red")),
+        &FilterExpr::eq("color", Value::Json(json!("red"))),
         &record
     ));
-    assert!(matches(&cmp("gone", FilterOperator::Exists, None), &record));
-    assert!(matches(&cmp("gone", FilterOperator::IsNull, None), &record));
-    assert!(!matches(
-        &cmp("absent", FilterOperator::Exists, None),
-        &record
-    ));
-    assert!(matches(&cmp("color", FilterOperator::Ne, int(1)), &record));
-    assert!(!matches(&cmp("color", FilterOperator::Lt, int(1)), &record));
+    assert!(matches(&FilterExpr::exists("gone"), &record));
+    assert!(matches(&FilterExpr::is_null("gone"), &record));
+    assert!(!matches(&FilterExpr::ne("gone", "x"), &record));
+    assert!(!matches(&FilterExpr::exists("absent"), &record));
+    assert!(matches(&FilterExpr::ne("color", Value::Int64(1)), &record));
+    assert!(!matches(&FilterExpr::lt("color", Value::Int64(1)), &record));
+    assert!(matches(&FilterExpr::gte("color", "red"), &record));
 }
 
 #[test]
 fn the_primary_key_filters_like_a_never_null_field() {
     let record = item();
-    assert!(matches(
-        &cmp("sku", FilterOperator::Eq, text("a-1")),
-        &record
-    ));
-    assert!(matches(
-        &cmp("sku", FilterOperator::Gt, text("a-0")),
-        &record
-    ));
-    assert!(!matches(&cmp("sku", FilterOperator::IsNull, None), &record));
+    assert!(matches(&FilterExpr::eq("sku", "a-1"), &record));
+    assert!(matches(&FilterExpr::gt("sku", "a-0"), &record));
+    assert!(!matches(&FilterExpr::is_null("sku"), &record));
 }
 
 #[test]
-fn malformed_filters_and_vector_fields_are_refused() {
+fn malformed_filters_and_vector_fields_are_refused_at_their_path() {
     let invalid = [
-        FilterExpr::And {
-            children: Vec::new(),
-        },
-        cmp("count", FilterOperator::Eq, None),
-        cmp("count", FilterOperator::Exists, int(1)),
-        cmp(
-            "count",
-            FilterOperator::Lt,
-            Some(ScalarMetadataValue::Bool(true)),
+        (FilterExpr::and(Vec::new()), "filter.and"),
+        (FilterExpr::eq("count", "3"), "filter.eq.count"),
+        (FilterExpr::eq("count", float(3.5)), "filter.eq.count"),
+        (FilterExpr::lt("count", true), "filter.range.count.lt"),
+        (FilterExpr::exists("embedding"), "filter.exists"),
+        (
+            FilterExpr::contains("count", Value::Int64(3)),
+            "filter.contains.count",
         ),
-        cmp("embedding", FilterOperator::Exists, None),
+        (
+            FilterExpr::or(vec![
+                FilterExpr::exists("count"),
+                FilterExpr::not_in("tags", Vec::new()),
+            ]),
+            "filter.or[1].not_in.tags",
+        ),
     ];
-    for filter in invalid {
-        assert!(
-            matches!(
-                CompiledFilter::compile(&schema(), &filter),
-                Err(QueryError::InvalidPredicate(_))
-            ),
-            "{filter:?}"
-        );
+    for (filter, path) in invalid {
+        match CompiledFilter::compile(&schema(), &filter) {
+            Err(QueryError::Storage(LogPoseError::InvalidArgument {
+                field: Some(field), ..
+            })) => assert_eq!(field, path, "{filter:?}"),
+            other => unreachable!("{filter:?} should be refused, got {other:?}"),
+        }
     }
 }

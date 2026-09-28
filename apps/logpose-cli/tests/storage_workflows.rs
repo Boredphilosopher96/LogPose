@@ -224,14 +224,14 @@ fn query_surfaces_local_predicate_json_errors_before_connection_failures() {
             "1",
             "--vector",
             "1.0,0.0",
-            "--predicate-json",
+            "--filter-json",
             predicate_path.to_str().expect("path should be utf8"),
         ],
     );
 
     assert!(!output.status.success(), "command should fail validation");
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("failed to parse predicate json"));
+    assert!(stderr.contains("failed to parse filter json"));
 }
 
 #[test]

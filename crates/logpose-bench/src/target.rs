@@ -7,9 +7,12 @@
 
 use crate::dataset::Metric;
 use anyhow::{Context, Result, anyhow, ensure};
-use logpose_query::{ExplainMode, FilterExpr, QueryRequest, query};
+use logpose_query::{ExplainMode, FilterExpr, QueryRequest, VectorQuery, query};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
-use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{
+    CollectionRef, DistanceMetric, PutRecord, RecordId, WriteOperation,
+    legacy::LEGACY_PRIMARY_KEY_FIELD,
+};
 use serde_json::{Map, Value};
 use std::{
     path::PathBuf,
@@ -255,33 +258,33 @@ impl BenchTarget for LocalEngineTarget {
     }
 
     fn search(&self, request: &SearchRequest<'_>) -> Result<SearchResponse> {
+        let collection = CollectionRef::parse(self.collection()?)?;
         let response = self
             .runtime
             .block_on(query(
                 &self.engine,
+                &collection,
                 QueryRequest {
-                    collection_name: self.collection()?.to_owned(),
-                    vector: request.vector.to_vec(),
+                    vector: Some(VectorQuery {
+                        field: None,
+                        values: request.vector.to_vec(),
+                    }),
                     top_k: request.k,
-                    snapshot: None,
-                    read_barrier: None,
-                    filters: Vec::new(),
-                    predicate: request.filter.cloned(),
+                    filter: request.filter.cloned(),
+                    output_fields: vec![LEGACY_PRIMARY_KEY_FIELD.to_owned()],
                     explain: ExplainMode::Plan,
-                    snapshot_token: None,
-                    pin: false,
+                    ..QueryRequest::default()
                 },
             ))
-            .context("running query")?;
+            .context("running query")?
+            .value;
         let ids = response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| {
-                candidate
-                    .id
-                    .as_str()
-                    .parse::<u64>()
-                    .with_context(|| format!("unexpected record id {}", candidate.id.as_str()))
+            .map(|hit| {
+                let id = hit.record.pk.label();
+                id.parse::<u64>()
+                    .with_context(|| format!("unexpected record id {id}"))
             })
             .collect::<Result<Vec<_>>>()?;
         let plan = response.diagnostics.and_then(|diagnostics| {

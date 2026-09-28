@@ -11,10 +11,7 @@ use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
-use logpose_query::{
-    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, SearchRequest, SearchTuning,
-    UnitStrategy, search,
-};
+use logpose_query::{FilterExpr, SearchRequest, SearchTuning, UnitStrategy, search};
 use logpose_storage::{IndexPolicy, ReadView};
 use logpose_types::{DistanceMetric, schema::FieldType, value::Value};
 use rayon as _;
@@ -49,14 +46,6 @@ struct Case {
     anti: bool,
 }
 
-fn comparison(field: &str, operator: FilterOperator, value: i64) -> FilterExpr {
-    FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator,
-        value: Some(ScalarMetadataValue::Number(value.into())),
-    })
-}
-
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -67,37 +56,37 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "uniform 1%",
-            filter: Some(comparison("bucket", FilterOperator::Eq, 7)),
+            filter: Some(FilterExpr::eq("bucket", 7_i64)),
             keep: |row| row.bucket == 7,
             anti: false,
         },
         Case {
             name: "uniform 10%",
-            filter: Some(comparison("bucket", FilterOperator::Lt, 10)),
+            filter: Some(FilterExpr::lt("bucket", 10_i64)),
             keep: |row| row.bucket < 10,
             anti: false,
         },
         Case {
             name: "uniform 50%",
-            filter: Some(comparison("bucket", FilterOperator::Lt, 50)),
+            filter: Some(FilterExpr::lt("bucket", 50_i64)),
             keep: |row| row.bucket < 50,
             anti: false,
         },
         Case {
             name: "anti-correlated 1%",
-            filter: Some(comparison("cluster", FilterOperator::Eq, 99)),
+            filter: Some(FilterExpr::eq("cluster", 99_i64)),
             keep: |row| row.cluster == 99,
             anti: true,
         },
         Case {
             name: "anti-correlated 10%",
-            filter: Some(comparison("cluster", FilterOperator::Gte, 90)),
+            filter: Some(FilterExpr::gte("cluster", 90_i64)),
             keep: |row| row.cluster >= 90,
             anti: true,
         },
         Case {
             name: "anti-correlated 50%",
-            filter: Some(comparison("cluster", FilterOperator::Gte, 50)),
+            filter: Some(FilterExpr::gte("cluster", 50_i64)),
             keep: |row| row.cluster >= 50,
             anti: true,
         },

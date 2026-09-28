@@ -18,10 +18,10 @@ pub use logpose_types::{ErrorCode, ErrorReason, FieldViolation};
 pub use retry::{NodeResolver, RedirectPolicy, RetryPolicy};
 
 use logpose_api_grpc::convert::{
-    collection_from_proto, create_request_to_proto, database_policy_to_proto,
-    json_object_from_proto, metric_from_proto, primary_key_from_proto, primary_key_to_proto,
-    record_from_proto, record_to_proto, schema_change_to_proto, snapshot_from_proto,
-    snapshot_to_proto, update_to_proto,
+    collection_from_proto, create_request_to_proto, database_policy_to_proto, filter_to_proto,
+    json_from_proto, metric_from_proto, order_by_to_proto, patch_to_proto, primary_key_from_proto,
+    primary_key_to_proto, record_from_proto, record_to_proto, schema_change_to_proto,
+    snapshot_from_proto, snapshot_to_proto, update_to_proto,
 };
 use logpose_api_grpc::proto::{
     self, AlterCollectionRequest, CollectionPlacementReply, CommitAckReply,
@@ -30,9 +30,8 @@ use logpose_api_grpc::proto::{
     GetCollectionRequest, GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest,
     GetMetadataRequest, GetRecordsRequest, GetRuntimeStatusRequest, InspectCollectionRequest,
     ListCollectionsRequest, ListDatabasesRequest, MaintenanceBacklogReply,
-    PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest, ScalarValue,
-    SnapshotReply, UpdateRecordsRequest, UpsertRecordsRequest,
-    log_pose_service_client::LogPoseServiceClient,
+    PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest, SnapshotReply,
+    UpdateRecordsRequest, UpsertRecordsRequest, log_pose_service_client::LogPoseServiceClient,
 };
 use logpose_auth::{AuthenticationMode, DatabaseRole};
 pub use logpose_auth::{DatabaseAccessPolicy, DatabaseRoleBinding};
@@ -41,24 +40,24 @@ pub use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_config as _;
 #[cfg(test)]
 use logpose_core as _;
-use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
-    QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings, ScalarMetadataValue,
+pub use logpose_query::{
+    CountRecordsRequest, CountRecordsResponse, ExplainMode, FilterExpr, OrderBy, QueryDiagnostics,
+    QueryHit, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings, RangeBounds,
+    ReadConsistency, ScrollRecordsRequest, ScrollRecordsResponse, SortDirection, VectorQuery,
 };
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
     CollectionId, CollectionPlacement, CollectionStats, CommitAck, CoordinationStatus,
     MaintenanceBacklog, MaintenanceError, MaintenanceStatus, NodeMetadata, NodeRole,
-    NodeRuntimeStatus, QueryUnitStats, RecordId, ScalarFieldStats, Snapshot,
+    NodeRuntimeStatus, QueryUnitStats, ScalarFieldStats, ScalarMetadataValue, Snapshot,
 };
 pub use logpose_types::{
     CollectionRef,
-    record::{PartialUpdate, PrimaryKey, Record},
+    record::{PartialUpdate, PrimaryKey, Record, RecordPatch},
     schema::SchemaChange,
 };
 use retry::Operation;
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -159,6 +158,15 @@ impl Interceptor for AuthInterceptor {
 
 type ServiceClient = LogPoseServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
+/// A service client that decodes replies of any size: the server bounds its replies by its
+/// configured message limit (16 MiB by default) and reports larger ones as `TOO_LARGE`, so the
+/// client does not add a smaller limit of its own (tonic's default is 4 MiB).
+fn service_client(channel: Channel, interceptor: AuthInterceptor) -> ServiceClient {
+    LogPoseServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX)
+}
+
 /// Thin gRPC client over the shared LogPose server contract.
 ///
 /// Cloning is cheap: clones share the connection and the redirect connections.
@@ -186,7 +194,7 @@ impl LogPoseClient {
         let channel = Endpoint::new(endpoint.into())?.connect().await?;
         let interceptor = AuthInterceptor::new(auth_token)?;
         Ok(Self {
-            inner: LogPoseServiceClient::with_interceptor(channel, interceptor.clone()),
+            inner: service_client(channel, interceptor.clone()),
             interceptor,
             retry: RetryPolicy::disabled(),
             redirects: None,
@@ -269,7 +277,7 @@ impl LogPoseClient {
             return Ok(client.clone());
         }
         let channel = Endpoint::new(endpoint.to_owned())?.connect_lazy();
-        let client = LogPoseServiceClient::with_interceptor(channel, self.interceptor.clone());
+        let client = service_client(channel, self.interceptor.clone());
         peers.insert(endpoint.to_owned(), client.clone());
         Ok(client)
     }
@@ -529,6 +537,8 @@ impl LogPoseClient {
                     database_name: collection.database_name.clone(),
                     collection_name: collection.collection_name.clone(),
                     records: updates.into_iter().map(update_to_proto).collect(),
+                    filter: None,
+                    patch: None,
                 },
                 |mut client, request| async move { client.update_records(request).await },
             )
@@ -549,6 +559,7 @@ impl LogPoseClient {
                     database_name: collection.database_name.clone(),
                     collection_name: collection.collection_name.clone(),
                     keys: keys.into_iter().map(primary_key_to_proto).collect(),
+                    filter: None,
                 },
                 |mut client, request| async move { client.delete_records(request).await },
             )
@@ -556,7 +567,135 @@ impl LogPoseClient {
         commit_ack_from_proto(response)
     }
 
-    /// Read records by primary key, projected to `output_fields` (every field when empty).
+    /// Delete every live record matching `filter`, as one atomic batch; `applied_ops` is the
+    /// number deleted. A match too large for one WAL frame fails with `TOO_LARGE`.
+    pub async fn delete_by_filter(
+        &self,
+        collection: &CollectionRef,
+        filter: FilterExpr,
+    ) -> Result<ScopedCollectionResponse<CommitAck>> {
+        let response = self
+            .call(
+                Operation::Write,
+                DeleteRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    keys: Vec::new(),
+                    filter: Some(filter_to_proto(filter)),
+                },
+                |mut client, request| async move { client.delete_records(request).await },
+            )
+            .await?;
+        commit_ack_from_proto(response)
+    }
+
+    /// Apply `patch` to every live record matching `filter`, as one atomic batch;
+    /// `applied_ops` is the number updated.
+    pub async fn update_by_filter(
+        &self,
+        collection: &CollectionRef,
+        filter: FilterExpr,
+        patch: RecordPatch,
+    ) -> Result<ScopedCollectionResponse<CommitAck>> {
+        let response = self
+            .call(
+                Operation::Write,
+                UpdateRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    records: Vec::new(),
+                    filter: Some(filter_to_proto(filter)),
+                    patch: Some(patch_to_proto(patch)),
+                },
+                |mut client, request| async move { client.update_records(request).await },
+            )
+            .await?;
+        commit_ack_from_proto(response)
+    }
+
+    /// Count the live records matching a filter.
+    pub async fn count(
+        &self,
+        collection: &CollectionRef,
+        request: CountRecordsRequest,
+    ) -> Result<ScopedCollectionResponse<CountRecordsResponse>> {
+        let read = request.read;
+        let response = self
+            .call(
+                Operation::Read,
+                proto::CountRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    filter: request.filter.map(filter_to_proto),
+                    snapshot: read.snapshot.map(snapshot_to_proto),
+                    read_barrier: read.read_barrier.map(snapshot_to_proto),
+                    snapshot_token: read.snapshot_token.unwrap_or_default(),
+                    pin: read.pin,
+                },
+                |mut client, request| async move { client.count_records(request).await },
+            )
+            .await?;
+        Ok(ScopedCollectionResponse {
+            database_name: response.database_name,
+            collection_name: response.collection_name,
+            response: CountRecordsResponse {
+                count: response.count,
+                snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
+                    ClientError::InvalidResponse("count response missing snapshot".to_owned())
+                })?,
+                snapshot_token: (!response.snapshot_token.is_empty())
+                    .then_some(response.snapshot_token),
+            },
+        })
+    }
+
+    /// One page of a scroll through the live records matching a filter; send the page's
+    /// `next_cursor` with the same filter and order for the next page.
+    pub async fn scroll(
+        &self,
+        collection: &CollectionRef,
+        request: ScrollRecordsRequest,
+    ) -> Result<ScopedCollectionResponse<ScrollRecordsResponse>> {
+        let response = self
+            .call(
+                Operation::Read,
+                proto::ScrollRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    filter: request.filter.map(filter_to_proto),
+                    order_by: request
+                        .order_by
+                        .into_iter()
+                        .map(order_by_to_proto)
+                        .collect(),
+                    page_size: request.page_size.unwrap_or_default(),
+                    output_fields: request.output_fields,
+                    cursor: request.cursor.unwrap_or_default(),
+                    snapshot_token: request.snapshot_token.unwrap_or_default(),
+                },
+                |mut client, request| async move { client.scroll_records(request).await },
+            )
+            .await?;
+        Ok(ScopedCollectionResponse {
+            database_name: response.database_name,
+            collection_name: response.collection_name,
+            response: ScrollRecordsResponse {
+                records: response
+                    .records
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, record)| record_from_proto(record, &format!("records[{index}]")))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                next_cursor: (!response.next_cursor.is_empty()).then_some(response.next_cursor),
+                snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
+                    ClientError::InvalidResponse("scroll response missing snapshot".to_owned())
+                })?,
+            },
+        })
+    }
+
+    /// Read records by primary key, projected to `output_fields` (every scalar field and
+    /// `$extra` key, but no vector, when empty).
     pub async fn get(
         &self,
         collection: &CollectionRef,
@@ -600,53 +739,66 @@ impl LogPoseClient {
         })
     }
 
-    /// Search a collection's first vector field. `request.collection_name` names the
-    /// collection as `database/collection`.
+    /// Search a collection (or, without a vector, scan it in order).
     pub async fn query(
         &self,
+        collection: &CollectionRef,
         request: QueryRequest,
     ) -> Result<ScopedCollectionResponse<QueryResponse>> {
-        validate_read_constraints(request.snapshot.as_ref(), request.read_barrier.as_ref())?;
-        let collection = CollectionRef::parse(&request.collection_name)
-            .map_err(|error| ClientError::InvalidRequest(error.to_string()))?;
+        validate_read_constraints(
+            request.read.snapshot.as_ref(),
+            request.read.read_barrier.as_ref(),
+        )?;
+        let read = request.read;
         let response = self
             .call(
                 Operation::Read,
                 QueryCollectionRequest {
-                    database_name: collection.database_name,
-                    collection_name: collection.collection_name,
-                    vector: request.vector,
-                    top_k: request.top_k as u64,
-                    snapshot: request.snapshot.map(snapshot_to_proto),
-                    read_barrier: request.read_barrier.map(snapshot_to_proto),
-                    filters: request
-                        .filters
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    vector: request.vector.map(|vector| proto::VectorQuery {
+                        field: vector.field.unwrap_or_default(),
+                        values: vector.values,
+                    }),
+                    filter: request.filter.map(filter_to_proto),
+                    order_by: request
+                        .order_by
                         .into_iter()
-                        .map(metadata_filter_to_proto)
-                        .collect::<Result<Vec<_>>>()?,
-                    predicate: request.predicate.map(predicate_to_proto).transpose()?,
+                        .map(order_by_to_proto)
+                        .collect(),
+                    top_k: request.top_k as u64,
+                    output_fields: request.output_fields,
+                    ef: request
+                        .ef
+                        .map_or(0, |ef| u32::try_from(ef).unwrap_or(u32::MAX)),
                     explain: explain_mode_to_proto(request.explain) as i32,
-                    snapshot_token: request.snapshot_token.unwrap_or_default(),
-                    pin: request.pin,
+                    snapshot: read.snapshot.map(snapshot_to_proto),
+                    read_barrier: read.read_barrier.map(snapshot_to_proto),
+                    snapshot_token: read.snapshot_token.unwrap_or_default(),
+                    pin: read.pin,
                 },
                 |mut client, request| async move { client.query_collection(request).await },
             )
             .await?;
-
+        let metric = match proto::DistanceMetric::try_from(response.metric) {
+            Ok(proto::DistanceMetric::Unspecified) => None,
+            _ => Some(metric_from_proto(response.metric, "metric")?),
+        };
         Ok(ScopedCollectionResponse {
             database_name: response.database_name,
             collection_name: response.collection_name,
             response: QueryResponse {
-                metric: metric_from_proto(response.metric, "metric")?,
-                top_k: response.top_k as usize,
-                returned: response.returned as usize,
+                vector_field: (!response.vector_field.is_empty()).then_some(response.vector_field),
+                metric,
+                top_k: usize::try_from(response.top_k).unwrap_or(usize::MAX),
                 snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
                     ClientError::InvalidResponse("query response missing snapshot".to_owned())
                 })?,
-                matches: response
-                    .matches
+                hits: response
+                    .hits
                     .into_iter()
-                    .map(query_match_from_proto)
+                    .enumerate()
+                    .map(|(index, hit)| query_hit_from_proto(hit, index))
                     .collect::<Result<Vec<_>>>()?,
                 diagnostics: response
                     .diagnostics
@@ -761,7 +913,10 @@ impl LogPoseClient {
             collection_name: response.collection_name,
             response: InspectReport {
                 target: response.target,
-                payload: serde_json::from_str(&response.payload_json)?,
+                payload: match response.payload {
+                    Some(payload) => json_from_proto(payload, "payload")?,
+                    None => serde_json::Value::Null,
+                },
             },
         })
     }
@@ -849,15 +1004,14 @@ fn snapshot_reply_from_proto(reply: SnapshotReply) -> ScopedCollectionResponse<S
     }
 }
 
-fn query_match_from_proto(candidate: proto::QueryMatch) -> Result<QueryMatch> {
-    let metadata = match candidate.metadata {
-        Some(metadata) => JsonValue::Object(json_object_from_proto(metadata, "metadata")?),
-        None => JsonValue::Object(serde_json::Map::new()),
-    };
-    Ok(QueryMatch {
-        id: RecordId::new(candidate.id),
-        value: candidate.value,
-        metadata,
+fn query_hit_from_proto(hit: proto::QueryHit, index: usize) -> Result<QueryHit> {
+    let path = format!("hits[{index}].record");
+    let record = hit
+        .record
+        .ok_or_else(|| ClientError::InvalidResponse(format!("{path} is missing")))?;
+    Ok(QueryHit {
+        record: record_from_proto(record, &path)?,
+        score: hit.score,
     })
 }
 
@@ -969,112 +1123,11 @@ fn database_role_from_proto(role: i32) -> Result<DatabaseRole> {
     }
 }
 
-fn metadata_filter_to_proto(filter: MetadataFilter) -> Result<proto::MetadataFilter> {
-    Ok(proto::MetadataFilter {
-        field: filter.field,
-        value: Some(scalar_value_to_proto(filter.value)?),
-    })
-}
-
-fn predicate_to_proto(predicate: FilterExpr) -> Result<proto::Predicate> {
-    let node = match predicate {
-        FilterExpr::And { children } => proto::predicate::Node::And(proto::PredicateList {
-            children: children
-                .into_iter()
-                .map(predicate_to_proto)
-                .collect::<Result<Vec<_>>>()?,
-        }),
-        FilterExpr::Or { children } => proto::predicate::Node::Or(proto::PredicateList {
-            children: children
-                .into_iter()
-                .map(predicate_to_proto)
-                .collect::<Result<Vec<_>>>()?,
-        }),
-        FilterExpr::Not { child } => proto::predicate::Node::Not(Box::new(proto::PredicateNot {
-            child: Some(Box::new(predicate_to_proto(*child)?)),
-        })),
-        FilterExpr::Comparison(comparison) => {
-            proto::predicate::Node::Comparison(predicate_comparison_to_proto(comparison)?)
-        }
-    };
-    Ok(proto::Predicate { node: Some(node) })
-}
-
-fn predicate_comparison_to_proto(
-    comparison: FilterComparison,
-) -> Result<proto::PredicateComparison> {
-    Ok(proto::PredicateComparison {
-        field: comparison.field,
-        operator: predicate_operator_to_proto(comparison.operator) as i32,
-        value: comparison.value.map(scalar_value_to_proto).transpose()?,
-    })
-}
-
-fn predicate_operator_to_proto(operator: FilterOperator) -> proto::PredicateOperator {
-    match operator {
-        FilterOperator::Eq => proto::PredicateOperator::Eq,
-        FilterOperator::Ne => proto::PredicateOperator::Ne,
-        FilterOperator::Lt => proto::PredicateOperator::Lt,
-        FilterOperator::Lte => proto::PredicateOperator::Lte,
-        FilterOperator::Gt => proto::PredicateOperator::Gt,
-        FilterOperator::Gte => proto::PredicateOperator::Gte,
-        FilterOperator::Exists => proto::PredicateOperator::Exists,
-        FilterOperator::IsNull => proto::PredicateOperator::IsNull,
-    }
-}
-
 fn explain_mode_to_proto(mode: ExplainMode) -> proto::ExplainMode {
     match mode {
         ExplainMode::None => proto::ExplainMode::None,
         ExplainMode::Plan => proto::ExplainMode::Plan,
         ExplainMode::Profile => proto::ExplainMode::Profile,
-    }
-}
-
-fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue> {
-    let kind = match value {
-        ScalarMetadataValue::String(value) => proto::scalar_value::Kind::StringValue(value),
-        ScalarMetadataValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                proto::scalar_value::Kind::Int64Value(value)
-            } else if let Some(value) = value.as_u64() {
-                proto::scalar_value::Kind::Uint64Value(value)
-            } else if let Some(value) = value.as_f64() {
-                proto::scalar_value::Kind::DoubleValue(value)
-            } else {
-                return Err(ClientError::InvalidResponse(
-                    "numeric scalar value must be finite".to_owned(),
-                ));
-            }
-        }
-        ScalarMetadataValue::Bool(value) => proto::scalar_value::Kind::BoolValue(value),
-        ScalarMetadataValue::Null => proto::scalar_value::Kind::NullValue(true),
-    };
-
-    Ok(ScalarValue { kind: Some(kind) })
-}
-
-fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue> {
-    match value.kind {
-        Some(proto::scalar_value::Kind::StringValue(value)) => {
-            Ok(ScalarMetadataValue::String(value))
-        }
-        Some(proto::scalar_value::Kind::Int64Value(value)) => {
-            Ok(ScalarMetadataValue::Number(value.into()))
-        }
-        Some(proto::scalar_value::Kind::Uint64Value(value)) => {
-            Ok(ScalarMetadataValue::Number(value.into()))
-        }
-        Some(proto::scalar_value::Kind::DoubleValue(value)) => serde_json::Number::from_f64(value)
-            .map(ScalarMetadataValue::Number)
-            .ok_or_else(|| {
-                ClientError::InvalidResponse("numeric scalar value must be finite".to_owned())
-            }),
-        Some(proto::scalar_value::Kind::BoolValue(value)) => Ok(ScalarMetadataValue::Bool(value)),
-        Some(proto::scalar_value::Kind::NullValue(_)) => Ok(ScalarMetadataValue::Null),
-        None => Err(ClientError::InvalidResponse(
-            "scalar value kind is required".to_owned(),
-        )),
     }
 }
 
@@ -1119,6 +1172,7 @@ fn query_plan_kind_from_proto(kind: i32) -> Result<QueryPlanKind> {
         proto::QueryPlanKind::VectorFirstAnn => Ok(QueryPlanKind::VectorFirstAnn),
         proto::QueryPlanKind::CooperativeFilteredAnn => Ok(QueryPlanKind::CooperativeFilteredAnn),
         proto::QueryPlanKind::HybridExactAnnMerge => Ok(QueryPlanKind::HybridExactAnnMerge),
+        proto::QueryPlanKind::OrderedScan => Ok(QueryPlanKind::OrderedScan),
     }
 }
 
@@ -1197,9 +1251,16 @@ fn scalar_field_stats_from_proto(stats: proto::ScalarFieldStats) -> Result<Scala
             .into_iter()
             .map(|(value, count)| (value, count as usize))
             .collect(),
-        min: stats.min.map(scalar_value_from_proto).transpose()?,
-        max: stats.max.map(scalar_value_from_proto).transpose()?,
+        min: stats.min.map(scalar_from_proto).transpose()?,
+        max: stats.max.map(scalar_from_proto).transpose()?,
         distinct_count: stats.distinct_count as usize,
+    })
+}
+
+fn scalar_from_proto(value: proto::JsonValue) -> Result<ScalarMetadataValue> {
+    let json = json_from_proto(value, "min")?;
+    ScalarMetadataValue::from_json(&json).ok_or_else(|| {
+        ClientError::InvalidResponse(format!("statistics bound {json} is not a scalar"))
     })
 }
 

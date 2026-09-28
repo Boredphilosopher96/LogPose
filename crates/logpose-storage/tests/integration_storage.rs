@@ -1358,17 +1358,14 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
     let engine = LocalStorageEngine::new(&root).expect("storage engine should reopen");
     let error = logpose_query::query(
         &engine,
+        &logpose_types::CollectionRef::parse("documents").expect("name"),
         logpose_query::QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
+            vector: Some(logpose_query::VectorQuery {
+                field: None,
+                values: vec![1.0, 0.0],
+            }),
             top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
+            ..logpose_query::QueryRequest::default()
         },
     )
     .await
@@ -1451,36 +1448,31 @@ async fn ann_queries_over_segments_see_only_live_rows() {
         .await
         .expect("write should succeed");
 
-    let query = |filters: Vec<logpose_query::MetadataFilter>| logpose_query::QueryRequest {
-        collection_name: "documents".to_owned(),
-        vector: vec![1.0, 0.0],
+    let collection = logpose_types::CollectionRef::parse("documents").expect("name");
+    let query = |filter: Option<logpose_query::FilterExpr>| logpose_query::QueryRequest {
+        vector: Some(logpose_query::VectorQuery {
+            field: None,
+            values: vec![1.0, 0.0],
+        }),
         top_k: 2,
-        snapshot: None,
-        read_barrier: None,
-        filters,
-        predicate: None,
-        explain: logpose_query::ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
+        filter,
+        output_fields: vec!["id".to_owned()],
+        ..logpose_query::QueryRequest::default()
     };
-    let keep = || {
-        vec![logpose_query::MetadataFilter {
-            field: "kind".to_owned(),
-            value: logpose_types::ScalarMetadataValue::String("keep".to_owned()),
-        }]
-    };
-    let ids = |response: logpose_query::QueryResponse| {
+    let keep = || Some(logpose_query::FilterExpr::eq("kind", "keep"));
+    let ids = |response: logpose_query::WithSchema<logpose_query::QueryResponse>| {
         response
-            .matches
+            .value
+            .hits
             .into_iter()
-            .map(|matched| matched.id.as_str().to_owned())
+            .map(|hit| hit.record.pk.label())
             .collect::<Vec<_>>()
     };
     for round in 0..2 {
-        let unfiltered = ids(logpose_query::query(&engine, query(Vec::new()))
+        let unfiltered = ids(logpose_query::query(&engine, &collection, query(None))
             .await
             .expect("query should succeed"));
-        let filtered = ids(logpose_query::query(&engine, query(keep()))
+        let filtered = ids(logpose_query::query(&engine, &collection, query(keep()))
             .await
             .expect("filtered query should succeed"));
         assert_eq!(unfiltered, ["doc-10", "doc-09"], "round {round}");
