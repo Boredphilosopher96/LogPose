@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status, Streaming, transport::Server};
 /// A running fake server.
 ///
 /// Each call pops the next scripted status and fails with it; once the script is empty,
-/// `GetMetadata`, `ListDatabases`, `WriteCollection`, and `FlushCollection` succeed and every
+/// `GetMetadata`, `ListDatabases`, `UpsertRecords`, and `FlushCollection` succeed and every
 /// other RPC is `UNIMPLEMENTED`.
 pub(crate) struct ScriptedServer {
     pub(crate) endpoint: String,
@@ -144,18 +144,46 @@ impl LogPoseService for ScriptedService {
         }))
     }
 
+    async fn drop_database(
+        &self,
+        _request: Request<proto::DropDatabaseRequest>,
+    ) -> Result<Response<proto::DropDatabaseReply>, Status> {
+        self.unimplemented("drop_database")
+    }
+
     async fn create_collection(
         &self,
         _request: Request<proto::CreateCollectionRequest>,
-    ) -> Result<Response<proto::CollectionDescriptorReply>, Status> {
+    ) -> Result<Response<proto::CollectionReply>, Status> {
         self.unimplemented("create_collection")
     }
 
     async fn get_collection(
         &self,
         _request: Request<proto::GetCollectionRequest>,
-    ) -> Result<Response<proto::CollectionDescriptorReply>, Status> {
+    ) -> Result<Response<proto::CollectionReply>, Status> {
         self.unimplemented("get_collection")
+    }
+
+    async fn list_collections(
+        &self,
+        _request: Request<proto::ListCollectionsRequest>,
+    ) -> Result<Response<proto::ListCollectionsReply>, Status> {
+        self.unimplemented("list_collections")
+    }
+
+    async fn alter_collection(
+        &self,
+        _request: Request<proto::AlterCollectionRequest>,
+    ) -> Result<Response<proto::CollectionReply>, Status> {
+        self.unimplemented("alter_collection")
+    }
+
+    async fn drop_collection(
+        &self,
+        _request: Request<proto::DropCollectionRequest>,
+    ) -> Result<Response<proto::DropCollectionReply>, Status> {
+        self.unimplemented("drop_collection")
     }
 
     async fn get_collection_placement(
@@ -165,13 +193,13 @@ impl LogPoseService for ScriptedService {
         self.unimplemented("get_collection_placement")
     }
 
-    async fn write_collection(
+    async fn upsert_records(
         &self,
-        request: Request<proto::WriteCollectionRequest>,
+        request: Request<proto::UpsertRecordsRequest>,
     ) -> Result<Response<proto::CommitAckReply>, Status> {
-        self.next("write_collection")?;
+        self.next("upsert_records")?;
         let request = request.into_inner();
-        let applied_ops = u64::try_from(request.operations.len()).unwrap_or(u64::MAX);
+        let applied_ops = u64::try_from(request.records.len()).unwrap_or(u64::MAX);
         Ok(Response::new(proto::CommitAckReply {
             last_seq_no: applied_ops,
             applied_ops,
@@ -184,11 +212,32 @@ impl LogPoseService for ScriptedService {
         }))
     }
 
-    async fn bulk_write_collection(
+    async fn update_records(
         &self,
-        _request: Request<Streaming<proto::BulkWriteCollectionRequest>>,
-    ) -> Result<Response<proto::BulkWriteCollectionReply>, Status> {
-        self.unimplemented("bulk_write_collection")
+        _request: Request<proto::UpdateRecordsRequest>,
+    ) -> Result<Response<proto::CommitAckReply>, Status> {
+        self.unimplemented("update_records")
+    }
+
+    async fn delete_records(
+        &self,
+        _request: Request<proto::DeleteRecordsRequest>,
+    ) -> Result<Response<proto::CommitAckReply>, Status> {
+        self.unimplemented("delete_records")
+    }
+
+    async fn get_records(
+        &self,
+        _request: Request<proto::GetRecordsRequest>,
+    ) -> Result<Response<proto::GetRecordsReply>, Status> {
+        self.unimplemented("get_records")
+    }
+
+    async fn bulk_upsert_records(
+        &self,
+        _request: Request<Streaming<proto::BulkUpsertRecordsRequest>>,
+    ) -> Result<Response<proto::BulkUpsertRecordsReply>, Status> {
+        self.unimplemented("bulk_upsert_records")
     }
 
     async fn query_collection(

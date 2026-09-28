@@ -399,9 +399,9 @@ mod client_tests {
     use crate::{ClientError, LogPoseClient, test_support::ScriptedServer};
     use logpose_api_grpc::status_from_error;
     use logpose_types::{
-        ErrorReason, LogPoseError, PutRecord, RecordId, ResourceKind, WriteOperation,
+        CollectionRef, ErrorReason, LogPoseError, ResourceKind,
+        record::{PrimaryKey, Record},
     };
-    use serde_json::json;
     use std::time::Instant;
     use tonic::Status;
 
@@ -430,12 +430,17 @@ mod client_tests {
         }
     }
 
-    fn put(id: &str) -> Vec<WriteOperation> {
-        vec![WriteOperation::Put(PutRecord {
-            id: RecordId::new(id),
-            vector: vec![1.0, 0.0],
-            metadata: json!({}),
-        })]
+    fn put(id: &str) -> Vec<Record> {
+        vec![Record {
+            pk: PrimaryKey::String(id.to_owned()),
+            vectors: [("vector".to_owned(), vec![1.0, 0.0])].into(),
+            fields: Default::default(),
+            extra: Default::default(),
+        }]
+    }
+
+    fn docs() -> CollectionRef {
+        CollectionRef::new("default", "docs")
     }
 
     async fn client(server: &ScriptedServer) -> LogPoseClient {
@@ -534,21 +539,21 @@ mod client_tests {
         let error = client(&server)
             .await
             .with_retry_policy(quick_retries(3))
-            .write("docs", put("a"))
+            .upsert(&docs(), put("a"))
             .await
             .expect_err("reads-only retries leave writes alone");
         assert_eq!(error.reason(), Some(ErrorReason::Unavailable));
-        assert_eq!(server.calls(), ["write_collection"]);
+        assert_eq!(server.calls(), ["upsert_records"]);
 
         let server = ScriptedServer::start("node-a", vec![unavailable(1)]).await;
         let ack = client(&server)
             .await
             .with_retry_policy(quick_retries(3).with_writes())
-            .write("docs", put("a"))
+            .upsert(&docs(), put("a"))
             .await
             .expect("an opted-in write retry should succeed");
         assert_eq!(ack.applied_ops, 1);
-        assert_eq!(server.calls(), ["write_collection", "write_collection"]);
+        assert_eq!(server.calls(), ["upsert_records", "upsert_records"]);
     }
 
     #[tokio::test]
@@ -561,12 +566,12 @@ mod client_tests {
             .with_redirects(RedirectPolicy::new(resolver));
 
         let ack = client
-            .write("docs", put("a"))
+            .upsert(&docs(), put("a"))
             .await
             .expect("the owner should accept the redirected write");
         assert_eq!(ack.applied_ops, 1);
-        assert_eq!(refuser.calls(), ["write_collection"]);
-        assert_eq!(owner.calls(), ["write_collection"]);
+        assert_eq!(refuser.calls(), ["upsert_records"]);
+        assert_eq!(owner.calls(), ["upsert_records"]);
 
         // Each request starts at the configured endpoint again.
         let metadata = client.metadata().await.expect("metadata should load");
@@ -589,7 +594,7 @@ mod client_tests {
         let snapshot = client(&follower)
             .await
             .with_redirects(RedirectPolicy::new(resolver))
-            .flush("docs")
+            .flush(&docs())
             .await
             .expect("the leader should flush");
         assert_eq!(snapshot.manifest_generation, 2);

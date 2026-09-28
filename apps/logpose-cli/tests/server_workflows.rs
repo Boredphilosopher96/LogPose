@@ -13,7 +13,7 @@ use logpose_telemetry as _;
 use logpose_types as _;
 use ratatui as _;
 use serde as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{fs, process::Command};
 use walkdir as _;
 
@@ -350,6 +350,54 @@ fn data_only_nodes_reject_collection_creation_over_cli_transport() {
 #[test]
 fn server_validation_errors_print_their_reason_and_field_violations() {
     let fixture = TestServerFixture::spawn("cli-typed-errors");
+    let input_path = fixture.temp_root.join("duplicate-keys.jsonl");
+    fs::write(
+        &input_path,
+        "{\"id\":\"alpha\",\"vector\":[1.0,0.0]}\n{\"id\":\"alpha\",\"vector\":[0.0,1.0]}\n",
+    )
+    .expect("jsonl input should be written");
+    fixture.run_cli([
+        "collection",
+        "create",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let output = fixture.run_cli_expect_failure([
+        "record",
+        "put",
+        "documents",
+        "--input",
+        input_path.to_str().expect("input path should be utf8"),
+    ]);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+
+    assert!(
+        stderr.contains("INVALID_ARGUMENT: write batch includes primary key"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("code: INVALID_ARGUMENT"), "{stderr}");
+    assert!(
+        stderr.contains("field records[1]: write batch includes primary key"),
+        "{stderr}"
+    );
+    // A batch commits atomically: the advice must not suggest a partial commit.
+    assert!(
+        stderr.contains(
+            "failed to write records; each batch commits atomically, so the failing batch was \
+             applied in full or not at all; verify collection state before retrying it"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("partially"), "{stderr}");
+}
+
+#[test]
+fn records_that_do_not_fit_the_schema_fail_before_reaching_the_server() {
+    let fixture = TestServerFixture::spawn("cli-schema-errors");
     let input_path = fixture.temp_root.join("wrong-dimensions.jsonl");
     fs::write(&input_path, r#"{"id":"alpha","vector":[1.0,0.0,0.5]}"#)
         .expect("jsonl input should be written");
@@ -373,29 +421,31 @@ fn server_validation_errors_print_their_reason_and_field_violations() {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
 
     assert!(
-        stderr.contains("DIMENSION_MISMATCH: record 'alpha' expected 2 dimensions but found 3"),
+        stderr.contains("JSONL record on line 1 does not fit the schema"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("vector field 'vector' expects 2 dimensions, found 3"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn invalid_collection_schemas_name_the_rejected_field() {
+    let fixture = TestServerFixture::spawn("cli-schema-create-errors");
+    let output = fixture.run_cli_expect_failure([
+        "collection",
+        "create",
+        "documents",
+        "--dimensions",
+        "0",
+        "--metric",
+        "dot",
+    ]);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+
     assert!(stderr.contains("code: INVALID_ARGUMENT"), "{stderr}");
-    assert!(
-        stderr.contains(
-            "field operations[0].vector: record 'alpha' expected 2 dimensions but found 3"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("metadata: actual_dimensions=3, expected_dimensions=2, record_id=alpha"),
-        "{stderr}"
-    );
-    // A batch commits atomically: the advice must not suggest a partial commit.
-    assert!(
-        stderr.contains(
-            "failed to write records; each batch commits atomically, so the failing batch was \
-             applied in full or not at all; verify collection state before retrying it"
-        ),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("partially"), "{stderr}");
+    assert!(stderr.contains("field vectors[0].dimensions:"), "{stderr}");
 }
 
 #[test]
@@ -459,9 +509,9 @@ fn data_commands_run_against_the_server_over_grpc() {
     let input_path = fixture.temp_root.join("records.jsonl");
     fs::write(
         &input_path,
-        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"color":"red","kind":"keep"}}
-{"id":"beta","vector":[0.5,0.0],"metadata":{"color":"green","kind":"drop"}}
-{"id":"gamma","vector":[0.8,0.0],"metadata":{"color":"blue","kind":"keep"}}"#,
+        r#"{"id":"alpha","vector":[1.0,0.0],"color":"red","kind":"keep"}
+{"id":"beta","vector":[0.5,0.0],"color":"green","kind":"drop"}
+{"id":"gamma","vector":[0.8,0.0],"color":"blue","kind":"keep"}"#,
     )
     .expect("jsonl input should be written");
 
@@ -483,7 +533,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     let get_body: Value =
         serde_json::from_str(&get_stdout).expect("collection output should be valid json");
     assert_eq!(get_body["name"], "colors");
-    assert_eq!(get_body["metric"], "dot");
+    assert_eq!(get_body["schema"]["vectors"][0]["metric"], "dot");
 
     fixture.run_cli([
         "record",
@@ -761,12 +811,12 @@ fn query_and_stats_support_read_barrier_flags_against_server() {
     let second_input = fixture.temp_root.join("records-second.jsonl");
     fs::write(
         &first_input,
-        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"kind":"keep"}}"#,
+        r#"{"id":"alpha","vector":[1.0,0.0],"kind":"keep"}"#,
     )
     .expect("first jsonl input should be written");
     fs::write(
         &second_input,
-        r#"{"id":"beta","vector":[0.4,0.0],"metadata":{"kind":"keep"}}"#,
+        r#"{"id":"beta","vector":[0.4,0.0],"kind":"keep"}"#,
     )
     .expect("second jsonl input should be written");
 
@@ -857,7 +907,7 @@ fn profiled_query_surfaces_filtered_scan_diagnostics() {
         .map(|index| {
             let kind = if index % 4 == 0 { "keep" } else { "drop" };
             format!(
-                r#"{{"id":"doc-{index}","vector":[{},0.0],"metadata":{{"kind":"{kind}","version":{index}}}}}"#,
+                r#"{{"id":"doc-{index}","vector":[{},0.0],"kind":"{kind}","version":{index}}}"#,
                 index as f32 + 1.0
             )
         })
@@ -979,4 +1029,103 @@ fn profiled_query_surfaces_filtered_scan_diagnostics() {
             .as_u64()
             .is_some()
     );
+}
+
+#[test]
+fn typed_schema_commands_manage_collections_and_records() {
+    let fixture = TestServerFixture::spawn("cli-typed-schema");
+    let schema_path = fixture.temp_root.join("products.json");
+    fs::write(
+        &schema_path,
+        r#"{
+  "primary_key": {"name": "sku", "type": "int64"},
+  "vectors": [{"name": "embedding", "dimensions": 2, "metric": "cosine"}],
+  "fields": [{"name": "title", "type": "string", "nullable": false}]
+}"#,
+    )
+    .expect("schema file should be written");
+    let records_path = fixture.temp_root.join("products.jsonl");
+    fs::write(
+        &records_path,
+        "{\"sku\":7,\"embedding\":[3.0,4.0],\"title\":\"lamp\",\"price\":12.5,\"color\":\"red\"}\n\
+         {\"sku\":8,\"embedding\":[1.0,0.0],\"title\":\"desk\",\"price\":99.0}\n",
+    )
+    .expect("records file should be written");
+
+    fixture.run_cli(["database", "put", "shop"]);
+    let created = fixture.run_cli_json(&[
+        "collection",
+        "create",
+        "products",
+        "--database",
+        "shop",
+        "--schema",
+        schema_path.to_str().expect("schema path should be utf8"),
+    ]);
+    let created: Value = serde_json::from_slice(&created.stdout).expect("create prints json");
+    assert_eq!(created["schema"]["primary_key"]["type"], "int64");
+    assert_eq!(created["schema"]["fields"][0]["index"], "inverted");
+
+    let altered = fixture.run_cli_json(&[
+        "collection",
+        "alter",
+        "shop/products",
+        "--change",
+        r#"{"add_field":{"name":"price","type":"float64"}}"#,
+    ]);
+    let altered: Value = serde_json::from_slice(&altered.stdout).expect("alter prints json");
+    assert_eq!(altered["schema"]["schema_version"], 2);
+    assert_eq!(altered["schema"]["fields"][1]["name"], "price");
+
+    let listed = fixture.run_cli_json(&["collection", "list", "--database", "shop"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("list prints json");
+    assert_eq!(listed[0]["name"], "products");
+    assert_eq!(listed[0]["schema"]["schema_version"], 2);
+
+    fixture.run_cli([
+        "record",
+        "put",
+        "shop/products",
+        "--input",
+        records_path.to_str().expect("records path should be utf8"),
+    ]);
+
+    let fetched = fixture.run_cli_json(&["record", "get", "shop/products", "7", "9"]);
+    let fetched: Value = serde_json::from_slice(&fetched.stdout).expect("get prints json");
+    assert_eq!(
+        fetched["records"],
+        json!([{
+            "sku": 7,
+            "embedding": [0.6, 0.8],
+            "title": "lamp",
+            "price": 12.5,
+            "color": "red"
+        }])
+    );
+    assert_eq!(fetched["missing_keys"], json!([9]));
+
+    let projected = fixture.run_cli_json(&[
+        "record",
+        "get",
+        "shop/products",
+        "8",
+        "--output-field",
+        "price",
+    ]);
+    let projected: Value = serde_json::from_slice(&projected.stdout).expect("get prints json");
+    assert_eq!(projected["records"], json!([{"sku": 8, "price": 99.0}]));
+
+    let human = fixture.run_cli(["record", "get", "shop/products", "8"]);
+    let human = String::from_utf8(human.stdout).expect("stdout should be utf8");
+    assert!(human.contains("Found: 1"), "{human}");
+
+    let refused = fixture.run_cli_expect_failure(["database", "drop", "shop"]);
+    let refused = String::from_utf8(refused.stderr).expect("stderr should be utf8");
+    assert!(refused.contains("FAILED_PRECONDITION"), "{refused}");
+
+    fixture.run_cli(["collection", "drop", "shop/products"]);
+    let listed = fixture.run_cli_json(&["collection", "list", "--database", "shop"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("list prints json");
+    assert_eq!(listed, json!([]));
+    fixture.run_cli(["database", "drop", "shop"]);
 }

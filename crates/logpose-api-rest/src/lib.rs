@@ -1,4 +1,9 @@
 //! REST API surface for LogPose.
+//!
+//! Every database-scoped route names its database in the path, `/v2/databases/{database}`,
+//! and every collection-scoped route names its collection below it,
+//! `/v2/databases/{database}/collections/{collection}`. No body or query string selects a
+//! database. Records are natural JSON documents typed by the collection's schema.
 
 mod error;
 
@@ -14,54 +19,71 @@ use axum::{
 };
 use error::{ApiError, ApiJson, ApiPath, ApiQuery};
 pub use error::{ErrorBody, http_status};
-use logpose_auth::DatabaseAccessPolicy;
-use logpose_catalog::DatabaseDescriptor;
+use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
+use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, FilterExpr, MetadataFilter, QueryRequest, ScalarMetadataValue};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, ResourceKind, Snapshot,
-    WriteOperation,
+    CollectionRef, CommitAck, LogPoseError, ResourceKind, Snapshot,
+    record::{PartialUpdate, PrimaryKey, Record},
+    schema::{CollectionSchema, CreateCollectionSpec, FieldType, SchemaChange},
+    value::Value as TypedValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 
+/// Collection routes live below this path template.
+const COLLECTION: &str = "/v2/databases/{database}/collections/{collection}";
+
 /// Every REST route: its path template and the handlers per method.
 ///
 /// The router is built from this table, and the API contract test checks it against
-/// `openapi/logpose.v1.yaml` in both directions.
-fn routes() -> Vec<(&'static str, MethodRouter<Arc<AppState>>)> {
+/// `openapi/logpose.v2.yaml` in both directions.
+fn routes() -> Vec<(String, MethodRouter<Arc<AppState>>)> {
+    let collection = |suffix: &str| format!("{COLLECTION}{suffix}");
     vec![
-        ("/health", get(health)),
-        ("/v1/metadata", get(metadata)),
-        ("/v1/runtime/status", get(runtime_status)),
-        ("/v1/databases", get(list_databases)),
-        ("/v1/databases/{name}", get(get_database).put(put_database)),
+        ("/health".to_owned(), get(health)),
+        ("/v2/metadata".to_owned(), get(metadata)),
+        ("/v2/runtime/status".to_owned(), get(runtime_status)),
+        ("/v2/databases".to_owned(), get(list_databases)),
         (
-            "/v1/databases/{name}/policy",
+            "/v2/databases/{database}".to_owned(),
+            get(get_database).put(put_database).delete(drop_database),
+        ),
+        (
+            "/v2/databases/{database}/policy".to_owned(),
             get(get_database_policy).put(put_database_policy),
         ),
-        ("/v1/collections", post(create_collection)),
-        ("/v1/collections/{name}", get(get_collection)),
         (
-            "/v1/collections/{name}/placement",
-            get(get_collection_placement),
+            "/v2/databases/{database}/collections".to_owned(),
+            get(list_collections).post(create_collection),
         ),
-        ("/v1/collections/{name}/writes", post(write_collection)),
-        ("/v1/collections/{name}/query", post(query_collection)),
-        ("/v1/collections/{name}/stats", get(get_collection_stats)),
-        ("/v1/collections/{name}/flush", post(flush_collection)),
-        ("/v1/collections/{name}/compact", post(compact_collection)),
-        ("/v1/collections/{name}/inspect", get(inspect_collection)),
+        (
+            collection(""),
+            get(get_collection)
+                .patch(alter_collection)
+                .delete(drop_collection),
+        ),
+        (collection("/placement"), get(get_collection_placement)),
+        (collection("/records/upsert"), post(upsert_records)),
+        (collection("/records/update"), post(update_records)),
+        (collection("/records/delete"), post(delete_records)),
+        (collection("/records/get"), post(get_records)),
+        (collection("/query"), post(query_collection)),
+        (collection("/stats"), get(get_collection_stats)),
+        (collection("/flush"), post(flush_collection)),
+        (collection("/compact"), post(compact_collection)),
+        (collection("/inspect"), get(inspect_collection)),
     ]
 }
 
 /// Path templates of every REST route, as the router registers them.
 #[doc(hidden)]
 #[must_use]
-pub fn route_paths() -> Vec<&'static str> {
+pub fn route_paths() -> Vec<String> {
     routes().into_iter().map(|(path, _)| path).collect()
 }
 
@@ -74,7 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     routes()
         .into_iter()
         .fold(Router::new(), |router, (path, handlers)| {
-            router.route(path, handlers)
+            router.route(&path, handlers)
         })
         .fallback(route_not_found)
         .method_not_allowed_fallback(route_not_found)
@@ -115,6 +137,32 @@ pub async fn serve_with_listener(
     axum::serve(listener, router(state)).await
 }
 
+/// The collection a route names in its path.
+#[derive(Debug, Deserialize)]
+struct CollectionPath {
+    database: String,
+    collection: String,
+}
+
+impl CollectionPath {
+    fn reference(&self) -> CollectionRef {
+        CollectionRef::new(self.database.clone(), self.collection.clone())
+    }
+
+    /// The `database/collection` key the application layer resolves.
+    fn key(&self) -> String {
+        self.reference().lookup_name()
+    }
+
+    fn scoped<T>(self, response: T) -> CollectionScopedResponse<T> {
+        CollectionScopedResponse {
+            database_name: self.database,
+            collection_name: self.collection,
+            response,
+        }
+    }
+}
+
 async fn health() -> impl IntoResponse {
     Json(HealthResponse { status: "ok" })
 }
@@ -131,62 +179,70 @@ async fn runtime_status(
     Ok(Json(state.runtime_status_with_auth(&auth).await?))
 }
 
+async fn list_databases(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DatabaseList>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(DatabaseList {
+        databases: state.databases_with_auth(&auth).await?,
+    }))
+}
+
 async fn put_database(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(database): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    ApiJson(descriptor): ApiJson<DatabaseDescriptor>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    validate_database_scope(&descriptor, &name)?;
-    Ok(Json(state.put_database_with_auth(&auth, descriptor).await?))
+    Ok(Json(
+        state
+            .put_database_with_auth(&auth, DatabaseDescriptor::new(database))
+            .await?,
+    ))
 }
 
 async fn get_database(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(database): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    Ok(Json(state.database_with_auth(&auth, &name).await?))
+    Ok(Json(state.database_with_auth(&auth, &database).await?))
 }
 
-async fn list_databases(
+async fn drop_database(
     headers: HeaderMap,
+    ApiPath(database): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<DatabaseDescriptor>>, ApiError> {
+) -> Result<Json<DroppedDatabase>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    Ok(Json(state.databases_with_auth(&auth).await?))
-}
-
-async fn create_collection(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    ApiJson(request): ApiJson<CreateCollectionBody>,
-) -> Result<(StatusCode, Json<logpose_catalog::CollectionDescriptor>), ApiError> {
-    let auth = request_auth_from_headers(&headers)?;
-    let descriptor = state
-        .create_collection_with_auth(
-            &auth,
-            CreateCollectionRequest::in_database(
-                default_database_if_blank(request.database_name),
-                request.name,
-                request.dimensions,
-                request.metric,
-            ),
-        )
-        .await?;
-    Ok((StatusCode::CREATED, Json(descriptor)))
+    state.drop_database_with_auth(&auth, &database).await?;
+    Ok(Json(DroppedDatabase {
+        database_name: database,
+    }))
 }
 
 async fn put_database_policy(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(database): ApiPath<String>,
     State(state): State<Arc<AppState>>,
-    ApiJson(policy): ApiJson<DatabaseAccessPolicy>,
+    ApiJson(body): ApiJson<DatabasePolicyBody>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    validate_policy_scope(&policy, &name)?;
+    let policy = DatabaseAccessPolicy {
+        role_bindings: body
+            .role_bindings
+            .into_iter()
+            .map(|binding| DatabaseRoleBinding {
+                database_name: database.clone(),
+                principal_name: binding.principal_name,
+                role: binding.role,
+            })
+            .collect(),
+        database_name: database,
+        authentication_mode: body.authentication_mode,
+    };
     Ok(Json(
         state
             .set_database_access_policy_with_auth(&auth, policy)
@@ -196,74 +252,184 @@ async fn put_database_policy(
 
 async fn get_database_policy(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(database): ApiPath<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DatabaseAccessPolicy>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     Ok(Json(
-        state.database_access_policy_with_auth(&auth, &name).await?,
+        state
+            .database_access_policy_with_auth(&auth, &database)
+            .await?,
     ))
+}
+
+async fn list_collections(
+    headers: HeaderMap,
+    ApiPath(database): ApiPath<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CollectionList>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    Ok(Json(CollectionList {
+        collections: state.list_collections_with_auth(&auth, &database).await?,
+    }))
+}
+
+async fn create_collection(
+    headers: HeaderMap,
+    ApiPath(database): ApiPath<String>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(spec): ApiJson<CreateCollectionSpec>,
+) -> Result<(StatusCode, Json<CollectionDescriptor>), ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let descriptor = state
+        .create_collection_with_auth(&auth, CreateCollectionRequest::from_spec(database, spec))
+        .await?;
+    Ok((StatusCode::CREATED, Json(descriptor)))
 }
 
 async fn get_collection(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
-    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<logpose_catalog::CollectionDescriptor>, ApiError> {
+) -> Result<Json<CollectionDescriptor>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = namespace.collection(name);
+    Ok(Json(
+        state.get_collection_with_auth(&auth, &path.key()).await?,
+    ))
+}
+
+async fn alter_collection(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(change): ApiJson<SchemaChange>,
+) -> Result<Json<CollectionDescriptor>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
     Ok(Json(
         state
-            .get_collection_with_auth(&auth, &collection_lookup_key(&collection))
+            .alter_collection_with_auth(&auth, &path.key(), change)
             .await?,
     ))
+}
+
+async fn drop_collection(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CollectionScopedResponse<Map<String, Value>>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    state.drop_collection_with_auth(&auth, &path.key()).await?;
+    Ok(Json(path.scoped(Map::new())))
 }
 
 async fn get_collection_placement(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
-    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionPlacement>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = namespace.collection(name);
     Ok(Json(
         state
-            .collection_placement_with_auth(&auth, &collection_lookup_key(&collection))
+            .collection_placement_with_auth(&auth, &path.key())
             .await?,
     ))
 }
 
-async fn write_collection(
+async fn upsert_records(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(request): ApiJson<WriteCollectionBody>,
-) -> Result<Json<CollectionScopedResponse<logpose_types::CommitAck>>, ApiError> {
+    ApiJson(body): ApiJson<RecordsBody>,
+) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    for (index, operation) in request.operations.iter().enumerate() {
-        if operation.id().as_str().is_empty() {
-            return Err(ApiError(LogPoseError::invalid_field(
-                format!("operations[{index}].id"),
-                "write operation record id must not be empty",
-            )));
+    let schema = state
+        .collection_schema_with_auth(&auth, &path.key())
+        .await?;
+    let records = body
+        .records
+        .into_iter()
+        .enumerate()
+        .map(|(index, document)| {
+            let key = document_key(&schema, &document);
+            Record::from_json(&schema, document)
+                .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ack = state
+        .upsert_records_with_auth(&auth, &path.key(), records)
+        .await?;
+    Ok(Json(path.scoped(ack)))
+}
+
+async fn update_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<RecordsBody>,
+) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let schema = state
+        .collection_schema_with_auth(&auth, &path.key())
+        .await?;
+    let updates = body
+        .records
+        .into_iter()
+        .enumerate()
+        .map(|(index, document)| {
+            let key = document_key(&schema, &document);
+            PartialUpdate::from_json(&schema, document)
+                .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ack = state
+        .update_records_with_auth(&auth, &path.key(), updates)
+        .await?;
+    Ok(Json(path.scoped(ack)))
+}
+
+async fn delete_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<KeysBody>,
+) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let keys = primary_keys_from_json(body.keys)?;
+    let ack = state
+        .delete_records_with_auth(&auth, &path.key(), keys)
+        .await?;
+    Ok(Json(path.scoped(ack)))
+}
+
+async fn get_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<GetRecordsBody>,
+) -> Result<Json<CollectionScopedResponse<RecordsResponse>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let keys = primary_keys_from_json(body.keys)?;
+    let fetched = state
+        .get_records_with_auth(&auth, &path.key(), keys.clone(), body.output_fields)
+        .await?;
+    let mut records = Vec::new();
+    let mut missing_keys = Vec::new();
+    for (key, record) in keys.into_iter().zip(fetched.records) {
+        match record {
+            Some(record) => records.push(record.to_json(&fetched.schema)),
+            None => missing_keys.push(key.to_json()),
         }
     }
-    let collection = request.collection(name);
-    let ack = state
-        .write_with_auth(
-            &auth,
-            &collection_lookup_key(&collection),
-            request.operations,
-        )
-        .await?;
-    Ok(Json(CollectionScopedResponse::new(collection, ack)))
+    Ok(Json(path.scoped(RecordsResponse {
+        records,
+        missing_keys,
+        snapshot: fetched.snapshot,
+    })))
 }
 
 async fn query_collection(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiJson(request): ApiJson<QueryCollectionBody>,
 ) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
@@ -274,8 +440,6 @@ async fn query_collection(
             "top_k must be greater than 0",
         )));
     }
-
-    let collection = request.collection(name);
     let filters = request
         .filters
         .into_iter()
@@ -296,7 +460,7 @@ async fn query_collection(
         .query_with_auth(
             &auth,
             QueryRequest {
-                collection_name: collection_lookup_key(&collection),
+                collection_name: path.key(),
                 vector: request.vector,
                 top_k: request.top_k,
                 snapshot: request.snapshot,
@@ -309,18 +473,16 @@ async fn query_collection(
             },
         )
         .await?;
-
-    Ok(Json(CollectionScopedResponse::new(collection, response)))
+    Ok(Json(path.scoped(response)))
 }
 
 async fn get_collection_stats(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(path): ApiPath<CollectionPath>,
     ApiQuery(params): ApiQuery<CollectionStatsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<logpose_types::CollectionStats>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = params.namespace().collection(name);
     let (snapshot, read_barrier) = read_constraints_from_query_pairs(
         params.snapshot_manifest_generation,
         params.snapshot_visible_seq_no,
@@ -329,57 +491,41 @@ async fn get_collection_stats(
     )?;
     Ok(Json(
         state
-            .stats_for_read_with_auth(
-                &auth,
-                &collection_lookup_key(&collection),
-                snapshot,
-                read_barrier,
-            )
+            .stats_for_read_with_auth(&auth, &path.key(), snapshot, read_barrier)
             .await?,
     ))
 }
 
 async fn flush_collection(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
-    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+) -> Result<Json<CollectionScopedResponse<Snapshot>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = namespace.collection(name);
-    let snapshot = state
-        .flush_with_auth(&auth, &collection_lookup_key(&collection))
-        .await?;
-    Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
+    let snapshot = state.flush_with_auth(&auth, &path.key()).await?;
+    Ok(Json(path.scoped(snapshot)))
 }
 
 async fn compact_collection(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
-    ApiQuery(namespace): ApiQuery<NamespaceQuery>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<CollectionScopedResponse<logpose_types::Snapshot>>, ApiError> {
+) -> Result<Json<CollectionScopedResponse<Snapshot>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let collection = namespace.collection(name);
-    let snapshot = state
-        .compact_with_auth(&auth, &collection_lookup_key(&collection))
-        .await?;
-    Ok(Json(CollectionScopedResponse::new(collection, snapshot)))
+    let snapshot = state.compact_with_auth(&auth, &path.key()).await?;
+    Ok(Json(path.scoped(snapshot)))
 }
 
 async fn inspect_collection(
     headers: HeaderMap,
-    ApiPath(name): ApiPath<String>,
+    ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<InspectCollectionParams>,
 ) -> Result<Json<CollectionScopedResponse<logpose_storage::InspectReport>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let (target, namespace) = inspect_target_from_params(params)?;
-    let collection = namespace.collection(name);
-    let report = state
-        .inspect_with_auth(&auth, &collection_lookup_key(&collection), target)
-        .await?;
-    Ok(Json(CollectionScopedResponse::new(collection, report)))
+    let target = inspect_target_from_params(params)?;
+    let report = state.inspect_with_auth(&auth, &path.key(), target).await?;
+    Ok(Json(path.scoped(report)))
 }
 
 #[derive(Debug, Serialize)]
@@ -387,108 +533,118 @@ struct HealthResponse {
     status: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateCollectionBody {
-    #[serde(default = "default_database_name")]
+#[derive(Debug, Serialize)]
+struct DatabaseList {
+    databases: Vec<DatabaseDescriptor>,
+}
+
+#[derive(Debug, Serialize)]
+struct DroppedDatabase {
     database_name: String,
-    name: String,
-    dimensions: usize,
-    metric: DistanceMetric,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionList {
+    collections: Vec<CollectionDescriptor>,
+}
+
+/// A database access policy without its database, which the path names.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DatabasePolicyBody {
+    authentication_mode: AuthenticationMode,
+    #[serde(default)]
+    role_bindings: Vec<RoleBindingBody>,
 }
 
 #[derive(Debug, Deserialize)]
-struct NamespaceQuery {
-    #[serde(
-        default = "default_database_name",
-        alias = "database_name",
-        rename = "database"
-    )]
-    database: String,
+#[serde(deny_unknown_fields)]
+struct RoleBindingBody {
+    principal_name: String,
+    role: DatabaseRole,
 }
 
-impl NamespaceQuery {
-    fn collection(&self, name: impl Into<String>) -> CollectionRef {
-        CollectionRef::new(
-            default_database_if_blank(self.database.clone()),
-            name.into(),
-        )
+/// Natural JSON documents: whole records for an upsert, or a key plus the fields to change
+/// for an update.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordsBody {
+    records: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeysBody {
+    keys: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetRecordsBody {
+    keys: Vec<Value>,
+    #[serde(default)]
+    output_fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordsResponse {
+    /// The live records found, in request order, as natural JSON documents.
+    records: Vec<Value>,
+    /// The requested keys without a live record, in request order.
+    missing_keys: Vec<Value>,
+    /// The state the lookup read.
+    snapshot: Snapshot,
+}
+
+/// The primary key a document names, when it names one of the schema's key type, so an error
+/// about the document can say which record it is.
+fn document_key(schema: &CollectionSchema, document: &Value) -> Option<PrimaryKey> {
+    match document.get(&schema.primary_key().name)? {
+        Value::String(value) => Some(PrimaryKey::String(value.clone())),
+        Value::Number(number) => number.as_i64().map(PrimaryKey::Int64),
+        _ => None,
     }
+}
+
+/// Primary keys from JSON: integers for `int64` keys and strings for `string` keys, checked
+/// against the schema's key type by the engine. Each is named `keys[i]`.
+fn primary_keys_from_json(keys: Vec<Value>) -> Result<Vec<PrimaryKey>, ApiError> {
+    keys.into_iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let invalid = |message: String| {
+                ApiError(LogPoseError::invalid_field(
+                    format!("keys[{index}]"),
+                    message,
+                ))
+            };
+            match key {
+                Value::String(value) => Ok(PrimaryKey::String(value)),
+                number @ Value::Number(_) => {
+                    match TypedValue::from_json(number, FieldType::Int64) {
+                        Ok(TypedValue::Int64(value)) => Ok(PrimaryKey::Int64(value)),
+                        Ok(_) => Err(invalid("a primary key must be an integer".to_owned())),
+                        Err(error) => Err(invalid(error.to_string())),
+                    }
+                }
+                other => Err(invalid(format!(
+                    "a primary key must be an integer or a string, found {other}"
+                ))),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
 struct CollectionStatsQuery {
-    #[serde(
-        default = "default_database_name",
-        alias = "database_name",
-        rename = "database"
-    )]
-    database: String,
     snapshot_manifest_generation: Option<u64>,
     snapshot_visible_seq_no: Option<u64>,
     read_barrier_manifest_generation: Option<u64>,
     read_barrier_visible_seq_no: Option<u64>,
 }
 
-impl CollectionStatsQuery {
-    fn namespace(&self) -> NamespaceQuery {
-        NamespaceQuery {
-            database: default_database_if_blank(self.database.clone()),
-        }
-    }
-}
-
-fn validate_policy_scope(
-    policy: &DatabaseAccessPolicy,
-    database_name: &str,
-) -> Result<(), ApiError> {
-    if policy.database_name != database_name {
-        return Err(ApiError(LogPoseError::invalid_field(
-            "database_name",
-            format!(
-                "database policy database_name '{}' does not match request database '{}'",
-                policy.database_name, database_name
-            ),
-        )));
-    }
-    Ok(())
-}
-
-fn validate_database_scope(
-    descriptor: &DatabaseDescriptor,
-    database_name: &str,
-) -> Result<(), ApiError> {
-    if descriptor.name != database_name {
-        return Err(ApiError(LogPoseError::invalid_field(
-            "name",
-            format!(
-                "database descriptor name '{}' does not match request database '{}'",
-                descriptor.name, database_name
-            ),
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct WriteCollectionBody {
-    #[serde(default = "default_database_name")]
-    database_name: String,
-    operations: Vec<WriteOperation>,
-}
-
-impl WriteCollectionBody {
-    fn collection(&self, name: impl Into<String>) -> CollectionRef {
-        CollectionRef::new(
-            default_database_if_blank(self.database_name.clone()),
-            name.into(),
-        )
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct QueryCollectionBody {
-    #[serde(default = "default_database_name")]
-    database_name: String,
     vector: Vec<f32>,
     top_k: usize,
     #[serde(default)]
@@ -507,23 +663,8 @@ struct QueryCollectionBody {
     pin: bool,
 }
 
-impl QueryCollectionBody {
-    fn collection(&self, name: impl Into<String>) -> CollectionRef {
-        CollectionRef::new(
-            default_database_if_blank(self.database_name.clone()),
-            name.into(),
-        )
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct InspectCollectionParams {
-    #[serde(
-        default = "default_database_name",
-        alias = "database_name",
-        rename = "database"
-    )]
-    database: String,
     target: Option<String>,
     segment_id: Option<String>,
 }
@@ -534,16 +675,6 @@ struct CollectionScopedResponse<T> {
     collection_name: String,
     #[serde(flatten)]
     response: T,
-}
-
-impl<T> CollectionScopedResponse<T> {
-    fn new(collection: CollectionRef, response: T) -> Self {
-        Self {
-            database_name: collection.database_name,
-            collection_name: collection.collection_name,
-            response,
-        }
-    }
 }
 
 fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiError> {
@@ -570,13 +701,8 @@ fn request_auth_from_headers(headers: &HeaderMap) -> Result<RequestAuth, ApiErro
     Ok(RequestAuth::bearer_token(token.trim()))
 }
 
-fn inspect_target_from_params(
-    params: InspectCollectionParams,
-) -> Result<(InspectTarget, NamespaceQuery), ApiError> {
-    let namespace = NamespaceQuery {
-        database: default_database_if_blank(params.database),
-    };
-    let target = match params.target.as_deref().unwrap_or("manifest") {
+fn inspect_target_from_params(params: InspectCollectionParams) -> Result<InspectTarget, ApiError> {
+    match params.target.as_deref().unwrap_or("manifest") {
         "manifest" => Ok(InspectTarget::Manifest),
         "wal" => Ok(InspectTarget::Wal),
         "segment" => params
@@ -594,19 +720,6 @@ fn inspect_target_from_params(
             "target",
             format!("unsupported inspect target '{other}'"),
         ))),
-    }?;
-    Ok((target, namespace))
-}
-
-fn default_database_name() -> String {
-    DEFAULT_DATABASE_NAME.to_owned()
-}
-
-fn default_database_if_blank(value: String) -> String {
-    if value.trim().is_empty() {
-        DEFAULT_DATABASE_NAME.to_owned()
-    } else {
-        value
     }
 }
 
@@ -660,15 +773,10 @@ fn read_constraints_from_query_pairs(
     Ok((snapshot, read_barrier))
 }
 
-fn collection_lookup_key(collection: &CollectionRef) -> String {
-    collection.lookup_name()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use logpose_auth::{
         AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
@@ -676,7 +784,7 @@ mod tests {
     };
     use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
-    use logpose_types::RecordId;
+    use logpose_types::{DistanceMetric, RecordId};
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -833,21 +941,128 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn health_endpoint_returns_ok() {
-        let state = Arc::new(AppState::new(test_config("rest-health")));
-        let app = router(state);
+    const DOCS: &str = "/v2/databases/default/collections/documents";
+
+    /// Send one request and return its status, `retry-after` header, and JSON body (`null`
+    /// when the body is empty or not JSON).
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+    ) -> (StatusCode, Option<String>, Value) {
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let request = match body {
+            Some(body) => request
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        }
+        .expect("request should build");
         let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/health")
-                    .body(axum::body::Body::empty())
-                    .expect("request should build"),
-            )
+            .clone()
+            .oneshot(request)
             .await
             .expect("router should respond");
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body should be readable")
+            .to_bytes();
+        (
+            status,
+            retry_after,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
 
-        assert_eq!(response.status(), StatusCode::OK);
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let (status, _, body) = send(app, method, uri, body, None).await;
+        (status, body)
+    }
+
+    /// The single-vector create spec: string key `id`, vector `vector`, dynamic fields on.
+    fn documents_spec(dimensions: u32, metric: &str) -> Value {
+        json!({
+            "name": "documents",
+            "primary_key": {"name": "id", "type": "string"},
+            "vectors": [{"name": "vector", "dimensions": dimensions, "metric": metric}]
+        })
+    }
+
+    /// The engine plan's example collection (decision D4), with an int64 key.
+    fn products_spec() -> Value {
+        json!({
+            "name": "products",
+            "primary_key": {"name": "sku", "type": "int64"},
+            "vectors": [{"name": "embedding", "dimensions": 3, "metric": "cosine"}],
+            "fields": [
+                {"name": "tenant", "type": "string", "nullable": false},
+                {"name": "price", "type": "float64"},
+                {"name": "tags", "type": "array<string>"},
+                {"name": "updated_at", "type": "timestamp"},
+                {"name": "attrs", "type": "json"}
+            ],
+            "dynamic_fields": true
+        })
+    }
+
+    async fn create_documents(app: &Router) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(documents_spec(2, "dot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    async fn upsert(app: &Router, records: Value) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            &format!("{DOCS}/records/upsert"),
+            Some(json!({ "records": records })),
+        )
+        .await
+    }
+
+    fn violation(body: &Value) -> &Value {
+        &body["details"]["field_violations"][0]["field"]
+    }
+
+    fn match_ids(body: &Value) -> Vec<&str> {
+        body["matches"]
+            .as_array()
+            .expect("matches should be an array")
+            .iter()
+            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let app = router(Arc::new(AppState::new(test_config("rest-health"))));
+        let (status, body) = call(&app, "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
     }
 
     #[tokio::test]
@@ -855,21 +1070,22 @@ mod tests {
         let mut config = test_config("rest-body-limit");
         config.limits.max_rest_body_bytes = 256;
         let app = router(Arc::new(AppState::new(config)));
-        let body = json!({
-            "name": "documents",
-            "dimensions": 2,
-            "metric": "dot",
-            "padding": "x".repeat(512),
-        })
-        .to_string();
+        let mut spec = documents_spec(2, "dot");
+        spec["fields"] = Value::Array(
+            (0..8)
+                .map(|index| json!({"name": format!("field_{index}_{}", "x".repeat(30)), "type": "string"}))
+                .collect(),
+        );
+        let body = spec.to_string();
         let size = body.len();
+        assert!(size > 256);
 
         let response = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/collections")
+                    .uri("/v2/databases/default/collections")
                     .header("content-type", "application/json")
                     .header("content-length", size)
                     .body(Body::from(body))
@@ -877,7 +1093,6 @@ mod tests {
             )
             .await
             .expect("router should respond");
-
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = json_body(response).await;
         assert_eq!(body["code"], "RESOURCE_EXHAUSTED");
@@ -886,32 +1101,18 @@ mod tests {
         assert_eq!(body["details"]["metadata"]["size_bytes"], size.to_string());
 
         // A body under the limit is accepted.
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::CREATED);
+        create_documents(&app).await;
     }
 
     #[tokio::test]
     async fn malformed_json_and_query_strings_are_typed_invalid_arguments() {
         let app = router(Arc::new(AppState::new(test_config("rest-malformed"))));
-
         let response = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/v1/collections")
+                    .uri("/v2/databases/default/collections")
                     .header("content-type", "application/json")
                     .body(Body::from("{not json"))
                     .expect("request should build"),
@@ -923,17 +1124,33 @@ mod tests {
         assert_eq!(body["code"], "INVALID_ARGUMENT");
         assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
 
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats?snapshot_visible_seq_no=abc")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(response).await["code"], "INVALID_ARGUMENT");
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/stats?snapshot_visible_seq_no=abc"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_ARGUMENT");
+
+        // Unknown keys in a create request are rejected, so a typo never changes a schema.
+        let mut spec = documents_spec(2, "dot");
+        spec["dimension"] = json!(2);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(spec),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("dimension")),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -941,35 +1158,21 @@ mod tests {
         let app = router(Arc::new(AppState::new(test_config(
             "rest-barrier-generation",
         ))));
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
+        create_documents(&app).await;
 
         // Sequence 0 is visible; manifest generation 9 is not.
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats?read_barrier_manifest_generation=9&read_barrier_visible_seq_no=0")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert!(response.headers().get("retry-after").is_none());
-        let body = json_body(response).await;
+        let (status, retry_after, body) = send(
+            &app,
+            "GET",
+            &format!(
+                "{DOCS}/stats?read_barrier_manifest_generation=9&read_barrier_visible_seq_no=0"
+            ),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(retry_after.is_none());
         assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
         let metadata = &body["details"]["metadata"];
         assert_eq!(metadata["required_manifest_generation"], "9");
@@ -985,65 +1188,36 @@ mod tests {
     #[tokio::test]
     async fn unknown_routes_return_a_typed_not_found() {
         let app = router(Arc::new(AppState::new(test_config("rest-unknown-route"))));
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v2/nothing")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = json_body(response).await;
-        assert_eq!(body["code"], "NOT_FOUND");
-        assert_eq!(body["details"]["metadata"]["resource_type"], "route");
-        assert_eq!(
-            body["details"]["metadata"]["resource_name"],
-            "GET /v2/nothing"
-        );
+        for path in ["/v2/nothing", "/v1/collections/documents"] {
+            let (status, body) = call(&app, "GET", path, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body["code"], "NOT_FOUND");
+            assert_eq!(body["details"]["metadata"]["resource_type"], "route");
+            assert_eq!(
+                body["details"]["metadata"]["resource_name"],
+                format!("GET {path}")
+            );
+        }
     }
 
     #[tokio::test]
     async fn unserved_methods_on_known_paths_return_a_typed_not_found() {
         let app = router(Arc::new(AppState::new(test_config("rest-unserved-method"))));
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("DELETE")
-                    .uri("/v1/collections/documents")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = json_body(response).await;
+        let (status, body) = call(&app, "POST", DOCS, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "NOT_FOUND");
         assert_eq!(body["details"]["metadata"]["resource_type"], "route");
         assert_eq!(
             body["details"]["metadata"]["resource_name"],
-            "DELETE /v1/collections/documents"
+            format!("POST {DOCS}")
         );
     }
 
     #[tokio::test]
     async fn undecodable_path_parameters_are_typed_invalid_arguments() {
         let app = router(Arc::new(AppState::new(test_config("rest-bad-path"))));
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/%FF")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(response).await;
+        let (status, body) = call(&app, "GET", "/v2/databases/default/collections/%FF", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "INVALID_ARGUMENT");
         assert_eq!(body["details"]["reason"], "INVALID_ARGUMENT");
     }
@@ -1051,159 +1225,124 @@ mod tests {
     #[tokio::test]
     async fn write_validation_errors_name_the_offending_field() {
         let app = router(Arc::new(AppState::new(test_config("rest-field-path"))));
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"name": "documents", "dimensions": 2, "metric": "dot"}).to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
+        create_documents(&app).await;
 
-        let write = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {"op": "put", "id": "a", "vector": [1.0, 0.0], "metadata": {}},
-                                {"op": "put", "id": "b", "vector": [1.0], "metadata": {}}
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(write).await;
+        let (status, body) = upsert(
+            &app,
+            json!([
+                {"id": "a", "vector": [1.0, 0.0]},
+                {"id": "b", "vector": [1.0]}
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["details"]["reason"], "DIMENSION_MISMATCH");
-        assert_eq!(
-            body["details"]["field_violations"][0]["field"],
-            "operations[1].vector"
-        );
+        assert_eq!(violation(&body), "records[1].vector");
         assert_eq!(body["details"]["metadata"]["record_id"], "b");
+
+        let (status, body) = upsert(&app, json!([{"id": "", "vector": [1.0, 0.0]}])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "records[0].id");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("must not be an empty string")),
+            "{body}"
+        );
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/delete"),
+            Some(json!({"keys": ["a", ""]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "keys[1]");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/delete"),
+            Some(json!({"keys": [1.5]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "keys[0]");
     }
 
     #[tokio::test]
     async fn runtime_status_requires_bearer_token_when_auth_is_configured() {
-        let state = Arc::new(AppState::new(auth_test_config("rest-auth-runtime")));
-        let app = router(state);
-
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/runtime/status")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
-        let authorized = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/runtime/status")
-                    .header("authorization", "Bearer operator-secret")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(authorized.status(), StatusCode::OK);
+        let app = router(Arc::new(AppState::new(auth_test_config(
+            "rest-auth-runtime",
+        ))));
+        let (status, _) = call(&app, "GET", "/v2/runtime/status", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = send(
+            &app,
+            "GET",
+            "/v2/runtime/status",
+            None,
+            Some("operator-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn database_endpoints_round_trip_with_operator_auth() {
-        let state = Arc::new(AppState::new(auth_test_config("rest-namespace-auth")));
-        let app = router(state);
+        let app = router(Arc::new(AppState::new(auth_test_config(
+            "rest-namespace-auth",
+        ))));
+        let (status, _) = call(&app, "GET", "/v2/databases", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/databases")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let operator = Some("operator-secret");
+        let (status, _, body) = send(&app, "PUT", "/v2/databases/analytics", None, operator).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["name"], "analytics");
+        assert_eq!(body["is_default"], false);
 
-        let put_database = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri("/v1/databases/analytics")
-                    .header("authorization", "Bearer operator-secret")
-                    .header("content-type", "application/json")
-                    .body(Body::from(database_body("analytics").to_string()))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(put_database.status(), StatusCode::OK);
-        let put_database_body = json_body(put_database).await;
-        assert_eq!(put_database_body["name"], "analytics");
+        let (status, _, body) = send(&app, "GET", "/v2/databases/analytics", None, operator).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "analytics");
 
-        let get_database = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/databases/analytics")
-                    .header("authorization", "Bearer operator-secret")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(get_database.status(), StatusCode::OK);
-        let get_database_body = json_body(get_database).await;
-        assert_eq!(get_database_body["name"], "analytics");
-
-        let list_databases = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/databases")
-                    .header("authorization", "Bearer operator-secret")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(list_databases.status(), StatusCode::OK);
-        let databases_body = json_body(list_databases).await;
-        let databases = databases_body
+        let (status, _, body) = send(&app, "GET", "/v2/databases", None, operator).await;
+        assert_eq!(status, StatusCode::OK);
+        let databases = body["databases"]
             .as_array()
             .expect("databases should be an array");
         assert_eq!(databases.len(), 2);
         assert!(
             databases
                 .iter()
-                .any(|database| database["name"] == "default"),
-            "default database should be lazily bootstrapped"
+                .any(|database| database["name"] == "default")
         );
         assert!(
             databases
                 .iter()
-                .any(|database| database["name"] == "analytics"),
-            "created database should be listed"
+                .any(|database| database["name"] == "analytics")
         );
+
+        let (status, _, _) = send(
+            &app,
+            "DELETE",
+            "/v2/databases/analytics",
+            None,
+            Some("reader-secret"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "only operators drop databases"
+        );
+        let (status, _, body) =
+            send(&app, "DELETE", "/v2/databases/analytics", None, operator).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "analytics");
+        let (status, _, _) = send(&app, "GET", "/v2/databases/analytics", None, operator).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1224,266 +1363,239 @@ mod tests {
             .await
             .expect("collection should be created");
         let app = router(state);
+        let reader = Some("reader-secret");
 
-        let stats = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats")
-                    .header("authorization", "Bearer reader-secret")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(stats.status(), StatusCode::OK);
+        let (status, _, _) = send(&app, "GET", &format!("{DOCS}/stats"), None, reader).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/get"),
+            Some(json!({"keys": ["alpha"]})),
+            reader,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
 
-        let write = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("authorization", "Bearer reader-secret")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "alpha",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": {}
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
+        for (path, body) in [
+            (
+                "records/upsert",
+                json!({"records": [{"id": "alpha", "vector": [1.0, 0.0]}]}),
+            ),
+            ("records/delete", json!({"keys": ["alpha"]})),
+        ] {
+            let (status, _, _) =
+                send(&app, "POST", &format!("{DOCS}/{path}"), Some(body), reader).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+        let (status, _, _) = send(
+            &app,
+            "PATCH",
+            DOCS,
+            Some(json!({"drop_field": {"name": "vector"}})),
+            reader,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _, _) = send(&app, "DELETE", DOCS, None, reader).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn every_collection_route_checks_database_access() {
+        let state = Arc::new(AppState::new(auth_test_config("rest-auth-routes")));
+        state
+            .control
+            .set_database_access_policy(read_only_policy("default", "reader"))
             .await
-            .expect("router should respond");
-        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+            .expect("database policy should persist");
+        state
+            .control
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+        let record = json!({"id": "alpha", "vector": [1.0, 0.0]});
+        let requests = [
+            ("GET", String::new(), None, true),
+            ("GET", "/placement".to_owned(), None, false),
+            ("GET", "/stats".to_owned(), None, true),
+            ("GET", "/inspect?target=wal".to_owned(), None, true),
+            (
+                "POST",
+                "/records/get".to_owned(),
+                Some(json!({"keys": ["alpha"]})),
+                true,
+            ),
+            (
+                "POST",
+                "/query".to_owned(),
+                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                true,
+            ),
+            (
+                "POST",
+                "/records/upsert".to_owned(),
+                Some(json!({"records": [record]})),
+                false,
+            ),
+            (
+                "POST",
+                "/records/update".to_owned(),
+                Some(json!({"records": [record]})),
+                false,
+            ),
+            (
+                "POST",
+                "/records/delete".to_owned(),
+                Some(json!({"keys": ["alpha"]})),
+                false,
+            ),
+            (
+                "PATCH",
+                String::new(),
+                Some(json!({"add_field": {"name": "color", "type": "string"}})),
+                false,
+            ),
+            ("POST", "/flush".to_owned(), None, false),
+            ("POST", "/compact".to_owned(), None, false),
+            ("DELETE", String::new(), None, false),
+        ];
+        let paths = route_paths();
+        for (method, suffix, body, readable) in requests {
+            let route = suffix.split('?').next().unwrap_or_default();
+            assert!(
+                paths.contains(&format!("{COLLECTION}{route}")),
+                "{method} {suffix} is a collection route"
+            );
+            let uri = format!("{DOCS}{suffix}");
+            let (status, _, response) = send(&app, method, &uri, body.clone(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {suffix} without a token: {response}"
+            );
+            let (status, _, response) = send(&app, method, &uri, body, Some("reader-secret")).await;
+            if !readable {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {suffix} by a read-only principal: {response}"
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {suffix} by a read-only principal: {response}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn data_endpoints_run_the_collection_workflow() {
-        let state = Arc::new(AppState::new(test_config("rest-workflow")));
-        let app = router(state);
+        let app = router(Arc::new(AppState::new(test_config("rest-workflow"))));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(documents_spec(2, "dot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["schema"]["vectors"][0]["dimensions"], 2);
 
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let create_body = json_body(create).await;
-        assert_eq!(create_body["database_name"], "default");
+        let (status, body) = upsert(
+            &app,
+            json!([
+                {"id": "alpha", "vector": [1.0, 0.0], "kind": "keep", "color": "red"},
+                {"id": "beta", "vector": [3.0, 0.0], "kind": "drop", "color": "blue"},
+                {"id": "gamma", "vector": [2.0, 0.0], "kind": "keep", "color": "red"}
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "documents");
+        assert_eq!(body["applied_ops"], 3);
+        assert_eq!(body["snapshot"]["manifest_generation"], 0);
+        assert_eq!(body["snapshot"]["visible_seq_no"], 3);
 
-        let write = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "alpha",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": {"kind": "keep", "color": "red"}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "beta",
-                                    "vector": [3.0, 0.0],
-                                    "metadata": {"kind": "drop", "color": "blue"}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "gamma",
-                                    "vector": [2.0, 0.0],
-                                    "metadata": {"kind": "keep", "color": "red"}
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(write.status(), StatusCode::OK);
-        let write_body = json_body(write).await;
-        assert_eq!(write_body["database_name"], "default");
-        assert_eq!(write_body["collection_name"], "documents");
-        assert_eq!(write_body["snapshot"]["manifest_generation"], 0);
-        assert_eq!(write_body["snapshot"]["visible_seq_no"], 3);
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/query"),
+            Some(json!({"vector": [1.0, 0.0], "top_k": 3, "filters": {"kind": "keep"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "documents");
+        assert_eq!(match_ids(&body), vec!["gamma", "alpha"]);
 
-        let query = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 3,
-                            "filters": {"kind": "keep"}
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(query.status(), StatusCode::OK);
-        let query_body = json_body(query).await;
-        assert_eq!(query_body["database_name"], "default");
-        assert_eq!(query_body["collection_name"], "documents");
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/stats?snapshot_manifest_generation=0&snapshot_visible_seq_no=3"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["live_record_count"], 3);
+        assert_eq!(body["deleted_record_count"], 0);
+        assert_eq!(body["mutable_op_count"], 3);
+        assert_eq!(body["segment_count"], 0);
+
+        let (status, body) = call(&app, "GET", &format!("{DOCS}/inspect?target=wal"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "documents");
+        assert_eq!(body["target"], "wal");
         assert_eq!(
-            query_body["matches"]
-                .as_array()
-                .expect("matches should be an array")
-                .iter()
-                .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
-                .collect::<Vec<_>>(),
-            vec!["gamma", "alpha"]
-        );
-
-        let stats = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats?snapshot_manifest_generation=0&snapshot_visible_seq_no=3")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(stats.status(), StatusCode::OK);
-        let stats_body = json_body(stats).await;
-        assert_eq!(stats_body["database_name"], "default");
-        assert_eq!(stats_body["live_record_count"], 3);
-        assert_eq!(stats_body["deleted_record_count"], 0);
-        assert_eq!(stats_body["mutable_op_count"], 3);
-        assert_eq!(stats_body["segment_count"], 0);
-
-        let wal = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=wal")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(wal.status(), StatusCode::OK);
-        let wal_body = json_body(wal).await;
-        assert_eq!(wal_body["database_name"], "default");
-        assert_eq!(wal_body["collection_name"], "documents");
-        assert_eq!(wal_body["target"], "wal");
-        assert_eq!(
-            wal_body["payload"]["records"]
+            body["payload"]["records"]
                 .as_array()
                 .expect("wal records should be an array")
                 .len(),
             3
         );
 
-        let flush = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/flush")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(flush.status(), StatusCode::OK);
-        let flush_body = json_body(flush).await;
-        assert_eq!(flush_body["database_name"], "default");
-        assert_eq!(flush_body["collection_name"], "documents");
+        for action in ["flush", "compact"] {
+            let (status, body) = call(&app, "POST", &format!("{DOCS}/{action}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{action}");
+            assert_eq!(body["database_name"], "default");
+            assert_eq!(body["collection_name"], "documents");
+        }
 
-        let compact = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/compact")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(compact.status(), StatusCode::OK);
-        let compact_body = json_body(compact).await;
-        assert_eq!(compact_body["database_name"], "default");
-        assert_eq!(compact_body["collection_name"], "documents");
-
-        let inspect = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=manifest")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(inspect.status(), StatusCode::OK);
-        let inspect_body = json_body(inspect).await;
-        assert_eq!(inspect_body["database_name"], "default");
-        assert_eq!(inspect_body["collection_name"], "documents");
-        assert_eq!(inspect_body["target"], "manifest");
-        let segment_id = inspect_body["payload"]["segments"][0]["segment_id"]
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/inspect?target=manifest"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], "manifest");
+        let segment_id = body["payload"]["segments"][0]["segment_id"]
             .as_str()
             .expect("segment id should be a string")
             .to_owned();
-
-        let segment = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!(
-                        "/v1/collections/documents/inspect?target=segment&segment_id={segment_id}"
-                    ))
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(segment.status(), StatusCode::OK);
-        let segment_body = json_body(segment).await;
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/inspect?target=segment&segment_id={segment_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], format!("segment:{segment_id}"));
         assert_eq!(
-            segment_body["target"]
-                .as_str()
-                .expect("segment target should be a string"),
-            format!("segment:{segment_id}")
-        );
-        assert_eq!(
-            segment_body["payload"]["records"]
+            body["payload"]["records"]
                 .as_array()
                 .expect("segment records should be an array")
                 .len(),
@@ -1493,280 +1605,94 @@ mod tests {
 
     #[tokio::test]
     async fn data_endpoints_support_read_barriers() {
-        let state = Arc::new(AppState::new(test_config("rest-read-barrier")));
-        let app = router(state);
+        let app = router(Arc::new(AppState::new(test_config("rest-read-barrier"))));
+        create_documents(&app).await;
+        let (status, write) = upsert(
+            &app,
+            json!([{"id": "alpha", "vector": [1.0, 0.0], "kind": "keep"}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, flush) = call(&app, "POST", &format!("{DOCS}/flush"), None).await;
+        assert_eq!(status, StatusCode::OK);
 
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let write = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [{
-                                "op": "put",
-                                "id": "alpha",
-                                "vector": [1.0, 0.0],
-                                "metadata": {"kind": "keep"}
-                            }]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(write.status(), StatusCode::OK);
-        let write_body = json_body(write).await;
-
-        let flush = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/flush")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(flush.status(), StatusCode::OK);
-        let flush_body = json_body(flush).await;
-
-        let query = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 1,
-                            "read_barrier": write_body["snapshot"]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(query.status(), StatusCode::OK);
-        let query_body = json_body(query).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/query"),
+            Some(json!({"vector": [1.0, 0.0], "top_k": 1, "read_barrier": write["snapshot"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            query_body["snapshot"]["manifest_generation"],
-            flush_body["manifest_generation"]
+            body["snapshot"]["manifest_generation"],
+            flush["manifest_generation"]
         );
-        assert_eq!(
-            query_body["snapshot"]["visible_seq_no"],
-            flush_body["visible_seq_no"]
-        );
-        assert_eq!(query_body["matches"][0]["id"], "alpha");
+        assert_eq!(body["snapshot"]["visible_seq_no"], flush["visible_seq_no"]);
+        assert_eq!(body["matches"][0]["id"], "alpha");
 
-        let stats = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/stats?read_barrier_manifest_generation=0&read_barrier_visible_seq_no=1")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(stats.status(), StatusCode::OK);
-        let stats_body = json_body(stats).await;
-        assert_eq!(
-            stats_body["manifest_generation"],
-            flush_body["manifest_generation"]
-        );
-        assert_eq!(stats_body["visible_seq_no"], flush_body["visible_seq_no"]);
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!(
+                "{DOCS}/stats?read_barrier_manifest_generation=0&read_barrier_visible_seq_no=1"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["manifest_generation"], flush["manifest_generation"]);
+        assert_eq!(body["visible_seq_no"], flush["visible_seq_no"]);
 
-        let unsatisfied = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 1,
-                            "read_barrier": {
-                                "manifest_generation": 0,
-                                "visible_seq_no": 2
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
+        let (status, retry_after, body) = send(
+            &app,
+            "POST",
+            &format!("{DOCS}/query"),
+            Some(json!({
+                "vector": [1.0, 0.0],
+                "top_k": 1,
+                "read_barrier": {"manifest_generation": 0, "visible_seq_no": 2}
+            })),
+            None,
+        )
+        .await;
         // Waiting never satisfies a barrier on one node, so there is no retry hint.
-        assert_eq!(unsatisfied.status(), StatusCode::CONFLICT);
-        assert!(unsatisfied.headers().get("retry-after").is_none());
-        let body = json_body(unsatisfied).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(retry_after.is_none());
         assert_eq!(body["code"], "FAILED_PRECONDITION");
         assert_eq!(body["details"]["reason"], "READ_BARRIER_NOT_SATISFIED");
         assert!(body["details"].get("retry_after_ms").is_none());
     }
 
     #[tokio::test]
-    async fn inspect_endpoints_support_wal_and_segment_targets_after_flush() {
-        let state = Arc::new(AppState::new(test_config("rest-inspect-targets")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        app.clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "alpha",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": {"kind": "keep"}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "beta",
-                                    "vector": [0.0, 1.0],
-                                    "metadata": {"kind": "drop"}
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        app.clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/flush")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        let manifest = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=manifest")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        let manifest_body = json_body(manifest).await;
-        let segment_id = manifest_body["payload"]["segments"][0]["segment_id"]
-            .as_str()
-            .expect("segment id should be a string")
-            .to_owned();
-
-        let wal = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=wal")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(json_body(wal).await["target"], "wal");
-
-        let segment = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri(format!(
-                        "/v1/collections/documents/inspect?target=segment&segment_id={segment_id}"
-                    ))
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        let segment_body = json_body(segment).await;
-        assert_eq!(
-            segment_body["target"]
-                .as_str()
-                .expect("segment target should be a string"),
-            format!("segment:{segment_id}")
-        );
+    async fn inspect_supports_maintenance_target_and_rejects_empty_segment_ids() {
+        let app = router(Arc::new(AppState::new(test_config("rest-maintenance"))));
+        create_documents(&app).await;
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/inspect?target=maintenance"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["target"], "maintenance");
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("{DOCS}/inspect?target=segment&segment_id="),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "segment_id");
     }
 
     #[tokio::test]
     async fn metadata_endpoint_reports_build_identity_fields() {
-        let state = Arc::new(AppState::new(test_config("rest-metadata")));
-        let app = router(state);
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/metadata")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
+        let app = router(Arc::new(AppState::new(test_config("rest-metadata"))));
+        let (status, body) = call(&app, "GET", "/v2/metadata", None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["product"], "LogPose");
         assert_eq!(body["node_name"], "rest-metadata");
         assert_eq!(body["profile"], "debug");
@@ -1795,19 +1721,8 @@ mod tests {
             .await
             .expect("collection should be created");
         let app = router(state);
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/runtime/status")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
+        let (status, body) = call(&app, "GET", "/v2/runtime/status", None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["role"], "combined");
         assert_eq!(body["storage_engine"], "local");
         assert_eq!(body["collection_count"], 1);
@@ -1861,7 +1776,7 @@ mod tests {
         assert_eq!(payload["coordination"]["leader_node"], "rest-node");
         assert_eq!(
             payload["coordination"]["registered_members"],
-            serde_json::json!(["rest-node", "rest-peer"])
+            json!(["rest-node", "rest-peer"])
         );
         assert_eq!(payload["coordination"]["last_error"], "warn");
     }
@@ -1879,19 +1794,8 @@ mod tests {
             .await
             .expect("collection should be created");
         let app = router(state);
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/placement")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
+        let (status, body) = call(&app, "GET", &format!("{DOCS}/placement"), None).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(body["database_name"], "default");
         assert_eq!(body["collection_name"], "documents");
         assert_eq!(body["assigned_node"], "rest-placement");
@@ -1919,179 +1823,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_round_trips_explicit_database_requests() {
-        let state = Arc::new(AppState::new(test_config("rest-namespace-reject")));
-        let app = router(state);
+    async fn routes_select_the_database_by_path() {
+        let app = router(Arc::new(AppState::new(test_config("rest-database-path"))));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/analytics/collections",
+            Some(documents_spec(2, "dot")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["database_name"], "analytics");
 
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "database_name": "analytics",
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
+        let (status, body) = call(
+            &app,
+            "GET",
+            "/v2/databases/analytics/collections/documents",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["database_name"], "analytics");
+        assert_eq!(body["name"], "documents");
 
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let create_body = json_body(create).await;
-        assert_eq!(create_body["database_name"], "analytics");
+        let (status, body) = call(&app, "GET", DOCS, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-        let get = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents?database=analytics")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/analytics/collections/documents/records/upsert",
+            Some(json!({"records": [{"id": "a", "vector": [1.0, 0.0]}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "analytics");
 
-        assert_eq!(get.status(), StatusCode::OK);
-        let get_body = json_body(get).await;
-        assert_eq!(get_body["database_name"], "analytics");
-        assert_eq!(get_body["name"], "documents");
+        // A body cannot select another database.
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v2/databases/analytics/collections/documents/records/upsert",
+            Some(json!({"database_name": "default", "records": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn rest_treats_blank_namespace_fields_as_default_namespace() {
-        let state = Arc::new(AppState::new(test_config("rest-blank-namespace")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "database_name": "   ",
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
+    async fn nodes_without_the_combined_role_reject_collection_lifecycle_changes() {
+        for (label, role) in [
+            ("rest-data-only", logpose_types::NodeRole::Data),
+            ("rest-control-create", logpose_types::NodeRole::Control),
+        ] {
+            let app = router(Arc::new(AppState::new(test_config_with_role(label, role))));
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v2/databases/default/collections",
+                Some(documents_spec(2, "dot")),
             )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let create_body = json_body(create).await;
-        assert_eq!(create_body["database_name"], "default");
-
-        let get = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents?database=")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(get.status(), StatusCode::OK);
-        let get_body = json_body(get).await;
-        assert_eq!(get_body["database_name"], "default");
-        assert_eq!(get_body["name"], "documents");
-
-        let inspect = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?database=")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(inspect.status(), StatusCode::OK);
-        let inspect_body = json_body(inspect).await;
-        assert_eq!(inspect_body["database_name"], "default");
-        assert_eq!(inspect_body["collection_name"], "documents");
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "FAILED_PRECONDITION");
+            assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
+            assert_eq!(body["details"]["metadata"]["node_role"], role.to_string());
+            assert!(body["message"].as_str().is_some_and(|message| {
+                message.contains("cannot accept control-plane collection lifecycle mutations")
+            }));
+        }
     }
 
-    #[tokio::test]
-    async fn data_only_nodes_reject_control_plane_collection_creation() {
-        let app = router(Arc::new(AppState::new(test_config_with_role(
-            "rest-data-only",
-            logpose_types::NodeRole::Data,
-        ))));
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = json_body(response).await;
-        assert_eq!(body["code"], "FAILED_PRECONDITION");
-        assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
-        assert_eq!(body["details"]["metadata"]["node_role"], "data");
-        assert!(body["message"].as_str().is_some_and(|message| {
-            message.contains("cannot accept control-plane collection lifecycle mutations")
-        }));
-    }
-
-    #[tokio::test]
-    async fn control_only_nodes_reject_control_plane_collection_creation() {
-        let app = router(Arc::new(AppState::new(test_config_with_role(
-            "rest-control-create",
-            logpose_types::NodeRole::Control,
-        ))));
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = json_body(response).await;
-        assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
-        assert_eq!(body["details"]["metadata"]["node_role"], "control");
+    /// Every collection data-plane request, for the routing tests.
+    fn data_plane_requests() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+        vec![
+            (
+                "upsert",
+                "POST",
+                format!("{DOCS}/records/upsert"),
+                Some(json!({"records": [{"id": "alpha", "vector": [1.0, 0.0]}]})),
+            ),
+            (
+                "update",
+                "POST",
+                format!("{DOCS}/records/update"),
+                Some(json!({"records": [{"id": "alpha", "kind": "keep"}]})),
+            ),
+            (
+                "delete",
+                "POST",
+                format!("{DOCS}/records/delete"),
+                Some(json!({"keys": ["alpha"]})),
+            ),
+            (
+                "get",
+                "POST",
+                format!("{DOCS}/records/get"),
+                Some(json!({"keys": ["alpha"]})),
+            ),
+            (
+                "alter",
+                "PATCH",
+                DOCS.to_owned(),
+                Some(json!({"add_field": {"name": "kind", "type": "string"}})),
+            ),
+            (
+                "query",
+                "POST",
+                format!("{DOCS}/query"),
+                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+            ),
+            ("stats", "GET", format!("{DOCS}/stats"), None),
+            ("flush", "POST", format!("{DOCS}/flush"), None),
+            ("compact", "POST", format!("{DOCS}/compact"), None),
+            (
+                "inspect",
+                "GET",
+                format!("{DOCS}/inspect?target=manifest"),
+                None,
+            ),
+        ]
     }
 
     #[tokio::test]
@@ -2112,125 +1963,21 @@ mod tests {
             .await
             .expect("collection should be created");
         drop(initial);
-
-        let state = Arc::new(AppState::new(test_config_with_root(
+        let app = router(Arc::new(AppState::new(test_config_with_root(
             "rest-control-only",
             logpose_types::NodeRole::Control,
             root,
-        )));
-        let app = router(state);
+        ))));
 
-        let responses = vec![
-            (
-                "write",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/writes")
-                            .header("content-type", "application/json")
-                            .body(Body::from(
-                                json!({
-                                    "operations": [
-                                        {
-                                            "op": "put",
-                                            "id": "alpha",
-                                            "vector": [1.0, 0.0],
-                                            "metadata": {"kind": "keep"}
-                                        }
-                                    ]
-                                })
-                                .to_string(),
-                            ))
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "query",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/query")
-                            .header("content-type", "application/json")
-                            .body(Body::from(
-                                json!({
-                                    "vector": [1.0, 0.0],
-                                    "top_k": 1
-                                })
-                                .to_string(),
-                            ))
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "stats",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .uri("/v1/collections/documents/stats")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "flush",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/flush")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "compact",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/compact")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "inspect",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .uri("/v1/collections/documents/inspect?target=manifest")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-        ];
-
-        for (operation, response) in responses {
-            assert_eq!(
-                response.status(),
-                StatusCode::CONFLICT,
-                "{operation} should be rejected on control-only nodes"
-            );
-            let body = json_body(response).await;
+        for (operation, method, uri, body) in data_plane_requests() {
+            let (status, body) = call(&app, method, &uri, body).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{operation}: {body}");
+            assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE", "{operation}");
             assert!(
                 body["message"]
                     .as_str()
                     .is_some_and(|message| message.contains("data-plane operations")),
-                "{operation} should explain the role mismatch"
+                "{operation} should explain the role mismatch: {body}"
             );
         }
     }
@@ -2253,125 +2000,20 @@ mod tests {
             .await
             .expect("collection should be created");
         drop(initial);
-
-        let state = Arc::new(AppState::new(test_config_with_root(
+        let app = router(Arc::new(AppState::new(test_config_with_root(
             "rest-recorded-node-b",
             logpose_types::NodeRole::Combined,
             root,
-        )));
-        let app = router(state);
+        ))));
 
-        let responses = vec![
-            (
-                "write",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/writes")
-                            .header("content-type", "application/json")
-                            .body(Body::from(
-                                json!({
-                                    "operations": [
-                                        {
-                                            "op": "put",
-                                            "id": "alpha",
-                                            "vector": [1.0, 0.0],
-                                            "metadata": {"kind": "keep"}
-                                        }
-                                    ]
-                                })
-                                .to_string(),
-                            ))
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "query",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/query")
-                            .header("content-type", "application/json")
-                            .body(Body::from(
-                                json!({
-                                    "vector": [1.0, 0.0],
-                                    "top_k": 1
-                                })
-                                .to_string(),
-                            ))
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "stats",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .uri("/v1/collections/documents/stats")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "flush",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/flush")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "compact",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .method("POST")
-                            .uri("/v1/collections/documents/compact")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-            (
-                "inspect",
-                app.clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .uri("/v1/collections/documents/inspect?target=manifest")
-                            .body(Body::empty())
-                            .expect("request should build"),
-                    )
-                    .await
-                    .expect("router should respond"),
-            ),
-        ];
-
-        for (operation, response) in responses {
+        for (operation, method, uri, body) in data_plane_requests() {
+            let (status, retry_after, body) = send(&app, method, &uri, body, None).await;
             assert_eq!(
-                response.status(),
+                status,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "{operation} should be rejected for recorded remote assignments"
+                "{operation} should be rejected for recorded remote assignments: {body}"
             );
-            assert_eq!(
-                response.headers()["retry-after"],
-                "1",
-                "{operation} should carry a retry hint"
-            );
-            let body = json_body(response).await;
+            assert_eq!(retry_after.as_deref(), Some("1"), "{operation}");
             assert_eq!(body["details"]["reason"], "NOT_OWNER", "{operation}");
             assert!(
                 body["details"]["metadata"]["owner_node"].is_string(),
@@ -2387,557 +2029,846 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_collection_returns_not_found() {
-        let state = Arc::new(AppState::new(test_config("rest-missing")));
-        let app = router(state);
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/missing")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    async fn missing_collections_and_databases_return_not_found() {
+        let app = router(Arc::new(AppState::new(test_config("rest-missing"))));
+        for (method, uri, body) in [
+            (
+                "GET",
+                "/v2/databases/default/collections/missing".to_owned(),
+                None,
+            ),
+            (
+                "GET",
+                "/v2/databases/default/collections/missing/placement".to_owned(),
+                None,
+            ),
+            (
+                "DELETE",
+                "/v2/databases/default/collections/missing".to_owned(),
+                None,
+            ),
+            (
+                "POST",
+                "/v2/databases/default/collections/missing/records/get".to_owned(),
+                Some(json!({"keys": ["a"]})),
+            ),
+            ("GET", "/v2/databases/nowhere/collections".to_owned(), None),
+            ("DELETE", "/v2/databases/nowhere".to_owned(), None),
+        ] {
+            let (status, body) = call(&app, method, &uri, body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
+            assert_eq!(body["code"], "NOT_FOUND");
+        }
     }
 
     #[tokio::test]
-    async fn missing_collection_placement_returns_not_found() {
-        let state = Arc::new(AppState::new(test_config("rest-missing-placement")));
-        let app = router(state);
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/missing/placement")
-                    .body(Body::empty())
-                    .expect("request should build"),
+    async fn create_collection_names_the_invalid_schema_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-bad-schema"))));
+        let cases = [
+            ("vectors[0].dimensions", documents_spec(0, "dot")),
+            ("vectors", {
+                let mut spec = documents_spec(2, "dot");
+                spec["vectors"] = json!([]);
+                spec
+            }),
+            ("fields[1].name", {
+                let mut spec = products_spec();
+                spec["fields"][1]["name"] = json!("tenant");
+                spec
+            }),
+            ("fields[0].index", {
+                let mut spec = products_spec();
+                spec["fields"][0] = json!({"name": "flag", "type": "bool", "index": "sorted"});
+                spec
+            }),
+            ("primary_key.name", {
+                let mut spec = documents_spec(2, "dot");
+                spec["primary_key"]["name"] = json!("1st");
+                spec
+            }),
+        ];
+        for (field, spec) in cases {
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v2/databases/default/collections",
+                Some(spec),
             )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn create_collection_rejects_zero_dimensions() {
-        let app = router(Arc::new(AppState::new(test_config("rest-zero-dimensions"))));
-
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 0,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(response).await;
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(violation(&body), field, "{body}");
+        }
+        let mut spec = products_spec();
+        spec["fields"][2]["type"] = json!("array<array<string>>");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(spec),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             body["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("dimensions must be greater than 0"))
+                .is_some_and(|message| message.contains("unknown field type")),
+            "{body}"
         );
     }
 
     #[tokio::test]
-    async fn segment_inspect_rejects_empty_segment_id() {
-        let state = Arc::new(AppState::new(test_config("rest-empty-segment")));
-        let app = router(state.clone());
+    async fn typed_collections_are_created_described_listed_altered_and_dropped() {
+        let app = router(Arc::new(AppState::new(test_config("rest-collections"))));
+        let (status, _) = call(&app, "PUT", "/v2/databases/shop", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, created) = call(
+            &app,
+            "POST",
+            "/v2/databases/shop/collections",
+            Some(products_spec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let schema = &created["schema"];
+        assert_eq!(schema["schema_version"], 1);
+        assert_eq!(
+            schema["primary_key"],
+            json!({"id": 0, "name": "sku", "type": "int64"})
+        );
+        assert_eq!(
+            schema["vectors"][0],
+            json!({"id": 1, "name": "embedding", "dimensions": 3, "metric": "cosine"})
+        );
+        assert_eq!(
+            schema["fields"][0],
+            json!({"id": 2, "name": "tenant", "type": "string", "index": "inverted", "nullable": false})
+        );
+        assert_eq!(schema["fields"][1]["index"], "inverted_and_sorted");
+        assert_eq!(schema["fields"][2]["type"], "array<string>");
+        assert_eq!(schema["fields"][4]["index"], "none");
+        assert_eq!(schema["dynamic_fields"], true);
+        assert_eq!(schema["retired_names"], json!([]));
 
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
+        let products = "/v2/databases/shop/collections/products";
+        let (status, described) = call(&app, "GET", products, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(described, created);
+        let (status, listed) = call(&app, "GET", "/v2/databases/shop/collections", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed, json!({"collections": [created]}));
+        let (_, listed) = call(&app, "GET", "/v2/databases/default/collections", None).await;
+        assert_eq!(listed, json!({"collections": []}));
+
+        let (status, altered) = call(
+            &app,
+            "PATCH",
+            products,
+            Some(json!({"add_field": {"name": "stock", "type": "int64"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{altered}");
+        assert_eq!(altered["schema"]["schema_version"], 2);
+        assert_eq!(altered["schema"]["fields"][5]["name"], "stock");
+        assert_eq!(altered["schema"]["fields"][5]["id"], 7);
+        let (_, altered) = call(
+            &app,
+            "PATCH",
+            products,
+            Some(json!({"rename_field": {"from": "stock", "to": "inventory"}})),
+        )
+        .await;
+        assert_eq!(altered["schema"]["fields"][5]["name"], "inventory");
+        assert_eq!(altered["schema"]["retired_names"], json!(["stock"]));
+        let (_, altered) = call(
+            &app,
+            "PATCH",
+            products,
+            Some(json!({"drop_field": {"name": "attrs"}})),
+        )
+        .await;
+        assert_eq!(altered["schema"]["schema_version"], 4);
+        assert_eq!(
+            altered["schema"]["retired_names"],
+            json!(["attrs", "stock"])
+        );
+        let (_, described) = call(&app, "GET", products, None).await;
+        assert_eq!(described, altered, "describe returns the live schema");
+
+        for (change, field) in [
+            (
+                json!({"add_field": {"name": "sku2", "type": "int64", "nullable": false}}),
+                "add_field.nullable",
+            ),
+            (
+                json!({"add_field": {"name": "tenant", "type": "string"}}),
+                "add_field.name",
+            ),
+            (json!({"drop_field": {"name": "sku"}}), "drop_field.name"),
+            (
+                json!({"drop_field": {"name": "embedding"}}),
+                "drop_field.name",
+            ),
+            (
+                json!({"rename_field": {"from": "nope", "to": "other"}}),
+                "rename_field.from",
+            ),
+            (
+                json!({"rename_field": {"from": "price", "to": "$extra"}}),
+                "rename_field.to",
+            ),
+        ] {
+            let (status, body) = call(&app, "PATCH", products, Some(change)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(violation(&body), field, "{body}");
+        }
+        let (status, _) = call(
+            &app,
+            "PATCH",
+            products,
+            Some(json!({"drop_field": {"name": "price"}, "add_field": {"name": "x", "type": "bool"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "one change per request");
+
+        let (status, body) = call(&app, "DELETE", "/v2/databases/shop", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "FAILED_PRECONDITION");
+        let (status, body) = call(&app, "DELETE", products, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"database_name": "shop", "collection_name": "products"})
+        );
+        let (status, _) = call(&app, "GET", products, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = call(&app, "DELETE", "/v2/databases/shop", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(&app, "DELETE", "/v2/databases/default", None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn typed_records_round_trip_as_natural_json() {
+        let app = router(Arc::new(AppState::new(test_config("rest-typed"))));
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(products_spec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let products = "/v2/databases/default/collections/products";
+
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/upsert"),
+            Some(json!({"records": [
+                {
+                    "sku": 1,
+                    "embedding": [3.0, 0.0, 4.0],
+                    "tenant": "acme",
+                    "price": 9.5,
+                    "tags": ["a", "b"],
+                    "updated_at": "2026-09-28T12:30:00.5+02:00",
+                    "attrs": {"size": 3, "big": u64::MAX},
+                    "color": "red"
+                },
+                {"sku": 2, "embedding": [0.0, 1.0, 0.0], "tenant": "acme", "updated_at": 0}
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 2);
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [1, 3, 2]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "products");
+        assert_eq!(body["missing_keys"], json!([3]));
+        assert_eq!(body["snapshot"], ack["snapshot"]);
+        assert_eq!(
+            body["records"][0],
+            json!({
+                "sku": 1,
+                "embedding": [0.6, 0.0, 0.8],
+                "tenant": "acme",
+                "price": 9.5,
+                "tags": ["a", "b"],
+                "updated_at": "2026-09-28T10:30:00.500000Z",
+                "attrs": {"size": 3, "big": u64::MAX},
+                "color": "red"
+            }),
+            "cosine vectors are normalized, timestamps are RFC 3339 in UTC, and $extra keys \
+             are flattened into the document"
+        );
+        assert_eq!(body["records"][1]["updated_at"], "1970-01-01T00:00:00Z");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [1], "output_fields": ["price", "color"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["records"][0],
+            json!({"sku": 1, "price": 9.5, "color": "red"})
+        );
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/update"),
+            Some(json!({"records": [{"sku": 1, "price": null, "tags": ["c"], "color": null, "origin": "eu"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [1]})),
+        )
+        .await;
+        let record = &body["records"][0];
+        assert!(
+            record.get("price").is_none(),
+            "null clears a field: {record}"
+        );
+        assert!(record.get("color").is_none(), "null removes a dynamic key");
+        assert_eq!(record["tags"], json!(["c"]));
+        assert_eq!(record["origin"], "eu");
+        assert_eq!(record["embedding"], json!([0.6, 0.0, 0.8]));
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/update"),
+            Some(json!({"records": [{"sku": 404, "price": 1.0}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["details"]["metadata"]["resource_type"], "record");
+        assert_eq!(body["details"]["metadata"]["resource_name"], "404");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/delete"),
+            Some(json!({"keys": [2, 99]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied_ops"], 2);
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [2]})),
+        )
+        .await;
+        assert_eq!(body["records"], json!([]));
+        assert_eq!(body["missing_keys"], json!([2]));
+    }
+
+    #[tokio::test]
+    async fn typed_values_round_trip_exactly_through_segments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-fidelity"))));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(json!({
+                "name": "extremes",
+                "primary_key": {"name": "id", "type": "int64"},
+                "vectors": [{"name": "v", "dimensions": 2, "metric": "l2"}],
+                "fields": [
+                    {"name": "n", "type": "int64"},
+                    {"name": "f", "type": "float64"},
+                    {"name": "at", "type": "timestamp"},
+                    {"name": "ns", "type": "array<int64>"},
+                    {"name": "doc", "type": "json"}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let extremes = "/v2/databases/default/collections/extremes";
+        let max = json!({
+            "id": i64::MAX,
+            "v": [0.1, -0.2],
+            "n": i64::MAX,
+            "f": f64::MAX,
+            "at": "9999-12-31T23:59:59.999999999Z",
+            "ns": [i64::MIN, 0, i64::MAX],
+            "doc": {"deep": {"list": [1, "two", null, {"k": u64::MAX}]}},
+            "\u{e9}t\u{e9} \u{1f600}": {"nested": [true, 1.5]}
+        });
+        let min = json!({
+            "id": i64::MIN,
+            "v": [0.0, 0.0],
+            "n": i64::MIN,
+            "f": -0.0,
+            "at": "0000-01-01T00:00:00-00:00",
+            "ns": [],
+            "doc": null
+        });
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/upsert"),
+            Some(json!({"records": [max, min]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let expected_max = json!({
+            "id": i64::MAX,
+            "v": [0.1, -0.2],
+            "n": i64::MAX,
+            "f": f64::MAX,
+            "at": "9999-12-31T23:59:59.999999Z",
+            "ns": [i64::MIN, 0, i64::MAX],
+            "doc": {"deep": {"list": [1, "two", null, {"k": u64::MAX}]}},
+            "\u{e9}t\u{e9} \u{1f600}": {"nested": [true, 1.5]}
+        });
+        let expected_min = json!({
+            "id": i64::MIN,
+            "v": [0.0, 0.0],
+            "n": i64::MIN,
+            "f": 0.0,
+            "at": "0000-01-01T00:00:00Z",
+            "ns": []
+        });
+        for stage in ["memtable", "flush", "compact"] {
+            if stage != "memtable" {
+                let (status, body) = call(&app, "POST", &format!("{extremes}/{stage}"), None).await;
+                assert_eq!(status, StatusCode::OK, "{stage}: {body}");
+            }
+            let (status, body) = call(
+                &app,
+                "POST",
+                &format!("{extremes}/records/get"),
+                Some(json!({"keys": [i64::MAX, i64::MIN, i64::MAX, 7]})),
             )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
+            .await;
+            assert_eq!(status, StatusCode::OK, "{stage}: {body}");
+            assert_eq!(
+                body["records"],
+                json!([expected_max, expected_min, expected_max]),
+                "{stage}: every type reads back exactly; a repeated key is returned each time"
+            );
+            assert_eq!(body["missing_keys"], json!([7]), "{stage}");
+        }
 
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=segment&segment_id=")
-                    .body(Body::empty())
-                    .expect("request should build"),
+        // A partial update merges with a row read back from a segment.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/update"),
+            Some(json!({"records": [{"id": i64::MIN, "n": 5, "ns": null}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/get"),
+            Some(json!({"keys": [i64::MIN], "output_fields": ["n", "ns", "v"]})),
+        )
+        .await;
+        assert_eq!(
+            body["records"],
+            json!([{"id": i64::MIN, "n": 5, "v": [0.0, 0.0]}])
+        );
+
+        // A key deleted after it was flushed has no row to update.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/delete"),
+            Some(json!({"keys": [i64::MAX]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/update"),
+            Some(json!({"records": [{"id": i64::MAX, "n": 1}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            i64::MAX.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn record_validation_errors_name_the_record_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-record-errors"))));
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(products_spec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let products = "/v2/databases/default/collections/products";
+        let valid = json!({"sku": 1, "embedding": [1.0, 0.0, 0.0], "tenant": "acme"});
+        let with = |key: &str, value: Value| {
+            let mut record = valid.clone();
+            record["sku"] = json!(2);
+            record[key] = value;
+            record
+        };
+        let cases = [
+            ("records[1].price", with("price", json!("cheap"))),
+            ("records[1].tags[1]", with("tags", json!(["a", 1]))),
+            ("records[1].tags[0]", with("tags", json!([null]))),
+            (
+                "records[1].updated_at",
+                with("updated_at", json!("yesterday")),
+            ),
+            ("records[1].tenant", with("tenant", json!(null))),
+            ("records[1].sku", with("sku", json!("two"))),
+            ("records[1].sku", with("sku", json!(1.5))),
+            ("records[1].embedding", with("embedding", json!("up"))),
+            ("records[1].$extra", with("$extra", json!({}))),
+            ("records[1]", json!(["not", "an", "object"])),
+            ("records[1]", valid.clone()),
+        ];
+        for (field, record) in cases {
+            let (status, body) = call(
+                &app,
+                "POST",
+                &format!("{products}/records/upsert"),
+                Some(json!({"records": [valid.clone(), record]})),
             )
-            .await
-            .expect("router should respond");
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(violation(&body), field, "{body}");
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/upsert"),
+            Some(json!({"records": [{"sku": 3, "embedding": [0.0, 0.0, 0.0], "tenant": "x"}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "records[0].embedding");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cannot be normalized")),
+            "a cosine vector of all zeros has no direction: {body}"
+        );
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/update"),
+            Some(json!({"records": [{"sku": 1}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "records[0]");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/update"),
+            Some(json!({"records": [{"price": 1.0}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "records[0].sku");
+
+        for (keys, field) in [(json!(["a"]), "keys[0]"), (json!([1, true]), "keys[1]")] {
+            let (status, body) = call(
+                &app,
+                "POST",
+                &format!("{products}/records/get"),
+                Some(json!({"keys": keys})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(violation(&body), field);
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(json!({
+                "name": "strict",
+                "primary_key": {"name": "id", "type": "string"},
+                "vectors": [{"name": "v", "dimensions": 1}],
+                "dynamic_fields": false
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections/strict/records/upsert",
+            Some(json!({"records": [{"id": "a", "v": [1.0], "extra": 1}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "records[0].extra");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections/strict/records/get",
+            Some(json!({"keys": ["a"], "output_fields": ["v", "extra"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "output_fields[1]");
+    }
+
+    #[tokio::test]
+    async fn schema_changes_shadow_dynamic_keys_and_survive_a_restart() {
+        let root = unique_temp_dir("rest-schema-restart");
+        let config = test_config_with_root(
+            "rest-schema-restart",
+            logpose_types::NodeRole::Combined,
+            root.clone(),
+        );
+        let app = router(Arc::new(AppState::new(config.clone())));
+        create_documents(&app).await;
+        let (status, _) = upsert(
+            &app,
+            json!([{"id": "alpha", "vector": [1.0, 0.0], "color": "red", "size": 1}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            DOCS,
+            Some(json!({"add_field": {"name": "color", "type": "string"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/get"),
+            Some(json!({"keys": ["alpha"]})),
+        )
+        .await;
+        assert_eq!(
+            body["records"][0],
+            json!({"id": "alpha", "vector": [1.0, 0.0], "size": 1}),
+            "the added field reads null on the old row, and the $extra key it names is hidden"
+        );
+
+        let (status, body) = upsert(
+            &app,
+            json!([{"id": "beta", "vector": [0.0, 1.0], "color": "blue"}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = upsert(
+            &app,
+            json!([{"id": "gamma", "vector": [0.0, 1.0], "color": 7}]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "color is typed now: {body}"
+        );
+        assert_eq!(violation(&body), "records[0].color");
+
+        let (status, _) = call(
+            &app,
+            "PATCH",
+            DOCS,
+            Some(json!({"rename_field": {"from": "color", "to": "colour"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = upsert(
+            &app,
+            json!([{"id": "gamma", "vector": [0.0, 1.0], "color": "green"}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "records[0].color");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("retired field name")),
+            "{body}"
+        );
+        drop(app);
+
+        let app = router(Arc::new(AppState::new(config)));
+        let (status, body) = call(&app, "GET", DOCS, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["schema"]["schema_version"], 3);
+        assert_eq!(body["schema"]["fields"][0]["name"], "colour");
+        assert_eq!(body["schema"]["retired_names"], json!(["color"]));
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/get"),
+            Some(json!({"keys": ["alpha", "beta"]})),
+        )
+        .await;
+        assert_eq!(
+            body["records"],
+            json!([
+                {"id": "alpha", "vector": [1.0, 0.0], "size": 1},
+                {"id": "beta", "vector": [0.0, 1.0], "colour": "blue"}
+            ])
+        );
+        let (status, _) = call(&app, "POST", &format!("{DOCS}/flush"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, after_flush) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/records/get"),
+            Some(json!({"keys": ["alpha", "beta"]})),
+        )
+        .await;
+        assert_eq!(
+            after_flush["records"], body["records"],
+            "segments read the same as memtables"
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn query_filters_preserve_large_integer_precision() {
-        let state = Arc::new(AppState::new(test_config("rest-large-integers")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let write = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "lower",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": { "score": 9007199254740992u64 }
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "higher",
-                                    "vector": [2.0, 0.0],
-                                    "metadata": { "score": 9007199254740993u64 }
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(write.status(), StatusCode::OK);
-
-        let query = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 5,
-                            "filters": { "score": 9007199254740993u64 }
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(query.status(), StatusCode::OK);
-        let query_body = json_body(query).await;
-        assert_eq!(
-            query_body["matches"]
-                .as_array()
-                .expect("matches should be an array")
-                .iter()
-                .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
-                .collect::<Vec<_>>(),
-            vec!["higher"]
-        );
+        let app = router(Arc::new(AppState::new(test_config("rest-large-integers"))));
+        create_documents(&app).await;
+        let (status, _) = upsert(
+            &app,
+            json!([
+                {"id": "lower", "vector": [1.0, 0.0], "score": 9_007_199_254_740_992_u64},
+                {"id": "higher", "vector": [2.0, 0.0], "score": 9_007_199_254_740_993_u64}
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/query"),
+            Some(json!({
+                "vector": [1.0, 0.0],
+                "top_k": 5,
+                "filters": {"score": 9_007_199_254_740_993_u64}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(match_ids(&body), vec!["higher"]);
     }
 
     #[tokio::test]
     async fn query_accepts_predicate_and_profile_diagnostics() {
-        let state = Arc::new(AppState::new(test_config("rest-predicate-profile")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let write = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "alpha",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": {"kind": "keep", "version": 1}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "beta",
-                                    "vector": [2.0, 0.0],
-                                    "metadata": {"kind": "drop", "version": 2}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "gamma",
-                                    "vector": [3.0, 0.0],
-                                    "metadata": {"kind": "drop", "version": 3}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "delta",
-                                    "vector": [4.0, 0.0],
-                                    "metadata": {"kind": "drop", "version": 4}
-                                },
-                                {
-                                    "op": "put",
-                                    "id": "epsilon",
-                                    "vector": [5.0, 0.0],
-                                    "metadata": {"kind": "keep", "version": 5}
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(write.status(), StatusCode::OK);
-
-        let query = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 1,
-                            "predicate": {
-                                "kind": "comparison",
-                                "field": "kind",
-                                "operator": "eq",
-                                "value": "keep"
-                            },
-                            "explain": "profile"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(query.status(), StatusCode::OK);
-        let query_body = json_body(query).await;
-        assert_eq!(
-            query_body["matches"]
-                .as_array()
-                .expect("matches should be an array")
-                .iter()
-                .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
-                .collect::<Vec<_>>(),
-            vec!["epsilon"]
-        );
-        assert_eq!(
-            query_body["diagnostics"]["chosen_plan"],
-            "predicate_first_exact"
-        );
+        let app = router(Arc::new(AppState::new(test_config(
+            "rest-predicate-profile",
+        ))));
+        create_documents(&app).await;
+        let (status, _) = upsert(
+            &app,
+            json!([
+                {"id": "alpha", "vector": [1.0, 0.0], "kind": "keep", "version": 1},
+                {"id": "beta", "vector": [2.0, 0.0], "kind": "drop", "version": 2},
+                {"id": "gamma", "vector": [3.0, 0.0], "kind": "drop", "version": 3},
+                {"id": "delta", "vector": [4.0, 0.0], "kind": "drop", "version": 4},
+                {"id": "epsilon", "vector": [5.0, 0.0], "kind": "keep", "version": 5}
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{DOCS}/query"),
+            Some(json!({
+                "vector": [1.0, 0.0],
+                "top_k": 1,
+                "predicate": {"kind": "comparison", "field": "kind", "operator": "eq", "value": "keep"},
+                "explain": "profile"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(match_ids(&body), vec!["epsilon"]);
+        let diagnostics = &body["diagnostics"];
+        assert_eq!(diagnostics["chosen_plan"], "predicate_first_exact");
         assert!(
-            query_body["diagnostics"]["fallback_reason"]
+            diagnostics["fallback_reason"]
                 .as_str()
                 .is_some_and(|reason| !reason.is_empty())
         );
         assert!(
-            query_body["diagnostics"]["candidates_merged"]
+            diagnostics["candidates_merged"]
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );
         assert!(
-            query_body["diagnostics"]["unit_scan_mix"]["memtable_scan"]
+            diagnostics["unit_scan_mix"]["memtable_scan"]
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["planning_micros"]
-                .as_u64()
-                .is_some(),
-            "profile mode should include stage timings"
-        );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["prefilter_micros"]
-                .as_u64()
-                .is_some()
-        );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["candidate_generation_micros"]
-                .as_u64()
-                .is_some()
-        );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["postfilter_micros"]
-                .as_u64()
-                .is_some()
-        );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["rerank_micros"]
-                .as_u64()
-                .is_some()
-        );
-        assert!(
-            query_body["diagnostics"]["stage_timings"]["merge_micros"]
-                .as_u64()
-                .is_some()
-        );
+        for stage in [
+            "planning_micros",
+            "prefilter_micros",
+            "candidate_generation_micros",
+            "postfilter_micros",
+            "rerank_micros",
+            "merge_micros",
+        ] {
+            assert!(
+                diagnostics["stage_timings"][stage].as_u64().is_some(),
+                "profile mode should include {stage}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn inspect_supports_maintenance_target() {
-        let state = Arc::new(AppState::new(test_config("rest-maintenance")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let inspect = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/collections/documents/inspect?target=maintenance")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(inspect.status(), StatusCode::OK);
-        let inspect_body = json_body(inspect).await;
-        assert_eq!(inspect_body["target"], "maintenance");
-        assert!(inspect_body["payload"]["last_error"].is_null());
-    }
-
-    #[tokio::test]
-    async fn query_rejects_malformed_predicates() {
-        let state = Arc::new(AppState::new(test_config("rest-invalid-predicate")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let query = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 1,
-                            "predicate": {
-                                "kind": "comparison",
-                                "field": "kind",
-                                "operator": "eq"
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn query_rejects_empty_logical_predicates() {
-        let state = Arc::new(AppState::new(test_config("rest-empty-logical-predicate")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let query = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 1,
-                            "predicate": {
-                                "kind": "and",
-                                "children": []
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn query_rejects_zero_top_k() {
-        let state = Arc::new(AppState::new(test_config("rest-zero-top-k")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let query = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/query")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "vector": [1.0, 0.0],
-                            "top_k": 0
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(query).await;
+    async fn query_rejects_malformed_requests() {
+        let app = router(Arc::new(AppState::new(test_config("rest-query-errors"))));
+        create_documents(&app).await;
+        let query = format!("{DOCS}/query");
+        for request in [
+            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "comparison", "field": "kind", "operator": "eq"}}),
+            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "and", "children": []}}),
+            json!({"vector": [1.0, 0.0], "top_k": 1, "filters": {"kind": {"nested": true}}}),
+        ] {
+            let (status, body) = call(&app, "POST", &query, Some(request)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({"vector": [1.0, 0.0], "top_k": 0})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(violation(&body), "top_k");
         assert!(
             body["message"]
                 .as_str()
@@ -2946,176 +2877,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_rejects_empty_put_record_id() {
-        let state = Arc::new(AppState::new(test_config("rest-empty-put-id")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let write = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "put",
-                                    "id": "",
-                                    "vector": [1.0, 0.0],
-                                    "metadata": {}
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(write).await;
-        assert!(body["message"].as_str().is_some_and(|message| {
-            message.contains("write operation record id must not be empty")
-        }));
-    }
-
-    #[tokio::test]
-    async fn write_rejects_empty_delete_record_id() {
-        let state = Arc::new(AppState::new(test_config("rest-empty-delete-id")));
-        let app = router(state);
-
-        let create = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "documents",
-                            "dimensions": 2,
-                            "metric": "dot"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(create.status(), StatusCode::CREATED);
-
-        let write = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/collections/documents/writes")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "operations": [
-                                {
-                                    "op": "delete",
-                                    "id": ""
-                                }
-                            ]
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-
-        assert_eq!(write.status(), StatusCode::BAD_REQUEST);
-        let body = json_body(write).await;
-        assert!(body["message"].as_str().is_some_and(|message| {
-            message.contains("write operation record id must not be empty")
-        }));
-    }
-
-    #[tokio::test]
     async fn rest_database_policy_endpoints_round_trip_json_and_role_errors() {
         let combined = router(Arc::new(AppState::new(test_config("rest-policy-combined"))));
-        let put = combined
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri("/v1/databases/default/policy")
-                    .header("content-type", "application/json")
-                    .body(Body::from(policy_body("default").to_string()))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(put.status(), StatusCode::OK);
-        let put_body = json_body(put).await;
-        assert_eq!(put_body["database_name"], "default");
-        assert_eq!(put_body["authentication_mode"], "external_token");
+        let (status, put) = call(
+            &combined,
+            "PUT",
+            "/v2/databases/default/policy",
+            Some(policy_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{put}");
+        assert_eq!(put["database_name"], "default");
+        assert_eq!(put["authentication_mode"], "external_token");
         assert_eq!(
-            put_body["role_bindings"]
+            put["role_bindings"]
                 .as_array()
                 .expect("bindings should be an array")
                 .len(),
             2
         );
+        let (status, get) = call(&combined, "GET", "/v2/databases/default/policy", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(get, put);
 
-        let get = combined
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/v1/databases/default/policy")
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(get.status(), StatusCode::OK);
-        let get_body = json_body(get).await;
-        assert_eq!(get_body, policy_body("default"));
+        let mut with_database = policy_body();
+        with_database["database_name"] = json!("other");
+        let (status, _) = call(
+            &combined,
+            "PUT",
+            "/v2/databases/default/policy",
+            Some(with_database),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the path names the database"
+        );
 
         let data_only = router(Arc::new(AppState::new(test_config_with_role(
             "rest-policy-data-only",
             logpose_types::NodeRole::Data,
         ))));
-        let data_error = data_only
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri("/v1/databases/default/policy")
-                    .header("content-type", "application/json")
-                    .body(Body::from(policy_body("default").to_string()))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("router should respond");
-        assert_eq!(data_error.status(), StatusCode::CONFLICT);
-        let data_error_body = json_body(data_error).await;
-        assert_eq!(data_error_body["details"]["reason"], "WRONG_NODE_ROLE");
-        assert!(data_error_body["message"].as_str().is_some_and(|message| {
+        let (status, body) = call(
+            &data_only,
+            "PUT",
+            "/v2/databases/default/policy",
+            Some(policy_body()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["details"]["reason"], "WRONG_NODE_ROLE");
+        assert!(body["message"].as_str().is_some_and(|message| {
             message.contains("cannot accept control-plane database mutations")
         }));
     }
@@ -3174,11 +2987,6 @@ mod tests {
         config
     }
 
-    fn database_body(database_name: &str) -> Value {
-        let descriptor = DatabaseDescriptor::new(database_name);
-        serde_json::to_value(descriptor).expect("database descriptor should serialize")
-    }
-
     fn read_only_policy(database_name: &str, principal_name: &str) -> DatabaseAccessPolicy {
         DatabaseAccessPolicy {
             database_name: database_name.to_owned(),
@@ -3191,21 +2999,13 @@ mod tests {
         }
     }
 
-    fn policy_body(database_name: &str) -> Value {
+    /// A policy body: the path names its database.
+    fn policy_body() -> Value {
         json!({
-            "database_name": database_name,
             "authentication_mode": "external_token",
             "role_bindings": [
-                {
-                    "database_name": database_name,
-                    "principal_name": "ops-admin",
-                    "role": "owner"
-                },
-                {
-                    "database_name": database_name,
-                    "principal_name": "reader-service",
-                    "role": "read_only"
-                }
+                {"principal_name": "ops-admin", "role": "owner"},
+                {"principal_name": "reader-service", "role": "read_only"}
             ]
         })
     }

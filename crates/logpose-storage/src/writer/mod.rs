@@ -76,7 +76,6 @@ use logpose_types::{
     CommitAck, LogPoseError, Result, RowAddr, SeqNo, Snapshot, UnitId, WriteOutcome,
     filter::FilterExpr,
     record::{ClientOp, PartialUpdate, PrimaryKey},
-    schema::{CollectionSchema, ScalarFieldSpec, SchemaError},
 };
 use logpose_vfs::is_crashed;
 use logpose_wal::{
@@ -128,35 +127,7 @@ impl Default for GroupCommitConfig {
     }
 }
 
-/// An online schema change, ordered with writes in the collection's request stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SchemaChange {
-    /// Add a nullable scalar field.
-    AddField(ScalarFieldSpec),
-    /// Drop a scalar or vector field.
-    DropField {
-        /// The field's current name.
-        name: String,
-    },
-    /// Rename any field.
-    RenameField {
-        /// The current name.
-        from: String,
-        /// The new name.
-        to: String,
-    },
-}
-
-impl SchemaChange {
-    /// Apply the change to `schema`, which is unchanged on error.
-    pub fn apply_to(&self, schema: &mut CollectionSchema) -> std::result::Result<(), SchemaError> {
-        match self {
-            Self::AddField(spec) => schema.add_field(spec.clone()).map(|_| ()),
-            Self::DropField { name } => schema.drop_field(name).map(|_| ()),
-            Self::RenameField { from, to } => schema.rename_field(from, to).map(|_| ()),
-        }
-    }
-}
+pub use logpose_types::schema::SchemaChange;
 
 /// Where the acknowledgement of one request goes.
 pub(crate) type Ack = oneshot::Sender<Result<CommitAck>>;

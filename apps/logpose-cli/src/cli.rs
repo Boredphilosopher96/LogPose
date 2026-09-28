@@ -1,12 +1,13 @@
 use crate::action::{
-    Action, CollectionCreateAction, CollectionStatsAction, DatabasePolicySetAction,
-    DatabasePutAction, ExplainArg, MetricArg, QueryAction, QueryFilter, QueryVector,
-    RecordDeleteAction, RecordPutAction, WorkflowKind, parse_query_filter, parse_query_vector,
-    parse_query_where,
+    Action, CollectionAlterAction, CollectionCreateAction, CollectionSchemaCreateAction,
+    CollectionStatsAction, DatabasePolicySetAction, DatabasePutAction, ExplainArg, MetricArg,
+    QueryAction, QueryFilter, QueryVector, RecordDeleteAction, RecordGetAction, RecordPutAction,
+    WorkflowKind, parse_query_filter, parse_query_vector, parse_query_where, parse_schema_change,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use logpose_storage::InspectTarget;
 use logpose_types::{CollectionRef, DEFAULT_DATABASE_NAME};
+use logpose_types::{DistanceMetric, schema::SchemaChange};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +114,9 @@ impl Cli {
                     DatabaseCommand::Put(args) => Action::DatabasePut(DatabasePutAction {
                         database_name: args.database_name,
                     }),
+                    DatabaseCommand::Drop(args) => Action::DatabaseDrop {
+                        database_name: args.database_name,
+                    },
                     DatabaseCommand::Policy(args) => match args.command {
                         DatabasePolicyCommand::Show(args) => Action::DatabasePolicyShow {
                             database_name: args.database,
@@ -134,13 +138,34 @@ impl Cli {
             Commands::Collection(args) => {
                 let action = match args.command {
                     CollectionCommand::Create(args) => {
-                        Action::CollectionCreate(CollectionCreateAction {
-                            collection: args.namespace.collection_ref(args.name),
-                            dimensions: args.dimensions,
-                            metric: args.metric.into(),
+                        let collection = args.namespace.collection_ref(args.name);
+                        match args.schema {
+                            Some(schema) => {
+                                Action::CollectionCreateFromSchema(CollectionSchemaCreateAction {
+                                    collection,
+                                    schema,
+                                })
+                            }
+                            // Without `--schema`, clap requires both flags, so the fallbacks
+                            // below never apply.
+                            None => Action::CollectionCreate(CollectionCreateAction {
+                                collection,
+                                dimensions: args.dimensions.unwrap_or_default(),
+                                metric: args.metric.map_or(DistanceMetric::Cosine, Into::into),
+                            }),
+                        }
+                    }
+                    CollectionCommand::List(args) => Action::CollectionList {
+                        database_name: args.database,
+                    },
+                    CollectionCommand::Show(args) => Action::CollectionShow(args.collection_ref()),
+                    CollectionCommand::Alter(args) => {
+                        Action::CollectionAlter(CollectionAlterAction {
+                            collection: args.namespace.collection_ref(args.collection),
+                            change: args.change,
                         })
                     }
-                    CollectionCommand::Show(args) => Action::CollectionShow(args.collection_ref()),
+                    CollectionCommand::Drop(args) => Action::CollectionDrop(args.collection_ref()),
                     CollectionCommand::Stats(args) => {
                         Action::CollectionStats(CollectionStatsAction {
                             collection: args.collection_ref(),
@@ -175,6 +200,11 @@ impl Cli {
                     RecordCommand::Delete(args) => Action::RecordDelete(RecordDeleteAction {
                         collection: args.collection_ref(),
                         id: args.id,
+                    }),
+                    RecordCommand::Get(args) => Action::RecordGet(RecordGetAction {
+                        collection: args.namespace.collection_ref(args.collection),
+                        keys: args.keys,
+                        output_fields: args.output_fields,
                     }),
                 };
                 CommandRequest::Direct {
@@ -466,6 +496,8 @@ pub enum DatabaseCommand {
     Show(DatabaseNameArg),
     /// Create or replace one database descriptor.
     Put(DatabaseNameArg),
+    /// Drop an empty database. The default database cannot be dropped.
+    Drop(DatabaseNameArg),
     /// Show or replace one database access policy.
     Policy(DatabasePolicyGroup),
 }
@@ -479,8 +511,8 @@ pub struct DatabaseListArgs {}
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Show or create one database descriptor.",
-    after_long_help = "Examples:\n  logpose database show analytics\n  logpose database put analytics\n  logpose --json database show analytics"
+    about = "Show, create, or drop one database.",
+    after_long_help = "Examples:\n  logpose database show analytics\n  logpose database put analytics\n  logpose database drop analytics\n  logpose --json database show analytics"
 )]
 pub struct DatabaseNameArg {
     #[arg(value_name = "DATABASE", help = "Database name. Example: analytics")]
@@ -549,8 +581,14 @@ pub struct CollectionGroup {
 pub enum CollectionCommand {
     /// Create a collection.
     Create(CollectionCreateArgs),
+    /// List the collections in a database.
+    List(CollectionListArgs),
     /// Show metadata for a collection.
     Show(CollectionNameArg),
+    /// Apply one online schema change.
+    Alter(CollectionAlterArgs),
+    /// Drop a collection and its data.
+    Drop(CollectionNameArg),
     /// Show collection-level storage statistics.
     Stats(CollectionStatsArgs),
     /// Explain where a collection is placed.
@@ -563,8 +601,8 @@ pub enum CollectionCommand {
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Create a collection with a fixed embedding shape and distance metric.",
-    after_long_help = "Examples:\n  logpose collection create colors --dimensions 768 --metric cosine\n  logpose --json collection create colors --dimensions 768 --metric cosine\n  logpose interactive"
+    about = "Create a collection from a typed schema, or with one vector field and dynamic fields.",
+    after_long_help = "Examples:\n  logpose collection create colors --dimensions 768 --metric cosine\n  logpose collection create products --schema products.json\n  logpose --json collection create colors --dimensions 768 --metric cosine\n  logpose interactive\n\nWith --dimensions and --metric, the collection has a string primary key `id`, one vector field `vector`, and dynamic fields on.\nA --schema file holds the REST create body: primary_key, vectors, fields, and dynamic_fields."
 )]
 pub struct CollectionCreateArgs {
     #[command(flatten)]
@@ -574,16 +612,60 @@ pub struct CollectionCreateArgs {
     #[arg(
         long,
         value_name = "DIMENSIONS",
+        required_unless_present = "schema",
+        conflicts_with = "schema",
         help = "Embedding dimensions stored in the collection. Example: 768"
     )]
-    pub dimensions: usize,
+    pub dimensions: Option<usize>,
     #[arg(
         long,
         value_enum,
         value_name = "METRIC",
+        required_unless_present = "schema",
+        conflicts_with = "schema",
         help = "Distance metric used when scoring matches."
     )]
-    pub metric: MetricArg,
+    pub metric: Option<MetricArg>,
+    #[arg(
+        long,
+        value_name = "JSON_PATH",
+        help = "Path to a typed schema JSON document. Example: products.json"
+    )]
+    pub schema: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "List the collections in a database with their schemas.",
+    after_long_help = "Examples:\n  logpose collection list\n  logpose --json collection list --database analytics"
+)]
+pub struct CollectionListArgs {
+    #[arg(
+        long,
+        default_value = DEFAULT_DATABASE_NAME,
+        value_name = "DATABASE",
+        help = "Database to list. Defaults to default."
+    )]
+    pub database: String,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Apply one online schema change: add a nullable field, drop a field, or rename a field.",
+    after_long_help = "Examples:\n  logpose collection alter products --change '{\"add_field\":{\"name\":\"price\",\"type\":\"float64\"}}'\n  logpose collection alter products --change '{\"drop_field\":{\"name\":\"price\"}}'\n  logpose collection alter products --change '{\"rename_field\":{\"from\":\"title\",\"to\":\"name\"}}'"
+)]
+pub struct CollectionAlterArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(value_name = "NAME", help = "Collection name. Example: products")]
+    pub collection: String,
+    #[arg(
+        long,
+        value_parser = parse_schema_change,
+        value_name = "CHANGE_JSON",
+        help = "The schema change as JSON, in the shape of the REST PATCH body."
+    )]
+    pub change: SchemaChange,
 }
 
 #[derive(Debug, Args)]
@@ -663,6 +745,35 @@ pub enum RecordCommand {
     Put(RecordPutArgs),
     /// Tombstone a single record id in a collection.
     Delete(RecordDeleteArgs),
+    /// Read records by primary key.
+    Get(RecordGetArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Read records by primary key, optionally projected to some fields.",
+    after_long_help = "Examples:\n  logpose record get colors alpha beta\n  logpose --json record get products 7 --output-field title --output-field price"
+)]
+pub struct RecordGetArgs {
+    #[command(flatten)]
+    pub namespace: NamespaceArgs,
+    #[arg(
+        value_name = "COLLECTION",
+        help = "Collection to read from. Example: colors"
+    )]
+    pub collection: String,
+    #[arg(
+        value_name = "KEY",
+        required = true,
+        help = "Primary keys to read, typed by the schema. Example: alpha"
+    )]
+    pub keys: Vec<String>,
+    #[arg(
+        long = "output-field",
+        value_name = "FIELD",
+        help = "Return only this field; repeat for more. The primary key is always returned."
+    )]
+    pub output_fields: Vec<String>,
 }
 
 #[derive(Debug, Args)]

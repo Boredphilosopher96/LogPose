@@ -243,10 +243,15 @@ impl ReadView {
         &self.version.meta.reference
     }
 
-    /// The collection's (legacy) vector metric.
+    /// The metric of the first vector field of the view's schema: the vector the legacy read
+    /// paths search.
     #[must_use]
     pub fn metric(&self) -> DistanceMetric {
-        self.version.meta.descriptor.metric
+        self.version
+            .schema
+            .vectors()
+            .first()
+            .map_or(DistanceMetric::Cosine, |field| field.metric)
     }
 
     /// Last sequence number the view includes.

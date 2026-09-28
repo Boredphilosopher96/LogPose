@@ -7,9 +7,16 @@ use logpose_types::{
     CollectionAssignment, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME,
     DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus, Result, Snapshot,
     WriteOperation,
+    legacy::{LEGACY_PRIMARY_KEY_FIELD, LEGACY_VECTOR_FIELD},
+    record::ClientOp,
+    schema::{
+        CollectionSchema, CreateCollectionSpec, PrimaryKeySpec, PrimaryKeyType, SchemaChange,
+        VectorFieldSpec,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Collection lifecycle, writes, maintenance, and statistics over one storage root.
 ///
@@ -77,6 +84,45 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
         ))
     }
 
+    /// Drop a collection: refuse new calls on it, wait for its in-flight write and
+    /// maintenance job, and durably remove its files. A metadata-store-backed engine also
+    /// removes the collection's metadata, fenced by `leader_fence`.
+    async fn drop_collection(
+        &self,
+        collection_name: &str,
+        leader_fence: Option<LeadershipFence>,
+    ) -> Result<()> {
+        let _ = collection_name;
+        let _ = leader_fence;
+        Err(unsupported("dropping collections"))
+    }
+
+    /// The collection's live schema: the schema of its current published state.
+    async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
+        let _ = collection_name;
+        Err(unsupported("reading schemas"))
+    }
+
+    /// Change the collection's schema online, ordered with the writes around it. Durable and
+    /// visible once this returns.
+    async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
+        let _ = collection_name;
+        let _ = change;
+        Err(unsupported("schema changes"))
+    }
+
+    /// Durably commit `ops` (upserts, partial updates, deletes by key) as one atomic batch,
+    /// validated against the collection's schema at its point in the write stream.
+    ///
+    /// Validation errors name the operation by its position, relative to the batch: a field
+    /// path such as `[2].price`, which callers prefix with the request field that holds the
+    /// batch (see [`LogPoseError::with_field_prefix`]).
+    async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
+        let _ = collection_name;
+        let _ = ops;
+        Err(unsupported("typed writes"))
+    }
+
     /// Load the persisted placement assignment for a collection descriptor.
     async fn collection_assignment_descriptor(
         &self,
@@ -88,7 +134,9 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
         ))
     }
 
-    /// Persist one or more write operations durably.
+    /// Persist v1-shaped write operations durably. Only for collections of the single-vector
+    /// shape [`CreateCollectionRequest::new`] creates; the APIs use
+    /// [`write_batch`](Self::write_batch). Deleted with the legacy read paths.
     async fn write(
         &self,
         collection_name: &str,
@@ -145,22 +193,30 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
 pub struct CreateCollectionRequest {
     /// Database containing the collection. Blank values default to `default`.
     pub database_name: String,
-    /// Human-readable collection name.
-    pub name: String,
-    /// Fixed embedding dimensionality.
-    pub dimensions: usize,
-    /// Distance metric reserved for future query layers.
-    pub metric: DistanceMetric,
+    /// The collection's name and schema, as the create request carries them (engine plan
+    /// decision D4). Validated when the collection is planned, so errors name spec fields
+    /// such as `vectors[0].dimensions`.
+    pub spec: CreateCollectionSpec,
 }
 
 impl CreateCollectionRequest {
-    /// Create a collection request in the default database namespace.
+    /// Create a collection from a schema-based spec in an explicit database namespace.
+    #[must_use]
+    pub fn from_spec(database_name: impl Into<String>, spec: CreateCollectionSpec) -> Self {
+        Self {
+            database_name: database_name.into(),
+            spec,
+        }
+    }
+
+    /// A request in the default database for the single-vector shape: string primary key
+    /// `id`, one vector field `vector` with `dimensions` and `metric`, and dynamic fields on.
     #[must_use]
     pub fn new(name: impl Into<String>, dimensions: usize, metric: DistanceMetric) -> Self {
         Self::in_database(DEFAULT_DATABASE_NAME, name, dimensions, metric)
     }
 
-    /// Create a collection request in an explicit database namespace.
+    /// [`CreateCollectionRequest::new`] in an explicit database namespace.
     #[must_use]
     pub fn in_database(
         database_name: impl Into<String>,
@@ -168,19 +224,37 @@ impl CreateCollectionRequest {
         dimensions: usize,
         metric: DistanceMetric,
     ) -> Self {
-        Self {
-            database_name: database_name.into(),
-            name: name.into(),
-            dimensions,
-            metric,
-        }
+        Self::from_spec(
+            database_name,
+            CreateCollectionSpec {
+                name: name.into(),
+                primary_key: PrimaryKeySpec {
+                    name: LEGACY_PRIMARY_KEY_FIELD.to_owned(),
+                    key_type: PrimaryKeyType::String,
+                },
+                vectors: vec![VectorFieldSpec {
+                    name: LEGACY_VECTOR_FIELD.to_owned(),
+                    // Out-of-range dimensions fail validation when the collection is planned.
+                    dimensions: u32::try_from(dimensions).unwrap_or(u32::MAX),
+                    metric,
+                }],
+                fields: Vec::new(),
+                dynamic_fields: true,
+            },
+        )
+    }
+
+    /// The collection name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.spec.name
     }
 
     /// Return the canonical database/collection reference for this request.
     #[must_use]
     pub fn collection_ref(&self) -> CollectionRef {
         let request = self.clone().with_defaults();
-        CollectionRef::new(request.database_name, request.name)
+        CollectionRef::new(request.database_name, request.spec.name)
     }
 
     /// Return the canonical database/collection lookup key for this request.
@@ -197,11 +271,13 @@ impl CreateCollectionRequest {
         };
         Self {
             database_name,
-            name: self.name,
-            dimensions: self.dimensions,
-            metric: self.metric,
+            spec: self.spec,
         }
     }
+}
+
+fn unsupported(what: &str) -> LogPoseError {
+    LogPoseError::internal(format!("{what} is not supported by this storage engine"))
 }
 
 /// Target to inspect from the local storage layout.

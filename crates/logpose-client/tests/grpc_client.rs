@@ -6,8 +6,9 @@ use logpose_auth::{
 };
 use logpose_catalog as _;
 use logpose_client::{
-    ClientError, CreateCollectionRequest, DatabaseAccessPolicy, DatabaseDescriptor,
-    DatabaseRoleBinding, ErrorCode, ErrorReason, LogPoseClient, ServerError,
+    ClientError, CollectionRef, CreateCollectionRequest, DatabaseAccessPolicy, DatabaseRoleBinding,
+    ErrorCode, ErrorReason, LogPoseClient, PartialUpdate, PrimaryKey, Record, SchemaChange,
+    ServerError,
 };
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
@@ -16,7 +17,15 @@ use logpose_query::{
     ScalarMetadataValue,
 };
 use logpose_storage::{CreateCollectionRequest as StorageCreateCollectionRequest, InspectTarget};
-use logpose_types::{DeleteRecord, DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{
+    DistanceMetric, PutRecord, RecordId,
+    legacy::record_from_put,
+    schema::{
+        CreateCollectionSpec, FieldIndex, FieldType, PrimaryKeySpec, PrimaryKeyType,
+        ScalarFieldSpec, VectorFieldSpec,
+    },
+    value::Value as RecordValue,
+};
 use serde as _;
 use serde_json::{Value, json};
 use std::{
@@ -62,30 +71,31 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .await
         .expect("collection should be created");
     let qualified = descriptor.lookup_name();
+    let collection = descriptor.collection_ref();
     assert_eq!(descriptor.database_name, "default");
     assert_eq!(descriptor.name, "documents");
 
     let read_back = client
-        .get_collection(&qualified)
+        .collection(&collection)
         .await
         .expect("collection should load");
     assert_eq!(read_back.database_name, "default");
     assert_eq!(read_back.collection_id, descriptor.collection_id);
 
     client
-        .write(
-            &qualified,
+        .upsert(
+            &collection,
             vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep","color":"red"}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.5, 0.0],
-                    metadata: json!({"kind":"drop","color":"blue"}),
-                }),
+                put(
+                    "alpha",
+                    vec![1.0, 0.0],
+                    json!({"kind":"keep","color":"red"}),
+                ),
+                put(
+                    "beta",
+                    vec![0.5, 0.0],
+                    json!({"kind":"drop","color":"blue"}),
+                ),
             ],
         )
         .await
@@ -135,7 +145,10 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         Some(1)
     );
 
-    let stats = client.stats(&qualified).await.expect("stats should load");
+    let stats = client
+        .stats(&collection, None, None)
+        .await
+        .expect("stats should load");
     assert_eq!(stats.database_name, "default");
     assert_eq!(stats.collection_name, "documents");
     assert_eq!(stats.live_record_count, 2);
@@ -156,37 +169,35 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let flush = client
-        .flush(&qualified)
+        .flush(&collection)
         .await
         .expect("flush should succeed");
     assert!(flush.manifest_generation >= 1);
 
     client
-        .write(
-            &qualified,
-            vec![
-                WriteOperation::Delete(DeleteRecord {
-                    id: RecordId::new("beta"),
-                }),
-                // A live memtable row keeps a mutable unit for the hybrid plan below: the delete
-                // alone only sets the segment row's deletion bit.
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("gamma"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"kind": "keep"}),
-                }),
-            ],
-        )
+        .delete(&collection, vec![PrimaryKey::String("beta".to_owned())])
         .await
         .expect("delete should succeed");
+    // A live memtable row keeps a mutable unit for the hybrid plan below: the delete alone only
+    // sets the segment row's deletion bit.
+    client
+        .upsert(
+            &collection,
+            vec![put("gamma", vec![0.0, 1.0], json!({"kind": "keep"}))],
+        )
+        .await
+        .expect("write should succeed");
 
     let compact = client
-        .compact(&qualified)
+        .compact(&collection)
         .await
         .expect("compact should succeed");
     assert!(compact.manifest_generation >= flush.manifest_generation);
 
-    let stats = client.stats(&qualified).await.expect("stats should reload");
+    let stats = client
+        .stats(&collection, None, None)
+        .await
+        .expect("stats should reload");
     assert_eq!(stats.live_record_count, 2);
     // The compaction rewrote the lone segment without its deleted row.
     assert_eq!(stats.deleted_record_count, 0);
@@ -263,7 +274,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert_eq!(hybrid_timings.merge_micros, 0);
 
     let inspect = client
-        .inspect(&qualified, InspectTarget::Manifest)
+        .inspect(&collection, InspectTarget::Manifest)
         .await
         .expect("inspect should succeed");
     assert_eq!(inspect.target, "manifest");
@@ -279,7 +290,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .to_owned();
 
     let wal = client
-        .inspect(&qualified, InspectTarget::Wal)
+        .inspect(&collection, InspectTarget::Wal)
         .await
         .expect("wal inspect should succeed");
     assert_eq!(wal.target, "wal");
@@ -293,7 +304,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let segment = client
-        .inspect(&qualified, InspectTarget::Segment(segment_id.clone()))
+        .inspect(&collection, InspectTarget::Segment(segment_id.clone()))
         .await
         .expect("segment inspect should succeed");
     assert_eq!(segment.target, format!("segment:{segment_id}"));
@@ -308,10 +319,212 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let maintenance = client
-        .inspect(&qualified, InspectTarget::Maintenance)
+        .inspect(&collection, InspectTarget::Maintenance)
         .await
         .expect("maintenance inspect should succeed");
     assert_eq!(maintenance.target, "maintenance");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_manages_typed_schemas_and_records() {
+    let temp_root = unique_temp_dir("client-grpc-typed");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+    client
+        .put_database("shop")
+        .await
+        .expect("database should be created");
+
+    let created = client
+        .create_collection(CreateCollectionRequest::from_spec(
+            "shop",
+            CreateCollectionSpec {
+                name: "products".to_owned(),
+                primary_key: PrimaryKeySpec {
+                    name: "sku".to_owned(),
+                    key_type: PrimaryKeyType::Int64,
+                },
+                vectors: vec![VectorFieldSpec {
+                    name: "embedding".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Cosine,
+                }],
+                fields: vec![ScalarFieldSpec {
+                    name: "title".to_owned(),
+                    field_type: FieldType::String,
+                    index: FieldIndex::Auto,
+                    nullable: false,
+                }],
+                dynamic_fields: true,
+            },
+        ))
+        .await
+        .expect("typed collection should be created");
+    let collection = created.collection_ref();
+    assert_eq!(created.schema.schema_version(), 1);
+    assert_eq!(created.schema.fields()[0].index, FieldIndex::Inverted);
+
+    let listed = client
+        .collections("shop")
+        .await
+        .expect("collections should be listed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].schema, created.schema);
+
+    let altered = client
+        .alter_collection(
+            &collection,
+            SchemaChange::AddField(ScalarFieldSpec {
+                name: "price".to_owned(),
+                field_type: FieldType::Float64,
+                index: FieldIndex::Auto,
+                nullable: true,
+            }),
+        )
+        .await
+        .expect("field should be added");
+    assert_eq!(altered.schema.schema_version(), 2);
+    assert!(altered.schema.field("price").is_some());
+
+    let record = Record {
+        pk: PrimaryKey::Int64(7),
+        vectors: [("embedding".to_owned(), vec![3.0, 4.0])].into(),
+        fields: [
+            ("title".to_owned(), RecordValue::String("lamp".to_owned())),
+            ("price".to_owned(), RecordValue::Float64(12.5)),
+        ]
+        .into(),
+        extra: json!({"color": "red"})
+            .as_object()
+            .cloned()
+            .expect("extra is an object"),
+    };
+    client
+        .upsert(&collection, vec![record])
+        .await
+        .expect("typed record should be written");
+
+    let fetched = client
+        .get(
+            &collection,
+            vec![PrimaryKey::Int64(7), PrimaryKey::Int64(8)],
+            Vec::new(),
+        )
+        .await
+        .expect("records should be read");
+    assert_eq!(fetched.records.len(), 1);
+    assert_eq!(fetched.missing_keys, vec![PrimaryKey::Int64(8)]);
+    // Cosine vectors are normalized when written.
+    assert_eq!(fetched.records[0].vectors["embedding"], vec![0.6, 0.8]);
+    assert_eq!(fetched.records[0].extra["color"], json!("red"));
+
+    let update = PartialUpdate {
+        pk: PrimaryKey::Int64(7),
+        vectors: Default::default(),
+        fields: [("price".to_owned(), RecordValue::Null)].into(),
+        extra: Default::default(),
+    };
+    client
+        .update(&collection, vec![update])
+        .await
+        .expect("record should be updated");
+    let projected = client
+        .get(
+            &collection,
+            vec![PrimaryKey::Int64(7)],
+            vec!["title".to_owned(), "price".to_owned()],
+        )
+        .await
+        .expect("projected record should be read");
+    let record = &projected.records[0];
+    assert!(record.vectors.is_empty());
+    assert!(record.extra.is_empty());
+    assert_eq!(
+        record.fields.get("title"),
+        Some(&RecordValue::String("lamp".to_owned()))
+    );
+    assert_eq!(record.fields.get("price"), None);
+
+    let missing = client
+        .update(
+            &collection,
+            vec![PartialUpdate {
+                pk: PrimaryKey::Int64(9),
+                vectors: Default::default(),
+                fields: [("price".to_owned(), RecordValue::Float64(1.0))].into(),
+                extra: Default::default(),
+            }],
+        )
+        .await
+        .expect_err("updating a missing record should fail");
+    assert_eq!(missing.reason(), Some(ErrorReason::ResourceNotFound));
+
+    let invalid = client
+        .upsert(
+            &collection,
+            vec![Record {
+                pk: PrimaryKey::Int64(10),
+                vectors: [("embedding".to_owned(), vec![1.0, 0.0])].into(),
+                fields: Default::default(),
+                extra: Default::default(),
+            }],
+        )
+        .await
+        .expect_err("a record without its required field should fail");
+    let ClientError::Server(invalid) = invalid else {
+        unreachable!("expected a typed server error, got {invalid:?}");
+    };
+    assert_eq!(invalid.reason(), Some(ErrorReason::InvalidArgument));
+    assert_eq!(
+        invalid
+            .field_violations()
+            .iter()
+            .map(|violation| violation.field.as_str())
+            .collect::<Vec<_>>(),
+        vec!["records[0].title"]
+    );
+
+    client
+        .delete(&collection, vec![PrimaryKey::Int64(7)])
+        .await
+        .expect("record should be deleted");
+    let after_delete = client
+        .get(&collection, vec![PrimaryKey::Int64(7)], Vec::new())
+        .await
+        .expect("records should be read");
+    assert!(after_delete.records.is_empty());
+
+    let refused = client
+        .drop_database("shop")
+        .await
+        .expect_err("a database with collections should not be dropped");
+    assert_eq!(refused.reason(), Some(ErrorReason::FailedPrecondition));
+    client
+        .drop_collection(&collection)
+        .await
+        .expect("collection should be dropped");
+    let gone = client
+        .collection(&collection)
+        .await
+        .expect_err("a dropped collection should not load");
+    assert_eq!(gone.reason(), Some(ErrorReason::ResourceNotFound));
+    client
+        .drop_database("shop")
+        .await
+        .expect("empty database should be dropped");
+    let databases = client.databases().await.expect("databases should list");
+    assert!(databases.iter().all(|database| database.name != "shop"));
 
     server.abort();
     let _ = server.await;
@@ -380,7 +593,7 @@ async fn grpc_client_round_trips_database_descriptors_over_grpc() {
         .expect("client should connect");
 
     let database = client
-        .set_database(DatabaseDescriptor::new("analytics"))
+        .put_database("analytics")
         .await
         .expect("database should be written");
     assert_eq!(database.name, "analytics");
@@ -449,7 +662,7 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
     assert_eq!(status.collections[0].assigned_role.as_str(), "data");
 
     let placement = client
-        .collection_placement("default/documents")
+        .collection_placement(&CollectionRef::new("default", "documents"))
         .await
         .expect("placement should load");
     assert_eq!(placement.database_name, "default");
@@ -531,20 +744,14 @@ async fn grpc_client_enforces_read_only_token_permissions() {
             .await
             .expect("client should connect with read-only auth");
 
+    let collection = CollectionRef::new("default", "documents");
     client
-        .stats("documents")
+        .stats(&collection, None, None)
         .await
         .expect("read-only token should read stats");
 
     let write_error = client
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({}),
-            })],
-        )
+        .upsert(&collection, vec![put("alpha", vec![1.0, 0.0], json!({}))])
         .await
         .expect_err("read-only token should not write");
     assert_eq!(write_error.reason(), Some(ErrorReason::PermissionDenied));
@@ -627,22 +834,23 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
         .await
         .expect("collection should be created");
 
-    let operations = (0..12)
+    let collection = CollectionRef::new("default", "documents");
+    let records = (0..12)
         .map(|index| {
             let kind = if index % 4 == 0 { "keep" } else { "drop" };
-            WriteOperation::Put(PutRecord {
-                id: RecordId::new(format!("doc-{index}")),
-                vector: vec![index as f32 + 1.0, 0.0],
-                metadata: json!({"kind":kind,"version":index}),
-            })
+            put(
+                &format!("doc-{index}"),
+                vec![index as f32 + 1.0, 0.0],
+                json!({"kind":kind,"version":index}),
+            )
         })
         .collect::<Vec<_>>();
     client
-        .write("default/documents", operations)
+        .upsert(&collection, records)
         .await
         .expect("write should succeed");
     client
-        .flush("default/documents")
+        .flush(&collection)
         .await
         .expect("flush should succeed");
 
@@ -674,7 +882,10 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
             .collect::<Vec<_>>(),
         vec!["doc-8", "doc-4"]
     );
-    let diagnostics = response.diagnostics.expect("diagnostics should be present");
+    let diagnostics = response
+        .diagnostics
+        .clone()
+        .expect("diagnostics should be present");
     // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
     // three rows the filter matches.
     assert_eq!(diagnostics.chosen_plan, QueryPlanKind::PredicateFirstExact);
@@ -699,6 +910,15 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
 
     server.abort();
     let _ = server.await;
+}
+
+fn put(id: &str, vector: Vec<f32>, metadata: Value) -> Record {
+    record_from_put(PutRecord {
+        id: RecordId::new(id),
+        vector,
+        metadata,
+    })
+    .expect("legacy record converts")
 }
 
 fn test_config(root: &Path, rest_addr: SocketAddr, grpc_addr: SocketAddr) -> LogPoseConfig {

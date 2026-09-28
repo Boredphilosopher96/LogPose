@@ -5,6 +5,7 @@ use super::{
     PrimaryKeyType, ScalarField, ScalarFieldSpec, SchemaError, VectorField, VectorFieldSpec,
     validate_field_name,
 };
+use crate::LogPoseError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -60,6 +61,66 @@ impl CreateCollectionSpec {
             self.fields.clone(),
             self.dynamic_fields,
         )
+    }
+
+    /// [`to_schema`](Self::to_schema), reporting a violated rule as an
+    /// `INVALID_ARGUMENT` error that names the request field, such as
+    /// `vectors[0].dimensions` or `fields[2].name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogPoseError::InvalidArgument`] when the request violates a
+    /// schema rule.
+    pub fn build_schema(&self) -> crate::Result<CollectionSchema> {
+        self.to_schema().map_err(|error| {
+            let message = error.to_string();
+            match self.error_field(&error) {
+                Some(field) => LogPoseError::invalid_field(field, message),
+                None => LogPoseError::invalid_argument(message),
+            }
+        })
+    }
+
+    /// The request field a [`SchemaError`] from [`to_schema`](Self::to_schema)
+    /// is about. A duplicated name is reported at its last declaration.
+    #[must_use]
+    pub fn error_field(&self, error: &SchemaError) -> Option<String> {
+        match error {
+            SchemaError::EmptyFieldName => self.name_field(""),
+            SchemaError::InvalidFieldName { name }
+            | SchemaError::ReservedFieldName { name }
+            | SchemaError::DuplicateFieldName { name } => self.name_field(name),
+            SchemaError::NoVectorField => Some("vectors".to_owned()),
+            SchemaError::InvalidDimensions { field, .. } => self
+                .vectors
+                .iter()
+                .position(|vector| &vector.name == field)
+                .map(|index| format!("vectors[{index}].dimensions")),
+            SchemaError::UnsupportedIndex { field, .. } => self
+                .fields
+                .iter()
+                .position(|scalar| &scalar.name == field)
+                .map(|index| format!("fields[{index}].index")),
+            SchemaError::InvalidFieldType { .. }
+            | SchemaError::UnknownField { .. }
+            | SchemaError::CannotDropPrimaryKey { .. }
+            | SchemaError::CannotDropLastVectorField { .. }
+            | SchemaError::AddedFieldNotNullable { .. }
+            | SchemaError::InvalidFieldId { .. }
+            | SchemaError::RetiredNameDeclared { .. }
+            | SchemaError::CounterExhausted { .. } => None,
+        }
+    }
+
+    /// Path of the last declaration named `name`.
+    fn name_field(&self, name: &str) -> Option<String> {
+        if let Some(index) = self.fields.iter().rposition(|field| field.name == name) {
+            return Some(format!("fields[{index}].name"));
+        }
+        if let Some(index) = self.vectors.iter().rposition(|field| field.name == name) {
+            return Some(format!("vectors[{index}].name"));
+        }
+        (self.primary_key.name == name).then(|| "primary_key.name".to_owned())
     }
 }
 

@@ -57,9 +57,9 @@ fn query_and_inspect_snapshot_contract() {
     let input_path = fixture.temp_root.join("records.jsonl");
     fs::write(
         &input_path,
-        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"color":"red","kind":"keep"}}
-{"id":"beta","vector":[0.5,0.0],"metadata":{"color":"green","kind":"drop"}}
-{"id":"gamma","vector":[0.8,0.0],"metadata":{"color":"blue","kind":"keep"}}"#,
+        r#"{"id":"alpha","vector":[1.0,0.0],"color":"red","kind":"keep"}
+{"id":"beta","vector":[0.5,0.0],"color":"green","kind":"drop"}
+{"id":"gamma","vector":[0.8,0.0],"color":"blue","kind":"keep"}"#,
     )
     .expect("jsonl input should be written");
 

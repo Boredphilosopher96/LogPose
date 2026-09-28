@@ -3,13 +3,13 @@ use crate::cli::OutputMode;
 use anyhow::Context;
 use logpose_auth::DatabaseAccessPolicy;
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
-use logpose_client::ScopedCollectionResponse;
+use logpose_client::{RecordsResponse, ScopedCollectionResponse};
 use logpose_config::LogPoseConfig;
 use logpose_query::QueryResponse;
 use logpose_storage::InspectReport;
 use logpose_types::{
-    CollectionPlacement, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, NodeRuntimeStatus,
-    Snapshot,
+    CollectionPlacement, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME,
+    NodeRuntimeStatus, Snapshot, schema::CollectionSchema,
 };
 use serde::Serialize;
 
@@ -21,14 +21,22 @@ pub enum ActionOutput {
     DatabasesListed(Vec<DatabaseDescriptor>),
     DatabasePolicyShown(DatabaseAccessPolicy),
     DatabasePolicyUpdated(DatabaseAccessPolicy),
+    DatabaseDropped(String),
     CollectionCreated(CollectionDescriptor),
+    CollectionsListed(Vec<CollectionDescriptor>),
     CollectionShown(CollectionDescriptor),
+    CollectionAltered(CollectionDescriptor),
+    CollectionDropped(CollectionRef),
     CollectionStats(CollectionStats),
     CollectionPlacement(CollectionPlacement),
     CollectionFlushed(ScopedCollectionResponse<Snapshot>),
     CollectionCompacted(ScopedCollectionResponse<Snapshot>),
     RecordsWritten(ScopedCollectionResponse<CommitAck>),
     RecordDeleted(ScopedCollectionResponse<CommitAck>),
+    RecordsFetched {
+        schema: CollectionSchema,
+        response: ScopedCollectionResponse<RecordsResponse>,
+    },
     Query(ScopedCollectionResponse<QueryResponse>),
     Inspect(ScopedCollectionResponse<InspectReport>),
 }
@@ -59,17 +67,22 @@ impl ActionOutput {
             ActionOutput::DatabasePolicyUpdated(policy) => {
                 render_database_policy("Database policy updated", policy)
             }
-            ActionOutput::CollectionCreated(descriptor) => format!(
-                "Collection created\nCollection: {}\nDimensions: {}\nMetric: {}",
-                collection_identity(&descriptor.database_name, &descriptor.name),
-                descriptor.dimensions,
-                metric_name(descriptor.metric)
-            ),
-            ActionOutput::CollectionShown(descriptor) => format!(
-                "Collection\nCollection: {}\nDimensions: {}\nMetric: {}",
-                collection_identity(&descriptor.database_name, &descriptor.name),
-                descriptor.dimensions,
-                metric_name(descriptor.metric)
+            ActionOutput::CollectionCreated(descriptor) => {
+                render_collection("Collection created", descriptor)
+            }
+            ActionOutput::DatabaseDropped(database_name) => {
+                format!("Database dropped\nDatabase: {database_name}")
+            }
+            ActionOutput::CollectionsListed(descriptors) => render_collections(descriptors),
+            ActionOutput::CollectionShown(descriptor) => {
+                render_collection("Collection", descriptor)
+            }
+            ActionOutput::CollectionAltered(descriptor) => {
+                render_collection("Schema changed", descriptor)
+            }
+            ActionOutput::CollectionDropped(collection) => format!(
+                "Collection dropped\nCollection: {}",
+                collection_identity(&collection.database_name, &collection.collection_name)
             ),
             ActionOutput::CollectionStats(stats) => render_stats(stats),
             ActionOutput::CollectionPlacement(placement) => render_placement(placement),
@@ -101,6 +114,7 @@ impl ActionOutput {
                 ack.snapshot.manifest_generation,
                 ack.snapshot.visible_seq_no,
             ),
+            ActionOutput::RecordsFetched { schema, response } => render_records(schema, response)?,
             ActionOutput::Query(response) => render_query(response)?,
             ActionOutput::Inspect(report) => format!(
                 "Inspection: {}\nCollection: {}\n{}",
@@ -122,8 +136,20 @@ impl ActionOutput {
             ActionOutput::DatabasesListed(descriptors) => pretty_json(descriptors),
             ActionOutput::DatabasePolicyShown(policy)
             | ActionOutput::DatabasePolicyUpdated(policy) => pretty_json(policy),
+            ActionOutput::DatabaseDropped(database_name) => {
+                pretty_json(&serde_json::json!({ "database_name": database_name }))
+            }
             ActionOutput::CollectionCreated(descriptor)
-            | ActionOutput::CollectionShown(descriptor) => pretty_json(descriptor),
+            | ActionOutput::CollectionShown(descriptor)
+            | ActionOutput::CollectionAltered(descriptor) => pretty_json(descriptor),
+            ActionOutput::CollectionsListed(descriptors) => pretty_json(descriptors),
+            ActionOutput::CollectionDropped(collection) => pretty_json(&serde_json::json!({
+                "database_name": collection.database_name,
+                "collection_name": collection.collection_name,
+            })),
+            ActionOutput::RecordsFetched { schema, response } => {
+                pretty_json(&records_json(schema, response))
+            }
             ActionOutput::CollectionStats(stats) => pretty_json(stats),
             ActionOutput::CollectionPlacement(placement) => pretty_json(placement),
             ActionOutput::CollectionFlushed(snapshot)
@@ -150,14 +176,19 @@ impl ActionOutput {
             ActionOutput::DatabasesListed(_) => "Databases",
             ActionOutput::DatabasePolicyShown(_) => "Database Policy",
             ActionOutput::DatabasePolicyUpdated(_) => "Database Policy Updated",
+            ActionOutput::DatabaseDropped(_) => "Database Dropped",
             ActionOutput::CollectionCreated(_) => "Collection Created",
+            ActionOutput::CollectionsListed(_) => "Collections",
             ActionOutput::CollectionShown(_) => "Collection",
+            ActionOutput::CollectionAltered(_) => "Schema Changed",
+            ActionOutput::CollectionDropped(_) => "Collection Dropped",
             ActionOutput::CollectionStats(_) => "Collection Statistics",
             ActionOutput::CollectionPlacement(_) => "Collection Placement",
             ActionOutput::CollectionFlushed(_) => "Collection Flushed",
             ActionOutput::CollectionCompacted(_) => "Collection Compacted",
             ActionOutput::RecordsWritten(_) => "Write Completed",
             ActionOutput::RecordDeleted(_) => "Delete Completed",
+            ActionOutput::RecordsFetched { .. } => "Records",
             ActionOutput::Query(_) => "Query Results",
             ActionOutput::Inspect(_) => "Inspection",
         }
@@ -427,6 +458,116 @@ fn collection_identity(database_name: &str, collection_name: &str) -> String {
     }
 }
 
+fn render_collections(descriptors: &[CollectionDescriptor]) -> String {
+    let mut lines = vec![format!("Collections ({})", descriptors.len())];
+    for descriptor in descriptors {
+        lines.push(format!(
+            "- {} (schema version {})",
+            collection_identity(&descriptor.database_name, &descriptor.name),
+            descriptor.schema.schema_version()
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Found records as natural JSON documents, in the shape of the REST reply.
+fn records_json(
+    schema: &CollectionSchema,
+    response: &ScopedCollectionResponse<RecordsResponse>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "database_name": response.database_name,
+        "collection_name": response.collection_name,
+        "records": response
+            .records
+            .iter()
+            .map(|record| record.to_json(schema))
+            .collect::<Vec<_>>(),
+        "missing_keys": response
+            .missing_keys
+            .iter()
+            .map(logpose_types::record::PrimaryKey::to_json)
+            .collect::<Vec<_>>(),
+        "snapshot": response.snapshot,
+    })
+}
+
+fn render_records(
+    schema: &CollectionSchema,
+    response: &ScopedCollectionResponse<RecordsResponse>,
+) -> anyhow::Result<String> {
+    let mut lines = vec![
+        "Records".to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(&response.database_name, &response.collection_name)
+        ),
+        format!("Found: {}", response.records.len()),
+    ];
+    if !response.missing_keys.is_empty() {
+        lines.push(format!(
+            "Missing: {}",
+            response
+                .missing_keys
+                .iter()
+                .map(logpose_types::record::PrimaryKey::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
+        "Read snapshot: generation {}, seq {}",
+        response.snapshot.manifest_generation, response.snapshot.visible_seq_no
+    ));
+    for record in &response.records {
+        lines.push(
+            serde_json::to_string(&record.to_json(schema)).context("failed to serialize record")?,
+        );
+    }
+    Ok(lines.join("\n"))
+}
+
+/// A collection's identity and schema: the primary key, each vector field, each scalar field,
+/// and whether undeclared keys are kept.
+fn render_collection(title: &str, descriptor: &CollectionDescriptor) -> String {
+    let schema = &descriptor.schema;
+    let primary_key = schema.primary_key();
+    let mut lines = vec![
+        title.to_owned(),
+        format!(
+            "Collection: {}",
+            collection_identity(&descriptor.database_name, &descriptor.name)
+        ),
+        format!("Schema version: {}", schema.schema_version()),
+        format!(
+            "Primary key: {} ({})",
+            primary_key.name, primary_key.key_type
+        ),
+    ];
+    for vector in schema.vectors() {
+        lines.push(format!(
+            "Vector: {} ({} dims, {})",
+            vector.name,
+            vector.dimensions,
+            metric_name(vector.metric)
+        ));
+    }
+    for field in schema.fields() {
+        lines.push(format!(
+            "Field: {} ({}{}, index {})",
+            field.name,
+            field.field_type,
+            if field.nullable { "" } else { ", required" },
+            field.index
+        ));
+    }
+    lines.push(format!(
+        "Dynamic fields: {}",
+        yes_no(schema.dynamic_fields())
+    ));
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,8 +581,8 @@ mod tests {
             collection_id: logpose_types::CollectionId::default(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
-            dimensions: 2,
-            metric: logpose_types::DistanceMetric::Dot,
+            schema: logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
+                .expect("schema"),
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,
@@ -484,8 +625,8 @@ mod tests {
             collection_id: logpose_types::CollectionId::default(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
-            dimensions: 2,
-            metric: logpose_types::DistanceMetric::Dot,
+            schema: logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
+                .expect("schema"),
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,

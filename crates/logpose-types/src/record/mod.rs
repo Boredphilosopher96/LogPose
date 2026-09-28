@@ -18,9 +18,11 @@
 
 mod error;
 mod parse;
+mod projection;
 mod validate;
 
 pub use error::RecordError;
+pub use projection::Projection;
 
 use crate::{
     schema::{CollectionSchema, PrimaryKeyType},
@@ -51,6 +53,16 @@ impl PrimaryKey {
         match self {
             Self::Int64(_) => PrimaryKeyType::Int64,
             Self::String(_) => PrimaryKeyType::String,
+        }
+    }
+
+    /// The key as plain text, without the quotes [`Display`](fmt::Display) puts around a
+    /// string key: the name an error reports for a missing record.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Int64(value) => value.to_string(),
+            Self::String(value) => value.clone(),
         }
     }
 

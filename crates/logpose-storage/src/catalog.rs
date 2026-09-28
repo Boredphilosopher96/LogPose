@@ -2,9 +2,9 @@
 
 use crate::{
     LocalStorageEngine,
-    durable_fs::create_dir_all_synced,
+    durable_fs::{create_dir_all_synced, sync_dir},
     engine::EngineCore,
-    error::{invalid_descriptor, json_message},
+    error::{invalid_descriptor, io_message, json_message},
     fs_util::{atomic_write, read_json},
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
@@ -105,6 +105,42 @@ impl CatalogStore for EngineCore {
         self.list_database_descriptors()
     }
 
+    fn delete_database(&self, database_name: &str) -> Result<()> {
+        validate_namespace_segment("database name", database_name)?;
+        if database_name == DEFAULT_DATABASE_NAME {
+            return Err(LogPoseError::failed_precondition(
+                "the default database cannot be dropped",
+            ));
+        }
+        self.with_empty_database(database_name, || {
+            let descriptor = self.database_descriptor_path(database_name);
+            if !self.exists(&descriptor)? {
+                return Err(LogPoseError::not_found(
+                    ResourceKind::Database,
+                    database_name,
+                ));
+            }
+            let dir = self.databases_root().join(database_name);
+            // The policy goes first: a crash after it leaves a database without a policy, which
+            // only operators can use, never a policy a later database of this name inherits.
+            let policy = self.database_policy_path(database_name);
+            if self.exists(&policy)? {
+                self.vfs.remove_file(&policy).map_err(|error| {
+                    io_message("failed to remove a database access policy", error)
+                })?;
+                sync_dir(self.vfs.as_ref(), &dir)?;
+            }
+            self.vfs
+                .remove_file(&descriptor)
+                .map_err(|error| io_message("failed to remove a database descriptor", error))?;
+            sync_dir(self.vfs.as_ref(), &dir)?;
+            self.vfs
+                .remove_dir_all(&dir)
+                .map_err(|error| io_message("failed to remove a database directory", error))?;
+            sync_dir(self.vfs.as_ref(), &self.databases_root())
+        })
+    }
+
     fn put_principal(&self, principal: Principal) -> Result<Principal> {
         validate_principal(&principal)?;
         atomic_write(
@@ -173,6 +209,10 @@ impl CatalogStore for LocalStorageEngine {
 
     fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
         self.engine().core().list_databases()
+    }
+
+    fn delete_database(&self, database_name: &str) -> Result<()> {
+        self.engine().core().delete_database(database_name)
     }
 
     fn put_principal(&self, principal: Principal) -> Result<Principal> {

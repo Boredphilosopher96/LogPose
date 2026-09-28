@@ -1900,6 +1900,11 @@ impl InteractiveApp {
     fn remember_collection(&mut self, action: &Action) {
         let collection = match action {
             Action::CollectionCreate(action) => Some(collection_label(&action.collection)),
+            Action::CollectionCreateFromSchema(action) => {
+                Some(collection_label(&action.collection))
+            }
+            Action::CollectionAlter(action) => Some(collection_label(&action.collection)),
+            Action::RecordGet(action) => Some(collection_label(&action.collection)),
             Action::CollectionShow(collection)
             | Action::CollectionPlacement(collection)
             | Action::CollectionFlush(collection)
@@ -1915,7 +1920,10 @@ impl InteractiveApp {
             | Action::DatabaseShow { .. }
             | Action::DatabasePut(_)
             | Action::DatabasePolicyShow { .. }
-            | Action::DatabasePolicySet(_) => None,
+            | Action::DatabasePolicySet(_)
+            | Action::DatabaseDrop { .. }
+            | Action::CollectionList { .. }
+            | Action::CollectionDrop(_) => None,
         };
         self.session.last_collection = collection;
     }

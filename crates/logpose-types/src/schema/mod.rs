@@ -9,10 +9,12 @@
 //! [`FieldId`]s, resolves `auto` indexes, and carries a `schema_version`
 //! that every online change bumps.
 
+mod change;
 mod collection;
 mod error;
 mod field;
 
+pub use change::SchemaChange;
 pub use collection::{CollectionSchema, CreateCollectionSpec, FieldRef};
 pub use error::SchemaError;
 pub use field::{

@@ -447,7 +447,7 @@ Exit criteria: at recall of at least 0.95, LogPose QPS is within 20 percent of M
 Runs alongside the engine phases. Each slice lands when its engine support exists.
 
 - P6a (after Phase 1): typed errors end to end, replacing `LogPoseError::Message(String)` and the substring matching in `classify_message` (`crates/logpose-service/src/lib.rs:1294`); not-owner and not-leader become `UNAVAILABLE` or 503; configured request size limits; client-streaming bulk ingest in gRPC.
-- P6b (after Phase 2): schema-based create, alter, list, and drop for collections; drop database; typed `Value` in proto instead of `metadata_json`; one database selector convention for all REST routes; `upsert`, `update`, `delete`, `get`.
+- P6b (after Phase 2): schema-based create, alter, list, and drop for collections; drop database; typed `Value` in proto instead of `metadata_json`; one database selector convention for all REST routes; `upsert`, `update`, `delete`, `get`. Landed as API v2 (`/v2/databases/{database}/collections/{collection}/...`, package `logpose.v2`), replacing v1.
 - P6c (after Phase 3): search request per D11 with filters, `order_by`, cursor, projection; `count`, `scroll`, delete by filter.
 - Always: keep `proto/`, `openapi/`, and `docs/src/api-overview.md` in sync; fix the OpenAPI 3.1 `nullable` misuse; add a contract test that validates the OpenAPI document and checks REST and gRPC parity.
 
