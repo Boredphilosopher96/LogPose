@@ -169,6 +169,21 @@ cargo run --release -p logpose-bench -- --help
 
 The JSON report records the machine, configuration, and per-case results. Committed baselines live in `benches/baselines/`; see its README for how to reproduce them. Compare new engine work against the latest baseline at the same preset and seed.
 
+### Comparing With Milvus
+
+Two subcommands run VectorDBBench-style workloads against a running server over the `logpose.v2` gRPC API, so LogPose can be compared with other vector databases on the same data and ground truth:
+
+- `vdb-prepare --shape <shape> --data-dir <dir>` writes a dataset directory: base and query vectors (`.fvecs`), an integer `rank` column, and exact top-k ground truth (`.ivecs`) for unfiltered search and for `rank < t` filters at 1 and 99 percent selectivity. Shapes mirror VectorDBBench datasets (`cohere-100k`, `openai-50k`, `cohere-1m`, `openai-500k`) with synthetic embedding-like vectors, plus `tiny` for smoke tests. A matching directory is reused.
+- `vdb-run --dataset <dir> --endpoint <grpc>` loads the dataset (one `BulkUpsertRecords` stream, then flush and compact), sweeps the query `ef` for each case until mean recall@10 reaches 0.95, and measures QPS and p50 and p99 latency at that `ef` with 1, 4, and 8 concurrent clients, each on its own connection.
+
+`scripts/bench/milvus_vdb.py` runs the same cases against Milvus with `pymilvus` and writes the same report shape, and `scripts/bench-milvus.sh` runs the whole comparison end to end: it starts a fresh `logpose-server`, then a fresh Milvus standalone container (never both at once), and writes `benches/baselines/phase5-milvus-<shape>.{json,md}`:
+
+```bash
+LOGPOSE_BENCH_DATA=$HOME/.cache/logpose-bench scripts/bench-milvus.sh cohere-100k openai-50k
+```
+
+It needs Docker for Milvus (`SKIP_MILVUS=1` runs LogPose alone) and Python 3 with `venv`; it creates a venv with `pymilvus` (pinned to 3.0.2) and `numpy` under `LOGPOSE_BENCH_DATA`.
+
 ## Non-Negotiable Harness Rules
 
 Every new generative, fuzzing, or simulation harness in LogPose should satisfy these rules:

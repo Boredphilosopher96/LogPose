@@ -1153,6 +1153,7 @@ fn test_config_with_role(
         auth: Default::default(),
         limits: Default::default(),
         snapshots: Default::default(),
+        index: Default::default(),
     }
 }
 

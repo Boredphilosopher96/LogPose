@@ -44,7 +44,14 @@ impl BuildInfo {
             git_sha: option_env!("LOGPOSE_GIT_SHA")
                 .unwrap_or("development")
                 .to_owned(),
-            profile: option_env!("PROFILE").unwrap_or("debug").to_owned(),
+            // `PROFILE` is set only for build scripts, so it cannot tell a release build
+            // of this crate from a debug one.
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .to_owned(),
         }
     }
 }
@@ -718,6 +725,16 @@ fn default_database_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_profile_matches_how_the_crate_was_compiled() {
+        let expected = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        assert_eq!(BuildInfo::current().profile, expected);
+    }
 
     #[test]
     fn database_ref_is_database_only() {

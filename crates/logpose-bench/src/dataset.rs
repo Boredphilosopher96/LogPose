@@ -3,7 +3,7 @@
 use crate::rng::SplitMix64;
 use anyhow::{Context, Result, bail, ensure};
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{BufReader, ErrorKind, Read},
@@ -11,7 +11,7 @@ use std::{
 };
 
 /// Similarity metric, owned by the harness so it does not depend on an engine's types.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Metric {
     /// Euclidean distance; smaller is closer.
@@ -28,6 +28,8 @@ pub enum Metric {
 pub enum DatasetSource {
     /// Clustered synthetic vectors.
     Synthetic(SyntheticSpec),
+    /// Synthetic vectors with low intrinsic dimension, shaped like text embeddings.
+    EmbeddingLike(EmbeddingLikeSpec),
     /// Vectors loaded from `.fvecs` files.
     Fvecs {
         /// Base vectors file.
@@ -162,6 +164,105 @@ pub fn generate_synthetic(spec: &SyntheticSpec, metric: Metric) -> Result<Datase
         base,
         queries,
         source: DatasetSource::Synthetic(spec.clone()),
+        reference_ground_truth: None,
+    })
+}
+
+/// Parameters for the embedding-like synthetic generator.
+///
+/// Real text embeddings have far fewer degrees of freedom than dimensions, and an
+/// isotropic Gaussian in hundreds of dimensions is a pathological case for graph
+/// indexes (every point is nearly equidistant from every other). This generator
+/// draws a Gaussian mixture in `latent_dims` dimensions, maps it to `dims`
+/// dimensions with a fixed random linear projection, and adds a little isotropic
+/// noise, so nearest neighbors are well defined the way they are for real
+/// embeddings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingLikeSpec {
+    /// Number of base rows.
+    pub n: usize,
+    /// Number of queries, drawn from the same distribution as the base rows.
+    pub queries: usize,
+    /// Output dimensionality.
+    pub dims: usize,
+    /// Dimensionality of the latent space.
+    pub latent_dims: usize,
+    /// Gaussian clusters in the latent space.
+    pub clusters: usize,
+    /// Standard deviation of latent points around their cluster center, relative to the
+    /// unit standard deviation of the centers.
+    pub spread: f64,
+    /// Standard deviation of the isotropic noise added to each output component.
+    pub noise: f64,
+    /// Seed for every random stream.
+    pub seed: u64,
+}
+
+const STREAM_LATENT_CENTERS: u64 = 11;
+const STREAM_PROJECTION: u64 = 12;
+const STREAM_LATENT_BASE: u64 = 13;
+const STREAM_LATENT_QUERIES: u64 = 14;
+
+/// Generate an embedding-like dataset (see [`EmbeddingLikeSpec`]).
+///
+/// Centers, the projection, base rows, and queries use separate random streams, so
+/// changing `n` leaves the queries and the leading rows unchanged.
+pub fn generate_embedding_like(spec: &EmbeddingLikeSpec, metric: Metric) -> Result<Dataset> {
+    ensure!(spec.dims > 0, "dims must be positive");
+    ensure!(spec.latent_dims > 0, "latent dims must be positive");
+    ensure!(spec.clusters > 0, "clusters must be positive");
+
+    let latent = spec.latent_dims;
+    let mut center_rng = SplitMix64::stream(spec.seed, STREAM_LATENT_CENTERS);
+    let centers = (0..spec.clusters * latent)
+        .map(|_| center_rng.gaussian())
+        .collect::<Vec<_>>();
+    let scale = 1.0 / (latent as f64).sqrt();
+    let mut projection_rng = SplitMix64::stream(spec.seed, STREAM_PROJECTION);
+    // Row-major `latent x dims`.
+    let projection = (0..latent * spec.dims)
+        .map(|_| projection_rng.gaussian() * scale)
+        .collect::<Vec<_>>();
+
+    let sample = |rng: &mut SplitMix64, point: &mut Vec<f64>, out: &mut Vec<f32>| {
+        let cluster = rng.below(spec.clusters as u64) as usize;
+        let center = &centers[cluster * latent..(cluster + 1) * latent];
+        point.clear();
+        point.extend(
+            center
+                .iter()
+                .map(|value| value + spec.spread * rng.gaussian()),
+        );
+        let mut row = vec![0.0_f64; spec.dims];
+        for (weight, basis) in point.iter().zip(projection.chunks_exact(spec.dims)) {
+            for (component, value) in row.iter_mut().zip(basis) {
+                *component += weight * value;
+            }
+        }
+        out.extend(
+            row.into_iter()
+                .map(|value| (value + spec.noise * rng.gaussian()) as f32),
+        );
+    };
+
+    let mut point = Vec::with_capacity(latent);
+    let mut base_rng = SplitMix64::stream(spec.seed, STREAM_LATENT_BASE);
+    let mut base = Vec::with_capacity(spec.n * spec.dims);
+    for _ in 0..spec.n {
+        sample(&mut base_rng, &mut point, &mut base);
+    }
+    let mut query_rng = SplitMix64::stream(spec.seed, STREAM_LATENT_QUERIES);
+    let mut queries = Vec::with_capacity(spec.queries * spec.dims);
+    for _ in 0..spec.queries {
+        sample(&mut query_rng, &mut point, &mut queries);
+    }
+
+    Ok(Dataset {
+        dims: spec.dims,
+        metric,
+        base,
+        queries,
+        source: DatasetSource::EmbeddingLike(spec.clone()),
         reference_ground_truth: None,
     })
 }
@@ -315,7 +416,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Metric, SyntheticSpec, generate_synthetic, read_vecs};
+    use super::{
+        EmbeddingLikeSpec, Metric, SyntheticSpec, generate_embedding_like, generate_synthetic,
+        read_vecs,
+    };
 
     fn spec(n: usize, seed: u64) -> SyntheticSpec {
         SyntheticSpec {
@@ -349,6 +453,65 @@ mod tests {
         let large = generate_synthetic(&spec(200, 9), Metric::L2)?;
         assert_eq!(small.queries, large.queries);
         assert_eq!(small.base[..], large.base[..small.base.len()]);
+        Ok(())
+    }
+
+    fn embedding_spec(n: usize) -> EmbeddingLikeSpec {
+        EmbeddingLikeSpec {
+            n,
+            queries: 6,
+            dims: 24,
+            latent_dims: 4,
+            clusters: 3,
+            spread: 1.0,
+            noise: 0.05,
+            seed: 7,
+        }
+    }
+
+    #[test]
+    fn embedding_like_generator_is_deterministic_and_prefix_stable() -> anyhow::Result<()> {
+        let small = generate_embedding_like(&embedding_spec(40), Metric::Cosine)?;
+        let again = generate_embedding_like(&embedding_spec(40), Metric::Cosine)?;
+        let large = generate_embedding_like(&embedding_spec(90), Metric::Cosine)?;
+        assert_eq!(small.base, again.base);
+        assert_eq!(small.len(), 40);
+        assert_eq!(small.query_count(), 6);
+        assert_eq!(small.queries, large.queries);
+        assert_eq!(small.base[..], large.base[..small.base.len()]);
+        assert!(small.base.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_like_rows_live_near_a_low_dimensional_subspace() -> anyhow::Result<()> {
+        // With tiny noise, every row is a combination of `latent_dims` basis vectors, so the
+        // residual after projecting on the span of the first rows is small.
+        let spec = EmbeddingLikeSpec {
+            noise: 0.0,
+            ..embedding_spec(12)
+        };
+        let dataset = generate_embedding_like(&spec, Metric::L2)?;
+        // Gram-Schmidt over the first rows; the rank never exceeds `latent_dims`.
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        for row in 0..dataset.len() {
+            let mut residual = dataset
+                .row(row)
+                .iter()
+                .map(|v| f64::from(*v))
+                .collect::<Vec<_>>();
+            for vector in &basis {
+                let dot = residual.iter().zip(vector).map(|(a, b)| a * b).sum::<f64>();
+                for (value, basis_value) in residual.iter_mut().zip(vector) {
+                    *value -= dot * basis_value;
+                }
+            }
+            let norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm > 1e-3 {
+                basis.push(residual.iter().map(|v| v / norm).collect());
+            }
+        }
+        assert!(basis.len() <= spec.latent_dims, "rank {}", basis.len());
         Ok(())
     }
 
