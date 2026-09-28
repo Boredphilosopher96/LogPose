@@ -2,7 +2,6 @@
 //! flushing, pinned tokens read exactly their state, filter writes resolve against the
 //! writer's latest state, and damaged index sections are typed corruption.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -11,8 +10,7 @@ use logpose_query::{
     SearchRequest, VectorQuery, count, scroll, search,
 };
 use logpose_storage::{
-    CollectionReader, EngineConfig, IndexPolicy, LocalStorageEngine, Projection, ReadOptions,
-    SnapshotToken, StorageEngine,
+    CollectionReader, Engine, EngineConfig, IndexPolicy, Projection, ReadOptions, SnapshotToken,
     segment_v2::{FileSource, SectionKind, SegmentReader},
 };
 use logpose_types::{
@@ -360,22 +358,18 @@ async fn filter_writes_resolve_against_the_latest_state() {
 
     // Without a resolver.
     let root = support::unique_temp_dir("no-resolver");
-    let engine = LocalStorageEngine::with_config(&root, EngineConfig::default()).expect("engine");
-    engine
-        .create_collection(logpose_storage::CreateCollectionRequest::new(
+    let engine = Engine::open_local(&root, EngineConfig::default()).expect("engine");
+    let descriptor = engine
+        .plan_collection_descriptor(&logpose_storage::CreateCollectionRequest::new(
             "items",
             8,
             DistanceMetric::L2,
         ))
+        .expect("plan");
+    let handle = engine
+        .create_collection(descriptor, None)
         .await
         .expect("create");
-    let handle = engine
-        .engine()
-        .collection(
-            &logpose_storage::CreateCollectionRequest::new("items", 8, DistanceMetric::L2)
-                .collection_ref(),
-        )
-        .expect("handle");
     let refused = handle
         .delete_by_filter(eq("group", 1))
         .await

@@ -295,7 +295,7 @@ fn project_records(value: &Value) -> Vec<Value> {
             json!({
                 "seq_no": record["seq_no"],
                 "op": record["op"],
-                "id": record["id"],
+                "pk": record["pk"],
                 "deleted": record["deleted"],
             })
         })

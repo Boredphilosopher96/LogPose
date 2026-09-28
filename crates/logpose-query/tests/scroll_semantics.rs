@@ -3,7 +3,6 @@
 //! first page read, in `(value, key)` order, whatever is written, flushed, or compacted
 //! between pages. Cursors are checked for tampering.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;

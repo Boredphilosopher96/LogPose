@@ -2,7 +2,6 @@
 
 pub mod error;
 pub mod filter;
-pub mod legacy;
 pub mod record;
 pub mod schema;
 pub mod value;
@@ -337,42 +336,6 @@ impl fmt::Display for CollectionId {
     }
 }
 
-/// User-supplied identifier for a stored record.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct RecordId(pub String);
-
-impl RecordId {
-    /// Create a record identifier from a string-like value.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the underlying string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for RecordId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl From<&str> for RecordId {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for RecordId {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
 /// Distance function configured for a collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -423,60 +386,6 @@ pub struct RemoteBlobConfig {
     pub prefix: String,
 }
 
-/// Insert or replace-style payload stored as a new version.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PutRecord {
-    /// External record identifier.
-    pub id: RecordId,
-    /// Raw vector payload stored in the MVP segment format.
-    pub vector: Vec<f32>,
-    /// User metadata preserved as opaque JSON.
-    pub metadata: Value,
-}
-
-/// Logical delete for a previously written record identifier.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DeleteRecord {
-    /// External record identifier.
-    pub id: RecordId,
-}
-
-/// Durable write operation persisted to the WAL and segments.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum WriteOperation {
-    /// Insert or replace a record version.
-    Put(PutRecord),
-    /// Tombstone an existing record identifier.
-    Delete(DeleteRecord),
-}
-
-impl WriteOperation {
-    /// Borrow the record identifier for this operation.
-    #[must_use]
-    pub fn id(&self) -> &RecordId {
-        match self {
-            Self::Put(record) => &record.id,
-            Self::Delete(record) => &record.id,
-        }
-    }
-
-    /// Validate collection dimensions for vector payloads.
-    pub fn validate_dimensions(&self, expected_dimensions: usize) -> Result<()> {
-        match self {
-            Self::Put(record) if record.vector.len() != expected_dimensions => {
-                Err(LogPoseError::DimensionMismatch {
-                    field: "vector".to_owned(),
-                    record_id: Some(record.id.to_string()),
-                    expected: expected_dimensions,
-                    actual: record.vector.len(),
-                })
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
 /// Commit metadata returned after durable append.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommitAck {
@@ -504,19 +413,6 @@ impl Snapshot {
         self.manifest_generation >= barrier.manifest_generation
             && self.visible_seq_no >= barrier.visible_seq_no
     }
-}
-
-/// Visible user record reconstructed from mutable and immutable storage.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VisibleRecord {
-    /// External record identifier.
-    pub id: RecordId,
-    /// Vector payload.
-    pub vector: Vec<f32>,
-    /// Opaque user metadata.
-    pub metadata: Value,
-    /// Sequence number of the visible version.
-    pub seq_no: SeqNo,
 }
 
 /// Scalar metadata value supported by query predicates and planner statistics.
@@ -648,30 +544,6 @@ pub struct QueryUnitStats {
     pub artifact_stats: Vec<QueryUnitArtifactStats>,
     /// Component-oriented byte accounting surfaced to planners and operators.
     pub component_bytes: BTreeMap<String, usize>,
-}
-
-/// Immutable ANN candidate returned before latest-visible resolution and rerank.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AnnCandidate {
-    /// Immutable unit that produced this candidate.
-    pub unit_id: String,
-    /// External record identifier.
-    pub record_id: RecordId,
-    /// Sequence number represented by the candidate.
-    pub seq_no: SeqNo,
-    /// Approximate vector score returned by candidate generation.
-    pub value: f32,
-}
-
-/// Planner-provided ANN candidate generation request.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AnnSearchRequest {
-    /// Query embedding vector.
-    pub vector: Vec<f32>,
-    /// Final top-k requested by the caller.
-    pub top_k: usize,
-    /// Candidate budget to materialize before rerank.
-    pub candidate_budget: usize,
 }
 
 /// Collection-level storage statistics surfaced to the CLI.

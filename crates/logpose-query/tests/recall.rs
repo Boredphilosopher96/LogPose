@@ -9,7 +9,6 @@
 //! `calibrate_cost_model` (ignored; release) measures the cost model's constants on this host
 //! and prints them.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index::{

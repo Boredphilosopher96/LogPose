@@ -4,8 +4,8 @@
 #![allow(dead_code, reason = "each test crate uses a subset")]
 
 use logpose_storage::{
-    CollectionHandle, CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine,
-    ReadOptions, ReadView, SchemaChange, StorageEngine,
+    CollectionHandle, CreateCollectionRequest, Engine, EngineConfig, IndexPolicy, ReadOptions,
+    ReadView, SchemaChange,
 };
 use logpose_types::{
     CollectionRef, DistanceMetric,
@@ -84,7 +84,7 @@ pub fn unique_temp_dir(name: &str) -> PathBuf {
 
 /// A typed collection on its own local engine.
 pub struct Fixture {
-    pub engine: LocalStorageEngine,
+    pub engine: Engine,
     pub handle: Arc<CollectionHandle>,
     pub reference: CollectionRef,
     pub root: PathBuf,
@@ -101,7 +101,7 @@ impl Fixture {
         fields: &[(&str, FieldType)],
     ) -> Self {
         let root = unique_temp_dir(label);
-        let engine = LocalStorageEngine::with_config(
+        let engine = Engine::open_local(
             &root,
             EngineConfig {
                 index: policy,
@@ -114,8 +114,8 @@ impl Fixture {
     }
 
     /// Reopen on the same root (the previous engine must be dropped).
-    pub fn reopen(root: &PathBuf, policy: IndexPolicy) -> LocalStorageEngine {
-        LocalStorageEngine::with_config(
+    pub fn reopen(root: &PathBuf, policy: IndexPolicy) -> Engine {
+        Engine::open_local(
             root,
             EngineConfig {
                 index: policy,
@@ -127,7 +127,7 @@ impl Fixture {
     }
 
     async fn create(
-        engine: LocalStorageEngine,
+        engine: Engine,
         root: PathBuf,
         dims: usize,
         metric: DistanceMetric,
@@ -135,14 +135,13 @@ impl Fixture {
     ) -> Self {
         let request = CreateCollectionRequest::new("items", dims, metric);
         let reference = request.collection_ref();
-        engine
-            .create_collection(request)
+        let descriptor = engine
+            .plan_collection_descriptor(&request)
+            .expect("collection should plan");
+        let handle = engine
+            .create_collection(descriptor, None)
             .await
             .expect("collection should be created");
-        let handle = engine
-            .engine()
-            .collection(&reference)
-            .expect("collection handle");
         for (name, field_type) in fields {
             handle
                 .alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
@@ -180,15 +179,12 @@ impl Fixture {
     }
 
     pub async fn flush(&self) {
-        self.engine
-            .flush(&self.reference.lookup_name())
-            .await
-            .expect("flush should succeed");
+        self.handle.flush().await.expect("flush should succeed");
     }
 
     pub async fn compact(&self) {
-        self.engine
-            .compact(&self.reference.lookup_name())
+        self.handle
+            .compact()
             .await
             .expect("compaction should succeed");
     }

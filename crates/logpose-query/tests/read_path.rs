@@ -3,7 +3,6 @@
 //! order by, and search compared with the model. Exact paths (segments without vector index
 //! sections) must match exactly; indexed segments (graphs and SQ8 codes) must keep recall.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;

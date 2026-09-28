@@ -2,7 +2,6 @@
 //! per-unit evaluation follows).
 
 use crate::{CompiledFilter, QueryError};
-use async_trait as _;
 use criterion as _;
 use logpose_types::{
     LogPoseError,

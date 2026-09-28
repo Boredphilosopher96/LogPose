@@ -676,8 +676,20 @@ mod tests {
             collection_id: logpose_types::CollectionId::default(),
             database_name: "analytics".to_owned(),
             name: "documents".to_owned(),
-            schema: logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
-                .expect("schema"),
+            schema: logpose_types::schema::CollectionSchema::new(
+                logpose_types::schema::PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    key_type: logpose_types::schema::PrimaryKeyType::String,
+                },
+                vec![logpose_types::schema::VectorFieldSpec {
+                    name: "vector".to_owned(),
+                    dimensions: 2,
+                    metric: logpose_types::DistanceMetric::Dot,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("schema"),
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,
@@ -720,8 +732,20 @@ mod tests {
             collection_id: logpose_types::CollectionId::default(),
             database_name: "default".to_owned(),
             name: "documents".to_owned(),
-            schema: logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
-                .expect("schema"),
+            schema: logpose_types::schema::CollectionSchema::new(
+                logpose_types::schema::PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    key_type: logpose_types::schema::PrimaryKeyType::String,
+                },
+                vec![logpose_types::schema::VectorFieldSpec {
+                    name: "vector".to_owned(),
+                    dimensions: 2,
+                    metric: logpose_types::DistanceMetric::Dot,
+                }],
+                Vec::new(),
+                true,
+            )
+            .expect("schema"),
             root_path: PathBuf::from("/tmp/documents"),
             remote_blob: None,
             flush_threshold_ops: 10,

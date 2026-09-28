@@ -7,9 +7,9 @@ use crate::{
     dv::dv_path,
     manifest::{DvRef, Manifest, manifest_path, publish_manifest},
     paths::segment_path,
-    test_support::{ControlledVfs, put},
+    test_support::{ControlledVfs, delete, put, scan, vector_schema},
 };
-use logpose_types::{CollectionId, CollectionRef, DistanceMetric, legacy::legacy_schema};
+use logpose_types::{CollectionId, CollectionRef, DistanceMetric};
 use logpose_vfs::{FaultPlan, FaultVfs, OpenMode, TearMode};
 use logpose_wal::BootId;
 use std::io::IoSlice;
@@ -31,7 +31,7 @@ fn exists_at(vfs: &dyn Vfs, path: &Path) -> bool {
 
 /// A manifest at `generation` holding the (empty-detail) segments `units`.
 fn manifest(generation: u64, units: &[u32]) -> Manifest {
-    let schema = legacy_schema(2, DistanceMetric::Dot).expect("schema");
+    let schema = vector_schema(2, DistanceMetric::Dot);
     let mut manifest = Manifest::empty(CollectionId(Uuid::from_u128(7)), schema);
     manifest.generation = generation;
     manifest.next_unit_id = units.iter().max().map_or(0, |unit| unit + 1);
@@ -243,14 +243,13 @@ fn create(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
-fn write(engine: &Engine, handle: &Arc<CollectionHandle>, id: &str) {
-    engine
-        .core()
-        .write(handle, vec![put(id, vec![1.0, 0.0])])
+fn write(handle: &Arc<CollectionHandle>, id: &str) {
+    handle
+        .write_blocking(vec![put(id, vec![1.0, 0.0])])
         .expect("write");
 }
 
@@ -278,16 +277,16 @@ fn a_segment_is_removed_only_after_the_last_version_and_token_holding_it_are_rel
     let engine = Engine::open(fault.process(), ROOT, config()).expect("engine should open");
     let handle = create(&engine, "gc");
     let core = engine.core();
-    write(&engine, &handle, "a");
-    core.flush_collection(&handle).expect("flush");
-    write(&engine, &handle, "b");
-    core.flush_collection(&handle).expect("flush");
+    write(&handle, "a");
+    handle.flush_blocking().expect("flush");
+    write(&handle, "b");
+    handle.flush_blocking().expect("flush");
     let inputs = handle.current().manifest.units().collect::<Vec<_>>();
     assert_eq!(inputs.len(), 2);
 
     let held = handle.current();
     let token = handle.pin_snapshot().expect("pin");
-    core.compact_collection(&handle).expect("compact");
+    handle.compact_blocking().expect("compact");
     let output = handle.current().manifest.units().collect::<Vec<_>>();
     assert_eq!(output.len(), 1);
     assert!(
@@ -327,10 +326,7 @@ fn a_segment_is_removed_only_after_the_last_version_and_token_holding_it_are_rel
     let handle = engine
         .collection(&CollectionRef::new_default("gc"))
         .expect("collection");
-    let records = engine
-        .core()
-        .scan_exact_internal(&handle, None, true, None)
-        .expect("scan");
+    let records = scan(&handle, None).expect("scan");
     assert_eq!(records.len(), 2);
 }
 
@@ -343,15 +339,15 @@ fn wal_files_and_old_manifests_are_removed_only_after_a_durable_checkpoint() {
     let controlled = ControlledVfs::wrap(fault.process());
     let engine = Engine::open(controlled.clone(), ROOT, config()).expect("engine should open");
     let handle = create(&engine, "wal");
-    let core = engine.core();
     let vfs = fault.process();
-    write(&engine, &handle, "a");
+    write(&handle, "a");
     let before = wal_files(vfs.as_ref(), &handle);
     assert_eq!(before.len(), 1);
 
     // The flush rotates the WAL, then fails before its CURRENT rename.
     controlled.fail_file_syncs_containing("CURRENT.tmp", 1);
-    core.flush_collection(&handle)
+    handle
+        .flush_blocking()
         .expect_err("the publish fails before the rename");
     assert!(
         !handle.is_poisoned(),
@@ -367,8 +363,8 @@ fn wal_files_and_old_manifests_are_removed_only_after_a_durable_checkpoint() {
     assert!(rotated.contains(&before[0]));
 
     // The retry flushes the memtable the failed flush froze, then the one "b" went to.
-    write(&engine, &handle, "b");
-    core.flush_collection(&handle).expect("flush");
+    write(&handle, "b");
+    handle.flush_blocking().expect("flush");
     let after = wal_files(vfs.as_ref(), &handle);
     let checkpoint = handle.current().checkpoint_seq_no;
     assert_eq!(checkpoint, 2);
@@ -390,8 +386,8 @@ fn wal_files_and_old_manifests_are_removed_only_after_a_durable_checkpoint() {
     assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 1)), "burned");
     assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 0)));
     assert!(exists_at(vfs.as_ref(), &manifest_path(&dir, 2)));
-    write(&engine, &handle, "c");
-    core.flush_collection(&handle).expect("flush");
+    write(&handle, "c");
+    handle.flush_blocking().expect("flush");
     engine.wait_for_gc();
     assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 2)));
     assert!(
@@ -409,10 +405,10 @@ fn an_abandoned_job_leaves_no_files_behind() {
     let controlled = ControlledVfs::wrap(fault.process());
     let engine = Engine::open(controlled.clone(), ROOT, config()).expect("engine should open");
     let handle = create(&engine, "abandoned");
-    let core = engine.core();
-    write(&engine, &handle, "a");
+    write(&handle, "a");
     controlled.fail_file_syncs_containing(".mf", 1);
-    core.flush_collection(&handle)
+    handle
+        .flush_blocking()
         .expect_err("the manifest file sync fails");
     engine.wait_for_gc();
     let vfs = fault.process();
@@ -427,7 +423,7 @@ fn an_abandoned_job_leaves_no_files_behind() {
         1,
         "the memtable stays frozen"
     );
-    core.flush_collection(&handle).expect("retry");
+    handle.flush_blocking().expect("retry");
     assert_eq!(
         handle.current().manifest.units().collect::<Vec<_>>(),
         [UnitId(3)],
@@ -479,15 +475,14 @@ fn a_read_in_progress_keeps_the_files_of_its_version() {
     let fault = FaultVfs::new(37);
     let engine = Engine::open(fault.process(), ROOT, config()).expect("engine should open");
     let handle = create(&engine, "reading");
-    let core = engine.core();
-    write(&engine, &handle, "a");
-    core.flush_collection(&handle).expect("flush");
-    write(&engine, &handle, "b");
-    core.flush_collection(&handle).expect("flush");
+    write(&handle, "a");
+    handle.flush_blocking().expect("flush");
+    write(&handle, "b");
+    handle.flush_blocking().expect("flush");
     let inputs = handle.current().manifest.units().collect::<Vec<_>>();
 
-    let (state, _) = core.read_state(&handle, None).expect("read state");
-    core.compact_collection(&handle).expect("compact");
+    let (state, _) = handle.read_state(None).expect("read state");
+    handle.compact_blocking().expect("compact");
     engine.wait_for_gc();
     let vfs = fault.process();
     for unit in &inputs {
@@ -528,13 +523,13 @@ fn waiting_for_gc_covers_the_versions_the_reaper_releases_in_the_background() {
     .expect("engine should open");
     let handle = create(&engine, "reaped");
     let core = engine.core();
-    write(&engine, &handle, "a");
-    core.flush_collection(&handle).expect("flush");
-    write(&engine, &handle, "b");
-    core.flush_collection(&handle).expect("flush");
+    write(&handle, "a");
+    handle.flush_blocking().expect("flush");
+    write(&handle, "b");
+    handle.flush_blocking().expect("flush");
     let inputs = handle.current().manifest.units().collect::<Vec<_>>();
     let _token = handle.pin_snapshot().expect("pin");
-    core.compact_collection(&handle).expect("compact");
+    handle.compact_blocking().expect("compact");
 
     // Occupy the maintenance pool, so the reaper's release waits behind this job.
     let (unblock, blocked) = std::sync::mpsc::channel::<()>();
@@ -572,7 +567,6 @@ fn expired<T>(result: &Result<T>) -> bool {
 #[test]
 fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run() {
     use crate::{TokenConfig, clock::ManualClock, manifest::MANIFESTS_DIR};
-    use logpose_types::{DeleteRecord, RecordId, WriteOperation};
     use std::{
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
         time::Duration,
@@ -599,34 +593,28 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
     let reads = Arc::new(AtomicUsize::new(0));
 
     let writer = {
-        let engine = engine.clone();
         let handle = Arc::clone(&handle);
         std::thread::spawn(move || {
-            let core = engine.core();
             for round in 0..400_u32 {
                 let id = format!("k{}", round % 37);
                 let operation = if round % 5 == 4 {
-                    WriteOperation::Delete(DeleteRecord {
-                        id: RecordId::new(&id),
-                    })
+                    delete(&id)
                 } else {
                     put(&id, vec![round as f32, 1.0])
                 };
-                core.write(&handle, vec![operation]).expect("write");
+                handle.write_blocking(vec![operation]).expect("write");
             }
         })
     };
     let maintenance = {
-        let engine = engine.clone();
         let handle = Arc::clone(&handle);
         let done = Arc::clone(&done);
         std::thread::spawn(move || {
-            let core = engine.core();
             let mut round = 0_u32;
             while !done.load(AtomicOrdering::Acquire) {
-                core.flush_collection(&handle).expect("flush");
+                handle.flush_blocking().expect("flush");
                 if round % 3 == 2 {
-                    core.compact_collection(&handle).expect("compact");
+                    handle.compact_blocking().expect("compact");
                 }
                 round += 1;
             }
@@ -646,13 +634,11 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
     };
     let readers = (0..3)
         .map(|reader| {
-            let engine = engine.clone();
             let handle = Arc::clone(&handle);
             let done = Arc::clone(&done);
             let reads = Arc::clone(&reads);
             let vfs = fault.process();
             std::thread::spawn(move || {
-                let core = engine.core();
                 let mut held = Vec::new();
                 let mut round = 0_usize;
                 while !done.load(AtomicOrdering::Acquire) {
@@ -689,7 +675,7 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                             );
                         }
                         // The reaper may expire the token between two uses.
-                        let records = core.scan_exact_internal(&handle, token.clone(), true, None);
+                        let records = scan(&handle, token.clone());
                         assert!(
                             records.is_ok() || expired(&records),
                             "read through a token: {:?}",
@@ -703,8 +689,7 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                                 None => *first = Some(records),
                             }
                         }
-                        let exact =
-                            core.scan_exact_internal(&handle, Some(snapshot.clone()), true, None);
+                        let exact = scan(&handle, Some(snapshot.clone()));
                         assert!(
                             exact.is_ok() || expired(&exact),
                             "read at an exact snapshot: {:?}",
@@ -713,8 +698,7 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                         drop(version);
                         reads.fetch_add(1, AtomicOrdering::Relaxed);
                     }
-                    core.scan_exact_internal(&handle, None, true, None)
-                        .expect("a read of the current state never fails");
+                    scan(&handle, None).expect("a read of the current state never fails");
                     if (held.len() > 4 || round % 7 == reader) && !held.is_empty() {
                         let (token, _, _) = held.remove(0);
                         handle.release_snapshot(&token);
@@ -738,9 +722,8 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
     clock.advance(Duration::from_secs(3600));
     engine.reap_snapshots();
     assert_eq!(handle.pinned_snapshots(), 0);
-    let core = engine.core();
-    core.flush_collection(&handle).expect("flush");
-    core.compact_collection(&handle).expect("compact");
+    handle.flush_blocking().expect("flush");
+    handle.compact_blocking().expect("compact");
     engine.wait_for_gc();
 
     // Exactly the durable manifest's files are left, with it and the previous generation.

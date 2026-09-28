@@ -8,14 +8,15 @@
 use crate::dataset::Metric;
 use anyhow::{Context, Result, anyhow, ensure};
 use logpose_query::{ExplainMode, FilterExpr, QueryRequest, VectorQuery, query};
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use logpose_storage::{CollectionHandle, CreateCollectionRequest, Engine, EngineConfig};
 use logpose_types::{
-    CollectionRef, DistanceMetric, LogPoseError, PutRecord, RecordId, WriteOperation,
-    legacy::LEGACY_PRIMARY_KEY_FIELD,
+    CollectionRef, DistanceMetric, LogPoseError,
+    record::{ClientOp, Record},
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
@@ -91,16 +92,16 @@ pub trait BenchTarget: Send + Sync {
 /// How long to wait for background maintenance to settle.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The current in-process engine: `LocalStorageEngine` plus `logpose_query::query`.
+/// The current in-process engine: `Engine` plus `logpose_query::query`.
 ///
 /// Queries run with [`ExplainMode::Plan`] so the report can show which plan
 /// the planner chose; plan diagnostics are cheap to produce.
 pub struct LocalEngineTarget {
     runtime: Runtime,
-    engine: LocalStorageEngine,
+    engine: Engine,
     root: PathBuf,
     remove_on_drop: bool,
-    collection: Option<CollectionSpec>,
+    collection: Option<(CollectionSpec, Arc<CollectionHandle>)>,
 }
 
 impl LocalEngineTarget {
@@ -125,7 +126,7 @@ impl LocalEngineTarget {
             .enable_all()
             .build()
             .context("building tokio runtime")?;
-        let engine = LocalStorageEngine::new(&root)
+        let engine = Engine::open_local(&root, EngineConfig::default())
             .with_context(|| format!("opening engine at {}", root.display()))?;
         Ok(Self {
             runtime,
@@ -143,19 +144,26 @@ impl LocalEngineTarget {
     fn spec(&self) -> Result<&CollectionSpec> {
         self.collection
             .as_ref()
+            .map(|(spec, _)| spec)
+            .ok_or_else(|| anyhow!("collection has not been created"))
+    }
+
+    fn handle(&self) -> Result<&Arc<CollectionHandle>> {
+        self.collection
+            .as_ref()
+            .map(|(_, handle)| handle)
             .ok_or_else(|| anyhow!("collection has not been created"))
     }
 
     fn wait_for_maintenance(&self) -> Result<()> {
-        let collection = self.collection()?;
+        let handle = self.handle()?;
         let started = Instant::now();
         // The engine clears `in_progress` before it enqueues follow-up work (a
         // flush that crosses the compaction threshold), so one idle reading can
         // fall in that gap. Require two idle readings with no run in between.
         let mut idle_after_runs = None;
         loop {
-            let stats = self.runtime.block_on(self.engine.stats(collection))?;
-            let maintenance = &stats.maintenance;
+            let maintenance = &handle.maintenance_status();
             if let Some(error) = maintenance.last_error.as_ref() {
                 return Err(anyhow!(
                     "background maintenance failed: {} failed: {}",
@@ -203,14 +211,19 @@ impl BenchTarget for LocalEngineTarget {
     }
 
     fn create(&mut self, spec: &CollectionSpec) -> Result<()> {
-        self.runtime
-            .block_on(self.engine.create_collection(CreateCollectionRequest::new(
+        let descriptor = self
+            .engine
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
                 spec.name.clone(),
                 spec.dims,
                 engine_metric(spec.metric),
-            )))
+            ))
+            .context("planning collection")?;
+        let handle = self
+            .runtime
+            .block_on(self.engine.create_collection(descriptor, None))
             .context("creating collection")?;
-        self.collection = Some(spec.clone());
+        self.collection = Some((spec.clone(), handle));
         Ok(())
     }
 
@@ -219,34 +232,29 @@ impl BenchTarget for LocalEngineTarget {
         let operations = rows
             .iter()
             .map(|row| {
-                // The engine is schemaless today; enforce the declared fields
-                // anyway so the harness honors the contract a typed schema needs.
-                let metadata = row
-                    .scalars
-                    .iter()
-                    .map(|(field, value)| {
-                        ensure!(
-                            spec.scalar_fields.iter().any(|declared| declared == field),
-                            "row {} has undeclared scalar field {field}",
-                            row.id
-                        );
-                        Ok(((*field).to_owned(), Value::from(*value)))
-                    })
-                    .collect::<Result<Map<_, _>>>()?;
-                Ok(WriteOperation::Put(PutRecord {
-                    id: RecordId::new(row.id.to_string()),
-                    vector: row.vector.to_vec(),
-                    metadata: Value::Object(metadata),
-                }))
+                // The collection declares no scalar fields, so they are dynamic (`$extra`)
+                // keys; enforce the declared fields anyway so the harness honors the contract
+                // a typed schema needs.
+                let mut record =
+                    Record::new(row.id.to_string()).with_vector("vector", row.vector.to_vec());
+                for (field, value) in &row.scalars {
+                    ensure!(
+                        spec.scalar_fields.iter().any(|declared| declared == field),
+                        "row {} has undeclared scalar field {field}",
+                        row.id
+                    );
+                    record
+                        .extra
+                        .insert((*field).to_owned(), Value::from(*value));
+                }
+                Ok(ClientOp::Upsert(record))
             })
             .collect::<Result<Vec<_>>>()?;
         // A stalled write is backpressure (flushes are behind), not a failure: retry it, as
         // a client would, so ingest measures sustained throughput instead of aborting.
+        let handle = self.handle()?;
         loop {
-            match self
-                .runtime
-                .block_on(self.engine.write(self.collection()?, operations.clone()))
-            {
+            match self.runtime.block_on(handle.write(operations.clone())) {
                 Err(LogPoseError::WriteStalled { .. }) => continue,
                 result => {
                     result.context("writing batch")?;
@@ -261,7 +269,7 @@ impl BenchTarget for LocalEngineTarget {
         // the explicit flush does not race them, then wait for any compaction.
         self.wait_for_maintenance()?;
         self.runtime
-            .block_on(self.engine.flush(self.collection()?))
+            .block_on(self.handle()?.flush())
             .context("flushing collection")?;
         self.wait_for_maintenance()?;
         Ok(true)
@@ -281,7 +289,7 @@ impl BenchTarget for LocalEngineTarget {
                     }),
                     top_k: request.k,
                     filter: request.filter.cloned(),
-                    output_fields: vec![LEGACY_PRIMARY_KEY_FIELD.to_owned()],
+                    output_fields: vec!["id".to_owned()],
                     explain: ExplainMode::Plan,
                     ..QueryRequest::default()
                 },
@@ -306,9 +314,7 @@ impl BenchTarget for LocalEngineTarget {
     }
 
     fn stats(&self) -> Result<Option<Value>> {
-        let stats = self
-            .runtime
-            .block_on(self.engine.stats(self.collection()?))?;
+        let stats = self.handle()?.stats(None)?;
         let disk_bytes = directory_size(&self.root);
         Ok(Some(serde_json::json!({
             "segment_count": stats.segment_count,

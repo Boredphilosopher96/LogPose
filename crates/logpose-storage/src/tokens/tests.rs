@@ -3,14 +3,17 @@
 
 use super::*;
 use crate::{
-    CreateCollectionRequest, Engine, EngineConfig, LocalStorageEngine, ManualClock, StorageEngine,
-    handle::CollectionMeta, manifest::Manifest, memtable::MemtableData, test_support::put,
+    CollectionHandle, CreateCollectionRequest, Engine, EngineConfig, ManualClock,
+    handle::CollectionMeta,
+    manifest::Manifest,
+    memtable::MemtableData,
+    test_support::{delete, put, scan, vector_schema},
     version::VersionCounters,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    DeleteRecord, DistanceMetric, RecordId, SeqNo, UnitId, VisibleRecord, WriteOperation,
-    legacy::legacy_schema, record::Record,
+    DistanceMetric, SeqNo, UnitId,
+    record::{ClientOp, Record},
 };
 use logpose_vfs::FaultVfs;
 use logpose_wal::{BootId, codec::RowImage};
@@ -31,7 +34,7 @@ fn test_meta(name: &str) -> Arc<CollectionMeta> {
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         name,
-        legacy_schema(2, DistanceMetric::Dot).expect("schema"),
+        vector_schema(2, DistanceMetric::Dot),
         PathBuf::from("/c"),
     );
     Arc::new(CollectionMeta::new(descriptor, None))
@@ -39,7 +42,7 @@ fn test_meta(name: &str) -> Arc<CollectionMeta> {
 
 /// A memtable `unit` holding `rows` slots from sequence number `first`.
 fn memtable(unit: u32, first: SeqNo, rows: u32) -> Arc<MemtableData> {
-    let schema = Arc::new(legacy_schema(2, DistanceMetric::Dot).expect("schema"));
+    let schema = Arc::new(vector_schema(2, DistanceMetric::Dot));
     let mut memtable = MemtableData::new(UnitId(unit), Arc::clone(&schema), first, Duration::ZERO);
     for row in 0..rows {
         let record = Record::new(format!("key-{unit}-{row}")).with_vector("vector", vec![1.0, 0.0]);
@@ -60,7 +63,7 @@ fn version_over(
     checkpoint: SeqNo,
     mut memtables: Vec<Arc<MemtableData>>,
 ) -> Arc<Version> {
-    let schema = legacy_schema(2, DistanceMetric::Dot).expect("schema");
+    let schema = vector_schema(2, DistanceMetric::Dot);
     let manifest = Manifest {
         generation,
         checkpoint_seq_no: checkpoint,
@@ -339,32 +342,27 @@ fn engine_config(clock: &Arc<ManualClock>, tokens: TokenConfig) -> EngineConfig 
     }
 }
 
-async fn open(fault: &Arc<FaultVfs>, config: EngineConfig) -> LocalStorageEngine {
-    let engine = LocalStorageEngine::from_engine(
-        Engine::open(fault.process(), ROOT, config).expect("engine should open"),
-    );
-    engine
-        .create_collection(CreateCollectionRequest::new(NAME, 2, DistanceMetric::Dot))
+async fn open(fault: &Arc<FaultVfs>, config: EngineConfig) -> (Engine, Arc<CollectionHandle>) {
+    let engine = Engine::open(fault.process(), ROOT, config).expect("engine should open");
+    let descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::new(NAME, 2, DistanceMetric::Dot))
+        .expect("plan");
+    let handle = engine
+        .create_collection(descriptor, None)
         .await
         .expect("collection should be created");
-    engine
+    (engine, handle)
 }
 
-async fn write(engine: &LocalStorageEngine, operations: Vec<WriteOperation>) {
-    engine.write(NAME, operations).await.expect("write");
+async fn write(handle: &CollectionHandle, operations: Vec<ClientOp>) {
+    handle.write(operations).await.expect("write");
 }
 
-fn delete(id: &str) -> WriteOperation {
-    WriteOperation::Delete(DeleteRecord {
-        id: RecordId::new(id),
-    })
-}
-
-async fn scan(
-    engine: &LocalStorageEngine,
-    snapshot: Option<Snapshot>,
-) -> Result<Vec<VisibleRecord>> {
-    engine.scan_exact(NAME, snapshot).await
+/// Pin the current state, returning the token and the snapshot it names.
+fn pin(handle: &CollectionHandle) -> Result<(SnapshotToken, Snapshot)> {
+    let token = handle.pin_snapshot()?;
+    let snapshot = handle.snapshot_version(&token)?.snapshot();
+    Ok((token, snapshot))
 }
 
 /// A token reads exactly the state it pinned, through writes, deletes, flushes and a
@@ -373,60 +371,46 @@ async fn scan(
 async fn reads_through_a_token_return_exactly_the_pinned_state() {
     let clock = Arc::new(ManualClock::new());
     let fault = FaultVfs::new(21);
-    let engine = open(&fault, engine_config(&clock, config(4))).await;
+    let (_engine, handle) = open(&fault, engine_config(&clock, config(4))).await;
     write(
-        &engine,
+        &handle,
         vec![put("a", vec![1.0, 0.0]), put("b", vec![0.0, 1.0])],
     )
     .await;
-    engine.flush(NAME).await.expect("flush");
-    write(&engine, vec![put("c", vec![1.0, 1.0])]).await;
+    handle.flush().await.expect("flush");
+    write(&handle, vec![put("c", vec![1.0, 1.0])]).await;
 
-    let (token, snapshot) = engine.pin_snapshot(NAME).expect("pin");
-    let pinned = scan(&engine, None).await.expect("scan");
-    let pinned_stats = engine.stats(NAME).await.expect("stats");
+    let (token, snapshot) = pin(&handle).expect("pin");
+    let pinned = scan(&handle, None).expect("scan");
+    let pinned_stats = handle.stats(None).expect("stats");
     assert_eq!(pinned.len(), 3);
 
-    write(&engine, vec![delete("a"), put("b", vec![5.0, 5.0])]).await;
-    engine.flush(NAME).await.expect("flush");
-    write(&engine, vec![put("d", vec![1.0, 0.0])]).await;
-    engine.flush(NAME).await.expect("flush");
-    engine.compact(NAME).await.expect("compact");
+    write(&handle, vec![delete("a"), put("b", vec![5.0, 5.0])]).await;
+    handle.flush().await.expect("flush");
+    write(&handle, vec![put("d", vec![1.0, 0.0])]).await;
+    handle.flush().await.expect("flush");
+    handle.compact().await.expect("compact");
     clock.advance(TTL - Duration::from_secs(1));
 
+    assert_eq!(scan(&handle, token.clone()).expect("token scan"), pinned);
     assert_eq!(
-        engine
-            .scan_exact_at_token(NAME, token.clone())
-            .await
-            .expect("token scan"),
+        scan(&handle, Some(snapshot.clone())).expect("snapshot scan"),
         pinned
     );
-    assert_eq!(
-        scan(&engine, Some(snapshot.clone()))
-            .await
-            .expect("snapshot scan"),
-        pinned
-    );
-    let stats = engine
-        .stats_at_token(NAME, token.clone())
-        .await
-        .expect("token stats");
+    let stats = handle.stats_at_token(&token).expect("token stats");
     assert_eq!(stats.manifest_generation, pinned_stats.manifest_generation);
     assert_eq!(stats.visible_seq_no, pinned_stats.visible_seq_no);
     assert_eq!(stats.live_record_count, 3);
-    let current = scan(&engine, None).await.expect("current");
+    let current = scan(&handle, None).expect("current");
     assert_ne!(current, pinned, "the current state moved on");
 
-    assert!(engine.release_snapshot(NAME, &token).expect("release"));
-    let error = engine
-        .scan_exact_at_token(NAME, token)
-        .await
-        .expect_err("released");
+    assert!(handle.release_snapshot(&token));
+    let error = scan(&handle, token).expect_err("released");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
     );
-    let error = scan(&engine, Some(snapshot)).await.expect_err("unpinned");
+    let error = scan(&handle, Some(snapshot)).expect_err("unpinned");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
@@ -439,19 +423,18 @@ async fn reads_through_a_token_return_exactly_the_pinned_state() {
 async fn an_unpinned_snapshot_expires_once_its_generation_is_superseded() {
     let clock = Arc::new(ManualClock::new());
     let fault = FaultVfs::new(22);
-    let engine = open(&fault, engine_config(&clock, config(4))).await;
-    write(&engine, vec![put("a", vec![1.0, 0.0])]).await;
-    let snapshot = engine.snapshot(NAME).await.expect("snapshot");
-    write(&engine, vec![put("b", vec![1.0, 0.0])]).await;
+    let (_engine, handle) = open(&fault, engine_config(&clock, config(4))).await;
+    write(&handle, vec![put("a", vec![1.0, 0.0])]).await;
+    let snapshot = handle.snapshot().expect("snapshot");
+    write(&handle, vec![put("b", vec![1.0, 0.0])]).await;
     assert_eq!(
-        scan(&engine, Some(snapshot.clone()))
-            .await
+        scan(&handle, Some(snapshot.clone()))
             .expect("same generation")
             .len(),
         1
     );
-    engine.flush(NAME).await.expect("flush");
-    let error = scan(&engine, Some(snapshot)).await.expect_err("superseded");
+    handle.flush().await.expect("flush");
+    let error = scan(&handle, Some(snapshot)).expect_err("superseded");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
@@ -464,34 +447,24 @@ async fn an_unpinned_snapshot_expires_once_its_generation_is_superseded() {
 async fn tokens_expire_on_the_injected_clock_and_the_reaper_drops_them() {
     let clock = Arc::new(ManualClock::new());
     let fault = FaultVfs::new(23);
-    let engine = open(&fault, engine_config(&clock, config(4))).await;
-    write(&engine, vec![put("a", vec![1.0, 0.0])]).await;
-    let (kept, _) = engine.pin_snapshot(NAME).expect("pin");
-    let (idle, _) = engine.pin_snapshot(NAME).expect("pin");
-    let handle = engine
-        .engine()
-        .collection(&logpose_types::CollectionRef::new_default(NAME))
-        .expect("handle");
+    let (engine, handle) = open(&fault, engine_config(&clock, config(4))).await;
+    write(&handle, vec![put("a", vec![1.0, 0.0])]).await;
+    let (kept, _) = pin(&handle).expect("pin");
+    let (idle, _) = pin(&handle).expect("pin");
     for _ in 0..3 {
         clock.advance(TTL / 2);
-        engine
-            .scan_exact_at_token(NAME, kept.clone())
-            .await
-            .expect("used tokens stay pinned");
+        scan(&handle, kept.clone()).expect("used tokens stay pinned");
     }
     assert_eq!(handle.pinned_snapshots(), 2, "not reaped yet");
-    assert_eq!(engine.engine().reap_snapshots(), 1);
+    assert_eq!(engine.reap_snapshots(), 1);
     assert_eq!(handle.pinned_snapshots(), 1);
-    let error = engine
-        .scan_exact_at_token(NAME, idle)
-        .await
-        .expect_err("idle token expired");
+    let error = scan(&handle, idle).expect_err("idle token expired");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
     );
     clock.advance(TTL);
-    assert_eq!(engine.engine().reap_snapshots(), 1);
+    assert_eq!(engine.reap_snapshots(), 1);
     assert_eq!(handle.pinned_snapshots(), 0);
 }
 
@@ -500,16 +473,16 @@ async fn tokens_expire_on_the_injected_clock_and_the_reaper_drops_them() {
 async fn pins_beyond_the_per_collection_limit_are_refused() {
     let clock = Arc::new(ManualClock::new());
     let fault = FaultVfs::new(24);
-    let engine = open(&fault, engine_config(&clock, config(2))).await;
-    let (first, _) = engine.pin_snapshot(NAME).expect("pin");
-    engine.pin_snapshot(NAME).expect("pin");
-    let error = engine.pin_snapshot(NAME).expect_err("over the limit");
+    let (_engine, handle) = open(&fault, engine_config(&clock, config(2))).await;
+    let (first, _) = pin(&handle).expect("pin");
+    pin(&handle).expect("pin");
+    let error = pin(&handle).expect_err("over the limit");
     assert!(
         matches!(error, LogPoseError::TooManySnapshots { .. }),
         "{error}"
     );
-    engine.release_snapshot(NAME, &first).expect("release");
-    engine.pin_snapshot(NAME).expect("room again");
+    handle.release_snapshot(&first);
+    pin(&handle).expect("room again");
 }
 
 /// While pinned snapshots hold more retired memory than the limit, new pins are refused, and
@@ -522,48 +495,36 @@ async fn the_pinned_memory_limit_refuses_new_pins_and_expires_the_oldest() {
         memory_limit: Some(64),
         ..config(8)
     };
-    let engine = open(&fault, engine_config(&clock, limit)).await;
-    write(&engine, vec![put("a", vec![1.0, 0.0])]).await;
-    let (oldest, _) = engine.pin_snapshot(NAME).expect("nothing is retired yet");
+    let (engine, handle) = open(&fault, engine_config(&clock, limit)).await;
+    write(&handle, vec![put("a", vec![1.0, 0.0])]).await;
+    let (oldest, _) = pin(&handle).expect("nothing is retired yet");
     write(
-        &engine,
+        &handle,
         vec![put("b", vec![1.0, 0.0]), put("c", vec![0.0, 1.0])],
     )
     .await;
-    let (newer, _) = engine.pin_snapshot(NAME).expect("nothing is retired yet");
-    engine
-        .flush(NAME)
+    let (newer, _) = pin(&handle).expect("nothing is retired yet");
+    handle
+        .flush()
         .await
         .expect("flush retires the memtable both pins hold");
-    let handle = engine
-        .engine()
-        .collection(&logpose_types::CollectionRef::new_default(NAME))
-        .expect("handle");
     assert!(handle.pinned_retired_bytes() > 64);
 
-    let error = engine
-        .pin_snapshot(NAME)
-        .expect_err("over the memory limit");
+    let error = pin(&handle).expect_err("over the memory limit");
     assert!(
         matches!(error, LogPoseError::TooManySnapshots { .. }),
         "{error}"
     );
-    let reaped = engine.engine().reap_snapshots();
+    let reaped = engine.reap_snapshots();
     assert!(reaped >= 1);
     assert!(handle.pinned_retired_bytes() <= 64);
-    let error = engine
-        .scan_exact_at_token(NAME, oldest)
-        .await
-        .expect_err("the oldest pin went first");
+    let error = scan(&handle, oldest).expect_err("the oldest pin went first");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
     );
     if reaped == 1 {
-        engine
-            .scan_exact_at_token(NAME, newer)
-            .await
-            .expect("the newer pin fits under the limit");
+        scan(&handle, newer).expect("the newer pin fits under the limit");
     }
-    engine.pin_snapshot(NAME).expect("under the limit again");
+    pin(&handle).expect("under the limit again");
 }

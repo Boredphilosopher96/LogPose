@@ -9,7 +9,6 @@
 //! exact metric value of the query against that row; hits best first. Segments without vector
 //! indexes must return the exact top k; indexed ones must keep recall.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;

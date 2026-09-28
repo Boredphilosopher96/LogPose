@@ -1,6 +1,5 @@
 //! Storage-backed exact query integration tests.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -8,10 +7,11 @@ use logpose_query::{
     ExplainMode, FilterExpr, QueryError, QueryRequest, QueryResponse, ReadConsistency, VectorQuery,
 };
 use logpose_storage::{
-    CollectionReader, CreateCollectionRequest, LocalStorageEngine, StorageEngine,
+    CollectionHandle, CollectionReader, CreateCollectionRequest, Engine, EngineConfig,
 };
 use logpose_types::{
-    CollectionRef, DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation,
+    CollectionRef, DistanceMetric, LogPoseError, Snapshot,
+    record::{ClientOp, PrimaryKey, Record},
 };
 use rayon as _;
 use roaring as _;
@@ -19,7 +19,8 @@ use serde as _;
 use serde_json::json;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror as _;
@@ -72,38 +73,21 @@ fn ids(response: &QueryResponse) -> Vec<String> {
 #[tokio::test]
 async fn queries_storage_records_and_honors_snapshots() {
     let root = unique_temp_dir("query-storage-snapshots");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({ "tag": "alpha" }),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.5, 0.0],
-                    metadata: json!({ "tag": "beta" }),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("gamma"),
-                    vector: vec![-1.0, 0.0],
-                    metadata: json!({ "tag": "gamma" }),
-                }),
-            ],
-        )
+    handle(&engine, "documents")
+        .write(vec![
+            put_with("alpha", vec![1.0, 0.0], json!({ "tag": "alpha" })),
+            put_with("beta", vec![0.5, 0.0], json!({ "tag": "beta" })),
+            put_with("gamma", vec![-1.0, 0.0], json!({ "tag": "gamma" })),
+        ])
         .await
         .expect("write should succeed");
 
@@ -121,9 +105,8 @@ async fn queries_storage_records_and_honors_snapshots() {
     .await
     .expect("query should succeed");
 
-    let snapshot = engine
-        .snapshot("documents")
-        .await
+    let snapshot = handle(&engine, "documents")
+        .snapshot()
         .expect("snapshot should succeed");
     assert_eq!(current.metric, Some(DistanceMetric::Dot));
     assert_eq!(current.top_k, 2);
@@ -133,15 +116,12 @@ async fn queries_storage_records_and_honors_snapshots() {
     assert!((current.hits[0].score.unwrap_or_default() - 1.0).abs() < 1e-6);
     assert!((current.hits[1].score.unwrap_or_default() - 0.5).abs() < 1e-6);
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("delta"),
-                vector: vec![3.0, 0.0],
-                metadata: json!({ "tag": "delta" }),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "delta",
+            vec![3.0, 0.0],
+            json!({ "tag": "delta" }),
+        )])
         .await
         .expect("write should succeed");
 
@@ -166,16 +146,14 @@ async fn queries_storage_records_and_honors_snapshots() {
 #[tokio::test]
 async fn returns_empty_matches_for_empty_collection() {
     let root = unique_temp_dir("query-empty-collection");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "empty",
-            3,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("empty", 3, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created");
 
     let response = query(
         &engine,
@@ -206,16 +184,14 @@ async fn returns_empty_matches_for_empty_collection() {
 #[tokio::test]
 async fn rejects_query_vector_with_wrong_collection_dimensions() {
     let root = unique_temp_dir("query-dimension-mismatch");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "embeddings",
-            3,
-            DistanceMetric::L2,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("embeddings", 3, DistanceMetric::L2),
+    )
+    .await
+    .expect("collection should be created");
 
     let result = query(
         &engine,
@@ -242,50 +218,32 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
 #[tokio::test]
 async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
     let root = unique_temp_dir("query-delete-flush-compact");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "profiles",
-            2,
-            DistanceMetric::L2,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("profiles", 2, DistanceMetric::L2),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "profiles",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![0.0, 0.0],
-                    metadata: json!({ "version": 1 }),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({ "version": 1 }),
-                }),
-            ],
-        )
+    handle(&engine, "profiles")
+        .write(vec![
+            put_with("alpha", vec![0.0, 0.0], json!({ "version": 1 })),
+            put_with("beta", vec![1.0, 0.0], json!({ "version": 1 })),
+        ])
         .await
         .expect("write should succeed");
 
     // Pin the state before the delete: the flush below supersedes its manifest generation.
-    let (_token, before_delete) = engine.pin_snapshot("profiles").expect("pin should succeed");
+    let (_token, before_delete) = pin(&engine, "profiles").expect("pin should succeed");
 
-    engine
-        .write(
-            "profiles",
-            vec![WriteOperation::Delete(logpose_types::DeleteRecord {
-                id: RecordId::new("alpha"),
-            })],
-        )
+    handle(&engine, "profiles")
+        .write(vec![delete("alpha")])
         .await
         .expect("delete should succeed");
-    engine
-        .flush("profiles")
+    handle(&engine, "profiles")
+        .flush()
         .await
         .expect("flush should succeed");
 
@@ -304,7 +262,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 
     // Pins end with the process: after a reopen the old generation is gone.
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let reopened = open(&root);
     let expired = query(&reopened, historical_request)
         .await
         .expect_err("an unpinned historical snapshot expires");
@@ -316,23 +274,20 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         "{expired}"
     );
 
-    reopened
-        .write(
-            "profiles",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("gamma"),
-                vector: vec![0.5, 0.0],
-                metadata: json!({ "version": 1 }),
-            })],
-        )
+    handle(&reopened, "profiles")
+        .write(vec![put_with(
+            "gamma",
+            vec![0.5, 0.0],
+            json!({ "version": 1 }),
+        )])
         .await
         .expect("write should succeed");
-    reopened
-        .flush("profiles")
+    handle(&reopened, "profiles")
+        .flush()
         .await
         .expect("flush should succeed");
-    reopened
-        .compact("profiles")
+    handle(&reopened, "profiles")
+        .compact()
         .await
         .expect("compaction should succeed");
 
@@ -349,30 +304,25 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 #[tokio::test]
 async fn exists_predicates_match_non_scalar_fields_after_flush() {
     let root = unique_temp_dir("query-exists-non-scalar-after-flush");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({ "details": { "kind": "keep" } }),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 0.0],
+            json!({ "details": { "kind": "keep" } }),
+        )])
         .await
         .expect("write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
 
@@ -400,7 +350,7 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
 #[tokio::test]
 async fn surfaces_unknown_collection_errors_from_storage() {
     let root = unique_temp_dir("query-missing-collection");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     let result = query(
         &engine,
@@ -422,4 +372,45 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("logpose-query-{label}-{suffix}"));
     fs::create_dir_all(&path).expect("temp dir should be created");
     path
+}
+
+fn open(root: &Path) -> Engine {
+    Engine::open_local(root, EngineConfig::default()).expect("engine should open")
+}
+
+async fn create(
+    engine: &Engine,
+    request: CreateCollectionRequest,
+) -> logpose_types::Result<Arc<CollectionHandle>> {
+    let descriptor = engine.plan_collection_descriptor(&request)?;
+    engine.create_collection(descriptor, None).await
+}
+
+fn handle(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
+    engine
+        .collection(&CollectionRef::parse(name).expect("name"))
+        .expect("the collection should be open")
+}
+
+fn put_with(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> ClientOp {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let serde_json::Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    ClientOp::Upsert(record)
+}
+
+fn delete(id: &str) -> ClientOp {
+    ClientOp::Delete(PrimaryKey::from(id))
+}
+
+/// Pin the current state of `name`, returning the token and the snapshot it names.
+fn pin(
+    engine: &Engine,
+    name: &str,
+) -> logpose_types::Result<(logpose_storage::SnapshotToken, Snapshot)> {
+    let handle = handle(engine, name);
+    let token = handle.pin_snapshot()?;
+    let snapshot = handle.snapshot_version(&token)?.snapshot();
+    Ok((token, snapshot))
 }

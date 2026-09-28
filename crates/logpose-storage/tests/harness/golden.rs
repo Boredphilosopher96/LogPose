@@ -67,7 +67,7 @@ fn generate() -> BTreeMap<PathBuf, Vec<u8>> {
         descriptor.flush_threshold_bytes = usize::MAX;
         descriptor.compaction_threshold_segments = usize::MAX;
         let handle = engine
-            .create_collection(descriptor, None)
+            .create_collection_blocking(descriptor, None)
             .expect("collection created");
         for (name, field_type) in [("n", FieldType::Int64), ("s", FieldType::String)] {
             handle

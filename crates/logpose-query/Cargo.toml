@@ -20,7 +20,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 criterion = "0.5"
 tokio.workspace = true
 

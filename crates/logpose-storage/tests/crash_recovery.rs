@@ -11,7 +11,6 @@
 #![allow(clippy::panic)]
 
 use arc_swap as _;
-use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
 use imbl as _;
@@ -30,15 +29,15 @@ use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
-#[path = "support/scan.rs"]
-mod scan;
-use scan::ScanExt;
+#[path = "support/engine.rs"]
+mod db;
 
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
+use db::{Row, create, handle, put_with, scan};
+use logpose_storage::{CreateCollectionRequest, Engine, EngineConfig};
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DeleteRecord, DistanceMetric,
-    LogPoseError, NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
-    WriteOutcome,
+    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DistanceMetric, LogPoseError,
+    NodeRole, SeqNo, Snapshot, WriteOutcome,
+    record::{ClientOp, PrimaryKey},
 };
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use serde_json::json;
@@ -54,23 +53,17 @@ const COLLECTION: &str = "crashy";
 
 #[derive(Clone, Debug)]
 enum Step {
-    Write(Vec<WriteOperation>),
+    Write(Vec<ClientOp>),
     Flush,
     Compact,
 }
 
-fn put(id: &str, x: f32) -> WriteOperation {
-    WriteOperation::Put(PutRecord {
-        id: RecordId::new(id),
-        vector: vec![x, 1.0],
-        metadata: json!({"key": id, "x": x}),
-    })
+fn put(id: &str, x: f32) -> ClientOp {
+    put_with(id, vec![x, 1.0], json!({"key": id, "x": x}))
 }
 
-fn delete(id: &str) -> WriteOperation {
-    WriteOperation::Delete(DeleteRecord {
-        id: RecordId::new(id),
-    })
+fn delete(id: &str) -> ClientOp {
+    db::delete(id)
 }
 
 /// Two flushes (the second rolls a WAL file with data and writes a DV file for the first
@@ -93,9 +86,9 @@ fn scenario() -> Vec<Step> {
 #[derive(Debug, Default)]
 struct Outcome {
     /// Batches whose write returned `Ok`, in order.
-    acked: Vec<Vec<WriteOperation>>,
+    acked: Vec<Vec<ClientOp>>,
     /// The batch whose write failed, if the run stopped in a write.
-    in_flight: Option<Vec<WriteOperation>>,
+    in_flight: Option<Vec<ClientOp>>,
     /// The step that failed, if any.
     failed_step: Option<usize>,
     /// Snapshots taken after each completed step, with the number of batches acked by then.
@@ -104,7 +97,12 @@ struct Outcome {
 
 struct Harness {
     fault: Arc<FaultVfs>,
-    engine: Option<LocalStorageEngine>,
+    engine: Option<Engine>,
+}
+
+/// Open an engine on `fault`'s filesystem.
+fn open(fault: &FaultVfs) -> logpose_types::Result<Engine> {
+    Engine::open(fault.process(), ROOT, EngineConfig::default())
 }
 
 impl Harness {
@@ -112,8 +110,7 @@ impl Harness {
     /// so every mutating operation comes from the test and runs are deterministic.
     async fn new(seed: u64) -> Self {
         let fault = FaultVfs::new(seed);
-        let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
-            .expect("engine should open on a fresh filesystem");
+        let engine = open(&fault).expect("engine should open on a fresh filesystem");
         let mut descriptor = engine
             .plan_collection_descriptor(&CreateCollectionRequest::new(
                 COLLECTION,
@@ -125,13 +122,14 @@ impl Harness {
         descriptor.flush_threshold_bytes = usize::MAX;
         descriptor.compaction_threshold_segments = usize::MAX;
         engine
-            .create_collection_from_descriptor(
+            .create_collection(
                 descriptor,
-                Some(&CollectionAssignment {
+                Some(CollectionAssignment {
                     assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
                     assigned_role: NodeRole::Data,
                 }),
             )
+            .await
             .expect("collection should be created");
         Self {
             fault,
@@ -139,7 +137,7 @@ impl Harness {
         }
     }
 
-    fn engine(&self) -> &LocalStorageEngine {
+    fn engine(&self) -> &Engine {
         self.engine
             .as_ref()
             .expect("engine should be open between crashes")
@@ -150,7 +148,7 @@ impl Harness {
         let mut outcome = Outcome::default();
         for (index, step) in steps.iter().enumerate() {
             let result = match step {
-                Step::Write(ops) => match engine.write(COLLECTION, ops.clone()).await {
+                Step::Write(ops) => match handle(engine, COLLECTION).write(ops.clone()).await {
                     Ok(_) => {
                         outcome.acked.push(ops.clone());
                         Ok(())
@@ -160,15 +158,15 @@ impl Harness {
                         Err(error)
                     }
                 },
-                Step::Flush => engine.flush(COLLECTION).await.map(|_| ()),
-                Step::Compact => engine.compact(COLLECTION).await.map(|_| ()),
+                Step::Flush => handle(engine, COLLECTION).flush().await.map(|_| ()),
+                Step::Compact => handle(engine, COLLECTION).compact().await.map(|_| ()),
             };
             if result.is_err() {
                 outcome.failed_step = Some(index);
                 break;
             }
             // Snapshot reads do no I/O that mutates, so they do not shift crash op counts.
-            match engine.snapshot(COLLECTION).await {
+            match handle(engine, COLLECTION).snapshot() {
                 Ok(snapshot) => outcome.snapshots.push((snapshot, outcome.acked.len())),
                 Err(_) => {
                     outcome.failed_step = Some(index);
@@ -183,32 +181,31 @@ impl Harness {
     fn crash_and_reopen(&mut self) {
         self.engine = None;
         self.fault.crash();
-        self.engine = Some(
-            LocalStorageEngine::with_vfs(self.fault.process(), ROOT, None)
-                .expect("engine should reopen after a crash"),
-        );
+        self.engine = Some(open(&self.fault).expect("engine should reopen after a crash"));
     }
 }
 
-/// The records visible after applying `batches` in order, numbering operations from 1.
-fn expected_visible(batches: &[Vec<WriteOperation>]) -> Vec<VisibleRecord> {
-    let mut latest = BTreeMap::<RecordId, Option<VisibleRecord>>::new();
+/// The rows visible after applying `batches` (upserts and deletes) in order, numbering
+/// operations from 1.
+fn expected_visible(batches: &[Vec<ClientOp>]) -> Vec<Row> {
+    let mut latest = BTreeMap::<PrimaryKey, Option<Row>>::new();
     for (op, seq_no) in batches.iter().flatten().zip(1..) {
         let visible = match op {
-            WriteOperation::Put(put) => Some(VisibleRecord {
-                id: put.id.clone(),
-                vector: put.vector.clone(),
-                metadata: put.metadata.clone(),
+            ClientOp::Upsert(record) => Some(Row {
+                id: record.pk.label(),
+                vector: record.vectors["vector"].clone(),
+                metadata: serde_json::Value::Object(record.extra.clone()),
                 seq_no,
             }),
-            WriteOperation::Delete(_) => None,
+            ClientOp::Delete(_) => None,
+            ClientOp::Update(_) => unreachable!("the scenarios upsert and delete"),
         };
-        latest.insert(op.id().clone(), visible);
+        latest.insert(op.pk().clone(), visible);
     }
     latest.into_values().flatten().collect()
 }
 
-fn op_count(batches: &[Vec<WriteOperation>]) -> SeqNo {
+fn op_count(batches: &[Vec<ClientOp>]) -> SeqNo {
     batches.iter().map(|batch| batch.len() as SeqNo).sum()
 }
 
@@ -217,15 +214,13 @@ async fn assert_recovered(
     harness: &Harness,
     outcome: &Outcome,
     context: &str,
-) -> Vec<Vec<WriteOperation>> {
+) -> Vec<Vec<ClientOp>> {
     let engine = harness.engine();
-    let recovered = engine
-        .scan_exact(COLLECTION, None)
+    let recovered = scan(engine, COLLECTION, None)
         .await
         .unwrap_or_else(|error| panic!("{context}: recovery failed: {error}"));
-    let snapshot = engine
-        .snapshot(COLLECTION)
-        .await
+    let snapshot = handle(engine, COLLECTION)
+        .snapshot()
         .unwrap_or_else(|error| panic!("{context}: snapshot failed: {error}"));
 
     let mut kept = outcome.acked.clone();
@@ -249,9 +244,8 @@ async fn assert_recovered(
         op_count(&kept),
         "{context}: visible sequence number must end exactly at a batch boundary"
     );
-    let stats = engine
-        .stats(COLLECTION)
-        .await
+    let stats = handle(engine, COLLECTION)
+        .stats(None)
         .unwrap_or_else(|error| panic!("{context}: stats failed: {error}"));
     assert_eq!(stats.live_record_count, recovered.len(), "{context}");
     let current = Snapshot {
@@ -264,7 +258,7 @@ async fn assert_recovered(
     // tokens, which could pin another, do not survive a restart). It never reads a different
     // state.
     for (snapshot, acked) in &outcome.snapshots {
-        let read = engine.scan_exact(COLLECTION, Some(snapshot.clone())).await;
+        let read = scan(engine, COLLECTION, Some(snapshot.clone())).await;
         if *snapshot == current {
             let read = read.unwrap_or_else(|error| {
                 panic!("{context}: snapshot {snapshot:?} is unreadable after recovery: {error}")
@@ -289,29 +283,28 @@ async fn assert_recovered(
 /// survive a further crash.
 async fn assert_engine_keeps_working(
     harness: &mut Harness,
-    mut kept: Vec<Vec<WriteOperation>>,
+    mut kept: Vec<Vec<ClientOp>>,
     context: &str,
 ) {
     let follow_up = vec![put("z", 9.0), delete("b")];
-    let engine = harness.engine();
-    engine
-        .write(COLLECTION, follow_up.clone())
+    let handle = handle(harness.engine(), COLLECTION);
+    handle
+        .write(follow_up.clone())
         .await
         .unwrap_or_else(|error| panic!("{context}: write after recovery failed: {error}"));
     kept.push(follow_up);
-    engine
-        .flush(COLLECTION)
+    handle
+        .flush()
         .await
         .unwrap_or_else(|error| panic!("{context}: flush after recovery failed: {error}"));
-    engine
-        .compact(COLLECTION)
+    handle
+        .compact()
         .await
         .unwrap_or_else(|error| panic!("{context}: compact after recovery failed: {error}"));
 
+    drop(handle);
     harness.crash_and_reopen();
-    let recovered = harness
-        .engine()
-        .scan_exact(COLLECTION, None)
+    let recovered = scan(harness.engine(), COLLECTION, None)
         .await
         .unwrap_or_else(|error| panic!("{context}: second recovery failed: {error}"));
     assert_eq!(
@@ -327,17 +320,14 @@ async fn assert_engine_keeps_working(
 async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
     let create_ops = {
         let fault = FaultVfs::new(0);
-        let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
-            .expect("engine should open on a fresh filesystem");
+        let engine = open(&fault).expect("engine should open on a fresh filesystem");
         let before = fault.mutating_ops();
-        engine
-            .create_collection(CreateCollectionRequest::new(
-                COLLECTION,
-                2,
-                DistanceMetric::Dot,
-            ))
-            .await
-            .expect("clean create should succeed");
+        create(
+            &engine,
+            CreateCollectionRequest::new(COLLECTION, 2, DistanceMetric::Dot),
+        )
+        .await
+        .expect("clean create should succeed");
         fault.mutating_ops() - before
     };
     assert!(
@@ -349,29 +339,25 @@ async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
         for k in 0..=create_ops {
             let context = format!("tear={tear:?} crash_after_ops={k} during create");
             let fault = FaultVfs::new(k * 4 + tear as u64);
-            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
-                .expect("engine should open on a fresh filesystem");
+            let engine = open(&fault).expect("engine should open on a fresh filesystem");
             fault.set_plan(FaultPlan {
                 crash_after_ops: Some(fault.mutating_ops() + k),
                 tear,
                 ..FaultPlan::default()
             });
-            let created = engine
-                .create_collection(CreateCollectionRequest::new(
-                    COLLECTION,
-                    2,
-                    DistanceMetric::Dot,
-                ))
-                .await
-                .is_ok();
+            let created = create(
+                &engine,
+                CreateCollectionRequest::new(COLLECTION, 2, DistanceMetric::Dot),
+            )
+            .await
+            .is_ok();
             drop(engine);
             fault.crash();
 
-            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
-                .unwrap_or_else(|error| panic!("{context}: reopen failed: {error}"));
+            let engine =
+                open(&fault).unwrap_or_else(|error| panic!("{context}: reopen failed: {error}"));
             let listed = engine
                 .list_collections()
-                .await
                 .unwrap_or_else(|error| panic!("{context}: listing failed: {error}"));
             if created {
                 assert_eq!(
@@ -381,37 +367,33 @@ async fn a_crash_while_creating_a_collection_leaves_it_absent_or_usable() {
                 );
             }
             if listed.is_empty() {
-                engine
-                    .create_collection(CreateCollectionRequest::new(
-                        COLLECTION,
-                        2,
-                        DistanceMetric::Dot,
-                    ))
-                    .await
-                    .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
+                create(
+                    &engine,
+                    CreateCollectionRequest::new(COLLECTION, 2, DistanceMetric::Dot),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
             } else {
                 assert_eq!(listed.len(), 1, "{context}");
-                let visible = engine
-                    .scan_exact(COLLECTION, None)
+                let visible = scan(&engine, COLLECTION, None)
                     .await
                     .unwrap_or_else(|error| panic!("{context}: scan failed: {error}"));
                 assert!(visible.is_empty(), "{context}: a new collection is empty");
             }
-            engine
-                .write(COLLECTION, vec![put("a", 1.0)])
+            handle(&engine, COLLECTION)
+                .write(vec![put("a", 1.0)])
                 .await
                 .unwrap_or_else(|error| panic!("{context}: write failed: {error}"));
-            engine
-                .flush(COLLECTION)
+            handle(&engine, COLLECTION)
+                .flush()
                 .await
                 .unwrap_or_else(|error| panic!("{context}: flush failed: {error}"));
             drop(engine);
             fault.crash();
-            let engine = LocalStorageEngine::with_vfs(fault.process(), ROOT, None)
+            let engine = open(&fault)
                 .unwrap_or_else(|error| panic!("{context}: second reopen failed: {error}"));
             assert_eq!(
-                engine
-                    .scan_exact(COLLECTION, None)
+                scan(&engine, COLLECTION, None)
                     .await
                     .unwrap_or_else(|error| panic!("{context}: second scan failed: {error}")),
                 expected_visible(&[vec![put("a", 1.0)]]),
@@ -444,8 +426,7 @@ async fn a_crash_while_dropping_a_collection_leaves_it_gone_or_whole() {
         let before = harness.fault.mutating_ops();
         harness
             .engine()
-            .engine()
-            .drop_collection(&CollectionRef::new_default(COLLECTION))
+            .drop_collection_blocking(&CollectionRef::new_default(COLLECTION))
             .expect("clean drop should succeed");
         harness.fault.mutating_ops() - before
     };
@@ -464,15 +445,13 @@ async fn a_crash_while_dropping_a_collection_leaves_it_gone_or_whole() {
             });
             let dropped = harness
                 .engine()
-                .engine()
-                .drop_collection(&CollectionRef::new_default(COLLECTION))
+                .drop_collection_blocking(&CollectionRef::new_default(COLLECTION))
                 .is_ok();
             harness.crash_and_reopen();
 
             let listed = harness
                 .engine()
                 .list_collections()
-                .await
                 .unwrap_or_else(|error| panic!("{context}: listing failed: {error}"));
             if dropped || listed.is_empty() {
                 assert!(
@@ -483,18 +462,14 @@ async fn a_crash_while_dropping_a_collection_leaves_it_gone_or_whole() {
                     collection_dir_entries(&harness).is_empty(),
                     "{context}: open removes what the drop left behind"
                 );
-                harness
-                    .engine()
-                    .create_collection(CreateCollectionRequest::new(
-                        COLLECTION,
-                        2,
-                        DistanceMetric::Dot,
-                    ))
-                    .await
-                    .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
-                harness
-                    .engine()
-                    .write(COLLECTION, vec![put("a", 1.0)])
+                create(
+                    harness.engine(),
+                    CreateCollectionRequest::new(COLLECTION, 2, DistanceMetric::Dot),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{context}: create again failed: {error}"));
+                handle(harness.engine(), COLLECTION)
+                    .write(vec![put("a", 1.0)])
                     .await
                     .unwrap_or_else(|error| panic!("{context}: write failed: {error}"));
             } else {
@@ -519,23 +494,18 @@ async fn run_to_crash_point(point: CrashPoint, seed: u64) -> (Harness, Outcome) 
     harness.engine = None;
     let report = harness.fault.crash();
     assert_eq!(report.triggered_at, Some(point));
-    harness.engine = Some(
-        LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
-            .expect("engine should reopen"),
-    );
+    harness.engine = Some(open(&harness.fault).expect("engine should reopen"));
     (harness, outcome)
 }
 
-async fn manifest_generation(harness: &Harness) -> u64 {
-    harness
-        .engine()
-        .stats(COLLECTION)
-        .await
+fn manifest_generation(harness: &Harness) -> u64 {
+    handle(harness.engine(), COLLECTION)
+        .stats(None)
         .expect("stats should succeed")
         .manifest_generation
 }
 
-/// One test per crash point the legacy engine implements, asserting the outcome from the crash
+/// One test per crash point a sequential scenario reaches, asserting the outcome from the crash
 /// analysis: before `CURRENT` is durably renamed the flush or compaction is invisible; after, it
 /// is complete; a WAL frame is durable exactly when its fsync returned.
 #[tokio::test]
@@ -580,7 +550,7 @@ async fn named_crash_points_have_the_documented_outcome() {
         let (mut harness, outcome) = run_to_crash_point(point, 20 + seed as u64).await;
         let context = format!("{point:?}");
         assert_eq!(outcome.failed_step, Some(first_flush), "{context}");
-        assert_eq!(manifest_generation(&harness).await, 0, "{context}");
+        assert_eq!(manifest_generation(&harness), 0, "{context}");
         let kept = assert_recovered(&harness, &outcome, &context).await;
         assert_engine_keeps_working(&mut harness, kept, &context).await;
     }
@@ -591,8 +561,10 @@ async fn named_crash_points_have_the_documented_outcome() {
         let (mut harness, outcome) = run_to_crash_point(point, 30 + seed as u64).await;
         let context = format!("{point:?}");
         assert_eq!(outcome.failed_step, Some(first_flush), "{context}");
-        assert_eq!(manifest_generation(&harness).await, 1, "{context}");
-        let stats = harness.engine().stats(COLLECTION).await.expect("stats");
+        assert_eq!(manifest_generation(&harness), 1, "{context}");
+        let stats = handle(harness.engine(), COLLECTION)
+            .stats(None)
+            .expect("stats");
         assert_eq!(
             stats.mutable_op_count, 0,
             "{context}: the flush checkpointed everything"
@@ -612,7 +584,7 @@ async fn named_crash_points_have_the_documented_outcome() {
         .expect("scenario has a second flush");
     let (mut harness, outcome) = run_to_crash_point(CrashPoint::FlushAfterDvSync, 35).await;
     assert_eq!(outcome.failed_step, Some(second_flush));
-    assert_eq!(manifest_generation(&harness).await, 1);
+    assert_eq!(manifest_generation(&harness), 1);
     let kept = assert_recovered(&harness, &outcome, "FlushAfterDvSync").await;
     assert_engine_keeps_working(&mut harness, kept, "FlushAfterDvSync").await;
 
@@ -620,8 +592,10 @@ async fn named_crash_points_have_the_documented_outcome() {
     let (mut harness, outcome) =
         run_to_crash_point(CrashPoint::CompactionAfterOutputSync, 40).await;
     assert_eq!(outcome.failed_step, Some(compact));
-    assert_eq!(manifest_generation(&harness).await, 2);
-    let stats = harness.engine().stats(COLLECTION).await.expect("stats");
+    assert_eq!(manifest_generation(&harness), 2);
+    let stats = handle(harness.engine(), COLLECTION)
+        .stats(None)
+        .expect("stats");
     assert_eq!(stats.segment_count, 2);
     let kept = assert_recovered(&harness, &outcome, "CompactionAfterOutputSync").await;
     assert_engine_keeps_working(&mut harness, kept, "CompactionAfterOutputSync").await;
@@ -646,9 +620,8 @@ async fn failed_wal_fsync_is_rolled_back_and_the_batch_never_reappears() {
                 tear,
                 ..FaultPlan::default()
             });
-            let error = harness
-                .engine()
-                .write(COLLECTION, vec![put("lost", 8.0)])
+            let error = handle(harness.engine(), COLLECTION)
+                .write(vec![put("lost", 8.0)])
                 .await
                 .expect_err("the fsync failure should fail the write");
             assert!(
@@ -693,9 +666,8 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
                 tear,
                 ..FaultPlan::default()
             });
-            let error = harness
-                .engine()
-                .write(COLLECTION, vec![put("lost", 8.0)])
+            let error = handle(harness.engine(), COLLECTION)
+                .write(vec![put("lost", 8.0)])
                 .await
                 .expect_err("the fsync failure should fail the write");
             assert!(
@@ -708,18 +680,15 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
                 ),
                 "{context}: {error}"
             );
-            let refused = harness
-                .engine()
-                .write(COLLECTION, vec![put("refused", 8.0)])
+            let refused = handle(harness.engine(), COLLECTION)
+                .write(vec![put("refused", 8.0)])
                 .await
                 .expect_err("the poisoned collection refuses writes");
             assert!(
                 matches!(refused, LogPoseError::CollectionPoisoned { .. }),
                 "{context}: {refused}"
             );
-            let visible = harness
-                .engine()
-                .scan_exact(COLLECTION, None)
+            let visible = scan(harness.engine(), COLLECTION, None)
                 .await
                 .unwrap_or_else(|error| panic!("{context}: scan after the failure: {error}"));
             assert_eq!(
@@ -730,13 +699,8 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
 
             // Reopen in the same process, without a crash.
             harness.engine = None;
-            harness.engine = Some(
-                LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
-                    .expect("engine should reopen in process"),
-            );
-            let visible = harness
-                .engine()
-                .scan_exact(COLLECTION, None)
+            harness.engine = Some(open(&harness.fault).expect("engine should reopen in process"));
+            let visible = scan(harness.engine(), COLLECTION, None)
                 .await
                 .unwrap_or_else(|error| panic!("{context}: scan after the reopen: {error}"));
             assert_eq!(
@@ -746,9 +710,8 @@ async fn failed_wal_fsync_then_more_writes_then_crash_keeps_exactly_the_acked_ba
             );
 
             let after = vec![put("after", 3.0), delete("b")];
-            harness
-                .engine()
-                .write(COLLECTION, after.clone())
+            handle(harness.engine(), COLLECTION)
+                .write(after.clone())
                 .await
                 .unwrap_or_else(|error| panic!("{context}: write after the failure: {error}"));
             outcome.acked.push(after);
@@ -784,11 +747,10 @@ async fn crash_after_wal_tail_repair_keeps_the_repair() {
         crash_at: Some(CrashPoint::RecoveryAfterTailRepair),
         ..FaultPlan::default()
     });
-    let engine = LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
-        .expect("the engine opens even when a collection fails to recover");
+    let engine =
+        open(&harness.fault).expect("the engine opens even when a collection fails to recover");
     let error = engine
-        .stats(COLLECTION)
-        .await
+        .collection(&CollectionRef::new_default(COLLECTION))
         .expect_err("recovery should crash right after repairing the tail");
     assert!(error.to_string().contains("tail repair"), "{error}");
     drop(engine);
@@ -796,10 +758,7 @@ async fn crash_after_wal_tail_repair_keeps_the_repair() {
         harness.fault.crash().triggered_at,
         Some(CrashPoint::RecoveryAfterTailRepair)
     );
-    harness.engine = Some(
-        LocalStorageEngine::with_vfs(harness.fault.process(), ROOT, None)
-            .expect("engine should reopen"),
-    );
+    harness.engine = Some(open(&harness.fault).expect("engine should reopen"));
     let kept = assert_recovered(&harness, &outcome, "RecoveryAfterTailRepair").await;
     assert_eq!(kept.len(), 2, "no write was in flight");
     assert_engine_keeps_working(&mut harness, kept, "RecoveryAfterTailRepair").await;

@@ -48,11 +48,11 @@ pub use search::{
 
 use logpose_catalog as _;
 use logpose_storage::{
-    CollectionReader, Projection as RowProjection, ReadOptions, ReadView, RowData, SnapshotToken,
+    CollectionReader, Projection as RowProjection, ReadOptions, ReadView, SnapshotToken,
 };
 use logpose_types::{
-    CollectionRef, DistanceMetric, LogPoseError, RecordId, ResourceKind, Snapshot, VisibleRecord,
-    record::{PrimaryKey, Projection, Record},
+    CollectionRef, DistanceMetric, LogPoseError, ResourceKind, Snapshot,
+    record::{Projection, Record},
     schema::CollectionSchema,
 };
 use serde::{Deserialize, Serialize};
@@ -934,76 +934,4 @@ fn diagnostics(outcome: &SearchOutcome, filtered: bool, explain: ExplainMode) ->
         plan_text: String::new(),
     }
     .with_rendered_plan(explain)
-}
-
-/// The v1 record id of a key.
-fn legacy_id(pk: &PrimaryKey) -> RecordId {
-    match pk {
-        PrimaryKey::String(value) => RecordId::new(value.clone()),
-        PrimaryKey::Int64(value) => RecordId::new(value.to_string()),
-    }
-}
-
-/// A row's fields as one JSON object: visible `$extra` keys, then typed scalar fields under
-/// their names.
-fn metadata(row: &RowData) -> Map<String, Value> {
-    let mut metadata = row.record.extra.clone();
-    for (name, value) in &row.record.fields {
-        metadata.insert(name.clone(), value.to_json());
-    }
-    metadata
-}
-
-/// A row in the v1 record shape: the key as id, the first vector field as the vector, and the
-/// scalar fields and `$extra` keys as metadata. For the storage tests' whole-collection scans.
-#[must_use]
-pub fn legacy_record(schema: &CollectionSchema, row: &RowData) -> VisibleRecord {
-    let vector = schema
-        .vectors()
-        .first()
-        .and_then(|field| row.record.vectors.get(&field.name))
-        .cloned()
-        .unwrap_or_default();
-    VisibleRecord {
-        id: legacy_id(&row.record.pk),
-        vector,
-        metadata: Value::Object(metadata(row)),
-        seq_no: row.seq_no,
-    }
-}
-
-/// Every live row of `view` in the v1 record shape, ordered by key.
-///
-/// # Errors
-///
-/// I/O and typed corruption.
-pub async fn scan_view(view: &ReadView) -> Result<Vec<VisibleRecord>> {
-    let (rows, _) = ops::scroll_view(
-        view,
-        None,
-        &ScrollOrder::Pk,
-        u32::MAX,
-        RowProjection::full(),
-        None,
-    )
-    .await?;
-    Ok(rows
-        .iter()
-        .map(|row| legacy_record(view.schema(), row))
-        .collect())
-}
-
-/// Every live row of `collection` as `options` select the state, in the v1 record shape,
-/// ordered by key.
-///
-/// # Errors
-///
-/// As [`CollectionReader::read_view`] and [`scan_view`].
-pub async fn scan_records<R: CollectionReader + ?Sized>(
-    reader: &R,
-    collection: &CollectionRef,
-    options: ReadOptions,
-) -> Result<Vec<VisibleRecord>> {
-    let view = reader.read_view(collection, options).await?;
-    scan_view(&view).await
 }

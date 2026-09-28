@@ -1007,8 +1007,20 @@ mod tests {
 
     #[test]
     fn query_response_serializes_ann_diagnostics_fields() {
-        let schema = logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot)
-            .expect("legacy schema should build");
+        let schema = logpose_types::schema::CollectionSchema::new(
+            logpose_types::schema::PrimaryKeySpec {
+                name: "id".to_owned(),
+                key_type: logpose_types::schema::PrimaryKeyType::String,
+            },
+            vec![logpose_types::schema::VectorFieldSpec {
+                name: "vector".to_owned(),
+                dimensions: 2,
+                metric: logpose_types::DistanceMetric::Dot,
+            }],
+            Vec::new(),
+            true,
+        )
+        .expect("schema should build");
         let mut record = Record::new("alpha");
         record.extra.insert("kind".to_owned(), json!("keep"));
         let payload = QueryResponse {

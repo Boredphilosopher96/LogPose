@@ -5,9 +5,9 @@ use super::*;
 use crate::runtime::RuntimeConfig;
 use crate::{
     CreateCollectionRequest,
-    test_support::{put, unique_temp_dir},
+    test_support::{put, scan, unique_temp_dir},
 };
-use logpose_types::{DistanceMetric, WriteOperation};
+use logpose_types::{DistanceMetric, record::ClientOp};
 use logpose_vfs::{FaultVfs, std_vfs};
 use std::{
     fs,
@@ -30,15 +30,12 @@ fn create(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
         .plan_collection_descriptor(&request(name))
         .expect("descriptor should plan");
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
-fn write(engine: &Engine, handle: &Arc<CollectionHandle>, ops: Vec<WriteOperation>) {
-    engine
-        .core()
-        .write(handle, ops)
-        .expect("write should succeed");
+fn write(handle: &Arc<CollectionHandle>, ops: Vec<ClientOp>) {
+    handle.write_blocking(ops).expect("write should succeed");
 }
 
 fn reference(name: &str) -> CollectionRef {
@@ -65,7 +62,25 @@ fn a_second_engine_on_the_same_root_fails_until_every_clone_is_dropped() {
     drop(first);
     assert!(open(&root).is_err(), "a clone still owns the root");
     drop(clone);
-    open(&root).expect("the root is free once every clone is dropped");
+
+    // An independent handle on LOCK is what another process looks like to the OS.
+    let foreign = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("LOCK"))
+        .expect("the engine should have created the lock file");
+    foreign
+        .try_lock()
+        .expect("the root is released once every clone is dropped");
+    let error = open(&root).expect_err("an engine must not open a root another process holds");
+    assert!(
+        error
+            .to_string()
+            .contains("is already in use by another engine"),
+        "{error}"
+    );
+    drop(foreign);
+    open(&root).expect("the root is free once the other holder exits");
 }
 
 #[test]
@@ -99,7 +114,7 @@ fn dropping_the_engine_waits_for_background_maintenance_before_releasing_the_roo
                 .expect("descriptor should plan");
             descriptor.flush_threshold_ops = 1;
             engine
-                .create_collection(descriptor, None)
+                .create_collection_blocking(descriptor, None)
                 .expect("collection should be created")
         } else {
             engine
@@ -108,11 +123,7 @@ fn dropping_the_engine_waits_for_background_maintenance_before_releasing_the_roo
         };
         // Each write crosses the flush threshold and queues a background flush; the engine is
         // dropped while it may still run, and the next open must not find the root locked.
-        write(
-            &engine,
-            &handle,
-            vec![put(&format!("id-{round}"), vec![1.0; 4096])],
-        );
+        write(&handle, vec![put(&format!("id-{round}"), vec![1.0; 4096])]);
     }
     let engine = open(&root).expect("engine should reopen");
     let handle = engine
@@ -142,7 +153,9 @@ fn concurrent_creates_of_one_name_have_exactly_one_winner() {
                     .plan_collection_descriptor(&request("documents"))
                     .expect("descriptor should plan");
                 barrier.wait();
-                engine.create_collection(descriptor, None).map(|_| ())
+                engine
+                    .create_collection_blocking(descriptor, None)
+                    .map(|_| ())
             })
         })
         .collect::<Vec<_>>();
@@ -178,16 +191,14 @@ fn create_and_drop_races_leave_the_map_and_the_disk_in_agreement() {
                         if let Ok(descriptor) =
                             engine.core().plan_collection_descriptor(&request("churn"))
                         {
-                            let _ = engine.create_collection(descriptor, None);
+                            let _ = engine.create_collection_blocking(descriptor, None);
                         }
                     } else {
-                        let _ = engine.drop_collection(&reference("churn"));
+                        let _ = engine.drop_collection_blocking(&reference("churn"));
                     }
                     if let Ok(handle) = engine.collection(&reference("churn")) {
-                        let _ = engine.core().write(
-                            &handle,
-                            vec![put(&format!("{index}-{step}"), vec![1.0, 0.0])],
-                        );
+                        let _ = handle
+                            .write_blocking(vec![put(&format!("{index}-{step}"), vec![1.0, 0.0])]);
                     }
                 }
             })
@@ -220,16 +231,15 @@ fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
     let root = unique_temp_dir("engine-drop");
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
-    write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+    write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
     let pinned = handle.current();
 
     engine
-        .drop_collection(&reference("documents"))
+        .drop_collection_blocking(&reference("documents"))
         .expect("drop should succeed");
     assert!(handle.is_dropped());
-    let error = engine
-        .core()
-        .write(&handle, vec![put("beta", vec![0.0, 1.0])])
+    let error = handle
+        .write_blocking(vec![put("beta", vec![0.0, 1.0])])
         .expect_err("a dropped handle must refuse writes");
     assert!(error.to_string().contains("does not exist"), "{error}");
     assert!(engine.collection(&reference("documents")).is_err());
@@ -240,7 +250,9 @@ fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
         "a pinned version keeps its resident state"
     );
     assert!(
-        engine.drop_collection(&reference("documents")).is_err(),
+        engine
+            .drop_collection_blocking(&reference("documents"))
+            .is_err(),
         "a second drop finds nothing"
     );
     assert_eq!(collection_dirs(&root), 0, "the drop removed the directory");
@@ -265,7 +277,7 @@ fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
     let root = unique_temp_dir("engine-drop-rename-fails");
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
-    write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+    write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
 
     // A non-empty directory in the way makes the retiring rename fail before anything changed.
     let mut blocker = handle.meta().dir.clone().into_os_string();
@@ -273,7 +285,7 @@ fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
     let blocker = PathBuf::from(blocker);
     fs::create_dir_all(blocker.join("in-the-way")).expect("blocker should be created");
     engine
-        .drop_collection(&reference("documents"))
+        .drop_collection_blocking(&reference("documents"))
         .expect_err("the rename fails");
 
     assert!(
@@ -284,7 +296,7 @@ fn a_drop_whose_rename_fails_leaves_the_collection_serving() {
         .collection(&reference("documents"))
         .expect("the collection is still served");
     assert!(Arc::ptr_eq(&served, &handle));
-    write(&engine, &handle, vec![put("beta", vec![0.0, 1.0])]);
+    write(&handle, vec![put("beta", vec![0.0, 1.0])]);
     assert_eq!(handle.visible_seq_no(), 2);
 
     fs::remove_dir_all(&blocker).expect("blocker should be removed");
@@ -329,7 +341,7 @@ fn a_collection_that_fails_recovery_does_not_fail_the_engine() {
     let engine = open(&root).expect("engine should open");
     let broken = create(&engine, "broken");
     let healthy = create(&engine, "healthy");
-    write(&engine, &healthy, vec![put("alpha", vec![1.0, 0.0])]);
+    write(&healthy, vec![put("alpha", vec![1.0, 0.0])]);
     let broken_dir = broken.meta().dir.clone();
     drop((broken, healthy));
     drop(engine);
@@ -350,7 +362,7 @@ fn a_collection_that_fails_recovery_does_not_fail_the_engine() {
         .expect("listing includes the failed collection");
     assert_eq!(listed.len(), 2);
     engine
-        .drop_collection(&reference("broken"))
+        .drop_collection_blocking(&reference("broken"))
         .expect("a failed collection can be dropped");
     assert_eq!(engine.core().list_descriptors().expect("listing").len(), 1);
 }
@@ -360,12 +372,10 @@ fn version_ids_increase_and_invariants_hold_across_writes_flush_and_compaction()
     let root = unique_temp_dir("engine-version-ids");
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
-    let core = engine.core();
     let mut last = handle.current();
     last.check_invariants().expect("initial version is valid");
     for round in 0..3 {
         write(
-            &engine,
             &handle,
             vec![
                 put(&format!("a{round}"), vec![1.0, 0.0]),
@@ -378,8 +388,7 @@ fn version_ids_increase_and_invariants_hold_across_writes_flush_and_compaction()
         written
             .check_invariants()
             .expect("invariants hold after a write");
-        core.flush_collection(&handle)
-            .expect("flush should succeed");
+        handle.flush_blocking().expect("flush should succeed");
         let flushed = handle.current();
         assert!(flushed.id > written.id);
         assert_eq!(flushed.counters.memtable_rows, 0);
@@ -389,7 +398,8 @@ fn version_ids_increase_and_invariants_hold_across_writes_flush_and_compaction()
             .expect("invariants hold after a flush");
         last = flushed;
     }
-    core.compact_collection(&handle)
+    handle
+        .compact_blocking()
         .expect("compaction should succeed");
     let compacted = handle.current();
     assert!(compacted.id > last.id);
@@ -454,18 +464,16 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
         })
         .collect::<Vec<_>>();
 
-    let core = engine.core();
     let mut acked = 0;
     for index in 0..200 {
-        let ack = core
-            .write(&handle, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
+        let ack = handle
+            .write_blocking(vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
             .expect("write should succeed");
         acked = ack.last_seq_no;
         // I1: a read that starts after the acknowledgement sees the write.
         assert!(handle.current().visible_seq_no >= acked);
         if index % 50 == 49 {
-            core.flush_collection(&handle)
-                .expect("flush should succeed");
+            handle.flush_blocking().expect("flush should succeed");
         }
         assert!(Instant::now() < deadline, "the test ran too long");
     }
@@ -486,28 +494,21 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
     let handle = create(&engine, "documents");
     let core = engine.core();
     for index in 0..3 {
-        write(
-            &engine,
-            &handle,
-            vec![put(&format!("seed-{index}"), vec![1.0, 0.0])],
-        );
-        core.flush_collection(&handle)
-            .expect("flush should succeed");
+        write(&handle, vec![put(&format!("seed-{index}"), vec![1.0, 0.0])]);
+        handle.flush_blocking().expect("flush should succeed");
     }
 
     let done = Arc::new(AtomicBool::new(false));
     let writer = {
-        let engine = engine.clone();
         let handle = Arc::clone(&handle);
         let done = Arc::clone(&done);
         thread::spawn(move || {
-            let core = engine.core();
             let mut acked = Vec::new();
             let mut index = 0;
             while !done.load(Ordering::Acquire) || acked.len() < 50 {
                 let id = format!("write-{index}");
-                let ack = core
-                    .write(&handle, vec![put(&id, vec![0.0, 1.0])])
+                let ack = handle
+                    .write_blocking(vec![put(&id, vec![0.0, 1.0])])
                     .expect("write should succeed");
                 assert!(
                     handle.current().visible_seq_no >= ack.last_seq_no,
@@ -527,9 +528,9 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
     for _ in 0..6 {
         // Flush adds a segment while holding the writer slot; compaction then runs while
         // writes continue.
-        core.flush_collection(&handle)
-            .expect("flush should succeed");
-        core.compact_collection(&handle)
+        handle.flush_blocking().expect("flush should succeed");
+        handle
+            .compact_blocking()
             .expect("compaction should succeed");
         let version = handle.current();
         version
@@ -555,12 +556,10 @@ fn compaction_keeps_every_write_that_lands_while_it_builds() {
             version.visible_seq_no, last,
             "{context}: every ack is visible"
         );
-        let visible = engine
-            .core()
-            .scan_exact_internal(&handle, None, true, None)
+        let visible = scan(&handle, None)
             .expect("scan should succeed")
             .into_iter()
-            .map(|record| (record.id.as_str().to_owned(), record.seq_no))
+            .map(|(seq_no, record)| (record.pk.label(), seq_no))
             .collect::<BTreeMap<_, _>>();
         for (id, seq_no) in &acked {
             assert_eq!(
@@ -598,27 +597,22 @@ async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
     descriptor.flush_threshold_ops = 1;
     descriptor.compaction_threshold_segments = usize::MAX;
     let busy = engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created");
     let quiet = create(&engine, "quiet");
-    {
-        let quiet = Arc::clone(&quiet);
-        engine
-            .io(move |core| core.write(&quiet, vec![put("alpha", vec![1.0, 0.0])]))
-            .await
-            .expect("write should succeed");
-    }
+    quiet
+        .write(vec![put("alpha", vec![1.0, 0.0])])
+        .await
+        .expect("write should succeed");
 
     // Every write of the busy collection queues a flush for it.
     let done = Arc::new(AtomicBool::new(false));
     let writer = {
-        let engine = engine.clone();
         let done = Arc::clone(&done);
         thread::spawn(move || {
-            let core = engine.core();
             let mut index = 0;
             while !done.load(Ordering::Acquire) {
-                core.write(&busy, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
+                busy.write_blocking(vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
                     .expect("write should succeed");
                 index += 1;
                 // Let the busy collection's flushes take the writer slot between writes.
@@ -665,24 +659,21 @@ fn the_engine_drops_promptly_after_a_crash_at_any_point_of_a_collection_drop() {
         let engine = Engine::open(fault.process(), "/storage", EngineConfig::default())
             .expect("engine should open");
         let handle = create(&engine, "documents");
-        write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+        write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
         drop(handle);
         fault.set_plan(logpose_vfs::FaultPlan {
             crash_after_ops: Some(fault.mutating_ops() + k),
             ..logpose_vfs::FaultPlan::default()
         });
-        let _ = engine.drop_collection(&reference("documents"));
+        let _ = engine.drop_collection_blocking(&reference("documents"));
         drop_within(engine, Duration::from_secs(60), &context);
 
         fault.crash();
         let engine = Engine::open(fault.process(), "/storage", EngineConfig::default())
             .expect("engine should reopen");
         if let Ok(handle) = engine.collection(&reference("documents")) {
-            write(&engine, &handle, vec![put("beta", vec![0.0, 1.0])]);
-            engine
-                .core()
-                .flush_collection(&handle)
-                .expect("flush should succeed");
+            write(&handle, vec![put("beta", vec![0.0, 1.0])]);
+            handle.flush_blocking().expect("flush should succeed");
         }
         drop_within(engine, Duration::from_secs(60), &context);
     }
@@ -708,7 +699,7 @@ fn the_engine_drop_stops_the_writer_of_a_collection_it_does_not_serve() {
     let root = unique_temp_dir("engine-duplicate-collection");
     let engine = open(&root).expect("engine should open");
     let handle = create(&engine, "documents");
-    write(&engine, &handle, vec![put("alpha", vec![1.0, 0.0])]);
+    write(&handle, vec![put("alpha", vec![1.0, 0.0])]);
     let dir = handle.meta().dir.clone();
     drop(handle);
     drop(engine);

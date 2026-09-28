@@ -15,7 +15,6 @@
 //! Every run is seeded. See each module for the environment variables that size it.
 
 use arc_swap as _;
-use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
 use imbl as _;

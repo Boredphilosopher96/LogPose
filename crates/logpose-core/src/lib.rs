@@ -13,10 +13,9 @@ use logpose_service::{
     FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
 use logpose_storage::{
-    CreateCollectionRequest, EngineConfig, InspectReport, InspectTarget, LocalStorageEngine,
-    TokenConfig,
+    CreateCollectionRequest, Engine, EngineConfig, InspectReport, InspectTarget, TokenConfig,
 };
-use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
+use logpose_storage_etcd::EtcdCatalogStore;
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
     LogPoseError, MetadataBackend, NodeMetadata, NodeRole, Snapshot,
@@ -106,7 +105,7 @@ impl AppState {
         })?;
         let build = BuildInfo::current();
         // One engine owns the storage root; the data plane and the catalog share it.
-        let local = LocalStorageEngine::with_config(
+        let engine = Engine::open_local(
             &config.storage_root,
             EngineConfig {
                 resolver: Some(logpose_query::resolver()),
@@ -118,15 +117,13 @@ impl AppState {
                 ..EngineConfig::default()
             },
         )?;
-        let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
-            MetadataBackend::Local => Arc::new(local.clone()),
-            MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::with_local(
-                local.clone(),
-                config.metadata.etcd.clone(),
-            )?),
-        };
-        let data = Arc::new(LogPoseDataService::new(storage));
-        let catalog: Arc<dyn CatalogStore> = Arc::new(local);
+        let data = Arc::new(match config.metadata.backend {
+            MetadataBackend::Local => LogPoseDataService::new(engine.clone()),
+            MetadataBackend::Etcd => {
+                LogPoseDataService::with_etcd(engine.clone(), config.metadata.etcd.clone())?
+            }
+        });
+        let catalog: Arc<dyn CatalogStore> = Arc::new(engine);
         let shared_catalog = match config.metadata.backend {
             MetadataBackend::Local => SharedCatalog::Local,
             MetadataBackend::Etcd => {

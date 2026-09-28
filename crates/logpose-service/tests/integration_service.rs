@@ -1,11 +1,9 @@
 //! Integration tests for `LogPoseDataService`.
 
-use async_trait as _;
 use axum as _;
 use axum::body::Body;
 use http_body_util as _;
 use http_body_util::BodyExt;
-use legacy_query::{LegacyQuery, MetadataFilter, QueryRequest};
 use logpose_api_grpc as _;
 use logpose_api_grpc::proto;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
@@ -19,8 +17,7 @@ use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_storage_etcd as _;
 use logpose_types::{
-    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, ScalarMetadataValue, Snapshot,
-    legacy::record_from_put,
+    DistanceMetric, LogPoseError, ResourceKind, Snapshot,
     record::{PrimaryKey, Record},
 };
 use rand as _;
@@ -37,8 +34,14 @@ use tonic as _;
 use tonic::Request;
 use tower as _;
 
-#[path = "support/legacy_query.rs"]
-mod legacy_query;
+/// A record with key `id`, the `vector` field, and `extra` as its `$extra` object.
+fn record(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> Record {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let serde_json::Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    record
+}
 
 /// `kind == "keep"` in the gRPC form.
 fn keep_proto_filter() -> proto::Filter {
@@ -93,24 +96,21 @@ async fn service_runs_filtered_query_and_storage_workflow() {
         .upsert(
             "documents",
             vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"color":"red","kind":"keep"}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![3.0, 0.0],
-                    metadata: json!({"color":"blue","kind":"drop"}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("gamma"),
-                    vector: vec![2.0, 0.0],
-                    metadata: json!({"color":"red","kind":"keep"}),
-                })
-                .expect("record"),
+                record(
+                    "alpha",
+                    vec![1.0, 0.0],
+                    json!({"color":"red","kind":"keep"}),
+                ),
+                record(
+                    "beta",
+                    vec![3.0, 0.0],
+                    json!({"color":"blue","kind":"drop"}),
+                ),
+                record(
+                    "gamma",
+                    vec![2.0, 0.0],
+                    json!({"color":"red","kind":"keep"}),
+                ),
             ],
         )
         .await
@@ -122,30 +122,33 @@ async fn service_runs_filtered_query_and_storage_workflow() {
         .expect("flush should succeed");
 
     let filtered = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 3,
-            snapshot: Some(snapshot.clone()),
-            read_barrier: None,
-            filters: vec![MetadataFilter {
-                field: "kind".to_owned(),
-                value: ScalarMetadataValue::String("keep".to_owned()),
-            }],
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 3,
+                filter: Some(FilterExpr::eq("kind", "keep")),
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("query should succeed");
 
     assert_eq!(filtered.snapshot, snapshot);
     assert_eq!(
         filtered
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["gamma", "alpha"]
     );
@@ -192,14 +195,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
     let first_ack = service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("first write should succeed");
@@ -211,14 +207,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
     let second_ack = service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("beta", vec![0.0, 1.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("second write should succeed");
@@ -228,27 +217,32 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
     assert_eq!(second_ack.snapshot.visible_seq_no, 2);
 
     let response = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: Some(second_ack.snapshot.clone()),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(second_ack.snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("query at write ack snapshot should succeed");
 
     assert_eq!(response.snapshot, second_ack.snapshot);
     assert_eq!(
         response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["alpha", "beta"]
     );
@@ -286,54 +280,42 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
     let ack = service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
     service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![2.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("beta", vec![2.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
 
-    let request = QueryRequest {
-        collection_name: "documents".to_owned(),
-        vector: vec![1.0, 0.0],
+    let request = logpose_query::QueryRequest {
+        vector: Some(logpose_query::VectorQuery {
+            field: None,
+            values: vec![1.0, 0.0],
+        }),
         top_k: 2,
-        snapshot: Some(ack.snapshot.clone()),
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: None,
-        explain: ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
+        output_fields: vec!["$extra".to_owned()],
+        read: logpose_query::ReadConsistency {
+            snapshot: Some(ack.snapshot.clone()),
+            ..logpose_query::ReadConsistency::default()
+        },
+        ..logpose_query::QueryRequest::default()
     };
     let response = service
-        .query(request.clone())
+        .query_collection("documents", request.clone())
         .await
+        .map(|reply| reply.value)
         .expect("a snapshot of the current generation is exact");
     assert_eq!(response.snapshot, ack.snapshot);
     assert_eq!(
         response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["alpha"]
     );
@@ -344,8 +326,9 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
         .expect("flush should succeed");
 
     let error = service
-        .query(request)
+        .query_collection("documents", request)
         .await
+        .map(|reply| reply.value)
         .expect_err("nothing pins the superseded generation");
     assert!(
         matches!(&error, LogPoseError::SnapshotExpired { .. }),
@@ -361,21 +344,26 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
     );
     // As a read barrier, the ack is still satisfied: barriers compare positions, not files.
     let response = service
-        .query(QueryRequest {
-            snapshot: None,
-            read_barrier: Some(ack.snapshot),
-            top_k: 2,
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    read_barrier: Some(ack.snapshot),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("the barrier is satisfied");
-    assert_eq!(response.matches.len(), 2);
+    assert_eq!(response.hits.len(), 2);
 }
 
 #[tokio::test]
@@ -396,14 +384,7 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
     let ack = service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
@@ -414,27 +395,32 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
         .expect("flush should succeed");
 
     let response = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: Some(ack.snapshot.clone()),
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    read_barrier: Some(ack.snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("read barrier should advance to the latest visible snapshot");
 
     assert_eq!(response.snapshot, flushed);
     assert_eq!(
         response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["alpha"]
     );
@@ -458,35 +444,33 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
     service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
 
     let error = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: Some(Snapshot {
-                manifest_generation: 0,
-                visible_seq_no: 2,
-            }),
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    read_barrier: Some(Snapshot {
+                        manifest_generation: 0,
+                        visible_seq_no: 2,
+                    }),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("barrier above the current snapshot should fail");
 
     assert!(matches!(
@@ -511,25 +495,31 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
         .expect("collection should be created");
 
     let error = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: Some(Snapshot {
-                manifest_generation: 0,
-                visible_seq_no: 0,
-            }),
-            read_barrier: Some(Snapshot {
-                manifest_generation: 0,
-                visible_seq_no: 0,
-            }),
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(Snapshot {
+                        manifest_generation: 0,
+                        visible_seq_no: 0,
+                    }),
+                    read_barrier: Some(Snapshot {
+                        manifest_generation: 0,
+                        visible_seq_no: 0,
+                    }),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("snapshot and read barrier should conflict");
 
     assert!(matches!(
@@ -557,14 +547,7 @@ async fn service_stats_read_barrier_advances_to_latest_snapshot() {
     let ack = service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
@@ -602,14 +585,7 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
     service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
@@ -650,35 +626,33 @@ async fn service_rejects_impossible_snapshots() {
     service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
 
     let error = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: Some(Snapshot {
-                manifest_generation: 0,
-                visible_seq_no: 99,
-            }),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(Snapshot {
+                        manifest_generation: 0,
+                        visible_seq_no: 99,
+                    }),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("invalid snapshot should error");
 
     assert!(matches!(
@@ -706,14 +680,7 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
     service
         .upsert(
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("write should succeed");
@@ -724,22 +691,27 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
         .expect("flush should succeed");
 
     let error = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: Some(Snapshot {
-                manifest_generation: flushed.manifest_generation,
-                visible_seq_no: flushed.visible_seq_no - 1,
-            }),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(Snapshot {
+                        manifest_generation: flushed.manifest_generation,
+                        visible_seq_no: flushed.visible_seq_no - 1,
+                    }),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("below-checkpoint snapshot should error");
 
     assert!(matches!(
@@ -770,14 +742,7 @@ async fn app_state_accepts_database_qualified_collection_references() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "default/documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("qualified write should succeed");
@@ -800,19 +765,20 @@ async fn app_state_accepts_database_qualified_collection_references() {
         .await
         .expect("qualified inspect should succeed");
     let query = state
-        .query(QueryRequest {
-            collection_name: "default/documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "default/documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                output_fields: vec!["$extra".to_owned()],
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("qualified query should succeed");
 
     assert_eq!(placement.collection_name, "documents");
@@ -823,8 +789,8 @@ async fn app_state_accepts_database_qualified_collection_references() {
     assert_eq!(stats.collection_name, "documents");
     assert_eq!(stats.live_record_count, 1);
     assert_eq!(inspect.target, "manifest");
-    assert_eq!(query.returned, 1);
-    assert_eq!(query.matches[0].id.as_str(), "alpha");
+    assert_eq!(query.hits.len(), 1);
+    assert_eq!(query.hits[0].record.pk.label(), "alpha");
 }
 
 #[tokio::test]
@@ -851,24 +817,9 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             &RequestAuth::default(),
             "documents",
             vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep","version":1}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![2.0, 0.0],
-                    metadata: json!({"kind":"drop","version":2}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("gamma"),
-                    vector: vec![5.0, 0.0],
-                    metadata: json!({"kind":"keep","version":3}),
-                })
-                .expect("record"),
+                record("alpha", vec![1.0, 0.0], json!({"kind":"keep","version":1})),
+                record("beta", vec![2.0, 0.0], json!({"kind":"drop","version":2})),
+                record("gamma", vec![5.0, 0.0], json!({"kind":"keep","version":3})),
             ],
         )
         .await
@@ -882,19 +833,22 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
     let predicate = FilterExpr::eq("kind", "keep");
 
     let service_response = state
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(predicate.clone()),
-            explain: ExplainMode::Profile,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 1,
+                filter: Some(predicate.clone()),
+                output_fields: vec!["$extra".to_owned()],
+                explain: ExplainMode::Profile,
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("service query should succeed");
 
     let rest_response = rest
@@ -951,7 +905,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .expect("grpc query should succeed")
         .into_inner();
 
-    assert_eq!(service_response.matches[0].id.as_str(), "gamma");
+    assert_eq!(service_response.hits[0].record.pk.label(), "gamma");
     assert_eq!(rest_body["hits"][0]["record"]["id"], "gamma");
     assert_eq!(grpc_id(&grpc_response, 0), "gamma");
     let service_diagnostics = service_response
@@ -1080,12 +1034,11 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     let records = (0..12)
         .map(|index| {
             let kind = if index % 4 == 0 { "keep" } else { "drop" };
-            record_from_put(PutRecord {
-                id: RecordId::new(format!("doc-{index}")),
-                vector: vec![index as f32 + 1.0, 0.0],
-                metadata: json!({"kind":kind,"version":index}),
-            })
-            .expect("record")
+            record(
+                &format!("doc-{index}"),
+                vec![index as f32 + 1.0, 0.0],
+                json!({"kind":kind,"version":index}),
+            )
         })
         .collect::<Vec<_>>();
     state
@@ -1100,19 +1053,22 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     let predicate = FilterExpr::eq("kind", "keep");
 
     let service_response = state
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(predicate.clone()),
-            explain: ExplainMode::Profile,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                filter: Some(predicate.clone()),
+                output_fields: vec!["$extra".to_owned()],
+                explain: ExplainMode::Profile,
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("service query should succeed");
     let rest_response = rest
         .clone()
@@ -1169,9 +1125,9 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
 
     assert_eq!(
         service_response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["doc-8", "doc-4"]
     );
@@ -1197,10 +1153,10 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     assert!(diagnostics.units_considered >= 1);
     assert_eq!(diagnostics.units_pruned, 0);
     assert_eq!(diagnostics.units_scanned, 1);
-    assert!(diagnostics.candidates_before_filter >= service_response.returned);
-    assert!(diagnostics.candidates_after_filter >= service_response.returned);
+    assert!(diagnostics.candidates_before_filter >= service_response.hits.len());
+    assert!(diagnostics.candidates_after_filter >= service_response.hits.len());
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
-    assert!(diagnostics.candidates_merged >= service_response.returned);
+    assert!(diagnostics.candidates_merged >= service_response.hits.len());
     assert_eq!(diagnostics.rerank_count, 1);
     assert_eq!(
         rest_body["diagnostics"]["chosen_plan"],
@@ -1374,18 +1330,8 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
         .upsert(
             "documents",
             vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"version":1}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"version":1}),
-                })
-                .expect("record"),
+                record("alpha", vec![1.0, 0.0], json!({"version":1})),
+                record("beta", vec![0.0, 1.0], json!({"version":1})),
             ],
         )
         .await

@@ -16,8 +16,7 @@ use logpose_core::AppState;
 use logpose_query::{ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, VectorQuery};
 use logpose_storage::{CreateCollectionRequest as StorageCreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    DistanceMetric, PutRecord, RecordId,
-    legacy::record_from_put,
+    DistanceMetric,
     schema::{
         CreateCollectionSpec, FieldIndex, FieldType, PrimaryKeySpec, PrimaryKeyType,
         ScalarFieldSpec, VectorFieldSpec,
@@ -1082,13 +1081,13 @@ async fn grpc_client_counts_scrolls_scans_and_writes_by_filter() {
     let _ = server.await;
 }
 
+/// A record with key `id`, the `vector` field, and `metadata` as its `$extra` object.
 fn put(id: &str, vector: Vec<f32>, metadata: Value) -> Record {
-    record_from_put(PutRecord {
-        id: RecordId::new(id),
-        vector,
-        metadata,
-    })
-    .expect("legacy record converts")
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let Value::Object(extra) = metadata {
+        record.extra = extra;
+    }
+    record
 }
 
 fn test_config(root: &Path, rest_addr: SocketAddr, grpc_addr: SocketAddr) -> LogPoseConfig {

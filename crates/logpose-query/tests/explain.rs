@@ -2,7 +2,6 @@
 //! actual counts per operator with the reason for each strategy, and parallel execution
 //! returns exactly what sequential execution returns.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
