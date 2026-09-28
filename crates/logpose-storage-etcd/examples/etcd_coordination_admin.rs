@@ -1,7 +1,6 @@
 //! Operator-facing etcd coordination admin helper for local chaos workflows.
 
 use anyhow::{Context, Error, Result, bail};
-use async_trait as _;
 use clap::{Parser, Subcommand, error::ErrorKind};
 use etcd_client::{Client, ConnectOptions, DeleteOptions};
 use logpose_auth as _;
