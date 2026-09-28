@@ -19,7 +19,9 @@
 # Every run holds an exclusive lock on its run directory
 # (LOGPOSE_BENCH_DATA/runs/<run id>) and refuses to start a server on a port
 # that is already in use, so two runs on one host need distinct run ids and
-# ports (see benches/baselines/README.md for an A/B recipe).
+# ports (see benches/baselines/README.md for an A/B recipe). A run stops the
+# logpose-server and Milvus container that a killed earlier run with the same
+# run id left behind. Needs Linux (/proc) and flock from util-linux.
 #
 # Environment:
 #   LOGPOSE_BENCH_DATA   work directory outside the repository for datasets,
@@ -98,28 +100,47 @@ fi
 run_dir="${data_root}/runs/${run_id}"
 results_dir="${run_dir}/results"
 milvus_container="logpose-bench-milvus-${run_id}"
+server_pid_file="${run_dir}/server.pid"
 mkdir -p "${data_root}/datasets" "${results_dir}"
 
-# One run per run directory. The lock is released when this shell and every
-# process that inherited the descriptor (the servers it starts) exit.
+command -v flock >/dev/null 2>&1 || die "flock (from util-linux) is required"
+
+# One run per run directory. The lock is released when this shell exits; the
+# long-lived processes it starts (cargo, logpose-server) do not inherit it, so
+# a run killed with SIGKILL leaves the lock held at most until its short-lived
+# bench clients finish.
 lock_file="${run_dir}/lock"
 exec {lock_fd}<>"${lock_file}"
 if ! flock -n "${lock_fd}"; then
-  die "run '${run_id}' is already in progress in ${run_dir} (lock held by pid $(cat "${lock_file}" 2>/dev/null || echo unknown)); set LOGPOSE_BENCH_RUN_ID and distinct ports to run another benchmark at the same time"
+  die "run '${run_id}' is already in progress in ${run_dir} (started by pid $(cat "${lock_file}" 2>/dev/null || echo unknown)); set LOGPOSE_BENCH_RUN_ID and distinct ports to run another benchmark at the same time"
 fi
 echo "$$" >"${lock_file}"
+
+# Removes the Milvus container of this run, if there is one. The container
+# carries the run directory as a label, so a container of the same name that
+# a run with another LOGPOSE_BENCH_DATA started is left alone (and fails).
+remove_milvus_container() {
+  local owner
+  if ! owner="$(docker container inspect -f '{{index .Config.Labels "logpose.bench.run-dir"}}' "${milvus_container}" 2>/dev/null)"; then
+    return 0
+  fi
+  if [[ "${owner}" != "${run_dir}" ]]; then
+    log "container ${milvus_container} belongs to run directory '${owner}'; not removing it"
+    return 1
+  fi
+  docker rm -f "${milvus_container}" >/dev/null
+}
 
 server_pid=""
 milvus_started=0
 cleanup() {
-  if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
+  if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
+    rm -f "${server_pid_file}"
   fi
-  # Only remove a container this run started; the name is unique to the run
-  # id, which this run holds the lock for.
   if [[ "${milvus_started}" == "1" ]]; then
-    docker rm -f "${milvus_container}" >/dev/null 2>&1 || true
+    remove_milvus_container || true
   fi
 }
 trap cleanup EXIT
@@ -206,6 +227,27 @@ rss_bytes() {
   echo "$(( ${kib:-0} * 1024 ))"
 }
 
+# This run holds the lock, so a logpose-server or Milvus container of this run
+# directory that is still up was left behind by an earlier run that was killed
+# (SIGKILL) before its cleanup ran. Stop them so they do not hold the ports.
+if [[ -f "${server_pid_file}" ]]; then
+  stale_pid="$(cat "${server_pid_file}")"
+  stale_exe="$(readlink "/proc/${stale_pid}/exe" 2>/dev/null || true)"
+  if [[ "${stale_pid}" =~ ^[0-9]+$ && "${stale_exe% (deleted)}" == "${run_dir}/bin/logpose-server" ]]; then
+    log "stopping logpose-server (pid ${stale_pid}) left running by an earlier run '${run_id}'"
+    kill "${stale_pid}" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "${stale_pid}" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "${stale_pid}" 2>/dev/null || true
+  fi
+  rm -f "${server_pid_file}"
+fi
+if [[ "${skip_milvus}" != "1" ]]; then
+  remove_milvus_container || die "the Milvus container name ${milvus_container} is taken by a run in another LOGPOSE_BENCH_DATA; use another LOGPOSE_BENCH_RUN_ID"
+fi
+
 # Fail before the build when the ports are taken; each server start checks again.
 require_free_ports "${used_ports[@]}"
 
@@ -215,10 +257,11 @@ if [[ "${target_dir}" != /* ]]; then
   target_dir="${repo_root}/${target_dir}"
 fi
 log "building logpose-server and logpose-bench (release)"
-(cd "${repo_root}" && cargo build --release -p logpose-server -p logpose-bench)
+(cd "${repo_root}" && cargo build --release -p logpose-server -p logpose-bench {lock_fd}>&-)
 # Run private copies, so a build in another checkout that shares the target
 # directory cannot swap the binaries between shapes.
 mkdir -p "${run_dir}/bin"
+rm -f "${run_dir}/bin/logpose-bench" "${run_dir}/bin/logpose-server"
 cp "${target_dir}/release/logpose-bench" "${target_dir}/release/logpose-server" "${run_dir}/bin/"
 bench_bin="${run_dir}/bin/logpose-bench"
 server_bin="${run_dir}/bin/logpose-server"
@@ -246,6 +289,9 @@ run_logpose() {
   local server_log="${results_dir}/${shape}-logpose-server.log"
   require_free_ports "${grpc_port}" "${rest_port}"
   rm -rf "${storage}"
+  # The path goes into a TOML basic string.
+  local storage_toml="${storage//\\/\\\\}"
+  storage_toml="${storage_toml//\"/\\\"}"
   log "starting logpose-server for ${shape} (gRPC ${grpc_port}, REST ${rest_port}, data ${storage})"
   LOGPOSE_CONFIG="node_name = \"bench\"
 rest_host = \"127.0.0.1\"
@@ -253,13 +299,14 @@ rest_port = ${rest_port}
 grpc_host = \"127.0.0.1\"
 grpc_port = ${grpc_port}
 log_filter = \"warn\"
-storage_root = \"${storage}\"
+storage_root = \"${storage_toml}\"
 
 [index]
 hnsw_m = ${hnsw_m}
 hnsw_ef_construction = ${hnsw_ef_construction}" \
-    "${server_bin}" >"${server_log}" 2>&1 &
+    "${server_bin}" >"${server_log}" 2>&1 {lock_fd}>&- &
   server_pid=$!
+  echo "${server_pid}" >"${server_pid_file}"
   wait_for_server "${server_pid}" "${server_log}" "${grpc_port}" "${rest_port}"
   logpose_loadavg="$(cut -d' ' -f1-3 /proc/loadavg)"
   "${bench_bin}" vdb-run \
@@ -279,15 +326,14 @@ hnsw_ef_construction = ${hnsw_ef_construction}" \
   kill "${server_pid}"
   wait "${server_pid}" 2>/dev/null || true
   server_pid=""
+  rm -f "${server_pid_file}"
   rm -rf "${storage}"
 }
 
 run_milvus() {
-  local shape="$1" dataset="$2" report="$3"
+  local shape="$1" dataset="$2" report="$3" published
   local volume="${run_dir}/milvus-${shape}"
-  # A container of this name can only be left over from an earlier run with
-  # this run id, which no longer holds the lock.
-  docker rm -f "${milvus_container}" >/dev/null 2>&1 || true
+  remove_milvus_container || die "the Milvus container name ${milvus_container} is taken by a run in another LOGPOSE_BENCH_DATA; use another LOGPOSE_BENCH_RUN_ID"
   require_free_ports "${milvus_port}" "${milvus_health_port}"
   rm -rf "${volume}"
   mkdir -p "${volume}/volumes"
@@ -304,6 +350,7 @@ EOF
   # The same single-container setup as Milvus's standalone_embed.sh: embedded
   # etcd and local storage.
   docker run -d --name "${milvus_container}" \
+    --label "logpose.bench.run-dir=${run_dir}" \
     --security-opt seccomp:unconfined \
     -e ETCD_USE_EMBED=true \
     -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
@@ -327,7 +374,8 @@ EOF
   done
   curl -sf "http://127.0.0.1:${milvus_health_port}/healthz" >/dev/null ||
     die "Milvus did not become healthy on port ${milvus_health_port}"
-  if ! docker port "${milvus_container}" 19530/tcp | grep -qx "127.0.0.1:${milvus_port}"; then
+  published="$(docker port "${milvus_container}" 19530/tcp)"
+  if ! grep -qx "127.0.0.1:${milvus_port}" <<<"${published}"; then
     die "port ${milvus_port} is not published by ${milvus_container}"
   fi
   milvus_loadavg="$(cut -d' ' -f1-3 /proc/loadavg)"
@@ -342,7 +390,7 @@ EOF
     --output "${report}"
   milvus_mem="$(docker stats --no-stream --format '{{.MemUsage}}' "${milvus_container}")"
   milvus_disk="$(du -sb "${volume}/volumes" | cut -f1)"
-  docker rm -f "${milvus_container}" >/dev/null
+  remove_milvus_container
   milvus_started=0
   rm -rf "${volume}"
 }
