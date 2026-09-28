@@ -93,6 +93,8 @@ pub use read::{
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use scheduler::{MaintenanceScheduler, SchedulerStats};
 pub use segment_v2::IndexPolicy;
+// Test support for deterministic job interleavings; not part of the documented API.
+#[doc(hidden)]
 pub use stepped::{JobKind, SteppedJob};
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,

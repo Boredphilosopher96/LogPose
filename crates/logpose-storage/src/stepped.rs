@@ -24,10 +24,15 @@ pub use crate::writer::JobKind;
 
 /// A flush or compaction whose phases the caller runs one at a time.
 ///
+/// Test support, hidden from the documented API: a stepped job bypasses the scheduler's
+/// permits and maintenance-memory reservation, so only deterministic-interleaving tests (the
+/// storage harness) use it.
+///
 /// Begun by [`Engine::begin_job`]. Dropping it (or [`abandon`](Self::abandon)) ends the job
 /// without a change, as a failed background job ends: its unit is burned and any file it wrote is
 /// removed. It holds a reference to the engine's state, so it must be dropped before the last
 /// [`Engine`] clone is.
+#[doc(hidden)]
 pub struct SteppedJob {
     kind: JobKind,
     handle: Arc<CollectionHandle>,
@@ -57,9 +62,12 @@ impl Engine {
     /// frozen memtable (freezing the active one if none is frozen) and waits for a flush already
     /// running; a compaction takes every unreserved segment. Blocking.
     ///
+    /// Test support, hidden from the documented API: see [`SteppedJob`].
+    ///
     /// # Errors
     ///
     /// The collection is poisoned, dropped, or its writer stopped.
+    #[doc(hidden)]
     pub fn begin_job(&self, handle: &Arc<CollectionHandle>, kind: JobKind) -> Result<SteppedJob> {
         let core = self.core();
         let (ticket, start) = handle.begin_job(kind)?;
