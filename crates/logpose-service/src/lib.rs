@@ -662,7 +662,10 @@ impl LogPoseDataService {
             (None, Some(read_barrier)) => {
                 let current = self.snapshot(collection_name).await?;
                 if current.satisfies_read_barrier(&read_barrier) {
-                    Ok(Some(current))
+                    // Read the current state, not `current`: a state published since is newer,
+                    // so it satisfies the barrier too, while `current` stops being readable
+                    // once a flush or compaction supersedes its generation.
+                    Ok(None)
                 } else {
                     Err(LogPoseError::ReadBarrierNotSatisfied {
                         collection: collection_name.to_owned(),
@@ -1703,5 +1706,161 @@ mod tests {
         assert!(!status.data_plane_ready);
         assert_eq!(status.collection_count, 0);
         assert!(status.collections.is_empty());
+    }
+
+    /// Stats behind a read barrier check the barrier against the current snapshot and then read
+    /// the current state. A flush that lands between the two is not an error: the state it
+    /// publishes is newer, so it satisfies the barrier too, while the checked snapshot's
+    /// generation is no longer retained.
+    #[tokio::test]
+    async fn stats_behind_a_read_barrier_survive_a_flush_between_check_and_read() {
+        /// A local engine that, once armed, writes and flushes right after it hands out a
+        /// snapshot.
+        struct FlushAfterSnapshot {
+            inner: logpose_storage::LocalStorageEngine,
+            armed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl StorageEngine for FlushAfterSnapshot {
+            async fn engine_name(&self) -> &'static str {
+                "flush-after-snapshot"
+            }
+
+            async fn create_collection(
+                &self,
+                request: CreateCollectionRequest,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                self.inner.create_collection(request).await
+            }
+
+            async fn open_collection(
+                &self,
+                name: &str,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                self.inner.open_collection(name).await
+            }
+
+            async fn write(
+                &self,
+                collection_name: &str,
+                operations: Vec<WriteOperation>,
+            ) -> logpose_types::Result<CommitAck> {
+                self.inner.write(collection_name, operations).await
+            }
+
+            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                let snapshot = self.inner.snapshot(collection_name).await?;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let put = WriteOperation::Put(logpose_types::PutRecord {
+                        id: logpose_types::RecordId::new("late"),
+                        vector: vec![0.0, 1.0],
+                        metadata: json!({}),
+                    });
+                    self.inner.write(collection_name, vec![put]).await?;
+                    self.inner.flush(collection_name).await?;
+                }
+                Ok(snapshot)
+            }
+
+            async fn scan_exact(
+                &self,
+                collection_name: &str,
+                snapshot: Option<Snapshot>,
+            ) -> logpose_types::Result<Vec<VisibleRecord>> {
+                self.inner.scan_exact(collection_name, snapshot).await
+            }
+
+            async fn ann_search_selected(
+                &self,
+                collection_name: &str,
+                snapshot: Option<Snapshot>,
+                immutable_unit_ids: Vec<String>,
+                request: AnnSearchRequest,
+                filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
+            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
+                self.inner
+                    .ann_search_selected(
+                        collection_name,
+                        snapshot,
+                        immutable_unit_ids,
+                        request,
+                        filter,
+                    )
+                    .await
+            }
+
+            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                self.inner.flush(collection_name).await
+            }
+
+            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                self.inner.compact(collection_name).await
+            }
+
+            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
+                self.inner.stats(collection_name).await
+            }
+
+            async fn stats_descriptor(
+                &self,
+                descriptor: &logpose_catalog::CollectionDescriptor,
+                snapshot: Option<Snapshot>,
+            ) -> logpose_types::Result<CollectionStats> {
+                self.inner.stats_descriptor(descriptor, snapshot).await
+            }
+
+            async fn inspect(
+                &self,
+                collection_name: &str,
+                target: InspectTarget,
+            ) -> logpose_types::Result<InspectReport> {
+                self.inner.inspect(collection_name, target).await
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "logpose-service-barrier-flush-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        let storage = Arc::new(FlushAfterSnapshot {
+            inner: logpose_storage::LocalStorageEngine::new(&root).expect("engine should open"),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let service = LogPoseDataService::new(Arc::clone(&storage) as Arc<dyn StorageEngine>);
+        service
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let put = WriteOperation::Put(logpose_types::PutRecord {
+            id: logpose_types::RecordId::new("first"),
+            vector: vec![1.0, 0.0],
+            metadata: json!({}),
+        });
+        let ack = service
+            .write("documents", vec![put])
+            .await
+            .expect("write should succeed");
+
+        storage.armed.store(true, Ordering::SeqCst);
+        let stats = service
+            .stats_for_read("documents", None, Some(ack.snapshot.clone()))
+            .await
+            .expect("a flush after the barrier check does not expire the read");
+        assert!(stats.manifest_generation > ack.snapshot.manifest_generation);
+        assert!(stats.visible_seq_no > ack.snapshot.visible_seq_no);
+        assert_eq!(stats.live_record_count, 2);
+
+        drop(service);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
