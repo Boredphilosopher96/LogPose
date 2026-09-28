@@ -288,6 +288,7 @@ mod tests {
         assert_eq!(vectors[0].metric, DistanceMetric::L2);
         assert!(schema.fields().is_empty());
         assert!(schema.dynamic_fields());
+        assert_eq!(schema.schema_version(), 1);
     }
 
     #[test]
