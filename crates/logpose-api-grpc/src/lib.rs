@@ -1050,7 +1050,12 @@ fn maintenance_status_to_proto(status: MaintenanceStatus) -> proto::MaintenanceS
     proto::MaintenanceStatus {
         pending: status.pending,
         in_progress: status.in_progress,
-        last_error: status.last_error,
+        last_error: status.last_error.map(|error| proto::MaintenanceError {
+            job: error.job,
+            message: error.message,
+            failed_at_unix_ms: error.failed_at_unix_ms,
+            consecutive_failures: error.consecutive_failures,
+        }),
         completed_runs: status.completed_runs as u64,
     }
 }

@@ -20,6 +20,14 @@
 //! rotation). With `max_frozen` memtables frozen and the active one over a trigger, the writer
 //! stops taking requests (the bounded channel pushes back on clients) until a flush commits; a
 //! request that waits longer than `write_stall_timeout` fails with `WriteStalled`.
+//!
+//! A failed job is retried in the background after a backoff of its own kind, so a failing
+//! compaction never holds back a freeze or a flush: flushes wait `FLUSH_RETRY_BACKOFF`, and
+//! compactions wait twice as long after each further failure in a row, up to
+//! `COMPACTION_RETRY_BACKOFF_MAX`. Once `max_flush_failures` flushes fail in a row, or one fails
+//! in a way no retry can fix (corrupt data, a full or read-only device), the collection is
+//! poisoned: writes, stalled ones included, fail at once with `CollectionPoisoned` instead of
+//! stalling against a device that cannot take a flush, and reads keep serving.
 
 use super::*;
 use crate::{
@@ -30,11 +38,108 @@ use crate::{
     manifest::{DvRef, MANIFEST_FORMAT_VERSION, manifest_path, publish_manifest},
     paths::SEGMENTS_DIR,
 };
+use logpose_types::MaintenanceError;
 use logpose_vfs::CrashPoint;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-/// How long background maintenance waits after a failed job before it plans again.
-pub(crate) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// How long background flushes wait after a failed flush (or freeze) before they are tried
+/// again.
+pub(crate) const FLUSH_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// How long background compactions wait after one failed compaction; each further failure in a
+/// row doubles the wait, up to [`COMPACTION_RETRY_BACKOFF_MAX`].
+pub(crate) const COMPACTION_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// The longest wait between background attempts of compactions that keep failing.
+pub(crate) const COMPACTION_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// When background jobs of one kind may run again after failures: never before `retry_at`,
+/// which is `first` after one failure and doubles with each further failure in a row, up to
+/// `max`. A job of the kind that completes resets it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Backoff {
+    first: Duration,
+    max: Duration,
+    /// Jobs of the kind that failed in a row.
+    failures: u32,
+    /// Engine-clock time before which no background job of the kind is requested.
+    retry_at: Option<Duration>,
+}
+
+impl Backoff {
+    /// A backoff of `first` after one failure, doubling up to `max`.
+    pub(super) const fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            first,
+            max,
+            failures: 0,
+            retry_at: None,
+        }
+    }
+
+    /// The backoff of background flushes: always [`FLUSH_RETRY_BACKOFF`], since the collection
+    /// is poisoned after `max_flush_failures` in a row anyway.
+    pub(super) const fn flush() -> Self {
+        Self::new(FLUSH_RETRY_BACKOFF, FLUSH_RETRY_BACKOFF)
+    }
+
+    /// The backoff of background compactions.
+    pub(super) const fn compaction() -> Self {
+        Self::new(COMPACTION_RETRY_BACKOFF, COMPACTION_RETRY_BACKOFF_MAX)
+    }
+
+    /// Whether a background job of the kind may be requested at `now`.
+    pub(super) fn ready(&self, now: Duration) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// Record a failure at `now`. Returns the failures in a row, this one included.
+    pub(super) fn failed(&mut self, now: Duration) -> u32 {
+        self.failures = self.failures.saturating_add(1);
+        let doublings = (self.failures - 1).min(31);
+        let wait = self.first.saturating_mul(1_u32 << doublings).min(self.max);
+        self.retry_at = Some(now.saturating_add(wait));
+        self.failures
+    }
+
+    /// A job of the kind completed: the next failure waits `first` again.
+    pub(super) fn succeeded(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    /// The engine-clock time before which no background job of the kind is requested.
+    #[cfg(test)]
+    pub(super) fn retry_at(&self) -> Option<Duration> {
+        self.retry_at
+    }
+}
+
+/// Whether a failed flush cannot succeed on a retry: the data it read is corrupt, or the
+/// device is full or read-only. Such a failure poisons the collection at once.
+fn lasting_failure(error: &LogPoseError) -> bool {
+    match error {
+        LogPoseError::Corrupt { .. } => true,
+        LogPoseError::Io { source, .. } => matches!(
+            source.kind(),
+            io::ErrorKind::StorageFull
+                | io::ErrorKind::QuotaExceeded
+                | io::ErrorKind::ReadOnlyFilesystem
+        ),
+        _ => false,
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for operators reading a failure's time.
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 /// How a job ended.
 enum Outcome {
@@ -94,10 +199,17 @@ impl Writer {
         self.schedule();
     }
 
-    /// Whether background maintenance may plan now: the collection had a data-plane access
-    /// since it was opened, and no job failed within the last backoff.
-    fn background_allowed(&self) -> bool {
-        self.handle.maintenance_armed() && self.retry_at.is_none_or(|at| self.clock_now() >= at)
+    /// Whether a background freeze or flush may be requested now: the collection had a
+    /// data-plane access since it was opened, and no flush failed within the flush backoff.
+    /// Compaction failures never hold it back.
+    fn flush_allowed(&self) -> bool {
+        self.handle.maintenance_armed() && self.flush_retry.ready(self.clock_now())
+    }
+
+    /// Whether background compactions may be planned now: the collection had a data-plane
+    /// access since it was opened, and no compaction failed within the compaction backoff.
+    fn compaction_allowed(&self) -> bool {
+        self.handle.maintenance_armed() && self.compaction_retry.ready(self.clock_now())
     }
 
     /// Whether the active memtable reached a flush trigger.
@@ -129,7 +241,7 @@ impl Writer {
             .flush_waiters
             .iter()
             .any(|(target, _)| *target >= state.active.first_seq_no);
-        waited || (self.background_allowed() && self.flush_triggered())
+        waited || (self.flush_allowed() && self.flush_triggered())
     }
 
     /// Whether writes stall: `max_frozen` memtables are frozen and the active one reached a
@@ -194,12 +306,12 @@ impl Writer {
                     %error,
                     "freezing the memtable for a flush failed"
                 );
-                self.retry_at = Some(self.clock_now() + RETRY_BACKOFF);
                 for (_, reply) in self.flush_waiters.drain(..) {
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(error.clone()));
                     }
                 }
+                self.job_failed(JobKind::Flush, &error);
             }
         }
     }
@@ -246,7 +358,7 @@ impl Writer {
         if !frozen || flushing {
             return;
         }
-        if !self.background_allowed() && self.flush_waiters.is_empty() {
+        if !self.flush_allowed() && self.flush_waiters.is_empty() {
             return;
         }
         if let Err(error) = self.request_job(JobKind::Flush, 0, Vec::new()) {
@@ -319,7 +431,7 @@ impl Writer {
             }
             return;
         }
-        if !self.background_allowed() {
+        if !self.compaction_allowed() {
             return;
         }
         let slots = self
@@ -343,7 +455,8 @@ impl Writer {
             );
             if let Err(error) = self.request_job(JobKind::Compact, plan.build_bytes, plan.inputs) {
                 tracing::warn!(%error, "the scheduler declined a compaction");
-                self.retry_at = Some(self.clock_now() + RETRY_BACKOFF);
+                let now = self.clock_now();
+                self.compaction_retry.failed(now);
                 break;
             }
         }
@@ -1258,25 +1371,8 @@ impl Writer {
             drop(running.permit);
         }
         match &outcome {
-            Outcome::Committed(_) | Outcome::Nothing => {
-                self.handle.update_maintenance_status(|status| {
-                    status.completed_runs += 1;
-                    status.last_error = None;
-                });
-            }
-            Outcome::Failed(error) => {
-                tracing::warn!(
-                    collection = %self.handle.descriptor().lookup_name(),
-                    kind = ?entry.kind,
-                    %error,
-                    "a maintenance job failed"
-                );
-                self.retry_at = Some(self.clock_now() + RETRY_BACKOFF);
-                let message = error.to_string();
-                self.handle.update_maintenance_status(|status| {
-                    status.last_error = Some(message);
-                });
-            }
+            Outcome::Committed(_) | Outcome::Nothing => self.job_succeeded(entry.kind),
+            Outcome::Failed(error) => self.job_failed(entry.kind, error),
             Outcome::Abandoned => {}
         }
         match entry.kind {
@@ -1310,6 +1406,78 @@ impl Writer {
             self.freeze_pending = true;
         }
         self.schedule();
+    }
+
+    /// A job of `kind` completed: reset the kind's backoff, count the run, and clear the last
+    /// error if a job of this kind reported it.
+    fn job_succeeded(&mut self, kind: JobKind) {
+        match kind {
+            JobKind::Flush => self.flush_retry.succeeded(),
+            JobKind::Compact => self.compaction_retry.succeeded(),
+        }
+        self.handle.update_maintenance_status(|status| {
+            status.completed_runs += 1;
+            if status
+                .last_error
+                .as_ref()
+                .is_some_and(|error| error.job == kind.label())
+            {
+                status.last_error = None;
+            }
+        });
+    }
+
+    /// A job of `kind` (or the freeze before a flush) failed with `error`: back off the kind's
+    /// background jobs, report the failure, and poison the collection once flushes keep
+    /// failing (`max_flush_failures` in a row) or one failed in a way no retry can fix.
+    ///
+    /// A job that failed because the writer refuses work (the collection was poisoned or
+    /// dropped, or the engine is shutting down) is no maintenance failure: its error is the
+    /// refusal, and the failure behind it stays the one reported.
+    fn job_failed(&mut self, kind: JobKind, error: &LogPoseError) {
+        if self.refusal().is_some()
+            && matches!(
+                error,
+                LogPoseError::CollectionPoisoned { .. }
+                    | LogPoseError::NotFound { .. }
+                    | LogPoseError::Unavailable { .. }
+            )
+        {
+            return;
+        }
+        let now = self.clock_now();
+        let failures = match kind {
+            JobKind::Flush => self.flush_retry.failed(now),
+            JobKind::Compact => self.compaction_retry.failed(now),
+        };
+        tracing::warn!(
+            collection = %self.handle.descriptor().lookup_name(),
+            ?kind,
+            failures,
+            %error,
+            "a maintenance job failed"
+        );
+        let reported = MaintenanceError {
+            job: kind.label().to_owned(),
+            message: error.to_string(),
+            failed_at_unix_ms: unix_ms_now(),
+            consecutive_failures: failures,
+        };
+        self.handle.update_maintenance_status(|status| {
+            status.last_error = Some(reported);
+        });
+        if kind != JobKind::Flush || self.refusal().is_some() {
+            return;
+        }
+        let limit = self.core.memtable.max_flush_failures.max(1);
+        let reason = if lasting_failure(error) {
+            format!("a flush failed and cannot succeed on a retry: {error}")
+        } else if failures >= limit {
+            format!("{failures} flushes in a row failed, the last with: {error}")
+        } else {
+            return;
+        };
+        self.poison(PoisonKind::ReadOnly, reason);
     }
 
     /// After a flush ended: answer the explicit flushes the checkpoint now covers, or fail them

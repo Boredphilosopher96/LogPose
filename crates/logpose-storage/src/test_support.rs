@@ -64,6 +64,8 @@ struct ControlState {
     fail_dir_syncs: Option<(PathBuf, u32)>,
     /// Renames onto paths containing this fail with EIO, this many times.
     fail_renames: Option<(String, u32)>,
+    /// Every hit of this crash point fails with EIO (without crashing).
+    fail_crash_point: Option<CrashPoint>,
 }
 
 /// Take one failure from `slot` when `matches` accepts its key.
@@ -157,6 +159,12 @@ impl ControlledVfs {
     pub(crate) fn stop_failing_renames(&self) {
         self.state().fail_renames = None;
     }
+
+    /// Fail every later hit of crash point `point` with EIO, without crashing (`None` stops
+    /// failing): a job that passes it fails, and nothing else does.
+    pub(crate) fn fail_crash_point(&self, point: Option<CrashPoint>) {
+        self.state().fail_crash_point = point;
+    }
 }
 
 impl Control {
@@ -233,6 +241,9 @@ impl Vfs for ControlledVfs {
         self.inner.try_lock_exclusive(path)
     }
     fn crash_point(&self, point: CrashPoint) -> io::Result<()> {
+        if self.state().fail_crash_point == Some(point) {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         self.inner.crash_point(point)
     }
 }

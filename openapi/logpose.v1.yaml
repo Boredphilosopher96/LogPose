@@ -1235,13 +1235,30 @@ components:
             - type: "null"
             - type: string
         last_error:
-          description: The last failed job's error, cleared by the next job that completes.
+          description: The last failed job, cleared once a job of the same kind completes.
           oneOf:
             - type: "null"
-            - type: string
+            - $ref: "#/components/schemas/MaintenanceError"
         completed_runs:
           type: integer
           description: Flushes and compactions that completed since the node opened the collection.
+    MaintenanceError:
+      type: object
+      description: A failed maintenance job.
+      required: [job, message, failed_at_unix_ms, consecutive_failures]
+      properties:
+        job:
+          type: string
+          description: The job that failed, `flush` or `compact`.
+        message:
+          type: string
+          description: What failed.
+        failed_at_unix_ms:
+          type: integer
+          description: When it failed, in milliseconds since the Unix epoch.
+        consecutive_failures:
+          type: integer
+          description: Jobs of this kind that failed in a row, this one included. Once flushes fail `max_flush_failures` times in a row (or once with a full or read-only device, or corrupt data), the collection is poisoned.
     ScalarFieldStats:
       type: object
       required: [present_count, null_count, distinct_count, value_counts]

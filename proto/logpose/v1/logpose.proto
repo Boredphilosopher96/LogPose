@@ -453,8 +453,15 @@ message InspectCollectionReply {
 message MaintenanceStatus {
   repeated string pending = 1;
   optional string in_progress = 2;
-  optional string last_error = 3;
+  MaintenanceError last_error = 3;
   uint64 completed_runs = 4;
+}
+
+message MaintenanceError {
+  string job = 1;
+  string message = 2;
+  uint64 failed_at_unix_ms = 3;
+  uint32 consecutive_failures = 4;
 }
 
 message ScalarFieldStats {
