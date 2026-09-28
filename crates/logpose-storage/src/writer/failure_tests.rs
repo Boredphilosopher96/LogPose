@@ -411,14 +411,10 @@ fn a_job_refused_by_a_poisoned_collection_keeps_the_error_that_poisoned_it() {
             .expect_err("a poisoned collection refuses the commit"),
     );
     drop(start);
-    // The writer answers the commit before it ends the job.
-    wait_for("the compaction to end", || {
-        handle.maintenance_status().in_progress.is_none()
-    });
-    let error = handle
-        .maintenance_status()
-        .last_error
-        .expect("the flush failure");
+    // The writer ends the job before it answers the commit.
+    let status = handle.maintenance_status();
+    assert_eq!(status.in_progress, None, "the compaction ended");
+    let error = status.last_error.expect("the flush failure");
     assert_eq!(error.job, "flush");
     assert_eq!(error.consecutive_failures, 2);
 }
