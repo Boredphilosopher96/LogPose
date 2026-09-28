@@ -1168,12 +1168,8 @@ mod tests {
         value::Value as TypedValue,
     };
     use serde_json::{Value, json};
-    use std::{
-        collections::BTreeMap,
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{collections::BTreeMap, path::PathBuf};
+    use tempfile::TempDir;
     use tonic::metadata::MetadataValue;
     use tonic_types::StatusExt;
 
@@ -1258,8 +1254,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_runs_collection_workflow() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-workflow"))));
+        let (config, _root) = test_config("grpc-workflow");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let create = service
             .create_collection(Request::new(create_collection_request(
@@ -1370,8 +1366,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_supports_read_barriers() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-read-barrier"))));
+        let (config, _root) = test_config("grpc-read-barrier");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -1452,8 +1448,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_supports_wal_and_segment_inspection_targets() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-inspect-targets"))));
+        let (config, _root) = test_config("grpc-inspect-targets");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -1560,8 +1556,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_metadata_reports_build_identity_fields() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-metadata"))));
+        let (config, _root) = test_config("grpc-metadata");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let metadata = service
             .get_metadata(Request::new(GetMetadataRequest {}))
@@ -1578,9 +1574,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_runtime_status_requires_bearer_token_when_auth_is_configured() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(auth_test_config(
-            "grpc-auth-runtime",
-        ))));
+        let (config, _root) = auth_test_config("grpc-auth-runtime");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let unauthorized = service
             .get_runtime_status(Request::new(GetRuntimeStatusRequest {}))
@@ -1607,9 +1602,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_database_rpcs_round_trip_with_operator_auth() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(auth_test_config(
-            "grpc-namespace-auth",
-        ))));
+        let (config, _root) = auth_test_config("grpc-namespace-auth");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let unauthorized = service
             .list_databases(Request::new(ListDatabasesRequest {}))
@@ -1664,7 +1658,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_database_policy_rpcs_round_trip_and_map_service_errors() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-policy"))));
+        let (config, _root) = test_config("grpc-policy");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let put = service
             .put_database_policy(Request::new(put_database_policy_request("default")))
@@ -1685,10 +1680,8 @@ mod tests {
             .into_inner();
         assert_eq!(get, put);
 
-        let data_only = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
-            "grpc-policy-data-only",
-            NodeRole::Data,
-        ))));
+        let (config, _root) = test_config_with_role("grpc-policy-data-only", NodeRole::Data);
+        let data_only = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         let error = data_only
             .put_database_policy(Request::new(put_database_policy_request("default")))
             .await
@@ -1704,7 +1697,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_read_only_principals_can_read_but_not_write_when_auth_is_configured() {
-        let state = Arc::new(AppState::new(auth_test_config("grpc-auth-readonly")));
+        let (config, _root) = auth_test_config("grpc-auth-readonly");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .set_database_access_policy(read_only_policy("default", "reader"))
@@ -1744,7 +1738,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_runtime_status_reports_control_plane_summary() {
-        let state = Arc::new(AppState::new(test_config("grpc-runtime-status")));
+        let (config, _root) = test_config("grpc-runtime-status");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .create_collection(storage_create_collection_request(
@@ -1823,7 +1818,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_collection_placement_reports_local_assignment() {
-        let state = Arc::new(AppState::new(test_config("grpc-placement")));
+        let (config, _root) = test_config("grpc-placement");
+        let state = Arc::new(AppState::new(config));
         state
             .control
             .create_collection(storage_create_collection_request(
@@ -1867,10 +1863,8 @@ mod tests {
 
     #[tokio::test]
     async fn data_only_nodes_reject_control_plane_collection_creation() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
-            "grpc-data-only",
-            NodeRole::Data,
-        ))));
+        let (config, _root) = test_config_with_role("grpc-data-only", NodeRole::Data);
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .create_collection(Request::new(create_collection_request(
@@ -1889,10 +1883,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_only_nodes_reject_control_plane_collection_creation() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config_with_role(
-            "grpc-control-create",
-            NodeRole::Control,
-        ))));
+        let (config, _root) = test_config_with_role("grpc-control-create", NodeRole::Control);
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .create_collection(Request::new(create_collection_request(
@@ -1911,7 +1903,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_only_nodes_reject_data_plane_grpc_operations() {
-        let root = unique_temp_dir("grpc-control-only");
+        let root_dir = unique_temp_dir("grpc-control-only");
+        let root = root_dir.path().to_path_buf();
         let initial = Arc::new(AppState::new(test_config_with_root(
             "grpc-control-only",
             NodeRole::Combined,
@@ -2006,7 +1999,8 @@ mod tests {
 
     #[tokio::test]
     async fn recorded_remote_assignments_reject_data_plane_grpc_operations() {
-        let root = unique_temp_dir("grpc-recorded-route");
+        let root_dir = unique_temp_dir("grpc-recorded-route");
+        let root = root_dir.path().to_path_buf();
         let initial = Arc::new(AppState::new(test_config_with_root(
             "grpc-recorded-node-a",
             NodeRole::Combined,
@@ -2109,7 +2103,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_maps_missing_collections_to_not_found() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-missing"))));
+        let (config, _root) = test_config("grpc-missing");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .get_collection(Request::new(get_collection_request("missing")))
@@ -2121,9 +2116,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_maps_missing_collection_placement_to_not_found() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
-            "grpc-missing-placement",
-        ))));
+        let (config, _root) = test_config("grpc-missing-placement");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .get_collection_placement(Request::new(get_collection_placement_request("missing")))
@@ -2135,8 +2129,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_rejects_zero_dimensions_for_collection_creation() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-dimensions"))));
+        let (config, _root) = test_config("grpc-zero-dimensions");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .create_collection(Request::new(create_collection_request(
@@ -2154,8 +2148,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_rejects_unknown_inspect_targets() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-invalid-target"))));
+        let (config, _root) = test_config("grpc-invalid-target");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .inspect_collection(Request::new(InspectCollectionRequest {
@@ -2174,8 +2168,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_query_filters_preserve_large_integer_precision() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-large-integers"))));
+        let (config, _root) = test_config("grpc-large-integers");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -2222,9 +2216,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_query_supports_filters_and_profile_diagnostics() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
-            "grpc-predicate-profile",
-        ))));
+        let (config, _root) = test_config("grpc-predicate-profile");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -2274,9 +2267,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_query_rejects_malformed_filters_at_their_path() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
-            "grpc-invalid-predicate",
-        ))));
+        let (config, _root) = test_config("grpc-invalid-predicate");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -2322,8 +2314,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_query_rejects_unknown_explain_modes() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-invalid-explain"))));
+        let (config, _root) = test_config("grpc-invalid-explain");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -2347,8 +2339,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_query_rejects_zero_top_k() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-zero-top-k"))));
+        let (config, _root) = test_config("grpc-zero-top-k");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         service
             .create_collection(Request::new(create_collection_request(
@@ -2374,8 +2366,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_requests_must_name_their_database_and_collection() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-selector"))));
+        let (config, _root) = test_config("grpc-selector");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
 
         let error = service
             .upsert_records(Request::new(UpsertRecordsRequest {
@@ -2407,8 +2399,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_creates_describes_lists_and_drops_typed_collections() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-collections"))));
+        let (config, _root) = test_config("grpc-collections");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         service
             .put_database(Request::new(put_database_request("shop")))
             .await
@@ -2548,8 +2540,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_create_collection_names_the_invalid_schema_field() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-bad-schema"))));
+        let (config, _root) = test_config("grpc-bad-schema");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         type Mutation = Box<dyn Fn(&mut CreateCollectionRequest)>;
         let cases: Vec<(&str, Mutation)> = vec![
             (
@@ -2607,7 +2599,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_typed_records_round_trip_through_upsert_get_update_and_delete() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-typed"))));
+        let (config, _root) = test_config("grpc-typed");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         service
             .create_collection(Request::new(products_request("default")))
             .await
@@ -2856,8 +2849,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_record_validation_errors_name_the_record_field() {
-        let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-record-errors"))));
+        let (config, _root) = test_config("grpc-record-errors");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         service
             .create_collection(Request::new(products_request("default")))
             .await
@@ -3049,7 +3042,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_alter_collection_changes_the_schema_and_shadows_dynamic_keys() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-alter"))));
+        let (config, _root) = test_config("grpc-alter");
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
         service
             .create_collection(Request::new(create_collection_request(
                 "documents",
@@ -3244,7 +3238,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_schema_changes_and_typed_records_survive_a_restart() {
-        let root = unique_temp_dir("grpc-restart");
+        let root_dir = unique_temp_dir("grpc-restart");
+        let root = root_dir.path().to_path_buf();
         let config = test_config_with_root("grpc-restart", NodeRole::Combined, root.clone());
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(config.clone())));
         service
@@ -3337,7 +3332,6 @@ mod tests {
             logpose_types::value::Value::Int64(12)
         );
         assert_eq!(fetched[0].vectors["embedding"], vec![0.0, 0.0, 1.0]);
-        let _ = fs::remove_dir_all(root);
     }
 
     fn default_database_name() -> String {
@@ -3638,12 +3632,16 @@ mod tests {
         status.get_details_error_info().map(|info| info.reason)
     }
 
-    fn test_config(label: &str) -> LogPoseConfig {
+    /// A combined node's configuration, and its storage root's guard: keep the guard alive for
+    /// as long as a node runs on the configuration.
+    fn test_config(label: &str) -> (LogPoseConfig, TempDir) {
         test_config_with_role(label, NodeRole::Combined)
     }
 
-    fn test_config_with_role(label: &str, node_role: NodeRole) -> LogPoseConfig {
-        test_config_with_root(label, node_role, unique_temp_dir(label))
+    fn test_config_with_role(label: &str, node_role: NodeRole) -> (LogPoseConfig, TempDir) {
+        let root = unique_temp_dir(label);
+        let config = test_config_with_root(label, node_role, root.path().to_path_buf());
+        (config, root)
     }
 
     fn test_config_with_root(
@@ -3659,8 +3657,8 @@ mod tests {
         }
     }
 
-    fn auth_test_config(label: &str) -> LogPoseConfig {
-        let mut config = test_config(label);
+    fn auth_test_config(label: &str) -> (LogPoseConfig, TempDir) {
+        let (mut config, root) = test_config(label);
         config.auth.bootstrap_tokens = vec![
             BootstrapTokenConfig {
                 token: "operator-secret".to_owned(),
@@ -3679,7 +3677,7 @@ mod tests {
                 ),
             },
         ];
-        config
+        (config, root)
     }
 
     fn read_only_policy(database_name: &str, principal_name: &str) -> DatabaseAccessPolicy {
@@ -3704,14 +3702,13 @@ mod tests {
         request
     }
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("logpose-api-grpc-{label}-{suffix}"));
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        path
+    /// A fresh temp directory named `logpose-api-grpc-{label}-…`, removed when the returned
+    /// guard drops, also when the test panics.
+    fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("logpose-api-grpc-{label}-"))
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     // ----- Search, count, scroll, and filter writes -----
@@ -3929,7 +3926,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_queries_search_a_named_vector_field_with_typed_filters_orders_and_projections() {
-        let service = items_service(test_config("grpc-p6c-query"), 1..=40).await;
+        let (config, _root) = test_config("grpc-p6c-query");
+        let service = items_service(config, 1..=40).await;
 
         // A vector search: acme items with 15 <= price < 45 are skus 10 to 28, best first.
         let mut request = items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 3);
@@ -4029,7 +4027,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_scroll_cursors_read_the_pinned_state_through_writes_flushes_and_compactions() {
-        let service = items_service(test_config("grpc-p6c-pinned"), 1..=40).await;
+        let (config, _root) = test_config("grpc-p6c-pinned");
+        let service = items_service(config, 1..=40).await;
         run_items_step(&service, "flush").await;
 
         let mut pin = items_count(Some(acme()));
@@ -4142,7 +4141,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_expired_scroll_cursors_and_tokens_fail_with_snapshot_expired() {
-        let mut config = test_config("grpc-p6c-expiry");
+        let (mut config, _root) = test_config("grpc-p6c-expiry");
         config.snapshots.token_ttl_ms = 200;
         let service = items_service(config, 1..=10).await;
         let page = service
@@ -4179,7 +4178,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_deletes_and_updates_by_filter_commit_every_match_as_one_batch() {
-        let service = items_service(test_config("grpc-p6c-filter-writes"), 1..=40).await;
+        let (config, _root) = test_config("grpc-p6c-filter-writes");
+        let service = items_service(config, 1..=40).await;
         let mut pin = items_count(None);
         pin.pin = true;
         let before = service
@@ -4274,7 +4274,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_read_replies_above_the_message_limit_are_too_large() {
-        let mut config = test_config("grpc-p6c-reply-limit");
+        let (mut config, _root) = test_config("grpc-p6c-reply-limit");
         config.limits.max_grpc_message_bytes = 2048;
         let service = items_service(config, 1..=40).await;
         let error = service
@@ -4304,7 +4304,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_search_count_scroll_and_filter_write_errors_name_the_request_field() {
-        let service = items_service(test_config("grpc-p6c-errors"), 1..=5).await;
+        let (config, _root) = test_config("grpc-p6c-errors");
+        let service = items_service(config, 1..=5).await;
         let embedding = || items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 3);
         let with_filter = |filter: proto::Filter| {
             let mut request = embedding();

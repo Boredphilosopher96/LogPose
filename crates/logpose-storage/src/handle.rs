@@ -865,7 +865,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_visible_returns_once_a_write_reaches_the_barrier() {
-        let root = unique_temp_dir("handle-wait-visible");
+        let root_dir = unique_temp_dir("handle-wait-visible");
+        let root = root_dir.path().to_path_buf();
         let engine =
             Engine::open(std_vfs(), &root, EngineConfig::default()).expect("engine should open");
         let descriptor = engine
@@ -912,7 +913,8 @@ mod tests {
     /// channel must never run ahead of `current`.
     #[test]
     fn the_visible_watch_never_runs_ahead_of_the_published_version() {
-        let root = unique_temp_dir("handle-watch-order");
+        let root_dir = unique_temp_dir("handle-watch-order");
+        let root = root_dir.path().to_path_buf();
         let engine =
             Engine::open(std_vfs(), &root, EngineConfig::default()).expect("engine should open");
         let descriptor = engine

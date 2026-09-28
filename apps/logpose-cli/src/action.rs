@@ -1559,46 +1559,48 @@ mod tests {
         assert!(parse_order_by("price:sideways").is_err());
     }
 
+    /// A fresh temp file named `{prefix}…{suffix}`, removed when the returned guard drops, also
+    /// when the test panics.
+    fn temp_file(prefix: &str, suffix: &str) -> tempfile::NamedTempFile {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .suffix(suffix)
+            .tempfile()
+            .expect("temp file should be created")
+    }
+
     #[test]
     fn read_jsonl_put_batches_splits_records_by_size_budget() {
-        let path = std::env::temp_dir().join(format!(
-            "logpose-cli-batch-test-{}.jsonl",
-            std::process::id()
-        ));
+        let file = temp_file("logpose-cli-batch-test-", ".jsonl");
+        let path = file.path();
         std::fs::write(
-            &path,
+            path,
             r#"{"id":"alpha","vector":[1.0],"label":"aaaaaaaaaaaaaaaaaaaaaaa"}
 {"id":"beta","vector":[2.0],"label":"bbbbbbbbbbbbbbbbbbbbbbb"}"#,
         )
         .expect("jsonl should be written");
 
-        let batches = read_jsonl_put_batches(&path, 70).expect("batches should parse");
+        let batches = read_jsonl_put_batches(path, 70).expect("batches should parse");
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 1);
-
-        std::fs::remove_file(&path).expect("temp file should be removed");
     }
 
     #[test]
     fn read_jsonl_put_batches_rejects_oversized_first_record() {
-        let path = std::env::temp_dir().join(format!(
-            "logpose-cli-oversized-batch-test-{}.jsonl",
-            std::process::id()
-        ));
+        let file = temp_file("logpose-cli-oversized-batch-test-", ".jsonl");
+        let path = file.path();
         std::fs::write(
-            &path,
+            path,
             r#"{"id":"alpha","vector":[1.0],"label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
         )
         .expect("jsonl should be written");
 
-        let error = read_jsonl_put_batches(&path, 40).expect_err("oversized record should fail");
+        let error = read_jsonl_put_batches(path, 40).expect_err("oversized record should fail");
 
         assert!(error.to_string().contains("line 1"));
         assert!(error.to_string().contains("max_batch_bytes"));
-
-        std::fs::remove_file(&path).expect("temp file should be removed");
     }
 
     #[test]
@@ -1678,22 +1680,18 @@ mod tests {
 
     #[test]
     fn read_database_policy_input_rejects_database_mismatch() {
-        let path = std::env::temp_dir().join(format!(
-            "logpose-cli-policy-test-{}.json",
-            std::process::id()
-        ));
+        let file = temp_file("logpose-cli-policy-test-", ".json");
+        let path = file.path();
         std::fs::write(
-            &path,
+            path,
             r#"{"database_name":"default","authentication_mode":"password","role_bindings":[]}"#,
         )
         .expect("policy json should be written");
 
-        let error = read_database_policy_input(&path, "analytics")
+        let error = read_database_policy_input(path, "analytics")
             .expect_err("mismatched database should fail");
 
         assert!(error.to_string().contains("database_name"));
-
-        std::fs::remove_file(&path).expect("temp file should be removed");
     }
 
     #[test]

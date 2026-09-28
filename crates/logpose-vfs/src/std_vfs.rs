@@ -202,27 +202,20 @@ impl VfsLock for StdLock {}
 mod tests {
     use super::*;
     use crate::{exists, read_file};
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
-    fn unique_dir(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("temp dir should be created");
-        dir
+    /// A fresh directory named `{prefix}-…` under the system temp directory, removed when the
+    /// returned guard drops, also when the test panics.
+    fn unique_dir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("{prefix}-"))
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     #[test]
     fn create_append_read_truncate_round_trip() {
-        let dir = unique_dir("logpose-std-vfs-file");
+        let temp_dir = unique_dir("logpose-std-vfs-file");
+        let dir = temp_dir.path().to_path_buf();
         let vfs = StdVfs;
         let path = dir.join("file");
 
@@ -263,8 +256,6 @@ mod tests {
         assert!(!exists(&vfs, &dir.join("missing")).expect("exists"));
         assert!(!exists(&vfs, &dir.join("missing").join("child")).expect("exists"));
         vfs.sync_dir(&dir).expect("dir sync should succeed");
-
-        let _ = fs::remove_dir_all(dir);
     }
 
     /// Files renamed and removed while the directory is listed are left out of the listing,
@@ -272,7 +263,8 @@ mod tests {
     /// engine's background flush renamed `CURRENT.tmp` into place, and failed with `NotFound`).
     #[test]
     fn listing_leaves_out_files_removed_while_it_runs() {
-        let dir = unique_dir("logpose-std-vfs-list");
+        let temp_dir = unique_dir("logpose-std-vfs-list");
+        let dir = temp_dir.path().to_path_buf();
         let vfs = StdVfs;
         fs::write(dir.join("stable"), b"x").expect("stable file");
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -298,12 +290,12 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         churn.join().expect("churn thread");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn lock_is_exclusive_until_dropped() {
-        let dir = unique_dir("logpose-std-vfs-lock");
+        let temp_dir = unique_dir("logpose-std-vfs-lock");
+        let dir = temp_dir.path().to_path_buf();
         let vfs = StdVfs;
         let path = dir.join("LOCK");
 
@@ -319,7 +311,5 @@ mod tests {
         );
         drop(first);
         drop(vfs.try_lock_exclusive(&path).expect("lock after release"));
-
-        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -12,9 +12,7 @@ use logpose_types::{ErrorCode, ErrorReason, error::fixtures::one_of_each_variant
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -376,14 +374,13 @@ fn every_grpc_rpc_has_a_rest_operation_and_vice_versa() {
     );
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-api-contract-{label}-{suffix}"));
-    std::fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-api-contract-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-api-contract-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 #[tokio::test]
@@ -398,7 +395,9 @@ async fn rest_router_serves_exactly_the_documented_routes_and_methods() {
     let routed_paths = route_paths().into_iter().collect::<BTreeSet<_>>();
     assert_eq!(routed_paths, documented_paths);
 
-    let root = unique_temp_dir("routes");
+    let root_dir = unique_temp_dir("routes");
+
+    let root = root_dir.path().to_path_buf();
     let app = router(Arc::new(AppState::new(LogPoseConfig {
         node_name: "contract".to_owned(),
         storage_root: root.clone(),
@@ -442,7 +441,6 @@ async fn rest_router_serves_exactly_the_documented_routes_and_methods() {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(root);
     assert!(
         problems.is_empty(),
         "route problems:\n{}",

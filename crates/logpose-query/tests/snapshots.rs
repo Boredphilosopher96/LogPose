@@ -358,7 +358,8 @@ async fn filter_writes_resolve_against_the_latest_state() {
     );
 
     // Without a resolver.
-    let root = support::unique_temp_dir("no-resolver");
+    let root_dir = support::unique_temp_dir("no-resolver");
+    let root = root_dir.path().to_path_buf();
     let engine = Engine::open_local(&root, EngineConfig::default()).expect("engine");
     let descriptor = engine
         .plan_collection_descriptor(&logpose_storage::CreateCollectionRequest::new(
@@ -399,8 +400,8 @@ async fn corrupted_index_sections_are_typed_index_corruption() {
         let mut rng = Rng::new(33);
         rows(&fixture, &mut rng, 0, 200).await;
         fixture.flush().await;
-        let root = fixture.root.clone();
-        drop(fixture);
+        let dir = fixture.close();
+        let root = dir.path().to_path_buf();
 
         let segment = find_segment(&root);
         let (offset, length) = {
@@ -555,7 +556,7 @@ async fn a_view_that_outlives_its_engine_fails_fetches_without_hanging() {
     let Fixture {
         engine,
         handle,
-        root,
+        dir: _dir,
         ..
     } = fixture;
     drop(handle);
@@ -582,7 +583,6 @@ async fn a_view_that_outlives_its_engine_fails_fetches_without_hanging() {
         110
     );
     drop(view);
-    let _ = fs::remove_dir_all(root);
 }
 
 /// A filter update whose key set is too large for one WAL frame fails with `TooLarge` before

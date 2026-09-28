@@ -10,3 +10,6 @@ description = "Filesystem abstraction for the LogPose engine, with a fault-injec
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true
