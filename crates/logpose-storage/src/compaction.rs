@@ -7,8 +7,9 @@
 //!
 //! 1. **Deletion-driven.** The segment with the most deleted rows among those whose deleted
 //!    fraction reaches `deleted_ratio` (segments of at least `base_rows` rows) or
-//!    `small_deleted_ratio` with at least `small_deleted_rows` deleted rows (smaller ones), plus
-//!    up to `min_merge - 1` of the smallest unreserved segments in the same or a lower tier.
+//!    `small_deleted_ratio` with at least `small_deleted_rows` deleted rows (smaller ones). A
+//!    segment of at least `base_rows` rows takes up to `min_merge - 1` of the smallest
+//!    unreserved segments in the same or a lower tier along; a smaller one is rewritten alone.
 //! 2. **Tiered.** For each tier from the lowest (tier 0 holds segments below `base_rows` live
 //!    rows, tier `t >= 1` holds `[base_rows * ratio^(t-1), base_rows * ratio^t)`): once it has
 //!    `min_merge` unreserved segments, take them in ascending unit order until `max_merge`,
@@ -446,6 +447,15 @@ impl Policy {
                 // Too large to rewrite even with the whole pool, so too large for any job.
                 continue;
             }
+            let mut taken = vec![heavy];
+            if heavy.rows < self.config.base_rows {
+                // A small segment is rewritten alone, so the rewrite copies no more rows than
+                // it drops. The tier-0 segments beside it have nothing to reclaim; they wait
+                // for their tier to fill instead of being copied again for every small
+                // segment that reaches the deleted-row floor.
+                plans.push(self.job(&taken, PlanReason::Deletions));
+                continue;
+            }
             let tier = self.tier(heavy.live());
             let mut smaller = free
                 .iter()
@@ -453,7 +463,6 @@ impl Policy {
                 .copied()
                 .collect::<Vec<_>>();
             smaller.sort_by_key(|segment| (segment.live(), segment.unit));
-            let mut taken = vec![heavy];
             for segment in smaller {
                 if taken.len() >= self.config.min_merge {
                     break;
@@ -499,7 +508,8 @@ impl Policy {
     /// smaller one needs `small_deleted_ratio` and at least `small_deleted_rows` deleted rows:
     /// the tiered rule merges it (dropping its deleted rows) once its tier fills, and the floor
     /// keeps a small collection from being rewritten on every delete. The ratio bounds the
-    /// cost: such a rewrite copies no more live rows than the deleted rows it drops, and a
+    /// cost: such a rewrite, of the segment alone, copies no more live rows than the deleted
+    /// rows it drops, and a
     /// segment that never fills its tier keeps fewer than half its rows (or fewer than the
     /// floor) deleted.
     #[allow(clippy::cast_precision_loss)]

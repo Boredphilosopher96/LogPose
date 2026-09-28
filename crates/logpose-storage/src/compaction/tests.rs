@@ -475,3 +475,60 @@ fn write_amplification_of_deletions_in_a_small_segment_is_at_most_one_row_per_de
     assert_eq!(copied, 450 + 225 + 112 + 48);
     assert!(copied <= 900);
 }
+
+/// A small segment rewritten for its deletions is rewritten alone: the segments beside it have
+/// nothing to reclaim and wait for their tier to fill. Otherwise every small segment that
+/// reached the deleted-row floor would copy up to `min_merge - 1` tier-0 segments of up to
+/// `base_rows` rows each, so deletes of short-lived rows would rewrite a long-lived small
+/// segment again and again.
+#[test]
+fn a_small_segment_rewritten_for_its_deletions_leaves_the_segments_beside_it_alone() {
+    let small = policy(
+        CompactionConfig {
+            base_rows: 1_000,
+            ..config()
+        },
+        u64::MAX,
+    );
+    // A long-lived small segment, and a short-lived one whose rows are all deleted.
+    let segments = [segment(1, 900, 0), segment(2, 128, 128), segment(3, 10, 0)];
+    let plans = small.plan(&segments, &BTreeSet::new(), 2);
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(plans[0].reason, PlanReason::Deletions);
+    assert_eq!(units(&plans[0]), [2]);
+
+    // Round after round, a flush of 128 rows that are all deleted later: the rows rewritten
+    // stay within the rows deleted, and the long-lived segment is never copied.
+    let mut segments = vec![segment(1, 900, 0)];
+    let mut next_unit = 1;
+    let (mut deleted, mut copied) = (0, 0);
+    for _ in 0..100 {
+        next_unit += 1;
+        segments.push(segment(next_unit, 128, 128));
+        deleted += 128;
+        loop {
+            let plans = small.plan(&segments, &BTreeSet::new(), 2);
+            if plans.is_empty() {
+                break;
+            }
+            for plan in plans {
+                let live = segments
+                    .iter()
+                    .filter(|segment| plan.inputs.contains(&segment.unit))
+                    .map(Candidate::live)
+                    .sum::<u64>();
+                segments.retain(|segment| !plan.inputs.contains(&segment.unit));
+                copied += live;
+                if live > 0 {
+                    next_unit += 1;
+                    segments.push(segment(next_unit, u32::try_from(live).expect("fits"), 0));
+                }
+            }
+        }
+    }
+    assert!(
+        copied <= deleted,
+        "{copied} rows copied for {deleted} deleted"
+    );
+    assert!(segments.iter().any(|segment| segment.unit == UnitId(1)));
+}
