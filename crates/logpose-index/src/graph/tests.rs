@@ -93,6 +93,71 @@ fn clustered_with_spread(
     }
 }
 
+/// Gaussian blobs around Gaussian centers (unit variance per dimension),
+/// under squared L2. In 64 or more dimensions the centers are almost
+/// equidistant, so no chain of ever-closer clusters leads a greedy walk to
+/// the query's cluster; `spread` well below 1 separates the blobs.
+fn separated_clusters(
+    rows: usize,
+    dim: usize,
+    clusters: usize,
+    queries: usize,
+    spread: f32,
+    seed: u64,
+) -> Clustered {
+    let mut rng = TestRng(seed);
+    let centers: Vec<Vec<f32>> = (0..clusters)
+        .map(|_| (0..dim).map(|_| rng.gaussian()).collect())
+        .collect();
+    let mut data = Vec::with_capacity(rows * dim);
+    let mut cluster_of = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let cluster = rng.below(clusters);
+        cluster_of.push(cluster);
+        data.extend(centers[cluster].iter().map(|c| c + spread * rng.gaussian()));
+    }
+    let queries = (0..queries)
+        .map(|_| {
+            let cluster = rng.below(clusters);
+            centers[cluster]
+                .iter()
+                .map(|c| c + spread * rng.gaussian())
+                .collect()
+        })
+        .collect();
+    Clustered {
+        vectors: F32Vectors::new(dim, data, F32Metric::L2Squared).expect("valid vectors"),
+        centers,
+        cluster_of,
+        queries,
+    }
+}
+
+/// Recall@`k` of every query at beam width `ef`, in query order, with the
+/// mean distance computations per query.
+fn per_query_recall(
+    data: &Clustered,
+    graph: &HnswGraph,
+    truths: &[Vec<u32>],
+    k: usize,
+    ef: usize,
+) -> (Vec<f64>, f64) {
+    let mut scratch = SearchScratch::new();
+    let mut distances = 0;
+    let recalls = data
+        .queries
+        .iter()
+        .zip(truths)
+        .map(|(query, truth)| {
+            let distance = data.vectors.query(query).expect("query");
+            let output = graph.search(&distance, k, ef, &mut scratch);
+            distances += output.stats.distance_computations;
+            recall(&output.neighbors, truth)
+        })
+        .collect();
+    (recalls, distances as f64 / data.queries.len().max(1) as f64)
+}
+
 fn brute_force<F: RowFilter + ?Sized>(
     vectors: &F32Vectors,
     query: &[f32],
@@ -615,6 +680,40 @@ fn recall_at_10_on_clustered_10k_by_32() {
     let mean = total / fixture.data.queries.len() as f64;
     eprintln!("unfiltered recall@10 (ef=64): {mean:.4}");
     assert!(mean >= 0.95, "recall@10 = {mean}");
+}
+
+#[test]
+fn no_query_misses_every_neighbor_on_separated_clusters() {
+    // 128 blobs in 128 dimensions whose centers are almost equidistant. A
+    // single greedy path over layer 1 used to stop in a cluster ranked 5th
+    // to 20th nearest to the query's own, and the layer-0 beam at ef = 64
+    // then returned only rows of that cluster: 5 of these 1,000 queries got
+    // recall 0 from the sequential build, while the mean stayed at 0.995.
+    let data = separated_clusters(20_000, 128, 128, 1_000, 0.1, 17);
+    let truths: Vec<Vec<u32>> = data
+        .queries
+        .iter()
+        .map(|query| brute_force(&data.vectors, query, 10, &AllRows))
+        .collect();
+    let sequential = HnswGraph::build(&data.vectors, HnswParams::default()).expect("build");
+    let parallel =
+        HnswGraph::build_parallel(&data.vectors, HnswParams::default()).expect("parallel build");
+    for (label, graph) in [("sequential", &sequential), ("parallel", &parallel)] {
+        let (recalls, _) = per_query_recall(&data, graph, &truths, 10, 64);
+        let missed: Vec<usize> = recalls
+            .iter()
+            .enumerate()
+            .filter(|(_, recall)| **recall == 0.0)
+            .map(|(query, _)| query)
+            .collect();
+        let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        eprintln!("{label}: recall@10 (ef=64) mean {mean:.4}, zero-recall queries {missed:?}");
+        assert!(
+            missed.is_empty(),
+            "{label}: queries {missed:?} found none of their true top 10"
+        );
+        assert!(mean >= 0.97, "{label}: recall@10 = {mean}");
+    }
 }
 
 #[test]
@@ -1344,6 +1443,80 @@ fn release_unfiltered_recall_and_qps() {
                 started.elapsed().as_secs_f64()
             );
             unfiltered_sweep(&data, &graph, &format!("{label} sequential"));
+        }
+    }
+}
+
+/// Counts row-to-row distances, a load-independent measure of build work.
+struct CountingSource<'a> {
+    inner: &'a F32Vectors,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl VectorSource for CountingSource<'_> {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> f32 {
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.distance_between(a, b)
+    }
+}
+
+/// Recall distribution (minimum, 1st percentile, mean, queries with recall
+/// 0), throughput and build time on separated clusters and on unclustered
+/// Gaussian data, for both builds.
+#[test]
+#[ignore = "release benchmark"]
+fn release_recall_distribution() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    for (rows, dim, clusters, spread, label) in [
+        (50_000, 128, 256, 0.15, "separated 50000x128, 256 clusters"),
+        (20_000, 128, 128, 0.1, "separated 20000x128, 128 clusters"),
+        (50_000, 32, 1, 1.0, "unclustered 50000x32"),
+        (50_000, 128, 1, 1.0, "unclustered 50000x128"),
+    ] {
+        let data = separated_clusters(rows, dim, clusters, 1_000, spread, 17);
+        let truths: Vec<Vec<u32>> = data
+            .queries
+            .iter()
+            .map(|query| brute_force(&data.vectors, query, 10, &AllRows))
+            .collect();
+        for parallel in [false, true] {
+            let source = CountingSource {
+                inner: &data.vectors,
+                count: AtomicU64::new(0),
+            };
+            let started = Instant::now();
+            let graph = if parallel {
+                HnswGraph::build_parallel(&source, HnswParams::default())
+            } else {
+                HnswGraph::build(&source, HnswParams::default())
+            }
+            .expect("build");
+            let build = started.elapsed().as_secs_f64();
+            let kind = if parallel { "parallel" } else { "sequential" };
+            eprintln!(
+                "{label} {kind}: build {build:.2}s, {:.0} distances/row",
+                source.count.load(Ordering::Relaxed) as f64 / rows as f64
+            );
+            for ef in [32, 64, 128] {
+                let started = Instant::now();
+                let (mut recalls, distances) = per_query_recall(&data, &graph, &truths, 10, ef);
+                let qps = recalls.len() as f64 / started.elapsed().as_secs_f64();
+                recalls.sort_by(f64::total_cmp);
+                let zero = recalls.iter().filter(|recall| **recall == 0.0).count();
+                let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+                eprintln!(
+                    "  ef={ef:>3}: recall@10 min {:.2} p1 {:.2} mean {mean:.4} zero {zero}, \
+                     {qps:>6.0} QPS (1 thread), {distances:>5.0} dist/query",
+                    recalls[0],
+                    recalls[recalls.len() / 100],
+                );
+            }
         }
     }
 }

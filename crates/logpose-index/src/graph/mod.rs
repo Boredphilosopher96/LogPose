@@ -19,9 +19,17 @@
 //! Yashunin (algorithm 4, with `keepPrunedConnections`), `M` links on upper
 //! layers, `2M` on layer 0, and levels drawn with `mL = 1 / ln(M)` from a
 //! counter-based RNG keyed by `(seed, row)`, with no artificial level cap.
-//! [`HnswGraph::insert`] appends one row incrementally.
+//! [`HnswGraph::insert`] appends one row incrementally. An insert descends
+//! like a query (below) to the layer above the row's own level, and every
+//! layer the row joins is searched with a beam of `ef_construction` rows.
 //!
 //! # Search
+//!
+//! A query walks greedily from the entry point down to layer 2. Layer 1, the
+//! entry layer, is searched with a beam of `M` rows instead of a single
+//! greedy path, and every row that beam keeps seeds the layer-0 beam of
+//! `ef` rows. On clustered data a single greedy path can stop in the wrong
+//! cluster, and the layer-0 beam cannot always leave it.
 //!
 //! Searches run on a reusable [`SearchScratch`] (binary-heap queues and a
 //! generation-stamped visited array, so steady-state queries do not allocate
