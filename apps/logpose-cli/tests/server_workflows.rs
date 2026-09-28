@@ -336,8 +336,57 @@ fn data_only_nodes_reject_collection_creation_over_cli_transport() {
 
     assert!(stderr.contains("failed to create collection"));
     assert!(stderr.contains(
-        "is running as 'data' and cannot accept control-plane collection lifecycle mutations"
+        "WRONG_NODE_ROLE: node 'cli-data-only' is running as 'data' and cannot accept \
+         control-plane collection lifecycle mutations"
     ));
+    assert!(stderr.contains("code: FAILED_PRECONDITION"), "{stderr}");
+    assert!(
+        stderr.contains("metadata: node=cli-data-only, node_role=data"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("retry:"), "{stderr}");
+}
+
+#[test]
+fn server_validation_errors_print_their_reason_and_field_violations() {
+    let fixture = TestServerFixture::spawn("cli-typed-errors");
+    let input_path = fixture.temp_root.join("wrong-dimensions.jsonl");
+    fs::write(&input_path, r#"{"id":"alpha","vector":[1.0,0.0,0.5]}"#)
+        .expect("jsonl input should be written");
+    fixture.run_cli([
+        "collection",
+        "create",
+        "documents",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+
+    let output = fixture.run_cli_expect_failure([
+        "record",
+        "put",
+        "documents",
+        "--input",
+        input_path.to_str().expect("input path should be utf8"),
+    ]);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+
+    assert!(
+        stderr.contains("DIMENSION_MISMATCH: record 'alpha' expected 2 dimensions but found 3"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("code: INVALID_ARGUMENT"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "field operations[0].vector: record 'alpha' expected 2 dimensions but found 3"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("metadata: actual_dimensions=3, expected_dimensions=2, record_id=alpha"),
+        "{stderr}"
+    );
 }
 
 #[test]
