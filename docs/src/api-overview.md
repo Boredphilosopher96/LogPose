@@ -139,7 +139,10 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 to `owner_node` or `leader_node` when the error names one, or retry after the
 hint. `COLLECTION_POISONED` means a storage failure made the collection
 read-only until an operator reopens the engine; reads keep working. Do not
-retry it automatically. `WAL_WRITE_FAILED` is the error of the writes whose WAL
+retry it automatically. Flushes that keep failing (five in a row by default,
+or one on a full or read-only device) poison the collection too, and the
+collection's stats then show the failure in `maintenance.last_error`.
+`WAL_WRITE_FAILED` is the error of the writes whose WAL
 group could not be made durable, which also poisons the collection: with
 `outcome` `not_applied` the write is definitely absent (`UNAVAILABLE`); with
 `unknown_fenced` or `unknown_unfenced` it may still appear after recovery, so
