@@ -1,0 +1,786 @@
+syntax = "proto3";
+
+package logpose.v2;
+
+// Errors
+//
+// A failed RPC returns a status whose code is the canonical LogPose error code, the same
+// name the REST API returns in `code`. The `grpc-status-details-bin` trailer carries a
+// `google.rpc.Status` whose details hold a `google.rpc.ErrorInfo` (a stable `reason` such
+// as `NOT_OWNER`, domain `logpose`, and `metadata` with the error's structured fields such
+// as `owner_node`), a `google.rpc.BadRequest` when the error names request fields such as
+// `records[2].price`, and a `google.rpc.RetryInfo` when retrying is expected to help.
+//
+// A retry hint is also sent as the ASCII trailer `retry-after-ms`. Not-owner and not-leader
+// are `UNAVAILABLE`. A request message larger than `limits.max_grpc_message_bytes` is
+// `RESOURCE_EXHAUSTED` with reason `TOO_LARGE`.
+//
+// Database selector
+//
+// Every database-scoped request names its database in `database_name`, and every
+// collection-scoped request names its collection in `database_name` and `collection_name`.
+// Both are required: an empty name is `INVALID_ARGUMENT`. There is no implicit default
+// database; the built-in database is named `default`.
+service LogPoseService {
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
+  rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
+
+  rpc PutDatabase(PutDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc GetDatabase(GetDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
+  // Drop an empty database and its access policy. The default database cannot be dropped,
+  // and a database that still holds a collection is FAILED_PRECONDITION.
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseReply);
+  rpc PutDatabasePolicy(PutDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
+  rpc GetDatabasePolicy(GetDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
+
+  rpc CreateCollection(CreateCollectionRequest) returns (CollectionReply);
+  rpc GetCollection(GetCollectionRequest) returns (CollectionReply);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsReply);
+  // Change a collection's schema online: add, drop, or rename one field. Returns the
+  // collection with its new schema.
+  rpc AlterCollection(AlterCollectionRequest) returns (CollectionReply);
+  rpc DropCollection(DropCollectionRequest) returns (DropCollectionReply);
+  rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
+
+  // Insert or replace whole records, as one atomic batch.
+  rpc UpsertRecords(UpsertRecordsRequest) returns (CommitAckReply);
+  // Change some fields of existing records, as one atomic batch. A key without a live
+  // record fails the whole batch with NOT_FOUND.
+  rpc UpdateRecords(UpdateRecordsRequest) returns (CommitAckReply);
+  // Delete records by primary key, as one atomic batch. Missing keys are no-ops.
+  rpc DeleteRecords(DeleteRecordsRequest) returns (CommitAckReply);
+  // Read records by primary key.
+  rpc GetRecords(GetRecordsRequest) returns (GetRecordsReply);
+  // Stream batches of upserts into one collection. See BulkUpsertRecordsRequest.
+  rpc BulkUpsertRecords(stream BulkUpsertRecordsRequest) returns (BulkUpsertRecordsReply);
+
+  rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
+  rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
+  rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
+  rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
+  rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
+}
+
+message GetMetadataRequest {}
+
+message GetMetadataReply {
+  string product = 1;
+  string node_name = 2;
+  string version = 3;
+  string git_sha = 4;
+  string profile = 5;
+}
+
+message GetRuntimeStatusRequest {}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_COMBINED = 1;
+  NODE_ROLE_CONTROL = 2;
+  NODE_ROLE_DATA = 3;
+}
+
+message MaintenanceBacklogReply {
+  uint64 collections_with_pending = 1;
+  uint64 pending_operations = 2;
+  uint64 collections_in_progress = 3;
+  uint64 collections_with_errors = 4;
+}
+
+message CoordinationStatusReply {
+  string cluster_name = 1;
+  bool membership_registered = 2;
+  optional int64 membership_lease_id = 3;
+  repeated string registered_members = 4;
+  optional string leader_node = 5;
+  bool is_local_leader = 6;
+  optional int64 leadership_lease_id = 7;
+  optional string last_error = 8;
+}
+
+message CollectionPlacementReply {
+  string collection_id = 1;
+  string collection_name = 2;
+  string assigned_node = 3;
+  NodeRole assigned_role = 4;
+  string route_kind = 5;
+  string route_reason = 6;
+  string database_name = 7;
+  optional string owner_node = 8;
+  optional uint64 ownership_epoch = 9;
+}
+
+message GetRuntimeStatusReply {
+  GetMetadataReply metadata = 1;
+  NodeRole role = 2;
+  string rest_endpoint = 3;
+  string grpc_endpoint = 4;
+  string storage_engine = 5;
+  bool control_plane_ready = 6;
+  bool data_plane_ready = 7;
+  uint64 collection_count = 8;
+  repeated CollectionPlacementReply collections = 9;
+  MaintenanceBacklogReply maintenance = 10;
+  optional CoordinationStatusReply coordination = 11;
+}
+
+// Databases
+
+message DatabaseDescriptorReply {
+  string database_id = 1;
+  string name = 2;
+  bool is_default = 3;
+}
+
+// Create the database if it does not exist; the stored descriptor is returned either way.
+message PutDatabaseRequest {
+  string database_name = 1;
+}
+
+message GetDatabaseRequest {
+  string database_name = 1;
+}
+
+message ListDatabasesRequest {}
+
+message ListDatabasesReply {
+  repeated DatabaseDescriptorReply databases = 1;
+}
+
+message DropDatabaseRequest {
+  string database_name = 1;
+}
+
+message DropDatabaseReply {
+  string database_name = 1;
+}
+
+enum AuthenticationMode {
+  AUTHENTICATION_MODE_UNSPECIFIED = 0;
+  AUTHENTICATION_MODE_DISABLED = 1;
+  AUTHENTICATION_MODE_PASSWORD = 2;
+  AUTHENTICATION_MODE_MUTUAL_TLS = 3;
+  AUTHENTICATION_MODE_EXTERNAL_TOKEN = 4;
+}
+
+enum DatabaseRole {
+  DATABASE_ROLE_UNSPECIFIED = 0;
+  DATABASE_ROLE_OWNER = 1;
+  DATABASE_ROLE_READ_WRITE = 2;
+  DATABASE_ROLE_READ_ONLY = 3;
+}
+
+// A principal's role in the database the policy belongs to.
+message DatabaseRoleBinding {
+  string principal_name = 1;
+  DatabaseRole role = 2;
+}
+
+message DatabaseAccessPolicyReply {
+  string database_name = 1;
+  AuthenticationMode authentication_mode = 2;
+  repeated DatabaseRoleBinding role_bindings = 3;
+}
+
+// Create or replace the access policy of `database_name`.
+message PutDatabasePolicyRequest {
+  string database_name = 1;
+  AuthenticationMode authentication_mode = 2;
+  repeated DatabaseRoleBinding role_bindings = 3;
+}
+
+message GetDatabasePolicyRequest {
+  string database_name = 1;
+}
+
+// Collections and schemas
+
+enum DistanceMetric {
+  DISTANCE_METRIC_UNSPECIFIED = 0;
+  DISTANCE_METRIC_COSINE = 1;
+  DISTANCE_METRIC_DOT = 2;
+  DISTANCE_METRIC_L2 = 3;
+}
+
+enum PrimaryKeyType {
+  PRIMARY_KEY_TYPE_UNSPECIFIED = 0;
+  PRIMARY_KEY_TYPE_STRING = 1;
+  PRIMARY_KEY_TYPE_INT64 = 2;
+}
+
+// Type of a scalar field. Arrays are flat, hold one element type, and cannot hold null.
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_BOOL = 1;
+  FIELD_TYPE_INT64 = 2;
+  FIELD_TYPE_FLOAT64 = 3;
+  FIELD_TYPE_STRING = 4;
+  FIELD_TYPE_TIMESTAMP = 5;
+  FIELD_TYPE_JSON = 6;
+  FIELD_TYPE_ARRAY_BOOL = 7;
+  FIELD_TYPE_ARRAY_INT64 = 8;
+  FIELD_TYPE_ARRAY_FLOAT64 = 9;
+  FIELD_TYPE_ARRAY_STRING = 10;
+  FIELD_TYPE_ARRAY_TIMESTAMP = 11;
+}
+
+// Scalar index of a field. AUTO lets the engine choose from the type: INVERTED for bool,
+// string, and arrays, INVERTED_AND_SORTED for numbers and timestamps, NONE for json. A
+// stored schema never holds AUTO.
+enum FieldIndex {
+  FIELD_INDEX_AUTO = 0;
+  FIELD_INDEX_NONE = 1;
+  FIELD_INDEX_INVERTED = 2;
+  FIELD_INDEX_SORTED = 3;
+  FIELD_INDEX_INVERTED_AND_SORTED = 4;
+}
+
+message PrimaryKeySpec {
+  string name = 1;
+  PrimaryKeyType type = 2;
+}
+
+message VectorFieldSpec {
+  string name = 1;
+  // 1 to 65,536 components.
+  uint32 dimensions = 2;
+  // Defaults to cosine. Cosine vectors are normalized to unit length when written.
+  DistanceMetric metric = 3;
+}
+
+message ScalarFieldSpec {
+  string name = 1;
+  FieldType type = 2;
+  FieldIndex index = 3;
+  // Whether records may omit the field or set it to null; defaults to true. Fields added
+  // to an existing collection must be nullable.
+  optional bool nullable = 4;
+}
+
+// Create a collection with a typed schema (engine plan decision D4).
+message CreateCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  PrimaryKeySpec primary_key = 3;
+  // At least one vector field.
+  repeated VectorFieldSpec vectors = 4;
+  repeated ScalarFieldSpec fields = 5;
+  // Whether undeclared keys are kept in the `$extra` dynamic field; defaults to true.
+  optional bool dynamic_fields = 6;
+}
+
+message PrimaryKeyField {
+  uint32 id = 1;
+  string name = 2;
+  PrimaryKeyType type = 3;
+}
+
+message VectorField {
+  uint32 id = 1;
+  string name = 2;
+  uint32 dimensions = 3;
+  DistanceMetric metric = 4;
+}
+
+message ScalarField {
+  uint32 id = 1;
+  string name = 2;
+  FieldType type = 3;
+  FieldIndex index = 4;
+  bool nullable = 5;
+}
+
+// A collection's stored schema. Field ids are stable and never reused; `schema_version`
+// grows by one with every change.
+message CollectionSchema {
+  uint64 schema_version = 1;
+  uint32 next_field_id = 2;
+  PrimaryKeyField primary_key = 3;
+  repeated VectorField vectors = 4;
+  repeated ScalarField fields = 5;
+  bool dynamic_fields = 6;
+  // Names that were declared once and then dropped or renamed away. `$extra` keys under
+  // these names stay hidden until a field with the name is declared again.
+  repeated string retired_names = 7;
+}
+
+message RemoteBlobConfig {
+  string endpoint = 1;
+  string bucket = 2;
+  string prefix = 3;
+}
+
+// A collection with its live schema.
+message CollectionReply {
+  string collection_id = 1;
+  string database_name = 2;
+  string name = 3;
+  CollectionSchema schema = 4;
+  string root_path = 5;
+  uint64 flush_threshold_ops = 6;
+  uint64 flush_threshold_bytes = 7;
+  uint64 compaction_threshold_segments = 8;
+  RemoteBlobConfig remote_blob = 9;
+}
+
+message GetCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+message ListCollectionsRequest {
+  string database_name = 1;
+}
+
+message ListCollectionsReply {
+  repeated CollectionReply collections = 1;
+}
+
+message DropField {
+  string name = 1;
+}
+
+message RenameField {
+  string from = 1;
+  string to = 2;
+}
+
+message AlterCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  oneof change {
+    // Add a nullable scalar field. Rows written before it read null.
+    ScalarFieldSpec add_field = 3;
+    // Drop a scalar or vector field (not the primary key or the last vector field).
+    DropField drop_field = 4;
+    // Rename any field, including the primary key.
+    RenameField rename_field = 5;
+  }
+}
+
+message DropCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+message DropCollectionReply {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+message GetCollectionPlacementRequest {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+// Typed values and records
+
+// The single value of `NullValue`, for a null.
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+// A typed field value. Exactly one kind is set; a value with no kind is INVALID_ARGUMENT.
+// A value must have the kind of its field's type: nothing is coerced, so an int64_value
+// does not fit a float64 field.
+message Value {
+  oneof kind {
+    NullValue null_value = 1;
+    bool bool_value = 2;
+    int64 int64_value = 3;
+    // Finite; NaN and infinities are rejected.
+    double float64_value = 4;
+    string string_value = 5;
+    // Microseconds since the Unix epoch, UTC, in years 0000 through 9999.
+    int64 timestamp_micros = 6;
+    // Elements of one kind, none null.
+    ValueArray array_value = 7;
+    // A `json` field's document.
+    JsonValue json_value = 8;
+  }
+}
+
+message ValueArray {
+  repeated Value values = 1;
+}
+
+// A JSON document, for `json` fields and the `$extra` dynamic field. Integers keep their
+// precision: int64_value, or uint64_value only above the int64 range.
+message JsonValue {
+  oneof kind {
+    NullValue null_value = 1;
+    bool bool_value = 2;
+    int64 int64_value = 3;
+    uint64 uint64_value = 4;
+    // Finite; NaN and infinities are rejected.
+    double float64_value = 5;
+    string string_value = 6;
+    JsonArray array_value = 7;
+    JsonObject object_value = 8;
+  }
+}
+
+message JsonArray {
+  repeated JsonValue values = 1;
+}
+
+message JsonObject {
+  map<string, JsonValue> fields = 1;
+}
+
+// A primary key: an int64 or a non-empty string of at most 1,024 bytes, as the schema
+// declares.
+message PrimaryKey {
+  oneof kind {
+    int64 int64_value = 1;
+    string string_value = 2;
+  }
+}
+
+message Vector {
+  repeated float values = 1;
+}
+
+// One record of a collection.
+//
+// Written records must carry every vector field. `fields` holds scalar fields by name; with
+// dynamic fields on, an undeclared name in `fields` is stored in `$extra` as JSON. `extra`
+// holds `$extra` keys directly. A key may not appear in both, and may not be a declared or
+// retired field name.
+//
+// Read records carry the fields the request projected: vectors, non-null scalar fields, and
+// the visible `$extra` keys.
+message Record {
+  PrimaryKey pk = 1;
+  map<string, Vector> vectors = 2;
+  map<string, Value> fields = 3;
+  JsonObject extra = 4;
+}
+
+// A change to some fields of one record.
+//
+// - `vectors`: each entry replaces that vector;
+// - `fields`: each entry replaces that field, and a null_value clears it;
+// - `extra`: each entry replaces that `$extra` key, and a JSON null removes it.
+message RecordUpdate {
+  PrimaryKey pk = 1;
+  map<string, Vector> vectors = 2;
+  map<string, Value> fields = 3;
+  JsonObject extra = 4;
+}
+
+message UpsertRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated Record records = 3;
+}
+
+message UpdateRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated RecordUpdate records = 3;
+}
+
+message DeleteRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated PrimaryKey keys = 3;
+}
+
+message GetRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated PrimaryKey keys = 3;
+  // Fields to return: declared field names, `$extra` for every visible dynamic key, or (with
+  // dynamic fields on) single dynamic keys. The primary key is always returned. Empty
+  // returns every field.
+  repeated string output_fields = 4;
+}
+
+message GetRecordsReply {
+  string database_name = 1;
+  string collection_name = 2;
+  // The live records found, in request order.
+  repeated Record records = 3;
+  // The requested keys without a live record, in request order.
+  repeated PrimaryKey missing_keys = 4;
+  // The state the lookup read.
+  Snapshot snapshot = 5;
+}
+
+// One batch of a BulkUpsertRecords stream.
+//
+// - The first message names the collection; later messages may leave `database_name` and
+//   `collection_name` empty or must repeat the same values.
+// - Each message is one batch, committed atomically exactly like one UpsertRecords call.
+//   Batches commit in stream order, one at a time: the server reads the next message only
+//   after the previous batch is committed, so HTTP/2 flow control pushes back on a client
+//   that sends faster than the collection commits.
+// - Each message is checked against `limits.max_grpc_message_bytes` on its own.
+// - If a batch fails, the RPC fails with that batch's error and stops reading. Every earlier
+//   batch is committed; the failed batch and everything after it are not. The error's
+//   `ErrorInfo` metadata reports `failed_batch_index`, `committed_batches`,
+//   `committed_operations`, and `last_committed_seq_no` (when a batch was committed).
+// - If the client cancels or disconnects, the batch being committed (if any) still completes
+//   or fails as a whole, and once the server sees the cancellation it starts no further
+//   batch, even one the client sent before cancelling.
+message BulkUpsertRecordsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated Record records = 3;
+}
+
+// Summary of a fully committed BulkUpsertRecords stream.
+message BulkUpsertRecordsReply {
+  string database_name = 1;
+  string collection_name = 2;
+  // Batches committed, which is every message in the stream.
+  uint64 committed_batches = 3;
+  // Records applied across all batches.
+  uint64 applied_ops = 4;
+  // Last sequence number of the last batch.
+  uint64 last_seq_no = 5;
+  // Snapshot that includes every batch.
+  Snapshot snapshot = 6;
+}
+
+message CommitAckReply {
+  string database_name = 1;
+  string collection_name = 2;
+  uint64 last_seq_no = 3;
+  uint64 applied_ops = 4;
+  Snapshot snapshot = 5;
+}
+
+message Snapshot {
+  uint64 manifest_generation = 1;
+  uint64 visible_seq_no = 2;
+}
+
+message SnapshotReply {
+  string database_name = 1;
+  string collection_name = 2;
+  uint64 manifest_generation = 3;
+  uint64 visible_seq_no = 4;
+}
+
+// Queries
+
+message ScalarValue {
+  oneof kind {
+    string string_value = 1;
+    int64 int64_value = 2;
+    uint64 uint64_value = 3;
+    double double_value = 4;
+    bool bool_value = 5;
+    bool null_value = 6;
+  }
+}
+
+message MetadataFilter {
+  string field = 1;
+  ScalarValue value = 2;
+}
+
+enum PredicateOperator {
+  PREDICATE_OPERATOR_UNSPECIFIED = 0;
+  PREDICATE_OPERATOR_EQ = 1;
+  PREDICATE_OPERATOR_NE = 2;
+  PREDICATE_OPERATOR_LT = 3;
+  PREDICATE_OPERATOR_LTE = 4;
+  PREDICATE_OPERATOR_GT = 5;
+  PREDICATE_OPERATOR_GTE = 6;
+  PREDICATE_OPERATOR_EXISTS = 7;
+  PREDICATE_OPERATOR_IS_NULL = 8;
+}
+
+message PredicateComparison {
+  string field = 1;
+  PredicateOperator operator = 2;
+  ScalarValue value = 3;
+}
+
+message PredicateList {
+  repeated Predicate children = 1;
+}
+
+message PredicateNot {
+  Predicate child = 1;
+}
+
+message Predicate {
+  oneof node {
+    PredicateList and = 1;
+    PredicateList or = 2;
+    PredicateNot not = 3;
+    PredicateComparison comparison = 4;
+  }
+}
+
+enum ExplainMode {
+  EXPLAIN_MODE_NONE = 0;
+  EXPLAIN_MODE_PLAN = 1;
+  EXPLAIN_MODE_PROFILE = 2;
+}
+
+// Search the collection's first vector field.
+message QueryCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  repeated float vector = 3;
+  uint64 top_k = 4;
+  Snapshot snapshot = 5;
+  Snapshot read_barrier = 6;
+  repeated MetadataFilter filters = 7;
+  Predicate predicate = 8;
+  ExplainMode explain = 9;
+}
+
+// One search hit. `id` is the primary key as text, and `metadata` holds the record's
+// scalar fields and visible `$extra` keys.
+message QueryMatch {
+  string id = 1;
+  float value = 2;
+  JsonObject metadata = 3;
+}
+
+enum QueryPlanKind {
+  QUERY_PLAN_KIND_UNSPECIFIED = 0;
+  QUERY_PLAN_KIND_UNFILTERED_EXACT_SCAN = 1;
+  QUERY_PLAN_KIND_PREDICATE_FIRST_EXACT = 2;
+  QUERY_PLAN_KIND_VECTOR_FIRST_EXACT = 3;
+  QUERY_PLAN_KIND_TINY_POPULATION_EXACT_FALLBACK = 4;
+  QUERY_PLAN_KIND_VECTOR_FIRST_ANN = 5;
+  QUERY_PLAN_KIND_COOPERATIVE_FILTERED_ANN = 6;
+  QUERY_PLAN_KIND_HYBRID_EXACT_ANN_MERGE = 7;
+}
+
+message QueryStageTimings {
+  uint64 planning_micros = 1;
+  uint64 prefilter_micros = 2;
+  uint64 candidate_generation_micros = 3;
+  uint64 postfilter_micros = 4;
+  uint64 rerank_micros = 5;
+  uint64 merge_micros = 6;
+}
+
+message QueryDiagnostics {
+  QueryPlanKind chosen_plan = 1;
+  string planner_reason = 2;
+  float estimated_selectivity = 3;
+  uint64 units_considered = 4;
+  uint64 units_pruned = 5;
+  uint64 units_scanned = 6;
+  uint64 candidates_before_filter = 7;
+  uint64 candidates_after_filter = 8;
+  uint64 candidates_reranked = 9;
+  uint64 candidates_merged = 10;
+  uint64 rerank_count = 11;
+  optional string fallback_reason = 12;
+  map<string, uint64> unit_scan_mix = 13;
+  QueryStageTimings stage_timings = 14;
+}
+
+message QueryCollectionReply {
+  string database_name = 1;
+  string collection_name = 2;
+  DistanceMetric metric = 3;
+  uint64 top_k = 4;
+  uint64 returned = 5;
+  Snapshot snapshot = 6;
+  repeated QueryMatch matches = 7;
+  QueryDiagnostics diagnostics = 8;
+}
+
+// Statistics and maintenance
+
+message GetCollectionStatsRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  Snapshot snapshot = 3;
+  Snapshot read_barrier = 4;
+}
+
+message CollectionStatsReply {
+  string collection_id = 1;
+  string collection_name = 2;
+  uint64 manifest_generation = 3;
+  uint64 visible_seq_no = 4;
+  uint64 mutable_op_count = 5;
+  uint64 segment_count = 6;
+  uint64 live_record_count = 7;
+  uint64 deleted_record_count = 8;
+  MaintenanceStatus maintenance = 9;
+  repeated QueryUnitStats query_units = 10;
+  string database_name = 11;
+}
+
+message FlushCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+message CompactCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+}
+
+enum InspectTarget {
+  INSPECT_TARGET_MANIFEST = 0;
+  INSPECT_TARGET_WAL = 1;
+  INSPECT_TARGET_SEGMENT = 2;
+  INSPECT_TARGET_MAINTENANCE = 3;
+}
+
+message InspectCollectionRequest {
+  string database_name = 1;
+  string collection_name = 2;
+  InspectTarget target = 3;
+  string segment_id = 4;
+}
+
+// An operator diagnostic dump; `payload_json` is a JSON document whose shape depends on the
+// target and is not a stable contract.
+message InspectCollectionReply {
+  string database_name = 1;
+  string collection_name = 2;
+  string target = 3;
+  string payload_json = 4;
+}
+
+message MaintenanceStatus {
+  repeated string pending = 1;
+  optional string in_progress = 2;
+  optional string last_error = 3;
+  uint64 completed_runs = 4;
+}
+
+message ScalarFieldStats {
+  uint64 present_count = 1;
+  uint64 null_count = 2;
+  map<string, uint64> value_counts = 3;
+  ScalarValue min = 4;
+  ScalarValue max = 5;
+  uint64 distinct_count = 6;
+}
+
+message QueryUnitArtifactStats {
+  string kind = 1;
+  string file_name = 2;
+  uint64 approx_bytes = 3;
+}
+
+message QueryUnitStats {
+  string unit_id = 1;
+  string tier = 2;
+  string index_kind = 3;
+  uint64 min_seq_no = 4;
+  uint64 max_seq_no = 5;
+  uint64 put_count = 6;
+  uint64 delete_count = 7;
+  uint64 approx_bytes = 8;
+  map<string, ScalarFieldStats> scalar_fields = 9;
+  repeated QueryUnitArtifactStats artifact_stats = 10;
+  map<string, uint64> component_bytes = 11;
+}

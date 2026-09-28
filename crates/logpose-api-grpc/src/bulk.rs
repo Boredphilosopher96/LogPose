@@ -1,9 +1,9 @@
-//! Client-streaming bulk ingest (`BulkWriteCollection`).
+//! Client-streaming bulk ingest (`BulkUpsertRecords`).
 //!
 //! Semantics, also documented on the proto message and in `docs/src/api-overview.md`:
 //!
 //! - The first message names the collection; later messages may omit it or must repeat it.
-//! - Each message is one batch, committed atomically like one `WriteCollection` call.
+//! - Each message is one batch, committed atomically like one `UpsertRecords` call.
 //! - Batches commit in order, one at a time. The next message is read only after the previous
 //!   batch commits, so HTTP/2 flow control pushes back on a client that sends faster than the
 //!   collection commits.
@@ -14,14 +14,14 @@
 //!   a cancelled call, the task starts no further batch, even one the client sent before it
 //!   cancelled and that is still buffered in the HTTP/2 stream.
 
-use super::{
-    collection_lookup_key, normalize_database_name, proto, request_auth_from_metadata,
-    snapshot_message_from_domain, write_operations_from_proto,
+use super::{proto, request_auth_from_metadata};
+use crate::{
+    convert::{records_from_proto, required_name, snapshot_to_proto},
+    error::message_too_large,
 };
-use crate::error::message_too_large;
 use logpose_core::{AppState, RequestAuth};
 use logpose_types::{CommitAck, LogPoseError};
-use proto::{BulkWriteCollectionReply, BulkWriteCollectionRequest};
+use proto::{BulkUpsertRecordsReply, BulkUpsertRecordsRequest};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -29,10 +29,10 @@ use std::sync::{
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Code, Request, Status, Streaming};
 
-pub(crate) async fn bulk_write_collection(
+pub(crate) async fn bulk_upsert_records(
     state: Arc<AppState>,
-    request: Request<Streaming<BulkWriteCollectionRequest>>,
-) -> Result<BulkWriteCollectionReply, LogPoseError> {
+    request: Request<Streaming<BulkUpsertRecordsRequest>>,
+) -> Result<BulkUpsertRecordsReply, LogPoseError> {
     let auth = request_auth_from_metadata(&request)?;
     let stream = request.into_inner();
     // If the client goes away, tonic drops this future; the spawned task keeps a batch that is
@@ -41,7 +41,7 @@ pub(crate) async fn bulk_write_collection(
     let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
     tokio::spawn(ingest(state, auth, stream, cancelled))
         .await
-        .map_err(|error| LogPoseError::internal(format!("bulk write task failed: {error}")))?
+        .map_err(|error| LogPoseError::internal(format!("bulk upsert task failed: {error}")))?
 }
 
 /// Marks the call cancelled when dropped. The handler future owns it, and tonic drops that
@@ -59,6 +59,12 @@ impl Drop for CancelOnDrop {
 struct Target {
     database_name: String,
     collection_name: String,
+}
+
+impl Target {
+    fn key(&self) -> String {
+        format!("{}/{}", self.database_name, self.collection_name)
+    }
 }
 
 #[derive(Default)]
@@ -91,9 +97,9 @@ async fn ingest<S>(
     auth: RequestAuth,
     mut stream: S,
     cancelled: Arc<AtomicBool>,
-) -> Result<BulkWriteCollectionReply, LogPoseError>
+) -> Result<BulkUpsertRecordsReply, LogPoseError>
 where
-    S: Stream<Item = Result<BulkWriteCollectionRequest, Status>> + Unpin,
+    S: Stream<Item = Result<BulkUpsertRecordsRequest, Status>> + Unpin,
 {
     let limit = state.config.limits.max_grpc_message_bytes;
     let mut target = None;
@@ -108,18 +114,14 @@ where
         // waiting for its result, so do not start it.
         if cancelled.load(Ordering::Acquire) {
             return Err(progress.fail(LogPoseError::unavailable(
-                "the client cancelled the bulk write stream",
+                "the client cancelled the bulk upsert stream",
             )));
         }
         let result = async {
             let target = resolve_target(&mut target, &message)?;
-            let operations = write_operations_from_proto(message.operations)?;
+            let records = records_from_proto(message.records, "records")?;
             state
-                .write_with_auth(
-                    &auth,
-                    &collection_lookup_key(&target.database_name, &target.collection_name),
-                    operations,
-                )
+                .upsert_records_with_auth(&auth, &target.key(), records)
                 .await
         }
         .await;
@@ -130,33 +132,40 @@ where
     }
     let (Some(target), Some(last_ack)) = (target, progress.last_ack) else {
         return Err(LogPoseError::invalid_argument(
-            "bulk write stream must contain at least one batch",
+            "bulk upsert stream must contain at least one batch",
         ));
     };
-    Ok(BulkWriteCollectionReply {
+    Ok(BulkUpsertRecordsReply {
         database_name: target.database_name,
         collection_name: target.collection_name,
         committed_batches: progress.committed_batches,
         applied_ops: progress.committed_operations,
         last_seq_no: last_ack.last_seq_no,
-        snapshot: Some(snapshot_message_from_domain(last_ack.snapshot)),
+        snapshot: Some(snapshot_to_proto(last_ack.snapshot)),
     })
 }
 
 fn resolve_target(
     target: &mut Option<Target>,
-    message: &BulkWriteCollectionRequest,
+    message: &BulkUpsertRecordsRequest,
 ) -> Result<Target, LogPoseError> {
     let Some(fixed) = target else {
-        if message.collection_name.trim().is_empty() {
-            return Err(LogPoseError::invalid_field(
-                "collection_name",
-                "the first bulk write batch must name the collection",
-            ));
-        }
         let resolved = Target {
-            database_name: normalize_database_name(&message.database_name),
-            collection_name: message.collection_name.clone(),
+            database_name: required_name("database_name", message.database_name.clone()).map_err(
+                |_| {
+                    LogPoseError::invalid_field(
+                        "database_name",
+                        "the first bulk upsert batch must name the database",
+                    )
+                },
+            )?,
+            collection_name: required_name("collection_name", message.collection_name.clone())
+                .map_err(|_| {
+                    LogPoseError::invalid_field(
+                        "collection_name",
+                        "the first bulk upsert batch must name the collection",
+                    )
+                })?,
         };
         *target = Some(resolved.clone());
         return Ok(resolved);
@@ -165,18 +174,16 @@ fn resolve_target(
         return Err(LogPoseError::invalid_field(
             "collection_name",
             format!(
-                "every bulk write batch must target collection '{}', got '{}'",
+                "every bulk upsert batch must target collection '{}', got '{}'",
                 fixed.collection_name, message.collection_name
             ),
         ));
     }
-    if !message.database_name.is_empty()
-        && normalize_database_name(&message.database_name) != fixed.database_name
-    {
+    if !message.database_name.is_empty() && message.database_name != fixed.database_name {
         return Err(LogPoseError::invalid_field(
             "database_name",
             format!(
-                "every bulk write batch must target database '{}', got '{}'",
+                "every bulk upsert batch must target database '{}', got '{}'",
                 fixed.database_name, message.database_name
             ),
         ));
@@ -196,11 +203,11 @@ fn stream_error(status: &Status, limit: usize) -> LogPoseError {
         // Tonic's decode limit; see `MessageLimitLayer`.
         Code::OutOfRange if !transport_failure => message_too_large(limit),
         Code::Internal if !transport_failure => LogPoseError::invalid_argument(format!(
-            "malformed bulk write message: {}",
+            "malformed bulk upsert message: {}",
             status.message()
         )),
         _ => LogPoseError::unavailable(format!(
-            "bulk write stream was interrupted: {}",
+            "bulk upsert stream was interrupted: {}",
             status.message()
         )),
     }
@@ -209,18 +216,23 @@ fn stream_error(status: &Status, limit: usize) -> LogPoseError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestServer, put, small_grpc_limit};
+    use crate::test_support::{TestServer, put, small_grpc_limit, text};
     use logpose_config::LimitsConfig;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic_types::StatusExt;
 
-    fn batch(collection: &str, ids: &[&str]) -> BulkWriteCollectionRequest {
-        BulkWriteCollectionRequest {
+    /// A batch of `ids`; an empty collection name leaves the target to the first batch.
+    fn batch(collection: &str, ids: &[&str]) -> BulkUpsertRecordsRequest {
+        BulkUpsertRecordsRequest {
+            database_name: if collection.is_empty() {
+                String::new()
+            } else {
+                "default".to_owned()
+            },
             collection_name: collection.to_owned(),
-            database_name: String::new(),
-            operations: ids.iter().map(|id| put(id)).collect(),
+            records: ids.iter().map(|id| put(id)).collect(),
         }
     }
 
@@ -235,13 +247,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_commits_every_batch_and_returns_a_summary() {
+    async fn bulk_upsert_commits_every_batch_and_returns_a_summary() {
         let mut server = TestServer::start("bulk-happy", LimitsConfig::default()).await;
         server.create_collection("docs").await;
 
         let reply = server
             .client
-            .bulk_write_collection(tokio_stream::iter([
+            .bulk_upsert_records(tokio_stream::iter([
                 batch("docs", &["a", "b"]),
                 batch("", &["c"]),
                 batch("docs", &["d", "e", "f"]),
@@ -263,19 +275,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_stops_at_the_first_failed_batch_and_reports_committed_progress() {
+    async fn bulk_upsert_stops_at_the_first_failed_batch_and_reports_committed_progress() {
         let mut server = TestServer::start("bulk-mid-failure", LimitsConfig::default()).await;
         server.create_collection("docs").await;
         let mut bad = batch("docs", &["c"]);
-        if let Some(proto::write_operation::Operation::Put(record)) =
-            &mut bad.operations[0].operation
-        {
-            record.vector = vec![1.0, 2.0, 3.0];
-        }
+        bad.records[0].vectors.insert(
+            "vector".to_owned(),
+            proto::Vector {
+                values: vec![1.0, 2.0, 3.0],
+            },
+        );
 
         let status = server
             .client
-            .bulk_write_collection(tokio_stream::iter([
+            .bulk_upsert_records(tokio_stream::iter([
                 batch("docs", &["a", "b"]),
                 bad,
                 batch("docs", &["d"]),
@@ -305,25 +318,23 @@ mod tests {
             .get_details_bad_request()
             .map(|bad_request| bad_request.field_violations)
             .unwrap_or_default();
-        assert_eq!(violations[0].field, "operations[0].vector");
+        assert_eq!(violations[0].field, "records[0].vector");
         // The failed batch is atomic and nothing after it is applied.
         assert_eq!(server.live_records("docs").await, 2);
     }
 
     #[tokio::test]
-    async fn bulk_write_rejects_an_oversized_batch_as_resource_exhausted() {
+    async fn bulk_upsert_rejects_an_oversized_batch_as_resource_exhausted() {
         let mut server = TestServer::start("bulk-oversize", small_grpc_limit(1024)).await;
         server.create_collection("docs").await;
         let mut oversized = batch("docs", &["big"]);
-        if let Some(proto::write_operation::Operation::Put(record)) =
-            &mut oversized.operations[0].operation
-        {
-            record.metadata_json = format!("{{\"blob\":\"{}\"}}", "x".repeat(4096));
-        }
+        oversized.records[0]
+            .fields
+            .insert("blob".to_owned(), text("x".repeat(4096)));
 
         let status = server
             .client
-            .bulk_write_collection(tokio_stream::iter([batch("docs", &["a"]), oversized]))
+            .bulk_upsert_records(tokio_stream::iter([batch("docs", &["a"]), oversized]))
             .await
             .expect_err("an oversized batch should fail the stream");
 
@@ -345,14 +356,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_keeps_committed_batches_when_the_client_disconnects() {
+    async fn bulk_upsert_keeps_committed_batches_when_the_client_disconnects() {
         let mut server = TestServer::start("bulk-disconnect", LimitsConfig::default()).await;
         server.create_collection("docs").await;
         let (sender, receiver) = mpsc::channel(4);
         let mut client = server.client.clone();
         let call = tokio::spawn(async move {
             client
-                .bulk_write_collection(ReceiverStream::new(receiver))
+                .bulk_upsert_records(ReceiverStream::new(receiver))
                 .await
         });
         sender
@@ -377,7 +388,7 @@ mod tests {
         // The server keeps serving the collection.
         let reply = server
             .client
-            .bulk_write_collection(tokio_stream::iter([batch("docs", &["c"])]))
+            .bulk_upsert_records(tokio_stream::iter([batch("docs", &["c"])]))
             .await
             .expect("a new stream should succeed after a disconnect")
             .into_inner();
@@ -386,7 +397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_starts_no_batch_after_the_client_cancels() {
+    async fn bulk_upsert_starts_no_batch_after_the_client_cancels() {
         let mut server = TestServer::start("bulk-cancel-buffered", LimitsConfig::default()).await;
         server.create_collection("docs").await;
         let (sender, receiver) = mpsc::channel(4);
@@ -457,7 +468,7 @@ mod tests {
         assert!(
             malformed
                 .to_string()
-                .contains("malformed bulk write message")
+                .contains("malformed bulk upsert message")
         );
 
         // What tonic returns when the HTTP/2 stream itself fails.
@@ -470,7 +481,7 @@ mod tests {
         assert!(
             interrupted
                 .to_string()
-                .contains("bulk write stream was interrupted")
+                .contains("bulk upsert stream was interrupted")
         );
 
         let too_large = stream_error(&Status::out_of_range("message too large"), 64);
@@ -478,11 +489,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_rejects_an_empty_stream() {
+    async fn bulk_upsert_rejects_an_empty_stream() {
         let mut server = TestServer::start("bulk-empty", LimitsConfig::default()).await;
         let status = server
             .client
-            .bulk_write_collection(tokio_stream::iter(Vec::<BulkWriteCollectionRequest>::new()))
+            .bulk_upsert_records(tokio_stream::iter(Vec::<BulkUpsertRecordsRequest>::new()))
             .await
             .expect_err("an empty stream should be rejected");
         assert_eq!(status.code(), Code::InvalidArgument);
@@ -490,14 +501,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_rejects_batches_that_switch_collections() {
+    async fn bulk_upsert_rejects_batches_that_switch_collections() {
         let mut server = TestServer::start("bulk-switch", LimitsConfig::default()).await;
         server.create_collection("docs").await;
         server.create_collection("other").await;
 
         let status = server
             .client
-            .bulk_write_collection(tokio_stream::iter([
+            .bulk_upsert_records(tokio_stream::iter([
                 batch("docs", &["a"]),
                 batch("other", &["b"]),
             ]))
@@ -518,11 +529,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_write_requires_the_first_batch_to_name_the_collection() {
+    async fn bulk_upsert_requires_the_first_batch_to_name_the_collection() {
         let mut server = TestServer::start("bulk-unnamed", LimitsConfig::default()).await;
         let status = server
             .client
-            .bulk_write_collection(tokio_stream::iter([batch("", &["a"])]))
+            .bulk_upsert_records(tokio_stream::iter([batch("", &["a"])]))
             .await
             .expect_err("an unnamed first batch should be rejected");
         assert_eq!(status.code(), Code::InvalidArgument);

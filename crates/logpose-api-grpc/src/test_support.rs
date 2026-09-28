@@ -74,10 +74,19 @@ impl TestServer {
     pub(crate) async fn create_collection(&mut self, name: &str) {
         self.client
             .create_collection(proto::CreateCollectionRequest {
-                name: name.to_owned(),
-                dimensions: 2,
-                metric: proto::DistanceMetric::Dot as i32,
-                database_name: String::new(),
+                database_name: "default".to_owned(),
+                collection_name: name.to_owned(),
+                primary_key: Some(proto::PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    r#type: proto::PrimaryKeyType::String as i32,
+                }),
+                vectors: vec![proto::VectorFieldSpec {
+                    name: "vector".to_owned(),
+                    dimensions: 2,
+                    metric: proto::DistanceMetric::Dot as i32,
+                }],
+                fields: Vec::new(),
+                dynamic_fields: Some(true),
             })
             .await
             .expect("collection should be created");
@@ -87,6 +96,7 @@ impl TestServer {
     pub(crate) async fn live_records(&mut self, collection: &str) -> u64 {
         self.client
             .get_collection_stats(proto::GetCollectionStatsRequest {
+                database_name: "default".to_owned(),
                 collection_name: collection.to_owned(),
                 ..Default::default()
             })
@@ -104,14 +114,29 @@ impl Drop for TestServer {
     }
 }
 
-/// A put of a two-dimensional vector.
-pub(crate) fn put(id: &str) -> proto::WriteOperation {
-    proto::WriteOperation {
-        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-            id: id.to_owned(),
-            vector: vec![1.0, 0.5],
-            metadata_json: "{}".to_owned(),
-        })),
+/// A record with a two-dimensional vector, for a collection `create_collection` made.
+pub(crate) fn put(id: &str) -> proto::Record {
+    proto::Record {
+        pk: Some(proto::PrimaryKey {
+            kind: Some(proto::primary_key::Kind::StringValue(id.to_owned())),
+        }),
+        vectors: [(
+            "vector".to_owned(),
+            proto::Vector {
+                values: vec![1.0, 0.5],
+            },
+        )]
+        .into_iter()
+        .collect(),
+        fields: Default::default(),
+        extra: None,
+    }
+}
+
+/// A string field value.
+pub(crate) fn text(value: String) -> proto::Value {
+    proto::Value {
+        kind: Some(proto::value::Kind::StringValue(value)),
     }
 }
 

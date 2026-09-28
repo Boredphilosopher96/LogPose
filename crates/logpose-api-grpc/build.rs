@@ -5,14 +5,14 @@ fn main() {
     let mut config = prost_build::Config::new();
     config.protoc_executable(protoc);
 
-    println!("cargo:rerun-if-changed=../../proto/logpose/v1/logpose.proto");
+    println!("cargo:rerun-if-changed=../../proto/logpose/v2/logpose.proto");
 
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_with_config(
             config,
-            &["../../proto/logpose/v1/logpose.proto"],
+            &["../../proto/logpose/v2/logpose.proto"],
             &["../../proto"],
         )
         .expect("protobuf compilation should succeed");

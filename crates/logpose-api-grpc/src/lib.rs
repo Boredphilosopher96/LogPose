@@ -1,6 +1,7 @@
 //! gRPC API surface for LogPose.
 
 mod bulk;
+pub mod convert;
 mod error;
 #[cfg(test)]
 mod test_support;
@@ -10,8 +11,13 @@ pub use error::{
     status_from_error,
 };
 
+use convert::{
+    collection_to_proto, create_spec_from_proto, database_policy_from_proto,
+    database_policy_to_proto, json_object_to_proto, metric_to_proto, primary_keys_from_proto,
+    records_from_proto, required_name, schema_change_from_proto, snapshot_from_proto,
+    snapshot_to_proto, split_lookups, updates_from_proto,
+};
 use error::{MessageLimitLayer, respond, unauthenticated};
-use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
     ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
@@ -19,9 +25,8 @@ use logpose_query::{
 };
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
-    CollectionPlacement, CoordinationStatus, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord,
-    QueryUnitStats, RecordId, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionPlacement, CommitAck, CoordinationStatus, LogPoseError, MaintenanceBacklog,
+    MaintenanceStatus, NodeRole, NodeRuntimeStatus, QueryUnitStats, ScalarFieldStats, Snapshot,
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
@@ -33,22 +38,24 @@ use tracing::info;
 #[allow(missing_docs)]
 /// Generated protobuf interfaces.
 pub mod proto {
-    tonic::include_proto!("logpose.v1");
+    tonic::include_proto!("logpose.v2");
 }
 
 use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
-use proto::{BulkWriteCollectionReply, BulkWriteCollectionRequest};
 use proto::{
-    CollectionDescriptorReply, CollectionPlacementReply, CollectionStatsReply, CommitAckReply,
+    AlterCollectionRequest, BulkUpsertRecordsReply, BulkUpsertRecordsRequest,
+    CollectionPlacementReply, CollectionReply, CollectionStatsReply, CommitAckReply,
     CompactCollectionRequest, CoordinationStatusReply, CreateCollectionRequest,
-    DatabaseAccessPolicyReply, DatabaseDescriptorReply, DatabaseRoleBindingReply,
-    FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
-    GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataReply,
-    GetMetadataRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest, InspectCollectionReply,
-    InspectCollectionRequest, InspectTarget, ListDatabasesReply, ListDatabasesRequest,
-    MaintenanceBacklogReply, NodeRole as ProtoNodeRole, PutDatabasePolicyRequest,
-    PutDatabaseRequest, QueryCollectionReply, QueryCollectionRequest, QueryMatch, RemoteBlobConfig,
-    ScalarValue, SnapshotReply, WriteCollectionRequest,
+    DatabaseAccessPolicyReply, DatabaseDescriptorReply, DeleteRecordsRequest, DropCollectionReply,
+    DropCollectionRequest, DropDatabaseReply, DropDatabaseRequest, FlushCollectionRequest,
+    GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
+    GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataReply, GetMetadataRequest,
+    GetRecordsReply, GetRecordsRequest, GetRuntimeStatusReply, GetRuntimeStatusRequest,
+    InspectCollectionReply, InspectCollectionRequest, InspectTarget, ListCollectionsReply,
+    ListCollectionsRequest, ListDatabasesReply, ListDatabasesRequest, MaintenanceBacklogReply,
+    NodeRole as ProtoNodeRole, PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionReply,
+    QueryCollectionRequest, QueryMatch, ScalarValue, SnapshotReply, UpdateRecordsRequest,
+    UpsertRecordsRequest,
 };
 
 /// Serve the gRPC API until shutdown.
@@ -92,7 +99,7 @@ pub async fn serve_with_listener(
     Ok(())
 }
 
-/// gRPC service implementation scaffold.
+/// gRPC service implementation over the shared application state.
 #[derive(Clone)]
 pub struct GrpcLogPoseService {
     state: Arc<AppState>,
@@ -143,11 +150,60 @@ impl LogPoseService for GrpcLogPoseService {
         respond(self.list_databases_inner(request).await)
     }
 
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseReply>, Status> {
+        respond(self.drop_database_inner(request).await)
+    }
+
+    async fn put_database_policy(
+        &self,
+        request: Request<PutDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        respond(self.put_database_policy_inner(request).await)
+    }
+
+    async fn get_database_policy(
+        &self,
+        request: Request<GetDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        respond(self.get_database_policy_inner(request).await)
+    }
+
     async fn create_collection(
         &self,
         request: Request<CreateCollectionRequest>,
-    ) -> Result<Response<CollectionDescriptorReply>, Status> {
+    ) -> Result<Response<CollectionReply>, Status> {
         respond(self.create_collection_inner(request).await)
+    }
+
+    async fn get_collection(
+        &self,
+        request: Request<GetCollectionRequest>,
+    ) -> Result<Response<CollectionReply>, Status> {
+        respond(self.get_collection_inner(request).await)
+    }
+
+    async fn list_collections(
+        &self,
+        request: Request<ListCollectionsRequest>,
+    ) -> Result<Response<ListCollectionsReply>, Status> {
+        respond(self.list_collections_inner(request).await)
+    }
+
+    async fn alter_collection(
+        &self,
+        request: Request<AlterCollectionRequest>,
+    ) -> Result<Response<CollectionReply>, Status> {
+        respond(self.alter_collection_inner(request).await)
+    }
+
+    async fn drop_collection(
+        &self,
+        request: Request<DropCollectionRequest>,
+    ) -> Result<Response<DropCollectionReply>, Status> {
+        respond(self.drop_collection_inner(request).await)
     }
 
     async fn get_collection_placement(
@@ -157,25 +213,32 @@ impl LogPoseService for GrpcLogPoseService {
         respond(self.get_collection_placement_inner(request).await)
     }
 
-    async fn get_collection(
+    async fn upsert_records(
         &self,
-        request: Request<GetCollectionRequest>,
-    ) -> Result<Response<CollectionDescriptorReply>, Status> {
-        respond(self.get_collection_inner(request).await)
-    }
-
-    async fn write_collection(
-        &self,
-        request: Request<WriteCollectionRequest>,
+        request: Request<UpsertRecordsRequest>,
     ) -> Result<Response<CommitAckReply>, Status> {
-        respond(self.write_collection_inner(request).await)
+        respond(self.upsert_records_inner(request).await)
     }
 
-    async fn bulk_write_collection(
+    async fn update_records(
         &self,
-        request: Request<Streaming<BulkWriteCollectionRequest>>,
-    ) -> Result<Response<BulkWriteCollectionReply>, Status> {
-        respond(bulk::bulk_write_collection(Arc::clone(&self.state), request).await)
+        request: Request<UpdateRecordsRequest>,
+    ) -> Result<Response<CommitAckReply>, Status> {
+        respond(self.update_records_inner(request).await)
+    }
+
+    async fn delete_records(
+        &self,
+        request: Request<DeleteRecordsRequest>,
+    ) -> Result<Response<CommitAckReply>, Status> {
+        respond(self.delete_records_inner(request).await)
+    }
+
+    async fn get_records(
+        &self,
+        request: Request<GetRecordsRequest>,
+    ) -> Result<Response<GetRecordsReply>, Status> {
+        respond(self.get_records_inner(request).await)
     }
 
     async fn query_collection(
@@ -213,18 +276,50 @@ impl LogPoseService for GrpcLogPoseService {
         respond(self.inspect_collection_inner(request).await)
     }
 
-    async fn put_database_policy(
+    async fn bulk_upsert_records(
         &self,
-        request: Request<PutDatabasePolicyRequest>,
-    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
-        respond(self.put_database_policy_inner(request).await)
+        request: Request<Streaming<BulkUpsertRecordsRequest>>,
+    ) -> Result<Response<BulkUpsertRecordsReply>, Status> {
+        respond(bulk::bulk_upsert_records(Arc::clone(&self.state), request).await)
+    }
+}
+
+/// A collection named by a request: its database and collection names, both required.
+struct Target {
+    database_name: String,
+    collection_name: String,
+}
+
+impl Target {
+    fn new(database_name: String, collection_name: String) -> Result<Self, LogPoseError> {
+        Ok(Self {
+            database_name: required_name("database_name", database_name)?,
+            collection_name: required_name("collection_name", collection_name)?,
+        })
     }
 
-    async fn get_database_policy(
-        &self,
-        request: Request<GetDatabasePolicyRequest>,
-    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
-        respond(self.get_database_policy_inner(request).await)
+    /// The `database/collection` key the application layer resolves.
+    fn key(&self) -> String {
+        format!("{}/{}", self.database_name, self.collection_name)
+    }
+
+    fn commit_ack(self, ack: CommitAck) -> CommitAckReply {
+        CommitAckReply {
+            database_name: self.database_name,
+            collection_name: self.collection_name,
+            last_seq_no: ack.last_seq_no,
+            applied_ops: ack.applied_ops as u64,
+            snapshot: Some(snapshot_to_proto(ack.snapshot)),
+        }
+    }
+
+    fn snapshot(self, snapshot: Snapshot) -> SnapshotReply {
+        SnapshotReply {
+            database_name: self.database_name,
+            collection_name: self.collection_name,
+            manifest_generation: snapshot.manifest_generation,
+            visible_seq_no: snapshot.visible_seq_no,
+        }
     }
 }
 
@@ -250,13 +345,13 @@ impl GrpcLogPoseService {
         request: Request<PutDatabaseRequest>,
     ) -> Result<DatabaseDescriptorReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let descriptor = request.descriptor.ok_or_else(|| {
-            LogPoseError::invalid_argument("database descriptor payload is required")
-        })?;
+        let database_name = required_name("database_name", request.into_inner().database_name)?;
         let stored = self
             .state
-            .put_database_with_auth(&auth, database_descriptor_from_proto(descriptor)?)
+            .put_database_with_auth(
+                &auth,
+                logpose_catalog::DatabaseDescriptor::new(database_name),
+            )
             .await?;
         Ok(database_descriptor_to_proto(stored))
     }
@@ -266,8 +361,7 @@ impl GrpcLogPoseService {
         request: Request<GetDatabaseRequest>,
     ) -> Result<DatabaseDescriptorReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
+        let database_name = required_name("database_name", request.into_inner().database_name)?;
         let descriptor = self.state.database_with_auth(&auth, &database_name).await?;
         Ok(database_descriptor_to_proto(descriptor))
     }
@@ -286,25 +380,125 @@ impl GrpcLogPoseService {
         })
     }
 
+    async fn drop_database_inner(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<DropDatabaseReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let database_name = required_name("database_name", request.into_inner().database_name)?;
+        self.state
+            .drop_database_with_auth(&auth, &database_name)
+            .await?;
+        Ok(DropDatabaseReply { database_name })
+    }
+
+    async fn put_database_policy_inner(
+        &self,
+        request: Request<PutDatabasePolicyRequest>,
+    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let policy = database_policy_from_proto(
+            required_name("database_name", request.database_name)?,
+            request.authentication_mode,
+            request.role_bindings,
+        )?;
+        let stored = self
+            .state
+            .set_database_access_policy_with_auth(&auth, policy)
+            .await?;
+        Ok(database_policy_to_proto(stored))
+    }
+
+    async fn get_database_policy_inner(
+        &self,
+        request: Request<GetDatabasePolicyRequest>,
+    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let database_name = required_name("database_name", request.into_inner().database_name)?;
+        let policy = self
+            .state
+            .database_access_policy_with_auth(&auth, &database_name)
+            .await?;
+        Ok(database_policy_to_proto(policy))
+    }
+
     async fn create_collection_inner(
         &self,
         request: Request<CreateCollectionRequest>,
-    ) -> Result<CollectionDescriptorReply, LogPoseError> {
+    ) -> Result<CollectionReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
+        let database_name = required_name("database_name", request.database_name.clone())?;
+        let spec = create_spec_from_proto(request)?;
         let descriptor = self
             .state
             .create_collection_with_auth(
                 &auth,
-                StorageCreateCollectionRequest::in_database(
-                    normalize_database_name(&request.database_name),
-                    request.name,
-                    request.dimensions as usize,
-                    metric_from_proto(request.metric)?,
-                ),
+                StorageCreateCollectionRequest::from_spec(database_name, spec),
             )
             .await?;
-        Ok(collection_descriptor_reply(descriptor))
+        Ok(collection_to_proto(descriptor))
+    }
+
+    async fn get_collection_inner(
+        &self,
+        request: Request<GetCollectionRequest>,
+    ) -> Result<CollectionReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let descriptor = self
+            .state
+            .get_collection_with_auth(&auth, &target.key())
+            .await?;
+        Ok(collection_to_proto(descriptor))
+    }
+
+    async fn list_collections_inner(
+        &self,
+        request: Request<ListCollectionsRequest>,
+    ) -> Result<ListCollectionsReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let database_name = required_name("database_name", request.into_inner().database_name)?;
+        let collections = self
+            .state
+            .list_collections_with_auth(&auth, &database_name)
+            .await?;
+        Ok(ListCollectionsReply {
+            collections: collections.into_iter().map(collection_to_proto).collect(),
+        })
+    }
+
+    async fn alter_collection_inner(
+        &self,
+        request: Request<AlterCollectionRequest>,
+    ) -> Result<CollectionReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let change = schema_change_from_proto(request.change)?;
+        let descriptor = self
+            .state
+            .alter_collection_with_auth(&auth, &target.key(), change)
+            .await?;
+        Ok(collection_to_proto(descriptor))
+    }
+
+    async fn drop_collection_inner(
+        &self,
+        request: Request<DropCollectionRequest>,
+    ) -> Result<DropCollectionReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        self.state
+            .drop_collection_with_auth(&auth, &target.key())
+            .await?;
+        Ok(DropCollectionReply {
+            database_name: target.database_name,
+            collection_name: target.collection_name,
+        })
     }
 
     async fn get_collection_placement_inner(
@@ -313,54 +507,78 @@ impl GrpcLogPoseService {
     ) -> Result<CollectionPlacementReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
         let placement = self
             .state
-            .collection_placement_with_auth(
-                &auth,
-                &collection_lookup_key(&request.database_name, &request.collection_name),
-            )
+            .collection_placement_with_auth(&auth, &target.key())
             .await?;
         Ok(collection_placement_reply_from_domain(placement))
     }
 
-    async fn get_collection_inner(
+    async fn upsert_records_inner(
         &self,
-        request: Request<GetCollectionRequest>,
-    ) -> Result<CollectionDescriptorReply, LogPoseError> {
-        let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let descriptor = self
-            .state
-            .get_collection_with_auth(
-                &auth,
-                &collection_lookup_key(&request.database_name, &request.collection_name),
-            )
-            .await?;
-        Ok(collection_descriptor_reply(descriptor))
-    }
-
-    async fn write_collection_inner(
-        &self,
-        request: Request<WriteCollectionRequest>,
+        request: Request<UpsertRecordsRequest>,
     ) -> Result<CommitAckReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let operations = write_operations_from_proto(request.operations)?;
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let records = records_from_proto(request.records, "records")?;
         let ack = self
             .state
-            .write_with_auth(
-                &auth,
-                &collection_lookup_key(&database_name, &request.collection_name),
-                operations,
-            )
+            .upsert_records_with_auth(&auth, &target.key(), records)
             .await?;
-        Ok(CommitAckReply {
-            last_seq_no: ack.last_seq_no,
-            applied_ops: ack.applied_ops as u64,
-            database_name,
-            collection_name: request.collection_name,
-            snapshot: Some(snapshot_message_from_domain(ack.snapshot)),
+        Ok(target.commit_ack(ack))
+    }
+
+    async fn update_records_inner(
+        &self,
+        request: Request<UpdateRecordsRequest>,
+    ) -> Result<CommitAckReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let updates = updates_from_proto(request.records, "records")?;
+        let ack = self
+            .state
+            .update_records_with_auth(&auth, &target.key(), updates)
+            .await?;
+        Ok(target.commit_ack(ack))
+    }
+
+    async fn delete_records_inner(
+        &self,
+        request: Request<DeleteRecordsRequest>,
+    ) -> Result<CommitAckReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let keys = primary_keys_from_proto(request.keys, "keys")?;
+        let ack = self
+            .state
+            .delete_records_with_auth(&auth, &target.key(), keys)
+            .await?;
+        Ok(target.commit_ack(ack))
+    }
+
+    async fn get_records_inner(
+        &self,
+        request: Request<GetRecordsRequest>,
+    ) -> Result<GetRecordsReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let keys = primary_keys_from_proto(request.keys, "keys")?;
+        let fetched = self
+            .state
+            .get_records_with_auth(&auth, &target.key(), keys.clone(), request.output_fields)
+            .await?;
+        let (records, missing_keys) = split_lookups(keys, fetched.records);
+        Ok(GetRecordsReply {
+            database_name: target.database_name,
+            collection_name: target.collection_name,
+            records,
+            missing_keys,
+            snapshot: Some(snapshot_to_proto(fetched.snapshot)),
         })
     }
 
@@ -370,7 +588,7 @@ impl GrpcLogPoseService {
     ) -> Result<QueryCollectionReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
+        let target = Target::new(request.database_name, request.collection_name)?;
         if request.top_k == 0 {
             return Err(LogPoseError::invalid_field(
                 "top_k",
@@ -388,10 +606,7 @@ impl GrpcLogPoseService {
             .query_with_auth(
                 &auth,
                 QueryRequest {
-                    collection_name: collection_lookup_key(
-                        &database_name,
-                        &request.collection_name,
-                    ),
+                    collection_name: target.key(),
                     vector: request.vector,
                     top_k: request.top_k as usize,
                     snapshot: request.snapshot.map(snapshot_from_proto),
@@ -403,33 +618,28 @@ impl GrpcLogPoseService {
             )
             .await?;
         Ok(QueryCollectionReply {
-            metric: proto_metric(response.metric) as i32,
+            database_name: target.database_name,
+            collection_name: target.collection_name,
+            metric: metric_to_proto(response.metric) as i32,
             top_k: response.top_k as u64,
             returned: response.returned as u64,
-            snapshot: Some(snapshot_message_from_domain(response.snapshot)),
+            snapshot: Some(snapshot_to_proto(response.snapshot)),
             matches: response
                 .matches
                 .into_iter()
-                .map(|candidate| {
-                    let metadata_json =
-                        serde_json::to_string(&candidate.metadata).map_err(|error| {
-                            LogPoseError::internal(format!(
-                                "failed to serialize query match metadata: {error}"
-                            ))
-                        })?;
-                    Ok(QueryMatch {
-                        id: candidate.id.to_string(),
-                        value: candidate.value,
-                        metadata_json,
-                    })
+                .map(|candidate| QueryMatch {
+                    id: candidate.id.to_string(),
+                    value: candidate.value,
+                    metadata: match &candidate.metadata {
+                        Value::Object(metadata) => Some(json_object_to_proto(metadata)),
+                        _ => None,
+                    },
                 })
-                .collect::<Result<Vec<_>, LogPoseError>>()?,
+                .collect(),
             diagnostics: response
                 .diagnostics
                 .map(query_diagnostics_to_proto)
                 .transpose()?,
-            database_name,
-            collection_name: request.collection_name,
         })
     }
 
@@ -439,12 +649,12 @@ impl GrpcLogPoseService {
     ) -> Result<CollectionStatsReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
+        let target = Target::new(request.database_name, request.collection_name)?;
         let stats = self
             .state
             .stats_for_read_with_auth(
                 &auth,
-                &collection_lookup_key(&database_name, &request.collection_name),
+                &target.key(),
                 request.snapshot.map(snapshot_from_proto),
                 request.read_barrier.map(snapshot_from_proto),
             )
@@ -458,19 +668,9 @@ impl GrpcLogPoseService {
     ) -> Result<SnapshotReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let snapshot = self
-            .state
-            .flush_with_auth(
-                &auth,
-                &collection_lookup_key(&database_name, &request.collection_name),
-            )
-            .await?;
-        Ok(snapshot_reply_from_domain(
-            snapshot,
-            database_name,
-            request.collection_name,
-        ))
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let snapshot = self.state.flush_with_auth(&auth, &target.key()).await?;
+        Ok(target.snapshot(snapshot))
     }
 
     async fn compact_collection_inner(
@@ -479,19 +679,9 @@ impl GrpcLogPoseService {
     ) -> Result<SnapshotReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let snapshot = self
-            .state
-            .compact_with_auth(
-                &auth,
-                &collection_lookup_key(&database_name, &request.collection_name),
-            )
-            .await?;
-        Ok(snapshot_reply_from_domain(
-            snapshot,
-            database_name,
-            request.collection_name,
-        ))
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let snapshot = self.state.compact_with_auth(&auth, &target.key()).await?;
+        Ok(target.snapshot(snapshot))
     }
 
     async fn inspect_collection_inner(
@@ -500,130 +690,21 @@ impl GrpcLogPoseService {
     ) -> Result<InspectCollectionReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let target = inspect_target_from_proto(request.target, request.segment_id)?;
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let inspect_target = inspect_target_from_proto(request.target, request.segment_id)?;
         let report = self
             .state
-            .inspect_with_auth(
-                &auth,
-                &collection_lookup_key(&database_name, &request.collection_name),
-                target,
-            )
+            .inspect_with_auth(&auth, &target.key(), inspect_target)
             .await?;
         let payload_json = serde_json::to_string(&report.payload).map_err(|error| {
             LogPoseError::internal(format!("failed to serialize inspect payload: {error}"))
         })?;
         Ok(InspectCollectionReply {
+            database_name: target.database_name,
+            collection_name: target.collection_name,
             target: report.target,
             payload_json,
-            database_name,
-            collection_name: request.collection_name,
         })
-    }
-
-    async fn put_database_policy_inner(
-        &self,
-        request: Request<PutDatabasePolicyRequest>,
-    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
-        let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let policy = request
-            .policy
-            .ok_or_else(|| LogPoseError::invalid_argument("database policy payload is required"))?;
-        let policy = database_access_policy_from_proto(policy)?;
-        let stored = self
-            .state
-            .set_database_access_policy_with_auth(&auth, policy)
-            .await?;
-        Ok(database_access_policy_to_proto(stored))
-    }
-
-    async fn get_database_policy_inner(
-        &self,
-        request: Request<GetDatabasePolicyRequest>,
-    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
-        let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let policy = self
-            .state
-            .database_access_policy_with_auth(&auth, &database_name)
-            .await?;
-        Ok(database_access_policy_to_proto(policy))
-    }
-}
-
-fn metric_from_proto(metric: i32) -> Result<DistanceMetric, LogPoseError> {
-    match proto::DistanceMetric::try_from(metric).unwrap_or(proto::DistanceMetric::Unspecified) {
-        proto::DistanceMetric::Cosine => Ok(DistanceMetric::Cosine),
-        proto::DistanceMetric::Dot => Ok(DistanceMetric::Dot),
-        proto::DistanceMetric::L2 => Ok(DistanceMetric::L2),
-        proto::DistanceMetric::Unspecified => Err(LogPoseError::invalid_field(
-            "metric",
-            "distance metric must be set",
-        )),
-    }
-}
-
-fn proto_metric(metric: DistanceMetric) -> proto::DistanceMetric {
-    match metric {
-        DistanceMetric::Cosine => proto::DistanceMetric::Cosine,
-        DistanceMetric::Dot => proto::DistanceMetric::Dot,
-        DistanceMetric::L2 => proto::DistanceMetric::L2,
-    }
-}
-
-/// Convert a batch of proto operations, naming a bad one by its index (`operations[2].put.id`).
-fn write_operations_from_proto(
-    operations: Vec<proto::WriteOperation>,
-) -> Result<Vec<WriteOperation>, LogPoseError> {
-    operations
-        .into_iter()
-        .enumerate()
-        .map(|(index, operation)| {
-            write_operation_from_proto(operation)
-                .map_err(|error| error.with_field_prefix(&format!("operations[{index}]")))
-        })
-        .collect()
-}
-
-fn write_operation_from_proto(
-    operation: proto::WriteOperation,
-) -> Result<WriteOperation, LogPoseError> {
-    match operation.operation {
-        Some(proto::write_operation::Operation::Put(put)) => {
-            if put.id.is_empty() {
-                return Err(LogPoseError::invalid_field(
-                    "put.id",
-                    "put operation record id must not be empty",
-                ));
-            }
-            let metadata = serde_json::from_str::<Value>(&put.metadata_json).map_err(|error| {
-                LogPoseError::invalid_field(
-                    "put.metadata_json",
-                    format!("invalid metadata_json: {error}"),
-                )
-            })?;
-            Ok(WriteOperation::Put(PutRecord {
-                id: RecordId::new(put.id),
-                vector: put.vector,
-                metadata,
-            }))
-        }
-        Some(proto::write_operation::Operation::Delete(delete)) => {
-            if delete.id.is_empty() {
-                return Err(LogPoseError::invalid_field(
-                    "delete.id",
-                    "delete operation record id must not be empty",
-                ));
-            }
-            Ok(WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new(delete.id),
-            }))
-        }
-        None => Err(LogPoseError::invalid_argument(
-            "write operation must include put or delete",
-        )),
     }
 }
 
@@ -774,33 +855,6 @@ fn inspect_target_from_proto(
     }
 }
 
-fn snapshot_from_proto(snapshot: proto::Snapshot) -> Snapshot {
-    Snapshot {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-    }
-}
-
-fn snapshot_message_from_domain(snapshot: Snapshot) -> proto::Snapshot {
-    proto::Snapshot {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-    }
-}
-
-fn snapshot_reply_from_domain(
-    snapshot: Snapshot,
-    database_name: String,
-    collection_name: String,
-) -> SnapshotReply {
-    SnapshotReply {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-        database_name,
-        collection_name,
-    }
-}
-
 fn query_diagnostics_to_proto(
     diagnostics: QueryDiagnostics,
 ) -> Result<proto::QueryDiagnostics, LogPoseError> {
@@ -868,41 +922,6 @@ fn database_descriptor_to_proto(
         database_id: descriptor.database_id.to_string(),
         name: descriptor.name,
         is_default: descriptor.is_default,
-    }
-}
-
-fn database_descriptor_from_proto(
-    descriptor: DatabaseDescriptorReply,
-) -> Result<logpose_catalog::DatabaseDescriptor, LogPoseError> {
-    Ok(logpose_catalog::DatabaseDescriptor {
-        database_id: descriptor.database_id.parse().map_err(
-            |error: logpose_types::LogPoseError| {
-                LogPoseError::invalid_argument(format!("invalid database_id: {error}"))
-            },
-        )?,
-        name: descriptor.name,
-        is_default: descriptor.is_default,
-    })
-}
-
-fn collection_descriptor_reply(
-    descriptor: logpose_catalog::CollectionDescriptor,
-) -> CollectionDescriptorReply {
-    CollectionDescriptorReply {
-        collection_id: descriptor.collection_id.to_string(),
-        name: descriptor.name,
-        dimensions: descriptor.dimensions as u64,
-        metric: proto_metric(descriptor.metric) as i32,
-        root_path: descriptor.root_path.display().to_string(),
-        flush_threshold_ops: descriptor.flush_threshold_ops as u64,
-        flush_threshold_bytes: descriptor.flush_threshold_bytes as u64,
-        compaction_threshold_segments: descriptor.compaction_threshold_segments as u64,
-        remote_blob: descriptor.remote_blob.map(|remote_blob| RemoteBlobConfig {
-            endpoint: remote_blob.endpoint,
-            bucket: remote_blob.bucket,
-            prefix: remote_blob.prefix,
-        }),
-        database_name: descriptor.database_name,
     }
 }
 
@@ -986,66 +1005,6 @@ fn collection_stats_reply_from_domain(
     })
 }
 
-fn database_access_policy_to_proto(policy: DatabaseAccessPolicy) -> DatabaseAccessPolicyReply {
-    DatabaseAccessPolicyReply {
-        database_name: policy.database_name,
-        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
-        role_bindings: policy
-            .role_bindings
-            .into_iter()
-            .map(database_role_binding_to_proto)
-            .collect(),
-    }
-}
-
-fn database_access_policy_from_proto(
-    policy: DatabaseAccessPolicyReply,
-) -> Result<DatabaseAccessPolicy, LogPoseError> {
-    Ok(DatabaseAccessPolicy {
-        database_name: normalize_database_name(&policy.database_name),
-        authentication_mode: authentication_mode_from_proto(policy.authentication_mode)?,
-        role_bindings: policy
-            .role_bindings
-            .into_iter()
-            .map(database_role_binding_from_proto)
-            .collect::<Result<Vec<_>, _>>()?,
-    })
-}
-
-fn database_role_binding_to_proto(binding: DatabaseRoleBinding) -> DatabaseRoleBindingReply {
-    DatabaseRoleBindingReply {
-        database_name: binding.database_name,
-        principal_name: binding.principal_name,
-        role: database_role_to_proto(binding.role) as i32,
-    }
-}
-
-fn database_role_binding_from_proto(
-    binding: DatabaseRoleBindingReply,
-) -> Result<DatabaseRoleBinding, LogPoseError> {
-    Ok(DatabaseRoleBinding {
-        database_name: normalize_database_name(&binding.database_name),
-        principal_name: binding.principal_name,
-        role: database_role_from_proto(binding.role)?,
-    })
-}
-
-fn normalize_database_name(database_name: &str) -> String {
-    if database_name.trim().is_empty() {
-        DEFAULT_DATABASE_NAME.to_owned()
-    } else {
-        database_name.to_owned()
-    }
-}
-
-fn collection_lookup_key(database_name: &str, collection_name: &str) -> String {
-    format!(
-        "{}/{}",
-        normalize_database_name(database_name),
-        collection_name
-    )
-}
-
 fn maintenance_status_to_proto(status: MaintenanceStatus) -> proto::MaintenanceStatus {
     proto::MaintenanceStatus {
         pending: status.pending,
@@ -1060,50 +1019,6 @@ fn node_role_to_proto(role: NodeRole) -> ProtoNodeRole {
         NodeRole::Combined => ProtoNodeRole::Combined,
         NodeRole::Control => ProtoNodeRole::Control,
         NodeRole::Data => ProtoNodeRole::Data,
-    }
-}
-
-fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
-    match mode {
-        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
-        AuthenticationMode::Password => proto::AuthenticationMode::Password,
-        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
-        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
-    }
-}
-
-fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, LogPoseError> {
-    match proto::AuthenticationMode::try_from(mode).map_err(|_| {
-        LogPoseError::invalid_argument(format!("unsupported authentication mode '{mode}'"))
-    })? {
-        proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
-        proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
-        proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
-        proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
-        proto::AuthenticationMode::Unspecified => Err(LogPoseError::invalid_argument(
-            "authentication mode is required",
-        )),
-    }
-}
-
-fn database_role_to_proto(role: DatabaseRole) -> proto::DatabaseRole {
-    match role {
-        DatabaseRole::Owner => proto::DatabaseRole::Owner,
-        DatabaseRole::ReadWrite => proto::DatabaseRole::ReadWrite,
-        DatabaseRole::ReadOnly => proto::DatabaseRole::ReadOnly,
-    }
-}
-
-fn database_role_from_proto(role: i32) -> Result<DatabaseRole, LogPoseError> {
-    match proto::DatabaseRole::try_from(role).map_err(|_| {
-        LogPoseError::invalid_argument(format!("unsupported database role '{role}'"))
-    })? {
-        proto::DatabaseRole::Owner => Ok(DatabaseRole::Owner),
-        proto::DatabaseRole::ReadWrite => Ok(DatabaseRole::ReadWrite),
-        proto::DatabaseRole::ReadOnly => Ok(DatabaseRole::ReadOnly),
-        proto::DatabaseRole::Unspecified => {
-            Err(LogPoseError::invalid_argument("database role is required"))
-        }
     }
 }
 
@@ -1179,12 +1094,13 @@ fn request_auth_from_metadata<T>(request: &Request<T>) -> Result<RequestAuth, Lo
 mod tests {
     use super::*;
     use logpose_auth::{
-        AccessTier, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding, Principal,
-        PrincipalKind,
+        AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
+        Principal, PrincipalKind,
     };
     use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryStageTimings};
-    use serde_json::Value;
+    use logpose_types::{DEFAULT_DATABASE_NAME, DistanceMetric};
+    use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
         fs,
@@ -1271,30 +1187,24 @@ mod tests {
         assert_eq!(create.name, "documents");
 
         let write = service
-            .write_collection(Request::new(write_collection_request(
+            .upsert_records(Request::new(upsert_request(
                 "documents",
                 vec![
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "alpha".to_owned(),
-                            vector: vec![1.0, 0.0],
-                            metadata_json: r#"{"kind":"keep","color":"red"}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "beta".to_owned(),
-                            vector: vec![3.0, 0.0],
-                            metadata_json: r#"{"kind":"drop","color":"blue"}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "gamma".to_owned(),
-                            vector: vec![2.0, 0.0],
-                            metadata_json: r#"{"kind":"keep","color":"red"}"#.to_owned(),
-                        })),
-                    },
+                    record(
+                        "alpha",
+                        vec![1.0, 0.0],
+                        json!({"kind":"keep","color":"red"}),
+                    ),
+                    record(
+                        "beta",
+                        vec![3.0, 0.0],
+                        json!({"kind":"drop","color":"blue"}),
+                    ),
+                    record(
+                        "gamma",
+                        vec![2.0, 0.0],
+                        json!({"kind":"keep","color":"red"}),
+                    ),
                 ],
             )))
             .await
@@ -1399,15 +1309,9 @@ mod tests {
             .expect("create should succeed");
 
         let write = service
-            .write_collection(Request::new(write_collection_request(
+            .upsert_records(Request::new(upsert_request(
                 "documents",
-                vec![proto::WriteOperation {
-                    operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                        id: "alpha".to_owned(),
-                        vector: vec![1.0, 0.0],
-                        metadata_json: r#"{"kind":"keep"}"#.to_owned(),
-                    })),
-                }],
+                vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
             )))
             .await
             .expect("write should succeed")
@@ -1487,23 +1391,11 @@ mod tests {
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(write_collection_request(
+            .upsert_records(Request::new(upsert_request(
                 "documents",
                 vec![
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "alpha".to_owned(),
-                            vector: vec![1.0, 0.0],
-                            metadata_json: r#"{"kind":"keep"}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "beta".to_owned(),
-                            vector: vec![0.0, 1.0],
-                            metadata_json: r#"{"kind":"drop"}"#.to_owned(),
-                        })),
-                    },
+                    record("alpha", vec![1.0, 0.0], json!({"kind":"keep"})),
+                    record("beta", vec![0.0, 1.0], json!({"kind":"drop"})),
                 ],
             )))
             .await
@@ -1515,16 +1407,7 @@ mod tests {
             .expect("flush should succeed");
 
         service
-            .write_collection(Request::new(write_collection_request(
-                "documents",
-                vec![proto::WriteOperation {
-                    operation: Some(proto::write_operation::Operation::Delete(
-                        proto::DeleteRecord {
-                            id: "alpha".to_owned(),
-                        },
-                    )),
-                }],
-            )))
+            .delete_records(Request::new(delete_request("documents", &["alpha"])))
             .await
             .expect("delete should succeed");
 
@@ -1782,16 +1665,10 @@ mod tests {
             .expect("read-only principal should read stats");
 
         let error = service
-            .write_collection(authorized_request(
-                write_collection_request(
+            .upsert_records(authorized_request(
+                upsert_request(
                     "documents",
-                    vec![proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "alpha".to_owned(),
-                            vector: vec![1.0, 0.0],
-                            metadata_json: "{}".to_owned(),
-                        })),
-                    }],
+                    vec![record("alpha", vec![1.0, 0.0], json!({}))],
                 ),
                 "reader-secret",
             ))
@@ -1997,17 +1874,9 @@ mod tests {
             (
                 "write",
                 service
-                    .write_collection(Request::new(write_collection_request(
+                    .upsert_records(Request::new(upsert_request(
                         "documents",
-                        vec![proto::WriteOperation {
-                            operation: Some(proto::write_operation::Operation::Put(
-                                proto::PutRecord {
-                                    id: "alpha".to_owned(),
-                                    vector: vec![1.0, 0.0],
-                                    metadata_json: r#"{"kind":"keep"}"#.to_owned(),
-                                },
-                            )),
-                        }],
+                        vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
                     )))
                     .await
                     .expect_err("control-only node should reject writes"),
@@ -2100,17 +1969,9 @@ mod tests {
             (
                 "write",
                 service
-                    .write_collection(Request::new(write_collection_request(
+                    .upsert_records(Request::new(upsert_request(
                         "documents",
-                        vec![proto::WriteOperation {
-                            operation: Some(proto::write_operation::Operation::Put(
-                                proto::PutRecord {
-                                    id: "alpha".to_owned(),
-                                    vector: vec![1.0, 0.0],
-                                    metadata_json: r#"{"kind":"keep"}"#.to_owned(),
-                                },
-                            )),
-                        }],
+                        vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
                     )))
                     .await
                     .expect_err("recorded remote writes should be rejected"),
@@ -2222,11 +2083,8 @@ mod tests {
             .expect_err("zero dimensions should error");
 
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(
-            error
-                .message()
-                .contains("dimensions must be greater than 0")
-        );
+        assert!(error.message().contains("has 0 dimensions"), "{error:?}");
+        assert_eq!(violation_fields(&error), vec!["vectors[0].dimensions"]);
     }
 
     #[tokio::test]
@@ -2264,23 +2122,19 @@ mod tests {
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(write_collection_request(
+            .upsert_records(Request::new(upsert_request(
                 "documents",
                 vec![
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "lower".to_owned(),
-                            vector: vec![1.0, 0.0],
-                            metadata_json: r#"{"score":9007199254740992}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "higher".to_owned(),
-                            vector: vec![2.0, 0.0],
-                            metadata_json: r#"{"score":9007199254740993}"#.to_owned(),
-                        })),
-                    },
+                    record(
+                        "lower",
+                        vec![1.0, 0.0],
+                        json!({"score": 9_007_199_254_740_992_u64}),
+                    ),
+                    record(
+                        "higher",
+                        vec![2.0, 0.0],
+                        json!({"score": 9_007_199_254_740_993_u64}),
+                    ),
                 ],
             )))
             .await
@@ -2326,44 +2180,18 @@ mod tests {
             .expect("create should succeed");
 
         service
-            .write_collection(Request::new(write_collection_request(
+            .upsert_records(Request::new(upsert_request(
                 "documents",
                 vec![
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "alpha".to_owned(),
-                            vector: vec![1.0, 0.0],
-                            metadata_json: r#"{"kind":"keep","version":1}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "beta".to_owned(),
-                            vector: vec![2.0, 0.0],
-                            metadata_json: r#"{"kind":"drop","version":2}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "gamma".to_owned(),
-                            vector: vec![3.0, 0.0],
-                            metadata_json: r#"{"kind":"drop","version":3}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "delta".to_owned(),
-                            vector: vec![4.0, 0.0],
-                            metadata_json: r#"{"kind":"drop","version":4}"#.to_owned(),
-                        })),
-                    },
-                    proto::WriteOperation {
-                        operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                            id: "epsilon".to_owned(),
-                            vector: vec![5.0, 0.0],
-                            metadata_json: r#"{"kind":"keep","version":5}"#.to_owned(),
-                        })),
-                    },
+                    record("alpha", vec![1.0, 0.0], json!({"kind":"keep","version":1})),
+                    record("beta", vec![2.0, 0.0], json!({"kind":"drop","version":2})),
+                    record("gamma", vec![3.0, 0.0], json!({"kind":"drop","version":3})),
+                    record("delta", vec![4.0, 0.0], json!({"kind":"drop","version":4})),
+                    record(
+                        "epsilon",
+                        vec![5.0, 0.0],
+                        json!({"kind":"keep","version":5}),
+                    ),
                 ],
             )))
             .await
@@ -2524,46 +2352,655 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_write_rejects_empty_put_record_id() {
+    async fn grpc_requests_must_name_their_database_and_collection() {
         let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-put-id"))));
-
-        service
-            .create_collection(Request::new(create_collection_request(
-                "documents",
-                2,
-                proto::DistanceMetric::Dot,
-            )))
-            .await
-            .expect("create should succeed");
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-selector"))));
 
         let error = service
-            .write_collection(Request::new(write_collection_request(
-                "documents",
-                vec![proto::WriteOperation {
-                    operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                        id: String::new(),
-                        vector: vec![1.0, 0.0],
-                        metadata_json: "{}".to_owned(),
-                    })),
-                }],
-            )))
+            .upsert_records(Request::new(UpsertRecordsRequest {
+                database_name: String::new(),
+                ..upsert_request("documents", Vec::new())
+            }))
             .await
-            .expect_err("empty put record id should error");
-
+            .expect_err("an empty database name is rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(
-            error
-                .message()
-                .contains("put operation record id must not be empty")
-        );
+        assert_eq!(violation_fields(&error), vec!["database_name"]);
+
+        let error = service
+            .get_collection(Request::new(GetCollectionRequest {
+                collection_name: " ".to_owned(),
+                ..get_collection_request("documents")
+            }))
+            .await
+            .expect_err("a blank collection name is rejected");
+        assert_eq!(violation_fields(&error), vec!["collection_name"]);
+
+        let error = service
+            .list_collections(Request::new(ListCollectionsRequest {
+                database_name: String::new(),
+            }))
+            .await
+            .expect_err("listing needs a database");
+        assert_eq!(violation_fields(&error), vec!["database_name"]);
     }
 
     #[tokio::test]
-    async fn grpc_write_rejects_empty_delete_record_id() {
+    async fn grpc_creates_describes_lists_and_drops_typed_collections() {
         let service =
-            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-empty-delete-id"))));
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-collections"))));
+        service
+            .put_database(Request::new(put_database_request("shop")))
+            .await
+            .expect("database should be created");
 
+        let created = service
+            .create_collection(Request::new(products_request("shop")))
+            .await
+            .expect("typed collection should be created")
+            .into_inner();
+        assert_eq!(created.database_name, "shop");
+        assert_eq!(created.name, "products");
+        let schema = created.schema.clone().expect("schema is returned");
+        assert_eq!(schema.schema_version, 1);
+        assert!(schema.dynamic_fields);
+        let primary_key = schema.primary_key.clone().expect("primary key");
+        assert_eq!(
+            (
+                primary_key.id,
+                primary_key.name.as_str(),
+                primary_key.r#type
+            ),
+            (0, "sku", proto::PrimaryKeyType::Int64 as i32)
+        );
+        assert_eq!(schema.vectors[0].name, "embedding");
+        assert_eq!(schema.vectors[0].dimensions, 3);
+        assert_eq!(
+            schema.vectors[0].metric,
+            proto::DistanceMetric::Cosine as i32
+        );
+        let tenant = &schema.fields[0];
+        assert_eq!(tenant.name, "tenant");
+        assert!(!tenant.nullable);
+        assert_eq!(tenant.index, proto::FieldIndex::Inverted as i32);
+        assert_eq!(
+            schema.fields[1].index,
+            proto::FieldIndex::InvertedAndSorted as i32,
+            "auto picks inverted and sorted for numbers"
+        );
+        assert_eq!(schema.fields[4].index, proto::FieldIndex::None as i32);
+        assert_eq!(
+            convert::schema_from_proto(schema.clone())
+                .expect("the reply is a valid schema")
+                .fields()
+                .len(),
+            5
+        );
+
+        let described = service
+            .get_collection(Request::new(GetCollectionRequest {
+                database_name: "shop".to_owned(),
+                collection_name: "products".to_owned(),
+            }))
+            .await
+            .expect("describe should succeed")
+            .into_inner();
+        assert_eq!(described, created);
+
+        let listed = service
+            .list_collections(Request::new(ListCollectionsRequest {
+                database_name: "shop".to_owned(),
+            }))
+            .await
+            .expect("list should succeed")
+            .into_inner();
+        assert_eq!(listed.collections, vec![created]);
+        let other = service
+            .list_collections(Request::new(ListCollectionsRequest {
+                database_name: "default".to_owned(),
+            }))
+            .await
+            .expect("list should succeed")
+            .into_inner();
+        assert!(other.collections.is_empty());
+        let error = service
+            .list_collections(Request::new(ListCollectionsRequest {
+                database_name: "nowhere".to_owned(),
+            }))
+            .await
+            .expect_err("a missing database has no collections to list");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+
+        let error = service
+            .drop_database(Request::new(DropDatabaseRequest {
+                database_name: "shop".to_owned(),
+            }))
+            .await
+            .expect_err("a database with a collection cannot be dropped");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("products"), "{error:?}");
+
+        let dropped = service
+            .drop_collection(Request::new(DropCollectionRequest {
+                database_name: "shop".to_owned(),
+                collection_name: "products".to_owned(),
+            }))
+            .await
+            .expect("drop should succeed")
+            .into_inner();
+        assert_eq!(dropped.collection_name, "products");
+        let error = service
+            .get_collection(Request::new(GetCollectionRequest {
+                database_name: "shop".to_owned(),
+                collection_name: "products".to_owned(),
+            }))
+            .await
+            .expect_err("a dropped collection is gone");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        let error = service
+            .drop_collection(Request::new(DropCollectionRequest {
+                database_name: "shop".to_owned(),
+                collection_name: "products".to_owned(),
+            }))
+            .await
+            .expect_err("dropping twice fails");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+
+        service
+            .drop_database(Request::new(DropDatabaseRequest {
+                database_name: "shop".to_owned(),
+            }))
+            .await
+            .expect("an empty database can be dropped");
+        let error = service
+            .get_database(Request::new(get_database_request("shop")))
+            .await
+            .expect_err("a dropped database is gone");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        let error = service
+            .drop_database(Request::new(DropDatabaseRequest {
+                database_name: "default".to_owned(),
+            }))
+            .await
+            .expect_err("the default database cannot be dropped");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn grpc_create_collection_names_the_invalid_schema_field() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-bad-schema"))));
+        type Mutation = Box<dyn Fn(&mut CreateCollectionRequest)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "vectors[0].dimensions",
+                Box::new(|request| request.vectors[0].dimensions = 0),
+            ),
+            (
+                "fields[1].name",
+                Box::new(|request| request.fields[1].name = "tenant".to_owned()),
+            ),
+            (
+                "fields[0].index",
+                Box::new(|request| {
+                    request.fields[0].r#type = proto::FieldType::Bool as i32;
+                    request.fields[0].index = proto::FieldIndex::Sorted as i32;
+                }),
+            ),
+            (
+                "fields[2].type",
+                Box::new(|request| request.fields[2].r#type = 0),
+            ),
+            (
+                "primary_key.type",
+                Box::new(|request| {
+                    if let Some(primary_key) = request.primary_key.as_mut() {
+                        primary_key.r#type = 0;
+                    }
+                }),
+            ),
+            (
+                "primary_key",
+                Box::new(|request| request.primary_key = None),
+            ),
+            ("vectors", Box::new(|request| request.vectors.clear())),
+            (
+                "primary_key.name",
+                Box::new(|request| {
+                    if let Some(primary_key) = request.primary_key.as_mut() {
+                        primary_key.name = "$extra".to_owned();
+                    }
+                }),
+            ),
+        ];
+        for (field, change) in cases {
+            let mut request = products_request("default");
+            change(&mut request);
+            let error = service
+                .create_collection(Request::new(request))
+                .await
+                .expect_err("an invalid schema is rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{field}");
+            assert_eq!(violation_fields(&error), vec![field], "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_typed_records_round_trip_through_upsert_get_update_and_delete() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-typed"))));
+        service
+            .create_collection(Request::new(products_request("default")))
+            .await
+            .expect("collection should be created");
+
+        let timestamp = 1_790_000_000_000_000_i64;
+        let widget = proto::Record {
+            pk: Some(int_key(1)),
+            vectors: [(
+                "embedding".to_owned(),
+                proto::Vector {
+                    values: vec![3.0, 0.0, 4.0],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            fields: [
+                ("tenant".to_owned(), string_value("acme")),
+                (
+                    "price".to_owned(),
+                    proto::Value {
+                        kind: Some(proto::value::Kind::Float64Value(9.5)),
+                    },
+                ),
+                (
+                    "tags".to_owned(),
+                    proto::Value {
+                        kind: Some(proto::value::Kind::ArrayValue(proto::ValueArray {
+                            values: vec![string_value("a"), string_value("b")],
+                        })),
+                    },
+                ),
+                (
+                    "updated_at".to_owned(),
+                    proto::Value {
+                        kind: Some(proto::value::Kind::TimestampMicros(timestamp)),
+                    },
+                ),
+                (
+                    "attrs".to_owned(),
+                    proto::Value {
+                        kind: Some(proto::value::Kind::JsonValue(convert::json_to_proto(
+                            &json!({"size": 3, "big": u64::MAX}),
+                        ))),
+                    },
+                ),
+                // Undeclared, so it is kept in `$extra` as JSON.
+                ("color".to_owned(), string_value("red")),
+            ]
+            .into_iter()
+            .collect(),
+            extra: Some(convert::json_object_to_proto(
+                json!({"origin": "eu"}).as_object().expect("object"),
+            )),
+        };
+        let gadget = proto::Record {
+            pk: Some(int_key(2)),
+            vectors: [(
+                "embedding".to_owned(),
+                proto::Vector {
+                    values: vec![0.0, 1.0, 0.0],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            fields: [("tenant".to_owned(), string_value("acme"))]
+                .into_iter()
+                .collect(),
+            extra: None,
+        };
+        let ack = service
+            .upsert_records(Request::new(UpsertRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                records: vec![widget, gadget],
+            }))
+            .await
+            .expect("typed upsert should succeed")
+            .into_inner();
+        assert_eq!(ack.applied_ops, 2);
+        assert_eq!(ack.database_name, "default");
+        assert_eq!(ack.collection_name, "products");
+
+        let fetched = service
+            .get_records(Request::new(get_request(
+                "products",
+                vec![int_key(1), int_key(3), int_key(2)],
+            )))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        assert_eq!(fetched.missing_keys, vec![int_key(3)]);
+        assert_eq!(
+            fetched.snapshot.expect("snapshot").visible_seq_no,
+            ack.last_seq_no
+        );
+        let records = convert::records_from_proto(fetched.records, "records").expect("decode");
+        assert_eq!(records.len(), 2);
+        let widget = &records[0];
+        assert_eq!(
+            widget.vectors["embedding"],
+            vec![0.6, 0.0, 0.8],
+            "cosine vectors are normalized when written"
+        );
+        assert_eq!(
+            widget.fields["price"],
+            logpose_types::value::Value::Float64(9.5)
+        );
+        assert_eq!(
+            widget.fields["tags"],
+            logpose_types::value::Value::Array(vec![
+                logpose_types::value::Value::String("a".to_owned()),
+                logpose_types::value::Value::String("b".to_owned()),
+            ])
+        );
+        assert_eq!(
+            widget.fields["updated_at"],
+            logpose_types::value::Value::Timestamp(
+                logpose_types::value::Timestamp::from_micros(timestamp).expect("timestamp")
+            )
+        );
+        assert_eq!(
+            widget.fields["attrs"],
+            logpose_types::value::Value::Json(json!({"size": 3, "big": u64::MAX}))
+        );
+        assert_eq!(
+            Value::Object(widget.extra.clone()),
+            json!({"color": "red", "origin": "eu"})
+        );
+        assert_eq!(records[1].pk, logpose_types::record::PrimaryKey::Int64(2));
+
+        let projected = service
+            .get_records(Request::new(GetRecordsRequest {
+                output_fields: vec!["price".to_owned(), "$extra".to_owned()],
+                ..get_request("products", vec![int_key(1)])
+            }))
+            .await
+            .expect("projected get should succeed")
+            .into_inner();
+        let projected = convert::records_from_proto(projected.records, "records").expect("decode");
+        assert!(projected[0].vectors.is_empty());
+        assert_eq!(
+            projected[0].fields.keys().collect::<Vec<_>>(),
+            vec!["price"]
+        );
+        assert_eq!(projected[0].extra.len(), 2);
+
+        service
+            .update_records(Request::new(UpdateRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                records: vec![proto::RecordUpdate {
+                    pk: Some(int_key(1)),
+                    vectors: Default::default(),
+                    fields: [
+                        (
+                            "price".to_owned(),
+                            proto::Value {
+                                kind: Some(proto::value::Kind::NullValue(0)),
+                            },
+                        ),
+                        (
+                            "tags".to_owned(),
+                            proto::Value {
+                                kind: Some(proto::value::Kind::ArrayValue(proto::ValueArray {
+                                    values: vec![string_value("c")],
+                                })),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    extra: Some(convert::json_object_to_proto(
+                        json!({"origin": null}).as_object().expect("object"),
+                    )),
+                }],
+            }))
+            .await
+            .expect("partial update should succeed");
+        let updated = service
+            .get_records(Request::new(get_request("products", vec![int_key(1)])))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let updated = convert::records_from_proto(updated.records, "records").expect("decode");
+        assert!(!updated[0].fields.contains_key("price"), "null clears");
+        assert_eq!(
+            updated[0].fields["tags"],
+            logpose_types::value::Value::Array(vec![logpose_types::value::Value::String(
+                "c".to_owned()
+            )])
+        );
+        assert_eq!(
+            Value::Object(updated[0].extra.clone()),
+            json!({"color": "red"})
+        );
+        assert_eq!(
+            updated[0].vectors["embedding"],
+            vec![0.6, 0.0, 0.8],
+            "an update keeps the vector it does not send"
+        );
+
+        let deleted = service
+            .delete_records(Request::new(DeleteRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                keys: vec![int_key(2), int_key(99)],
+            }))
+            .await
+            .expect("delete should succeed")
+            .into_inner();
+        assert_eq!(deleted.applied_ops, 2, "a missing key is a no-op delete");
+        let after = service
+            .get_records(Request::new(get_request("products", vec![int_key(2)])))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        assert!(after.records.is_empty());
+        assert_eq!(after.missing_keys, vec![int_key(2)]);
+    }
+
+    #[tokio::test]
+    async fn grpc_record_validation_errors_name_the_record_field() {
+        let service =
+            GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-record-errors"))));
+        service
+            .create_collection(Request::new(products_request("default")))
+            .await
+            .expect("collection should be created");
+        let valid = || proto::Record {
+            pk: Some(int_key(1)),
+            vectors: [(
+                "embedding".to_owned(),
+                proto::Vector {
+                    values: vec![1.0, 0.0, 0.0],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            fields: [("tenant".to_owned(), string_value("acme"))]
+                .into_iter()
+                .collect(),
+            extra: None,
+        };
+        let upsert = |record: proto::Record| {
+            let service = service.clone();
+            async move {
+                service
+                    .upsert_records(Request::new(UpsertRecordsRequest {
+                        database_name: default_database_name(),
+                        collection_name: "products".to_owned(),
+                        records: vec![valid(), record],
+                    }))
+                    .await
+                    .expect_err("the batch is rejected")
+            }
+        };
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record
+            .fields
+            .insert("price".to_owned(), proto::Value { kind: None });
+        let error = upsert(record).await;
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(violation_fields(&error), vec!["records[1].price"]);
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record.fields.insert(
+            "price".to_owned(),
+            proto::Value {
+                kind: Some(proto::value::Kind::Int64Value(5)),
+            },
+        );
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].price"]);
+        assert!(error.message().contains("expected float64"), "{error:?}");
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record.fields.insert(
+            "tags".to_owned(),
+            proto::Value {
+                kind: Some(proto::value::Kind::ArrayValue(proto::ValueArray {
+                    values: vec![
+                        string_value("a"),
+                        proto::Value {
+                            kind: Some(proto::value::Kind::Int64Value(1)),
+                        },
+                    ],
+                })),
+            },
+        );
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].tags[1]"]);
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record.vectors.insert(
+            "embedding".to_owned(),
+            proto::Vector {
+                values: vec![1.0, 0.0],
+            },
+        );
+        let error = upsert(record).await;
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(reason(&error).as_deref(), Some("DIMENSION_MISMATCH"));
+        assert_eq!(violation_fields(&error), vec!["records[1].embedding"]);
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record.fields.clear();
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].tenant"]);
+
+        let mut record = valid();
+        record.pk = Some(string_key("two"));
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].sku"]);
+
+        let mut record = valid();
+        record.pk = None;
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].pk"]);
+
+        let error = upsert(valid()).await;
+        assert_eq!(violation_fields(&error), vec!["records[1]"]);
+        assert!(error.message().contains("more than once"), "{error:?}");
+
+        let mut record = valid();
+        record.pk = Some(int_key(2));
+        record.extra = Some(convert::json_object_to_proto(
+            json!({"price": 1}).as_object().expect("object"),
+        ));
+        let error = upsert(record).await;
+        assert_eq!(violation_fields(&error), vec!["records[1].price"]);
+
+        let error = service
+            .update_records(Request::new(UpdateRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                records: vec![proto::RecordUpdate {
+                    pk: Some(int_key(404)),
+                    vectors: Default::default(),
+                    fields: [("price".to_owned(), string_value("x"))]
+                        .into_iter()
+                        .collect(),
+                    extra: None,
+                }],
+            }))
+            .await
+            .expect_err("a type error is reported before the key is looked up");
+        assert_eq!(violation_fields(&error), vec!["records[0].price"]);
+
+        let error = service
+            .update_records(Request::new(UpdateRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                records: vec![proto::RecordUpdate {
+                    pk: Some(int_key(404)),
+                    vectors: Default::default(),
+                    fields: [(
+                        "price".to_owned(),
+                        proto::Value {
+                            kind: Some(proto::value::Kind::Float64Value(1.0)),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    extra: None,
+                }],
+            }))
+            .await
+            .expect_err("an update of a missing key fails");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert_eq!(reason(&error).as_deref(), Some("RESOURCE_NOT_FOUND"));
+        assert_eq!(
+            error
+                .get_details_error_info()
+                .and_then(|info| info.metadata.get("resource_type").cloned())
+                .as_deref(),
+            Some("record")
+        );
+
+        let error = service
+            .delete_records(Request::new(DeleteRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                keys: vec![int_key(1), string_key("one")],
+            }))
+            .await
+            .expect_err("a string key does not fit an int64 primary key");
+        assert_eq!(violation_fields(&error), vec!["keys[1]"]);
+
+        let error = service
+            .get_records(Request::new(get_request(
+                "products",
+                vec![proto::PrimaryKey { kind: None }],
+            )))
+            .await
+            .expect_err("a key must be set");
+        assert_eq!(violation_fields(&error), vec!["keys[0]"]);
+
+        let error = service
+            .get_records(Request::new(get_request("products", vec![string_key("x")])))
+            .await
+            .expect_err("a string key does not fit an int64 primary key");
+        assert_eq!(violation_fields(&error), vec!["keys[0]"]);
+    }
+
+    #[tokio::test]
+    async fn grpc_alter_collection_changes_the_schema_and_shadows_dynamic_keys() {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config("grpc-alter"))));
         service
             .create_collection(Request::new(create_collection_request(
                 "documents",
@@ -2571,42 +3008,345 @@ mod tests {
                 proto::DistanceMetric::Dot,
             )))
             .await
-            .expect("create should succeed");
-
-        let error = service
-            .write_collection(Request::new(write_collection_request(
+            .expect("collection should be created");
+        service
+            .upsert_records(Request::new(upsert_request(
                 "documents",
-                vec![proto::WriteOperation {
-                    operation: Some(proto::write_operation::Operation::Delete(
-                        proto::DeleteRecord { id: String::new() },
-                    )),
+                vec![record(
+                    "alpha",
+                    vec![1.0, 0.0],
+                    json!({"color": "red", "size": 1}),
+                )],
+            )))
+            .await
+            .expect("upsert should succeed");
+
+        let altered = service
+            .alter_collection(Request::new(alter_request(
+                "default",
+                "documents",
+                proto::alter_collection_request::Change::AddField(proto::ScalarFieldSpec {
+                    name: "color".to_owned(),
+                    r#type: proto::FieldType::String as i32,
+                    index: proto::FieldIndex::Auto as i32,
+                    nullable: None,
+                }),
+            )))
+            .await
+            .expect("add field should succeed")
+            .into_inner();
+        let schema = altered.schema.expect("schema");
+        assert_eq!(schema.schema_version, 2);
+        assert_eq!(schema.fields[0].name, "color");
+
+        let before = service
+            .get_records(Request::new(get_request(
+                "documents",
+                vec![string_key("alpha")],
+            )))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let before = convert::records_from_proto(before.records, "records").expect("decode");
+        assert!(
+            before[0].fields.is_empty(),
+            "an added field reads null on rows written before it"
+        );
+        assert_eq!(
+            Value::Object(before[0].extra.clone()),
+            json!({"size": 1}),
+            "the dynamic key the new field declares is shadowed"
+        );
+
+        service
+            .upsert_records(Request::new(upsert_request(
+                "documents",
+                vec![proto::Record {
+                    fields: [("color".to_owned(), string_value("blue"))]
+                        .into_iter()
+                        .collect(),
+                    ..record("beta", vec![0.0, 1.0], json!({}))
                 }],
             )))
             .await
-            .expect_err("empty delete record id should error");
+            .expect("typed upsert should succeed");
 
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(
-            error
-                .message()
-                .contains("delete operation record id must not be empty")
+        let renamed = service
+            .alter_collection(Request::new(alter_request(
+                "default",
+                "documents",
+                proto::alter_collection_request::Change::RenameField(proto::RenameField {
+                    from: "color".to_owned(),
+                    to: "colour".to_owned(),
+                }),
+            )))
+            .await
+            .expect("rename should succeed")
+            .into_inner()
+            .schema
+            .expect("schema");
+        assert_eq!(renamed.retired_names, vec!["color".to_owned()]);
+        let beta = service
+            .get_records(Request::new(get_request(
+                "documents",
+                vec![string_key("beta")],
+            )))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let beta = convert::records_from_proto(beta.records, "records").expect("decode");
+        assert_eq!(
+            beta[0].fields["colour"],
+            logpose_types::value::Value::String("blue".to_owned())
         );
+
+        let error = service
+            .upsert_records(Request::new(upsert_request(
+                "documents",
+                vec![record("gamma", vec![1.0, 1.0], json!({"color": "green"}))],
+            )))
+            .await
+            .expect_err("a retired name cannot be stored dynamically");
+        assert_eq!(violation_fields(&error), vec!["records[0].color"]);
+
+        let error = service
+            .get_records(Request::new(GetRecordsRequest {
+                output_fields: vec!["color".to_owned()],
+                ..get_request("documents", vec![string_key("beta")])
+            }))
+            .await
+            .expect_err("a retired name cannot be projected");
+        assert_eq!(violation_fields(&error), vec!["output_fields[0]"]);
+
+        service
+            .alter_collection(Request::new(alter_request(
+                "default",
+                "documents",
+                proto::alter_collection_request::Change::DropField(proto::DropField {
+                    name: "colour".to_owned(),
+                }),
+            )))
+            .await
+            .expect("drop should succeed");
+        let beta = service
+            .get_records(Request::new(get_request(
+                "documents",
+                vec![string_key("beta")],
+            )))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let beta = convert::records_from_proto(beta.records, "records").expect("decode");
+        assert!(beta[0].fields.is_empty(), "a dropped field is hidden");
+
+        for (change, field) in [
+            (
+                proto::alter_collection_request::Change::AddField(proto::ScalarFieldSpec {
+                    name: "required".to_owned(),
+                    r#type: proto::FieldType::Bool as i32,
+                    index: proto::FieldIndex::Auto as i32,
+                    nullable: Some(false),
+                }),
+                "add_field.nullable",
+            ),
+            (
+                proto::alter_collection_request::Change::DropField(proto::DropField {
+                    name: "id".to_owned(),
+                }),
+                "drop_field.name",
+            ),
+            (
+                proto::alter_collection_request::Change::RenameField(proto::RenameField {
+                    from: "missing".to_owned(),
+                    to: "other".to_owned(),
+                }),
+                "rename_field.from",
+            ),
+            (
+                proto::alter_collection_request::Change::RenameField(proto::RenameField {
+                    from: "vector".to_owned(),
+                    to: "id".to_owned(),
+                }),
+                "rename_field.to",
+            ),
+        ] {
+            let error = service
+                .alter_collection(Request::new(alter_request("default", "documents", change)))
+                .await
+                .expect_err("an invalid change is rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(violation_fields(&error), vec![field], "{error:?}");
+        }
+        let error = service
+            .alter_collection(Request::new(AlterCollectionRequest {
+                change: None,
+                ..alter_request(
+                    "default",
+                    "documents",
+                    proto::alter_collection_request::Change::DropField(proto::DropField {
+                        name: "x".to_owned(),
+                    }),
+                )
+            }))
+            .await
+            .expect_err("an alter needs a change");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn grpc_schema_changes_and_typed_records_survive_a_restart() {
+        let root = unique_temp_dir("grpc-restart");
+        let config = test_config_with_root("grpc-restart", NodeRole::Combined, root.clone());
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config.clone())));
+        service
+            .create_collection(Request::new(products_request("default")))
+            .await
+            .expect("collection should be created");
+        service
+            .alter_collection(Request::new(alter_request(
+                "default",
+                "products",
+                proto::alter_collection_request::Change::AddField(proto::ScalarFieldSpec {
+                    name: "stock".to_owned(),
+                    r#type: proto::FieldType::Int64 as i32,
+                    index: proto::FieldIndex::Auto as i32,
+                    nullable: None,
+                }),
+            )))
+            .await
+            .expect("add field should succeed");
+        service
+            .upsert_records(Request::new(UpsertRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: "products".to_owned(),
+                records: vec![proto::Record {
+                    pk: Some(int_key(7)),
+                    vectors: [(
+                        "embedding".to_owned(),
+                        proto::Vector {
+                            values: vec![0.0, 0.0, 2.0],
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    fields: [
+                        ("tenant".to_owned(), string_value("acme")),
+                        (
+                            "stock".to_owned(),
+                            proto::Value {
+                                kind: Some(proto::value::Kind::Int64Value(12)),
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    extra: None,
+                }],
+            }))
+            .await
+            .expect("upsert should succeed");
+        service
+            .alter_collection(Request::new(alter_request(
+                "default",
+                "products",
+                proto::alter_collection_request::Change::RenameField(proto::RenameField {
+                    from: "stock".to_owned(),
+                    to: "inventory".to_owned(),
+                }),
+            )))
+            .await
+            .expect("rename should succeed");
+        drop(service);
+
+        let reopened = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
+        let described = reopened
+            .get_collection(Request::new(GetCollectionRequest {
+                database_name: "default".to_owned(),
+                collection_name: "products".to_owned(),
+            }))
+            .await
+            .expect("the collection is recovered")
+            .into_inner()
+            .schema
+            .expect("schema");
+        assert_eq!(described.schema_version, 3);
+        assert_eq!(
+            described.fields.last().map(|field| field.name.as_str()),
+            Some("inventory")
+        );
+        let fetched = reopened
+            .get_records(Request::new(get_request("products", vec![int_key(7)])))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let fetched = convert::records_from_proto(fetched.records, "records").expect("decode");
+        assert_eq!(
+            fetched[0].fields["inventory"],
+            logpose_types::value::Value::Int64(12)
+        );
+        assert_eq!(fetched[0].vectors["embedding"], vec![0.0, 0.0, 1.0]);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn default_database_name() -> String {
         DEFAULT_DATABASE_NAME.to_owned()
     }
 
+    /// A collection of the single-vector shape: string key `id`, vector `vector`, dynamic
+    /// fields on.
     fn create_collection_request(
         name: &str,
-        dimensions: u64,
+        dimensions: u32,
         metric: proto::DistanceMetric,
     ) -> CreateCollectionRequest {
         CreateCollectionRequest {
-            name: name.to_owned(),
-            dimensions,
-            metric: metric as i32,
             database_name: default_database_name(),
+            collection_name: name.to_owned(),
+            primary_key: Some(proto::PrimaryKeySpec {
+                name: "id".to_owned(),
+                r#type: proto::PrimaryKeyType::String as i32,
+            }),
+            vectors: vec![proto::VectorFieldSpec {
+                name: "vector".to_owned(),
+                dimensions,
+                metric: metric as i32,
+            }],
+            fields: Vec::new(),
+            dynamic_fields: Some(true),
+        }
+    }
+
+    /// The typed `products` collection of the engine plan's example: an int64 key `sku`, a
+    /// three-dimension cosine vector, typed scalar fields, and dynamic fields on.
+    fn products_request(database_name: &str) -> CreateCollectionRequest {
+        let field = |name: &str, field_type: proto::FieldType, nullable: Option<bool>| {
+            proto::ScalarFieldSpec {
+                name: name.to_owned(),
+                r#type: field_type as i32,
+                index: proto::FieldIndex::Auto as i32,
+                nullable,
+            }
+        };
+        CreateCollectionRequest {
+            database_name: database_name.to_owned(),
+            collection_name: "products".to_owned(),
+            primary_key: Some(proto::PrimaryKeySpec {
+                name: "sku".to_owned(),
+                r#type: proto::PrimaryKeyType::Int64 as i32,
+            }),
+            vectors: vec![proto::VectorFieldSpec {
+                name: "embedding".to_owned(),
+                dimensions: 3,
+                metric: proto::DistanceMetric::Cosine as i32,
+            }],
+            fields: vec![
+                field("tenant", proto::FieldType::String, Some(false)),
+                field("price", proto::FieldType::Float64, None),
+                field("tags", proto::FieldType::ArrayString, None),
+                field("updated_at", proto::FieldType::Timestamp, None),
+                field("attrs", proto::FieldType::Json, None),
+            ],
+            dynamic_fields: None,
         }
     }
 
@@ -2625,26 +3365,86 @@ mod tests {
 
     fn get_collection_request(collection_name: &str) -> GetCollectionRequest {
         GetCollectionRequest {
-            collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
         }
     }
 
     fn get_collection_placement_request(collection_name: &str) -> GetCollectionPlacementRequest {
         GetCollectionPlacementRequest {
-            collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
         }
     }
 
-    fn write_collection_request(
-        collection_name: &str,
-        operations: Vec<proto::WriteOperation>,
-    ) -> WriteCollectionRequest {
-        WriteCollectionRequest {
-            collection_name: collection_name.to_owned(),
-            operations,
+    fn string_value(value: &str) -> proto::Value {
+        proto::Value {
+            kind: Some(proto::value::Kind::StringValue(value.to_owned())),
+        }
+    }
+
+    fn string_key(value: &str) -> proto::PrimaryKey {
+        proto::PrimaryKey {
+            kind: Some(proto::primary_key::Kind::StringValue(value.to_owned())),
+        }
+    }
+
+    fn int_key(value: i64) -> proto::PrimaryKey {
+        proto::PrimaryKey {
+            kind: Some(proto::primary_key::Kind::Int64Value(value)),
+        }
+    }
+
+    /// A record of the single-vector shape whose `metadata` keys go to `$extra`.
+    fn record(id: &str, vector: Vec<f32>, metadata: Value) -> proto::Record {
+        let metadata = metadata
+            .as_object()
+            .cloned()
+            .expect("record metadata must be an object");
+        proto::Record {
+            pk: Some(string_key(id)),
+            vectors: [("vector".to_owned(), proto::Vector { values: vector })]
+                .into_iter()
+                .collect(),
+            fields: Default::default(),
+            extra: Some(convert::json_object_to_proto(&metadata)),
+        }
+    }
+
+    fn upsert_request(collection_name: &str, records: Vec<proto::Record>) -> UpsertRecordsRequest {
+        UpsertRecordsRequest {
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
+            records,
+        }
+    }
+
+    fn delete_request(collection_name: &str, ids: &[&str]) -> DeleteRecordsRequest {
+        DeleteRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
+            keys: ids.iter().map(|id| string_key(id)).collect(),
+        }
+    }
+
+    fn get_request(collection_name: &str, keys: Vec<proto::PrimaryKey>) -> GetRecordsRequest {
+        GetRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
+            keys,
+            output_fields: Vec::new(),
+        }
+    }
+
+    fn alter_request(
+        database_name: &str,
+        collection_name: &str,
+        change: proto::alter_collection_request::Change,
+    ) -> AlterCollectionRequest {
+        AlterCollectionRequest {
+            database_name: database_name.to_owned(),
+            collection_name: collection_name.to_owned(),
+            change: Some(change),
         }
     }
 
@@ -2654,6 +3454,7 @@ mod tests {
         top_k: u64,
     ) -> QueryCollectionRequest {
         QueryCollectionRequest {
+            database_name: default_database_name(),
             collection_name: collection_name.to_owned(),
             vector,
             top_k,
@@ -2662,14 +3463,13 @@ mod tests {
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
-            database_name: default_database_name(),
         }
     }
 
     fn get_collection_stats_request(collection_name: &str) -> GetCollectionStatsRequest {
         GetCollectionStatsRequest {
-            collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
             snapshot: None,
             read_barrier: None,
         }
@@ -2677,15 +3477,15 @@ mod tests {
 
     fn flush_collection_request(collection_name: &str) -> FlushCollectionRequest {
         FlushCollectionRequest {
-            collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
         }
     }
 
     fn compact_collection_request(collection_name: &str) -> CompactCollectionRequest {
         CompactCollectionRequest {
-            collection_name: collection_name.to_owned(),
             database_name: default_database_name(),
+            collection_name: collection_name.to_owned(),
         }
     }
 
@@ -2695,31 +3495,27 @@ mod tests {
         segment_id: impl Into<String>,
     ) -> InspectCollectionRequest {
         InspectCollectionRequest {
+            database_name: default_database_name(),
             collection_name: collection_name.to_owned(),
             target: target as i32,
             segment_id: segment_id.into(),
-            database_name: default_database_name(),
         }
     }
 
     fn put_database_policy_request(database_name: &str) -> proto::PutDatabasePolicyRequest {
         proto::PutDatabasePolicyRequest {
-            policy: Some(proto::DatabaseAccessPolicyReply {
-                database_name: database_name.to_owned(),
-                authentication_mode: proto::AuthenticationMode::ExternalToken as i32,
-                role_bindings: vec![
-                    proto::DatabaseRoleBindingReply {
-                        database_name: database_name.to_owned(),
-                        principal_name: "ops-admin".to_owned(),
-                        role: proto::DatabaseRole::Owner as i32,
-                    },
-                    proto::DatabaseRoleBindingReply {
-                        database_name: database_name.to_owned(),
-                        principal_name: "reader-service".to_owned(),
-                        role: proto::DatabaseRole::ReadOnly as i32,
-                    },
-                ],
-            }),
+            database_name: database_name.to_owned(),
+            authentication_mode: proto::AuthenticationMode::ExternalToken as i32,
+            role_bindings: vec![
+                proto::DatabaseRoleBinding {
+                    principal_name: "ops-admin".to_owned(),
+                    role: proto::DatabaseRole::Owner as i32,
+                },
+                proto::DatabaseRoleBinding {
+                    principal_name: "reader-service".to_owned(),
+                    role: proto::DatabaseRole::ReadOnly as i32,
+                },
+            ],
         }
     }
 
@@ -2731,13 +3527,7 @@ mod tests {
 
     fn put_database_request(database_name: &str) -> proto::PutDatabaseRequest {
         proto::PutDatabaseRequest {
-            descriptor: Some(proto::DatabaseDescriptorReply {
-                database_id: logpose_catalog::DatabaseDescriptor::new(database_name)
-                    .database_id
-                    .to_string(),
-                name: database_name.to_owned(),
-                is_default: database_name == DEFAULT_DATABASE_NAME,
-            }),
+            database_name: database_name.to_owned(),
         }
     }
 
@@ -2749,6 +3539,24 @@ mod tests {
 
     fn list_databases_request() -> proto::ListDatabasesRequest {
         proto::ListDatabasesRequest {}
+    }
+
+    /// The request fields a status's `BadRequest` detail names.
+    fn violation_fields(status: &Status) -> Vec<String> {
+        status
+            .get_details_bad_request()
+            .map(|bad_request| {
+                bad_request
+                    .field_violations
+                    .into_iter()
+                    .map(|violation| violation.field)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn reason(status: &Status) -> Option<String> {
+        status.get_details_error_info().map(|info| info.reason)
     }
 
     fn test_config(label: &str) -> LogPoseConfig {

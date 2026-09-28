@@ -306,7 +306,7 @@ mod tests {
     async fn unary_requests_above_the_message_limit_are_resource_exhausted() {
         use crate::{
             proto,
-            test_support::{TestServer, put, small_grpc_limit},
+            test_support::{TestServer, put, small_grpc_limit, text},
         };
 
         let mut server = TestServer::start("grpc-message-limit", small_grpc_limit(1024)).await;
@@ -315,25 +315,25 @@ mod tests {
         // Under the limit: accepted.
         server
             .client
-            .write_collection(proto::WriteCollectionRequest {
+            .upsert_records(proto::UpsertRecordsRequest {
+                database_name: "default".to_owned(),
                 collection_name: "docs".to_owned(),
-                operations: vec![put("a")],
-                database_name: String::new(),
+                records: vec![put("a")],
             })
             .await
             .expect("a small write should succeed");
 
         // Over the limit: rejected before the handler runs, with a typed error.
         let mut oversized = put("b");
-        if let Some(proto::write_operation::Operation::Put(record)) = &mut oversized.operation {
-            record.metadata_json = format!("{{\"blob\":\"{}\"}}", "x".repeat(4096));
-        }
+        oversized
+            .fields
+            .insert("blob".to_owned(), text("x".repeat(4096)));
         let status = server
             .client
-            .write_collection(proto::WriteCollectionRequest {
+            .upsert_records(proto::UpsertRecordsRequest {
+                database_name: "default".to_owned(),
                 collection_name: "docs".to_owned(),
-                operations: vec![oversized],
-                database_name: String::new(),
+                records: vec![oversized],
             })
             .await
             .expect_err("an oversized write should be rejected");
@@ -357,7 +357,7 @@ mod tests {
             .client
             .get_collection(proto::GetCollectionRequest {
                 collection_name: "missing".to_owned(),
-                database_name: String::new(),
+                database_name: "default".to_owned(),
             })
             .await
             .expect_err("a missing collection should be reported");
