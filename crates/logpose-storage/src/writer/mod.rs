@@ -3,8 +3,8 @@
 //! Each collection has one writer task on the engine's writer runtime. It owns the collection's
 //! [`WalWriter`], its private state (schema, memtables, segments, deletion vectors, and the
 //! primary-key index, which run ahead of the published `Version` by at most one prepared group),
-//! the durable manifest, and the maintenance job slot. Nothing else touches them, so the writer
-//! takes no locks, and it is the only code that publishes a `Version`.
+//! the durable manifest, and the collection's maintenance jobs. Nothing else touches them, so
+//! the writer takes no locks, and it is the only code that publishes a `Version`.
 //!
 //! Group commit is a two-stage pipeline with at most one WAL I/O in flight:
 //!
