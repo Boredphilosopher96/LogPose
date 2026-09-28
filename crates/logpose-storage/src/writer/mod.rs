@@ -39,6 +39,8 @@
 mod apply;
 #[cfg(test)]
 mod dv_tests;
+#[cfg(test)]
+mod model_tests;
 mod pk_index;
 mod prepare;
 #[cfg(test)]
@@ -545,7 +547,7 @@ impl Writer {
         if let Some(io) = inflight.take() {
             self.finish(io).await;
         }
-        self.stop();
+        self.stop().await;
     }
 
     /// Collect a group starting at `first`, prepare it, and start its I/O once the group in
@@ -1729,10 +1731,30 @@ impl Writer {
     }
 
     /// Fail everything still queued and stop.
-    fn stop(&mut self) {
+    ///
+    /// Both channels are closed and then drained with `recv`, which after a close also waits
+    /// for a send that already passed the channel's open check but has not queued its message
+    /// yet. Dropping a receiver, or draining it with `try_recv`, misses such a message: it then
+    /// sits in the channel with its reply sender alive, and its caller (a client write, a job
+    /// thread blocked on a begin or commit, a quiescing drop) waits forever, which hangs engine
+    /// shutdown.
+    async fn stop(&mut self) {
         self.requests.close();
-        while let Ok(request) = self.requests.try_recv() {
+        self.control.close();
+        while let Some(request) = self.requests.recv().await {
             let _ = request.ack().send(Err(shutting_down()));
+        }
+        while let Some(message) = self.control.recv().await {
+            match message {
+                ControlMsg::BeginJob { reply, .. } => {
+                    let _ = reply.send(Err(shutting_down()));
+                }
+                ControlMsg::CommitJob { reply, .. } => {
+                    let _ = reply.send(Err(shutting_down()));
+                }
+                ControlMsg::Quiesce { reply } => self.quiesce_waiters.push(reply),
+                ControlMsg::EndJob { .. } | ControlMsg::Shutdown => {}
+            }
         }
         for (_, reply) in self.waiting_jobs.drain(..) {
             let _ = reply.send(Err(shutting_down()));
