@@ -633,9 +633,19 @@ pub fn filter_to_proto(filter: FilterExpr) -> proto::Filter {
 /// # Errors
 ///
 /// Returns `INVALID_ARGUMENT` naming the node for a filter with no node, a comparison without a
-/// field path or an operand, or an operand that is not a valid value.
+/// field path or an operand, or an operand that is not a valid value, and for a filter past
+/// the limits of [`FilterExpr::check_limits`].
 pub fn filter_from_proto(filter: proto::Filter, path: &str) -> Result<FilterExpr> {
+    let filter = filter_node_from_proto(filter, path, 1)?;
+    filter.check_limits(path)?;
+    Ok(filter)
+}
+
+fn filter_node_from_proto(filter: proto::Filter, path: &str, depth: usize) -> Result<FilterExpr> {
     use proto::filter::Node;
+    if depth > logpose_types::filter::MAX_FILTER_DEPTH {
+        return Err(logpose_types::filter::too_deep(path));
+    }
     let Some(node) = filter.node else {
         return Err(LogPoseError::invalid_field(
             path,
@@ -683,13 +693,19 @@ pub fn filter_from_proto(filter: proto::Filter, path: &str) -> Result<FilterExpr
         list.filters
             .into_iter()
             .enumerate()
-            .map(|(index, child)| filter_from_proto(child, &format!("{node_path}[{index}]")))
+            .map(|(index, child)| {
+                filter_node_from_proto(child, &format!("{node_path}[{index}]"), depth + 1)
+            })
             .collect()
     };
     Ok(match node {
         Node::And(children) => FilterExpr::And(list(children)?),
         Node::Or(children) => FilterExpr::Or(list(children)?),
-        Node::Not(child) => FilterExpr::Not(Box::new(filter_from_proto(*child, &node_path)?)),
+        Node::Not(child) => FilterExpr::Not(Box::new(filter_node_from_proto(
+            *child,
+            &node_path,
+            depth + 1,
+        )?)),
         Node::Eq(comparison) | Node::Ne(comparison) | Node::Contains(comparison) => {
             let at = field_path(&comparison.field)?;
             let value = operand(comparison.value, &at)?;

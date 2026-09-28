@@ -4284,9 +4284,17 @@ mod tests {
             field: "price".to_owned(),
             ..proto::FieldRange::default()
         })));
+        let mut deep = FilterExpr::eq("sku", 1);
+        for _ in 0..40 {
+            deep = FilterExpr::negate(deep);
+        }
+        let too_deep = format!("filter{}", ".not".repeat(32));
+        let wide = FilterExpr::in_values("sku", vec![TypedValue::Int64(1); 10_000]);
         for (request, field) in [
             (bad_token, "snapshot_token"),
             (bad_bound, "filter.range.price"),
+            (items_count(Some(deep)), too_deep.as_str()),
+            (items_count(Some(wide)), "filter"),
         ] {
             let error = service
                 .count_records(Request::new(request))

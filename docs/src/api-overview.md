@@ -723,6 +723,11 @@ and its range bounds compare two strings or two numbers. A value is never
 `bool`), and not both `gt` and `gte` (or `lt` and `lte`); `contains` and
 `contains_any` need an array field.
 
+A filter nests at most 32 levels (`{"not": {"eq": ...}}` is two) and has at
+most 10,000 terms: its nodes plus the values of its `in`, `not_in`, and
+`contains_any` lists. A filter past either limit is `INVALID_ARGUMENT`, at the
+first node too deep or at `filter`.
+
 In gRPC a filter is the `Filter` message, a `oneof` with the same operators:
 `FilterList` for `and` and `or`, `FieldValue` (`field` and a typed `Value`) for
 `eq`, `ne`, and `contains`, `FieldValues` for `in`, `not_in`, and

@@ -3795,7 +3795,18 @@ mod tests {
             }
             body
         };
+        let mut deep = json!({"eq": {"sku": 1}});
+        for _ in 0..40 {
+            deep = json!({ "not": deep });
+        }
+        let too_deep = format!("filter{}", ".not".repeat(32));
         let cases = [
+            ("records/count", json!({"filter": deep}), too_deep.as_str()),
+            (
+                "records/count",
+                json!({"filter": {"in": {"sku": vec![1; 10_000]}}}),
+                "filter",
+            ),
             ("query", query(json!({"top_k": 0})), "top_k"),
             ("query", query(json!({"top_k": 10_001})), "top_k"),
             (

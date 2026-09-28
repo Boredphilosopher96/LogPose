@@ -31,6 +31,12 @@
 //!
 //! Every node is an object with one key. Errors name the node with its path, such as
 //! `filter.and[1].range.price.gte`; the gRPC API reports the same paths.
+//!
+//! # Limits
+//!
+//! A filter nests at most [`MAX_FILTER_DEPTH`] levels (the root is level 1) and has at most
+//! [`MAX_FILTER_TERMS`] terms: nodes plus the operands of `in`, `not_in`, and `contains_any`
+//! lists. [`FilterExpr::check_limits`] enforces both; parsing and compiling a filter check them.
 
 use crate::{
     LogPoseError,
@@ -43,6 +49,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue};
+
+/// Most levels a filter nests: `{"not": {"eq": ...}}` has two.
+pub const MAX_FILTER_DEPTH: usize = 32;
+
+/// Most terms a filter has: its nodes plus the operands of its lists.
+pub const MAX_FILTER_TERMS: usize = 10_000;
 
 /// A boolean filter over record fields. Operands are typed [`Value`]s; a comparison with a
 /// dynamic key or a `json` field uses the operand's JSON form.
@@ -326,6 +338,41 @@ impl FilterExpr {
         }
     }
 
+    /// Check the filter against [`MAX_FILTER_DEPTH`] and [`MAX_FILTER_TERMS`], without
+    /// recursion, so any depth is safe to check. `path` names the filter in the request.
+    ///
+    /// # Errors
+    ///
+    /// [`LogPoseError::InvalidArgument`] at the first node past the depth limit, or at `path`
+    /// for a filter with too many terms.
+    pub fn check_limits(&self, path: &str) -> Result<(), LogPoseError> {
+        let mut terms = 0_usize;
+        let mut pending = vec![(self, 1_usize, path.to_owned())];
+        while let Some((node, depth, node_path)) = pending.pop() {
+            if depth > MAX_FILTER_DEPTH {
+                return Err(too_deep(&node_path));
+            }
+            terms += 1;
+            let node_path = format!("{node_path}.{}", node.operator());
+            match node {
+                Self::And(children) | Self::Or(children) => {
+                    for (index, child) in children.iter().enumerate() {
+                        pending.push((child, depth + 1, format!("{node_path}[{index}]")));
+                    }
+                }
+                Self::Not(child) => pending.push((child, depth + 1, node_path)),
+                Self::In { values, .. }
+                | Self::NotIn { values, .. }
+                | Self::ContainsAny { values, .. } => terms += values.len(),
+                _ => {}
+            }
+            if terms > MAX_FILTER_TERMS {
+                return Err(too_many_terms(path));
+            }
+        }
+        Ok(())
+    }
+
     /// Parse a filter from its natural JSON form, typing each operand by the field it compares:
     /// a declared field's operand converts like a record value of that field's type (an array
     /// field's operand like one element), the primary key's like a key, and a dynamic key's or
@@ -344,7 +391,9 @@ impl FilterExpr {
         json: JsonValue,
         path: &str,
     ) -> Result<Self, LogPoseError> {
-        parse_node(schema, json, path)
+        let filter = parse_node(schema, json, path, 1)?;
+        filter.check_limits(path)?;
+        Ok(filter)
     }
 
     /// The natural JSON form: the inverse of [`FilterExpr::from_json`].
@@ -460,11 +509,33 @@ enum Operand {
     Bound,
 }
 
+/// The error for a node nested past [`MAX_FILTER_DEPTH`].
+#[must_use]
+pub fn too_deep(path: &str) -> LogPoseError {
+    LogPoseError::invalid_field(
+        path,
+        format!("a filter nests at most {MAX_FILTER_DEPTH} levels"),
+    )
+}
+
+fn too_many_terms(path: &str) -> LogPoseError {
+    LogPoseError::invalid_field(
+        path,
+        format!(
+            "a filter has at most {MAX_FILTER_TERMS} terms (nodes plus the values of its lists)"
+        ),
+    )
+}
+
 fn parse_node(
     schema: &CollectionSchema,
     json: JsonValue,
     path: &str,
+    depth: usize,
 ) -> Result<FilterExpr, LogPoseError> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(too_deep(path));
+    }
     let JsonValue::Object(object) = json else {
         return Err(LogPoseError::invalid_field(
             path,
@@ -491,7 +562,9 @@ fn parse_node(
             let children = items
                 .into_iter()
                 .enumerate()
-                .map(|(index, item)| parse_node(schema, item, &format!("{node_path}[{index}]")))
+                .map(|(index, item)| {
+                    parse_node(schema, item, &format!("{node_path}[{index}]"), depth + 1)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(if operator == "and" {
                 FilterExpr::And(children)
@@ -500,7 +573,10 @@ fn parse_node(
             })
         }
         "not" => Ok(FilterExpr::Not(Box::new(parse_node(
-            schema, body, &node_path,
+            schema,
+            body,
+            &node_path,
+            depth + 1,
         )?))),
         "exists" | "is_null" => {
             let JsonValue::String(field) = body else {
@@ -725,7 +801,9 @@ impl From<PrimaryKey> for Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilterExpr, FilterTarget, RangeBounds, resolve_field};
+    use super::{
+        FilterExpr, FilterTarget, MAX_FILTER_DEPTH, MAX_FILTER_TERMS, RangeBounds, resolve_field,
+    };
     use crate::{
         ErrorCode, LogPoseError,
         schema::{
@@ -856,6 +934,47 @@ mod tests {
             assert_eq!(error.code(), ErrorCode::InvalidArgument, "{json}");
             assert_eq!(invalid_path(&error), Some(path), "{json}: {error}");
         }
+    }
+
+    #[test]
+    fn filters_past_the_depth_and_term_limits_are_rejected() {
+        let schema = schema(false);
+        let mut json = json!({ "eq": { "tenant": "a" } });
+        for _ in 1..MAX_FILTER_DEPTH {
+            json = json!({ "not": json });
+        }
+        let filter = FilterExpr::from_json(&schema, json.clone(), "filter")
+            .expect("a filter at the depth limit should parse");
+        assert!(filter.check_limits("filter").is_ok());
+        let deeper = json!({ "and": [json] });
+        let error = FilterExpr::from_json(&schema, deeper, "filter").expect_err("too deep");
+        let expected = format!("filter.and[0]{}", ".not".repeat(MAX_FILTER_DEPTH - 1));
+        assert_eq!(invalid_path(&error), Some(expected.as_str()), "{error}");
+
+        // Built directly, far past what any request parser would nest: checked without
+        // recursion.
+        let mut deep = FilterExpr::eq("tenant", "a");
+        for _ in 0..100_000 {
+            deep = FilterExpr::negate(deep);
+        }
+        let error = deep.check_limits("filter").expect_err("too deep");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let mut deep = Some(deep);
+        // Unnest before dropping: dropping 100k nested boxes would recurse.
+        while let Some(FilterExpr::Not(child)) = deep.take() {
+            deep = Some(*child);
+        }
+
+        let wide = FilterExpr::in_values(
+            "sku",
+            (0..i64::try_from(MAX_FILTER_TERMS).unwrap_or(i64::MAX))
+                .map(Value::Int64)
+                .collect(),
+        );
+        let error = wide.check_limits("filter").expect_err("too many terms");
+        assert_eq!(invalid_path(&error), Some("filter"));
+        let within = FilterExpr::in_values("sku", vec![Value::Int64(1); MAX_FILTER_TERMS - 1]);
+        assert!(within.check_limits("filter").is_ok());
     }
 
     #[test]

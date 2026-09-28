@@ -9,6 +9,7 @@
 //! below `filter` (the same paths [`FilterExpr::from_json`] uses, such as
 //! `filter.and[1].range.price.gte`):
 //!
+//! - the filter is within the depth and term limits of [`FilterExpr::check_limits`];
 //! - `and` and `or` need a child, `in`, `not_in`, and `contains_any` a value, and `range` a
 //!   bound, but not both `gt` and `gte` (or `lt` and `lte`);
 //! - `contains` and `contains_any` need an array field, and `range` an ordered one (not `bool`);
@@ -93,7 +94,9 @@ enum JsonTarget {
 enum Cond {
     IsNull,
     Exists,
+    /// Sorted and deduplicated, for binary search.
     AnyOf(Vec<ScalarKey>),
+    /// Sorted and deduplicated, for binary search.
     NoneOf(Vec<ScalarKey>),
     Range(Bound<ScalarKey>, Bound<ScalarKey>),
 }
@@ -104,9 +107,9 @@ impl Cond {
         match self {
             Self::IsNull => keys.is_empty(),
             Self::Exists => !keys.is_empty(),
-            Self::AnyOf(wanted) => keys.iter().any(|key| wanted.contains(key)),
+            Self::AnyOf(wanted) => keys.iter().any(|key| wanted.binary_search(key).is_ok()),
             Self::NoneOf(unwanted) => {
-                !keys.is_empty() && keys.iter().all(|key| !unwanted.contains(key))
+                !keys.is_empty() && keys.iter().all(|key| unwanted.binary_search(key).is_err())
             }
             Self::Range(low, high) => keys
                 .iter()
@@ -193,6 +196,7 @@ impl CompiledFilter {
     ///
     /// `InvalidArgument` at the node's path; see the [module documentation](self).
     pub fn compile(schema: &Arc<CollectionSchema>, expr: &FilterExpr) -> Result<Self> {
+        expr.check_limits(FILTER_PATH)?;
         Ok(Self {
             root: compile_node(schema, expr, FILTER_PATH)?,
             schema: Arc::clone(schema),
@@ -400,13 +404,15 @@ fn comparison(
     };
     match key_type(target) {
         Some(element) => {
-            let keys = values
+            let mut keys = values
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
                     exact_key(element, value).map_err(|message| invalid(&at(index), message))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            keys.sort();
+            keys.dedup();
             let cond = if negated {
                 Cond::NoneOf(keys)
             } else {
