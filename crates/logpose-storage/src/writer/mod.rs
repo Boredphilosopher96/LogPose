@@ -37,6 +37,8 @@
 //! engine's fatal handler stops the process.
 
 mod apply;
+#[cfg(test)]
+mod dv_tests;
 mod pk_index;
 mod prepare;
 #[cfg(test)]
