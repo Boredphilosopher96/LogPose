@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{process::ExitCode, time::Duration};
 use tempfile as _;
+use tracing as _;
 
 #[derive(Debug, Parser)]
 #[command(

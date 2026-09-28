@@ -13,6 +13,7 @@ use serde as _;
 use std::path::Path;
 use std::time::Duration;
 use tempfile as _;
+use tracing as _;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -2390,6 +2390,235 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
+/// A create that stopped after writing its pending metadata (its process died before the
+/// local collection) is rolled back by its node once the node registers: the metadata is
+/// removed and the name can be created again.
+#[tokio::test]
+async fn etcd_node_rolls_back_a_pending_create_without_local_state() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_node_rolls_back_a_pending_create_without_local_state").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("reconcile-roll-back");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-reconcile-roll-back";
+    let root_dir = unique_temp_dir("etcd-reconcile-roll-back");
+    let collection = CollectionRef::new_default("documents");
+    let collection_keys = format!(
+        "{key_prefix}/clusters/{cluster_name}/collections/{}",
+        collection.lookup_name()
+    );
+    let descriptor = CollectionDescriptor::new_in_database(
+        "default",
+        "documents",
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+            .spec
+            .build_schema()
+            .expect("schema"),
+        root_dir.path(),
+    )
+    .without_root_path();
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd client should connect");
+    for (key, value) in [
+        (
+            format!("{collection_keys}/assignment"),
+            serde_json::to_string(&CollectionAssignment {
+                assigned_node: "node-a".to_owned(),
+                assigned_role: NodeRole::Combined,
+            })
+            .expect("assignment should serialize"),
+        ),
+        (
+            format!("{collection_keys}/descriptor"),
+            json!({ "descriptor": descriptor, "ready": false }).to_string(),
+        ),
+        (
+            format!("{collection_keys}/shards/0/owner"),
+            json!({
+                "database_name": "default",
+                "collection_name": "documents",
+                "shard_id": "0",
+                "owner_node_id": "node-a",
+                "epoch": 1,
+            })
+            .to_string(),
+        ),
+    ] {
+        client
+            .put(key, value, None)
+            .await
+            .expect("pending metadata should be seeded");
+    }
+
+    let state = Arc::new(AppState::new(test_config(
+        "node-a",
+        root_dir.path().to_path_buf(),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    wait_for_local_leadership(&state).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let keys = client
+            .get(
+                collection_keys.clone(),
+                Some(
+                    etcd_client::GetOptions::new()
+                        .with_prefix()
+                        .with_count_only(),
+                ),
+            )
+            .await
+            .expect("metadata should be readable")
+            .count();
+        if keys == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the leader to roll the pending create back"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let created = state
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("the name can be created again");
+    assert_ne!(created.collection_id, descriptor.collection_id);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+/// A create that stopped after its local collection, before marking the metadata ready (here,
+/// because its node lost the leadership that fences that step), is rolled forward by its node
+/// while another node leads: only the node a collection is placed on sees its local state.
+/// Re-registering the node's membership starts a pass at once.
+#[tokio::test]
+async fn etcd_follower_rolls_forward_its_pending_create_while_another_node_leads() {
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_follower_rolls_forward_its_pending_create_while_another_node_leads",
+    )
+    .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("reconcile-roll-forward");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-reconcile-roll-forward";
+    let (config, _root) = short_ttl_config(
+        "node-a",
+        "etcd-reconcile-roll-forward",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, _) = wait_for_local_leadership(&state).await;
+    let created = state
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created");
+
+    // Another node takes the leadership: its record replaces node-a's on a lease of its own.
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd client should connect");
+    let other_lease = client
+        .lease_grant(60, None)
+        .await
+        .expect("etcd should grant a lease")
+        .id();
+    client
+        .put(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            serde_json::to_string(&LeadershipRecord {
+                node_id: "node-b".to_owned(),
+                lease_id: other_lease,
+            })
+            .expect("leadership record should serialize"),
+            Some(PutOptions::new().with_lease(other_lease)),
+        )
+        .await
+        .expect("the leader key should be replaced");
+    wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            !coordination.is_local_leader && coordination.leader_node.as_deref() == Some("node-b")
+        })
+    })
+    .await;
+
+    // Put the metadata back in the state the create left it in before its last step.
+    let descriptor_key =
+        format!("{key_prefix}/clusters/{cluster_name}/collections/default/documents/descriptor");
+    let response = client
+        .get(descriptor_key.clone(), None)
+        .await
+        .expect("descriptor should be readable");
+    let mut stored: serde_json::Value = serde_json::from_slice(
+        response
+            .kvs()
+            .first()
+            .expect("descriptor should exist")
+            .value(),
+    )
+    .expect("descriptor should decode");
+    stored["ready"] = json!(false);
+    client
+        .put(descriptor_key, stored.to_string(), None)
+        .await
+        .expect("descriptor should be rewritten");
+    let error = state
+        .get_collection("documents")
+        .await
+        .expect_err("a pending create is not served");
+    assert!(
+        matches!(error, LogPoseError::ReconciliationRequired { .. }),
+        "{error:?}"
+    );
+
+    revoke_lease_out_of_band(&endpoints, membership_lease_id).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let described = loop {
+        match state.get_collection("documents").await {
+            Ok(described) => break described,
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the node to roll the pending create forward: {error}"
+            ),
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(described.collection_id, created.collection_id);
+    let status = state
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+    let coordination = status
+        .coordination
+        .expect("coordination state should be present");
+    assert!(!coordination.is_local_leader, "{coordination:?}");
+    assert_eq!(coordination.leader_node.as_deref(), Some("node-b"));
+
+    let _ = client.lease_revoke(other_lease).await;
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
 /// Config with TTLs short enough that the coordination loop ticks every second, and its
 /// storage root's guard: keep the guard alive for as long as a node runs on the configuration.
 fn short_ttl_config(

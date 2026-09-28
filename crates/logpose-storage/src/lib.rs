@@ -18,8 +18,9 @@
 //! - `segment`: the engine's handle on one segment v2 file, and writing one.
 //! - `inspect`: collection statistics (O(units), from counters and zone maps) and `inspect`
 //!   reports.
-//! - `collections`, `catalog`: collection create requests, collection, database and principal
-//!   descriptor files, and the [`CatalogStore`](logpose_catalog::CatalogStore) over them.
+//! - `collections`, `catalog`: collection create requests, and collection, database, principal,
+//!   and access-policy descriptor files, which `Engine`'s catalog calls read and write on the
+//!   I/O pool.
 //! - `paths`: the on-disk layout.
 //! - `recovery`: the durability barrier, loading the manifest `CURRENT` names, orphan cleanup,
 //!   and replaying the WAL above its checkpoint.

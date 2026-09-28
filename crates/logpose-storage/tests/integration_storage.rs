@@ -31,7 +31,7 @@ use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
 };
-use logpose_catalog::{CatalogStore, DatabaseDescriptor};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_storage::{CreateCollectionRequest, Engine, InspectTarget};
 use logpose_types::{
     CorruptionKind, DEFAULT_DATABASE_NAME, DistanceMetric, ErrorCode, LogPoseError, Snapshot,
@@ -108,13 +108,14 @@ async fn create_collection_persists_default_database_descriptor() {
     assert!(database_descriptor.is_default);
 }
 
-#[test]
-fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
+#[tokio::test]
+async fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
     let root_dir = support::unique_temp_dir("storage-catalog-invalid-stored");
     let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     engine
         .put_database(DatabaseDescriptor::new("analytics"))
+        .await
         .expect("database descriptor should persist");
     engine
         .put_principal(Principal::new_with_access_tier(
@@ -122,6 +123,7 @@ fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
             PrincipalKind::User,
             AccessTier::Observer,
         ))
+        .await
         .expect("principal descriptor should persist");
 
     // Damage the stored copies so they no longer pass validation: only the default database
@@ -142,15 +144,19 @@ fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
     for error in [
         engine
             .get_database("analytics")
+            .await
             .expect_err("a damaged database descriptor should fail"),
         engine
             .list_databases()
+            .await
             .expect_err("listing a damaged database descriptor should fail"),
         engine
             .get_principal("reader")
+            .await
             .expect_err("a damaged principal descriptor should fail"),
         engine
             .list_principals()
+            .await
             .expect_err("listing a damaged principal descriptor should fail"),
     ] {
         assert_eq!(error.code(), ErrorCode::DataLoss, "{error}");
@@ -168,14 +174,15 @@ fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
     }
 }
 
-#[test]
-fn catalog_store_round_trips_databases_principals_and_policies() {
+#[tokio::test]
+async fn catalog_round_trips_databases_principals_and_policies() {
     let root_dir = support::unique_temp_dir("storage-catalog-round-trip");
     let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
+        .await
         .expect("database descriptor should persist");
     let principal = engine
         .put_principal(Principal::new_with_access_tier(
@@ -183,6 +190,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
             PrincipalKind::User,
             AccessTier::Observer,
         ))
+        .await
         .expect("principal descriptor should persist");
     let policy = engine
         .put_database_access_policy(DatabaseAccessPolicy {
@@ -194,28 +202,33 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
                 role: DatabaseRole::ReadOnly,
             }],
         })
+        .await
         .expect("database policy should persist");
 
     assert_eq!(
         engine
             .get_database("analytics")
+            .await
             .expect("database lookup should succeed"),
         database
     );
     assert_eq!(
         engine
             .get_principal("reader")
+            .await
             .expect("principal lookup should succeed"),
         principal
     );
     assert_eq!(
         engine
             .get_database_access_policy("analytics")
+            .await
             .expect("policy lookup should succeed"),
         policy
     );
     let databases = engine
         .list_databases()
+        .await
         .expect("database listing should succeed");
     assert_eq!(databases.len(), 2);
     assert!(
@@ -231,6 +244,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
     assert_eq!(
         engine
             .list_principals()
+            .await
             .expect("principal listing should succeed"),
         vec![principal.clone()]
     );
@@ -266,31 +280,35 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
     assert_eq!(
         reopened
             .get_database("analytics")
+            .await
             .expect("reopened database lookup should succeed"),
         database
     );
     assert_eq!(
         reopened
             .get_principal("reader")
+            .await
             .expect("reopened principal lookup should succeed"),
         principal
     );
     assert_eq!(
         reopened
             .get_database_access_policy("analytics")
+            .await
             .expect("reopened policy lookup should succeed"),
         policy
     );
 }
 
-#[test]
-fn catalog_store_overwrites_database_policy_by_database_name() {
+#[tokio::test]
+async fn catalog_overwrites_database_policy_by_database_name() {
     let root_dir = support::unique_temp_dir("storage-catalog-database-isolation");
     let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
+        .await
         .expect("database should persist");
 
     let owner_policy = engine
@@ -303,6 +321,7 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
                 role: DatabaseRole::Owner,
             }],
         })
+        .await
         .expect("owner policy should persist");
     let read_only_policy = engine
         .put_database_access_policy(DatabaseAccessPolicy {
@@ -314,11 +333,13 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
                 role: DatabaseRole::ReadOnly,
             }],
         })
+        .await
         .expect("read-only policy should replace the existing database policy");
 
     assert_eq!(
         engine
             .get_database_access_policy("analytics")
+            .await
             .expect("database policy lookup should succeed"),
         read_only_policy
     );
@@ -326,23 +347,26 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
     assert_eq!(
         engine
             .get_database("analytics")
+            .await
             .expect("database descriptor should still load"),
         database
     );
     assert_ne!(owner_policy, read_only_policy);
 }
 
-#[test]
-fn put_database_preserves_stable_database_identity_on_replace() {
+#[tokio::test]
+async fn put_database_preserves_stable_database_identity_on_replace() {
     let root_dir = support::unique_temp_dir("storage-database-idempotence");
     let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let first = engine
         .put_database(DatabaseDescriptor::new("analytics"))
+        .await
         .expect("first database descriptor should persist");
     let replacement = engine
         .put_database(DatabaseDescriptor::new("analytics"))
+        .await
         .expect("replacing a database descriptor should preserve its identity");
 
     assert_eq!(replacement.name, "analytics");

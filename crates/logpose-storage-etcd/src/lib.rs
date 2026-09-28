@@ -22,7 +22,16 @@ use logpose_types::{
 use protoc_bin_vendored as _;
 use serde::{Deserialize, Serialize};
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+mod reconcile;
+
+pub use reconcile::ReconcileReport;
+use reconcile::run_to_completion;
 
 // The metadata configuration types (`MetadataBackend`, `EtcdMetadataConfig`,
 // and `MetadataConfig`) live in `logpose-types` so that crates like
@@ -38,16 +47,48 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// failure in between leaves only metadata, which a retry removes. Creates and drops are fenced
 /// by the control-plane leader's lease; publishing an altered schema is not fenced, but it only
 /// ever moves the catalog's schema version forward.
+///
+/// A create or drop runs as a task of its own, so it completes even when its caller stops
+/// waiting for it. A create that still stops between its steps (its process died, etcd
+/// failed after the local create, or the node lost its leadership) leaves pending metadata,
+/// which [`reconcile_pending`](Self::reconcile_pending) resolves on the node it is placed on,
+/// whether or not that node leads.
 #[derive(Clone)]
 pub struct EtcdCollectionCatalog {
     engine: Engine,
     etcd: EtcdPlacementStore,
+    /// The collections a create or drop on this node is working on, with how many; the
+    /// reconciler leaves their pending metadata alone.
+    in_flight: Arc<Mutex<BTreeMap<String, usize>>>,
+    #[cfg(test)]
+    interrupt: Arc<Mutex<Option<reconcile::Interrupt>>>,
 }
 
 /// Shared etcd-backed catalog metadata for database descriptors and policies.
 #[derive(Clone)]
 pub struct EtcdCatalogStore {
     etcd: EtcdPlacementStore,
+}
+
+/// Proof that a process is the registered incarnation of its node: the lease of its
+/// membership key. It fences the changes a node makes to the metadata of the collections placed
+/// on it ([`EtcdCollectionCatalog::reconcile_pending`]); another process that registers the
+/// same node id replaces the key's lease and so voids the fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipFence {
+    /// The node, as registered.
+    pub node_id: String,
+    /// The lease its membership key is attached to.
+    pub lease_id: i64,
+}
+
+/// What fences a guarded change of a collection's metadata.
+#[derive(Clone, Copy)]
+enum Fence<'a> {
+    /// The control-plane leader's lease: creates and drops.
+    Leader(&'a LeadershipFence),
+    /// The membership lease of the node the collection is placed on: reconciliation.
+    Member(&'a MembershipFence),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +130,9 @@ impl EtcdCollectionCatalog {
         Ok(Self {
             engine,
             etcd: EtcdPlacementStore::new(config)?,
+            in_flight: Arc::default(),
+            #[cfg(test)]
+            interrupt: Arc::default(),
         })
     }
 
@@ -104,11 +148,31 @@ impl EtcdCollectionCatalog {
     /// Create a collection: authoritative metadata first, then the local collection with its
     /// placement `assignment`, then the metadata is marked ready. Fenced by `leader_fence`.
     ///
+    /// The steps run as a task of their own: dropping the returned future does not stop them.
+    ///
     /// # Errors
     ///
     /// `AlreadyExists`, a stale assignment that needs manual reconciliation, the local
     /// create's error (after rolling the metadata back), or etcd failures.
     pub async fn create_collection(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+        leader_fence: LeadershipFence,
+    ) -> Result<CollectionDescriptor> {
+        let operation = self.begin_operation(&request.lookup_name());
+        let catalog = self.clone();
+        run_to_completion(async move {
+            let _operation = operation;
+            catalog
+                .create_steps(request, assignment, leader_fence)
+                .await
+        })
+        .await
+    }
+
+    /// The steps of [`create_collection`](Self::create_collection).
+    async fn create_steps(
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
@@ -156,18 +220,24 @@ impl EtcdCollectionCatalog {
                 return Err(error);
             }
         };
+        #[cfg(test)]
+        self.interruption_point(reconcile::Step::MetadataWritten)
+            .await?;
         match self
             .engine
             .create_collection(descriptor.clone(), Some(assignment))
             .await
         {
             Ok(handle) => {
+                #[cfg(test)]
+                self.interruption_point(reconcile::Step::LocalChanged)
+                    .await?;
                 self.etcd
                     .mark_collection_ready_if_revision_matches(
                         &collection_name,
                         &descriptor,
                         metadata_revision,
-                        &leader_fence,
+                        Fence::Leader(&leader_fence),
                     )
                     .await?;
                 Ok(handle.describe())
@@ -197,15 +267,16 @@ impl EtcdCollectionCatalog {
     ///
     /// # Errors
     ///
-    /// `NotFound`, a pending descriptor that needs manual reconciliation, or etcd failures.
+    /// `NotFound`, `ReconciliationRequired` for pending metadata (a create that has not finished),
+    /// or etcd failures.
     pub async fn describe(&self, name: &str) -> Result<CollectionDescriptor> {
         match self.etcd.get_descriptor(name).await? {
             Some(stored_descriptor) if stored_descriptor.ready => Ok(self
                 .materialize_runtime_descriptor(stored_descriptor.descriptor)
                 .await),
-            Some(_) => Err(pending_descriptor_requires_manual_reconciliation_error(
-                &canonical_collection_lookup_name(name),
-            )),
+            Some(_) => Err(pending_descriptor_error(&canonical_collection_lookup_name(
+                name,
+            ))),
             None => Err(LogPoseError::not_found(
                 ResourceKind::Collection,
                 canonical_collection_lookup_name(name),
@@ -258,6 +329,8 @@ impl EtcdCollectionCatalog {
     /// Drop a collection: the local collection first (the commit point for its data), then its
     /// metadata, fenced by `leader_fence`.
     ///
+    /// The steps run as a task of their own: dropping the returned future does not stop them.
+    ///
     /// # Errors
     ///
     /// `NotFound` when neither exists, the local drop's error, or etcd failures.
@@ -267,6 +340,21 @@ impl EtcdCollectionCatalog {
         leader_fence: LeadershipFence,
     ) -> Result<()> {
         let collection_name = canonical_collection_lookup_name(collection_name);
+        let operation = self.begin_operation(&collection_name);
+        let catalog = self.clone();
+        run_to_completion(async move {
+            let _operation = operation;
+            catalog.drop_steps(collection_name, leader_fence).await
+        })
+        .await
+    }
+
+    /// The steps of [`drop_collection`](Self::drop_collection).
+    async fn drop_steps(
+        &self,
+        collection_name: String,
+        leader_fence: LeadershipFence,
+    ) -> Result<()> {
         let revision = self
             .etcd
             .collection_metadata_revision(&collection_name)
@@ -282,13 +370,16 @@ impl EtcdCollectionCatalog {
             Err(LogPoseError::NotFound { .. }) => false,
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        self.interruption_point(reconcile::Step::LocalChanged)
+            .await?;
         match revision {
             Some(revision) => {
                 self.etcd
                     .delete_collection_metadata_if_revision_matches(
                         &collection_name,
                         revision,
-                        Some(&leader_fence),
+                        Some(Fence::Leader(&leader_fence)),
                     )
                     .await
             }
@@ -777,6 +868,33 @@ impl EtcdPlacementStore {
         .map_err(json_encode_message)
     }
 
+    fn membership_prefix(&self) -> String {
+        format!(
+            "{}/clusters/{}/members/",
+            self.key_prefix, self.cluster_name
+        )
+    }
+
+    fn membership_key(&self, node_id: &str) -> String {
+        format!("{}{node_id}", self.membership_prefix())
+    }
+
+    /// The comparison that holds while `fence` does.
+    fn fence_compare(&self, fence: Fence<'_>) -> Result<Compare> {
+        Ok(match fence {
+            Fence::Leader(fence) => Compare::value(
+                self.leadership_key(),
+                CompareOp::Equal,
+                self.leadership_value(&fence.node_id, fence.lease_id)?,
+            ),
+            Fence::Member(fence) => Compare::lease(
+                self.membership_key(&fence.node_id),
+                CompareOp::Equal,
+                fence.lease_id,
+            ),
+        })
+    }
+
     fn database_descriptor_key(&self, database_name: &str) -> String {
         format!(
             "{}/clusters/{}/databases/{database_name}/descriptor",
@@ -885,7 +1003,7 @@ impl EtcdPlacementStore {
         collection_name: &str,
         descriptor: &CollectionDescriptor,
         revision: CollectionMetadataRevision,
-        leader_fence: &LeadershipFence,
+        fence: Fence<'_>,
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
@@ -894,12 +1012,9 @@ impl EtcdPlacementStore {
         let descriptor_value =
             serde_json::to_string(&StoredCollectionDescriptor::ready(descriptor))
                 .map_err(json_encode_message)?;
-        let leadership_key = self.leadership_key();
-        let leadership_value =
-            self.leadership_value(&leader_fence.node_id, leader_fence.lease_id)?;
         let txn = Txn::new()
             .when([
-                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
+                self.fence_compare(fence)?,
                 Compare::mod_revision(
                     assignment_key.clone(),
                     CompareOp::Equal,
@@ -925,7 +1040,7 @@ impl EtcdPlacementStore {
             Err(LogPoseError::ReconciliationRequired {
                 collection: collection_name.to_owned(),
                 message: format!(
-                    "authoritative etcd metadata for collection '{collection_name}' changed before local state could be finalized; manual reconciliation is required"
+                    "authoritative etcd metadata for collection '{collection_name}' changed, or the change lost its fence, before the create could be marked ready; the node the collection is placed on rolls a pending create forward or back"
                 ),
             })
         }
@@ -1082,7 +1197,7 @@ impl EtcdPlacementStore {
         &self,
         collection_name: &str,
         revision: CollectionMetadataRevision,
-        leader_fence: Option<&LeadershipFence>,
+        fence: Option<Fence<'_>>,
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
@@ -1105,12 +1220,8 @@ impl EtcdPlacementStore {
                 revision.owner_mod_revision,
             ),
         ];
-        if let Some(fence) = leader_fence {
-            compares.push(Compare::value(
-                self.leadership_key(),
-                CompareOp::Equal,
-                self.leadership_value(&fence.node_id, fence.lease_id)?,
-            ));
+        if let Some(fence) = fence {
+            compares.push(self.fence_compare(fence)?);
         }
         let txn = Txn::new().when(compares).and_then([
             TxnOp::delete(assignment_key, Some(DeleteOptions::new())),
@@ -1125,7 +1236,7 @@ impl EtcdPlacementStore {
             Err(LogPoseError::ReconciliationRequired {
                 collection: collection_name.to_owned(),
                 message: format!(
-                    "authoritative etcd metadata for collection '{collection_name}' changed before rollback could remove it; manual reconciliation is required"
+                    "authoritative etcd metadata for collection '{collection_name}' changed, or the change lost its fence, before its metadata could be removed"
                 ),
             })
         }
@@ -1223,11 +1334,11 @@ fn stale_assignment_requires_manual_reconciliation_error(collection_name: &str) 
     }
 }
 
-fn pending_descriptor_requires_manual_reconciliation_error(collection_name: &str) -> LogPoseError {
+fn pending_descriptor_error(collection_name: &str) -> LogPoseError {
     LogPoseError::ReconciliationRequired {
         collection: collection_name.to_owned(),
         message: format!(
-            "collection '{collection_name}' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it"
+            "collection '{collection_name}' has pending metadata in etcd: its create has not finished, and a create that stopped between its steps is rolled forward or back by the node the collection is placed on"
         ),
     }
 }
@@ -1391,10 +1502,7 @@ impl EtcdCoordinationClient {
         node_id: &str,
         node_role: logpose_types::NodeRole,
     ) -> Result<MembershipLease> {
-        let membership_key = format!(
-            "{}/clusters/{}/members/{node_id}",
-            self.store.key_prefix, self.config.cluster_name
-        );
+        let membership_key = self.store.membership_key(node_id);
         let payload = serde_json::json!({
             "node_id": node_id,
             "node_role": node_role,
@@ -1534,10 +1642,7 @@ impl EtcdCoordinationClient {
 
     /// Return all currently visible membership records under the configured cluster.
     pub async fn list_membership(&self) -> Result<Vec<MembershipRecord>> {
-        let membership_prefix = format!(
-            "{}/clusters/{}/members/",
-            self.store.key_prefix, self.config.cluster_name
-        );
+        let membership_prefix = self.store.membership_prefix();
         let mut client = self.store.client().await?;
         let response = client
             .get(
