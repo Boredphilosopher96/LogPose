@@ -257,10 +257,10 @@ fn report(failure: &Failure) -> ! {
             }
         }
     };
-    // Hand-stepped runs on `FaultVfs` replay exactly (in practice: the engine's own flush of a
-    // memtable an abandoned flush left frozen runs in the background). With background jobs,
-    // or on the real filesystem, timing varies, so a replay usually, but not always, fails
-    // the same way.
+    // Hand-stepped runs on `FaultVfs` replay exactly: the runner settles what the engine does
+    // in the background after every action (see `Session::settle`). With background jobs, or
+    // on the real filesystem, timing varies, so a replay usually, but not always, fails the
+    // same way.
     let exact = if failure.setup.maintenance == Maintenance::Stepped
         && failure.setup.backend == Backend::Fault
     {
