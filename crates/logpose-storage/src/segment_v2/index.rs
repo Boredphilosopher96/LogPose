@@ -296,6 +296,7 @@ fn vector_sections(
     };
     let live_rows = || (0..rows).filter(|row| !vector.nulls.contains(*row));
 
+    let mut has_codes = false;
     if non_null >= u64::from(policy.sq8_min_rows) {
         let mut training = Vec::with_capacity(non_null as usize * dim);
         for row in live_rows() {
@@ -318,6 +319,7 @@ fn vector_sections(
                 }
             }
             if ok {
+                has_codes = true;
                 let mut payload = Vec::new();
                 write_codes_section(&params, u64::from(rows), &codes, &mut payload)
                     .map_err(encode)?;
@@ -332,7 +334,9 @@ fn vector_sections(
         }
     }
 
-    if non_null >= u64::from(policy.graph_min_rows) {
+    // Walks traverse SQ8 codes, so a field without codes (a range too wide for them) gets no
+    // graph either: it would never be walked, and inspect would report it as `hnsw`.
+    if has_codes && non_null >= u64::from(policy.graph_min_rows) {
         // One node per distinct vector, in order of first appearance.
         let mut node_of: HashMap<&[u8], u32> = HashMap::new();
         let mut node_rows: Vec<Vec<u32>> = Vec::new();
@@ -622,4 +626,83 @@ pub(crate) fn attach_decoded(
         _ => {}
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment_v2::SegmentIdentity;
+    use logpose_types::{
+        CollectionId,
+        record::Record,
+        schema::{CollectionSchema, PrimaryKeySpec, PrimaryKeyType, VectorFieldSpec},
+    };
+    use logpose_wal::codec::RowImage;
+    use std::sync::Arc;
+
+    fn built(vectors: impl Fn(u32) -> Vec<f32>) -> Vec<(IndexSectionKind, u32)> {
+        let schema = Arc::new(
+            CollectionSchema::new(
+                PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    key_type: PrimaryKeyType::String,
+                },
+                vec![VectorFieldSpec {
+                    name: "v".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::L2,
+                }],
+                Vec::new(),
+                false,
+            )
+            .expect("schema"),
+        );
+        let mut builder = SegmentBuilder::new(
+            Arc::clone(&schema),
+            SegmentIdentity {
+                collection_id: CollectionId::default(),
+                unit_id: 1,
+            },
+        )
+        .expect("builder");
+        for row in 0..16 {
+            let record = Record::new(format!("k{row:02}")).with_vector("v", vectors(row));
+            let image = RowImage::from_record(&schema, record).expect("row image");
+            builder
+                .push_row_image(u64::from(row) + 1, &image)
+                .expect("push");
+        }
+        let policy = IndexPolicy {
+            graph_min_rows: 4,
+            sq8_min_rows: 2,
+            ..IndexPolicy::default()
+        };
+        builder
+            .build_index_sections(&policy)
+            .expect("index sections")
+            .sections
+    }
+
+    /// A vector field whose range is too wide for SQ8 gets neither codes nor a graph: walks
+    /// traverse codes, so its segments are scanned exactly in f32.
+    #[test]
+    fn a_field_without_sq8_codes_gets_no_graph() {
+        #[allow(clippy::cast_precision_loss)]
+        let ordinary = built(|row| vec![row as f32, (row * row) as f32]);
+        let kinds = ordinary.iter().map(|(kind, _)| *kind).collect::<Vec<_>>();
+        assert!(kinds.contains(&IndexSectionKind::VectorSq8), "{kinds:?}");
+        assert!(kinds.contains(&IndexSectionKind::VectorGraph), "{kinds:?}");
+
+        #[allow(clippy::cast_precision_loss)]
+        let wide = built(|row| {
+            let sign = if row % 2 == 0 { 1.0 } else { -1.0 };
+            vec![sign * f32::MAX, row as f32]
+        });
+        assert!(
+            wide.iter().all(|(kind, _)| !matches!(
+                kind,
+                IndexSectionKind::VectorSq8 | IndexSectionKind::VectorGraph
+            )),
+            "{wide:?}"
+        );
+    }
 }
