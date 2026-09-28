@@ -678,3 +678,40 @@ fn random_segments_read_the_same_through_a_thrashing_cache() {
         }
     }
 }
+
+/// Row images read through the reader decode keys, the dynamic block index, and blocks on
+/// first use; those decoded forms are charged to the cache then, so a later charge (the read
+/// path's, after a hit) adds nothing.
+#[test]
+fn row_images_charge_the_forms_they_decode() {
+    let (bytes, _) = vector_segment(4, 4096 + 5);
+    let cache = cache();
+    let reader = SegmentReader::open(MemorySource::new(bytes))
+        .expect("opens")
+        .with_cache(&cache);
+    let images = reader
+        .row_images_projected(&[0, 4096], false)
+        .expect("rows");
+    assert_eq!(images.len(), 2);
+    let pk = reader
+        .section_unit(
+            reader
+                .find_section(SectionKind::PkColumn, None)
+                .expect("keys"),
+        )
+        .expect("unit");
+    let index = reader.dynamic_index_unit().expect("dynamic index");
+    let dynamic = reader.dynamic().expect("dynamic").expect("present");
+    let keys = [
+        reader.unit_key(&pk).expect("cached"),
+        reader.unit_key(&index).expect("cached"),
+        page_key(&reader, dynamic.section_index(), 0),
+        page_key(&reader, dynamic.section_index(), 1),
+    ];
+    let used = cache.used();
+    for key in &keys {
+        assert!(cache.residency(key), "{key:?}");
+        cache.charge_decoded(key);
+        assert_eq!(cache.used(), used, "{key:?} was charged when decoded");
+    }
+}
