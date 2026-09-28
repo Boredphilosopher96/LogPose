@@ -418,6 +418,52 @@ fn a_flush_whose_commit_poisons_answers_its_waiters_with_its_own_error() {
     engine.scheduler().resume();
 }
 
+/// A step of an explicit compaction whose commit poisons the collection (the `CURRENT` rename
+/// fails) answers the compaction with its own error, as a flush answers its explicit flushes,
+/// and later requests get `CollectionPoisoned` naming it. Both kinds of step: a merge of two
+/// segments, and the index build of a lone segment that follows once nothing more merges.
+#[test]
+fn an_explicit_compaction_step_that_poisons_answers_it_with_its_own_error() {
+    for merge in [true, false] {
+        let vfs = ControlledVfs::wrap(FaultVfs::new(11).process());
+        let clock = Arc::new(ManualClock::new());
+        let config = EngineConfig {
+            index: crate::IndexPolicy {
+                graph_min_rows: 2,
+                sq8_min_rows: 2,
+                ..crate::IndexPolicy::default()
+            },
+            ..config(&clock)
+        };
+        let engine = open(&vfs, config);
+        let handle = create(&engine, usize::MAX, usize::MAX);
+        for round in 0..if merge { 2_u8 } else { 1 } {
+            write(
+                &handle,
+                (0..4_u8)
+                    .map(|row| upsert(&format!("r{round}{row}"), f32::from(round * 4 + row)))
+                    .collect(),
+            );
+            handle.flush_blocking().expect("the flush commits");
+        }
+        assert_eq!(handle.current().indexed_segments(), (0, 0));
+
+        vfs.fail_crash_point(Some(CrashPoint::CurrentAfterRename));
+        let cause = handle
+            .compact_blocking()
+            .expect_err("the step's manifest publish fails after the rename");
+        assert!(
+            !matches!(cause, LogPoseError::CollectionPoisoned { .. }),
+            "merge {merge}: the compaction gets its step's own failure: {cause:?}"
+        );
+        assert!(handle.is_poisoned(), "merge {merge}");
+        let later = handle
+            .write_blocking(vec![upsert("z", 9.0)])
+            .expect_err("the collection is poisoned");
+        assert_poisoned_by(&later, &cause);
+    }
+}
+
 /// A failure unrelated to a running flush (a WAL fsync) poisons the collection: the explicit
 /// compaction fails at once, and the explicit flush is left to the running flush, which
 /// answers it with `CollectionPoisoned` when it ends, so it never waits for a flush that does
