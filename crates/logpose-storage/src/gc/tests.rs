@@ -421,6 +421,73 @@ fn an_abandoned_job_leaves_no_files_behind() {
     );
 }
 
+/// Dropping the last reference to a file handle removes its files only when the writer marked
+/// it obsolete: a handle of a live segment can be dropped (at shutdown, or by a stray `Version`)
+/// without touching the files the durable manifest still references.
+#[test]
+fn only_the_last_reference_to_an_obsolete_handle_removes_its_files() {
+    let fault = FaultVfs::new(36);
+    let engine = Engine::open(fault.process(), ROOT, config()).expect("engine should open");
+    let vfs = fault.process();
+    let dir = Path::new(ROOT).join("handles");
+    let live = UnitFiles::new(&dir, UnitId(1)).published();
+    let obsolete = UnitFiles::new(&dir, UnitId(2)).published();
+    for path in live.iter().chain(&obsolete) {
+        touch(vfs.as_ref(), path);
+    }
+    let gc = engine.core().gc.clone();
+    let live_handle = Arc::new(FileHandle::new(UnitId(1), live.clone(), gc.clone()));
+    let obsolete_handle = Arc::new(FileHandle::new(UnitId(2), obsolete.clone(), gc));
+    let reader = Arc::clone(&obsolete_handle);
+    obsolete_handle.mark_obsolete();
+    drop(obsolete_handle);
+    engine.wait_for_gc();
+    assert!(
+        obsolete.iter().all(|path| exists_at(vfs.as_ref(), path)),
+        "a reader still holds the obsolete handle"
+    );
+    drop(reader);
+    drop(live_handle);
+    engine.wait_for_gc();
+    assert!(obsolete.iter().all(|path| !exists_at(vfs.as_ref(), path)));
+    assert!(
+        live.iter().all(|path| exists_at(vfs.as_ref(), path)),
+        "a handle that was never marked obsolete leaves its files"
+    );
+}
+
+/// The state a read runs against holds its `Version`, so the segment files the read opens by
+/// path stay on disk until the read ends, even when a compaction retires them and nothing else
+/// holds that `Version` any more.
+#[test]
+fn a_read_in_progress_keeps_the_files_of_its_version() {
+    let fault = FaultVfs::new(37);
+    let engine = Engine::open(fault.process(), ROOT, config()).expect("engine should open");
+    let handle = create(&engine, "reading");
+    let core = engine.core();
+    write(&engine, &handle, "a");
+    core.flush_collection(&handle).expect("flush");
+    write(&engine, &handle, "b");
+    core.flush_collection(&handle).expect("flush");
+    let inputs = handle.current().manifest.units().collect::<Vec<_>>();
+
+    let (state, _) = core.read_state(&handle, None).expect("read state");
+    core.compact_collection(&handle).expect("compact");
+    engine.wait_for_gc();
+    let vfs = fault.process();
+    for unit in &inputs {
+        assert!(
+            unit_files_exist(vfs.as_ref(), &handle, *unit),
+            "the read still needs {unit}"
+        );
+    }
+    drop(state);
+    engine.wait_for_gc();
+    for unit in &inputs {
+        assert!(!unit_files_exist(vfs.as_ref(), &handle, *unit), "released");
+    }
+}
+
 /// The reaper releases the versions of the pins it drops on the maintenance pool, off the
 /// caller's thread. Waiting for the collector waits for those releases too, so the files a
 /// reaped pin alone held are gone once it returns.
