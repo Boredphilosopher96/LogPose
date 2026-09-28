@@ -923,7 +923,10 @@ mod tests {
         assert_eq!(moved, copied);
         assert_eq!(
             moved,
-            [1, 2, 3, 4].into_iter().flat_map(vector).collect::<Vec<_>>()
+            [1, 2, 3, 4]
+                .into_iter()
+                .flat_map(vector)
+                .collect::<Vec<_>>()
         );
     }
 
