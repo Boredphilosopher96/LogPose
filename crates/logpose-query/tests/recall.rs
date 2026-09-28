@@ -159,6 +159,17 @@ async fn build(rows: usize, seed: u64, policy: IndexPolicy) -> (Fixture, Vec<Row
     (fixture, stored, centers)
 }
 
+/// Removes a directory when dropped.
+struct RemoveOnDrop(Option<std::path::PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(root) = self.0.take() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
 /// Queries near clusters 0 to 9, which the anti-correlated filters exclude.
 fn queries(centers: &[Vec<f32>], count: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = Rng::new(seed);
@@ -351,7 +362,11 @@ async fn staged_search_keeps_recall_on_clustered_data_at_every_selectivity() {
 #[tokio::test]
 #[ignore = "throughput report; run with --release -- --ignored --nocapture"]
 async fn qps_100k_top10_ef64() {
+    // Declared first, so it runs after the engine is dropped: a 100,000-row collection takes
+    // about 80 MB of the temporary directory.
+    let mut cleanup = RemoveOnDrop(None);
     let (fixture, rows, centers) = build(100_000, 5, IndexPolicy::default()).await;
+    cleanup.0 = Some(fixture.root.clone());
     let view = fixture.view().await;
     let queries = queries(&centers, 1_000, 3);
     let all = cases();
@@ -572,7 +587,11 @@ async fn calibrate_cost_model() {
     let (f32_fixed, f32_per_dim) = fit_line(&f32_points);
     let (sq8_kernel_fixed, sq8_per_dim) = fit_line(&sq8_points);
 
+    // Declared first, so it runs after the engine is dropped: a 100,000-row collection takes
+    // about 80 MB of the temporary directory.
+    let mut cleanup = RemoveOnDrop(None);
     let (fixture, rows, centers) = build(100_000, 5, IndexPolicy::default()).await;
+    cleanup.0 = Some(fixture.root.clone());
     let view = fixture.view().await;
     let queries = queries(&centers, 100, 11);
     let base = SearchTuning {

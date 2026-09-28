@@ -608,6 +608,8 @@ impl ReadView {
             .map(|unit| (unit.id(), unit))
             .collect::<HashMap<_, _>>();
         let mut out = Vec::with_capacity(addrs.len());
+        // Each segment's accessors are resolved once, not once per row.
+        let mut readers: HashMap<UnitId, SegmentRows<'_>> = HashMap::new();
         for addr in addrs {
             let unit = units.get(&addr.unit).ok_or_else(|| {
                 LogPoseError::internal(format!("unit {} is not in the read view", addr.unit))
@@ -628,7 +630,13 @@ impl ReadView {
                     continue;
                 }
                 UnitKind::Segment(segment) => {
-                    unit.row_image(segment, addr.row, projection, pins)?
+                    let rows = match readers.entry(addr.unit) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(unit.segment_rows(segment, projection, pins)?)
+                        }
+                    };
+                    rows.image(addr.row)?
                 }
             };
             out.push(RowData {
@@ -725,33 +733,36 @@ impl ReadView {
         else {
             return Residency::Resident;
         };
+        // The units a fetch of the need would load: whole sections, directories, and (when
+        // their directory is resident, so they can be located without I/O) pages and blocks.
+        // A directory that is itself cold stands for its whole section.
         let reader = segment.reader();
-        let kinds: Vec<(SectionKind, Option<FieldId>)> = match need {
-            SectionNeed::Pk => vec![
-                (SectionKind::PkColumn, None),
-                (SectionKind::PkSorted, None),
-                (SectionKind::PkFilter, None),
-            ],
-            SectionNeed::ScalarIndex(field) => vec![
-                (SectionKind::ScalarInverted, Some(*field)),
-                (SectionKind::ScalarSorted, Some(*field)),
-            ],
-            SectionNeed::Column(field) => vec![(SectionKind::ScalarColumn, Some(*field))],
-            SectionNeed::VectorIndex(field) => vec![
-                (SectionKind::VectorSq8, Some(*field)),
-                (SectionKind::VectorGraph, Some(*field)),
-            ],
-            SectionNeed::DynamicBlocks(_) => vec![(SectionKind::DynamicJson, None)],
-            SectionNeed::VectorRows(field, _) => vec![(SectionKind::VectorF32, Some(*field))],
-        };
         let mut cold = 0;
-        for (kind, field) in kinds {
-            if let Some(unit) = reader
-                .find_section(kind, field)
-                .and_then(|index| reader.section_unit(index))
-                && !reader.residency(&unit)
-            {
-                cold += unit.len_hint().unwrap_or(0);
+        let mut pins = PinSet::new();
+        let mut directory_cold = false;
+        for (unit, _) in stage_one_units(segment, need) {
+            match reader.resident(&unit) {
+                Some(bytes) => {
+                    if let Some(key) = reader.unit_key(&unit) {
+                        pins.insert(key, bytes);
+                    }
+                }
+                None => {
+                    directory_cold = true;
+                    cold += unit.len_hint().unwrap_or_else(|| {
+                        reader
+                            .sections()
+                            .get(unit.section_index())
+                            .map_or(0, |entry| entry.length)
+                    });
+                }
+            }
+        }
+        if !directory_cold && let Ok(units) = stage_two_units(segment, need, &pins) {
+            for unit in units {
+                if !reader.residency(&unit) {
+                    cold += unit.len_hint().unwrap_or(0);
+                }
             }
         }
         if cold == 0 {
@@ -1402,28 +1413,18 @@ impl<'v> UnitView<'v> {
         Ok(VectorIndexRef { graph, sq8 })
     }
 
-    /// The stored image of segment `row` from `pins`, as
-    /// [`SegmentReader::row_images_projected`](crate::segment_v2::SegmentReader::row_images_projected)
-    /// reads it: the key, every scalar column in field order, the `$extra` object, and the
-    /// vectors when the projection asks for them.
-    fn row_image(
+    /// The accessors [`ReadView::project`] reads a segment's rows through, from `pins`.
+    fn segment_rows<'p>(
         &self,
-        segment: &SegmentHandle,
-        row: RowId,
+        segment: &'v SegmentHandle,
         projection: Projection,
-        pins: &PinSet,
-    ) -> Result<logpose_wal::codec::RowImage> {
-        use logpose_wal::codec::{F32Bytes, RowImage, ValueBytes, WirePk};
+        pins: &'p PinSet,
+    ) -> Result<SegmentRows<'p>>
+    where
+        'v: 'p,
+    {
         let schema = segment.reader().schema();
-        let pk = self.pks(pins)?.pk_at(row).ok_or_else(|| {
-            LogPoseError::internal(format!("row {row} of unit {} has no key", segment.unit))
-        })?;
-        let mut image = RowImage {
-            pk: WirePk::from(pk),
-            vectors: Vec::new(),
-            scalars: Vec::new(),
-            dynamic: None,
-        };
+        let mut vectors = Vec::new();
         if projection.vectors {
             let mut fields = schema
                 .vectors()
@@ -1432,9 +1433,7 @@ impl<'v> UnitView<'v> {
                 .collect::<Vec<_>>();
             fields.sort_unstable();
             for field in fields {
-                if let Some(vector) = self.vector_rows(field, pins)?.get(row)? {
-                    image.vectors.push((field, F32Bytes::from_f32s(&vector)));
-                }
+                vectors.push((field, self.vector_rows(field, pins)?));
             }
         }
         let mut fields = schema
@@ -1443,18 +1442,17 @@ impl<'v> UnitView<'v> {
             .map(|field| field.id)
             .collect::<Vec<_>>();
         fields.sort_unstable();
+        let mut columns = Vec::with_capacity(fields.len());
         for field in fields {
-            if let Some(value) = self.column(field, pins)?.value(row)? {
-                let bytes = ValueBytes::encode(&value).map_err(|error| {
-                    LogPoseError::internal(format!("a stored value does not encode: {error}"))
-                })?;
-                image.scalars.push((field, bytes));
-            }
+            columns.push((field, self.column(field, pins)?));
         }
-        if let Some(raw) = self.dynamic(pins)?.raw(row)? {
-            image.dynamic = Some(ValueBytes::from_encoded(raw.to_vec()));
-        }
-        Ok(image)
+        Ok(SegmentRows {
+            unit: segment.unit,
+            pks: self.pks(pins)?,
+            columns,
+            vectors,
+            dynamic: self.dynamic(pins)?,
+        })
     }
 
     fn vector_handle(&self, field: FieldId, pins: &PinSet) -> Result<Option<Arc<VectorHandle>>> {
@@ -1855,6 +1853,51 @@ impl<'p> DynamicRef<'p> {
             } => Ok(Self::block(segment, handle, pins, row)?.raw(row)),
             DynamicInner::Empty => Ok(None),
         }
+    }
+}
+
+/// A segment's accessors for building row images (see [`ReadView::project`]).
+struct SegmentRows<'p> {
+    unit: UnitId,
+    pks: PkRef<'p>,
+    columns: Vec<(FieldId, ColumnRef<'p>)>,
+    vectors: Vec<(FieldId, VectorRowsRef<'p>)>,
+    dynamic: DynamicRef<'p>,
+}
+
+impl SegmentRows<'_> {
+    /// The stored image of `row`, as
+    /// [`SegmentReader::row_images_projected`](crate::segment_v2::SegmentReader::row_images_projected)
+    /// reads it: the key, every scalar column in field order, the `$extra` object, and the
+    /// vectors when the projection asks for them.
+    fn image(&self, row: RowId) -> Result<logpose_wal::codec::RowImage> {
+        use logpose_wal::codec::{F32Bytes, RowImage, ValueBytes, WirePk};
+        let pk = self.pks.pk_at(row).ok_or_else(|| {
+            LogPoseError::internal(format!("row {row} of unit {} has no key", self.unit))
+        })?;
+        let mut image = RowImage {
+            pk: WirePk::from(pk),
+            vectors: Vec::new(),
+            scalars: Vec::new(),
+            dynamic: None,
+        };
+        for (field, vectors) in &self.vectors {
+            if let Some(vector) = vectors.get(row)? {
+                image.vectors.push((*field, F32Bytes::from_f32s(&vector)));
+            }
+        }
+        for (field, column) in &self.columns {
+            if let Some(value) = column.value(row)? {
+                let bytes = ValueBytes::encode(&value).map_err(|error| {
+                    LogPoseError::internal(format!("a stored value does not encode: {error}"))
+                })?;
+                image.scalars.push((*field, bytes));
+            }
+        }
+        if let Some(raw) = self.dynamic.raw(row)? {
+            image.dynamic = Some(ValueBytes::from_encoded(raw.to_vec()));
+        }
+        Ok(image)
     }
 }
 
