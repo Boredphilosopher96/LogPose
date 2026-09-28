@@ -585,6 +585,15 @@ impl Writer {
                 }
             }
             ControlMsg::BeginJob { kind, reply } => self.begin_by_hand(kind, reply).await,
+            ControlMsg::Tick { reply } => {
+                self.tick();
+                // The control path drained the pipeline, so a freeze the tick found due runs
+                // now rather than before the next group.
+                if std::mem::take(&mut self.freeze_pending) {
+                    self.freeze_if_due().await;
+                }
+                let _ = reply.send(());
+            }
             ControlMsg::Quiesce { reply } => {
                 // A drop voids every job that has not begun. Should the drop not commit, the
                 // next tick plans them again.
@@ -1579,8 +1588,10 @@ impl Writer {
                     let _ = reply.send(Err(shutting_down()));
                 }
                 ControlMsg::Quiesce { reply } => self.quiesce_waiters.push(reply),
+                // A tick that never ran: dropping its reply tells the caller the writer stopped.
                 ControlMsg::PermitGranted { .. }
                 | ControlMsg::EndJob { .. }
+                | ControlMsg::Tick { .. }
                 | ControlMsg::Shutdown => {}
             }
         }

@@ -555,6 +555,17 @@ impl CollectionHandle {
         Ok((JobTicket::new(Arc::clone(self), start.job), start))
     }
 
+    /// Run the writer's tick now and wait for it; see
+    /// [`Engine::tick_writer`](crate::Engine::tick_writer). Blocking.
+    pub(crate) fn tick_writer(&self) -> Result<()> {
+        let (reply, replied) = oneshot::channel();
+        self.writer
+            .control
+            .send(ControlMsg::Tick { reply })
+            .map_err(|_| self.unavailable())?;
+        replied.blocking_recv().map_err(|_| self.writer_stopped())
+    }
+
     /// Wait until the writer has drained its pipeline and no maintenance job is active. Used by
     /// a drop after it marked the handle dropped. Blocking.
     pub(crate) fn quiesce(&self) {

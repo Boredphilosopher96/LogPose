@@ -358,6 +358,9 @@ pub(crate) enum ControlMsg {
     },
     /// A job ended without committing (its ticket was dropped).
     EndJob { job: JobId, wrote_files: bool },
+    /// Run the tick now, after every control message sent before this one, and reply once it
+    /// ran; for tests that place the tick's work (a job's retry after its backoff) themselves.
+    Tick { reply: oneshot::Sender<()> },
     /// Reply once the pipeline is drained and no job runs (a drop waits for this after it
     /// marked the handle dropped, so nothing is written afterwards). A std channel, because a
     /// drop blocks its caller and may be called from anywhere.
