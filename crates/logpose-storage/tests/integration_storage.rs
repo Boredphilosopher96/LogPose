@@ -1,7 +1,6 @@
 //! Integration tests for `logpose-storage` workflows.
 
 use arc_swap as _;
-use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
 use imbl as _;
@@ -21,22 +20,21 @@ use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
-#[path = "support/scan.rs"]
-mod scan;
+#[path = "support/engine.rs"]
+mod db;
 #[path = "support/fs.rs"]
 mod support;
 
-use scan::ScanExt;
+use db::{create, delete, describe, handle, open, pin, put_with, scan, scan_at_token};
 
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
 };
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
-use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
+use logpose_storage::{CreateCollectionRequest, Engine, InspectTarget};
 use logpose_types::{
-    CorruptionKind, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, ErrorCode, LogPoseError,
-    PutRecord, RecordId, Snapshot, WriteOperation,
+    CorruptionKind, DEFAULT_DATABASE_NAME, DistanceMetric, ErrorCode, LogPoseError, Snapshot,
 };
 use serde_json::{Value, json};
 use std::{
@@ -47,54 +45,34 @@ use std::{
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
     let root = support::unique_temp_dir("storage-write-scan");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "colors",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("colors", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "colors",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"color":"red"}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"color":"green"}),
-                }),
-            ],
-        )
+    handle(&engine, "colors")
+        .write(vec![
+            put_with("alpha", vec![1.0, 0.0], json!({"color":"red"})),
+            put_with("beta", vec![0.0, 1.0], json!({"color":"green"})),
+        ])
         .await
         .expect("writes should succeed");
 
-    let before_delete = engine
-        .scan_exact("colors", None)
+    let before_delete = scan(&engine, "colors", None)
         .await
         .expect("scan should succeed");
     assert_eq!(before_delete.len(), 2);
 
-    engine
-        .write(
-            "colors",
-            vec![WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("alpha"),
-            })],
-        )
+    handle(&engine, "colors")
+        .write(vec![delete("alpha")])
         .await
         .expect("delete should succeed");
 
-    let after_delete = engine
-        .scan_exact("colors", None)
+    let after_delete = scan(&engine, "colors", None)
         .await
         .expect("scan should succeed");
     assert_eq!(after_delete.len(), 1);
@@ -104,16 +82,15 @@ async fn create_write_scan_and_delete_records() {
 #[tokio::test]
 async fn create_collection_persists_default_database_descriptor() {
     let root = support::unique_temp_dir("storage-default-database");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "colors",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("colors", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
     let database_descriptor_path = root
         .join("databases")
@@ -132,7 +109,7 @@ async fn create_collection_persists_default_database_descriptor() {
 #[test]
 fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
     let root = support::unique_temp_dir("storage-catalog-invalid-stored");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
     engine
         .put_database(DatabaseDescriptor::new("analytics"))
         .expect("database descriptor should persist");
@@ -191,7 +168,7 @@ fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
 #[test]
 fn catalog_store_round_trips_databases_principals_and_policies() {
     let root = support::unique_temp_dir("storage-catalog-round-trip");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -281,7 +258,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
     );
 
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let reopened = open(&root);
     assert_eq!(
         reopened
             .get_database("analytics")
@@ -305,7 +282,7 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
 #[test]
 fn catalog_store_overwrites_database_policy_by_database_name() {
     let root = support::unique_temp_dir("storage-catalog-database-isolation");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     let database = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -353,7 +330,7 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
 #[test]
 fn put_database_preserves_stable_database_identity_on_replace() {
     let root = support::unique_temp_dir("storage-database-idempotence");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     let first = engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -369,46 +346,37 @@ fn put_database_preserves_stable_database_identity_on_replace() {
 #[tokio::test]
 async fn duplicate_collection_names_can_exist_in_different_databases() {
     let root = support::unique_temp_dir("storage-namespace-duplicates");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let default_descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("default namespace collection should be created");
-    let analytics_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_database(
-            "analytics",
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("analytics database collection should be created");
+    let default_descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("default namespace collection should be created")
+    .describe();
+    let analytics_descriptor = create(
+        &engine,
+        CreateCollectionRequest::in_database("analytics", "documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("analytics database collection should be created")
+    .describe();
     assert_ne!(
         default_descriptor.collection_id,
         analytics_descriptor.collection_id
     );
 
-    let opened_default = engine
-        .open_collection("documents")
-        .await
-        .expect("default namespace lookup should work");
-    let opened_analytics = engine
-        .open_collection("analytics/documents")
-        .await
-        .expect("database-qualified lookup should work");
+    let opened_default =
+        describe(&engine, "documents").expect("default namespace lookup should work");
+    let opened_analytics =
+        describe(&engine, "analytics/documents").expect("database-qualified lookup should work");
 
     assert_eq!(opened_default.database_name, "default");
     assert_eq!(opened_analytics.database_name, "analytics");
 
-    let explicit_analytics = engine
-        .open_collection_in_database("analytics", "documents")
-        .await
-        .expect("explicit database lookup should work");
+    let explicit_analytics =
+        describe(&engine, "analytics/documents").expect("explicit database lookup should work");
     assert_eq!(
         explicit_analytics.collection_id,
         analytics_descriptor.collection_id
@@ -418,27 +386,28 @@ async fn duplicate_collection_names_can_exist_in_different_databases() {
 #[tokio::test]
 async fn create_collection_allows_duplicate_names_in_distinct_databases() {
     let root = support::unique_temp_dir("storage-duplicate-collection-namespaces");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let left = engine
-        .create_collection(CreateCollectionRequest::in_database(
+    let left = create(
+        &engine,
+        CreateCollectionRequest::in_database(
             DEFAULT_DATABASE_NAME,
             "events",
             2,
             DistanceMetric::Dot,
-        ))
-        .await
-        .expect("first collection should be created");
+        ),
+    )
+    .await
+    .expect("first collection should be created")
+    .describe();
 
-    let right = engine
-        .create_collection(CreateCollectionRequest::in_database(
-            "analytics",
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("second collection in another database should be created");
+    let right = create(
+        &engine,
+        CreateCollectionRequest::in_database("analytics", "events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("second collection in another database should be created")
+    .describe();
 
     assert_eq!(left.name, "events");
     assert_eq!(right.name, "events");
@@ -448,7 +417,6 @@ async fn create_collection_allows_duplicate_names_in_distinct_databases() {
 
     let descriptors = engine
         .list_collections()
-        .await
         .expect("collection listing should succeed");
     assert_eq!(
         descriptors
@@ -462,17 +430,14 @@ async fn create_collection_allows_duplicate_names_in_distinct_databases() {
 #[tokio::test]
 async fn create_collection_rejects_reserved_namespace_separator() {
     let root = support::unique_temp_dir("storage-reserved-separator");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let error = engine
-        .create_collection(CreateCollectionRequest::in_database(
-            "analytics",
-            "docs/v2",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect_err("slash-containing collection names should fail");
+    let error = create(
+        &engine,
+        CreateCollectionRequest::in_database("analytics", "docs/v2", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect_err("slash-containing collection names should fail");
 
     assert!(error.to_string().contains("collection_name"));
     assert!(error.to_string().contains("/"));
@@ -481,49 +446,40 @@ async fn create_collection_rejects_reserved_namespace_separator() {
 #[tokio::test]
 async fn open_collection_resolves_database_collection_tuple() {
     let root = support::unique_temp_dir("storage-open-collection-namespace");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let default_descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("default namespace collection should be created");
-    let analytics_descriptor = engine
-        .create_collection(CreateCollectionRequest::in_database(
-            "analytics",
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("analytics database collection should be created");
+    let default_descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("default namespace collection should be created")
+    .describe();
+    let analytics_descriptor = create(
+        &engine,
+        CreateCollectionRequest::in_database("analytics", "events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("analytics database collection should be created")
+    .describe();
 
-    let default_lookup = engine
-        .open_collection("events")
-        .await
-        .expect("default namespace lookup should succeed");
+    let default_lookup =
+        describe(&engine, "events").expect("default namespace lookup should succeed");
     assert_eq!(
         default_lookup.collection_id,
         default_descriptor.collection_id
     );
 
-    let explicit_lookup = engine
-        .open_collection_in_database("analytics", "events")
-        .await
-        .expect("explicit database lookup should succeed");
+    let explicit_lookup =
+        describe(&engine, "analytics/events").expect("explicit database lookup should succeed");
     assert_eq!(
         explicit_lookup.collection_id,
         analytics_descriptor.collection_id
     );
     assert_eq!(explicit_lookup.database_name, "analytics");
 
-    let slash_lookup = engine
-        .open_collection("analytics/events")
-        .await
-        .expect("database-qualified lookup should succeed");
+    let slash_lookup =
+        describe(&engine, "analytics/events").expect("database-qualified lookup should succeed");
     assert_eq!(
         slash_lookup.collection_id,
         analytics_descriptor.collection_id
@@ -533,46 +489,39 @@ async fn open_collection_resolves_database_collection_tuple() {
 #[tokio::test]
 async fn flush_persists_visible_records_for_reopen() {
     let root = support::unique_temp_dir("storage-flush");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            3,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 3, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("doc-1"),
-                vector: vec![0.1, 0.2, 0.3],
-                metadata: json!({"topic":"intro"}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "doc-1",
+            vec![0.1, 0.2, 0.3],
+            json!({"topic":"intro"}),
+        )])
         .await
         .expect("write should succeed");
 
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
 
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let visible = reopened
-        .scan_exact("documents", None)
+    let reopened = open(&root);
+    let visible = scan(&reopened, "documents", None)
         .await
         .expect("scan should succeed");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "doc-1");
 
-    let stats = reopened
-        .stats("documents")
-        .await
+    let stats = handle(&reopened, "documents")
+        .stats(None)
         .expect("stats should succeed");
     assert_eq!(stats.manifest_generation, 1);
     assert_eq!(stats.visible_seq_no, 1);
@@ -620,57 +569,43 @@ async fn flush_persists_visible_records_for_reopen() {
 #[tokio::test]
 async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta() {
     let root = support::unique_temp_dir("storage-reopen-post-checkpoint-delta");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 0.0],
+            json!({"version":1}),
+        )])
         .await
         .expect("first write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"version":2}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with("beta", vec![0.0, 1.0], json!({"version":2}))])
         .await
         .expect("second write should succeed");
 
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let visible = reopened
-        .scan_exact("documents", None)
+    let reopened = open(&root);
+    let visible = scan(&reopened, "documents", None)
         .await
         .expect("scan should succeed after reopen");
     assert_eq!(visible.len(), 2);
     assert_eq!(visible[0].id.as_str(), "alpha");
     assert_eq!(visible[1].id.as_str(), "beta");
 
-    let stats = reopened
-        .stats("documents")
-        .await
+    let stats = handle(&reopened, "documents")
+        .stats(None)
         .expect("stats should succeed after reopen");
     assert_eq!(stats.visible_seq_no, 2);
     assert_eq!(stats.segment_count, 1);
@@ -680,30 +615,26 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
 #[tokio::test]
 async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
     let root = support::unique_temp_dir("storage-checkpointed-wal-corruption");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 0.0],
+            json!({"version":1}),
+        )])
         .await
         .expect("write should succeed");
-    let flushed = engine
-        .flush("documents")
+    let flushed = handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
 
@@ -715,17 +646,15 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
         .expect("corrupted rolled wal should be written");
 
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let visible = reopened
-        .scan_exact("documents", None)
+    let reopened = open(&root);
+    let visible = scan(&reopened, "documents", None)
         .await
         .expect("checkpointed wal corruption should be ignored once the manifest covers it");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
 
-    let stats = reopened
-        .stats("documents")
-        .await
+    let stats = handle(&reopened, "documents")
+        .stats(None)
         .expect("stats should still load after reopen");
     assert_eq!(stats.segment_count, 1);
     assert_eq!(stats.mutable_op_count, 0);
@@ -735,42 +664,31 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
 #[tokio::test]
 async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart() {
     let root = support::unique_temp_dir("storage-old-snapshot-rotated-wal");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 0.0],
+            json!({"version":1}),
+        )])
         .await
         .expect("write should succeed");
-    let (token, pre_flush_snapshot) = engine.pin_snapshot("documents").expect("pin");
-    engine
-        .flush("documents")
+    let (token, pre_flush_snapshot) = pin(&engine, "documents").expect("pin");
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with("beta", vec![0.0, 1.0], json!({"version":1}))])
         .await
         .expect("write after the flush should succeed");
     assert_eq!(
@@ -779,9 +697,8 @@ async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart
         "the flush rotated the WAL and deleted the checkpointed file"
     );
 
-    let old_snapshot_stats = engine
-        .stats_at_token("documents", token.clone())
-        .await
+    let old_snapshot_stats = handle(&engine, "documents")
+        .stats_at_token(&token)
         .expect("the pinned state is readable");
     assert_eq!(old_snapshot_stats.live_record_count, 1);
     assert_eq!(old_snapshot_stats.mutable_op_count, 1);
@@ -789,8 +706,7 @@ async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart
         old_snapshot_stats.manifest_generation,
         pre_flush_snapshot.manifest_generation
     );
-    let visible = engine
-        .scan_exact("documents", Some(pre_flush_snapshot.clone()))
+    let visible = scan(&engine, "documents", Some(pre_flush_snapshot.clone()))
         .await
         .expect("the exact snapshot a token pins stays readable");
     assert_eq!(visible.len(), 1);
@@ -798,18 +714,16 @@ async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart
 
     // Pins live in memory: a restart ends them.
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let error = reopened
-        .scan_exact_at_token("documents", token)
+    let reopened = open(&root);
+    let error = scan_at_token(&reopened, "documents", token)
         .await
         .expect_err("tokens do not survive a restart");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
         "{error}"
     );
-    let error = reopened
-        .stats_snapshot("documents", Some(pre_flush_snapshot))
-        .await
+    let error = handle(&reopened, "documents")
+        .stats(Some(pre_flush_snapshot))
         .expect_err("an older generation is not retained");
     assert!(
         matches!(error, LogPoseError::SnapshotExpired { .. }),
@@ -820,73 +734,57 @@ async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart
 #[tokio::test]
 async fn a_pinned_snapshot_preserves_pre_compaction_history() {
     let root = support::unique_temp_dir("storage-old-snapshot-compaction-history");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 0.0],
+            json!({"version":1}),
+        )])
         .await
         .expect("first write should succeed");
-    let (token, old_snapshot) = engine.pin_snapshot("documents").expect("pin");
-    engine
-        .flush("documents")
+    let (token, old_snapshot) = pin(&engine, "documents").expect("pin");
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("first flush should succeed");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![2.0, 0.0],
-                metadata: json!({"version":2}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with(
+            "alpha",
+            vec![2.0, 0.0],
+            json!({"version":2}),
+        )])
         .await
         .expect("second write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("second flush should succeed");
-    engine
-        .compact("documents")
+    handle(&engine, "documents")
+        .compact()
         .await
         .expect("compaction should succeed");
 
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"version":3}),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![put_with("beta", vec![0.0, 1.0], json!({"version":3}))])
         .await
         .expect("third write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("third flush should succeed");
 
-    let old_snapshot_stats = engine
-        .stats_at_token("documents", token.clone())
-        .await
+    let old_snapshot_stats = handle(&engine, "documents")
+        .stats_at_token(&token)
         .expect("pinned stats stay readable after compaction");
     assert_eq!(
         old_snapshot_stats.manifest_generation,
@@ -896,21 +794,15 @@ async fn a_pinned_snapshot_preserves_pre_compaction_history() {
     assert_eq!(old_snapshot_stats.mutable_op_count, 1);
     assert_eq!(old_snapshot_stats.segment_count, 0);
 
-    let visible = engine
-        .scan_exact_at_token("documents", token.clone())
+    let visible = scan_at_token(&engine, "documents", token.clone())
         .await
         .expect("the pinned state keeps the pre-compaction record");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id.as_str(), "alpha");
     assert_eq!(visible[0].metadata["version"], json!(1));
 
-    assert!(
-        engine
-            .release_snapshot("documents", &token)
-            .expect("release")
-    );
-    let error = engine
-        .scan_exact("documents", Some(old_snapshot))
+    assert!(handle(&engine, "documents").release_snapshot(&token));
+    let error = scan(&engine, "documents", Some(old_snapshot))
         .await
         .expect_err("released");
     assert!(
@@ -922,59 +814,42 @@ async fn a_pinned_snapshot_preserves_pre_compaction_history() {
 #[tokio::test]
 async fn compact_merges_segments_and_preserves_latest_versions() {
     let root = support::unique_temp_dir("storage-compact");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "profiles",
-            2,
-            DistanceMetric::L2,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("profiles", 2, DistanceMetric::L2),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "profiles",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 1.0],
-                metadata: json!({"version":1}),
-            })],
-        )
+    handle(&engine, "profiles")
+        .write(vec![put_with(
+            "alpha",
+            vec![1.0, 1.0],
+            json!({"version":1}),
+        )])
         .await
         .expect("write should succeed");
-    engine
-        .flush("profiles")
+    handle(&engine, "profiles")
+        .flush()
         .await
         .expect("flush should succeed");
 
-    engine
-        .write(
-            "profiles",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![2.0, 2.0],
-                    metadata: json!({"version":2}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![3.0, 3.0],
-                    metadata: json!({"version":1}),
-                }),
-            ],
-        )
+    handle(&engine, "profiles")
+        .write(vec![
+            put_with("alpha", vec![2.0, 2.0], json!({"version":2})),
+            put_with("beta", vec![3.0, 3.0], json!({"version":1})),
+        ])
         .await
         .expect("write should succeed");
-    engine
-        .flush("profiles")
+    handle(&engine, "profiles")
+        .flush()
         .await
         .expect("flush should succeed");
 
-    let before = engine
-        .stats("profiles")
-        .await
+    let before = handle(&engine, "profiles")
+        .stats(None)
         .expect("stats should succeed");
     assert_eq!(before.live_record_count, 2);
     assert_eq!(
@@ -983,14 +858,13 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
     );
     assert_eq!(before.segment_count, 2);
 
-    engine
-        .compact("profiles")
+    handle(&engine, "profiles")
+        .compact()
         .await
         .expect("compaction should succeed");
 
-    let after = engine
-        .stats("profiles")
-        .await
+    let after = handle(&engine, "profiles")
+        .stats(None)
         .expect("stats should succeed");
     assert_eq!(after.live_record_count, 2);
     assert_eq!(
@@ -999,8 +873,7 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
     );
     assert_eq!(after.segment_count, 1);
 
-    let visible = engine
-        .scan_exact("profiles", None)
+    let visible = scan(&engine, "profiles", None)
         .await
         .expect("scan should succeed");
     assert_eq!(visible.len(), 2);
@@ -1014,51 +887,33 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
 #[tokio::test]
 async fn inspect_reports_manifest_wal_and_segment_targets() {
     let root = support::unique_temp_dir("storage-inspect");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "documents",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"version":1}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"version":1}),
-                }),
-            ],
-        )
+    handle(&engine, "documents")
+        .write(vec![
+            put_with("alpha", vec![1.0, 0.0], json!({"version":1})),
+            put_with("beta", vec![0.0, 1.0], json!({"version":1})),
+        ])
         .await
         .expect("write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
-    engine
-        .write(
-            "documents",
-            vec![WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("alpha"),
-            })],
-        )
+    handle(&engine, "documents")
+        .write(vec![delete("alpha")])
         .await
         .expect("delete should succeed");
 
-    let manifest = engine
-        .inspect("documents", InspectTarget::Manifest)
+    let manifest = handle(&engine, "documents")
+        .inspect(InspectTarget::Manifest)
         .await
         .expect("manifest inspect should succeed");
     assert_eq!(manifest.target, "manifest");
@@ -1076,8 +931,8 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
         .expect("segment id should be a string")
         .to_owned();
 
-    let wal = engine
-        .inspect("documents", InspectTarget::Wal)
+    let wal = handle(&engine, "documents")
+        .inspect(InspectTarget::Wal)
         .await
         .expect("wal inspect should succeed");
     assert_eq!(wal.target, "wal");
@@ -1096,8 +951,8 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
         "one operation above the checkpoint"
     );
 
-    let segment = engine
-        .inspect("documents", InspectTarget::Segment(segment_id.clone()))
+    let segment = handle(&engine, "documents")
+        .inspect(InspectTarget::Segment(segment_id.clone()))
         .await
         .expect("segment inspect should succeed");
     assert_eq!(segment.target, format!("segment:{segment_id}"));
@@ -1140,13 +995,13 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
     assert_eq!(
         records
             .iter()
-            .map(|record| (record["id"].as_str(), record["deleted"].as_bool()))
+            .map(|record| (record["pk"].as_str(), record["deleted"].as_bool()))
             .collect::<Vec<_>>(),
         [(Some("alpha"), Some(true)), (Some("beta"), Some(false))]
     );
 
-    let maintenance = engine
-        .inspect("documents", InspectTarget::Maintenance)
+    let maintenance = handle(&engine, "documents")
+        .inspect(InspectTarget::Maintenance)
         .await
         .expect("maintenance inspect should succeed");
     assert_eq!(maintenance.target, "maintenance");
@@ -1159,9 +1014,8 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
         Some(0)
     );
 
-    let stats = engine
-        .stats("documents")
-        .await
+    let stats = handle(&engine, "documents")
+        .stats(None)
         .expect("stats should succeed");
     assert_eq!(stats.live_record_count, 1);
     assert_eq!(stats.deleted_record_count, 1);
@@ -1172,7 +1026,7 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
 #[tokio::test]
 async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     let root = support::unique_temp_dir("storage-background-maintenance");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     create_with_thresholds(
         &engine,
@@ -1183,15 +1037,12 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     )
     .expect("collection should be created");
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep","shard":1}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 0.0],
+            json!({"kind":"keep","shard":1}),
+        )])
         .await
         .expect("first write should succeed");
 
@@ -1200,15 +1051,12 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     })
     .await;
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-2"),
-                vector: vec![2.0, 0.0],
-                metadata: json!({"kind":"keep","shard":2}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-2",
+            vec![2.0, 0.0],
+            json!({"kind":"keep","shard":2}),
+        )])
         .await
         .expect("second write should succeed");
 
@@ -1221,7 +1069,9 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
     })
     .await;
 
-    let stats = engine.stats("events").await.expect("stats should succeed");
+    let stats = handle(&engine, "events")
+        .stats(None)
+        .expect("stats should succeed");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.deleted_record_count, 0);
     assert_eq!(stats.segment_count, 1);
@@ -1233,16 +1083,14 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
 #[tokio::test]
 async fn background_maintenance_preserves_namespace_for_duplicate_collection_names() {
     let root = support::unique_temp_dir("storage-background-maintenance-namespace");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("default namespace collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("default namespace collection should be created");
     create_with_thresholds(
         &engine,
         CreateCollectionRequest::in_database("analytics", "events", 2, DistanceMetric::Dot),
@@ -1252,15 +1100,12 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
     )
     .expect("database namespace collection should be created");
 
-    engine
-        .write(
-            "analytics/events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"namespace":"analytics","shard":1}),
-            })],
-        )
+    handle(&engine, "analytics/events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 0.0],
+            json!({"namespace":"analytics","shard":1}),
+        )])
         .await
         .expect("database write should succeed");
 
@@ -1269,16 +1114,14 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
     })
     .await;
 
-    let default_stats = engine
-        .stats("events")
-        .await
+    let default_stats = handle(&engine, "events")
+        .stats(None)
         .expect("default namespace stats should succeed");
     assert_eq!(default_stats.segment_count, 0);
     assert_eq!(default_stats.mutable_op_count, 0);
 
-    let analytics_stats = engine
-        .stats("analytics/events")
-        .await
+    let analytics_stats = handle(&engine, "analytics/events")
+        .stats(None)
         .expect("database namespace stats should succeed");
     assert_eq!(analytics_stats.segment_count, 1);
     assert_eq!(analytics_stats.mutable_op_count, 0);
@@ -1291,39 +1134,27 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
 #[tokio::test]
 async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
     let root = support::unique_temp_dir("storage-segment-corruption");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-    engine
-        .write(
-            "documents",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![2.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                }),
-            ],
-        )
+    let engine = open(&root);
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
+    handle(&engine, "documents")
+        .write(vec![
+            put_with("alpha", vec![1.0, 0.0], json!({"kind":"keep"})),
+            put_with("beta", vec![2.0, 0.0], json!({"kind":"keep"})),
+        ])
         .await
         .expect("write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
-    let segment_id = engine
-        .inspect("documents", InspectTarget::Manifest)
+    let segment_id = handle(&engine, "documents")
+        .inspect(InspectTarget::Manifest)
         .await
         .expect("manifest inspect should succeed")
         .payload["segments"][0]["segment_id"]
@@ -1355,7 +1186,7 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
     bytes[last] ^= 0x40;
     fs::write(&path, &bytes).expect("corrupted segment should be written");
 
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should reopen");
+    let engine = open(&root);
     let error = logpose_query::query(
         &engine,
         &logpose_types::CollectionRef::parse("documents").expect("name"),
@@ -1380,8 +1211,7 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
         ),
         "unexpected error: {error:?}"
     );
-    let error = engine
-        .scan_exact("documents", None)
+    let error = scan(&engine, "documents", None)
         .await
         .expect_err("a scan reads the vector section too");
     assert!(
@@ -1401,50 +1231,38 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
 #[tokio::test]
 async fn ann_queries_over_segments_see_only_live_rows() {
     let root = support::unique_temp_dir("storage-ann-live-rows");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-    engine
+    let engine = open(&root);
+    create(
+        &engine,
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
+    handle(&engine, "documents")
         .write(
-            "documents",
             (1..=12)
                 .map(|index| {
-                    WriteOperation::Put(PutRecord {
-                        id: RecordId::new(format!("doc-{index:02}")),
-                        vector: vec![index as f32, 0.0],
-                        metadata: json!({
+                    put_with(
+                        &format!("doc-{index:02}"),
+                        vec![index as f32, 0.0],
+                        json!({
                             "kind": if index % 3 == 0 { "drop" } else { "keep" }
                         }),
-                    })
+                    )
                 })
                 .collect(),
         )
         .await
         .expect("write should succeed");
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
-    engine
-        .write(
-            "documents",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("doc-12"),
-                    vector: vec![0.5, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                }),
-                WriteOperation::Delete(DeleteRecord {
-                    id: RecordId::new("doc-11"),
-                }),
-            ],
-        )
+    handle(&engine, "documents")
+        .write(vec![
+            put_with("doc-12", vec![0.5, 0.0], json!({"kind":"keep"})),
+            delete("doc-11"),
+        ])
         .await
         .expect("write should succeed");
 
@@ -1478,8 +1296,8 @@ async fn ann_queries_over_segments_see_only_live_rows() {
         assert_eq!(unfiltered, ["doc-10", "doc-09"], "round {round}");
         assert_eq!(filtered, ["doc-10", "doc-08"], "round {round}");
         // The same answers once the upsert and the delete are flushed too.
-        engine
-            .flush("documents")
+        handle(&engine, "documents")
+            .flush()
             .await
             .expect("flush should succeed");
     }
@@ -1488,7 +1306,7 @@ async fn ann_queries_over_segments_see_only_live_rows() {
 #[tokio::test]
 async fn manual_flush_and_background_maintenance_do_not_race() {
     let root = support::unique_temp_dir("storage-manual-background-race");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     create_with_thresholds(
         &engine,
@@ -1503,22 +1321,19 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
     let manual = engine.clone();
     let write_task = tokio::spawn(async move {
         for index in 0..12 {
-            writer
-                .write(
-                    "events",
-                    vec![WriteOperation::Put(PutRecord {
-                        id: RecordId::new(format!("evt-{index}")),
-                        vector: vec![index as f32, 0.0],
-                        metadata: json!({"kind":"keep","version":index}),
-                    })],
-                )
+            handle(&writer, "events")
+                .write(vec![put_with(
+                    &format!("evt-{index}"),
+                    vec![index as f32, 0.0],
+                    json!({"kind":"keep","version":index}),
+                )])
                 .await?;
         }
         logpose_types::Result::<()>::Ok(())
     });
     let manual_task = tokio::spawn(async move {
         for _ in 0..12 {
-            let _ = manual.flush("events").await?;
+            let _ = handle(&manual, "events").flush().await?;
         }
         logpose_types::Result::<()>::Ok(())
     });
@@ -1537,14 +1352,16 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
     })
     .await;
 
-    let stats = engine.stats("events").await.expect("stats should succeed");
+    let stats = handle(&engine, "events")
+        .stats(None)
+        .expect("stats should succeed");
     assert_eq!(stats.maintenance.last_error, None);
 }
 
 #[tokio::test]
 async fn background_maintenance_handles_inflight_writes_without_losing_visibility() {
     let root = support::unique_temp_dir("storage-follow-up-background-flush");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
     create_with_thresholds(
         &engine,
@@ -1555,15 +1372,12 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     )
     .expect("collection should be created");
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0; 65_536],
-                metadata: json!({"kind":"keep","version":1}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0; 65_536],
+            json!({"kind":"keep","version":1}),
+        )])
         .await
         .expect("first write should succeed");
 
@@ -1575,15 +1389,12 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     })
     .await;
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-2"),
-                vector: vec![2.0; 65_536],
-                metadata: json!({"kind":"keep","version":2}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-2",
+            vec![2.0; 65_536],
+            json!({"kind":"keep","version":2}),
+        )])
         .await
         .expect("second write should succeed");
 
@@ -1595,7 +1406,9 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     })
     .await;
 
-    let stats = engine.stats("events").await.expect("stats should succeed");
+    let stats = handle(&engine, "events")
+        .stats(None)
+        .expect("stats should succeed");
     assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.mutable_op_count, 0);
     assert_eq!(stats.maintenance.last_error, None);
@@ -1607,26 +1420,22 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
 #[tokio::test]
 async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
     let root = support::unique_temp_dir("storage-resume-background-maintenance");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 0.0],
+            json!({"kind":"keep"}),
+        )])
         .await
         .expect("write should succeed");
     drop(engine);
@@ -1646,10 +1455,9 @@ async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
     )
     .expect("descriptor should be written");
 
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let stats = reopened
-        .stats("events")
-        .await
+    let reopened = open(&root);
+    let stats = handle(&reopened, "events")
+        .stats(None)
         .expect("stats should succeed");
     assert_eq!(
         stats.maintenance,
@@ -1668,26 +1476,21 @@ async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
 #[tokio::test]
 async fn rejects_impossible_snapshots() {
     let root = support::unique_temp_dir("storage-invalid-snapshot");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 0.0],
+            json!({"kind":"keep"}),
+        )])
         .await
         .expect("write should succeed");
 
@@ -1696,15 +1499,13 @@ async fn rejects_impossible_snapshots() {
         visible_seq_no: 99,
     };
 
-    let scan_error = engine
-        .scan_exact("events", Some(invalid_snapshot.clone()))
+    let scan_error = scan(&engine, "events", Some(invalid_snapshot.clone()))
         .await
         .expect_err("invalid snapshot should fail");
     assert!(scan_error.to_string().contains("invalid snapshot"));
 
-    let stats_error = engine
-        .stats_snapshot("events", Some(invalid_snapshot))
-        .await
+    let stats_error = handle(&engine, "events")
+        .stats(Some(invalid_snapshot))
         .expect_err("invalid snapshot should fail");
     assert!(stats_error.to_string().contains("invalid snapshot"));
 }
@@ -1712,45 +1513,41 @@ async fn rejects_impossible_snapshots() {
 #[tokio::test]
 async fn rejects_snapshots_below_manifest_checkpoint() {
     let root = support::unique_temp_dir("storage-below-checkpoint-snapshot");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created");
 
-    let flushed = engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
-        )
+    let flushed = handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 0.0],
+            json!({"kind":"keep"}),
+        )])
         .await
         .expect("write should succeed");
     assert_eq!(flushed.last_seq_no, 1);
 
-    let snapshot = engine.flush("events").await.expect("flush should succeed");
+    let snapshot = handle(&engine, "events")
+        .flush()
+        .await
+        .expect("flush should succeed");
     let invalid_snapshot = Snapshot {
         manifest_generation: snapshot.manifest_generation,
         visible_seq_no: snapshot.visible_seq_no - 1,
     };
 
-    let scan_error = engine
-        .scan_exact("events", Some(invalid_snapshot.clone()))
+    let scan_error = scan(&engine, "events", Some(invalid_snapshot.clone()))
         .await
         .expect_err("below-checkpoint snapshot should fail");
     assert!(scan_error.to_string().contains("invalid snapshot"));
 
-    let stats_error = engine
-        .stats_snapshot("events", Some(invalid_snapshot))
-        .await
+    let stats_error = handle(&engine, "events")
+        .stats(Some(invalid_snapshot))
         .expect_err("below-checkpoint snapshot should fail");
     assert!(stats_error.to_string().contains("invalid snapshot"));
 }
@@ -1758,16 +1555,15 @@ async fn rejects_snapshots_below_manifest_checkpoint() {
 #[tokio::test]
 async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     let root = support::unique_temp_dir("storage-invalid-thresholds");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Dot),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
     let descriptor_path = descriptor.root_path.join("descriptor.json");
     let mut descriptor_json: Value =
@@ -1783,50 +1579,44 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
     .expect("descriptor should be rewritten");
 
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let error = reopened
-        .open_collection("events")
-        .await
-        .expect_err("invalid thresholds should be rejected");
+    let reopened = open(&root);
+    let error = describe(&reopened, "events").expect_err("invalid thresholds should be rejected");
     assert!(error.to_string().contains("threshold"));
 }
 
 #[tokio::test]
 async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expires() {
     let root = support::unique_temp_dir("storage-snapshot-flush");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    let descriptor = engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    let descriptor = create(
+        &engine,
+        CreateCollectionRequest::new("events", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created")
+    .describe();
 
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 2.0],
-                metadata: json!({"kind":"login"}),
-            })],
-        )
+    handle(&engine, "events")
+        .write(vec![put_with(
+            "evt-1",
+            vec![1.0, 2.0],
+            json!({"kind":"login"}),
+        )])
         .await
         .expect("write should succeed");
 
-    let unpinned = engine
-        .snapshot("events")
-        .await
+    let unpinned = handle(&engine, "events")
+        .snapshot()
         .expect("snapshot should succeed");
-    let (token, snapshot) = engine.pin_snapshot("events").expect("pin");
+    let (token, snapshot) = pin(&engine, "events").expect("pin");
     assert_eq!(snapshot, unpinned);
-    engine.flush("events").await.expect("flush should succeed");
+    handle(&engine, "events")
+        .flush()
+        .await
+        .expect("flush should succeed");
 
-    let visible = engine
-        .scan_exact_at_token("events", token.clone())
+    let visible = scan_at_token(&engine, "events", token.clone())
         .await
         .expect("the pinned snapshot still scans");
     assert_eq!(visible.len(), 1);
@@ -1841,9 +1631,8 @@ async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expi
         .count();
     assert_eq!(wal_files, 1);
 
-    engine.release_snapshot("events", &token).expect("release");
-    let error = engine
-        .scan_exact("events", Some(unpinned))
+    handle(&engine, "events").release_snapshot(&token);
+    let error = scan(&engine, "events", Some(unpinned))
         .await
         .expect_err("nothing pins the old generation");
     assert!(
@@ -1855,44 +1644,30 @@ async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expi
 #[tokio::test]
 async fn duplicate_id_batch_rejects_without_committing_anything() {
     let root = support::unique_temp_dir("storage-duplicate-batch");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "items",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("items", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created");
 
-    let error = engine
-        .write(
-            "items",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("dup"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"version":1}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("dup"),
-                    vector: vec![2.0, 0.0],
-                    metadata: json!({"version":2}),
-                }),
-            ],
-        )
+    let error = handle(&engine, "items")
+        .write(vec![
+            put_with("dup", vec![1.0, 0.0], json!({"version":1})),
+            put_with("dup", vec![2.0, 0.0], json!({"version":2})),
+        ])
         .await
         .expect_err("duplicate batch should fail");
     assert!(error.to_string().contains("more than once"), "{error}");
     assert_eq!(
         error.details().field_violations[0].field,
-        "operations[1]",
+        "[1]",
         "the second operation repeats the key"
     );
 
-    let visible = engine
-        .scan_exact("items", None)
+    let visible = scan(&engine, "items", None)
         .await
         .expect("scan should succeed");
     assert!(visible.is_empty(), "invalid batch should commit nothing");
@@ -1901,39 +1676,25 @@ async fn duplicate_id_batch_rejects_without_committing_anything() {
 #[tokio::test]
 async fn dimension_error_batch_rejects_without_committing_anything() {
     let root = support::unique_temp_dir("storage-dimension-batch");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine = open(&root);
 
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "embeddings",
-            2,
-            DistanceMetric::Cosine,
-        ))
-        .await
-        .expect("collection should be created");
+    create(
+        &engine,
+        CreateCollectionRequest::new("embeddings", 2, DistanceMetric::Cosine),
+    )
+    .await
+    .expect("collection should be created");
 
-    let error = engine
-        .write(
-            "embeddings",
-            vec![
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("ok"),
-                    vector: vec![1.0, 1.0],
-                    metadata: json!({"kind":"valid"}),
-                }),
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new("bad"),
-                    vector: vec![1.0, 1.0, 1.0],
-                    metadata: json!({"kind":"invalid"}),
-                }),
-            ],
-        )
+    let error = handle(&engine, "embeddings")
+        .write(vec![
+            put_with("ok", vec![1.0, 1.0], json!({"kind":"valid"})),
+            put_with("bad", vec![1.0, 1.0, 1.0], json!({"kind":"invalid"})),
+        ])
         .await
         .expect_err("dimension mismatch batch should fail");
     assert!(error.to_string().contains("expected 2 dimensions"));
 
-    let visible = engine
-        .scan_exact("embeddings", None)
+    let visible = scan(&engine, "embeddings", None)
         .await
         .expect("scan should succeed");
     assert!(visible.is_empty(), "invalid batch should commit nothing");
@@ -1941,7 +1702,7 @@ async fn dimension_error_batch_rejects_without_committing_anything() {
 
 /// Create a collection whose maintenance thresholds are set before it is created.
 fn create_with_thresholds(
-    engine: &LocalStorageEngine,
+    engine: &Engine,
     request: CreateCollectionRequest,
     flush_ops: usize,
     flush_bytes: usize,
@@ -1951,21 +1712,21 @@ fn create_with_thresholds(
     descriptor.flush_threshold_ops = flush_ops;
     descriptor.flush_threshold_bytes = flush_bytes;
     descriptor.compaction_threshold_segments = compact_segments;
-    engine.create_collection_from_descriptor(descriptor, None)
+    engine
+        .create_collection_blocking(descriptor, None)
+        .map(|handle| handle.describe())
 }
 
-async fn wait_for_condition<F>(engine: &LocalStorageEngine, collection_name: &str, predicate: F)
+async fn wait_for_condition<F>(engine: &Engine, collection_name: &str, predicate: F)
 where
     F: Fn(&logpose_types::CollectionStats) -> bool,
 {
-    // Generous because each poll replays the WAL and can block behind a flush,
-    // which takes seconds for large vectors on a loaded machine. Passing tests
-    // return as soon as the predicate holds.
+    // Generous because a flush of large vectors takes seconds on a loaded machine. Passing
+    // tests return as soon as the predicate holds.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let stats = engine
-            .stats(collection_name)
-            .await
+        let stats = handle(engine, collection_name)
+            .stats(None)
             .expect("stats should succeed");
         if predicate(&stats) {
             return;

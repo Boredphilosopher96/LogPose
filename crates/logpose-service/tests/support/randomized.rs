@@ -1,17 +1,18 @@
 use axum::body::Body;
 use http_body_util::BodyExt;
-use legacy_query::{LegacyQuery, MetadataFilter, QueryMatch, QueryRequest, QueryResponse};
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
 use logpose_catalog::{CollectionDescriptor, DEFAULT_COMPACTION_THRESHOLD_SEGMENTS};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, FilterExpr, QueryDiagnostics, QueryPlanKind};
+use logpose_query::{
+    ExplainMode, FilterExpr, QueryDiagnostics, QueryPlanKind, ReadConsistency, VectorQuery,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    MaintenanceStatus, PutRecord, RecordId, ScalarMetadataValue, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation, legacy::client_op_from_write,
+    CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError,
+    MaintenanceStatus, SeqNo, Snapshot,
+    record::{ClientOp, PrimaryKey, Record},
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde as _;
@@ -25,9 +26,6 @@ use std::{
 };
 use tonic::Request;
 use tower::util::ServiceExt;
-
-#[path = "legacy_query.rs"]
-mod legacy_query;
 
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 30;
@@ -43,19 +41,135 @@ const RECORD_ID_POOL: usize = 6;
 const EXACT_QUERY_TOP_K: usize = 3;
 const EXACT_QUERY_VECTORS: [[f32; RECORD_DIMENSIONS]; 3] = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
 
-/// Apply legacy write operations as one mixed client batch.
-async fn write_legacy(
+/// Commit `operations` as one batch through the authenticated write surface.
+async fn write_ops(
     state: &AppState,
     collection_name: &str,
-    operations: Vec<WriteOperation>,
+    operations: &[ModelOp],
 ) -> logpose_service::Result<logpose_types::CommitAck> {
-    let operations = operations
-        .into_iter()
-        .map(|operation| client_op_from_write(operation).expect("legacy operation converts"))
-        .collect();
     state
-        .write_with_auth(&RequestAuth::default(), collection_name, operations)
+        .write_with_auth(
+            &RequestAuth::default(),
+            collection_name,
+            operations.iter().map(ModelOp::client_op).collect(),
+        )
         .await
+}
+
+/// A write the model applies: an upsert of a test record, or a delete by key.
+#[derive(Clone, Debug)]
+enum ModelOp {
+    Put(TestRecord),
+    Delete(String),
+}
+
+impl ModelOp {
+    fn id(&self) -> &str {
+        match self {
+            Self::Put(record) => &record.id,
+            Self::Delete(id) => id,
+        }
+    }
+
+    /// The operation as a client batch carries it: the record's metadata is its `$extra`.
+    fn client_op(&self) -> ClientOp {
+        match self {
+            Self::Put(record) => {
+                let mut row =
+                    Record::new(record.id.as_str()).with_vector("vector", record.vector.clone());
+                if let Value::Object(extra) = &record.metadata {
+                    row.extra = extra.clone();
+                }
+                ClientOp::Upsert(row)
+            }
+            Self::Delete(id) => ClientOp::Delete(PrimaryKey::from(id.as_str())),
+        }
+    }
+}
+
+/// A live row as the model sees it.
+#[derive(Clone, Debug)]
+struct ModelRow {
+    id: String,
+    vector: Vec<f32>,
+    metadata: Value,
+}
+
+/// A query hit in the form the model predicts: the key, the metric value, and `$extra`.
+#[derive(Clone, Debug, PartialEq)]
+struct QueryMatch {
+    id: String,
+    value: f32,
+    metadata: Value,
+}
+
+/// A query reply in the form the model predicts.
+#[derive(Clone, Debug, PartialEq)]
+struct QueryResponse {
+    metric: DistanceMetric,
+    top_k: usize,
+    snapshot: Snapshot,
+    matches: Vec<QueryMatch>,
+    diagnostics: Option<QueryDiagnostics>,
+}
+
+impl QueryResponse {
+    /// The service's reply in the model's form.
+    fn from_reply(reply: logpose_query::QueryResponse) -> Self {
+        Self {
+            metric: reply.metric.unwrap_or(DistanceMetric::Cosine),
+            top_k: reply.top_k,
+            snapshot: reply.snapshot,
+            matches: reply
+                .hits
+                .into_iter()
+                .map(|hit| QueryMatch {
+                    id: hit.record.pk.label(),
+                    value: hit.score.unwrap_or_default(),
+                    metadata: Value::Object(hit.record.extra),
+                })
+                .collect(),
+            diagnostics: reply.diagnostics,
+        }
+    }
+}
+
+/// A vector query the harness sends through every surface: the service, REST, and gRPC.
+#[derive(Clone, Debug)]
+struct QueryRequest {
+    vector: Vec<f32>,
+    top_k: usize,
+    snapshot: Option<Snapshot>,
+    predicate: Option<FilterExpr>,
+    explain: ExplainMode,
+}
+
+/// Run `request` through the service's query surface.
+async fn query_service(
+    state: &AppState,
+    request: QueryRequest,
+) -> Result<QueryResponse, LogPoseError> {
+    state
+        .query_collection(
+            COLLECTION_NAME,
+            logpose_query::QueryRequest {
+                vector: Some(VectorQuery {
+                    field: None,
+                    values: request.vector,
+                }),
+                filter: request.predicate,
+                top_k: request.top_k,
+                output_fields: vec!["$extra".to_owned()],
+                explain: request.explain,
+                read: ReadConsistency {
+                    snapshot: request.snapshot,
+                    ..ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
+        .await
+        .map(|reply| QueryResponse::from_reply(reply.value))
 }
 
 #[derive(Clone, Debug)]
@@ -91,7 +205,7 @@ struct TestRecord {
 
 #[derive(Debug)]
 enum ExpectedState {
-    Visible(VisibleRecord),
+    Visible(ModelRow),
     Deleted,
 }
 
@@ -106,7 +220,7 @@ struct ExpectedGenerationState {
 /// was superseded dropped it.
 #[derive(Clone, Debug)]
 struct PhysicalRow {
-    id: RecordId,
+    id: String,
     seq_no: SeqNo,
     in_segment: bool,
     /// The manifest generation whose flush or compaction dropped the row.
@@ -122,7 +236,7 @@ struct ExpectedModel {
     next_seq_no: SeqNo,
     segment_count: usize,
     generation_states: BTreeMap<u64, ExpectedGenerationState>,
-    history: Vec<(SeqNo, WriteOperation)>,
+    history: Vec<(SeqNo, ModelOp)>,
     rows: Vec<PhysicalRow>,
 }
 
@@ -153,7 +267,7 @@ impl ExpectedModel {
     /// superseded it.
     fn superseded(&self, row: &PhysicalRow, visible_seq_no: SeqNo) -> bool {
         self.history.iter().any(|(seq_no, operation)| {
-            *seq_no > row.seq_no && *seq_no <= visible_seq_no && operation.id() == &row.id
+            *seq_no > row.seq_no && *seq_no <= visible_seq_no && operation.id() == row.id
         })
     }
 
@@ -162,7 +276,7 @@ impl ExpectedModel {
         self.history
             .iter()
             .filter(|(seq_no, operation)| {
-                *seq_no > self.checkpoint_seq_no && matches!(operation, WriteOperation::Put(_))
+                *seq_no > self.checkpoint_seq_no && matches!(operation, ModelOp::Put(_))
             })
             .count()
     }
@@ -172,17 +286,17 @@ impl ExpectedModel {
         self.metric = Some(metric);
     }
 
-    fn record_write(&mut self, operations: &[WriteOperation]) {
+    fn record_write(&mut self, operations: &[ModelOp]) {
         for operation in operations {
             self.next_seq_no += 1;
             let mut operation = operation.clone();
             // Storage keeps cosine vectors normalized to unit length, so the model does too.
             if self.metric == Some(DistanceMetric::Cosine)
-                && let WriteOperation::Put(put) = &mut operation
+                && let ModelOp::Put(put) = &mut operation
             {
                 normalize(&mut put.vector);
             }
-            if let WriteOperation::Put(put) = &operation {
+            if let ModelOp::Put(put) = &operation {
                 self.rows.push(PhysicalRow {
                     id: put.id.clone(),
                     seq_no: self.next_seq_no,
@@ -340,41 +454,15 @@ impl ExpectedModel {
         snapshot: Snapshot,
         keep_only: bool,
     ) -> QueryResponse {
-        let metric = self.metric.expect("metric should be set");
-        let filters = if keep_only {
-            vec![MetadataFilter {
-                field: "kind".to_owned(),
-                value: ScalarMetadataValue::String("keep".to_owned()),
-            }]
-        } else {
-            Vec::new()
-        };
-
-        let mut matches = self
-            .resolve_latest(snapshot.visible_seq_no)
-            .into_values()
-            .filter_map(|state| match state {
-                ExpectedState::Visible(record) => Some(record),
-                ExpectedState::Deleted => None,
-            })
-            .filter(|record| record_matches_filters(record, &filters))
-            .map(|record| QueryMatch {
-                id: record.id,
-                value: expected_match_value(metric, vector, &record.vector),
-                metadata: record.metadata,
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by(|left, right| compare_query_matches(metric, left, right));
+        let mut matches = self.expected_query_ranking(vector, snapshot.clone(), keep_only);
         matches.truncate(EXACT_QUERY_TOP_K);
 
         QueryResponse {
-            metric,
+            metric: self.metric.expect("metric should be set"),
             top_k: EXACT_QUERY_TOP_K,
-            returned: matches.len(),
             snapshot,
             matches,
             diagnostics: None,
-            snapshot_token: None,
         }
     }
 
@@ -385,15 +473,6 @@ impl ExpectedModel {
         keep_only: bool,
     ) -> Vec<QueryMatch> {
         let metric = self.metric.expect("metric should be set");
-        let filters = if keep_only {
-            vec![MetadataFilter {
-                field: "kind".to_owned(),
-                value: ScalarMetadataValue::String("keep".to_owned()),
-            }]
-        } else {
-            Vec::new()
-        };
-
         let mut matches = self
             .resolve_latest(snapshot.visible_seq_no)
             .into_values()
@@ -401,7 +480,7 @@ impl ExpectedModel {
                 ExpectedState::Visible(record) => Some(record),
                 ExpectedState::Deleted => None,
             })
-            .filter(|record| record_matches_filters(record, &filters))
+            .filter(|record| !keep_only || record.metadata["kind"] == "keep")
             .map(|record| QueryMatch {
                 id: record.id,
                 value: expected_match_value(metric, vector, &record.vector),
@@ -412,26 +491,25 @@ impl ExpectedModel {
         matches
     }
 
-    fn resolve_latest(&self, visible_seq_no: SeqNo) -> BTreeMap<RecordId, ExpectedState> {
+    fn resolve_latest(&self, visible_seq_no: SeqNo) -> BTreeMap<String, ExpectedState> {
         let mut resolved = BTreeMap::new();
-        for (seq_no, operation) in self
+        for (_, operation) in self
             .history
             .iter()
             .rev()
             .filter(|(seq_no, _)| *seq_no <= visible_seq_no)
         {
-            let id = operation.id().clone();
+            let id = operation.id().to_owned();
             if resolved.contains_key(&id) {
                 continue;
             }
             let state = match operation {
-                WriteOperation::Put(put) => ExpectedState::Visible(VisibleRecord {
+                ModelOp::Put(put) => ExpectedState::Visible(ModelRow {
                     id: put.id.clone(),
                     vector: put.vector.clone(),
                     metadata: put.metadata.clone(),
-                    seq_no: *seq_no,
                 }),
-                WriteOperation::Delete(_) => ExpectedState::Deleted,
+                ModelOp::Delete(_) => ExpectedState::Deleted,
             };
             resolved.insert(id, state);
         }
@@ -461,15 +539,15 @@ pub async fn run_background_maintenance_stays_off() {
     let (state, _) = open_state_without_background_maintenance(&root, 0).await;
     let segments = DEFAULT_COMPACTION_THRESHOLD_SEGMENTS as u64;
     let put = |slot: u64| {
-        vec![WriteOperation::Put(PutRecord {
-            id: RecordId::new(format!("id-{slot}")),
+        vec![ModelOp::Put(TestRecord {
+            id: format!("id-{slot}"),
             vector: vec![1.0, slot as f32],
             metadata: json!({ "kind": "keep", "slot": slot, "version": 0 }),
         })]
     };
 
     for slot in 0..segments {
-        write_legacy(&state, COLLECTION_NAME, put(slot))
+        write_ops(&state, COLLECTION_NAME, &put(slot))
             .await
             .expect("write should succeed");
         let snapshot = state
@@ -479,7 +557,7 @@ pub async fn run_background_maintenance_stays_off() {
         assert_eq!(snapshot.manifest_generation, slot + 1);
     }
     // On a collection that kept the default thresholds, this write queues a compaction.
-    let ack = write_legacy(&state, COLLECTION_NAME, put(segments))
+    let ack = write_ops(&state, COLLECTION_NAME, &put(segments))
         .await
         .expect("write should succeed");
     assert_eq!(
@@ -529,17 +607,8 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
 
         match action {
             ServiceAction::PutBatch(records) => {
-                let operations = records
-                    .into_iter()
-                    .map(|record| {
-                        WriteOperation::Put(PutRecord {
-                            id: RecordId::new(record.id),
-                            vector: record.vector,
-                            metadata: record.metadata,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let ack = write_legacy(&state, COLLECTION_NAME, operations.clone())
+                let operations = records.into_iter().map(ModelOp::Put).collect::<Vec<_>>();
+                let ack = write_ops(&state, COLLECTION_NAME, &operations)
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(seed, &trace, format!("write failed: {error}"))
@@ -548,10 +617,8 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 assert_ack_matches(&ack, operations.len(), &model, seed, &trace);
             }
             ServiceAction::Delete { id } => {
-                let operations = vec![WriteOperation::Delete(DeleteRecord {
-                    id: RecordId::new(id),
-                })];
-                let ack = write_legacy(&state, COLLECTION_NAME, operations.clone())
+                let operations = vec![ModelOp::Delete(id)];
+                let ack = write_ops(&state, COLLECTION_NAME, &operations)
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(seed, &trace, format!("delete failed: {error}"))
@@ -786,20 +853,18 @@ async fn assert_snapshot_expired_everywhere(
     let expired = |message: &str| message.contains("no longer available");
     let vector = EXACT_QUERY_VECTORS[vector_index].to_vec();
     let request = QueryRequest {
-        collection_name: COLLECTION_NAME.to_owned(),
         vector: vector.clone(),
         top_k: EXACT_QUERY_TOP_K,
         snapshot: Some(snapshot.clone()),
-        read_barrier: None,
-        filters: Vec::new(),
         predicate: None,
         explain: ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
     };
-    let error = state.query(request).await.err().unwrap_or_else(|| {
-        panic_with_context(seed, trace, "a superseded snapshot was queried".to_owned())
-    });
+    let error = query_service(state, request)
+        .await
+        .err()
+        .unwrap_or_else(|| {
+            panic_with_context(seed, trace, "a superseded snapshot was queried".to_owned())
+        });
     assert!(
         expired(&error.to_string()),
         "seed={seed} trace={trace:?}: {error}"
@@ -897,20 +962,17 @@ async fn assert_query_parity(
 ) {
     let vector = EXACT_QUERY_VECTORS[vector_index].to_vec();
     let request = QueryRequest {
-        collection_name: COLLECTION_NAME.to_owned(),
         vector: vector.clone(),
         top_k: EXACT_QUERY_TOP_K,
         snapshot: snapshot.clone(),
-        read_barrier: None,
-        filters: Vec::new(),
         predicate: keep_only.then(keep_only_predicate),
         explain: ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
     };
-    let actual = state.query(request.clone()).await.unwrap_or_else(|error| {
-        panic_with_context(seed, trace, format!("service query failed: {error}"))
-    });
+    let actual = query_service(state, request.clone())
+        .await
+        .unwrap_or_else(|error| {
+            panic_with_context(seed, trace, format!("service query failed: {error}"))
+        });
     let expected = model.expected_query_response(
         &vector,
         snapshot.unwrap_or_else(|| model.current_snapshot()),
@@ -998,8 +1060,7 @@ async fn assert_query_parity(
         explain: ExplainMode::Profile,
         ..request.clone()
     };
-    let profiled_service = state
-        .query(profiled_request.clone())
+    let profiled_service = query_service(state, profiled_request.clone())
         .await
         .unwrap_or_else(|error| {
             panic_with_context(
@@ -1760,13 +1821,6 @@ fn assert_query_response_matches_oracle(
         &expected.snapshot,
         &actual.snapshot,
     );
-    assert_eq_with_context(
-        seed,
-        trace,
-        "query returned count mismatch",
-        &actual.matches.len(),
-        &actual.returned,
-    );
 
     if !uses_ann(plan) {
         assert_eq_with_context(
@@ -1782,12 +1836,12 @@ fn assert_query_response_matches_oracle(
     let expected_top_ids = expected
         .matches
         .iter()
-        .map(|candidate| candidate.id.as_str().to_owned())
+        .map(|candidate| candidate.id.clone())
         .collect::<Vec<_>>();
     let actual_ids = actual
         .matches
         .iter()
-        .map(|candidate| candidate.id.as_str().to_owned())
+        .map(|candidate| candidate.id.clone())
         .collect::<Vec<_>>();
     let hits = expected_top_ids
         .iter()
@@ -1810,7 +1864,7 @@ fn assert_query_response_matches_oracle(
         .enumerate()
         .map(|(rank, candidate)| {
             (
-                candidate.id.as_str().to_owned(),
+                candidate.id.clone(),
                 (rank, candidate.value, candidate.metadata.clone()),
             )
         })
@@ -2252,15 +2306,6 @@ fn assert_proto_stage_timing_matches(
     let _ = (seed, trace, label, expected, actual);
 }
 
-fn record_matches_filters(record: &VisibleRecord, filters: &[MetadataFilter]) -> bool {
-    filters.iter().all(|filter| {
-        record
-            .metadata
-            .get(&filter.field)
-            .is_some_and(|value| scalar_matches_value(&filter.value, value))
-    })
-}
-
 fn proto_plan_kind(plan: QueryPlanKind) -> proto::QueryPlanKind {
     match plan {
         QueryPlanKind::UnfilteredExactScan => proto::QueryPlanKind::UnfilteredExactScan,
@@ -2332,16 +2377,6 @@ fn minimum_required_hits(top_k: usize) -> usize {
         0
     } else {
         (top_k * 2).div_ceil(3)
-    }
-}
-
-fn scalar_matches_value(expected: &ScalarMetadataValue, actual: &Value) -> bool {
-    match (expected, actual) {
-        (ScalarMetadataValue::String(expected), Value::String(actual)) => expected == actual,
-        (ScalarMetadataValue::Number(expected), Value::Number(actual)) => expected == actual,
-        (ScalarMetadataValue::Bool(expected), Value::Bool(actual)) => expected == actual,
-        (ScalarMetadataValue::Null, Value::Null) => true,
-        _ => false,
     }
 }
 

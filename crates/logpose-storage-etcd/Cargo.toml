@@ -12,7 +12,6 @@ workspace = true
 ignored = ["protoc-bin-vendored"]
 
 [dependencies]
-async-trait.workspace = true
 etcd-client = "0.20"
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }

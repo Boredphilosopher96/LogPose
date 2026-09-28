@@ -1,7 +1,6 @@
 //! Manual coordination smoke probe for a local etcd-backed LogPose cluster.
 
 use anyhow as _;
-use async_trait as _;
 use clap as _;
 use etcd_client::Client;
 use logpose_auth as _;
@@ -70,7 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collection = CollectionRef::new_default("chaos");
     let descriptor = CollectionDescriptor::new(
         "chaos",
-        logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
+        logpose_storage::CreateCollectionRequest::new("chaos", 2, DistanceMetric::Dot)
+            .spec
+            .build_schema()
+            .expect("schema"),
         Path::new("/tmp"),
     )
     .without_root_path();

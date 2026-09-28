@@ -1156,7 +1156,7 @@ curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?
 curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?target=wal"
 
 # Inspect a specific segment
-curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?target=segment&segment_id=seg-001"
+curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?target=segment&segment_id=00000002"
 
 # Inspect maintenance state
 curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?target=maintenance"
@@ -1166,6 +1166,9 @@ curl "http://127.0.0.1:8080/v2/databases/default/collections/embeddings/inspect?
 |--------------|--------|----------|---------------------------------------------|
 | `target`     | string | no       | `manifest`, `wal`, `segment`, `maintenance` |
 | `segment_id` | string | no       | Required when `target=segment`              |
+
+A `segment_id` is a segment's unit id, eight hex digits, as the manifest report
+lists it.
 
 **Response** (`200`):
 

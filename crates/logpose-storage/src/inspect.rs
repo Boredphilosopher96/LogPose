@@ -7,35 +7,72 @@
 //! with codes only, `flat` otherwise.
 
 use crate::{
-    InspectReport, InspectTarget,
-    engine::EngineCore,
-    handle::CollectionHandle,
-    legacy_view::{legacy_id, legacy_put},
-    segment::SegmentHandle,
-    state::ReadAt,
+    handle::CollectionHandle, segment::SegmentHandle, state::ReadAt, tokens::SnapshotToken,
     version::Version,
 };
 use logpose_types::{
-    CollectionStats, LogPoseError, QueryUnitArtifactStats, QueryUnitStats, ResourceKind, Result,
-    RowAddr, ScalarFieldStats, ScalarMetadataValue, SeqNo,
+    CollectionStats, LogPoseError, MaintenanceStatus, QueryUnitArtifactStats, QueryUnitStats,
+    ResourceKind, Result, RowAddr, ScalarFieldStats, ScalarMetadataValue, SeqNo, Snapshot,
+    record::PrimaryKey,
     schema::{FieldId, FieldRef},
 };
-use logpose_wal::codec::ValueBytes;
-use serde_json::json;
+use logpose_wal::codec::{RowImage, ValueBytes};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
 use std::{collections::BTreeMap, sync::Arc};
 
 /// The query-unit id of the memtables, reported as one mutable unit.
 const MUTABLE_UNIT_ID: &str = "mutable-delta";
 
-impl EngineCore {
-    /// Collection statistics of the state `at` names.
-    pub(crate) fn collection_stats(
-        &self,
-        handle: &CollectionHandle,
-        at: impl Into<ReadAt>,
-    ) -> Result<CollectionStats> {
-        let (version, snapshot) = self.read_state(handle, at)?;
-        let descriptor = handle.descriptor();
+/// What [`CollectionHandle::inspect`] reports on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InspectTarget {
+    /// The manifest of the current state.
+    Manifest,
+    /// The rows written since the checkpoint: the memtables, which the WAL above the
+    /// checkpoint rebuilds on recovery.
+    Wal,
+    /// The collection's maintenance status.
+    Maintenance,
+    /// One segment by its unit id: its manifest entry, section table, and rows.
+    Segment(String),
+}
+
+/// A JSON inspection report for operators and the CLI.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InspectReport {
+    /// The inspected target: `manifest`, `wal`, `maintenance`, or `segment:<unit>`.
+    pub target: String,
+    /// JSON payload describing the target.
+    pub payload: JsonValue,
+}
+
+impl CollectionHandle {
+    /// Statistics of the current state, or of the exact `snapshot` (see
+    /// [`ReadOptions::snapshot`](crate::ReadOptions::snapshot)). O(units): no row is read.
+    ///
+    /// # Errors
+    ///
+    /// The collection is dropped, or `snapshot` is invalid or no longer retained
+    /// (`SnapshotExpired`).
+    pub fn stats(&self, snapshot: Option<Snapshot>) -> Result<CollectionStats> {
+        self.stats_at(snapshot)
+    }
+
+    /// Statistics of the state `token` pins, extending the token's expiry.
+    ///
+    /// # Errors
+    ///
+    /// The collection is dropped, or the token expired, was released, or is unknown
+    /// (`SnapshotExpired`).
+    pub fn stats_at_token(&self, token: &SnapshotToken) -> Result<CollectionStats> {
+        self.stats_at(token.clone())
+    }
+
+    fn stats_at(&self, at: impl Into<ReadAt>) -> Result<CollectionStats> {
+        self.arm_maintenance();
+        let (version, snapshot) = self.read_state(at)?;
+        let descriptor = self.descriptor();
         let mut query_units = vec![mutable_unit_stats(&version)];
         for segment in version.segments.iter() {
             query_units.push(segment_unit_stats(&version, segment));
@@ -52,81 +89,104 @@ impl EngineCore {
             live_record_count: usize::try_from(version.counters.live_rows()).unwrap_or(usize::MAX),
             deleted_record_count: usize::try_from(version.counters.deleted_rows)
                 .unwrap_or(usize::MAX),
-            maintenance: handle.maintenance_status(),
+            maintenance: self.maintenance_status(),
             query_units,
         })
     }
 
-    /// The `inspect` report of `target` over the current `Version`.
-    pub(crate) fn inspect(
-        &self,
-        handle: &CollectionHandle,
-        target: InspectTarget,
-    ) -> Result<InspectReport> {
-        handle.ensure_open()?;
-        let version = handle.current();
-        match target {
-            InspectTarget::Manifest => Ok(InspectReport {
-                target: "manifest".to_owned(),
-                payload: version.manifest.inspect_json(),
-            }),
-            InspectTarget::Wal => {
-                // The memtables hold every row written since the checkpoint; deletes live only
-                // in deletion vectors (and the WAL files).
-                let mut records = Vec::new();
-                for memtable in version.memtables() {
-                    for slot in 0..memtable.slot_count() {
-                        let image = memtable.row_image(slot).map_err(LogPoseError::internal)?;
-                        let put = legacy_put(&version.schema, &image)?;
-                        records.push(json!({
-                            "seq_no": memtable.seq_no(slot).unwrap_or_default(),
-                            "op": "put",
-                            "id": put.id,
-                            "vector": put.vector,
-                            "metadata": put.metadata,
-                            "unit": memtable.unit.to_string(),
-                            "deleted": version.is_deleted(RowAddr {
-                                unit: memtable.unit,
-                                row: slot,
-                            }),
-                        }));
-                    }
+    /// The `inspect` report of `target` over the current state. Runs on the engine's I/O pool:
+    /// a segment report reads the segment's rows.
+    ///
+    /// # Errors
+    ///
+    /// The collection is dropped, the engine is shut down, an unknown segment (`NotFound`),
+    /// or I/O and typed corruption reading a segment.
+    pub async fn inspect(&self, target: InspectTarget) -> Result<InspectReport> {
+        self.ensure_open()?;
+        self.arm_maintenance();
+        let version = self.current();
+        let status = self.maintenance_status();
+        self.run_io(move || inspect_version(&version, status, target))
+            .await
+    }
+}
+
+/// The `inspect` report of `target` over `version`.
+fn inspect_version(
+    version: &Version,
+    status: MaintenanceStatus,
+    target: InspectTarget,
+) -> Result<InspectReport> {
+    match target {
+        InspectTarget::Manifest => Ok(InspectReport {
+            target: "manifest".to_owned(),
+            payload: version.manifest.inspect_json(),
+        }),
+        InspectTarget::Wal => {
+            // The memtables hold every row written since the checkpoint; deletes live only in
+            // deletion vectors (and the WAL files).
+            let mut records = Vec::new();
+            for memtable in version.memtables() {
+                for slot in 0..memtable.slot_count() {
+                    let image = memtable.row_image(slot).map_err(LogPoseError::internal)?;
+                    records.push(json!({
+                        "seq_no": memtable.seq_no(slot).unwrap_or_default(),
+                        "op": "put",
+                        "pk": PrimaryKey::from(image.pk.clone()).to_json(),
+                        "record": record_json(version, &image)?,
+                        "unit": memtable.unit.to_string(),
+                        "deleted": version.is_deleted(RowAddr {
+                            unit: memtable.unit,
+                            row: slot,
+                        }),
+                    }));
                 }
-                records.sort_by_key(|record| record["seq_no"].as_u64().unwrap_or_default());
-                Ok(InspectReport {
-                    target: "wal".to_owned(),
-                    payload: json!({
-                        "checkpoint_seq_no": version.checkpoint_seq_no,
-                        "visible_seq_no": version.visible_seq_no,
-                        "schema_version": version.schema.schema_version(),
-                        "memtables": version.memtables().map(|memtable| json!({
-                            "unit": memtable.unit.to_string(),
-                            "first_seq_no": memtable.first_seq_no,
-                            "last_seq_no": memtable.last_seq_no,
-                            "slots": memtable.slot_count(),
-                            "bytes": memtable.bytes().total(),
-                        })).collect::<Vec<_>>(),
-                        "records": records,
-                    }),
-                })
             }
-            InspectTarget::Maintenance => Ok(InspectReport {
-                target: "maintenance".to_owned(),
-                payload: serde_json::to_value(handle.maintenance_status())
-                    .map_err(crate::error::json_message)?,
-            }),
-            InspectTarget::Segment(segment_id) => {
-                let segment = version
-                    .segments
-                    .iter()
-                    .find(|segment| segment.unit.to_string() == segment_id)
-                    .ok_or_else(|| {
-                        LogPoseError::not_found(ResourceKind::Segment, segment_id.clone())
-                    })?;
-                inspect_segment(&version, segment)
-            }
+            records.sort_by_key(|record| record["seq_no"].as_u64().unwrap_or_default());
+            Ok(InspectReport {
+                target: "wal".to_owned(),
+                payload: json!({
+                    "checkpoint_seq_no": version.checkpoint_seq_no,
+                    "visible_seq_no": version.visible_seq_no,
+                    "schema_version": version.schema.schema_version(),
+                    "memtables": version.memtables().map(|memtable| json!({
+                        "unit": memtable.unit.to_string(),
+                        "first_seq_no": memtable.first_seq_no,
+                        "last_seq_no": memtable.last_seq_no,
+                        "slots": memtable.slot_count(),
+                        "bytes": memtable.bytes().total(),
+                    })).collect::<Vec<_>>(),
+                    "records": records,
+                }),
+            })
+        }
+        InspectTarget::Maintenance => Ok(InspectReport {
+            target: "maintenance".to_owned(),
+            payload: serde_json::to_value(status).map_err(crate::error::json_message)?,
+        }),
+        InspectTarget::Segment(segment_id) => {
+            let segment = version
+                .segments
+                .iter()
+                .find(|segment| segment.unit.to_string() == segment_id)
+                .ok_or_else(|| {
+                    LogPoseError::not_found(ResourceKind::Segment, segment_id.clone())
+                })?;
+            inspect_segment(version, segment)
         }
     }
+}
+
+/// `image` as a reader of `version` sees it, as the record's JSON document.
+fn record_json(version: &Version, image: &RowImage) -> Result<JsonValue> {
+    let record = image.to_record(&version.schema).map_err(|error| {
+        LogPoseError::internal(format!(
+            "row {} cannot be read with schema version {}: {error}",
+            PrimaryKey::from(image.pk.clone()).label(),
+            version.schema.schema_version()
+        ))
+    })?;
+    Ok(record.to_json(&version.schema))
 }
 
 /// The `inspect segment` report: the manifest entry, the section table, and every row.
@@ -154,7 +214,7 @@ fn inspect_segment(version: &Version, segment: &Arc<SegmentHandle>) -> Result<In
             "row": row,
             "seq_no": stored.seq_no,
             "op": "put",
-            "id": legacy_id(&stored.image.pk),
+            "pk": PrimaryKey::from(stored.image.pk.clone()).to_json(),
             "deleted": version.is_deleted(RowAddr {
                 unit: segment.unit,
                 row,

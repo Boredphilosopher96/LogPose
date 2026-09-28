@@ -1,6 +1,5 @@
 //! Deterministic control-plane/data-plane simulation scenarios.
 
-use async_trait as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_query as _;

@@ -75,4 +75,23 @@ max_tokens_per_collection = 64   # the default
 Both values must be greater than 0. Either key may be omitted to keep its
 default.
 
-`node_name` must not be `local`. That token is reserved for anonymous local placement metadata created by raw storage-engine workflows.
+## Storage Engine
+
+The storage engine's settings are built in; `LOGPOSE_CONFIG` sets only `storage_root` and the `[snapshots]` table above. The defaults the server runs with:
+
+| Setting | Default |
+| --- | --- |
+| Engine memory budget (memtables, primary-key indexes, maintenance, and the buffer cache of segment sections) | 4 GiB |
+| Memtable reservation, engine-wide | an eighth of the budget |
+| Maintenance memory for flush and compaction builds | a fifth of the budget |
+| Memtable flush triggers | 64 MiB, 1,000,000 rows, or 10 minutes |
+| Frozen memtables before writes wait | 2; a write that waits 30 seconds fails with `WRITE_STALLED` |
+| WAL file size before rotation | 64 MiB |
+| Group commit | up to 256 requests or 16 MiB per group, no added delay |
+| Compaction tiers | 32,768 live rows times powers of four; merges of 4 to 10 segments, at most 2,000,000 rows or 8 GiB |
+| Index sections | SQ8 codes from 1,024 rows, an HNSW graph from 20,000 distinct vectors, and the scalar indexes each typed field declares |
+| Threads | 8 I/O threads, one query thread per core, a maintenance thread per four cores, 2 writer threads |
+
+Each collection's descriptor also carries its own flush and compaction thresholds, set when it is created: `flush_threshold_ops` (10,000 operations), `flush_threshold_bytes` (64 MiB, capped by the engine's memtable size), and `compaction_threshold_segments` (4 segments of one tier).
+
+`node_name` must not be `local`. That name is reserved for the placement of collections created without an explicit assignment.

@@ -1,14 +1,13 @@
 use axum::body::Body;
 use http_body_util::BodyExt;
-use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::ExplainMode;
 use logpose_storage::CreateCollectionRequest;
 use logpose_types::{
-    DistanceMetric, NodeRole, PutRecord, RecordId, WriteOperation, legacy::client_op_from_write,
+    DistanceMetric, NodeRole,
+    record::{ClientOp, Record},
 };
 use serde as _;
 use serde_json::{Value, json};
@@ -22,19 +21,21 @@ use std::{
 use tonic::Request;
 use tower::util::ServiceExt;
 
-#[path = "legacy_query.rs"]
-mod legacy_query;
+/// A record with key `id`, the `vector` field, and `extra` as its `$extra` object.
+fn record(id: &str, vector: Vec<f32>, extra: Value) -> Record {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    record
+}
 
-/// Apply legacy write operations as one mixed client batch.
-async fn write_legacy(
+/// Commit `operations` as one batch through the authenticated write surface.
+async fn write_ops(
     state: &AppState,
     collection_name: &str,
-    operations: Vec<WriteOperation>,
+    operations: Vec<ClientOp>,
 ) -> logpose_service::Result<logpose_types::CommitAck> {
-    let operations = operations
-        .into_iter()
-        .map(|operation| client_op_from_write(operation).expect("legacy operation converts"))
-        .collect();
     state
         .write_with_auth(&RequestAuth::default(), collection_name, operations)
         .await
@@ -108,7 +109,7 @@ impl ExpectedModel {
         scenario_name: &str,
         collection_name: &str,
         records: usize,
-    ) -> Vec<WriteOperation> {
+    ) -> Vec<ClientOp> {
         let collection_name = canonical_collection_name(collection_name);
         let collection = self
             .collections
@@ -123,11 +124,11 @@ impl ExpectedModel {
                 let index = start_index + offset;
                 let record_id = format!("{collection_name}-{index}");
                 collection.record_ids.push(record_id.clone());
-                WriteOperation::Put(PutRecord {
-                    id: RecordId::new(record_id),
-                    vector: vec![index as f32 + 1.0, 0.0],
-                    metadata: json!({"scenario": scenario_name, "index": index}),
-                })
+                ClientOp::Upsert(record(
+                    &record_id,
+                    vec![index as f32 + 1.0, 0.0],
+                    json!({"scenario": scenario_name, "index": index}),
+                ))
             })
             .collect()
     }
@@ -307,7 +308,7 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
             }
             Step::WriteBatch(collection_name, records) => {
                 let operations = model.record_write_batch(name, collection_name, records);
-                write_legacy(&harness.state, collection_name, operations)
+                write_ops(&harness.state, collection_name, operations)
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(&trace, format!("write failed: {error}"))
@@ -330,14 +331,14 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
                 assert_data_matches(&harness, &model, collection_name, &trace).await;
             }
             Step::ExpectWriteRejected(collection_name) => {
-                let error = write_legacy(
+                let error = write_ops(
                     &harness.state,
                     collection_name,
-                    vec![WriteOperation::Put(PutRecord {
-                        id: RecordId::new(format!("{collection_name}-rejected")),
-                        vector: vec![1.0, 0.0],
-                        metadata: json!({"scenario": name}),
-                    })],
+                    vec![ClientOp::Upsert(record(
+                        &format!("{collection_name}-rejected"),
+                        vec![1.0, 0.0],
+                        json!({"scenario": name}),
+                    ))],
                 )
                 .await
                 .expect_err("data-plane write should be rejected");
@@ -825,19 +826,20 @@ async fn assert_data_matches(
 
     let service_query = harness
         .state
-        .query(QueryRequest {
-            collection_name: collection_name.to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: expected_record_count,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            collection_name,
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: expected_record_count,
+                output_fields: vec!["$extra".to_owned()],
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .unwrap_or_else(|error| {
             panic_with_context(trace, format!("service query failed: {error}"))
         });
@@ -870,14 +872,15 @@ async fn assert_data_matches(
         .into_inner();
 
     assert_eq!(
-        service_query.returned, expected_record_count,
+        service_query.hits.len(),
+        expected_record_count,
         "trace: {trace:?}"
     );
     assert_eq!(
         service_query
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.to_string())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         expected_ids,
         "trace: {trace:?}"

@@ -51,7 +51,7 @@ fn create(engine: &Engine) -> Arc<CollectionHandle> {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 

@@ -1,8 +1,8 @@
 //! Database, principal and access-policy descriptor files, served through [`CatalogStore`].
 
 use crate::{
-    LocalStorageEngine,
-    durable_fs::{create_dir_all_synced, sync_dir},
+    Engine,
+    durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     engine::EngineCore,
     error::{invalid_descriptor, io_message, json_message},
     fs_util::{atomic_write, read_json},
@@ -14,6 +14,10 @@ use serde::de::DeserializeOwned;
 use std::path::Path;
 
 impl EngineCore {
+    pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
+        path_exists(self.vfs.as_ref(), path)
+    }
+
     pub(crate) fn ensure_database_descriptor(&self, database_name: &str) -> Result<()> {
         if database_name.trim().is_empty() {
             return Err(LogPoseError::invalid_field(
@@ -198,46 +202,45 @@ impl CatalogStore for EngineCore {
     }
 }
 
-impl CatalogStore for LocalStorageEngine {
+/// The catalog of database, principal, and access-policy descriptors under the engine's root.
+impl CatalogStore for Engine {
     fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
-        self.engine().core().put_database(descriptor)
+        self.core().put_database(descriptor)
     }
 
     fn get_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        self.engine().core().get_database(database_name)
+        self.core().get_database(database_name)
     }
 
     fn list_databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.engine().core().list_databases()
+        self.core().list_databases()
     }
 
     fn delete_database(&self, database_name: &str) -> Result<()> {
-        self.engine().core().delete_database(database_name)
+        self.core().delete_database(database_name)
     }
 
     fn put_principal(&self, principal: Principal) -> Result<Principal> {
-        self.engine().core().put_principal(principal)
+        self.core().put_principal(principal)
     }
 
     fn get_principal(&self, principal_name: &str) -> Result<Principal> {
-        self.engine().core().get_principal(principal_name)
+        self.core().get_principal(principal_name)
     }
 
     fn list_principals(&self) -> Result<Vec<Principal>> {
-        self.engine().core().list_principals()
+        self.core().list_principals()
     }
 
     fn put_database_access_policy(
         &self,
         policy: DatabaseAccessPolicy,
     ) -> Result<DatabaseAccessPolicy> {
-        self.engine().core().put_database_access_policy(policy)
+        self.core().put_database_access_policy(policy)
     }
 
     fn get_database_access_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
-        self.engine()
-            .core()
-            .get_database_access_policy(database_name)
+        self.core().get_database_access_policy(database_name)
     }
 }
 
@@ -324,7 +327,8 @@ mod tests {
     #[test]
     fn list_databases_bootstraps_the_default_database_descriptor() {
         let root = unique_temp_dir("storage-default-database-bootstrap");
-        let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+        let engine =
+            Engine::open_local(&root, crate::EngineConfig::default()).expect("engine should open");
 
         let databases = engine
             .list_databases()

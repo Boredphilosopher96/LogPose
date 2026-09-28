@@ -1,6 +1,5 @@
 //! Seeded randomized service and transport parity tests.
 
-use async_trait as _;
 use logpose_auth as _;
 use logpose_service as _;
 use logpose_storage_etcd as _;
