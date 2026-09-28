@@ -12,7 +12,8 @@
 //!
 //! After every step the published version must satisfy its invariants (one live row per key
 //! among them), its live rows must equal the model, and a point lookup of every key (newest
-//! unit first, as readers do) must agree. Partial updates and deletes resolve keys through the
+//! unit first, as readers do) must agree, both on the version and through a read view (whose
+//! live counts must also sum to the model's size). Partial updates and deletes resolve keys through the
 //! primary-key index, so a wrong index entry shows up as a wrong merged row, a wrong
 //! `NotFound`, or two live rows.
 //!
@@ -20,7 +21,11 @@
 //! `LOGPOSE_MODEL_VERBOSE` prints each background seed as it starts.
 
 use super::*;
-use crate::{CreateCollectionRequest, Engine, EngineConfig, legacy_view::legacy_put};
+use crate::{
+    CreateCollectionRequest, Engine, EngineConfig,
+    legacy_view::legacy_put,
+    read::{Projection, ReadOptions},
+};
 use logpose_types::{
     CollectionRef, DistanceMetric, ResourceKind,
     record::{PartialUpdate, PrimaryKey, Record},
@@ -73,6 +78,53 @@ fn reopen(engine: &Engine) -> Arc<CollectionHandle> {
     engine
         .collection(&CollectionRef::new_default(NAME))
         .expect("collection should reopen")
+}
+
+/// The live rows of the view the read path serves: point lookups of every key and the sum of
+/// the units' live counts, which the caller compares with the model.
+fn read_path(
+    engine: &Engine,
+    handle: &CollectionHandle,
+    model: &Model,
+) -> std::result::Result<(), String> {
+    let view = engine
+        .core()
+        .read_view_of(handle, &ReadOptions::default())
+        .map_err(|error| error.to_string())?;
+    let live = view
+        .units()
+        .iter()
+        .map(|unit| u64::from(unit.live_count()))
+        .sum::<u64>();
+    if live != model.len() as u64 {
+        return Err(format!(
+            "the read view counts {live} live rows, the model {}",
+            model.len()
+        ));
+    }
+    let keys = (0..KEYS)
+        .map(|key| PrimaryKey::from(format!("k{key}").as_str()))
+        .collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let rows = runtime
+        .block_on(view.get(&keys, Projection::full()))
+        .map_err(|error| error.to_string())?;
+    for (key, row) in (0..KEYS).zip(rows) {
+        let id = format!("k{key}");
+        let expected = model.get(&id).map(|(vector, _)| vector);
+        let found = row
+            .as_ref()
+            .and_then(|row| row.record.vectors.values().next());
+        if found != expected {
+            return Err(format!(
+                "read view get({id}) = {:?}, but the model holds {expected:?}",
+                row.map(|row| row.record)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn live(handle: &CollectionHandle) -> std::result::Result<Model, String> {
@@ -228,7 +280,12 @@ impl Run {
 
     fn check(&self, what: &str) {
         match live(&self.handle()) {
-            Ok(rows) if rows == self.model => {}
+            Ok(rows) if rows == self.model => {
+                let engine = self.engine.as_ref().expect("open");
+                if let Err(error) = read_path(engine, &self.handle(), &self.model) {
+                    self.fail(format!("{what}: {error}"));
+                }
+            }
             Ok(rows) => self.fail(format!(
                 "{what}: live rows differ\nexpected {:?}\nactual   {:?}",
                 self.model, rows
