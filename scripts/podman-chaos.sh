@@ -747,7 +747,8 @@ for index in range(count):
     lines.append(json.dumps({
         "id": f"{prefix}-{index}",
         "vector": [x, y],
-        "metadata": {"kind": prefix, "index": index},
+        "kind": prefix,
+        "index": index,
     }))
 path.write_text("\n".join(lines))
 PY
