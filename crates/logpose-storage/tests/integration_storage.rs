@@ -44,7 +44,8 @@ use std::{
 
 #[tokio::test]
 async fn create_write_scan_and_delete_records() {
-    let root = support::unique_temp_dir("storage-write-scan");
+    let root_dir = support::unique_temp_dir("storage-write-scan");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -81,7 +82,8 @@ async fn create_write_scan_and_delete_records() {
 
 #[tokio::test]
 async fn create_collection_persists_default_database_descriptor() {
-    let root = support::unique_temp_dir("storage-default-database");
+    let root_dir = support::unique_temp_dir("storage-default-database");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -108,7 +110,8 @@ async fn create_collection_persists_default_database_descriptor() {
 
 #[test]
 fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
-    let root = support::unique_temp_dir("storage-catalog-invalid-stored");
+    let root_dir = support::unique_temp_dir("storage-catalog-invalid-stored");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     engine
         .put_database(DatabaseDescriptor::new("analytics"))
@@ -167,7 +170,8 @@ fn stored_descriptors_that_fail_validation_are_reported_as_corrupt() {
 
 #[test]
 fn catalog_store_round_trips_databases_principals_and_policies() {
-    let root = support::unique_temp_dir("storage-catalog-round-trip");
+    let root_dir = support::unique_temp_dir("storage-catalog-round-trip");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let database = engine
@@ -281,7 +285,8 @@ fn catalog_store_round_trips_databases_principals_and_policies() {
 
 #[test]
 fn catalog_store_overwrites_database_policy_by_database_name() {
-    let root = support::unique_temp_dir("storage-catalog-database-isolation");
+    let root_dir = support::unique_temp_dir("storage-catalog-database-isolation");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let database = engine
@@ -329,7 +334,8 @@ fn catalog_store_overwrites_database_policy_by_database_name() {
 
 #[test]
 fn put_database_preserves_stable_database_identity_on_replace() {
-    let root = support::unique_temp_dir("storage-database-idempotence");
+    let root_dir = support::unique_temp_dir("storage-database-idempotence");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let first = engine
@@ -345,7 +351,8 @@ fn put_database_preserves_stable_database_identity_on_replace() {
 
 #[tokio::test]
 async fn duplicate_collection_names_can_exist_in_different_databases() {
-    let root = support::unique_temp_dir("storage-namespace-duplicates");
+    let root_dir = support::unique_temp_dir("storage-namespace-duplicates");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let default_descriptor = create(
@@ -385,7 +392,8 @@ async fn duplicate_collection_names_can_exist_in_different_databases() {
 
 #[tokio::test]
 async fn create_collection_allows_duplicate_names_in_distinct_databases() {
-    let root = support::unique_temp_dir("storage-duplicate-collection-namespaces");
+    let root_dir = support::unique_temp_dir("storage-duplicate-collection-namespaces");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let left = create(
@@ -429,7 +437,8 @@ async fn create_collection_allows_duplicate_names_in_distinct_databases() {
 
 #[tokio::test]
 async fn create_collection_rejects_reserved_namespace_separator() {
-    let root = support::unique_temp_dir("storage-reserved-separator");
+    let root_dir = support::unique_temp_dir("storage-reserved-separator");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let error = create(
@@ -445,7 +454,8 @@ async fn create_collection_rejects_reserved_namespace_separator() {
 
 #[tokio::test]
 async fn open_collection_resolves_database_collection_tuple() {
-    let root = support::unique_temp_dir("storage-open-collection-namespace");
+    let root_dir = support::unique_temp_dir("storage-open-collection-namespace");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let default_descriptor = create(
@@ -488,7 +498,8 @@ async fn open_collection_resolves_database_collection_tuple() {
 
 #[tokio::test]
 async fn flush_persists_visible_records_for_reopen() {
-    let root = support::unique_temp_dir("storage-flush");
+    let root_dir = support::unique_temp_dir("storage-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -568,7 +579,8 @@ async fn flush_persists_visible_records_for_reopen() {
 
 #[tokio::test]
 async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta() {
-    let root = support::unique_temp_dir("storage-reopen-post-checkpoint-delta");
+    let root_dir = support::unique_temp_dir("storage-reopen-post-checkpoint-delta");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -614,7 +626,8 @@ async fn reopen_after_flush_and_new_write_only_replays_the_post_checkpoint_delta
 
 #[tokio::test]
 async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
-    let root = support::unique_temp_dir("storage-checkpointed-wal-corruption");
+    let root_dir = support::unique_temp_dir("storage-checkpointed-wal-corruption");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -663,7 +676,8 @@ async fn checkpointed_rolled_wal_corruption_does_not_block_recovery() {
 
 #[tokio::test]
 async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart() {
-    let root = support::unique_temp_dir("storage-old-snapshot-rotated-wal");
+    let root_dir = support::unique_temp_dir("storage-old-snapshot-rotated-wal");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -733,7 +747,8 @@ async fn a_pinned_snapshot_reads_exactly_its_state_after_a_flush_until_a_restart
 
 #[tokio::test]
 async fn a_pinned_snapshot_preserves_pre_compaction_history() {
-    let root = support::unique_temp_dir("storage-old-snapshot-compaction-history");
+    let root_dir = support::unique_temp_dir("storage-old-snapshot-compaction-history");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -813,7 +828,8 @@ async fn a_pinned_snapshot_preserves_pre_compaction_history() {
 
 #[tokio::test]
 async fn compact_merges_segments_and_preserves_latest_versions() {
-    let root = support::unique_temp_dir("storage-compact");
+    let root_dir = support::unique_temp_dir("storage-compact");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -886,7 +902,8 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
 
 #[tokio::test]
 async fn inspect_reports_manifest_wal_and_segment_targets() {
-    let root = support::unique_temp_dir("storage-inspect");
+    let root_dir = support::unique_temp_dir("storage-inspect");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -1025,7 +1042,8 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
 
 #[tokio::test]
 async fn background_maintenance_flushes_and_compacts_using_thresholds() {
-    let root = support::unique_temp_dir("storage-background-maintenance");
+    let root_dir = support::unique_temp_dir("storage-background-maintenance");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create_with_thresholds(
@@ -1082,7 +1100,8 @@ async fn background_maintenance_flushes_and_compacts_using_thresholds() {
 
 #[tokio::test]
 async fn background_maintenance_preserves_namespace_for_duplicate_collection_names() {
-    let root = support::unique_temp_dir("storage-background-maintenance-namespace");
+    let root_dir = support::unique_temp_dir("storage-background-maintenance-namespace");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -1133,7 +1152,8 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
 /// corruption, never a wrong answer or a panic.
 #[tokio::test]
 async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
-    let root = support::unique_temp_dir("storage-segment-corruption");
+    let root_dir = support::unique_temp_dir("storage-segment-corruption");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let descriptor = create(
         &engine,
@@ -1230,7 +1250,8 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
 /// delete superseded never appear, and filters apply before the budget.
 #[tokio::test]
 async fn ann_queries_over_segments_see_only_live_rows() {
-    let root = support::unique_temp_dir("storage-ann-live-rows");
+    let root_dir = support::unique_temp_dir("storage-ann-live-rows");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     create(
         &engine,
@@ -1305,7 +1326,8 @@ async fn ann_queries_over_segments_see_only_live_rows() {
 
 #[tokio::test]
 async fn manual_flush_and_background_maintenance_do_not_race() {
-    let root = support::unique_temp_dir("storage-manual-background-race");
+    let root_dir = support::unique_temp_dir("storage-manual-background-race");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create_with_thresholds(
@@ -1360,7 +1382,8 @@ async fn manual_flush_and_background_maintenance_do_not_race() {
 
 #[tokio::test]
 async fn background_maintenance_handles_inflight_writes_without_losing_visibility() {
-    let root = support::unique_temp_dir("storage-follow-up-background-flush");
+    let root_dir = support::unique_temp_dir("storage-follow-up-background-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create_with_thresholds(
@@ -1419,7 +1442,8 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
 /// lowered while the engine was down) once it has a data-plane access.
 #[tokio::test]
 async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
-    let root = support::unique_temp_dir("storage-resume-background-maintenance");
+    let root_dir = support::unique_temp_dir("storage-resume-background-maintenance");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -1475,7 +1499,8 @@ async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
 
 #[tokio::test]
 async fn rejects_impossible_snapshots() {
-    let root = support::unique_temp_dir("storage-invalid-snapshot");
+    let root_dir = support::unique_temp_dir("storage-invalid-snapshot");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -1512,7 +1537,8 @@ async fn rejects_impossible_snapshots() {
 
 #[tokio::test]
 async fn rejects_snapshots_below_manifest_checkpoint() {
-    let root = support::unique_temp_dir("storage-below-checkpoint-snapshot");
+    let root_dir = support::unique_temp_dir("storage-below-checkpoint-snapshot");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -1554,7 +1580,8 @@ async fn rejects_snapshots_below_manifest_checkpoint() {
 
 #[tokio::test]
 async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
-    let root = support::unique_temp_dir("storage-invalid-thresholds");
+    let root_dir = support::unique_temp_dir("storage-invalid-thresholds");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -1586,7 +1613,8 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
 
 #[tokio::test]
 async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expires() {
-    let root = support::unique_temp_dir("storage-snapshot-flush");
+    let root_dir = support::unique_temp_dir("storage-snapshot-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let descriptor = create(
@@ -1643,7 +1671,8 @@ async fn a_pinned_snapshot_remains_readable_after_flush_and_an_unpinned_one_expi
 
 #[tokio::test]
 async fn duplicate_id_batch_rejects_without_committing_anything() {
-    let root = support::unique_temp_dir("storage-duplicate-batch");
+    let root_dir = support::unique_temp_dir("storage-duplicate-batch");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -1675,7 +1704,8 @@ async fn duplicate_id_batch_rejects_without_committing_anything() {
 
 #[tokio::test]
 async fn dimension_error_batch_rejects_without_committing_anything() {
-    let root = support::unique_temp_dir("storage-dimension-batch");
+    let root_dir = support::unique_temp_dir("storage-dimension-batch");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(

@@ -16,12 +16,7 @@ use logpose_storage_etcd as _;
 use logpose_types::{CollectionAssignment, DistanceMetric, record::Record};
 use rand as _;
 use serde as _;
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use thiserror as _;
 use tokio as _;
 use tonic as _;
@@ -38,7 +33,7 @@ fn record(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> Record {
 
 #[tokio::test]
 async fn control_plane_reports_runtime_status_and_local_placement() {
-    let config = test_config("control-runtime");
+    let (config, _root) = test_config("control-runtime");
     let state = Arc::new(AppState::new(config.clone()));
 
     let descriptor = state
@@ -105,7 +100,7 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
 
 #[tokio::test]
 async fn control_plane_reconstructs_runtime_status_after_restart() {
-    let config = test_config("control-restart");
+    let (config, _root) = test_config("control-restart");
     let state = Arc::new(AppState::new(config.clone()));
 
     state
@@ -151,7 +146,8 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
 
 #[tokio::test]
 async fn control_plane_rejects_missing_collection_placement_requests() {
-    let state = Arc::new(AppState::new(test_config("control-missing")));
+    let (config, _root) = test_config("control-missing");
+    let state = Arc::new(AppState::new(config));
 
     let error = state
         .control
@@ -167,7 +163,8 @@ async fn control_plane_rejects_missing_collection_placement_requests() {
 
 #[tokio::test]
 async fn control_plane_reports_non_default_database_collection_identity() {
-    let state = Arc::new(AppState::new(test_config("control-qualified-database")));
+    let (config, _root) = test_config("control-qualified-database");
+    let state = Arc::new(AppState::new(config));
 
     let descriptor = state
         .control
@@ -206,7 +203,8 @@ async fn control_plane_reports_non_default_database_collection_identity() {
 
 #[tokio::test]
 async fn control_plane_distinguishes_duplicate_collection_names_across_databases() {
-    let state = Arc::new(AppState::new(test_config("control-namespace-collision")));
+    let (config, _root) = test_config("control-namespace-collision");
+    let state = Arc::new(AppState::new(config));
 
     let default_descriptor = state
         .control
@@ -306,10 +304,8 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
 
 #[tokio::test]
 async fn data_only_nodes_reject_control_plane_collection_creation() {
-    let state = Arc::new(AppState::new(test_config_with_role(
-        "control-data-only",
-        logpose_types::NodeRole::Data,
-    )));
+    let (config, _root) = test_config_with_role("control-data-only", logpose_types::NodeRole::Data);
+    let state = Arc::new(AppState::new(config));
 
     let error = state
         .control
@@ -331,10 +327,9 @@ async fn data_only_nodes_reject_control_plane_collection_creation() {
 
 #[tokio::test]
 async fn control_only_nodes_reject_app_state_data_plane_operations() {
-    let state = Arc::new(AppState::new(test_config_with_role(
-        "control-appstate-gate",
-        logpose_types::NodeRole::Control,
-    )));
+    let (config, _root) =
+        test_config_with_role("control-appstate-gate", logpose_types::NodeRole::Control);
+    let state = Arc::new(AppState::new(config));
 
     let error = state
         .upsert_records_with_auth(
@@ -354,10 +349,9 @@ async fn control_only_nodes_reject_app_state_data_plane_operations() {
 
 #[tokio::test]
 async fn control_only_nodes_reject_control_plane_collection_creation() {
-    let state = Arc::new(AppState::new(test_config_with_role(
-        "control-assignment",
-        logpose_types::NodeRole::Control,
-    )));
+    let (config, _root) =
+        test_config_with_role("control-assignment", logpose_types::NodeRole::Control);
+    let state = Arc::new(AppState::new(config));
 
     let error = state
         .control
@@ -382,7 +376,8 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
 
 #[tokio::test]
 async fn control_only_restarts_preserve_persisted_data_assignment() {
-    let root = unique_temp_dir("control-role-restart");
+    let root_dir = unique_temp_dir("control-role-restart");
+    let root = root_dir.path().to_path_buf();
     let combined = logpose_config::LogPoseConfig {
         node_name: "control-role-node".to_owned(),
         node_role: logpose_types::NodeRole::Combined,
@@ -439,7 +434,8 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
 
 #[tokio::test]
 async fn data_only_restarts_preserve_persisted_local_data_assignment() {
-    let root = unique_temp_dir("data-role-restart");
+    let root_dir = unique_temp_dir("data-role-restart");
+    let root = root_dir.path().to_path_buf();
     let combined = test_config_with_root(
         "data-role-node",
         logpose_types::NodeRole::Combined,
@@ -560,7 +556,8 @@ fn segment_files(collection_dir: &std::path::Path) -> usize {
 /// never makes.
 #[tokio::test]
 async fn control_plane_status_reads_never_run_maintenance() {
-    let root = unique_temp_dir("control-status-maintenance");
+    let root_dir = unique_temp_dir("control-status-maintenance");
+    let root = root_dir.path().to_path_buf();
     let collection_dir =
         collection_due_a_flush_after_restart(root.clone(), "control-status-maintenance").await;
 
@@ -584,7 +581,8 @@ async fn control_plane_status_reads_never_run_maintenance() {
 /// maintenance either.
 #[tokio::test]
 async fn combined_runtime_status_reads_never_run_maintenance() {
-    let root = unique_temp_dir("combined-status-maintenance");
+    let root_dir = unique_temp_dir("combined-status-maintenance");
+    let root = root_dir.path().to_path_buf();
     let collection_dir =
         collection_due_a_flush_after_restart(root.clone(), "combined-status-maintenance").await;
 
@@ -607,7 +605,8 @@ async fn combined_runtime_status_reads_never_run_maintenance() {
 
 #[tokio::test]
 async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations() {
-    let root = unique_temp_dir("recorded-node-restart");
+    let root_dir = unique_temp_dir("recorded-node-restart");
+    let root = root_dir.path().to_path_buf();
     let initial = Arc::new(AppState::new(test_config_with_root(
         "recorded-node-a",
         logpose_types::NodeRole::Combined,
@@ -729,7 +728,8 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
 
 #[tokio::test]
 async fn raw_local_storage_creates_surface_local_runtime_status() {
-    let root = unique_temp_dir("raw-local-status");
+    let root_dir = unique_temp_dir("raw-local-status");
+    let root = root_dir.path().to_path_buf();
     let engine =
         Engine::open_local(&root, EngineConfig::default()).expect("storage engine should open");
     let descriptor = engine
@@ -784,7 +784,8 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
 
 #[tokio::test]
 async fn local_control_assignments_still_reject_data_plane_operations() {
-    let root = unique_temp_dir("local-control-assignment");
+    let root_dir = unique_temp_dir("local-control-assignment");
+    let root = root_dir.path().to_path_buf();
     let engine =
         Engine::open_local(&root, EngineConfig::default()).expect("storage engine should open");
     let descriptor = engine
@@ -858,7 +859,8 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
 
 #[tokio::test]
 async fn control_plane_round_trips_default_database_access_policy_after_restart() {
-    let root = unique_temp_dir("control-policy-restart");
+    let root_dir = unique_temp_dir("control-policy-restart");
+    let root = root_dir.path().to_path_buf();
     let initial = Arc::new(AppState::new(test_config_with_root(
         "control-policy-restart",
         logpose_types::NodeRole::Combined,
@@ -896,7 +898,8 @@ async fn control_plane_round_trips_default_database_access_policy_after_restart(
 
 #[tokio::test]
 async fn control_plane_reads_database_access_policies_by_database_name() {
-    let state = Arc::new(AppState::new(test_config("control-policy-namespace")));
+    let (config, _root) = test_config("control-policy-namespace");
+    let state = Arc::new(AppState::new(config));
     let default_policy = sample_policy("default");
     let analytics_policy = sample_policy("analytics");
 
@@ -930,10 +933,9 @@ async fn control_plane_reads_database_access_policies_by_database_name() {
 #[tokio::test]
 async fn data_only_nodes_reject_database_policy_mutation_while_control_only_nodes_accept_it() {
     let policy = sample_policy("default");
-    let data_state = Arc::new(AppState::new(test_config_with_role(
-        "control-policy-data-only",
-        logpose_types::NodeRole::Data,
-    )));
+    let (config, _root) =
+        test_config_with_role("control-policy-data-only", logpose_types::NodeRole::Data);
+    let data_state = Arc::new(AppState::new(config));
 
     let data_error = data_state
         .control
@@ -950,7 +952,9 @@ async fn data_only_nodes_reject_database_policy_mutation_while_control_only_node
         "unexpected error: {data_error}"
     );
 
-    let root = unique_temp_dir("control-policy-control-only");
+    let root_dir = unique_temp_dir("control-policy-control-only");
+
+    let root = root_dir.path().to_path_buf();
     let combined = Arc::new(AppState::new(test_config_with_root(
         "control-policy-control-only",
         logpose_types::NodeRole::Combined,
@@ -977,25 +981,28 @@ async fn data_only_nodes_reject_database_policy_mutation_while_control_only_node
     assert_eq!(read_policy, policy);
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-control-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-control-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-control-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
-fn test_config(label: &str) -> logpose_config::LogPoseConfig {
+/// A combined node's configuration, and its storage root's guard: keep the guard alive for as
+/// long as a node runs on the configuration.
+fn test_config(label: &str) -> (logpose_config::LogPoseConfig, tempfile::TempDir) {
     test_config_with_role(label, logpose_types::NodeRole::Combined)
 }
 
 fn test_config_with_role(
     label: &str,
     node_role: logpose_types::NodeRole,
-) -> logpose_config::LogPoseConfig {
-    test_config_with_root(label, node_role, unique_temp_dir(label))
+) -> (logpose_config::LogPoseConfig, tempfile::TempDir) {
+    let root = unique_temp_dir(label);
+    let config = test_config_with_root(label, node_role, root.path().to_path_buf());
+    (config, root)
 }
 
 fn test_config_with_root(

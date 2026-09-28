@@ -12,6 +12,7 @@ use protoc_bin_vendored as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{process::ExitCode, time::Duration};
+use tempfile as _;
 
 #[derive(Debug, Parser)]
 #[command(

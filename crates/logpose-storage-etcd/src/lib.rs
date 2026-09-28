@@ -1736,11 +1736,7 @@ mod tests {
     use super::*;
     use logpose_storage::CreateCollectionRequest;
     use logpose_types::DistanceMetric;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::path::PathBuf;
 
     fn assignment(node_id: &str) -> CollectionAssignment {
         CollectionAssignment {
@@ -1760,14 +1756,13 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("logpose-storage-etcd-{label}-{suffix}"));
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        path
+    /// A fresh temp directory named `logpose-storage-etcd-{label}-…`, removed when the returned
+    /// guard drops, also when the test panics.
+    fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("logpose-storage-etcd-{label}-"))
+            .tempdir()
+            .expect("temp dir should be created")
     }
 
     #[test]
@@ -2060,7 +2055,8 @@ mod tests {
 
     #[tokio::test]
     async fn authoritative_assignment_reads_fail_closed_when_etcd_is_unreachable() {
-        let root = unique_temp_dir("fail-closed-assignment");
+        let root_dir = unique_temp_dir("fail-closed-assignment");
+        let root = root_dir.path().to_path_buf();
         let engine = Engine::open_local(&root, logpose_storage::EngineConfig::default())
             .expect("engine should open");
         let descriptor = engine

@@ -24,6 +24,7 @@ use rand as _;
 use rayon as _;
 use roaring as _;
 use serde as _;
+use tempfile as _;
 use thiserror as _;
 use tracing as _;
 use twox_hash as _;

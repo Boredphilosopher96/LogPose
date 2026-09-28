@@ -338,7 +338,8 @@ mod tests {
     /// must be perfect.
     #[test]
     fn runs_every_case_against_an_in_process_server() -> anyhow::Result<()> {
-        let root = scratch_dir("run");
+        let root_dir = scratch_dir("run")?;
+        let root = root_dir.path().to_path_buf();
         let prepared = files::prepare(&root.join("data"), &files::tests::request(), false)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -411,7 +412,6 @@ mod tests {
 
         server.abort();
         drop(runtime);
-        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 }

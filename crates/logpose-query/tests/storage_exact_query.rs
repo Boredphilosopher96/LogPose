@@ -18,12 +18,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use serde_json::json;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::Path, sync::Arc};
 use thiserror as _;
 
 fn request(
@@ -73,7 +68,8 @@ fn ids(response: &QueryResponse) -> Vec<String> {
 
 #[tokio::test]
 async fn queries_storage_records_and_honors_snapshots() {
-    let root = unique_temp_dir("query-storage-snapshots");
+    let root_dir = unique_temp_dir("query-storage-snapshots");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -146,7 +142,8 @@ async fn queries_storage_records_and_honors_snapshots() {
 
 #[tokio::test]
 async fn returns_empty_matches_for_empty_collection() {
-    let root = unique_temp_dir("query-empty-collection");
+    let root_dir = unique_temp_dir("query-empty-collection");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -184,7 +181,8 @@ async fn returns_empty_matches_for_empty_collection() {
 
 #[tokio::test]
 async fn rejects_query_vector_with_wrong_collection_dimensions() {
-    let root = unique_temp_dir("query-dimension-mismatch");
+    let root_dir = unique_temp_dir("query-dimension-mismatch");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -218,7 +216,8 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
 
 #[tokio::test]
 async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
-    let root = unique_temp_dir("query-delete-flush-compact");
+    let root_dir = unique_temp_dir("query-delete-flush-compact");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -304,7 +303,8 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 
 #[tokio::test]
 async fn exists_predicates_match_non_scalar_fields_after_flush() {
-    let root = unique_temp_dir("query-exists-non-scalar-after-flush");
+    let root_dir = unique_temp_dir("query-exists-non-scalar-after-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     create(
@@ -350,7 +350,8 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
 
 #[tokio::test]
 async fn surfaces_unknown_collection_errors_from_storage() {
-    let root = unique_temp_dir("query-missing-collection");
+    let root_dir = unique_temp_dir("query-missing-collection");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
 
     let result = query(
@@ -365,14 +366,13 @@ async fn surfaces_unknown_collection_errors_from_storage() {
     ));
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-query-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-query-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-query-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 fn open(root: &Path) -> Engine {

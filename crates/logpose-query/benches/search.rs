@@ -17,7 +17,7 @@ use rayon as _;
 use roaring as _;
 use serde as _;
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 use thiserror as _;
 use tokio::runtime::Runtime;
 
@@ -36,14 +36,9 @@ impl Rng {
     }
 }
 
-fn setup(runtime: &Runtime) -> Engine {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("logpose-search-bench-{unique}"));
+fn setup(runtime: &Runtime, root: &Path) -> Engine {
     let engine = Engine::open_local(
-        &root,
+        root,
         EngineConfig {
             index: IndexPolicy {
                 graph_min_rows: 5_000,
@@ -99,7 +94,12 @@ fn request(vector: Vec<f32>, filtered: bool) -> QueryRequest {
 
 fn search_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("runtime");
-    let engine = setup(&runtime);
+    // Declared before the engine, so the engine drops first and the directory after it.
+    let root = tempfile::Builder::new()
+        .prefix("logpose-search-bench-")
+        .tempdir()
+        .expect("temp dir");
+    let engine = setup(&runtime, root.path());
     let mut rng = Rng(11);
     let collection = CollectionRef::parse("bench").expect("name");
     let queries = (0..64)

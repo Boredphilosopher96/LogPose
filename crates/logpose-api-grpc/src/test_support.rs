@@ -5,11 +5,8 @@ use crate::{proto, serve_with_listener};
 use logpose_config::{LimitsConfig, LogPoseConfig};
 use logpose_core::AppState;
 use proto::log_pose_service_client::LogPoseServiceClient;
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tonic::transport::Channel;
 
@@ -19,21 +16,20 @@ pub(crate) struct TestServer {
     /// The server's state, for tests that drive a handler directly.
     pub(crate) state: Arc<AppState>,
     task: JoinHandle<()>,
-    root: PathBuf,
+    /// The node's storage root, removed when the server drops.
+    _root: TempDir,
 }
 
 impl TestServer {
     /// Start a combined node with `limits` and connect a client to it.
     pub(crate) async fn start(label: &str, limits: LimitsConfig) -> Self {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("logpose-api-grpc-{label}-{suffix}"));
-        std::fs::create_dir_all(&root).expect("temp dir should be created");
+        let root = tempfile::Builder::new()
+            .prefix(&format!("logpose-api-grpc-{label}-"))
+            .tempdir()
+            .expect("temp dir should be created");
         let state = Arc::new(AppState::new(LogPoseConfig {
             node_name: label.to_owned(),
-            storage_root: root.clone(),
+            storage_root: root.path().to_path_buf(),
             limits,
             ..LogPoseConfig::default()
         }));
@@ -66,7 +62,7 @@ impl TestServer {
             address,
             state,
             task,
-            root,
+            _root: root,
         }
     }
 
@@ -110,7 +106,6 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

@@ -462,17 +462,13 @@ fn read_i64(path: &Path) -> Result<Vec<i64>> {
         .collect())
 }
 
-/// A fresh path under the system temporary directory for a test.
+/// A fresh temp directory named `logpose-vdb-{label}-…` for a test, removed when the returned
+/// guard drops, also when the test panics.
 #[cfg(test)]
-pub(crate) fn scratch_dir(label: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!(
-        "logpose-vdb-{label}-{}-{nanos}",
-        std::process::id()
-    ))
+pub(crate) fn scratch_dir(label: &str) -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-vdb-{label}-"))
+        .tempdir()
 }
 
 #[cfg(test)]
@@ -510,7 +506,8 @@ pub(crate) mod tests {
 
     #[test]
     fn prepares_round_trips_and_reuses_a_directory() -> anyhow::Result<()> {
-        let root = scratch_dir("prepare");
+        let root_dir = scratch_dir("prepare")?;
+        let root = root_dir.path().to_path_buf();
         let request = request();
         let first = prepare(&root, &request, false)?;
         assert_eq!(first.manifest.cases.len(), 3);
@@ -545,8 +542,6 @@ pub(crate) mod tests {
         let regenerated = prepare(&root, &other, false)?;
         assert_eq!(regenerated.manifest.k, 3);
         assert!(regenerated.truths[0].iter().all(|row| row.len() == 3));
-
-        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 }

@@ -47,11 +47,11 @@ mod tests {
     use super::*;
     use crate::test_support::unique_temp_dir;
     use logpose_vfs::{FaultVfs, StdVfs};
-    use std::fs;
 
     #[test]
     fn second_lock_attempt_fails_until_the_first_is_released() {
-        let root = unique_temp_dir("root-lock-exclusive");
+        let root_dir = unique_temp_dir("root-lock-exclusive");
+        let root = root_dir.path().to_path_buf();
 
         let first = lock_root_exclusively(&StdVfs, &root).expect("first lock should succeed");
         let error = lock_root_exclusively(&StdVfs, &root)
@@ -77,7 +77,6 @@ mod tests {
         let second =
             lock_root_exclusively(&StdVfs, &root).expect("lock should succeed after release");
         drop(second);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

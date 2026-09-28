@@ -28,6 +28,7 @@ logpose-core = { path = "../logpose-core" }
 rand = "~0.10"
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true

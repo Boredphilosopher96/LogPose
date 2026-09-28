@@ -56,8 +56,10 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     };
     let key_prefix = unique_etcd_prefix("remote-discovery");
     cleanup_prefix(&endpoints, &key_prefix).await;
-    let root_a = unique_temp_dir("etcd-node-a");
-    let root_b = unique_temp_dir("etcd-node-b");
+    let root_a_dir = unique_temp_dir("etcd-node-a");
+    let root_a = root_a_dir.path().to_path_buf();
+    let root_b_dir = unique_temp_dir("etcd-node-b");
+    let root_b = root_b_dir.path().to_path_buf();
     let cluster_name = "core-etcd-metadata";
 
     let state_a = Arc::new(AppState::new(test_config(
@@ -153,9 +155,10 @@ async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
     let key_prefix = unique_etcd_prefix("alter-catalog");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-alter-catalog";
+    let root_dir = unique_temp_dir("etcd-alter-node-a");
     let state_a = Arc::new(AppState::new(test_config(
         "alter-node-a",
-        unique_temp_dir("etcd-alter-node-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -182,9 +185,10 @@ async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
         .expect("the owner should apply the schema change");
     assert!(altered.schema.scalar_field("color").is_some());
 
+    let root_dir = unique_temp_dir("etcd-alter-node-b");
     let state_b = Arc::new(AppState::new(test_config(
         "alter-node-b",
-        unique_temp_dir("etcd-alter-node-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -212,9 +216,10 @@ async fn etcd_drop_database_refuses_while_any_collection_metadata_remains() {
     let key_prefix = unique_etcd_prefix("drop-database");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-drop-database";
+    let root_dir = unique_temp_dir("etcd-drop-db-node");
     let state = Arc::new(AppState::new(test_config(
         "drop-db-node",
-        unique_temp_dir("etcd-drop-db-node"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -278,8 +283,10 @@ async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
     };
     let key_prefix = unique_etcd_prefix("shared-database-policies");
     cleanup_prefix(&endpoints, &key_prefix).await;
-    let root_a = unique_temp_dir("etcd-policy-node-a");
-    let root_b = unique_temp_dir("etcd-policy-node-b");
+    let root_a_dir = unique_temp_dir("etcd-policy-node-a");
+    let root_a = root_a_dir.path().to_path_buf();
+    let root_b_dir = unique_temp_dir("etcd-policy-node-b");
+    let root_b = root_b_dir.path().to_path_buf();
     let cluster_name = "core-etcd-auth-metadata";
     let bootstrap_tokens = vec![
         BootstrapTokenConfig {
@@ -380,8 +387,10 @@ async fn etcd_metadata_backend_reads_shared_principal_overrides_across_nodes() {
     };
     let key_prefix = unique_etcd_prefix("shared-principal-overrides");
     cleanup_prefix(&endpoints, &key_prefix).await;
-    let root_a = unique_temp_dir("etcd-principal-node-a");
-    let root_b = unique_temp_dir("etcd-principal-node-b");
+    let root_a_dir = unique_temp_dir("etcd-principal-node-a");
+    let root_a = root_a_dir.path().to_path_buf();
+    let root_b_dir = unique_temp_dir("etcd-principal-node-b");
+    let root_b = root_b_dir.path().to_path_buf();
     let cluster_name = "core-etcd-shared-principals";
     let bootstrap_tokens = vec![BootstrapTokenConfig {
         token: "operator-token".to_owned(),
@@ -450,9 +459,10 @@ async fn etcd_stored_principals_that_fail_validation_are_reported_as_corrupt() {
     let key_prefix = unique_etcd_prefix("invalid-stored-principal");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-invalid-principal";
+    let root_dir = unique_temp_dir("etcd-invalid-principal");
     let config = test_config(
         "invalid-principal-node",
-        unique_temp_dir("etcd-invalid-principal"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -510,8 +520,10 @@ async fn etcd_collection_creation_seeds_shared_database_metadata() {
     };
     let key_prefix = unique_etcd_prefix("shared-database-seeding");
     cleanup_prefix(&endpoints, &key_prefix).await;
-    let root_a = unique_temp_dir("etcd-seeded-database-node-a");
-    let root_b = unique_temp_dir("etcd-seeded-database-node-b");
+    let root_a_dir = unique_temp_dir("etcd-seeded-database-node-a");
+    let root_a = root_a_dir.path().to_path_buf();
+    let root_b_dir = unique_temp_dir("etcd-seeded-database-node-b");
+    let root_b = root_b_dir.path().to_path_buf();
     let cluster_name = "core-etcd-shared-database-seeding";
     let bootstrap_tokens = vec![BootstrapTokenConfig {
         token: "operator-token".to_owned(),
@@ -586,9 +598,10 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
             AccessTier::Operator,
         ),
     }];
+    let root_dir = unique_temp_dir("etcd-combined-catalog-node");
     let mut combined_config = test_config_with_auth(
         "combined-node",
-        unique_temp_dir("etcd-combined-catalog-node"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -607,9 +620,10 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
         .await
         .expect("combined node should seed the shared database");
 
+    let root_dir = unique_temp_dir("etcd-data-catalog-node");
     let mut data_config = test_config_with_auth(
         "data-node",
-        unique_temp_dir("etcd-data-catalog-node"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -663,9 +677,10 @@ async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-runtime-status";
 
+    let root_dir = unique_temp_dir("etcd-runtime-status-coordinator");
     let mut combined_config = test_config(
         "coordinator-a",
-        unique_temp_dir("etcd-runtime-status-coordinator"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -673,9 +688,10 @@ async fn etcd_runtime_status_surfaces_membership_and_controller_leader() {
     combined_config.node_role = NodeRole::Combined;
     let combined = Arc::new(AppState::new(combined_config));
 
+    let root_dir = unique_temp_dir("etcd-runtime-status-data");
     let mut data_config = test_config(
         "data-b",
-        unique_temp_dir("etcd-runtime-status-data"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -735,9 +751,10 @@ async fn etcd_new_node_registration_updates_visible_membership() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-node-registration";
 
+    let root_dir = unique_temp_dir("etcd-node-registration-a");
     let mut leader_config = test_config(
         "node-a",
-        unique_temp_dir("etcd-node-registration-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -757,9 +774,10 @@ async fn etcd_new_node_registration_updates_visible_membership() {
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-node-registration-b");
     let mut follower_config = test_config(
         "node-b",
-        unique_temp_dir("etcd-node-registration-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -791,9 +809,10 @@ async fn etcd_new_node_registration_updates_visible_membership() {
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-node-registration-c");
     let mut joining_config = test_config(
         "node-c",
-        unique_temp_dir("etcd-node-registration-c"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -849,9 +868,10 @@ async fn etcd_membership_leases_expire_after_state_drop() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-membership-expiry";
 
+    let root_dir = unique_temp_dir("etcd-membership-expiry");
     let mut config = test_config(
         "coordinator-a",
-        unique_temp_dir("etcd-membership-expiry"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -906,9 +926,10 @@ async fn etcd_rejoining_node_re_registers_membership_after_restart() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-membership-rejoin";
 
+    let root_dir = unique_temp_dir("etcd-membership-rejoin-a");
     let mut leader_config = test_config(
         "node-a",
-        unique_temp_dir("etcd-membership-rejoin-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -926,7 +947,9 @@ async fn etcd_rejoining_node_re_registers_membership_after_restart() {
     })
     .await;
 
-    let follower_root = unique_temp_dir("etcd-membership-rejoin-b");
+    let follower_root_dir = unique_temp_dir("etcd-membership-rejoin-b");
+
+    let follower_root = follower_root_dir.path().to_path_buf();
     let mut follower_config = test_config(
         "node-b",
         follower_root.clone(),
@@ -1028,9 +1051,10 @@ async fn etcd_follower_nodes_reject_control_plane_mutations() {
         ),
     }];
 
+    let root_dir = unique_temp_dir("etcd-leader-gate-a");
     let mut leader_config = test_config_with_auth(
         "leader-a",
-        unique_temp_dir("etcd-leader-gate-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1046,9 +1070,10 @@ async fn etcd_follower_nodes_reject_control_plane_mutations() {
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-leader-gate-b");
     let mut follower_config = test_config_with_auth(
         "follower-b",
-        unique_temp_dir("etcd-leader-gate-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1116,9 +1141,10 @@ async fn etcd_catalog_transactions_reject_stale_leaders_after_leadership_moves()
         ),
     }];
 
+    let root_dir = unique_temp_dir("etcd-stale-leader-catalog-fence");
     let mut leader_config = test_config_with_auth(
         "leader-a",
-        unique_temp_dir("etcd-stale-leader-catalog-fence"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1243,9 +1269,10 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion";
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-a");
     let mut owner_config = test_config(
         "owner-a",
-        unique_temp_dir("etcd-owner-promotion-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1260,9 +1287,10 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-b");
     let mut follower_config = test_config(
         "owner-b",
-        unique_temp_dir("etcd-owner-promotion-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1433,9 +1461,10 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion-barrier";
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-barrier-a");
     let mut owner_config = test_config(
         "owner-a",
-        unique_temp_dir("etcd-owner-promotion-barrier-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1450,9 +1479,10 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-barrier-b");
     let mut follower_config = test_config(
         "owner-b",
-        unique_temp_dir("etcd-owner-promotion-barrier-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1630,9 +1660,10 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-missing-owner-read-fence";
 
+    let root_dir = unique_temp_dir("etcd-missing-owner-read-fence-a");
     let mut owner_config = test_config(
         "owner-a",
-        unique_temp_dir("etcd-missing-owner-read-fence-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1712,6 +1743,7 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-metadata";
     let collection = CollectionRef::new_default("documents");
+    let root_dir = unique_temp_dir("etcd-owner-promotion-pending");
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         "documents",
@@ -1719,7 +1751,7 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
             .spec
             .build_schema()
             .expect("schema"),
-        unique_temp_dir("etcd-owner-promotion-pending").as_path(),
+        root_dir.path(),
     )
     .without_root_path();
     let assignment = CollectionAssignment {
@@ -1815,9 +1847,10 @@ async fn etcd_owner_promotion_conflicts_for_control_only_members() {
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-owner-promotion-control-only";
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-control-only-a");
     let mut owner_config = test_config(
         "owner-a",
-        unique_temp_dir("etcd-owner-promotion-control-only-a"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1832,9 +1865,10 @@ async fn etcd_owner_promotion_conflicts_for_control_only_members() {
     })
     .await;
 
+    let root_dir = unique_temp_dir("etcd-owner-promotion-control-only-b");
     let mut control_config = test_config(
         "control-b",
-        unique_temp_dir("etcd-owner-promotion-control-only-b"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         cluster_name,
@@ -1880,7 +1914,8 @@ async fn etcd_owner_promotion_conflicts_for_control_only_members() {
 
 #[tokio::test]
 async fn etcd_runtime_status_surfaces_coordination_errors_when_etcd_is_unreachable() {
-    let root = unique_temp_dir("etcd-runtime-status-error");
+    let root_dir = unique_temp_dir("etcd-runtime-status-error");
+    let root = root_dir.path().to_path_buf();
     let mut config = LogPoseConfig {
         node_name: "unreachable-node".to_owned(),
         storage_root: root,
@@ -1933,9 +1968,10 @@ async fn etcd_keep_alive_reports_revoked_leases_as_expired() {
     };
     let key_prefix = unique_etcd_prefix("keep-alive-reports-expired");
     cleanup_prefix(&endpoints, &key_prefix).await;
+    let root_dir = unique_temp_dir("etcd-keep-alive-reports-expired");
     let config = test_config(
         "keep-alive-node",
-        unique_temp_dir("etcd-keep-alive-reports-expired"),
+        root_dir.path().to_path_buf(),
         &endpoints,
         &key_prefix,
         "core-etcd-keep-alive-reports-expired",
@@ -2006,7 +2042,7 @@ async fn etcd_node_recampaigns_after_leadership_lease_revocation() {
     let key_prefix = unique_etcd_prefix("recampaign-after-leadership-revocation");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-recampaign-after-leadership-revocation";
-    let config = short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-recampaign-after-leadership-revocation",
         &endpoints,
@@ -2060,7 +2096,7 @@ async fn etcd_node_recampaigns_when_leader_key_disappears() {
     let key_prefix = unique_etcd_prefix("recampaign-after-leader-key-delete");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-recampaign-after-leader-key-delete";
-    let config = short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-recampaign-after-leader-key-delete",
         &endpoints,
@@ -2113,7 +2149,7 @@ async fn etcd_node_re_registers_after_membership_lease_revocation() {
     let key_prefix = unique_etcd_prefix("re-register-after-membership-revocation");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-re-register-after-membership-revocation";
-    let config = short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-re-register-after-membership-revocation",
         &endpoints,
@@ -2161,7 +2197,7 @@ async fn etcd_node_re_registers_when_membership_record_disappears() {
     let key_prefix = unique_etcd_prefix("re-register-after-membership-key-delete");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-re-register-after-membership-key-delete";
-    let config = short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-re-register-after-membership-key-delete",
         &endpoints,
@@ -2220,21 +2256,23 @@ async fn etcd_follower_takes_over_after_leader_loses_leadership_lease() {
     let key_prefix = unique_etcd_prefix("follower-takeover-after-leadership-revocation");
     cleanup_prefix(&endpoints, &key_prefix).await;
     let cluster_name = "core-etcd-follower-takeover-after-leadership-revocation";
-    let leader = Arc::new(AppState::new(short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-follower-takeover-a",
         &endpoints,
         &key_prefix,
         cluster_name,
-    )));
+    );
+    let leader = Arc::new(AppState::new(config));
     let (_, leadership_lease_id) = wait_for_local_leadership(&leader).await;
-    let follower = Arc::new(AppState::new(short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-b",
         "etcd-follower-takeover-b",
         &endpoints,
         &key_prefix,
         cluster_name,
-    )));
+    );
+    let follower = Arc::new(AppState::new(config));
     wait_for_runtime_status(&follower, |status| {
         status.coordination.as_ref().is_some_and(|coordination| {
             coordination.membership_registered
@@ -2321,13 +2359,14 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
         .await
         .expect("stale leader key should be written");
 
-    let state = Arc::new(AppState::new(short_ttl_config(
+    let (config, _root) = short_ttl_config(
         "leader-a",
         "etcd-restart-waits-out-stale-leader-key",
         &endpoints,
         &key_prefix,
         cluster_name,
-    )));
+    );
+    let state = Arc::new(AppState::new(config));
     let waiting = wait_for_runtime_status(&state, |status| {
         status.coordination.as_ref().is_some_and(|coordination| {
             coordination.membership_registered && coordination.leader_node.is_some()
@@ -2351,17 +2390,19 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
-/// Config with TTLs short enough that the coordination loop ticks every second.
+/// Config with TTLs short enough that the coordination loop ticks every second, and its
+/// storage root's guard: keep the guard alive for as long as a node runs on the configuration.
 fn short_ttl_config(
     node_name: &str,
     temp_label: &str,
     endpoints: &[String],
     key_prefix: &str,
     cluster_name: &str,
-) -> LogPoseConfig {
+) -> (LogPoseConfig, tempfile::TempDir) {
+    let root = unique_temp_dir(temp_label);
     let mut config = test_config(
         node_name,
-        unique_temp_dir(temp_label),
+        root.path().to_path_buf(),
         endpoints,
         key_prefix,
         cluster_name,
@@ -2369,7 +2410,7 @@ fn short_ttl_config(
     config.node_role = NodeRole::Combined;
     config.metadata.etcd.membership_ttl_secs = 3;
     config.metadata.etcd.leadership_ttl_secs = 3;
-    config
+    (config, root)
 }
 
 /// Wait until the node leads and return its (membership, leadership) lease ids.
@@ -2553,14 +2594,13 @@ fn unique_etcd_prefix(label: &str) -> String {
     format!("/logpose/tests/{label}/{suffix}")
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-core-{label}-{suffix}"));
-    fs::create_dir_all(&path).expect("temp dir should be created");
-    path
+/// A fresh temp directory named `logpose-core-{label}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-core-{label}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 /// Restart a node so that its engine recovers the collection state mirrored into its storage
