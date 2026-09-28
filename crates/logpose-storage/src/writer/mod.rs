@@ -47,8 +47,6 @@ mod dv_tests;
 #[cfg(test)]
 mod failure_tests;
 mod jobs;
-#[cfg(test)]
-mod model_tests;
 mod pk_index;
 mod prepare;
 #[cfg(test)]

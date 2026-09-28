@@ -81,7 +81,9 @@ fn generate() -> BTreeMap<PathBuf, Vec<u8>> {
                 .with_vector("vector", vec![x, 1.0, -x])
                 .with_field("n", Value::Int64(n))
                 .with_field(field, Value::String(label.to_owned()));
-            record.extra.insert("tag".to_owned(), json!(format!("t{n}")));
+            record
+                .extra
+                .insert("tag".to_owned(), json!(format!("t{n}")));
             ClientOp::Upsert(record)
         };
         let record = |key: &str, x: f32, n: i64, label: &str| labelled(key, x, n, "s", label);
@@ -94,7 +96,9 @@ fn generate() -> BTreeMap<PathBuf, Vec<u8>> {
             record("c", 3.0, 3, "gamma"),
         ]);
         let mut update = PartialUpdate::new("b");
-        update.fields.insert("s".to_owned(), Value::String("bravo".to_owned()));
+        update
+            .fields
+            .insert("s".to_owned(), Value::String("bravo".to_owned()));
         write(vec![ClientOp::Update(update)]);
         handle.flush_blocking().expect("first flush");
         write(vec![
@@ -107,7 +111,9 @@ fn generate() -> BTreeMap<PathBuf, Vec<u8>> {
                 to: "label".to_owned(),
             })
             .expect("rename");
-        handle.flush_blocking().expect("second flush writes a DV file");
+        handle
+            .flush_blocking()
+            .expect("second flush writes a DV file");
         // What stays in the WAL above the checkpoint: a batch, a schema change, an update.
         write(vec![labelled("e", 5.0, 5, "label", "echo")]);
         handle
@@ -129,8 +135,17 @@ fn generate() -> BTreeMap<PathBuf, Vec<u8>> {
     let dir = files
         .keys()
         .find_map(|path| {
-            let relative = path.strip_prefix(Path::new(ROOT).join("collections")).ok()?;
-            Some(relative.components().next()?.as_os_str().to_string_lossy().into_owned())
+            let relative = path
+                .strip_prefix(Path::new(ROOT).join("collections"))
+                .ok()?;
+            Some(
+                relative
+                    .components()
+                    .next()?
+                    .as_os_str()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         })
         .expect("the collection has a directory");
     files
@@ -157,7 +172,10 @@ fn collect(vfs: &dyn Vfs, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
         if entry.is_dir {
             collect(vfs, &path, files);
         } else {
-            files.insert(path.clone(), logpose_vfs::read_file(vfs, &path).expect("read"));
+            files.insert(
+                path.clone(),
+                logpose_vfs::read_file(vfs, &path).expect("read"),
+            );
         }
     }
 }
@@ -172,7 +190,10 @@ fn committed() -> BTreeMap<PathBuf, Vec<u8>> {
             if path.is_dir() {
                 stack.push(path);
             } else {
-                let relative = path.strip_prefix(&root).expect("under the root").to_path_buf();
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("under the root")
+                    .to_path_buf();
                 files.insert(relative, std::fs::read(&path).expect("read"));
             }
         }
@@ -183,7 +204,11 @@ fn committed() -> BTreeMap<PathBuf, Vec<u8>> {
 #[test]
 fn the_engine_writes_the_committed_golden_files() {
     let generated = generate();
-    assert_eq!(generate(), generated, "the golden workload is deterministic");
+    assert_eq!(
+        generate(),
+        generated,
+        "the golden workload is deterministic"
+    );
     let kinds = |suffix: &str| {
         generated
             .keys()
@@ -233,8 +258,13 @@ fn the_committed_golden_files_open_and_read_back() {
         file.sync_all().expect("sync");
     }
     let engine = Engine::open(fault.process(), ROOT, config()).expect("the golden root opens");
-    let handle = engine.collection(&reference()).expect("the golden collection");
-    handle.current().check_invariants().expect("invariants hold");
+    let handle = engine
+        .collection(&reference())
+        .expect("the golden collection");
+    handle
+        .current()
+        .check_invariants()
+        .expect("invariants hold");
     let keys = ["a", "b", "c", "d", "e"].map(PrimaryKey::from);
     let view = engine
         .read_view_blocking(&reference(), &Default::default())
@@ -278,10 +308,14 @@ fn the_committed_golden_files_open_and_read_back() {
     let c = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime")
-        .block_on(view.get(&[PrimaryKey::from("c")], logpose_storage::Projection::full()))
+        .block_on(view.get(
+            &[PrimaryKey::from("c")],
+            logpose_storage::Projection::full(),
+        ))
         .expect("get");
     assert_eq!(
-        c[0].as_ref().and_then(|row| row.record.fields.get("rank").cloned()),
+        c[0].as_ref()
+            .and_then(|row| row.record.fields.get("rank").cloned()),
         Some(Value::Int64(9)),
         "the WAL's schema change and update replay"
     );

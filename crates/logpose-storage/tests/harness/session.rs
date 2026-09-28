@@ -73,7 +73,7 @@ impl Setup {
         Self {
             backend,
             maintenance,
-            metric: if seed % 2 == 0 {
+            metric: if seed.is_multiple_of(2) {
                 DistanceMetric::Dot
             } else {
                 DistanceMetric::L2
@@ -165,7 +165,7 @@ impl Session {
     /// with the same setup and group commit settings; [`open`](Self::open) recovers it.
     pub fn attach(&self, fault: Arc<FaultVfs>) -> Result<Self, String> {
         let mut session = Self::detached(self.setup, Some(fault), None)?;
-        session.group = self.group.clone();
+        session.group = self.group;
         Ok(session)
     }
 
@@ -228,7 +228,7 @@ impl Session {
                     ..IndexPolicy::default()
                 }
             },
-            group: self.group.clone().unwrap_or_default(),
+            group: self.group.unwrap_or_default(),
             resolver: Some(logpose_query::resolver()),
             on_fatal: Some(Arc::new(move |_| {
                 fatal.fetch_add(1, Ordering::Relaxed);

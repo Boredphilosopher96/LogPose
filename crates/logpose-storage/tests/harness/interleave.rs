@@ -72,7 +72,11 @@ struct Interleaving {
 
 #[allow(clippy::panic, reason = "a failed interleaving reports its events")]
 fn run(scenario: &Interleaving) -> usize {
-    let mut sequences = vec![(0..scenario.write_count).map(Event::Write).collect::<Vec<_>>()];
+    let mut sequences = vec![
+        (0..scenario.write_count)
+            .map(Event::Write)
+            .collect::<Vec<_>>(),
+    ];
     sequences.extend(scenario.jobs.iter().map(|kind| phases(*kind)));
     let all = interleavings(&sequences);
     for (index, events) in all.iter().enumerate() {

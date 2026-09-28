@@ -532,10 +532,11 @@ impl Runner {
         expected: Result<(Model, usize), Refusal>,
         armed: bool,
     ) -> Check {
-        if let Err(error) = &result {
-            if !armed && self.refused_after_fault(error) {
-                return Ok(());
-            }
+        if let Err(error) = &result
+            && !armed
+            && self.refused_after_fault(error)
+        {
+            return Ok(());
         }
         match (result, expected) {
             (Ok(ack), Ok((next, applied))) => {
@@ -678,11 +679,11 @@ impl Runner {
         }
         // Stay well below the per-collection cap: release the oldest live token past eight,
         // and forget dead ones past twelve.
-        if self.tokens.iter().filter(|pinned| !pinned.dead).count() >= 8 {
-            if let Some(pinned) = self.tokens.iter_mut().find(|pinned| !pinned.dead) {
-                self.session.handle().release_snapshot(&pinned.token);
-                pinned.dead = true;
-            }
+        if self.tokens.iter().filter(|pinned| !pinned.dead).count() >= 8
+            && let Some(pinned) = self.tokens.iter_mut().find(|pinned| !pinned.dead)
+        {
+            self.session.handle().release_snapshot(&pinned.token);
+            pinned.dead = true;
         }
         while self.tokens.len() >= 12 {
             match self.tokens.iter().position(|pinned| pinned.dead) {
@@ -927,10 +928,10 @@ impl Runner {
     pub fn drop_scroll(&mut self, id: u64) {
         if let Some(index) = self.scrolls.iter().position(|scroll| scroll.id == id) {
             let scroll = self.scrolls.remove(index);
-            if let (Some(cursor), false) = (scroll.cursor, scroll.dead) {
-                if self.session.is_open() {
-                    self.session.handle().release_snapshot(&cursor.token);
-                }
+            if let (Some(cursor), false) = (scroll.cursor, scroll.dead)
+                && self.session.is_open()
+            {
+                self.session.handle().release_snapshot(&cursor.token);
             }
         }
     }
@@ -1307,7 +1308,7 @@ impl<'a> Checker<'a> {
             let Some(row) = model.rows.get(pk) else {
                 return fail(format!("{context}: {pk} is not a live row"));
             };
-            if filter.is_some_and(|filter| !model.matches(filter, pk, row)) {
+            if filter.is_some_and(|filter| !model.matches(filter, row)) {
                 return fail(format!("{context}: {pk} does not match the filter"));
             }
             check_row(model, &hit.row).map_err(|error| format!("{context}: {error}"))?;

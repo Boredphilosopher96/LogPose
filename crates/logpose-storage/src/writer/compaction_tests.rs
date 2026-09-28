@@ -1,9 +1,10 @@
 //! Compaction v2 and maintenance scheduling at the writer: the size-tiered policy picking
 //! segments as flushes land, flush priority over compaction, the write stall, the
 //! maintenance-memory reservation, background compaction beside writes, deletes, and flushes,
-//! a randomized run with tiny thresholds (crashes included), write amplification, several
-//! compactions of one collection at once beside concurrent clients and crashes, and what a
-//! collection drop and an engine drop release and answer.
+//! write amplification, several compactions of one collection at once beside concurrent
+//! clients and crashes, and what a collection drop and an engine drop release and answer. The
+//! randomized model check with background jobs and crashes is harness v2's
+//! (`tests/harness/random.rs`).
 
 use super::*;
 use crate::{
@@ -602,161 +603,6 @@ fn write_amplification_stays_within_one_rewrite_per_tier() {
     assert_eq!(written.compaction_rows, 3 * ingested, "{written:?}");
     assert_eq!(segment_rows(&handle), [256]);
     assert!(written.compaction_bytes > 0);
-}
-
-/// What the randomized run asks of the engine at each step.
-#[derive(Clone, Copy, Debug)]
-enum Action {
-    Upsert,
-    Update,
-    Delete,
-    Flush,
-    Compact,
-    Reopen,
-    /// Power off after `ops` more mutating operations, whatever background job is running.
-    Crash {
-        ops: u64,
-        tear: TearMode,
-    },
-}
-
-fn action(rng: &mut StdRng) -> Action {
-    match rng.random_range(0..100) {
-        0..=49 => Action::Upsert,
-        50..=59 => Action::Update,
-        60..=79 => Action::Delete,
-        80..=84 => Action::Flush,
-        85..=89 => Action::Compact,
-        90..=93 => Action::Reopen,
-        _ => Action::Crash {
-            ops: rng.random_range(0..40),
-            tear: TearMode::ALL[rng.random_range(0..TearMode::ALL.len())],
-        },
-    }
-}
-
-fn scenario_seeds() -> Vec<u64> {
-    match std::env::var("LOGPOSE_COMPACTION_RANDOM_SEED") {
-        Ok(value) if !value.trim().is_empty() => value
-            .split(',')
-            .filter_map(|seed| seed.trim().parse().ok())
-            .collect(),
-        _ => {
-            let base = rand::rng().random::<u64>();
-            (0..200).map(|index| base.wrapping_add(index)).collect()
-        }
-    }
-}
-
-/// One seeded scenario with tiny thresholds (a flush every three operations, tiers of two rows,
-/// merges of two segments), so background flushes and compactions run all the time, and
-/// crashes land in the middle of them. The live rows equal the model after every step and
-/// every recovery: every acknowledged write survives, and nothing else appears.
-fn run_scenario(seed: u64) -> u64 {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let fault = FaultVfs::new(seed);
-    let engine_config = || EngineConfig {
-        compaction: CompactionConfig {
-            deleted_ratio: 0.3,
-            ..tiny_tiers()
-        },
-        ..config()
-    };
-    let mut engine = open(&fault, engine_config());
-    let mut handle = create(&engine, 3, 2);
-    let mut model = BTreeMap::<String, f32>::new();
-    let mut trace = Vec::new();
-    let mut compactions = 0;
-    for step in 0..40 {
-        let action = action(&mut rng);
-        trace.push(action);
-        let context = format!("seed {seed}, step {step}: {trace:?}");
-        let id = format!("k{}", rng.random_range(0..10));
-        let x = step as f32;
-        match action {
-            Action::Upsert => {
-                write(&handle, vec![upsert(&id, x)]);
-                model.insert(id, x);
-            }
-            Action::Update => {
-                let mut update = PartialUpdate::new(id.as_str());
-                update.vectors.insert("vector".to_owned(), vec![x, 1.0]);
-                let result = handle.write_blocking(vec![ClientOp::Update(update)]);
-                match model.get_mut(&id) {
-                    Some(value) => {
-                        result
-                            .map_err(|error| format!("{context}: {error}"))
-                            .expect("update");
-                        *value = x;
-                    }
-                    None => assert!(result.is_err(), "{context}: update of a missing key"),
-                }
-            }
-            Action::Delete => {
-                write(&handle, vec![delete(&id)]);
-                model.remove(&id);
-            }
-            Action::Flush => {
-                handle
-                    .flush_blocking()
-                    .map_err(|error| format!("{context}: {error}"))
-                    .expect("flush");
-            }
-            Action::Compact => {
-                handle
-                    .compact_blocking()
-                    .map_err(|error| format!("{context}: {error}"))
-                    .expect("compact");
-            }
-            Action::Reopen => {
-                compactions += engine.scheduler().stats().compactions_granted;
-                drop(handle);
-                drop(engine);
-                engine = open(&fault, engine_config());
-                handle = reopen(&engine);
-            }
-            Action::Crash { ops, tear } => {
-                compactions += engine.scheduler().stats().compactions_granted;
-                fault.set_plan(FaultPlan {
-                    crash_after_ops: Some(fault.mutating_ops() + ops),
-                    tear,
-                    ..FaultPlan::default()
-                });
-                // Background jobs keep running into the crash; no write is in flight.
-                std::thread::sleep(Duration::from_millis(rng.random_range(0..20)));
-                drop(handle);
-                drop(engine);
-                fault.crash();
-                fault.set_plan(FaultPlan::default());
-                engine = open(&fault, engine_config());
-                handle = reopen(&engine);
-                // The recovered collection plans again once it is used.
-                handle.arm_maintenance();
-            }
-        }
-        handle
-            .current()
-            .check_invariants()
-            .map_err(|error| format!("{context}: {error}"))
-            .expect("invariants hold");
-        assert_eq!(live(&handle), model, "{context}");
-    }
-    compactions += engine.scheduler().stats().compactions_granted;
-    compactions
-}
-
-#[test]
-fn randomized_background_maintenance_with_tiny_thresholds_matches_the_model() {
-    let seeds = scenario_seeds();
-    let mut compactions = 0;
-    for seed in &seeds {
-        compactions += run_scenario(*seed);
-    }
-    assert!(
-        compactions >= seeds.len() as u64,
-        "compaction must run constantly: {compactions} over {} seeds",
-        seeds.len()
-    );
 }
 
 /// Dropping a collection releases everything it holds at the scheduler: the permit and the

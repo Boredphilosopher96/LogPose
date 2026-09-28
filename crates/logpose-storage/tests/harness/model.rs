@@ -50,14 +50,6 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(schema: CollectionSchema) -> Self {
-        Self {
-            schema,
-            rows: BTreeMap::new(),
-            visible_seq_no: 0,
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -200,7 +192,7 @@ impl Model {
     pub fn matching(&self, filter: Option<&FilterExpr>) -> Vec<PrimaryKey> {
         self.rows
             .iter()
-            .filter(|(pk, row)| filter.is_none_or(|filter| self.matches(filter, pk, row)))
+            .filter(|(_, row)| filter.is_none_or(|filter| self.matches(filter, row)))
             .map(|(pk, _)| pk.clone())
             .collect()
     }
@@ -248,11 +240,11 @@ impl Model {
     /// Whether `row` matches `filter`: declared fields compare by type (integers as integers,
     /// strings bytewise); `ne` needs a value other than the operand; `not` is the complement
     /// over live rows, so it matches rows without a value too.
-    pub fn matches(&self, filter: &FilterExpr, pk: &PrimaryKey, row: &Row) -> bool {
+    pub fn matches(&self, filter: &FilterExpr, row: &Row) -> bool {
         match filter {
-            FilterExpr::And { children } => children.iter().all(|c| self.matches(c, pk, row)),
-            FilterExpr::Or { children } => children.iter().any(|c| self.matches(c, pk, row)),
-            FilterExpr::Not { child } => !self.matches(child, pk, row),
+            FilterExpr::And { children } => children.iter().all(|c| self.matches(c, row)),
+            FilterExpr::Or { children } => children.iter().any(|c| self.matches(c, row)),
+            FilterExpr::Not { child } => !self.matches(child, row),
             FilterExpr::Comparison(comparison) => self.compare(comparison, row),
         }
     }
@@ -292,7 +284,7 @@ impl Model {
         let mut scored = self
             .rows
             .iter()
-            .filter(|(pk, row)| filter.is_none_or(|filter| self.matches(filter, pk, row)))
+            .filter(|(_, row)| filter.is_none_or(|filter| self.matches(filter, row)))
             .map(|(pk, row)| (pk.clone(), metric_value(metric, query, &row.vector)))
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| {
@@ -313,7 +305,7 @@ impl Model {
         let mut rows = self
             .rows
             .iter()
-            .filter(|(pk, row)| filter.is_none_or(|filter| self.matches(filter, pk, row)))
+            .filter(|(_, row)| filter.is_none_or(|filter| self.matches(filter, row)))
             .map(|(pk, row)| (self.typed_value(field, row).cloned(), pk.clone()))
             .collect::<Vec<_>>();
         rows.sort_by(|(left, left_pk), (right, right_pk)| {

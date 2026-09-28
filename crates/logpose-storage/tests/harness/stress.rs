@@ -221,7 +221,11 @@ fn writer(
 }
 
 /// One reader: take views and check each one's internal consistency.
-fn reader(engine: Engine, handle: Arc<CollectionHandle>, stop: Arc<AtomicBool>) -> Result<u64, String> {
+fn reader(
+    engine: Engine,
+    handle: Arc<CollectionHandle>,
+    stop: Arc<AtomicBool>,
+) -> Result<u64, String> {
     let runtime = runtime();
     let collection = reference();
     let mut last = 0;
@@ -321,7 +325,11 @@ fn check_final(session: &Session, models: &[Rows]) -> Result<(), String> {
         let value = row_of(&row.record).ok_or_else(|| format!("{} has no n", row.record.pk))?;
         found.insert(row.record.pk, value);
     }
-    let expected = models.iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect::<Rows>();
+    let expected = models
+        .iter()
+        .flatten()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Rows>();
     if found != expected {
         return Err(format!(
             "the final rows differ from the writers' models: {} vs {} rows",
