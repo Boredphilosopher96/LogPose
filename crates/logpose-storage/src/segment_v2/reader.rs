@@ -520,6 +520,22 @@ impl<S: SectionSource> SegmentReader<S> {
         self.row_meta_via(Via::Cache)
     }
 
+    /// Sequence numbers in row order, decoded once per cache load: the decoded form rides with
+    /// the cached section.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors.
+    pub fn row_meta_shared(&self) -> Result<Arc<Vec<SeqNo>>, SegmentError> {
+        let (index, entry) = self.required(SectionKind::RowMeta)?;
+        let region = section_region(index, &entry);
+        self.section_via(index, Via::Cache)?.decoded(|raw| {
+            self.decode_row_meta(raw, &entry)
+                .map(|seqs| (seqs, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
+    }
+
     fn row_meta_via(&self, via: Via) -> Result<Vec<SeqNo>, SegmentError> {
         let (index, entry) = self.required(SectionKind::RowMeta)?;
         let region = section_region(index, &entry);
@@ -569,6 +585,19 @@ impl<S: SectionSource> SegmentReader<S> {
     /// I/O or corruption errors.
     pub fn pk_column(&self) -> Result<PkColumn, SegmentError> {
         self.pk_column_via(Via::Cache)
+    }
+
+    /// [`pk_column`](Self::pk_column), decoded once per cache load.
+    fn pk_column_shared(&self) -> Result<Arc<PkColumn>, SegmentError> {
+        let (index, entry) = self.required(SectionKind::PkColumn)?;
+        let region = section_region(index, &entry);
+        self.check_pk_encoding(&entry, region)?;
+        let rows = usize_from(self.header.row_count);
+        self.section_via(index, Via::Cache)?.decoded(|raw| {
+            PkColumn::decode(raw, entry.encoding, rows)
+                .map(|column| (column, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
     }
 
     fn pk_column_via(&self, via: Via) -> Result<PkColumn, SegmentError> {
@@ -682,6 +711,23 @@ impl<S: SectionSource> SegmentReader<S> {
     /// I/O or corruption errors.
     pub fn scalar_column(&self, field: FieldId) -> Result<Option<ScalarColumn>, SegmentError> {
         self.scalar_column_via(field, Via::Cache)
+    }
+
+    /// [`scalar_column`](Self::scalar_column), decoded once per cache load.
+    fn scalar_column_shared(
+        &self,
+        field: FieldId,
+    ) -> Result<Option<Arc<ScalarColumn>>, SegmentError> {
+        let Some(index) = self.find_section(SectionKind::ScalarColumn, Some(field)) else {
+            return Ok(None);
+        };
+        let entry = self.entry(index)?;
+        self.section_via(index, Via::Cache)?
+            .decoded(|raw| {
+                self.decode_scalar(index, &entry, raw)
+                    .map(|column| (column, raw.len() as u64 * 2))
+            })
+            .map(Some)
     }
 
     fn scalar_column_via(
@@ -1056,7 +1102,7 @@ impl<S: SectionSource> SegmentReader<S> {
             )));
         }
         let via = Via::Cache;
-        let pks = self.pk_column_via(via)?;
+        let pks = self.pk_column_shared()?;
         let mut vector_fields: Vec<_> = if vectors {
             self.schema.vectors().iter().map(|field| field.id).collect()
         } else {
@@ -1073,7 +1119,7 @@ impl<S: SectionSource> SegmentReader<S> {
         scalar_fields.sort_unstable();
         let mut columns = Vec::new();
         for field in scalar_fields {
-            if let Some(column) = self.scalar_column_via(field, via)? {
+            if let Some(column) = self.scalar_column_shared(field)? {
                 columns.push((field, column));
             }
         }

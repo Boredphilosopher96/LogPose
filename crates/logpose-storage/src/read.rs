@@ -491,7 +491,7 @@ impl ReadView {
                             Some(
                                 segment
                                     .reader()
-                                    .row_meta()
+                                    .row_meta_shared()
                                     .map_err(|error| segment_error(segment.path(), error))?,
                             )
                         } else {
@@ -1204,7 +1204,10 @@ impl<'v> UnitView<'v> {
     /// # Errors
     ///
     /// `Internal` if the prefix was not fetched, or typed corruption.
-    pub fn vector_rows(&self, field: FieldId, pins: &PinSet) -> Result<VectorRowsRef<'v>> {
+    pub fn vector_rows<'p>(&self, field: FieldId, pins: &'p PinSet) -> Result<VectorRowsRef<'p>>
+    where
+        'v: 'p,
+    {
         let segment = match self.kind {
             UnitKind::Memtable(memtable) => {
                 return Ok(VectorRowsRef(VectorRowsInner::Memtable(memtable, field)));
@@ -1214,23 +1217,10 @@ impl<'v> UnitView<'v> {
         let Some(handle) = self.vector_handle(field, pins)? else {
             return Ok(VectorRowsRef(VectorRowsInner::Missing));
         };
-        let mut pages = HashMap::new();
-        for page in 0..handle.prefix().page_count() {
-            let Some(unit) = handle.page_unit(page) else {
-                continue;
-            };
-            if let Some(bytes) = segment
-                .reader()
-                .unit_key(&unit)
-                .and_then(|key| pins.get(&key))
-            {
-                pages.insert(page, Arc::clone(bytes));
-            }
-        }
         Ok(VectorRowsRef(VectorRowsInner::Segment {
-            unit: segment.unit,
+            segment,
             handle,
-            pages,
+            pins,
         }))
     }
 }
@@ -1509,19 +1499,19 @@ pub struct VectorIndexRef {
 }
 
 /// The f32 vectors of one unit's field.
-pub struct VectorRowsRef<'v>(VectorRowsInner<'v>);
+pub struct VectorRowsRef<'p>(VectorRowsInner<'p>);
 
-enum VectorRowsInner<'v> {
+enum VectorRowsInner<'p> {
     /// A memtable's arena.
-    Memtable(&'v MemtableData, FieldId),
-    /// A segment's pinned pages.
+    Memtable(&'p MemtableData, FieldId),
+    /// A segment's pinned pages, looked up per row (a search touches a few of many pages).
     Segment {
-        /// The unit.
-        unit: UnitId,
+        /// The segment.
+        segment: &'p SegmentHandle,
         /// The verified prefix.
         handle: Arc<VectorHandle>,
-        /// Pinned pages by page number.
-        pages: HashMap<u32, Arc<AlignedBytes>>,
+        /// The pins holding the fetched pages.
+        pins: &'p PinSet,
     },
     /// The unit has no vectors for the field.
     Missing,
@@ -1539,18 +1529,20 @@ impl VectorRowsRef<'_> {
                 Ok(memtable.vector(*field, row).map(std::borrow::Cow::Borrowed))
             }
             VectorRowsInner::Segment {
-                unit,
+                segment,
                 handle,
-                pages,
+                pins,
             } => {
                 let prefix = handle.prefix();
                 if row >= prefix.row_count() || prefix.nulls().contains(row) {
                     return Ok(None);
                 }
                 let page_rows = prefix.page_rows().max(1);
-                let page = pages
-                    .get(&(row / page_rows))
-                    .ok_or_else(|| not_fetched(*unit, "a vector page"))?;
+                let page = handle
+                    .page_unit(row / page_rows)
+                    .and_then(|unit| segment.reader().unit_key(&unit))
+                    .and_then(|key| pins.get(&key))
+                    .ok_or_else(|| not_fetched(segment.unit, "a vector page"))?;
                 let dim = prefix.dim() as usize;
                 let start = (row % page_rows) as usize * dim * 4;
                 let bytes = page
