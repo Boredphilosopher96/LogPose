@@ -13,22 +13,22 @@ pub use error::{
 
 use convert::{
     collection_to_proto, create_spec_from_proto, database_policy_from_proto,
-    database_policy_to_proto, json_object_to_proto, metric_to_proto, primary_keys_from_proto,
+    database_policy_to_proto, filter_from_proto, json_to_proto, metric_to_proto,
+    order_by_from_proto, patch_from_proto, primary_keys_from_proto, record_to_proto,
     records_from_proto, required_name, schema_change_from_proto, snapshot_from_proto,
     snapshot_to_proto, split_lookups, updates_from_proto,
 };
 use error::{MessageLimitLayer, respond, unauthenticated};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
-    QueryPlanKind, QueryRequest, QueryStageTimings, ScalarMetadataValue,
+    CountRecordsRequest, ExplainMode, FilterExpr, QueryDiagnostics, QueryPlanKind, QueryRequest,
+    QueryStageTimings, ReadConsistency, ScrollRecordsRequest, VectorQuery,
 };
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
     CollectionPlacement, CommitAck, CoordinationStatus, LogPoseError, MaintenanceBacklog,
     MaintenanceStatus, NodeRole, NodeRuntimeStatus, QueryUnitStats, ScalarFieldStats, Snapshot,
 };
-use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
@@ -45,7 +45,7 @@ use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
 use proto::{
     AlterCollectionRequest, BulkUpsertRecordsReply, BulkUpsertRecordsRequest,
     CollectionPlacementReply, CollectionReply, CollectionStatsReply, CommitAckReply,
-    CompactCollectionRequest, CoordinationStatusReply, CreateCollectionRequest,
+    CompactCollectionRequest, CoordinationStatusReply, CountRecordsReply, CreateCollectionRequest,
     DatabaseAccessPolicyReply, DatabaseDescriptorReply, DeleteRecordsRequest, DropCollectionReply,
     DropCollectionRequest, DropDatabaseReply, DropDatabaseRequest, FlushCollectionRequest,
     GetCollectionPlacementRequest, GetCollectionRequest, GetCollectionStatsRequest,
@@ -54,7 +54,7 @@ use proto::{
     InspectCollectionReply, InspectCollectionRequest, InspectTarget, ListCollectionsReply,
     ListCollectionsRequest, ListDatabasesReply, ListDatabasesRequest, MaintenanceBacklogReply,
     NodeRole as ProtoNodeRole, PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionReply,
-    QueryCollectionRequest, QueryMatch, ScalarValue, SnapshotReply, UpdateRecordsRequest,
+    QueryCollectionRequest, QueryHit, ScrollRecordsReply, SnapshotReply, UpdateRecordsRequest,
     UpsertRecordsRequest,
 };
 
@@ -239,6 +239,20 @@ impl LogPoseService for GrpcLogPoseService {
         request: Request<GetRecordsRequest>,
     ) -> Result<Response<GetRecordsReply>, Status> {
         respond(self.get_records_inner(request).await)
+    }
+
+    async fn count_records(
+        &self,
+        request: Request<proto::CountRecordsRequest>,
+    ) -> Result<Response<CountRecordsReply>, Status> {
+        respond(self.count_records_inner(request).await)
+    }
+
+    async fn scroll_records(
+        &self,
+        request: Request<proto::ScrollRecordsRequest>,
+    ) -> Result<Response<ScrollRecordsReply>, Status> {
+        respond(self.scroll_records_inner(request).await)
     }
 
     async fn query_collection(
@@ -537,11 +551,39 @@ impl GrpcLogPoseService {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let target = Target::new(request.database_name, request.collection_name)?;
-        let updates = updates_from_proto(request.records, "records")?;
-        let ack = self
-            .state
-            .update_records_with_auth(&auth, &target.key(), updates)
-            .await?;
+        let ack = match (request.filter, request.patch) {
+            (None, None) => {
+                let updates = updates_from_proto(request.records, "records")?;
+                self.state
+                    .update_records_with_auth(&auth, &target.key(), updates)
+                    .await?
+            }
+            (Some(filter), Some(patch)) => {
+                if !request.records.is_empty() {
+                    return Err(LogPoseError::invalid_field(
+                        "records",
+                        "an update takes records or a filter and a patch, not both",
+                    ));
+                }
+                let filter = filter_from_proto(filter, "filter")?;
+                let patch = patch_from_proto(patch, "patch")?;
+                self.state
+                    .update_by_filter_with_auth(&auth, &target.key(), filter, patch)
+                    .await?
+            }
+            (Some(_), None) => {
+                return Err(LogPoseError::invalid_field(
+                    "patch",
+                    "an update by filter needs a patch",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(LogPoseError::invalid_field(
+                    "filter",
+                    "a patch applies to the records a filter matches; set filter",
+                ));
+            }
+        };
         Ok(target.commit_ack(ack))
     }
 
@@ -552,11 +594,26 @@ impl GrpcLogPoseService {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let target = Target::new(request.database_name, request.collection_name)?;
-        let keys = primary_keys_from_proto(request.keys, "keys")?;
-        let ack = self
-            .state
-            .delete_records_with_auth(&auth, &target.key(), keys)
-            .await?;
+        let ack = match request.filter {
+            None => {
+                let keys = primary_keys_from_proto(request.keys, "keys")?;
+                self.state
+                    .delete_records_with_auth(&auth, &target.key(), keys)
+                    .await?
+            }
+            Some(filter) => {
+                if !request.keys.is_empty() {
+                    return Err(LogPoseError::invalid_field(
+                        "keys",
+                        "a delete takes keys or a filter, not both",
+                    ));
+                }
+                let filter = filter_from_proto(filter, "filter")?;
+                self.state
+                    .delete_by_filter_with_auth(&auth, &target.key(), filter)
+                    .await?
+            }
+        };
         Ok(target.commit_ack(ack))
     }
 
@@ -582,6 +639,70 @@ impl GrpcLogPoseService {
         })
     }
 
+    async fn count_records_inner(
+        &self,
+        request: Request<proto::CountRecordsRequest>,
+    ) -> Result<CountRecordsReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let response = self
+            .state
+            .count_records_with_auth(
+                &auth,
+                &target.key(),
+                CountRecordsRequest {
+                    filter: optional_filter(request.filter)?,
+                    read: ReadConsistency {
+                        snapshot: request.snapshot.map(snapshot_from_proto),
+                        read_barrier: request.read_barrier.map(snapshot_from_proto),
+                        snapshot_token: non_empty(request.snapshot_token),
+                        pin: request.pin,
+                    },
+                },
+            )
+            .await?;
+        Ok(CountRecordsReply {
+            database_name: target.database_name,
+            collection_name: target.collection_name,
+            count: response.count,
+            snapshot: Some(snapshot_to_proto(response.snapshot)),
+            snapshot_token: response.snapshot_token.unwrap_or_default(),
+        })
+    }
+
+    async fn scroll_records_inner(
+        &self,
+        request: Request<proto::ScrollRecordsRequest>,
+    ) -> Result<ScrollRecordsReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let target = Target::new(request.database_name, request.collection_name)?;
+        let page = self
+            .state
+            .scroll_records_with_auth(
+                &auth,
+                &target.key(),
+                ScrollRecordsRequest {
+                    filter: optional_filter(request.filter)?,
+                    order_by: order_by_from_proto(request.order_by, "order_by")?,
+                    page_size: (request.page_size != 0).then_some(request.page_size),
+                    output_fields: request.output_fields,
+                    cursor: non_empty(request.cursor),
+                    snapshot_token: non_empty(request.snapshot_token),
+                },
+            )
+            .await?
+            .value;
+        Ok(ScrollRecordsReply {
+            database_name: target.database_name,
+            collection_name: target.collection_name,
+            records: page.records.into_iter().map(record_to_proto).collect(),
+            next_cursor: page.next_cursor.unwrap_or_default(),
+            snapshot: Some(snapshot_to_proto(page.snapshot)),
+        })
+    }
+
     async fn query_collection_inner(
         &self,
         request: Request<QueryCollectionRequest>,
@@ -589,54 +710,49 @@ impl GrpcLogPoseService {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let target = Target::new(request.database_name, request.collection_name)?;
-        if request.top_k == 0 {
-            return Err(LogPoseError::invalid_field(
-                "top_k",
-                "top_k must be greater than 0",
-            ));
-        }
-        let filters = request
-            .filters
-            .into_iter()
-            .map(metadata_filter_from_proto)
-            .collect::<Result<Vec<_>, _>>()?;
-        let predicate = request.predicate.map(predicate_from_proto).transpose()?;
         let response = self
             .state
-            .query_with_auth(
+            .query_collection_with_auth(
                 &auth,
+                &target.key(),
                 QueryRequest {
-                    collection_name: target.key(),
-                    vector: request.vector,
-                    top_k: request.top_k as usize,
-                    snapshot: request.snapshot.map(snapshot_from_proto),
-                    read_barrier: request.read_barrier.map(snapshot_from_proto),
-                    filters,
-                    predicate,
+                    vector: request.vector.map(|vector| VectorQuery {
+                        field: non_empty(vector.field),
+                        values: vector.values,
+                    }),
+                    filter: optional_filter(request.filter)?,
+                    order_by: order_by_from_proto(request.order_by, "order_by")?,
+                    top_k: usize::try_from(request.top_k).unwrap_or(usize::MAX),
+                    output_fields: request.output_fields,
+                    ef: (request.ef != 0).then_some(request.ef as usize),
                     explain: explain_mode_from_proto(request.explain)?,
-                    snapshot_token: (!request.snapshot_token.is_empty())
-                        .then_some(request.snapshot_token),
-                    pin: request.pin,
+                    read: ReadConsistency {
+                        snapshot: request.snapshot.map(snapshot_from_proto),
+                        read_barrier: request.read_barrier.map(snapshot_from_proto),
+                        snapshot_token: non_empty(request.snapshot_token),
+                        pin: request.pin,
+                    },
                 },
             )
-            .await?;
+            .await?
+            .value;
         Ok(QueryCollectionReply {
             database_name: target.database_name,
             collection_name: target.collection_name,
-            metric: metric_to_proto(response.metric) as i32,
+            vector_field: response.vector_field.unwrap_or_default(),
+            metric: response
+                .metric
+                .map_or(proto::DistanceMetric::Unspecified, metric_to_proto)
+                as i32,
             top_k: response.top_k as u64,
-            returned: response.returned as u64,
+            returned: response.hits.len() as u64,
             snapshot: Some(snapshot_to_proto(response.snapshot)),
-            matches: response
-                .matches
+            hits: response
+                .hits
                 .into_iter()
-                .map(|candidate| QueryMatch {
-                    id: candidate.id.to_string(),
-                    value: candidate.value,
-                    metadata: match &candidate.metadata {
-                        Value::Object(metadata) => Some(json_object_to_proto(metadata)),
-                        _ => None,
-                    },
+                .map(|hit| QueryHit {
+                    record: Some(record_to_proto(hit.record)),
+                    score: hit.score,
                 })
                 .collect(),
             diagnostics: response
@@ -700,86 +816,25 @@ impl GrpcLogPoseService {
             .state
             .inspect_with_auth(&auth, &target.key(), inspect_target)
             .await?;
-        let payload_json = serde_json::to_string(&report.payload).map_err(|error| {
-            LogPoseError::internal(format!("failed to serialize inspect payload: {error}"))
-        })?;
         Ok(InspectCollectionReply {
             database_name: target.database_name,
             collection_name: target.collection_name,
             target: report.target,
-            payload_json,
+            payload: Some(json_to_proto(&report.payload)),
         })
     }
 }
 
-fn metadata_filter_from_proto(
-    filter: proto::MetadataFilter,
-) -> Result<MetadataFilter, LogPoseError> {
-    let value = filter
-        .value
-        .ok_or_else(|| LogPoseError::invalid_argument("metadata filter value is required"))?;
-    Ok(MetadataFilter {
-        field: filter.field,
-        value: scalar_value_from_proto(value)?,
-    })
+/// The filter of a request, if it names one.
+fn optional_filter(filter: Option<proto::Filter>) -> Result<Option<FilterExpr>, LogPoseError> {
+    filter
+        .map(|filter| filter_from_proto(filter, "filter"))
+        .transpose()
 }
 
-fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, LogPoseError> {
-    match predicate
-        .node
-        .ok_or_else(|| LogPoseError::invalid_argument("predicate node is required"))?
-    {
-        proto::predicate::Node::And(list) => Ok(FilterExpr::And {
-            children: list
-                .children
-                .into_iter()
-                .map(predicate_from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-        }),
-        proto::predicate::Node::Or(list) => Ok(FilterExpr::Or {
-            children: list
-                .children
-                .into_iter()
-                .map(predicate_from_proto)
-                .collect::<Result<Vec<_>, _>>()?,
-        }),
-        proto::predicate::Node::Not(node) => Ok(FilterExpr::Not {
-            child: Box::new(predicate_from_proto(*node.child.ok_or_else(|| {
-                LogPoseError::invalid_argument("not predicate child is required")
-            })?)?),
-        }),
-        proto::predicate::Node::Comparison(comparison) => Ok(FilterExpr::Comparison(
-            predicate_comparison_from_proto(comparison)?,
-        )),
-    }
-}
-
-fn predicate_comparison_from_proto(
-    comparison: proto::PredicateComparison,
-) -> Result<FilterComparison, LogPoseError> {
-    Ok(FilterComparison {
-        field: comparison.field,
-        operator: predicate_operator_from_proto(comparison.operator)?,
-        value: comparison.value.map(scalar_value_from_proto).transpose()?,
-    })
-}
-
-fn predicate_operator_from_proto(operator: i32) -> Result<FilterOperator, LogPoseError> {
-    match proto::PredicateOperator::try_from(operator)
-        .unwrap_or(proto::PredicateOperator::Unspecified)
-    {
-        proto::PredicateOperator::Eq => Ok(FilterOperator::Eq),
-        proto::PredicateOperator::Ne => Ok(FilterOperator::Ne),
-        proto::PredicateOperator::Lt => Ok(FilterOperator::Lt),
-        proto::PredicateOperator::Lte => Ok(FilterOperator::Lte),
-        proto::PredicateOperator::Gt => Ok(FilterOperator::Gt),
-        proto::PredicateOperator::Gte => Ok(FilterOperator::Gte),
-        proto::PredicateOperator::Exists => Ok(FilterOperator::Exists),
-        proto::PredicateOperator::IsNull => Ok(FilterOperator::IsNull),
-        proto::PredicateOperator::Unspecified => Err(LogPoseError::invalid_argument(
-            "predicate comparison operator must be set",
-        )),
-    }
+/// `None` for an empty proto string.
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn explain_mode_from_proto(mode: i32) -> Result<ExplainMode, LogPoseError> {
@@ -790,50 +845,6 @@ fn explain_mode_from_proto(mode: i32) -> Result<ExplainMode, LogPoseError> {
         proto::ExplainMode::Plan => Ok(ExplainMode::Plan),
         proto::ExplainMode::Profile => Ok(ExplainMode::Profile),
     }
-}
-
-fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue, LogPoseError> {
-    match value.kind {
-        Some(proto::scalar_value::Kind::StringValue(value)) => {
-            Ok(ScalarMetadataValue::String(value))
-        }
-        Some(proto::scalar_value::Kind::Int64Value(value)) => {
-            Ok(ScalarMetadataValue::Number(Number::from(value)))
-        }
-        Some(proto::scalar_value::Kind::Uint64Value(value)) => {
-            Ok(ScalarMetadataValue::Number(Number::from(value)))
-        }
-        Some(proto::scalar_value::Kind::DoubleValue(value)) => Number::from_f64(value)
-            .map(ScalarMetadataValue::Number)
-            .ok_or_else(|| LogPoseError::invalid_argument("double scalar value must be finite")),
-        Some(proto::scalar_value::Kind::BoolValue(value)) => Ok(ScalarMetadataValue::Bool(value)),
-        Some(proto::scalar_value::Kind::NullValue(_)) => Ok(ScalarMetadataValue::Null),
-        None => Err(LogPoseError::invalid_argument(
-            "scalar value kind is required",
-        )),
-    }
-}
-
-fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue, LogPoseError> {
-    let kind = match value {
-        ScalarMetadataValue::String(value) => proto::scalar_value::Kind::StringValue(value),
-        ScalarMetadataValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                proto::scalar_value::Kind::Int64Value(value)
-            } else if let Some(value) = value.as_u64() {
-                proto::scalar_value::Kind::Uint64Value(value)
-            } else if let Some(value) = value.as_f64() {
-                proto::scalar_value::Kind::DoubleValue(value)
-            } else {
-                return Err(LogPoseError::internal(
-                    "numeric scalar value must be finite",
-                ));
-            }
-        }
-        ScalarMetadataValue::Bool(value) => proto::scalar_value::Kind::BoolValue(value),
-        ScalarMetadataValue::Null => proto::scalar_value::Kind::NullValue(true),
-    };
-    Ok(ScalarValue { kind: Some(kind) })
 }
 
 fn inspect_target_from_proto(
@@ -895,6 +906,7 @@ fn query_plan_kind_to_proto(plan: QueryPlanKind) -> proto::QueryPlanKind {
         QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
         QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
         QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,
+        QueryPlanKind::OrderedScan => proto::QueryPlanKind::OrderedScan,
     }
 }
 
@@ -1074,8 +1086,8 @@ fn scalar_field_stats_to_proto(
             .into_iter()
             .map(|(value, count)| (value, count as u64))
             .collect(),
-        min: stats.min.map(scalar_value_to_proto).transpose()?,
-        max: stats.max.map(scalar_value_to_proto).transpose()?,
+        min: stats.min.map(|value| json_to_proto(&value.to_json())),
+        max: stats.max.map(|value| json_to_proto(&value.to_json())),
         distinct_count: stats.distinct_count as u64,
     })
 }
@@ -1239,25 +1251,13 @@ mod tests {
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                filters: vec![proto::MetadataFilter {
-                    field: "kind".to_owned(),
-                    value: Some(proto::ScalarValue {
-                        kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
-                    }),
-                }],
+                filter: Some(keep_filter()),
                 ..query_collection_request("documents", vec![1.0, 0.0], 3)
             }))
             .await
             .expect("query should succeed")
             .into_inner();
-        assert_eq!(
-            query
-                .matches
-                .iter()
-                .map(|candidate| candidate.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["gamma", "alpha"]
-        );
+        assert_eq!(hit_ids(&query), vec!["gamma", "alpha"]);
 
         let stats = service
             .get_collection_stats(Request::new(get_collection_stats_request("documents")))
@@ -1351,7 +1351,7 @@ mod tests {
             flush.manifest_generation
         );
         assert_eq!(query_snapshot.visible_seq_no, flush.visible_seq_no);
-        assert_eq!(query.matches[0].id, "alpha");
+        assert_eq!(hit_ids(&query)[0], "alpha");
 
         let stats = service
             .get_collection_stats(Request::new(GetCollectionStatsRequest {
@@ -1430,10 +1430,7 @@ mod tests {
             .expect("manifest inspect should succeed")
             .into_inner();
         assert_eq!(manifest.target, "manifest");
-        let manifest_segments = manifest
-            .payload_json
-            .parse::<Value>()
-            .expect("manifest payload should be valid json");
+        let manifest_segments = inspect_payload(manifest);
         let segment_id = manifest_segments["segments"][0]["segment_id"]
             .as_str()
             .expect("segment id should be a string")
@@ -1449,10 +1446,7 @@ mod tests {
             .expect("wal inspect should succeed")
             .into_inner();
         assert_eq!(wal.target, "wal");
-        let wal_payload = wal
-            .payload_json
-            .parse::<Value>()
-            .expect("wal payload should be valid json");
+        let wal_payload = inspect_payload(wal);
         // The delete after the flush only set a deletion bit on the segment's row, so the
         // memtable holds no record, but one operation sits above the checkpoint.
         assert!(
@@ -1478,10 +1472,7 @@ mod tests {
             .expect("segment inspect should succeed")
             .into_inner();
         assert_eq!(segment.target, format!("segment:{segment_id}"));
-        let segment_payload = segment
-            .payload_json
-            .parse::<Value>()
-            .expect("segment payload should be valid json");
+        let segment_payload = inspect_payload(segment);
         assert_eq!(
             segment_payload["records"]
                 .as_array()
@@ -2151,30 +2142,21 @@ mod tests {
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                filters: vec![proto::MetadataFilter {
-                    field: "score".to_owned(),
-                    value: Some(proto::ScalarValue {
-                        kind: Some(proto::scalar_value::Kind::Uint64Value(9007199254740993)),
-                    }),
-                }],
+                filter: Some(convert::filter_to_proto(FilterExpr::eq(
+                    "score",
+                    9_007_199_254_740_993_i64,
+                ))),
                 ..query_collection_request("documents", vec![1.0, 0.0], 5)
             }))
             .await
             .expect("query should succeed")
             .into_inner();
 
-        assert_eq!(
-            query
-                .matches
-                .iter()
-                .map(|candidate| candidate.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["higher"]
-        );
+        assert_eq!(hit_ids(&query), vec!["higher"]);
     }
 
     #[tokio::test]
-    async fn grpc_query_supports_predicate_and_profile_diagnostics() {
+    async fn grpc_query_supports_filters_and_profile_diagnostics() {
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
             "grpc-predicate-profile",
         ))));
@@ -2208,19 +2190,7 @@ mod tests {
 
         let query = service
             .query_collection(Request::new(QueryCollectionRequest {
-                predicate: Some(proto::Predicate {
-                    node: Some(proto::predicate::Node::Comparison(
-                        proto::PredicateComparison {
-                            field: "kind".to_owned(),
-                            operator: proto::PredicateOperator::Eq as i32,
-                            value: Some(proto::ScalarValue {
-                                kind: Some(proto::scalar_value::Kind::StringValue(
-                                    "keep".to_owned(),
-                                )),
-                            }),
-                        },
-                    )),
-                }),
+                filter: Some(keep_filter()),
                 explain: proto::ExplainMode::Profile as i32,
                 ..query_collection_request("documents", vec![1.0, 0.0], 1)
             }))
@@ -2228,14 +2198,7 @@ mod tests {
             .expect("query should succeed")
             .into_inner();
 
-        assert_eq!(
-            query
-                .matches
-                .iter()
-                .map(|candidate| candidate.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["epsilon"]
-        );
+        assert_eq!(hit_ids(&query), vec!["epsilon"]);
         let diagnostics = query.diagnostics.expect("diagnostics should be present");
         assert_eq!(
             proto::QueryPlanKind::try_from(diagnostics.chosen_plan).expect("plan should decode"),
@@ -2245,7 +2208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_query_rejects_malformed_predicates() {
+    async fn grpc_query_rejects_malformed_filters_at_their_path() {
         let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
             "grpc-invalid-predicate",
         ))));
@@ -2259,53 +2222,37 @@ mod tests {
             .await
             .expect("create should succeed");
 
-        let error = service
-            .query_collection(Request::new(QueryCollectionRequest {
-                predicate: Some(proto::Predicate {
-                    node: Some(proto::predicate::Node::Comparison(
-                        proto::PredicateComparison {
-                            field: "kind".to_owned(),
-                            operator: proto::PredicateOperator::Eq as i32,
-                            value: None,
-                        },
-                    )),
-                }),
-                ..query_collection_request("documents", vec![1.0, 0.0], 1)
-            }))
-            .await
-            .expect_err("malformed predicate should error");
-
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[tokio::test]
-    async fn grpc_query_rejects_empty_logical_predicates() {
-        let service = GrpcLogPoseService::new(Arc::new(AppState::new(test_config(
-            "grpc-empty-logical-predicate",
-        ))));
-
-        service
-            .create_collection(Request::new(create_collection_request(
-                "documents",
-                2,
-                proto::DistanceMetric::Dot,
-            )))
-            .await
-            .expect("create should succeed");
-
-        let error = service
-            .query_collection(Request::new(QueryCollectionRequest {
-                predicate: Some(proto::Predicate {
-                    node: Some(proto::predicate::Node::And(proto::PredicateList {
-                        children: Vec::new(),
+        let cases = [
+            (
+                proto::Filter {
+                    node: Some(proto::filter::Node::Eq(proto::FieldValue {
+                        field: "kind".to_owned(),
+                        value: None,
                     })),
-                }),
-                ..query_collection_request("documents", vec![1.0, 0.0], 1)
-            }))
-            .await
-            .expect_err("empty logical predicate should error");
-
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+                },
+                "filter.eq.kind",
+            ),
+            (
+                proto::Filter {
+                    node: Some(proto::filter::Node::And(proto::FilterList {
+                        filters: Vec::new(),
+                    })),
+                },
+                "filter.and",
+            ),
+            (proto::Filter { node: None }, "filter"),
+        ];
+        for (filter, path) in cases {
+            let error = service
+                .query_collection(Request::new(QueryCollectionRequest {
+                    filter: Some(filter),
+                    ..query_collection_request("documents", vec![1.0, 0.0], 1)
+                }))
+                .await
+                .expect_err("malformed filter should error");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(violation_fields(&error), vec![path]);
+        }
     }
 
     #[tokio::test]
@@ -2762,6 +2709,7 @@ mod tests {
                             proto::Value {
                                 kind: Some(proto::value::Kind::ArrayValue(proto::ValueArray {
                                     values: vec![string_value("c")],
+                                    ..Default::default()
                                 })),
                             },
                         ),
@@ -2772,6 +2720,7 @@ mod tests {
                         json!({"origin": null}).as_object().expect("object"),
                     )),
                 }],
+                ..Default::default()
             }))
             .await
             .expect("partial update should succeed");
@@ -2803,6 +2752,7 @@ mod tests {
                 database_name: default_database_name(),
                 collection_name: "products".to_owned(),
                 keys: vec![int_key(2), int_key(99)],
+                ..Default::default()
             }))
             .await
             .expect("delete should succeed")
@@ -2946,6 +2896,7 @@ mod tests {
                         .collect(),
                     extra: None,
                 }],
+                ..Default::default()
             }))
             .await
             .expect_err("a type error is reported before the key is looked up");
@@ -2968,6 +2919,7 @@ mod tests {
                     .collect(),
                     extra: None,
                 }],
+                ..Default::default()
             }))
             .await
             .expect_err("an update of a missing key fails");
@@ -2986,6 +2938,7 @@ mod tests {
                 database_name: default_database_name(),
                 collection_name: "products".to_owned(),
                 keys: vec![int_key(1), string_key("one")],
+                ..Default::default()
             }))
             .await
             .expect_err("a string key does not fit an int64 primary key");
@@ -3433,6 +3386,7 @@ mod tests {
             database_name: default_database_name(),
             collection_name: collection_name.to_owned(),
             keys: ids.iter().map(|id| string_key(id)).collect(),
+            filter: None,
         }
     }
 
@@ -3465,16 +3419,40 @@ mod tests {
         QueryCollectionRequest {
             database_name: default_database_name(),
             collection_name: collection_name.to_owned(),
-            vector,
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vector,
+            }),
             top_k,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: proto::ExplainMode::None as i32,
-            snapshot_token: String::new(),
-            pin: false,
+            ..QueryCollectionRequest::default()
         }
+    }
+
+    /// `kind == "keep"`.
+    fn keep_filter() -> proto::Filter {
+        convert::filter_to_proto(FilterExpr::eq("kind", "keep"))
+    }
+
+    /// The string keys of a reply's hits.
+    fn hit_ids(reply: &QueryCollectionReply) -> Vec<String> {
+        reply
+            .hits
+            .iter()
+            .map(
+                |hit| match hit.record.as_ref().and_then(|record| record.pk.clone()) {
+                    Some(proto::PrimaryKey {
+                        kind: Some(proto::primary_key::Kind::StringValue(id)),
+                    }) => id,
+                    other => format!("{other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    /// An inspect reply's payload as JSON.
+    fn inspect_payload(reply: InspectCollectionReply) -> Value {
+        convert::json_from_proto(reply.payload.expect("inspect payload"), "payload")
+            .expect("payload should convert")
     }
 
     fn get_collection_stats_request(collection_name: &str) -> GetCollectionStatsRequest {

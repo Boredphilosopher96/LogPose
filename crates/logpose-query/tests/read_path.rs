@@ -180,9 +180,9 @@ fn model_matches(filter: &FilterExpr, row: &Row) -> bool {
             let keys = keys_of(row, field);
             !keys.is_empty() && keys.iter().all(|key| !unwanted.contains(key))
         }
-        FilterExpr::Range { field, bounds } => keys_of(row, field)
-            .iter()
-            .any(|key| within(key, bounds)),
+        FilterExpr::Range { field, bounds } => {
+            keys_of(row, field).iter().any(|key| within(key, bounds))
+        }
     }
 }
 
@@ -226,7 +226,11 @@ fn dynamic_matches(filter: &FilterExpr, d: Option<Option<i64>>) -> bool {
 fn random_bounds(rng: &mut Rng, operand: &mut impl FnMut(&mut Rng) -> Value) -> RangeBounds {
     let mut bounds = RangeBounds::default();
     let lower = rng.below(3);
-    let upper = if lower == 2 { rng.below(2) } else { rng.below(3) };
+    let upper = if lower == 2 {
+        rng.below(2)
+    } else {
+        rng.below(3)
+    };
     match lower {
         0 => bounds.gt = Some(operand(rng)),
         1 => bounds.gte = Some(operand(rng)),

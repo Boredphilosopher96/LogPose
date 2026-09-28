@@ -6,6 +6,7 @@
 //! set, an unreachable etcd is a failure, and under CI a missing variable is too.
 
 use etcd_client::{Client, DeleteOptions, PutOptions};
+use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
@@ -13,7 +14,7 @@ use logpose_auth::{
 use logpose_catalog::CollectionDescriptor;
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, QueryRequest};
+use logpose_query::ExplainMode;
 use logpose_service as _;
 use logpose_storage::CreateCollectionRequest;
 use logpose_storage_etcd::{
@@ -36,6 +37,9 @@ use std::{
 use tokio::time::{Instant, sleep};
 
 /// Environment variable that enables the etcd integration tests.
+#[path = "../../logpose-service/tests/support/legacy_query.rs"]
+mod legacy_query;
+
 const ETCD_ENDPOINTS_ENV: &str = "LOGPOSE_TEST_ETCD_ENDPOINTS";
 
 #[tokio::test]

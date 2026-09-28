@@ -109,7 +109,14 @@ async fn queries_storage_records_and_honors_snapshots() {
 
     let current = query(
         &engine,
-        request("documents", vec![1.0, 0.0], 2, None, None, ExplainMode::None),
+        request(
+            "documents",
+            vec![1.0, 0.0],
+            2,
+            None,
+            None,
+            ExplainMode::None,
+        ),
     )
     .await
     .expect("query should succeed");
@@ -122,10 +129,7 @@ async fn queries_storage_records_and_honors_snapshots() {
     assert_eq!(current.top_k, 2);
     assert_eq!(current.hits.len(), 2);
     assert_eq!(current.snapshot, snapshot);
-    assert_eq!(
-        ids(&current),
-        vec!["alpha", "beta"]
-    );
+    assert_eq!(ids(&current), vec!["alpha", "beta"]);
     assert!((current.hits[0].score.unwrap_or_default() - 1.0).abs() < 1e-6);
     assert!((current.hits[1].score.unwrap_or_default() - 0.5).abs() < 1e-6);
 
@@ -143,16 +147,20 @@ async fn queries_storage_records_and_honors_snapshots() {
 
     let historical = query(
         &engine,
-        request("documents", vec![1.0, 0.0], 3, Some(snapshot.clone()), None, ExplainMode::None),
+        request(
+            "documents",
+            vec![1.0, 0.0],
+            3,
+            Some(snapshot.clone()),
+            None,
+            ExplainMode::None,
+        ),
     )
     .await
     .expect("historical query should succeed");
 
     assert_eq!(historical.snapshot, snapshot);
-    assert_eq!(
-        ids(&historical),
-        vec!["alpha", "beta", "gamma"]
-    );
+    assert_eq!(ids(&historical), vec!["alpha", "beta", "gamma"]);
 }
 
 #[tokio::test]
@@ -171,14 +179,21 @@ async fn returns_empty_matches_for_empty_collection() {
 
     let response = query(
         &engine,
-        request("empty", vec![1.0, 0.0, 0.0], 5, None, None, ExplainMode::None),
+        request(
+            "empty",
+            vec![1.0, 0.0, 0.0],
+            5,
+            None,
+            None,
+            ExplainMode::None,
+        ),
     )
     .await
     .expect("query should succeed");
 
     assert_eq!(response.metric, Some(DistanceMetric::Cosine));
     assert_eq!(response.top_k, 5);
-        assert_eq!(response.hits.len(), 0);
+    assert_eq!(response.hits.len(), 0);
     assert_eq!(
         response.snapshot,
         Snapshot {
@@ -204,7 +219,14 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
 
     let result = query(
         &engine,
-        request("embeddings", vec![1.0, 0.0], 1, None, None, ExplainMode::None),
+        request(
+            "embeddings",
+            vec![1.0, 0.0],
+            1,
+            None,
+            None,
+            ExplainMode::None,
+        ),
     )
     .await;
 
@@ -267,14 +289,18 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("flush should succeed");
 
-    let historical_request = request("profiles", vec![0.0, 0.0], 2, Some(before_delete), None, ExplainMode::None);
+    let historical_request = request(
+        "profiles",
+        vec![0.0, 0.0],
+        2,
+        Some(before_delete),
+        None,
+        ExplainMode::None,
+    );
     let historical = query(&engine, historical_request.clone())
         .await
         .expect("a pinned historical query should succeed");
-    assert_eq!(
-        ids(&historical),
-        vec!["alpha", "beta"]
-    );
+    assert_eq!(ids(&historical), vec!["alpha", "beta"]);
 
     // Pins end with the process: after a reopen the old generation is gone.
     drop(engine);
@@ -317,10 +343,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
     .await
     .expect("current query should succeed");
 
-    assert_eq!(
-        ids(&current),
-        vec!["gamma", "beta"]
-    );
+    assert_eq!(ids(&current), vec!["gamma", "beta"]);
 }
 
 #[tokio::test]
@@ -355,7 +378,14 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
 
     let response = query(
         &engine,
-        request("documents", vec![1.0, 0.0], 1, None, Some(FilterExpr::exists("details")), ExplainMode::Plan),
+        request(
+            "documents",
+            vec![1.0, 0.0],
+            1,
+            None,
+            Some(FilterExpr::exists("details")),
+            ExplainMode::Plan,
+        ),
     )
     .await
     .expect("exists query should succeed");

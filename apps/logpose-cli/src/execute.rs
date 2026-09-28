@@ -1,13 +1,14 @@
 use crate::{
     action::{
-        Action, CLI_PUT_BATCH_BYTES, primary_key_from_text, query_request_from_action,
-        read_collection_spec, read_database_policy_input, read_jsonl_put_batches,
-        records_from_documents, stats_read_barrier_from_action, stats_snapshot_from_action,
+        Action, CLI_PUT_BATCH_BYTES, count_request_from_action, primary_key_from_text,
+        query_request_from_action, read_collection_spec, read_database_policy_input,
+        read_jsonl_put_batches, records_from_documents, scroll_request_from_action,
+        stats_read_barrier_from_action, stats_snapshot_from_action,
     },
     feedback::{ProgressHandle, Reporter},
     render::ActionOutput,
 };
-use anyhow::Context;
+use anyhow::{Context, bail};
 use logpose_client::{ClientConfig, CreateCollectionRequest, LogPoseClient};
 use logpose_config::LogPoseConfig;
 
@@ -258,22 +259,63 @@ pub async fn execute_action<R: Reporter>(
             ))
         }
         Action::RecordDelete(action) => {
-            let progress = ProgressHandle::start(reporter.clone(), "Deleting record...");
+            let progress = ProgressHandle::start(reporter.clone(), "Deleting records...");
             let client = connect_client(config, auth_token).await?;
             let schema = client
                 .collection(&action.collection)
                 .await
                 .context("failed to fetch the collection schema")?
                 .schema;
-            let key = primary_key_from_text(&schema, &action.id)?;
-            let ack = client
-                .delete(&action.collection, vec![key])
-                .await
-                .context(
-                    "failed to delete record; the delete may have been durably recorded before the error was returned, so verify collection state before retrying",
-                )?;
+            let ack = match (&action.id, action.filter.resolve(&schema)?) {
+                (Some(id), None) => {
+                    let key = primary_key_from_text(&schema, id)?;
+                    client.delete(&action.collection, vec![key]).await.context(
+                        "failed to delete record; the delete may have been durably recorded before the error was returned, so verify collection state before retrying",
+                    )?
+                }
+                (None, Some(filter)) => client
+                    .delete_by_filter(&action.collection, filter)
+                    .await
+                    .context(
+                        "failed to delete by filter; the delete may have been durably recorded before the error was returned, so verify collection state before retrying",
+                    )?,
+                (Some(_), Some(_)) => bail!("delete either a record id or a filter, not both"),
+                (None, None) => bail!("delete needs a record id or a filter"),
+            };
             progress.finish_success("Delete completed");
             Ok(ActionOutput::RecordDeleted(ack))
+        }
+        Action::Count(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Counting records...");
+            let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
+            let request = count_request_from_action(action, &schema)?;
+            let response = client
+                .count(&action.collection, request)
+                .await
+                .context("failed to count records")?;
+            progress.finish_success("Count ready");
+            Ok(ActionOutput::Count(response))
+        }
+        Action::Scroll(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Reading a page...");
+            let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
+            let request = scroll_request_from_action(action, &schema)?;
+            let response = client
+                .scroll(&action.collection, request)
+                .await
+                .context("failed to scroll records")?;
+            progress.finish_success("Page ready");
+            Ok(ActionOutput::Scroll { schema, response })
         }
         Action::RecordGet(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Reading records...");
@@ -297,14 +339,19 @@ pub async fn execute_action<R: Reporter>(
         }
         Action::Query(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Running query...");
-            let request = query_request_from_action(action)?;
             let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
+            let request = query_request_from_action(action, &schema)?;
             let response = client
-                .query(request)
+                .query(&action.collection, request)
                 .await
                 .context("failed to query collection")?;
             progress.finish_success("Query completed");
-            Ok(ActionOutput::Query(response))
+            Ok(ActionOutput::Query { schema, response })
         }
         Action::Inspect { collection, target } => {
             let progress =

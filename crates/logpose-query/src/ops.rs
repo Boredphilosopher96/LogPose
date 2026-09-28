@@ -18,8 +18,9 @@
 use crate::{QueryError, Result, compile::CompiledFilter};
 use logpose_storage::{
     CollectionReader, FetchPlan, Projection, ReadOptions, ReadView, RowData, SectionNeed,
-    SnapshotToken, TOKEN_BYTES, UnitView, base64url_decode, base64url_encode, checksum,
+    SnapshotToken, TOKEN_BYTES, UnitView, base64url_decode, base64url_encode,
     cache::PinSet,
+    checksum,
     read::{Direction, ScalarKey, value_index_keys},
 };
 use logpose_types::{
@@ -341,12 +342,10 @@ async fn scroll_entries(
         .map(Arc::new);
     let ordered_field = match order {
         ScrollOrder::Pk => None,
-        ScrollOrder::Field { field, direction } => {
-            Some((
-                order_field(view.schema(), field, "order_by[0].field")?,
-                *direction,
-            ))
-        }
+        ScrollOrder::Field { field, direction } => Some((
+            order_field(view.schema(), field, "order_by[0].field")?,
+            *direction,
+        )),
     };
     let mut plan = FetchPlan::default();
     let mut units = Vec::new();
@@ -541,9 +540,7 @@ impl FromStr for Cursor {
 
     fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
         let bytes = base64url_decode(text).ok_or(InvalidCursor)?;
-        let (body, crc) = bytes
-            .split_last_chunk::<4>()
-            .ok_or(InvalidCursor)?;
+        let (body, crc) = bytes.split_last_chunk::<4>().ok_or(InvalidCursor)?;
         if checksum(body) != u32::from_le_bytes(*crc) {
             return Err(InvalidCursor);
         }

@@ -5,6 +5,7 @@ use axum as _;
 use axum::body::Body;
 use http_body_util as _;
 use http_body_util::BodyExt;
+use legacy_query::{LegacyQuery, MetadataFilter, QueryRequest};
 use logpose_api_grpc as _;
 use logpose_api_grpc::proto;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
@@ -13,15 +14,12 @@ use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_config as _;
 use logpose_core::RequestAuth;
-use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryPlanKind,
-    QueryRequest, ScalarMetadataValue,
-};
+use logpose_query::{ExplainMode, FilterExpr, QueryPlanKind};
 use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_storage_etcd as _;
 use logpose_types::{
-    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, Snapshot,
+    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, ScalarMetadataValue, Snapshot,
     legacy::record_from_put,
     record::{PrimaryKey, Record},
 };
@@ -38,6 +36,34 @@ use thiserror as _;
 use tonic as _;
 use tonic::Request;
 use tower as _;
+
+#[path = "support/legacy_query.rs"]
+mod legacy_query;
+
+/// `kind == "keep"` in the gRPC form.
+fn keep_proto_filter() -> proto::Filter {
+    logpose_api_grpc::convert::filter_to_proto(FilterExpr::eq("kind", "keep"))
+}
+
+/// The key of the `index`th gRPC hit.
+fn grpc_id(reply: &proto::QueryCollectionReply, index: usize) -> String {
+    match reply.hits[index]
+        .record
+        .as_ref()
+        .and_then(|record| record.pk.as_ref())
+        .and_then(|pk| pk.kind.clone())
+    {
+        Some(proto::primary_key::Kind::StringValue(id)) => id,
+        other => format!("{other:?}"),
+    }
+}
+
+/// The keys of every gRPC hit.
+fn grpc_ids(reply: &proto::QueryCollectionReply) -> Vec<String> {
+    (0..reply.hits.len())
+        .map(|index| grpc_id(reply, index))
+        .collect()
+}
 use tower::util::ServiceExt;
 
 #[tokio::test]
@@ -853,11 +879,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .await
         .expect("flush should succeed");
 
-    let predicate = FilterExpr::Comparison(FilterComparison {
-        field: "kind".to_owned(),
-        operator: FilterOperator::Eq,
-        value: Some(ScalarMetadataValue::String("keep".to_owned())),
-    });
+    let predicate = FilterExpr::eq("kind", "keep");
 
     let service_response = state
         .query(QueryRequest {
@@ -884,14 +906,9 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": [1.0, 0.0],
+                        "vector": { "values": [1.0, 0.0] },
                         "top_k": 1,
-                        "predicate": {
-                            "kind": "comparison",
-                            "field": "kind",
-                            "operator": "eq",
-                            "value": "keep"
-                        },
+                        "filter": { "eq": { "kind": "keep" } },
                         "explain": "profile"
                     })
                     .to_string(),
@@ -912,25 +929,20 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
 
     let grpc_response = grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name: "default".to_owned(),
             collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vec![1.0, 0.0],
+            }),
+            filter: Some(keep_proto_filter()),
+            order_by: Vec::new(),
             top_k: 1,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::Profile as i32,
             snapshot: None,
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(proto::Predicate {
-                node: Some(proto::predicate::Node::Comparison(
-                    proto::PredicateComparison {
-                        field: "kind".to_owned(),
-                        operator: proto::PredicateOperator::Eq as i32,
-                        value: Some(proto::ScalarValue {
-                            kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
-                        }),
-                    },
-                )),
-            }),
-            explain: proto::ExplainMode::Profile as i32,
-            database_name: "default".to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -939,8 +951,8 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .into_inner();
 
     assert_eq!(service_response.matches[0].id.as_str(), "gamma");
-    assert_eq!(rest_body["matches"][0]["id"], "gamma");
-    assert_eq!(grpc_response.matches[0].id, "gamma");
+    assert_eq!(rest_body["hits"][0]["record"]["id"], "gamma");
+    assert_eq!(grpc_id(&grpc_response, 0), "gamma");
     let service_diagnostics = service_response
         .diagnostics
         .as_ref()
@@ -1084,11 +1096,7 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
         .await
         .expect("flush should succeed");
 
-    let predicate = FilterExpr::Comparison(FilterComparison {
-        field: "kind".to_owned(),
-        operator: FilterOperator::Eq,
-        value: Some(ScalarMetadataValue::String("keep".to_owned())),
-    });
+    let predicate = FilterExpr::eq("kind", "keep");
 
     let service_response = state
         .query(QueryRequest {
@@ -1114,14 +1122,9 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": [1.0, 0.0],
+                        "vector": { "values": [1.0, 0.0] },
                         "top_k": 2,
-                        "predicate": {
-                            "kind": "comparison",
-                            "field": "kind",
-                            "operator": "eq",
-                            "value": "keep"
-                        },
+                        "filter": { "eq": { "kind": "keep" } },
                         "explain": "profile"
                     })
                     .to_string(),
@@ -1141,25 +1144,20 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     .expect("body should be json");
     let grpc_response = grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name: "default".to_owned(),
             collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vec![1.0, 0.0],
+            }),
+            filter: Some(keep_proto_filter()),
+            order_by: Vec::new(),
             top_k: 2,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::Profile as i32,
             snapshot: None,
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(proto::Predicate {
-                node: Some(proto::predicate::Node::Comparison(
-                    proto::PredicateComparison {
-                        field: "kind".to_owned(),
-                        operator: proto::PredicateOperator::Eq as i32,
-                        value: Some(proto::ScalarValue {
-                            kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
-                        }),
-                    },
-                )),
-            }),
-            explain: proto::ExplainMode::Profile as i32,
-            database_name: "default".to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -1176,22 +1174,15 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
         vec!["doc-8", "doc-4"]
     );
     assert_eq!(
-        rest_body["matches"]
+        rest_body["hits"]
             .as_array()
-            .expect("rest matches should be an array")
+            .expect("rest hits should be an array")
             .iter()
-            .map(|candidate| candidate["id"].as_str().expect("id should be string"))
+            .map(|hit| hit["record"]["id"].as_str().expect("id should be string"))
             .collect::<Vec<_>>(),
         vec!["doc-8", "doc-4"]
     );
-    assert_eq!(
-        grpc_response
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["doc-8", "doc-4"]
-    );
+    assert_eq!(grpc_ids(&grpc_response), vec!["doc-8", "doc-4"]);
     let diagnostics = service_response
         .diagnostics
         .as_ref()

@@ -12,10 +12,7 @@ use logpose_client::{
 };
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
-use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryPlanKind, QueryRequest,
-    ScalarMetadataValue,
-};
+use logpose_query::{ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, VectorQuery};
 use logpose_storage::{CreateCollectionRequest as StorageCreateCollectionRequest, InspectTarget};
 use logpose_types::{
     DistanceMetric, PutRecord, RecordId,
@@ -102,25 +99,23 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .expect("write should succeed");
 
     let query = client
-        .query(QueryRequest {
-            collection_name: qualified.clone(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(FilterExpr::Comparison(FilterComparison {
-                field: "kind".to_owned(),
-                operator: FilterOperator::Eq,
-                value: Some(ScalarMetadataValue::String("keep".to_owned())),
-            })),
-            explain: ExplainMode::Profile,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query(
+            &CollectionRef::parse(&qualified.clone()).expect("name"),
+            QueryRequest {
+                vector: Some(VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                filter: Some(FilterExpr::eq("kind", "keep")),
+                output_fields: vec!["$extra".to_owned()],
+                explain: ExplainMode::Profile,
+                ..QueryRequest::default()
+            },
+        )
         .await
         .expect("query should succeed");
-    assert_eq!(query.matches[0].id.as_str(), "alpha");
+    assert_eq!(query.hits[0].record.pk.label(), "alpha");
     assert_eq!(
         query
             .diagnostics
@@ -230,21 +225,23 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     );
 
     let hybrid_query = client
-        .query(QueryRequest {
-            collection_name: qualified.clone(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::Profile,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query(
+            &CollectionRef::parse(&qualified.clone()).expect("name"),
+            QueryRequest {
+                vector: Some(VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                filter: None,
+                output_fields: vec!["$extra".to_owned()],
+                explain: ExplainMode::Profile,
+                ..QueryRequest::default()
+            },
+        )
         .await
         .expect("hybrid query should succeed");
-    assert_eq!(hybrid_query.matches[0].id.as_str(), "alpha");
+    assert_eq!(hybrid_query.hits[0].record.pk.label(), "alpha");
     let hybrid_diagnostics = hybrid_query
         .diagnostics
         .as_ref()
@@ -855,30 +852,28 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
         .expect("flush should succeed");
 
     let response = client
-        .query(QueryRequest {
-            collection_name: "default/documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(FilterExpr::Comparison(FilterComparison {
-                field: "kind".to_owned(),
-                operator: FilterOperator::Eq,
-                value: Some(ScalarMetadataValue::String("keep".to_owned())),
-            })),
-            explain: ExplainMode::Profile,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query(
+            &CollectionRef::parse("default/documents").expect("name"),
+            QueryRequest {
+                vector: Some(VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                filter: Some(FilterExpr::eq("kind", "keep")),
+                output_fields: vec!["$extra".to_owned()],
+                explain: ExplainMode::Profile,
+                ..QueryRequest::default()
+            },
+        )
         .await
         .expect("query should succeed");
 
     assert_eq!(
         response
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|hit| hit.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["doc-8", "doc-4"]
     );
@@ -894,10 +889,10 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
     assert!(diagnostics.units_considered >= 1);
     assert_eq!(diagnostics.units_pruned, 0);
     assert_eq!(diagnostics.units_scanned, 1);
-    assert!(diagnostics.candidates_before_filter >= response.returned);
-    assert!(diagnostics.candidates_after_filter >= response.returned);
+    assert!(diagnostics.candidates_before_filter >= response.hits.len());
+    assert!(diagnostics.candidates_after_filter >= response.hits.len());
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
-    assert!(diagnostics.candidates_merged >= response.returned);
+    assert!(diagnostics.candidates_merged >= response.hits.len());
     assert_eq!(diagnostics.rerank_count, 1);
     assert_eq!(diagnostics.unit_scan_mix.get("exact_f32").copied(), Some(1));
     assert!(diagnostics.fallback_reason.is_some());

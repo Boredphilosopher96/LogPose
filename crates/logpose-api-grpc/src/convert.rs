@@ -9,9 +9,11 @@
 use crate::proto;
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_catalog::CollectionDescriptor;
+use logpose_query::{OrderBy, SortDirection};
 use logpose_types::{
     CollectionId, DistanceMetric, LogPoseError, RemoteBlobConfig, Snapshot,
-    record::{PartialUpdate, PrimaryKey, Record},
+    filter::{FilterExpr, RangeBounds},
+    record::{PartialUpdate, PrimaryKey, Record, RecordPatch},
     schema::{
         CollectionSchema, CreateCollectionSpec, ElementType, FieldIndex, FieldRef, FieldType,
         PrimaryKeySpec, PrimaryKeyType, ScalarFieldSpec, SchemaChange, VectorFieldSpec,
@@ -583,6 +585,227 @@ pub fn updates_from_proto(
             })
         })
         .collect()
+}
+
+// ----- Filters, orders, and patches -----
+
+/// The proto form of a filter.
+#[must_use]
+pub fn filter_to_proto(filter: FilterExpr) -> proto::Filter {
+    use proto::filter::Node;
+    let list = |children: Vec<FilterExpr>| proto::FilterList {
+        filters: children.into_iter().map(filter_to_proto).collect(),
+    };
+    let field_value = |field: String, value: Value| proto::FieldValue {
+        field,
+        value: Some(value_to_proto(value)),
+    };
+    let field_values = |field: String, values: Vec<Value>| proto::FieldValues {
+        field,
+        values: values.into_iter().map(value_to_proto).collect(),
+    };
+    let node = match filter {
+        FilterExpr::And(children) => Node::And(list(children)),
+        FilterExpr::Or(children) => Node::Or(list(children)),
+        FilterExpr::Not(child) => Node::Not(Box::new(filter_to_proto(*child))),
+        FilterExpr::Eq { field, value } => Node::Eq(field_value(field, value)),
+        FilterExpr::Ne { field, value } => Node::Ne(field_value(field, value)),
+        FilterExpr::Contains { field, value } => Node::Contains(field_value(field, value)),
+        FilterExpr::In { field, values } => Node::In(field_values(field, values)),
+        FilterExpr::NotIn { field, values } => Node::NotIn(field_values(field, values)),
+        FilterExpr::ContainsAny { field, values } => Node::ContainsAny(field_values(field, values)),
+        FilterExpr::Range { field, bounds } => Node::Range(proto::FieldRange {
+            field,
+            gt: bounds.gt.map(value_to_proto),
+            gte: bounds.gte.map(value_to_proto),
+            lt: bounds.lt.map(value_to_proto),
+            lte: bounds.lte.map(value_to_proto),
+        }),
+        FilterExpr::Exists { field } => Node::Exists(field),
+        FilterExpr::IsNull { field } => Node::IsNull(field),
+    };
+    proto::Filter { node: Some(node) }
+}
+
+/// A filter from proto. Nodes are named by their path in the REST form of the filter, the paths
+/// the query crate reports its own checks at: `filter.and[1].range.price.gte`.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` naming the node for a filter with no node, a comparison without a
+/// field path or an operand, or an operand that is not a valid value.
+pub fn filter_from_proto(filter: proto::Filter, path: &str) -> Result<FilterExpr> {
+    use proto::filter::Node;
+    let Some(node) = filter.node else {
+        return Err(LogPoseError::invalid_field(
+            path,
+            "a filter must set exactly one node",
+        ));
+    };
+    let operator = match &node {
+        Node::And(_) => "and",
+        Node::Or(_) => "or",
+        Node::Not(_) => "not",
+        Node::Eq(_) => "eq",
+        Node::Ne(_) => "ne",
+        Node::Range(_) => "range",
+        Node::In(_) => "in",
+        Node::NotIn(_) => "not_in",
+        Node::Contains(_) => "contains",
+        Node::ContainsAny(_) => "contains_any",
+        Node::Exists(_) => "exists",
+        Node::IsNull(_) => "is_null",
+    };
+    let node_path = format!("{path}.{operator}");
+    let field_path = |field: &str| -> Result<String> {
+        if field.is_empty() {
+            return Err(LogPoseError::invalid_field(
+                &node_path,
+                format!("'{operator}' needs a field path"),
+            ));
+        }
+        Ok(format!("{node_path}.{field}"))
+    };
+    let operand = |value: Option<proto::Value>, at: &str| -> Result<Value> {
+        let value = value.ok_or_else(|| {
+            LogPoseError::invalid_field(at, format!("'{operator}' needs an operand"))
+        })?;
+        value_from_proto(value, at)
+    };
+    let operands = |values: Vec<proto::Value>, at: &str| -> Result<Vec<Value>> {
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| value_from_proto(value, &format!("{at}[{index}]")))
+            .collect()
+    };
+    let list = |list: proto::FilterList| -> Result<Vec<FilterExpr>> {
+        list.filters
+            .into_iter()
+            .enumerate()
+            .map(|(index, child)| filter_from_proto(child, &format!("{node_path}[{index}]")))
+            .collect()
+    };
+    Ok(match node {
+        Node::And(children) => FilterExpr::And(list(children)?),
+        Node::Or(children) => FilterExpr::Or(list(children)?),
+        Node::Not(child) => FilterExpr::Not(Box::new(filter_from_proto(*child, &node_path)?)),
+        Node::Eq(comparison) | Node::Ne(comparison) | Node::Contains(comparison) => {
+            let at = field_path(&comparison.field)?;
+            let value = operand(comparison.value, &at)?;
+            let field = comparison.field;
+            match operator {
+                "eq" => FilterExpr::Eq { field, value },
+                "ne" => FilterExpr::Ne { field, value },
+                _ => FilterExpr::Contains { field, value },
+            }
+        }
+        Node::In(comparison) | Node::NotIn(comparison) | Node::ContainsAny(comparison) => {
+            let at = field_path(&comparison.field)?;
+            let values = operands(comparison.values, &at)?;
+            let field = comparison.field;
+            match operator {
+                "in" => FilterExpr::In { field, values },
+                "not_in" => FilterExpr::NotIn { field, values },
+                _ => FilterExpr::ContainsAny { field, values },
+            }
+        }
+        Node::Range(range) => {
+            let at = field_path(&range.field)?;
+            let bound = |value: Option<proto::Value>, name: &str| {
+                value
+                    .map(|value| value_from_proto(value, &format!("{at}.{name}")))
+                    .transpose()
+            };
+            FilterExpr::Range {
+                bounds: RangeBounds {
+                    gt: bound(range.gt, "gt")?,
+                    gte: bound(range.gte, "gte")?,
+                    lt: bound(range.lt, "lt")?,
+                    lte: bound(range.lte, "lte")?,
+                },
+                field: range.field,
+            }
+        }
+        Node::Exists(field) | Node::IsNull(field) => {
+            if field.is_empty() {
+                return Err(LogPoseError::invalid_field(
+                    node_path,
+                    format!("'{operator}' needs a field path"),
+                ));
+            }
+            if operator == "exists" {
+                FilterExpr::Exists { field }
+            } else {
+                FilterExpr::IsNull { field }
+            }
+        }
+    })
+}
+
+/// The proto form of an order.
+#[must_use]
+pub fn order_by_to_proto(order: OrderBy) -> proto::OrderBy {
+    proto::OrderBy {
+        field: order.field,
+        direction: match order.direction {
+            SortDirection::Asc => proto::SortDirection::Asc,
+            SortDirection::Desc => proto::SortDirection::Desc,
+        } as i32,
+    }
+}
+
+/// Orders from proto, the `i`th named `field[i]`.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` for an unknown direction.
+pub fn order_by_from_proto(orders: Vec<proto::OrderBy>, field: &str) -> Result<Vec<OrderBy>> {
+    orders
+        .into_iter()
+        .enumerate()
+        .map(|(index, order)| {
+            let direction = match proto::SortDirection::try_from(order.direction) {
+                Ok(proto::SortDirection::Asc) => SortDirection::Asc,
+                Ok(proto::SortDirection::Desc) => SortDirection::Desc,
+                Err(_) => {
+                    return Err(LogPoseError::invalid_field(
+                        format!("{field}[{index}].direction"),
+                        format!("unknown sort direction {}", order.direction),
+                    ));
+                }
+            };
+            Ok(OrderBy {
+                field: order.field,
+                direction,
+            })
+        })
+        .collect()
+}
+
+/// The proto form of a patch.
+#[must_use]
+pub fn patch_to_proto(patch: RecordPatch) -> proto::RecordPatch {
+    proto::RecordPatch {
+        vectors: vectors_to_proto(patch.vectors).into_iter().collect(),
+        fields: fields_to_proto(patch.fields).into_iter().collect(),
+        extra: (!patch.extra.is_empty()).then(|| json_object_to_proto(&patch.extra)),
+    }
+}
+
+/// A patch from proto, before schema validation; members are named below `path`.
+///
+/// # Errors
+///
+/// Returns `INVALID_ARGUMENT` naming the first bad member.
+pub fn patch_from_proto(patch: proto::RecordPatch, path: &str) -> Result<RecordPatch> {
+    let (vectors, fields, extra) =
+        parts_from_proto(patch.vectors, patch.fields, patch.extra, path)?;
+    Ok(RecordPatch {
+        vectors,
+        fields,
+        extra,
+    })
 }
 
 // ----- Snapshots -----

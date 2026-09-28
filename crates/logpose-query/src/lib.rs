@@ -127,6 +127,7 @@ fn invalid(field: &str, message: impl Into<String>) -> QueryError {
 
 /// The vector half of a query.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VectorQuery {
     /// The vector field to search; `None` searches the collection's only vector field.
     #[serde(default)]
@@ -158,6 +159,7 @@ impl From<SortDirection> for Direction {
 /// Order results by a declared scalar field (not an array or JSON). Ties are broken by primary
 /// key ascending, and rows without a value come last in both directions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderBy {
     /// The field.
     pub field: String,
@@ -307,6 +309,56 @@ pub struct QueryResponse {
     pub snapshot_token: Option<String>,
 }
 
+impl QueryResponse {
+    /// The response as natural JSON, the REST form: records as documents typed by `schema`
+    /// (the schema of the state read), each hit `{"score": ..., "record": {...}}`.
+    #[must_use]
+    pub fn to_json(&self, schema: &CollectionSchema) -> Value {
+        let mut object = Map::new();
+        if let Some(field) = &self.vector_field {
+            object.insert("vector_field".to_owned(), Value::from(field.as_str()));
+        }
+        if let Some(metric) = self.metric {
+            object.insert(
+                "metric".to_owned(),
+                serde_json::to_value(metric).unwrap_or(Value::Null),
+            );
+        }
+        object.insert("top_k".to_owned(), Value::from(self.top_k));
+        object.insert("returned".to_owned(), Value::from(self.hits.len()));
+        object.insert(
+            "snapshot".to_owned(),
+            serde_json::to_value(&self.snapshot).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "hits".to_owned(),
+            Value::Array(
+                self.hits
+                    .iter()
+                    .map(|hit| {
+                        let mut entry = Map::new();
+                        if let Some(score) = hit.score {
+                            entry.insert("score".to_owned(), Value::from(score));
+                        }
+                        entry.insert("record".to_owned(), hit.record.to_json(schema));
+                        Value::Object(entry)
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(diagnostics) = &self.diagnostics {
+            object.insert(
+                "diagnostics".to_owned(),
+                serde_json::to_value(diagnostics).unwrap_or(Value::Null),
+            );
+        }
+        if let Some(token) = &self.snapshot_token {
+            object.insert("snapshot_token".to_owned(), Value::from(token.as_str()));
+        }
+        Value::Object(object)
+    }
+}
+
 /// A count of the records matching a filter.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CountRecordsRequest {
@@ -356,6 +408,33 @@ pub struct ScrollRecordsResponse {
     pub next_cursor: Option<String>,
     /// The state the page read; every page of one scroll reads the same state.
     pub snapshot: Snapshot,
+}
+
+impl ScrollRecordsResponse {
+    /// The page as natural JSON, the REST form: records as documents typed by `schema`, and
+    /// `next_cursor` (null after the last page).
+    #[must_use]
+    pub fn to_json(&self, schema: &CollectionSchema) -> Value {
+        let mut object = Map::new();
+        object.insert(
+            "records".to_owned(),
+            Value::Array(
+                self.records
+                    .iter()
+                    .map(|record| record.to_json(schema))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "next_cursor".to_owned(),
+            self.next_cursor.as_deref().map_or(Value::Null, Value::from),
+        );
+        object.insert(
+            "snapshot".to_owned(),
+            serde_json::to_value(&self.snapshot).unwrap_or(Value::Null),
+        );
+        Value::Object(object)
+    }
 }
 
 /// A read result with the schema of the state it read, which renders its records.

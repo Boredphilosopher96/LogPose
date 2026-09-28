@@ -36,8 +36,8 @@ use crate::{
     LogPoseError,
     record::PrimaryKey,
     schema::{
-        CollectionSchema, DYNAMIC_FIELD_NAME, FieldRef, FieldType, PrimaryKeyField,
-        PrimaryKeyType, ScalarField,
+        CollectionSchema, DYNAMIC_FIELD_NAME, FieldRef, FieldType, PrimaryKeyField, PrimaryKeyType,
+        ScalarField,
     },
     value::Value,
 };
@@ -355,7 +355,8 @@ impl FilterExpr {
             entry.insert(field.to_owned(), value);
             JsonValue::Object(entry)
         };
-        let values = |values: &[Value]| JsonValue::Array(values.iter().map(Value::to_json).collect());
+        let values =
+            |values: &[Value]| JsonValue::Array(values.iter().map(Value::to_json).collect());
         let body = match self {
             Self::And(children) | Self::Or(children) => {
                 JsonValue::Array(children.iter().map(Self::to_json).collect())
@@ -364,9 +365,18 @@ impl FilterExpr {
             Self::Eq { field, value }
             | Self::Ne { field, value }
             | Self::Contains { field, value } => field_value(field, value.to_json()),
-            Self::In { field, values: list }
-            | Self::NotIn { field, values: list }
-            | Self::ContainsAny { field, values: list } => field_value(field, values(list)),
+            Self::In {
+                field,
+                values: list,
+            }
+            | Self::NotIn {
+                field,
+                values: list,
+            }
+            | Self::ContainsAny {
+                field,
+                values: list,
+            } => field_value(field, values(list)),
             Self::Range { field, bounds } => field_value(
                 field,
                 JsonValue::Object(
@@ -428,9 +438,9 @@ pub fn resolve_field<'a>(
     match schema.field(path) {
         Some(FieldRef::PrimaryKey(field)) => Ok(FilterTarget::PrimaryKey(field)),
         Some(FieldRef::Scalar(field)) => Ok(FilterTarget::Scalar(field)),
-        Some(FieldRef::Vector(_)) => Err(format!(
-            "'{path}' is a vector field and cannot be filtered"
-        )),
+        Some(FieldRef::Vector(_)) => {
+            Err(format!("'{path}' is a vector field and cannot be filtered"))
+        }
         None if schema.is_retired(path) => Err(format!(
             "field '{path}' was dropped or renamed and cannot be filtered"
         )),
@@ -449,7 +459,6 @@ enum Operand {
     /// A range bound: a non-integral number stays a float for integer and timestamp fields.
     Bound,
 }
-
 
 fn parse_node(
     schema: &CollectionSchema,

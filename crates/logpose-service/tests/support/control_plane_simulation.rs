@@ -1,10 +1,11 @@
 use axum::body::Body;
 use http_body_util::BodyExt;
+use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, QueryRequest};
+use logpose_query::ExplainMode;
 use logpose_storage::CreateCollectionRequest;
 use logpose_types::{
     DistanceMetric, NodeRole, PutRecord, RecordId, WriteOperation, legacy::client_op_from_write,
@@ -20,6 +21,9 @@ use std::{
 };
 use tonic::Request;
 use tower::util::ServiceExt;
+
+#[path = "legacy_query.rs"]
+mod legacy_query;
 
 /// Apply legacy write operations as one mixed client batch.
 async fn write_legacy(
@@ -844,15 +848,20 @@ async fn assert_data_matches(
     let grpc_query = harness
         .grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name,
             collection_name: bare_collection_name,
-            vector: vec![1.0, 0.0],
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vec![1.0, 0.0],
+            }),
+            filter: None,
+            order_by: Vec::new(),
             top_k: expected_record_count as u64,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::None as i32,
             snapshot: None,
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: proto::ExplainMode::None as i32,
-            database_name,
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -880,9 +889,13 @@ async fn assert_data_matches(
     );
     assert_eq!(
         grpc_query
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.clone())
+            .filter_map(|hit| hit.record.as_ref().and_then(|record| record.pk.clone()))
+            .map(|pk| match pk.kind {
+                Some(proto::primary_key::Kind::StringValue(id)) => id,
+                other => format!("{other:?}"),
+            })
             .collect::<Vec<_>>(),
         expected_ids,
         "trace: {trace:?}"
@@ -985,8 +998,9 @@ async fn rest_collection_query(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": [1.0, 0.0],
-                        "top_k": top_k
+                        "vector": { "values": [1.0, 0.0] },
+                        "top_k": top_k,
+                        "output_fields": ["id"]
                     })
                     .to_string(),
                 ))
@@ -1004,12 +1018,12 @@ async fn rest_collection_query(
 }
 
 fn query_match_ids_from_json(response: &Value) -> Vec<String> {
-    response["matches"]
+    response["hits"]
         .as_array()
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item["id"].as_str().map(str::to_owned))
+                .filter_map(|item| item["record"]["id"].as_str().map(str::to_owned))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()

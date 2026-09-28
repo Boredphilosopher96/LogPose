@@ -6,8 +6,7 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, QueryResponse, VectorQuery,
-    scan_records,
+    ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, QueryResponse, VectorQuery, scan_records,
 };
 use logpose_storage::{
     CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine, ReadOptions,

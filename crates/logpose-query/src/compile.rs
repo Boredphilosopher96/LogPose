@@ -264,7 +264,8 @@ fn compile_node(schema: &CollectionSchema, expr: &FilterExpr, path: &str) -> Res
         FilterExpr::Not(child) => Node::Not(Box::new(compile_node(schema, child, &node_path)?)),
         FilterExpr::Exists { field } | FilterExpr::IsNull { field } => {
             let exists = matches!(expr, FilterExpr::Exists { .. });
-            let target = resolve_field(schema, field).map_err(|message| invalid(&node_path, message))?;
+            let target =
+                resolve_field(schema, field).map_err(|message| invalid(&node_path, message))?;
             leaf(
                 target,
                 if exists { Cond::Exists } else { Cond::IsNull },
@@ -281,7 +282,13 @@ fn compile_node(schema: &CollectionSchema, expr: &FilterExpr, path: &str) -> Res
             let field_path = format!("{node_path}.{field}");
             let target = target_for(schema, field, expr, &field_path)?;
             let negated = matches!(expr, FilterExpr::Ne { .. });
-            comparison(target, std::slice::from_ref(value), negated, &field_path, false)?
+            comparison(
+                target,
+                std::slice::from_ref(value),
+                negated,
+                &field_path,
+                false,
+            )?
         }
         FilterExpr::In { field, values }
         | FilterExpr::NotIn { field, values }
@@ -395,7 +402,9 @@ fn comparison(
             let keys = values
                 .iter()
                 .enumerate()
-                .map(|(index, value)| exact_key(element, value).map_err(|message| invalid(&at(index), message)))
+                .map(|(index, value)| {
+                    exact_key(element, value).map_err(|message| invalid(&at(index), message))
+                })
                 .collect::<Result<Vec<_>>>()?;
             let cond = if negated {
                 Cond::NoneOf(keys)
@@ -408,7 +417,9 @@ fn comparison(
             let scalars = values
                 .iter()
                 .enumerate()
-                .map(|(index, value)| json_scalar(value).map_err(|message| invalid(&at(index), message)))
+                .map(|(index, value)| {
+                    json_scalar(value).map_err(|message| invalid(&at(index), message))
+                })
                 .collect::<Result<Vec<_>>>()?;
             let cond = if negated {
                 JsonCond::NoneOf(scalars)
@@ -459,7 +470,8 @@ fn range(target: FilterTarget<'_>, bounds: &RangeBounds, field_path: &str) -> Re
     let mut high = Bound::Unbounded;
     for (name, value) in named {
         let bound_path = format!("{field_path}.{name}");
-        let bound = range_bound(element, name, value).map_err(|message| invalid(&bound_path, message))?;
+        let bound =
+            range_bound(element, name, value).map_err(|message| invalid(&bound_path, message))?;
         if matches!(name, "gt" | "gte") {
             low = bound;
         } else {
@@ -483,13 +495,18 @@ fn element_type(field_type: FieldType) -> Option<ElementType> {
 }
 
 fn mismatch(element: ElementType, value: &Value) -> String {
-    format!("expected an operand of type {element}, found {}", value.kind())
+    format!(
+        "expected an operand of type {element}, found {}",
+        value.kind()
+    )
 }
 
 /// The key equal to `value` in a column of `element` type.
 fn exact_key(element: ElementType, value: &Value) -> std::result::Result<ScalarKey, String> {
     match (element, value) {
-        (_, Value::Null) => Err("a filter operand cannot be null; use is_null or exists".to_owned()),
+        (_, Value::Null) => {
+            Err("a filter operand cannot be null; use is_null or exists".to_owned())
+        }
         (ElementType::Bool, Value::Bool(value)) => Ok(ScalarKey::Bool(*value)),
         (ElementType::Int64, Value::Int64(value)) => Ok(ScalarKey::Int(*value)),
         (ElementType::Int64, Value::Float64(value)) => integral(*value)
@@ -501,7 +518,9 @@ fn exact_key(element: ElementType, value: &Value) -> std::result::Result<ScalarK
         (ElementType::Timestamp, Value::Int64(micros)) => Ok(ScalarKey::timestamp_micros(*micros)),
         (ElementType::Timestamp, Value::Float64(value)) => integral(*value)
             .map(ScalarKey::timestamp_micros)
-            .ok_or_else(|| format!("expected timestamp microseconds, found the non-integral {value}")),
+            .ok_or_else(|| {
+                format!("expected timestamp microseconds, found the non-integral {value}")
+            }),
         (ElementType::Float64, Value::Float64(value)) => float_key(*value),
         #[allow(clippy::cast_precision_loss)]
         (ElementType::Float64, Value::Int64(value)) => {
@@ -862,11 +881,8 @@ fn json_matches(value: Option<&JsonValue>, cond: &JsonCond) -> bool {
     match cond {
         JsonCond::Exists => value.is_some(),
         JsonCond::IsNull => matches!(value, Some(JsonValue::Null)),
-        JsonCond::AnyOf(wanted) => scalar().is_some_and(|actual| {
-            wanted
-                .iter()
-                .any(|wanted| scalars_equal(&actual, wanted))
-        }),
+        JsonCond::AnyOf(wanted) => scalar()
+            .is_some_and(|actual| wanted.iter().any(|wanted| scalars_equal(&actual, wanted))),
         JsonCond::NoneOf(unwanted) => scalar().is_some_and(|actual| {
             unwanted
                 .iter()
@@ -1019,8 +1035,14 @@ mod tests {
                 "filter.or[0].eq.tenant",
             ),
             (FilterExpr::eq("embedding", 1), "filter.eq.embedding"),
-            (FilterExpr::eq("$extra.tenant", "a"), "filter.eq.$extra.tenant"),
-            (FilterExpr::contains("tenant", "a"), "filter.contains.tenant"),
+            (
+                FilterExpr::eq("$extra.tenant", "a"),
+                "filter.eq.$extra.tenant",
+            ),
+            (
+                FilterExpr::contains("tenant", "a"),
+                "filter.contains.tenant",
+            ),
             (FilterExpr::gt("active", true), "filter.range.active"),
             (
                 FilterExpr::range("price", RangeBounds::default()),
@@ -1037,16 +1059,16 @@ mod tests {
                 ),
                 "filter.range.price",
             ),
-            (
-                FilterExpr::lt("price", "cheap"),
-                "filter.range.price.lt",
-            ),
+            (FilterExpr::lt("price", "cheap"), "filter.range.price.lt"),
             (
                 FilterExpr::in_values("tags", vec![Value::from("a"), Value::Int64(3)]),
                 "filter.in.tags[1]",
             ),
             (FilterExpr::in_values("tags", vec![]), "filter.in.tags"),
-            (FilterExpr::eq("stock", Value::Float64(2.5)), "filter.eq.stock"),
+            (
+                FilterExpr::eq("stock", Value::Float64(2.5)),
+                "filter.eq.stock",
+            ),
             (FilterExpr::eq("sku", "7"), "filter.eq.sku"),
             (FilterExpr::eq("tenant", Value::Null), "filter.eq.tenant"),
             (

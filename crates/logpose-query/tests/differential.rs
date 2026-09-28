@@ -73,7 +73,10 @@ fn random_comparison(rng: &mut Rng) -> FilterExpr {
                 FilterExpr::ne("s", word(rng))
             }
         }
-        4 => FilterExpr::in_values("n", vec![Value::Int64(number(rng)), Value::Int64(number(rng))]),
+        4 => FilterExpr::in_values(
+            "n",
+            vec![Value::Int64(number(rng)), Value::Int64(number(rng))],
+        ),
         _ => match rng.below(4) {
             0 => FilterExpr::eq("n", number(rng)),
             1 => FilterExpr::ne("n", number(rng)),
@@ -114,12 +117,10 @@ fn matches(filter: &FilterExpr, row: &Row) -> bool {
         FilterExpr::IsNull { field } if field == "n" => row.n.is_none(),
         FilterExpr::Exists { field } if field == "s" => row.s.is_some(),
         FilterExpr::Eq { field, value } if field == "n" => row.n == Some(int(value)),
-        FilterExpr::Ne { field, value } if field == "n" => {
-            row.n.is_some_and(|n| n != int(value))
-        }
-        FilterExpr::In { field, values } if field == "n" => {
-            row.n.is_some_and(|n| values.iter().any(|value| int(value) == n))
-        }
+        FilterExpr::Ne { field, value } if field == "n" => row.n.is_some_and(|n| n != int(value)),
+        FilterExpr::In { field, values } if field == "n" => row
+            .n
+            .is_some_and(|n| values.iter().any(|value| int(value) == n)),
         FilterExpr::Range { field, bounds } if field == "n" => row.n.is_some_and(|n| {
             bounds.lt.as_ref().is_none_or(|bound| n < int(bound))
                 && bounds.gte.as_ref().is_none_or(|bound| n >= int(bound))

@@ -11,10 +11,7 @@ use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
-use logpose_query::{
-    FilterExpr, SearchRequest, SearchTuning,
-    UnitStrategy, search,
-};
+use logpose_query::{FilterExpr, SearchRequest, SearchTuning, UnitStrategy, search};
 use logpose_storage::{IndexPolicy, ReadView};
 use logpose_types::{DistanceMetric, schema::FieldType, value::Value};
 use rayon as _;

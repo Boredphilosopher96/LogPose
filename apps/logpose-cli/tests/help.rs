@@ -107,7 +107,11 @@ fn query_help_explains_input_formats_and_examples() {
     assert!(stdout.contains("kind=article"));
     assert!(stdout.contains("score=json:7"));
     assert!(stdout.contains("--where <FIELD:OP[:VALUE]>"));
-    assert!(stdout.contains("eq, ne, lt, lte, gt, gte, exists, is_null"));
+    assert!(
+        stdout.contains(
+            "eq, ne, lt, lte, gt, gte, in, not_in, contains, contains_any, exists, is_null"
+        )
+    );
     assert!(stdout.contains("--explain <MODE>"));
     assert!(stdout.contains("plan"));
     assert!(stdout.contains("profile"));

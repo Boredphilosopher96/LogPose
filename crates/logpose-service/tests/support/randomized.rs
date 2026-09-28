@@ -1,19 +1,17 @@
 use axum::body::Body;
 use http_body_util::BodyExt;
+use legacy_query::{LegacyQuery, MetadataFilter, QueryMatch, QueryRequest, QueryResponse};
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
 use logpose_catalog::{CollectionDescriptor, DEFAULT_COMPACTION_THRESHOLD_SEGMENTS};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{
-    ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
-    QueryResponse, ScalarMetadataValue,
-};
+use logpose_query::{ExplainMode, FilterExpr, QueryDiagnostics, QueryPlanKind};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    MaintenanceStatus, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
-    legacy::client_op_from_write,
+    MaintenanceStatus, PutRecord, RecordId, ScalarMetadataValue, SeqNo, Snapshot, VisibleRecord,
+    WriteOperation, legacy::client_op_from_write,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde as _;
@@ -27,6 +25,9 @@ use std::{
 };
 use tonic::Request;
 use tower::util::ServiceExt;
+
+#[path = "legacy_query.rs"]
+mod legacy_query;
 
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 30;
@@ -826,7 +827,7 @@ async fn assert_snapshot_expired_everywhere(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": vector,
+                        "vector": { "values": vector },
                         "top_k": EXACT_QUERY_TOP_K,
                         "snapshot": snapshot,
                     })
@@ -846,18 +847,23 @@ async fn assert_snapshot_expired_everywhere(
 
     let status = grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
-            vector,
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vector,
+            }),
+            filter: None,
+            order_by: Vec::new(),
             top_k: EXACT_QUERY_TOP_K as u64,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::None as i32,
             snapshot: Some(proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: proto::ExplainMode::None as i32,
-            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -924,19 +930,15 @@ async fn assert_query_parity(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": request.vector,
+                        "vector": { "values": request.vector },
                         "top_k": request.top_k,
                         "snapshot": request.snapshot,
-                        "predicate": if keep_only {
-                            json!({
-                                "kind": "comparison",
-                                "field": "kind",
-                                "operator": "eq",
-                                "value": "keep"
-                            })
+                        "filter": if keep_only {
+                            json!({ "eq": { "kind": "keep" } })
                         } else {
                             Value::Null
-                        }
+                        },
+                        "output_fields": ["$extra"]
                     })
                     .to_string(),
                 ))
@@ -946,12 +948,7 @@ async fn assert_query_parity(
         .expect("rest query should respond");
     let rest_body = json_body(rest_response).await;
     assert_eq!(
-        rest_body["matches"]
-            .as_array()
-            .expect("matches should be an array")
-            .iter()
-            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
-            .collect::<Vec<_>>(),
+        rest_ids(&rest_body),
         actual
             .matches
             .iter()
@@ -962,18 +959,23 @@ async fn assert_query_parity(
 
     let grpc_response = grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
-            vector,
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: vector,
+            }),
+            filter: keep_only.then(keep_only_proto_filter),
+            order_by: Vec::new(),
             top_k: EXACT_QUERY_TOP_K as u64,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::None as i32,
             snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: keep_only.then(keep_only_proto_predicate),
-            explain: proto::ExplainMode::None as i32,
-            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -983,11 +985,7 @@ async fn assert_query_parity(
         })
         .into_inner();
     assert_eq!(
-        grpc_response
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        grpc_ids(&grpc_response),
         actual
             .matches
             .iter()
@@ -1072,19 +1070,15 @@ async fn assert_query_parity(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "vector": profiled_request.vector,
+                        "vector": { "values": profiled_request.vector },
                         "top_k": profiled_request.top_k,
                         "snapshot": profiled_request.snapshot,
-                        "predicate": if keep_only {
-                            json!({
-                                "kind": "comparison",
-                                "field": "kind",
-                                "operator": "eq",
-                                "value": "keep"
-                            })
+                        "filter": if keep_only {
+                            json!({ "eq": { "kind": "keep" } })
                         } else {
                             Value::Null
                         },
+                        "output_fields": ["$extra"],
                         "explain": "profile"
                     })
                     .to_string(),
@@ -1095,12 +1089,7 @@ async fn assert_query_parity(
         .expect("rest profile query should respond");
     let profiled_rest_body = json_body(profiled_rest_response).await;
     assert_eq!(
-        profiled_rest_body["matches"]
-            .as_array()
-            .expect("matches should be an array")
-            .iter()
-            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
-            .collect::<Vec<_>>(),
+        rest_ids(&profiled_rest_body),
         profiled_service
             .matches
             .iter()
@@ -1121,18 +1110,23 @@ async fn assert_query_parity(
 
     let profiled_grpc = grpc
         .query_collection(Request::new(proto::QueryCollectionRequest {
+            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             collection_name: COLLECTION_NAME.to_owned(),
-            vector: request.vector.clone(),
+            vector: Some(proto::VectorQuery {
+                field: String::new(),
+                values: request.vector.clone(),
+            }),
+            filter: keep_only.then(keep_only_proto_filter),
+            order_by: Vec::new(),
             top_k: EXACT_QUERY_TOP_K as u64,
+            output_fields: vec!["$extra".to_owned()],
+            ef: 0,
+            explain: proto::ExplainMode::Profile as i32,
             snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
                 visible_seq_no: snapshot.visible_seq_no,
             }),
             read_barrier: None,
-            filters: Vec::new(),
-            predicate: keep_only.then(keep_only_proto_predicate),
-            explain: proto::ExplainMode::Profile as i32,
-            database_name: DEFAULT_DATABASE_NAME.to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -1142,11 +1136,7 @@ async fn assert_query_parity(
         })
         .into_inner();
     assert_eq!(
-        profiled_grpc
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        grpc_ids(&profiled_grpc),
         profiled_service
             .matches
             .iter()
@@ -1504,10 +1494,13 @@ async fn assert_inspect_parity(
         })
         .into_inner();
     assert_eq!(grpc_response.target, target_label);
-    let grpc_payload =
-        serde_json::from_str::<Value>(&grpc_response.payload_json).unwrap_or_else(|error| {
-            panic_with_context(seed, trace, format!("grpc inspect payload failed: {error}"))
-        });
+    let grpc_payload = logpose_api_grpc::convert::json_from_proto(
+        grpc_response.payload.clone().unwrap_or_default(),
+        "payload",
+    )
+    .unwrap_or_else(|error| {
+        panic_with_context(seed, trace, format!("grpc inspect payload failed: {error}"))
+    });
     match target_label {
         "manifest" => assert_eq!(
             grpc_payload["segments"]
@@ -1620,14 +1613,17 @@ async fn assert_inspect_segment_parity(
         })
         .into_inner();
     assert_eq!(grpc_response.target, format!("segment:{segment_id}"));
-    let grpc_payload =
-        serde_json::from_str::<Value>(&grpc_response.payload_json).unwrap_or_else(|error| {
-            panic_with_context(
-                seed,
-                trace,
-                format!("grpc segment inspect payload failed: {error}"),
-            )
-        });
+    let grpc_payload = logpose_api_grpc::convert::json_from_proto(
+        grpc_response.payload.clone().unwrap_or_default(),
+        "payload",
+    )
+    .unwrap_or_else(|error| {
+        panic_with_context(
+            seed,
+            trace,
+            format!("grpc segment inspect payload failed: {error}"),
+        )
+    });
     assert!(
         grpc_payload["records"]
             .as_array()
@@ -2276,29 +2272,50 @@ fn proto_plan_kind(plan: QueryPlanKind) -> proto::QueryPlanKind {
         QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
         QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
         QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,
+        QueryPlanKind::OrderedScan => proto::QueryPlanKind::OrderedScan,
     }
 }
 
-fn keep_only_predicate() -> logpose_query::FilterExpr {
-    logpose_query::FilterExpr::Comparison(logpose_query::FilterComparison {
-        field: "kind".to_owned(),
-        operator: logpose_query::FilterOperator::Eq,
-        value: Some(ScalarMetadataValue::String("keep".to_owned())),
-    })
+fn keep_only_predicate() -> FilterExpr {
+    FilterExpr::eq("kind", "keep")
 }
 
-fn keep_only_proto_predicate() -> proto::Predicate {
-    proto::Predicate {
-        node: Some(proto::predicate::Node::Comparison(
-            proto::PredicateComparison {
-                field: "kind".to_owned(),
-                operator: proto::PredicateOperator::Eq as i32,
-                value: Some(proto::ScalarValue {
-                    kind: Some(proto::scalar_value::Kind::StringValue("keep".to_owned())),
-                }),
-            },
-        )),
-    }
+fn keep_only_proto_filter() -> proto::Filter {
+    logpose_api_grpc::convert::filter_to_proto(keep_only_predicate())
+}
+
+/// The keys of a REST query reply's hits.
+fn rest_ids(body: &Value) -> Vec<String> {
+    body["hits"]
+        .as_array()
+        .expect("hits should be an array")
+        .iter()
+        .map(|hit| {
+            hit["record"]["id"]
+                .as_str()
+                .expect("id should be a string")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The keys of a gRPC query reply's hits.
+fn grpc_ids(reply: &proto::QueryCollectionReply) -> Vec<String> {
+    reply
+        .hits
+        .iter()
+        .map(|hit| {
+            match hit
+                .record
+                .as_ref()
+                .and_then(|record| record.pk.as_ref())
+                .and_then(|pk| pk.kind.clone())
+            {
+                Some(proto::primary_key::Kind::StringValue(id)) => id,
+                other => format!("{other:?}"),
+            }
+        })
+        .collect()
 }
 
 fn uses_ann(plan: QueryPlanKind) -> bool {

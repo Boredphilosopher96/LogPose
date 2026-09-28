@@ -353,7 +353,11 @@ impl StorageEngine for LocalStorageEngine {
         handle.write(ops).await
     }
 
-    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+    async fn delete_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+    ) -> Result<CommitAck> {
         self.handle(collection_name)?.delete_by_filter(filter).await
     }
 

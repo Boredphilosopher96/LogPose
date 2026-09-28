@@ -690,7 +690,11 @@ impl StorageEngine for EtcdBackedStorageEngine {
         self.local.write_batch(collection_name, ops).await
     }
 
-    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+    async fn delete_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+    ) -> Result<CommitAck> {
         self.local.delete_by_filter(collection_name, filter).await
     }
 

@@ -128,7 +128,11 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
     /// and committed as one atomic batch (see [`CollectionHandle::delete_by_filter`]).
     ///
     /// [`CollectionHandle::delete_by_filter`]: crate::CollectionHandle::delete_by_filter
-    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+    async fn delete_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+    ) -> Result<CommitAck> {
         let _ = collection_name;
         let _ = filter;
         Err(unsupported("filter writes"))

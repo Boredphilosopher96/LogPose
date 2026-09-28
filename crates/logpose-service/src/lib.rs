@@ -711,13 +711,9 @@ impl LogPoseDataService {
         request: QueryRequest,
     ) -> Result<WithSchema<QueryResponse>> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::query(
-            self.storage.as_ref(),
-            &descriptor.collection_ref(),
-            request,
-        )
-        .await
-        .map_err(Into::into)
+        logpose_query::query(self.storage.as_ref(), &descriptor.collection_ref(), request)
+            .await
+            .map_err(Into::into)
     }
 
     /// Count the live records matching a filter: see [`logpose_query::count_records`].
@@ -727,13 +723,9 @@ impl LogPoseDataService {
         request: CountRecordsRequest,
     ) -> Result<CountRecordsResponse> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::count_records(
-            self.storage.as_ref(),
-            &descriptor.collection_ref(),
-            request,
-        )
-        .await
-        .map_err(Into::into)
+        logpose_query::count_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
+            .await
+            .map_err(Into::into)
     }
 
     /// One page of a scroll: see [`logpose_query::scroll_records`].
@@ -743,13 +735,9 @@ impl LogPoseDataService {
         request: ScrollRecordsRequest,
     ) -> Result<WithSchema<ScrollRecordsResponse>> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::scroll_records(
-            self.storage.as_ref(),
-            &descriptor.collection_ref(),
-            request,
-        )
-        .await
-        .map_err(Into::into)
+        logpose_query::scroll_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
+            .await
+            .map_err(Into::into)
     }
 
     /// Capture the current read snapshot.

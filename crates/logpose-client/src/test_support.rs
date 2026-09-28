@@ -240,6 +240,20 @@ impl LogPoseService for ScriptedService {
         self.unimplemented("bulk_upsert_records")
     }
 
+    async fn count_records(
+        &self,
+        _request: Request<proto::CountRecordsRequest>,
+    ) -> Result<Response<proto::CountRecordsReply>, Status> {
+        self.unimplemented("count_records")
+    }
+
+    async fn scroll_records(
+        &self,
+        _request: Request<proto::ScrollRecordsRequest>,
+    ) -> Result<Response<proto::ScrollRecordsReply>, Status> {
+        self.unimplemented("scroll_records")
+    }
+
     async fn query_collection(
         &self,
         _request: Request<proto::QueryCollectionRequest>,

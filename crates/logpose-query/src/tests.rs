@@ -92,7 +92,10 @@ fn floats_and_timestamps_accept_their_operand_forms() {
         &record
     ));
     assert!(matches(&FilterExpr::lt("seen", seen(2_000_000)), &record));
-    assert!(matches(&FilterExpr::lt("seen", float(1_000_000.5)), &record));
+    assert!(matches(
+        &FilterExpr::lt("seen", float(1_000_000.5)),
+        &record
+    ));
 }
 
 #[test]
@@ -115,7 +118,10 @@ fn arrays_match_by_element_and_ne_excludes_rows_holding_the_value() {
 #[test]
 fn nulls_never_match_ne_but_not_includes_them() {
     let missing = Record::new("a-3");
-    assert!(!matches(&FilterExpr::ne("count", Value::Int64(1)), &missing));
+    assert!(!matches(
+        &FilterExpr::ne("count", Value::Int64(1)),
+        &missing
+    ));
     assert!(!matches(
         &FilterExpr::not_in("count", vec![Value::Int64(1)]),
         &missing
@@ -162,7 +168,10 @@ fn malformed_filters_and_vector_fields_are_refused_at_their_path() {
         (FilterExpr::eq("count", float(3.5)), "filter.eq.count"),
         (FilterExpr::lt("count", true), "filter.range.count.lt"),
         (FilterExpr::exists("embedding"), "filter.exists"),
-        (FilterExpr::contains("count", Value::Int64(3)), "filter.contains.count"),
+        (
+            FilterExpr::contains("count", Value::Int64(3)),
+            "filter.contains.count",
+        ),
         (
             FilterExpr::or(vec![
                 FilterExpr::exists("count"),
@@ -174,8 +183,7 @@ fn malformed_filters_and_vector_fields_are_refused_at_their_path() {
     for (filter, path) in invalid {
         match CompiledFilter::compile(&schema(), &filter) {
             Err(QueryError::Storage(LogPoseError::InvalidArgument {
-                field: Some(field),
-                ..
+                field: Some(field), ..
             })) => assert_eq!(field, path, "{filter:?}"),
             other => unreachable!("{filter:?} should be refused, got {other:?}"),
         }

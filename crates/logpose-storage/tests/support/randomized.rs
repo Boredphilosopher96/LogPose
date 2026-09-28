@@ -1,5 +1,6 @@
 use crate::scan::ScanExt;
-use logpose_query::{ExplainMode, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, query};
+use legacy_query::{QueryMatch, QueryRequest, QueryResponse, query};
+use logpose_query::{ExplainMode, QueryPlanKind};
 use logpose_storage::{
     CreateCollectionRequest, InspectTarget, LocalStorageEngine, SnapshotToken, StorageEngine,
 };
@@ -19,6 +20,8 @@ use std::{
 
 #[path = "fs.rs"]
 mod fs_support;
+#[path = "legacy_query.rs"]
+mod legacy_query;
 
 const COLLECTION_NAME: &str = "randomized";
 const DEFAULT_SCENARIO_STEPS: usize = 40;
@@ -1507,12 +1510,7 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         vector,
         top_k: EXACT_QUERY_TOP_K,
         snapshot: None,
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: None,
-        explain: logpose_query::ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
+        explain: ExplainMode::None,
     }
 }
 
@@ -1522,12 +1520,7 @@ fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRe
         vector,
         top_k: EXACT_QUERY_TOP_K,
         snapshot: Some(snapshot),
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: None,
-        explain: logpose_query::ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
+        explain: ExplainMode::None,
     }
 }
 

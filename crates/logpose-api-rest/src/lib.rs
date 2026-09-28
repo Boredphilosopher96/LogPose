@@ -22,11 +22,15 @@ pub use error::{ErrorBody, http_status};
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, FilterExpr, MetadataFilter, QueryRequest, ScalarMetadataValue};
+use logpose_query::{
+    CountRecordsRequest, CountRecordsResponse, ExplainMode, OrderBy, QueryRequest, ReadConsistency,
+    ScrollRecordsRequest, VectorQuery,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionRef, CommitAck, LogPoseError, ResourceKind, Snapshot,
-    record::{PartialUpdate, PrimaryKey, Record},
+    filter::FilterExpr,
+    record::{PartialUpdate, PrimaryKey, Record, RecordPatch},
     schema::{CollectionSchema, CreateCollectionSpec, FieldType, SchemaChange},
     value::Value as TypedValue,
 };
@@ -72,6 +76,8 @@ fn routes() -> Vec<(String, MethodRouter<Arc<AppState>>)> {
         (collection("/records/update"), post(update_records)),
         (collection("/records/delete"), post(delete_records)),
         (collection("/records/get"), post(get_records)),
+        (collection("/records/count"), post(count_records)),
+        (collection("/records/scroll"), post(scroll_records)),
         (collection("/query"), post(query_collection)),
         (collection("/stats"), get(get_collection_stats)),
         (collection("/flush"), post(flush_collection)),
@@ -365,25 +371,54 @@ async fn update_records(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(body): ApiJson<RecordsBody>,
+    ApiJson(body): ApiJson<UpdateBody>,
 ) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let schema = state
         .collection_schema_with_auth(&auth, &path.key())
         .await?;
-    let updates = body
-        .records
-        .into_iter()
-        .enumerate()
-        .map(|(index, document)| {
-            let key = document_key(&schema, &document);
-            PartialUpdate::from_json(&schema, document)
-                .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let ack = state
-        .update_records_with_auth(&auth, &path.key(), updates)
-        .await?;
+    let ack = match (body.records, body.filter, body.patch) {
+        (Some(records), None, None) => {
+            let updates = records
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| {
+                    let key = document_key(&schema, &document);
+                    PartialUpdate::from_json(&schema, document)
+                        .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            state
+                .update_records_with_auth(&auth, &path.key(), updates)
+                .await?
+        }
+        (None, Some(filter), Some(patch)) => {
+            let filter = FilterExpr::from_json(&schema, filter, "filter")?;
+            let patch = RecordPatch::from_json(&schema, patch)
+                .map_err(|error| error.to_error("patch", None))?;
+            state
+                .update_by_filter_with_auth(&auth, &path.key(), filter, patch)
+                .await?
+        }
+        (Some(_), _, _) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "records",
+                "an update takes records or a filter and a patch, not both",
+            )));
+        }
+        (None, None, _) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "records",
+                "an update needs records, or a filter and a patch",
+            )));
+        }
+        (None, Some(_), None) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "patch",
+                "an update by filter needs a patch",
+            )));
+        }
+    };
     Ok(Json(path.scoped(ack)))
 }
 
@@ -391,13 +426,38 @@ async fn delete_records(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(body): ApiJson<KeysBody>,
+    ApiJson(body): ApiJson<DeleteBody>,
 ) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let keys = primary_keys_from_json(body.keys)?;
-    let ack = state
-        .delete_records_with_auth(&auth, &path.key(), keys)
-        .await?;
+    let ack = match (body.keys, body.filter) {
+        (Some(keys), None) => {
+            let keys = primary_keys_from_json(keys)?;
+            state
+                .delete_records_with_auth(&auth, &path.key(), keys)
+                .await?
+        }
+        (None, Some(filter)) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            let filter = FilterExpr::from_json(&schema, filter, "filter")?;
+            state
+                .delete_by_filter_with_auth(&auth, &path.key(), filter)
+                .await?
+        }
+        (Some(_), Some(_)) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "keys",
+                "a delete takes keys or a filter, not both",
+            )));
+        }
+        (None, None) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "keys",
+                "a delete needs keys or a filter",
+            )));
+        }
+    };
     Ok(Json(path.scoped(ack)))
 }
 
@@ -427,53 +487,111 @@ async fn get_records(
     })))
 }
 
-async fn query_collection(
+async fn count_records(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(request): ApiJson<QueryCollectionBody>,
-) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
+    ApiJson(body): ApiJson<CountBody>,
+) -> Result<Json<CollectionScopedResponse<CountRecordsResponse>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    if request.top_k == 0 {
-        return Err(ApiError(LogPoseError::invalid_field(
-            "top_k",
-            "top_k must be greater than 0",
-        )));
-    }
-    let filters = request
-        .filters
-        .into_iter()
-        .map(|(field, value)| {
-            let field_name = field.clone();
-            ScalarMetadataValue::from_json(&value)
-                .map(|value| MetadataFilter { field, value })
-                .ok_or_else(|| {
-                    ApiError(LogPoseError::invalid_field(
-                        format!("filters.{field_name}"),
-                        "query filters must contain only scalar JSON values",
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
     let response = state
-        .query_with_auth(
+        .count_records_with_auth(
             &auth,
-            QueryRequest {
-                collection_name: path.key(),
-                vector: request.vector,
-                top_k: request.top_k,
-                snapshot: request.snapshot,
-                read_barrier: request.read_barrier,
-                filters,
-                predicate: request.predicate,
-                explain: request.explain,
-                snapshot_token: request.snapshot_token,
-                pin: request.pin,
+            &path.key(),
+            CountRecordsRequest {
+                filter,
+                read: ReadConsistency {
+                    snapshot: body.snapshot,
+                    read_barrier: body.read_barrier,
+                    snapshot_token: body.snapshot_token,
+                    pin: body.pin,
+                },
             },
         )
         .await?;
     Ok(Json(path.scoped(response)))
+}
+
+async fn scroll_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<ScrollBody>,
+) -> Result<Json<CollectionScopedResponse<Value>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
+    let page = state
+        .scroll_records_with_auth(
+            &auth,
+            &path.key(),
+            ScrollRecordsRequest {
+                filter,
+                order_by: body.order_by,
+                page_size: body.page_size,
+                output_fields: body.output_fields,
+                cursor: body.cursor,
+                snapshot_token: body.snapshot_token,
+            },
+        )
+        .await?;
+    Ok(Json(path.scoped(page.value.to_json(&page.schema))))
+}
+
+async fn query_collection(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<QueryCollectionBody>,
+) -> Result<Json<CollectionScopedResponse<Value>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
+    let response = state
+        .query_collection_with_auth(
+            &auth,
+            &path.key(),
+            QueryRequest {
+                vector: body.vector,
+                filter,
+                order_by: body.order_by,
+                top_k: body.top_k,
+                output_fields: body.output_fields,
+                ef: body.ef,
+                explain: body.explain,
+                read: ReadConsistency {
+                    snapshot: body.snapshot,
+                    read_barrier: body.read_barrier,
+                    snapshot_token: body.snapshot_token,
+                    pin: body.pin,
+                },
+            },
+        )
+        .await?;
+    Ok(Json(path.scoped(response.value.to_json(&response.schema))))
 }
 
 async fn get_collection_stats(
@@ -572,10 +690,58 @@ struct RecordsBody {
     records: Vec<Value>,
 }
 
+/// Keys to delete, or a filter whose matches to delete.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeysBody {
-    keys: Vec<Value>,
+struct DeleteBody {
+    #[serde(default)]
+    keys: Option<Vec<Value>>,
+    #[serde(default)]
+    filter: Option<Value>,
+}
+
+/// Partial documents to apply by key, or a filter and the patch to apply to its matches.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateBody {
+    #[serde(default)]
+    records: Option<Vec<Value>>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    patch: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountBody {
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    snapshot: Option<Snapshot>,
+    #[serde(default)]
+    read_barrier: Option<Snapshot>,
+    #[serde(default)]
+    snapshot_token: Option<String>,
+    #[serde(default)]
+    pin: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScrollBody {
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
+    #[serde(default)]
+    page_size: Option<u32>,
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    snapshot_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,19 +810,25 @@ struct CollectionStatsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryCollectionBody {
-    vector: Vec<f32>,
+    #[serde(default)]
+    vector: Option<VectorQuery>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
     top_k: usize,
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default)]
+    ef: Option<usize>,
+    #[serde(default)]
+    explain: ExplainMode,
     #[serde(default)]
     snapshot: Option<Snapshot>,
     #[serde(default)]
     read_barrier: Option<Snapshot>,
-    #[serde(default)]
-    filters: Map<String, Value>,
-    #[serde(default)]
-    predicate: Option<FilterExpr>,
-    #[serde(default)]
-    explain: ExplainMode,
     #[serde(default)]
     snapshot_token: Option<String>,
     #[serde(default)]
@@ -784,7 +956,7 @@ mod tests {
     };
     use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
-    use logpose_types::{DistanceMetric, RecordId};
+    use logpose_types::DistanceMetric;
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -796,18 +968,21 @@ mod tests {
 
     #[test]
     fn query_response_serializes_ann_diagnostics_fields() {
-        let payload = serde_json::to_value(QueryResponse {
-            metric: DistanceMetric::Dot,
+        let schema = logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot)
+            .expect("legacy schema should build");
+        let mut record = Record::new("alpha");
+        record.extra.insert("kind".to_owned(), json!("keep"));
+        let payload = QueryResponse {
+            vector_field: Some("vector".to_owned()),
+            metric: Some(DistanceMetric::Dot),
             top_k: 2,
-            returned: 1,
             snapshot: Snapshot {
                 manifest_generation: 7,
                 visible_seq_no: 11,
             },
-            matches: vec![logpose_query::QueryMatch {
-                id: RecordId::new("alpha"),
-                value: 42.0,
-                metadata: json!({"kind":"keep"}),
+            hits: vec![logpose_query::QueryHit {
+                record,
+                score: Some(42.0),
             }],
             diagnostics: Some(QueryDiagnostics {
                 chosen_plan: QueryPlanKind::CooperativeFilteredAnn,
@@ -838,8 +1013,15 @@ mod tests {
                 }),
             }),
             snapshot_token: None,
-        })
-        .expect("query response should serialize");
+        }
+        .to_json(&schema);
+        assert_eq!(
+            payload["hits"][0]["record"],
+            json!({ "id": "alpha", "kind": "keep" })
+        );
+        assert_eq!(payload["hits"][0]["score"], Value::from(42.0));
+        assert_eq!(payload["returned"], 1);
+        assert_eq!(payload["metric"], "dot");
 
         assert_eq!(
             payload["diagnostics"]["chosen_plan"],
