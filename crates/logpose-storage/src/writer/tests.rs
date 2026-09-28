@@ -1156,11 +1156,11 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
         status().in_progress.is_none()
     });
 
-    // Over the threshold again: a flush is requested and runs.
-    for id in ["c", "d"] {
-        core.write(&handle, vec![put(id, vec![1.0, 0.0])])
-            .expect("write");
-    }
+    // Still over the threshold, so the next publish requests a flush, and it runs. One write
+    // only: the flush freezes the state that write published, and a second write could land
+    // after the freeze and stay in the delta.
+    core.write(&handle, vec![put("c", vec![1.0, 0.0])])
+        .expect("write");
     wait_for("a flush after the failed drop", &|| {
         handle.current().manifest_generation > 0
     });
