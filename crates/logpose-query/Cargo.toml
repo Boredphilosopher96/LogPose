@@ -10,8 +10,11 @@ workspace = true
 
 [dependencies]
 logpose-catalog = { path = "../logpose-catalog" }
+logpose-index = { path = "../logpose-index" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
+rayon.workspace = true
+roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,5 +25,5 @@ criterion = "0.5"
 tokio.workspace = true
 
 [[bench]]
-name = "phase4_ann"
+name = "search"
 harness = false
