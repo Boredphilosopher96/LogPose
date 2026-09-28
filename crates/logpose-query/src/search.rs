@@ -688,6 +688,7 @@ fn unit_first_stage(
     let usable_graph = index.graph.as_ref().filter(|_| index.sq8.is_some());
     let Some(sq8) = index.sq8.as_ref() else {
         report.strategy = UnitStrategy::ExactF32;
+        report.candidates = usize::try_from(matched).unwrap_or(usize::MAX);
         report.reason = "no SQ8 codes (small segment)".to_owned();
         return Ok((report, UnitOutput::Scan(allowed)));
     };
