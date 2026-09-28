@@ -806,7 +806,7 @@ pub struct RecordGetArgs {
     #[arg(
         long = "output-field",
         value_name = "FIELD",
-        help = "Return only this field; repeat for more. The primary key is always returned."
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
     )]
     pub output_fields: Vec<String>,
 }
@@ -955,7 +955,7 @@ pub struct ScrollArgs {
     #[arg(
         long = "output-field",
         value_name = "FIELD",
-        help = "Return only this field; repeat for more. The primary key is always returned."
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
     )]
     pub output_fields: Vec<String>,
     #[arg(
@@ -1024,7 +1024,7 @@ pub struct QueryArgs {
     #[arg(
         long = "output-field",
         value_name = "FIELD",
-        help = "Return only this field; repeat for more. The primary key is always returned."
+        help = "Return only this field; repeat for more. The primary key is always returned. Without one, every scalar field and $extra key is returned but no vector: name a vector field to get it."
     )]
     pub output_fields: Vec<String>,
     #[arg(

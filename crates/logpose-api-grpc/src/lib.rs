@@ -2676,11 +2676,26 @@ mod tests {
         let records = convert::records_from_proto(fetched.records, "records").expect("decode");
         assert_eq!(records.len(), 2);
         let widget = &records[0];
+        assert!(
+            widget.vectors.is_empty(),
+            "the default projection returns no vectors"
+        );
+        let with_vector = service
+            .get_records(Request::new(GetRecordsRequest {
+                output_fields: vec!["embedding".to_owned()],
+                ..get_request("products", vec![int_key(1)])
+            }))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        let with_vector =
+            convert::records_from_proto(with_vector.records, "records").expect("decode");
         assert_eq!(
-            widget.vectors["embedding"],
+            with_vector[0].vectors["embedding"],
             vec![0.6, 0.0, 0.8],
             "cosine vectors are normalized when written"
         );
+        assert!(with_vector[0].fields.is_empty());
         assert_eq!(
             widget.fields["price"],
             logpose_types::value::Value::Float64(9.5)
@@ -2758,7 +2773,15 @@ mod tests {
             .await
             .expect("partial update should succeed");
         let updated = service
-            .get_records(Request::new(get_request("products", vec![int_key(1)])))
+            .get_records(Request::new(GetRecordsRequest {
+                output_fields: vec![
+                    "embedding".to_owned(),
+                    "price".to_owned(),
+                    "tags".to_owned(),
+                    "$extra".to_owned(),
+                ],
+                ..get_request("products", vec![int_key(1)])
+            }))
             .await
             .expect("get should succeed")
             .into_inner();
@@ -3270,7 +3293,10 @@ mod tests {
             Some("inventory")
         );
         let fetched = reopened
-            .get_records(Request::new(get_request("products", vec![int_key(7)])))
+            .get_records(Request::new(GetRecordsRequest {
+                output_fields: vec!["inventory".to_owned(), "embedding".to_owned()],
+                ..get_request("products", vec![int_key(7)])
+            }))
             .await
             .expect("get should succeed")
             .into_inner();

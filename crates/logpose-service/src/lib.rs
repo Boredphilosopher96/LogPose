@@ -611,7 +611,8 @@ impl LogPoseDataService {
         .await
     }
 
-    /// Point lookups by primary key, projected to `output_fields` (every field when empty).
+    /// Point lookups by primary key, projected to `output_fields` (every scalar field and
+    /// `$extra` key, but no vector, when empty).
     pub async fn get_records(
         &self,
         collection_name: &str,

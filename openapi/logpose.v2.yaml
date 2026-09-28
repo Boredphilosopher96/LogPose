@@ -1643,7 +1643,7 @@ components:
         output_fields:
           type: array
           default: []
-          description: "Fields to return: declared field names, `$extra` for every visible dynamic key, or (with dynamic fields on) single dynamic keys. The primary key is always returned. Empty returns every field."
+          description: "Fields to return: declared field names, `$extra` for every visible dynamic key, or (with dynamic fields on) single dynamic keys. The primary key is always returned. Empty returns every scalar field and every visible dynamic key, but no vector field: name a vector field to get it back."
           items:
             type: string
     RecordsResponse:
@@ -1855,7 +1855,7 @@ components:
         output_fields:
           type: array
           default: []
-          description: "Fields each hit returns, as `records/get` projects them; empty returns every field, vectors included. Name only the primary key to return keys and scores alone."
+          description: "Fields each hit returns, as `records/get` projects them; empty returns every scalar field and `$extra`, no vectors. Name only the primary key to return keys and scores alone."
           items:
             type: string
         ef:

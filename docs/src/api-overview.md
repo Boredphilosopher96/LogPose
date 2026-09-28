@@ -653,7 +653,9 @@ curl -X POST http://127.0.0.1:8080/v2/databases/analytics/collections/products/r
 
 `output_fields` projects the returned records: declared field names, `$extra`
 for every visible dynamic key, or (with dynamic fields on) single dynamic keys.
-The primary key is always returned, and an empty list returns every field.
+The primary key is always returned. An empty list returns every scalar field
+and every visible `$extra` key but no vector field: name a vector field to get
+it back (`"output_fields": ["embedding", "title"]`).
 
 Vectors of a `cosine` field are normalized to unit length when they are
 written, so reads return the normalized vector (`[3, 4]` reads back as
@@ -911,7 +913,7 @@ curl -X POST http://127.0.0.1:8080/v2/databases/analytics/collections/products/q
 | `filter`         | object   | no       | A [filter](#filters)                                                                                               |
 | `order_by`       | array    | no       | At most one `{"field": ..., "direction": "asc" or "desc"}`: reorders the vector hits, or orders the scan (key by default) |
 | `top_k`          | integer  | yes      | Results to return, 1 to 10,000                                                                                     |
-| `output_fields`  | string[] | no       | Fields each hit returns, as `records/get` projects them; empty returns every field, vectors included              |
+| `output_fields`  | string[] | no       | Fields each hit returns, as `records/get` projects them; empty returns every scalar field and `$extra`, no vectors |
 | `ef`             | integer  | no       | Beam width of graph walks, 1 to 4,096 (default 64, and at least four candidates per result); vector search only    |
 | `explain`        | string   | no       | `"none"`, `"plan"`, or `"profile"`                                                                                 |
 | `snapshot`       | object   | no       | Read one exact snapshot; see snapshot retention above                                                              |

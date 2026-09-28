@@ -423,9 +423,21 @@ async fn grpc_client_manages_typed_schemas_and_records() {
         .expect("records should be read");
     assert_eq!(fetched.records.len(), 1);
     assert_eq!(fetched.missing_keys, vec![PrimaryKey::Int64(8)]);
-    // Cosine vectors are normalized when written.
-    assert_eq!(fetched.records[0].vectors["embedding"], vec![0.6, 0.8]);
+    assert!(
+        fetched.records[0].vectors.is_empty(),
+        "no vectors by default"
+    );
     assert_eq!(fetched.records[0].extra["color"], json!("red"));
+    let with_vector = client
+        .get(
+            &collection,
+            vec![PrimaryKey::Int64(7)],
+            vec!["embedding".to_owned()],
+        )
+        .await
+        .expect("records should be read");
+    // Cosine vectors are normalized when written.
+    assert_eq!(with_vector.records[0].vectors["embedding"], vec![0.6, 0.8]);
 
     let update = PartialUpdate {
         pk: PrimaryKey::Int64(7),

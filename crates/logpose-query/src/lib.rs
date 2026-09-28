@@ -181,7 +181,8 @@ pub struct QueryRequest {
     pub order_by: Vec<OrderBy>,
     /// Results wanted, 1 to [`MAX_RESULTS`].
     pub top_k: usize,
-    /// Fields each hit returns, as `GetRecords` projects them; empty returns every field.
+    /// Fields each hit returns, as `GetRecords` projects them; empty returns every scalar field
+    /// and `$extra` key, no vectors.
     pub output_fields: Vec<String>,
     /// Beam width of graph walks, 1 to [`MAX_EF`]; only with a vector.
     pub ef: Option<usize>,
@@ -390,7 +391,8 @@ pub struct ScrollRecordsRequest {
     pub order_by: Vec<OrderBy>,
     /// Rows per page, 1 to [`MAX_RESULTS`]; [`DEFAULT_PAGE_SIZE`] when `None`.
     pub page_size: Option<u32>,
-    /// Fields each record returns; empty returns every field.
+    /// Fields each record returns; empty returns every scalar field and `$extra` key, no
+    /// vectors.
     pub output_fields: Vec<String>,
     /// Continue after the page that returned this cursor.
     pub cursor: Option<String>,

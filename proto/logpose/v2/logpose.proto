@@ -524,7 +524,8 @@ message GetRecordsRequest {
   repeated PrimaryKey keys = 3;
   // Fields to return: declared field names, `$extra` for every visible dynamic key, or (with
   // dynamic fields on) single dynamic keys. The primary key is always returned. Empty
-  // returns every field.
+  // returns every scalar field and every visible dynamic key, but no vector field: name a
+  // vector field to get it back.
   repeated string output_fields = 4;
 }
 
@@ -734,7 +735,8 @@ message ScrollRecordsRequest {
   repeated OrderBy order_by = 4;
   // Records per page, 1 to 10,000; 0 is 100.
   uint32 page_size = 5;
-  // Fields to return, as GetRecordsRequest projects them; empty returns every field.
+  // Fields to return, as GetRecordsRequest projects them; empty returns every scalar field and
+  // dynamic key, no vectors.
   repeated string output_fields = 6;
   string cursor = 7;
   // A first page reads the state this token pins, from a pinned count or query.
@@ -782,8 +784,9 @@ message QueryCollectionRequest {
   repeated OrderBy order_by = 5;
   // Results wanted, 1 to 10,000.
   uint64 top_k = 6;
-  // Fields each hit returns, as GetRecordsRequest projects them; empty returns every field,
-  // vectors included. Name only the primary key to return keys and scores alone.
+  // Fields each hit returns, as GetRecordsRequest projects them; empty returns every scalar
+  // field and dynamic key, no vectors. Name only the primary key to return keys and scores
+  // alone.
   repeated string output_fields = 7;
   // Beam width of graph walks, 1 to 4,096, with a vector only; 0 uses the default (64, and at
   // least four candidates per result).

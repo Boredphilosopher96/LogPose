@@ -694,7 +694,8 @@ impl LogPoseClient {
         })
     }
 
-    /// Read records by primary key, projected to `output_fields` (every field when empty).
+    /// Read records by primary key, projected to `output_fields` (every scalar field and
+    /// `$extra` key, but no vector, when empty).
     pub async fn get(
         &self,
         collection: &CollectionRef,

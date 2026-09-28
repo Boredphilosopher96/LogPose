@@ -2516,7 +2516,6 @@ mod tests {
             body["records"][0],
             json!({
                 "sku": 1,
-                "embedding": [0.6, 0.0, 0.8],
                 "tenant": "acme",
                 "price": 9.5,
                 "tags": ["a", "b"],
@@ -2524,10 +2523,24 @@ mod tests {
                 "attrs": {"size": 3, "big": u64::MAX},
                 "color": "red"
             }),
-            "cosine vectors are normalized, timestamps are RFC 3339 in UTC, and $extra keys \
-             are flattened into the document"
+            "no vectors by default, timestamps are RFC 3339 in UTC, and $extra keys are \
+             flattened into the document"
         );
         assert_eq!(body["records"][1]["updated_at"], "1970-01-01T00:00:00Z");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [1], "output_fields": ["embedding"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"][0],
+            json!({"sku": 1, "embedding": [0.6, 0.0, 0.8]}),
+            "a named vector is returned, normalized for cosine"
+        );
 
         let (status, body) = call(
             &app,
@@ -2554,7 +2567,7 @@ mod tests {
             &app,
             "POST",
             &format!("{products}/records/get"),
-            Some(json!({"keys": [1]})),
+            Some(json!({"keys": [1], "output_fields": ["embedding", "price", "tags", "$extra"]})),
         )
         .await;
         let record = &body["records"][0];
@@ -2676,7 +2689,10 @@ mod tests {
                 &app,
                 "POST",
                 &format!("{extremes}/records/get"),
-                Some(json!({"keys": [i64::MAX, i64::MIN, i64::MAX, 7]})),
+                Some(json!({
+                    "keys": [i64::MAX, i64::MIN, i64::MAX, 7],
+                    "output_fields": ["v", "n", "f", "at", "ns", "doc", "$extra"]
+                })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{stage}: {body}");
@@ -2891,7 +2907,7 @@ mod tests {
         .await;
         assert_eq!(
             body["records"][0],
-            json!({"id": "alpha", "vector": [1.0, 0.0], "size": 1}),
+            json!({"id": "alpha", "size": 1}),
             "the added field reads null on the old row, and the $extra key it names is hidden"
         );
 
@@ -2946,7 +2962,9 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/records/get"),
-            Some(json!({"keys": ["alpha", "beta"]})),
+            Some(
+                json!({"keys": ["alpha", "beta"], "output_fields": ["vector", "colour", "$extra"]}),
+            ),
         )
         .await;
         assert_eq!(
@@ -2962,7 +2980,9 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/records/get"),
-            Some(json!({"keys": ["alpha", "beta"]})),
+            Some(
+                json!({"keys": ["alpha", "beta"], "output_fields": ["vector", "colour", "$extra"]}),
+            ),
         )
         .await;
         assert_eq!(
@@ -3368,11 +3388,21 @@ mod tests {
         }
         let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
         let keys = (1..=40).collect::<Vec<i64>>();
+        let fields = json!(["embedding", "thumb", "tenant", "price", "tags", "$extra"]);
         for (path, body) in [
-            ("query", json!({"vector": vector, "top_k": 40})),
-            ("query", json!({"top_k": 40})),
-            ("records/scroll", json!({"page_size": 40})),
-            ("records/get", json!({"keys": keys})),
+            (
+                "query",
+                json!({"vector": vector, "top_k": 40, "output_fields": fields}),
+            ),
+            ("query", json!({"top_k": 40, "output_fields": fields})),
+            (
+                "records/scroll",
+                json!({"page_size": 40, "output_fields": fields}),
+            ),
+            (
+                "records/get",
+                json!({"keys": keys, "output_fields": fields}),
+            ),
         ] {
             let (status, error) = call(&app, "POST", &format!("{ITEMS}/{path}"), Some(body)).await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {error}");

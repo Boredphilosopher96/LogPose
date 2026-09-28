@@ -1194,7 +1194,6 @@ fn typed_schema_commands_manage_collections_and_records() {
         fetched["records"],
         json!([{
             "sku": 7,
-            "embedding": [0.6, 0.8],
             "title": "lamp",
             "price": 12.5,
             "color": "red"
@@ -1212,6 +1211,21 @@ fn typed_schema_commands_manage_collections_and_records() {
     ]);
     let projected: Value = serde_json::from_slice(&projected.stdout).expect("get prints json");
     assert_eq!(projected["records"], json!([{"sku": 8, "price": 99.0}]));
+
+    // Vectors come back only when named.
+    let with_vector = fixture.run_cli_json(&[
+        "record",
+        "get",
+        "shop/products",
+        "7",
+        "--output-field",
+        "embedding",
+    ]);
+    let with_vector: Value = serde_json::from_slice(&with_vector.stdout).expect("get prints json");
+    assert_eq!(
+        with_vector["records"],
+        json!([{"sku": 7, "embedding": [0.6, 0.8]}])
+    );
 
     let human = fixture.run_cli(["record", "get", "shop/products", "8"]);
     let human = String::from_utf8(human.stdout).expect("stdout should be utf8");

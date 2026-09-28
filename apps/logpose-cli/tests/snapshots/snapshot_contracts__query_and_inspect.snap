@@ -17,11 +17,7 @@ expression: snapshot
         "record": {
           "color": "red",
           "id": "alpha",
-          "kind": "keep",
-          "vector": [
-            1.0,
-            0.0
-          ]
+          "kind": "keep"
         },
         "score": 1.0
       }
@@ -77,11 +73,7 @@ expression: snapshot
         "record": {
           "color": "red",
           "id": "alpha",
-          "kind": "keep",
-          "vector": [
-            1.0,
-            0.0
-          ]
+          "kind": "keep"
         },
         "score": 1.0
       }
