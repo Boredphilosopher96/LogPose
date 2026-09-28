@@ -4445,6 +4445,19 @@ mod tests {
                 items_update(FilterExpr::eq("sku", "one"), price_patch),
                 "filter.eq.sku",
             ),
+            // A patch cannot change the primary key.
+            (
+                items_update(
+                    FilterExpr::eq("sku", 1),
+                    RecordPatch {
+                        fields: [("sku".to_owned(), TypedValue::Int64(99))]
+                            .into_iter()
+                            .collect(),
+                        ..RecordPatch::default()
+                    },
+                ),
+                "patch.sku",
+            ),
         ] {
             let error = service
                 .update_records(Request::new(request))
