@@ -50,6 +50,8 @@ mod jobs;
 mod pk_index;
 mod prepare;
 #[cfg(test)]
+mod status_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use apply::{LogicalState, replay_frame};

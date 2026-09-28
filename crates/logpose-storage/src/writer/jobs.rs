@@ -306,12 +306,16 @@ impl Writer {
                     %error,
                     "freezing the memtable for a flush failed"
                 );
-                for (_, reply) in self.flush_waiters.drain(..) {
+                // Report the failure before answering, so a caller whose flush failed reads it
+                // in the status. The waiters are taken first: should the failure poison the
+                // collection, they still get the freeze's own error.
+                let waiters = std::mem::take(&mut self.flush_waiters);
+                self.job_failed(JobKind::Flush, &error);
+                for (_, reply) in waiters {
                     if let Some(reply) = reply {
                         let _ = reply.send(Err(error.clone()));
                     }
                 }
-                self.job_failed(JobKind::Flush, &error);
             }
         }
     }
@@ -560,19 +564,11 @@ impl Writer {
                     },
                     Err(error) => Outcome::Failed(error),
                 };
-                if let Some(reply) = reply {
-                    let _ = reply.send(match &outcome {
-                        Outcome::Committed(snapshot) => Ok(snapshot.clone()),
-                        Outcome::Failed(error) => Err(error.clone()),
-                        Outcome::Nothing | Outcome::Abandoned => {
-                            Ok(self.handle.current().snapshot())
-                        }
-                    });
-                }
-                self.end_job(job, outcome, wrote_files).await;
+                self.end_job(job, outcome, wrote_files, reply).await;
             }
             ControlMsg::EndJob { job, wrote_files } => {
-                self.end_job(job, Outcome::Abandoned, wrote_files).await;
+                self.end_job(job, Outcome::Abandoned, wrote_files, None)
+                    .await;
             }
             ControlMsg::Flush { reply } => self.explicit_flush(reply).await,
             ControlMsg::Compact { reply } => {
@@ -665,7 +661,7 @@ impl Writer {
         let (kind, inputs) = (entry.kind, entry.inputs.clone());
         if let Some(refusal) = self.refusal() {
             drop(permit);
-            self.end_job(job, Outcome::Failed(refusal.clone_error()), false)
+            self.end_job(job, Outcome::Failed(refusal.clone_error()), false, None)
                 .await;
             return;
         }
@@ -673,7 +669,7 @@ impl Writer {
             Ok(unit) => unit,
             Err(error) => {
                 drop(permit);
-                self.end_job(job, Outcome::Failed(error), false).await;
+                self.end_job(job, Outcome::Failed(error), false, None).await;
                 return;
             }
         };
@@ -692,12 +688,12 @@ impl Writer {
         };
         let work = match work {
             Ok(JobWork::Nothing) => {
-                self.end_job(job, Outcome::Nothing, false).await;
+                self.end_job(job, Outcome::Nothing, false, None).await;
                 return;
             }
             Ok(work) => work,
             Err(error) => {
-                self.end_job(job, Outcome::Failed(error), false).await;
+                self.end_job(job, Outcome::Failed(error), false, None).await;
                 return;
             }
         };
@@ -734,7 +730,7 @@ impl Writer {
             ticket.done(result);
         });
         if let Err(error) = spawned {
-            self.end_job(job, Outcome::Failed(error), false).await;
+            self.end_job(job, Outcome::Failed(error), false, None).await;
         }
     }
 
@@ -808,8 +804,10 @@ impl Writer {
         let work = match work {
             Ok(work) => work,
             Err(error) => {
-                let _ = reply.send(Err(error.clone()));
-                self.end_job(job, Outcome::Failed(error), false).await;
+                // The job is over before the caller hears of it, as for every answer.
+                self.end_job(job, Outcome::Failed(error.clone()), false, None)
+                    .await;
+                let _ = reply.send(Err(error));
                 return;
             }
         };
@@ -820,9 +818,13 @@ impl Writer {
             unit,
             work,
         };
-        if reply.send(Ok(start)).is_err() || nothing {
-            // Gone before it wrote anything, or nothing to do.
-            self.end_job(job, Outcome::Abandoned, false).await;
+        if nothing {
+            // Nothing to do: the job is over before the caller hears of it.
+            self.end_job(job, Outcome::Abandoned, false, None).await;
+            let _ = reply.send(Ok(start));
+        } else if reply.send(Ok(start)).is_err() {
+            // Gone before it wrote anything.
+            self.end_job(job, Outcome::Abandoned, false, None).await;
         }
     }
 
@@ -1366,9 +1368,22 @@ impl Writer {
     }
 
     /// Job `job` is over: release its permit and reservations, remove what it wrote if no
-    /// manifest names it, settle the explicit requests it answers, and plan again.
-    async fn end_job(&mut self, job: JobId, outcome: Outcome, wrote_files: bool) {
+    /// manifest names it, publish the maintenance status without it, settle the requests it
+    /// answers (`reply`, a hand-stepped commit's, among them), and plan again.
+    ///
+    /// The status goes out before any answer, so a caller whose flush, compaction, or commit
+    /// returned never reads a status that still shows the job pending or running.
+    async fn end_job(
+        &mut self,
+        job: JobId,
+        outcome: Outcome,
+        wrote_files: bool,
+        reply: Option<SnapshotReply>,
+    ) {
         let Some(entry) = self.jobs.remove(&job) else {
+            if let Some(reply) = reply {
+                let _ = reply.send(self.answer(&outcome));
+            }
             return;
         };
         for unit in &entry.inputs {
@@ -1386,19 +1401,12 @@ impl Writer {
             Outcome::Failed(error) => self.job_failed(entry.kind, error),
             Outcome::Abandoned => {}
         }
-        match entry.kind {
-            JobKind::Flush => self.settle_flush_waiters(&outcome),
-            JobKind::Compact => {
-                for reply in entry.waiters {
-                    let _ = reply.send(match &outcome {
-                        Outcome::Committed(snapshot) => Ok(snapshot.clone()),
-                        Outcome::Failed(error) => Err(error.clone()),
-                        Outcome::Nothing | Outcome::Abandoned => {
-                            Ok(self.handle.current().snapshot())
-                        }
-                    });
-                }
-            }
+        self.update_status();
+        for reply in reply.into_iter().chain(entry.waiters) {
+            let _ = reply.send(self.answer(&outcome));
+        }
+        if entry.kind == JobKind::Flush {
+            self.settle_flush_waiters(&outcome);
         }
         if self.running_jobs() == 0 {
             for waiter in self.quiesce_waiters.drain(..) {
@@ -1417,6 +1425,15 @@ impl Writer {
             self.freeze_pending = true;
         }
         self.schedule();
+    }
+
+    /// What a request that job answers gets for `outcome`.
+    fn answer(&self, outcome: &Outcome) -> Result<Snapshot> {
+        match outcome {
+            Outcome::Committed(snapshot) => Ok(snapshot.clone()),
+            Outcome::Failed(error) => Err(error.clone()),
+            Outcome::Nothing | Outcome::Abandoned => Ok(self.handle.current().snapshot()),
+        }
     }
 
     /// A job of `kind` completed: reset the kind's backoff, count the run, and clear the last
