@@ -69,7 +69,8 @@ fn a_full_tier_is_merged_in_ascending_unit_order() {
     assert_eq!(plans.len(), 1);
     assert_eq!(units(&plans[0]), [1, 3, 4, 6]);
     assert_eq!(plans[0].reason, PlanReason::Tiered { tier: 0 });
-    assert_eq!(plans[0].build_bytes, 100 * 100);
+    // 100 live rows at 100 bytes, plus the largest input (40 rows) read whole.
+    assert_eq!(plans[0].build_bytes, 100 * 100 + 40 * 100);
 }
 
 #[test]
@@ -161,14 +162,15 @@ fn reserved_segments_are_never_planned_twice_and_jobs_stop_at_the_slot_limit() {
 
 #[test]
 fn a_job_is_capped_at_half_the_memory_pool() {
-    // Each segment needs 10 rows * 100 bytes; half the pool (2,500) fits two of them.
-    let policy = Policy::new(config(), 2, 5_000, RowShape::default());
+    // Each segment holds 10 rows * 100 bytes, and the input being read adds 1,000: half the
+    // pool (3,500) fits two of them (3,000), not three (4,000).
+    let policy = Policy::new(config(), 2, 7_000, RowShape::default());
     let segments = (1..=5).map(|unit| segment(unit, 10, 0)).collect::<Vec<_>>();
     let plans = policy.plan(&segments, &BTreeSet::new(), 2);
     assert_eq!(plans.len(), 2);
     for plan in &plans {
         assert_eq!(plan.inputs.len(), 2, "{plan:?}");
-        assert!(plan.build_bytes <= 2_500);
+        assert!(plan.build_bytes <= 3_500);
     }
 }
 
@@ -179,8 +181,46 @@ fn build_bytes_count_stored_rows_and_the_graph_per_vector_field() {
         vector_dims: 96,
     };
     let inputs = [segment(1, 10, 5), segment(2, 20, 0)];
-    // 5 + 20 live rows at (100 stored + 2 * 141 graph) bytes each.
-    assert_eq!(build_bytes(&inputs, shape), 25 * (100 + 2 * 141));
+    // 5 + 20 live rows at (100 stored + 2 * 141 graph) bytes each, plus the larger input's
+    // 2,000-byte file.
+    assert_eq!(build_bytes(&inputs, shape), 25 * (100 + 2 * 141) + 2_000);
+}
+
+/// The build reads each input whole, deleted rows included, so a rewrite of a mostly deleted
+/// segment is charged its whole file, not just its few live rows.
+#[test]
+fn build_bytes_charge_the_largest_input_whole_deleted_rows_included() {
+    let shape = RowShape::default();
+    // 10 of 1,000 rows live: 1,000 bytes of output, but the build holds the 100,000-byte file.
+    let mostly_deleted = [segment(1, 1_000, 990)];
+    assert_eq!(build_bytes(&mostly_deleted, shape), 10 * 100 + 100_000);
+    // Inputs are read one at a time: only the largest is charged whole.
+    let inputs = [segment(1, 10, 0), segment(2, 30, 0), segment(3, 20, 0)];
+    assert_eq!(build_bytes(&inputs, shape), 60 * 100 + 30 * 100);
+}
+
+/// A segment built to half the pool (the largest a background job makes) that passes the
+/// deleted ratio is still rewritten: a deletion-driven rewrite of one segment alone may take
+/// the whole pool, since reading it whole beside its live rows needs more than half.
+#[test]
+fn a_segment_at_the_half_pool_cap_is_still_rewritten_for_its_deletions() {
+    // 400 rows at 100 bytes: a 40,000-byte file. With 30 % deleted, the rewrite holds 28,000
+    // bytes of output plus the file, 68,000 bytes: more than half of a 100,000-byte pool.
+    let roomy = policy(config(), 100_000);
+    let heavy = segment(1, 400, 120);
+    let plans = roomy.plan(&[heavy, segment(2, 10, 0)], &BTreeSet::new(), 2);
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert_eq!(plans[0].reason, PlanReason::Deletions);
+    assert_eq!(
+        units(&plans[0]),
+        [1],
+        "nothing joins a job past half the pool"
+    );
+    assert_eq!(plans[0].build_bytes, 68_000);
+
+    // A segment that needs more than the whole pool is never planned.
+    let tight = policy(config(), 60_000);
+    assert!(tight.plan(&[heavy], &BTreeSet::new(), 2).is_empty());
 }
 
 #[test]
@@ -236,7 +276,8 @@ fn background_compaction_is_off_at_the_maximum_threshold_but_explicit_still_plan
 #[test]
 fn an_explicit_compaction_takes_what_fits_the_whole_pool_or_is_left_for_the_scheduler_to_decline() {
     let segments = (1..=5).map(|unit| segment(unit, 10, 0)).collect::<Vec<_>>();
-    let fits_three = policy(config(), 3_000);
+    // Two segments need 3,000 bytes, three 4,000, four 5,000.
+    let fits_three = policy(config(), 4_000);
     let plan = fits_three
         .plan_explicit(&segments, &BTreeSet::new())
         .expect("plan");

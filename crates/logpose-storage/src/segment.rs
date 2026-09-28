@@ -140,6 +140,34 @@ impl SegmentHandle {
             .map_err(|error| segment_error(self.path(), error))
     }
 
+    /// Visit the rows `wanted` accepts, in row order, read around the cache. The segment's
+    /// sections are held while it runs; each row is decoded when visited, so a caller that
+    /// copies rows elsewhere never holds a second copy of every row. A `visit` error is
+    /// returned as is.
+    pub(crate) fn for_each_row(
+        &self,
+        wanted: impl FnMut(u32) -> bool,
+        mut visit: impl FnMut(u32, SegmentRow) -> Result<()>,
+    ) -> Result<()> {
+        enum Stop {
+            Segment(SegmentError),
+            Visit(LogPoseError),
+        }
+        impl From<SegmentError> for Stop {
+            fn from(error: SegmentError) -> Self {
+                Self::Segment(error)
+            }
+        }
+        self.reader
+            .for_each_row(wanted, |row, stored| {
+                visit(row, stored).map_err(Stop::Visit)
+            })
+            .map_err(|stop| match stop {
+                Stop::Segment(error) => segment_error(self.path(), error),
+                Stop::Visit(error) => error,
+            })
+    }
+
     /// Keys and sequence numbers in row order, read around the cache.
     pub(crate) fn keys(&self) -> Result<(PkColumn, Vec<SeqNo>)> {
         self.reader

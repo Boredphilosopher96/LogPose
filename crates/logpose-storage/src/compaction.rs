@@ -14,10 +14,11 @@
 //!    `max_output_rows`, `max_output_bytes`, or the job's memory cap would be exceeded.
 //! 3. At most `max_jobs_per_collection` jobs at once, and no segment in two of them.
 //!
-//! Every job is sized to its maintenance-memory reservation, [`build_bytes`]: the policy caps
-//! a background job at half the pool, so two jobs can run at once, and the scheduler grants its
-//! permit only once that much of the pool is free. A row is rewritten about once per tier it
-//! climbs.
+//! Every job is sized to its maintenance-memory reservation, [`build_bytes`] (the output's rows
+//! plus the largest input, which the build reads whole): the policy caps a background job at
+//! half the pool, so two jobs can run at once, except that a deletion-driven rewrite of one
+//! segment alone may take the whole pool. The scheduler grants a permit only once that much of
+//! the pool is free. A row is rewritten about once per tier it climbs.
 //!
 //! **Job.** The protocol:
 //!
@@ -91,23 +92,29 @@ impl CoreRef {
         let mut pks = Vec::new();
         let mut sources = Vec::new();
         for (segment, deleted) in &work.inputs {
-            let rows = segment.read_rows()?;
-            let mut map = Vec::with_capacity(rows.len());
-            for (row, stored) in (0_u32..).zip(rows) {
-                if deleted.contains(row) {
-                    map.push(u32::MAX);
-                    continue;
-                }
-                map.push(builder.row_count());
-                builder
-                    .push_row_image(stored.seq_no, &stored.image)
-                    .map_err(LogPoseError::from)?;
-                pks.push(PrimaryKey::from(stored.image.pk));
-                sources.push(RowAddr {
-                    unit: segment.unit,
-                    row,
-                });
-            }
+            // One input at a time, with each copied row decoded only as it is visited: the build
+            // holds the output, plus the sections of the input it reads (`build_bytes`).
+            let mut map = Vec::new();
+            segment.for_each_row(
+                |row| !deleted.contains(row),
+                |row, stored| {
+                    // Rows arrive in order; the skipped ones in between were deleted.
+                    map.resize(row as usize, u32::MAX);
+                    map.push(builder.row_count());
+                    builder
+                        .push_row_image(stored.seq_no, &stored.image)
+                        .map_err(LogPoseError::from)?;
+                    pks.push(PrimaryKey::from(stored.image.pk));
+                    sources.push(RowAddr {
+                        unit: segment.unit,
+                        row,
+                    });
+                    Ok(())
+                },
+            )?;
+            // Trailing deleted rows.
+            let rows = (segment.row_count() as usize).max(map.len());
+            map.resize(rows, u32::MAX);
             maps.push(Arc::<[u32]>::from(map));
         }
         let output = if builder.row_count() == 0 {
@@ -240,16 +247,21 @@ impl RowShape {
 
 /// Memory a build of `inputs` holds: every copied row as stored (vectors, scalar columns, and
 /// keys, from the input files' bytes per row), plus the graph under construction for each
-/// vector field (`32 * 4 * 1.1` bytes per row).
+/// vector field (`32 * 4 * 1.1` bytes per row), plus the input being read. The build reads one
+/// input at a time with every section loaded whole, deleted rows included, so the largest
+/// input's file is charged in full: a rewrite of a mostly deleted segment holds far more than
+/// its live rows.
 pub(crate) fn build_bytes(inputs: &[Candidate], shape: RowShape) -> u64 {
-    inputs
+    let output = inputs
         .iter()
         .map(|input| {
             let per_row = input.file_len / u64::from(input.rows.max(1))
                 + shape.vector_fields * GRAPH_BYTES_PER_ROW;
             input.live().saturating_mul(per_row)
         })
-        .fold(0_u64, u64::saturating_add)
+        .fold(0_u64, u64::saturating_add);
+    let largest_input = inputs.iter().map(|input| input.file_len).max().unwrap_or(0);
+    output.saturating_add(largest_input)
 }
 
 /// Why a job was planned.
@@ -282,7 +294,8 @@ pub(crate) struct Policy {
     pub(crate) config: CompactionConfig,
     /// Whether background compaction runs for the collection.
     pub(crate) background: bool,
-    /// The engine's maintenance-memory pool; a background job reserves at most half of it.
+    /// The engine's maintenance-memory pool; a background job reserves at most half of it,
+    /// except a deletion-driven rewrite of one segment alone.
     pub(crate) pool_bytes: u64,
     pub(crate) shape: RowShape,
 }
@@ -369,7 +382,10 @@ impl Policy {
             .copied()
             .collect::<Vec<_>>();
 
-        // 1. Deletion-driven.
+        // 1. Deletion-driven. The rewrite of the heavy segment alone may use the whole pool:
+        // the largest segments are built to half of it, and a rewrite also holds the input file
+        // it reads, so within half the pool a large segment could never shed its deleted rows.
+        // Smaller segments join only while the job stays within half the pool.
         while plans.len() < slots {
             let heavy = free
                 .iter()
@@ -378,8 +394,8 @@ impl Policy {
                 .copied();
             let Some(heavy) = heavy else { break };
             free.retain(|segment| segment.unit != heavy.unit);
-            if !self.fits(&[], &heavy, cap) {
-                // Too large to rewrite within the cap; the tiers may still take it.
+            if !self.fits(&[], &heavy, self.pool_bytes) {
+                // Too large to rewrite even with the whole pool, so too large for any job.
                 continue;
             }
             let tier = self.tier(heavy.live());
