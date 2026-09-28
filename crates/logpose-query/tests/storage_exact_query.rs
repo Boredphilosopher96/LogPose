@@ -5,10 +5,14 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryError, QueryRequest, query,
+    ExplainMode, FilterExpr, QueryError, QueryRequest, QueryResponse, ReadConsistency, VectorQuery,
 };
-use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
-use logpose_types::{DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation};
+use logpose_storage::{
+    CollectionReader, CreateCollectionRequest, LocalStorageEngine, StorageEngine,
+};
+use logpose_types::{
+    CollectionRef, DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation,
+};
 use rayon as _;
 use roaring as _;
 use serde as _;
@@ -19,6 +23,51 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror as _;
+
+fn request(
+    collection: &str,
+    vector: Vec<f32>,
+    top_k: usize,
+    snapshot: Option<Snapshot>,
+    filter: Option<FilterExpr>,
+    explain: ExplainMode,
+) -> (CollectionRef, QueryRequest) {
+    (
+        CollectionRef::parse(collection).expect("name"),
+        QueryRequest {
+            vector: Some(VectorQuery {
+                field: None,
+                values: vector,
+            }),
+            top_k,
+            filter,
+            output_fields: vec!["$extra".to_owned()],
+            explain,
+            read: ReadConsistency {
+                snapshot,
+                ..ReadConsistency::default()
+            },
+            ..QueryRequest::default()
+        },
+    )
+}
+
+async fn query(
+    reader: &dyn CollectionReader,
+    (collection, request): (CollectionRef, QueryRequest),
+) -> Result<QueryResponse, QueryError> {
+    logpose_query::query(reader, &collection, request)
+        .await
+        .map(|result| result.value)
+}
+
+fn ids(response: &QueryResponse) -> Vec<String> {
+    response
+        .hits
+        .iter()
+        .map(|hit| hit.record.pk.label())
+        .collect()
+}
 
 #[tokio::test]
 async fn queries_storage_records_and_honors_snapshots() {
@@ -60,18 +109,7 @@ async fn queries_storage_records_and_honors_snapshots() {
 
     let current = query(
         &engine,
-        QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("documents", vec![1.0, 0.0], 2, None, None, ExplainMode::None),
     )
     .await
     .expect("query should succeed");
@@ -80,20 +118,16 @@ async fn queries_storage_records_and_honors_snapshots() {
         .snapshot("documents")
         .await
         .expect("snapshot should succeed");
-    assert_eq!(current.metric, DistanceMetric::Dot);
+    assert_eq!(current.metric, Some(DistanceMetric::Dot));
     assert_eq!(current.top_k, 2);
-    assert_eq!(current.returned, 2);
+    assert_eq!(current.hits.len(), 2);
     assert_eq!(current.snapshot, snapshot);
     assert_eq!(
-        current
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        ids(&current),
         vec!["alpha", "beta"]
     );
-    assert!((current.matches[0].value - 1.0).abs() < 1e-6);
-    assert!((current.matches[1].value - 0.5).abs() < 1e-6);
+    assert!((current.hits[0].score.unwrap_or_default() - 1.0).abs() < 1e-6);
+    assert!((current.hits[1].score.unwrap_or_default() - 0.5).abs() < 1e-6);
 
     engine
         .write(
@@ -109,29 +143,14 @@ async fn queries_storage_records_and_honors_snapshots() {
 
     let historical = query(
         &engine,
-        QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 3,
-            snapshot: Some(snapshot.clone()),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("documents", vec![1.0, 0.0], 3, Some(snapshot.clone()), None, ExplainMode::None),
     )
     .await
     .expect("historical query should succeed");
 
     assert_eq!(historical.snapshot, snapshot);
     assert_eq!(
-        historical
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        ids(&historical),
         vec!["alpha", "beta", "gamma"]
     );
 }
@@ -152,26 +171,14 @@ async fn returns_empty_matches_for_empty_collection() {
 
     let response = query(
         &engine,
-        QueryRequest {
-            collection_name: "empty".to_owned(),
-            vector: vec![1.0, 0.0, 0.0],
-            top_k: 5,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("empty", vec![1.0, 0.0, 0.0], 5, None, None, ExplainMode::None),
     )
     .await
     .expect("query should succeed");
 
-    assert_eq!(response.metric, DistanceMetric::Cosine);
+    assert_eq!(response.metric, Some(DistanceMetric::Cosine));
     assert_eq!(response.top_k, 5);
-    assert_eq!(response.returned, 0);
-    assert_eq!(response.matches.len(), 0);
+        assert_eq!(response.hits.len(), 0);
     assert_eq!(
         response.snapshot,
         Snapshot {
@@ -197,18 +204,7 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
 
     let result = query(
         &engine,
-        QueryRequest {
-            collection_name: "embeddings".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("embeddings", vec![1.0, 0.0], 1, None, None, ExplainMode::None),
     )
     .await;
 
@@ -271,27 +267,12 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("flush should succeed");
 
-    let historical_request = QueryRequest {
-        collection_name: "profiles".to_owned(),
-        vector: vec![0.0, 0.0],
-        top_k: 2,
-        snapshot: Some(before_delete),
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: None,
-        explain: logpose_query::ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
-    };
+    let historical_request = request("profiles", vec![0.0, 0.0], 2, Some(before_delete), None, ExplainMode::None);
     let historical = query(&engine, historical_request.clone())
         .await
         .expect("a pinned historical query should succeed");
     assert_eq!(
-        historical
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        ids(&historical),
         vec!["alpha", "beta"]
     );
 
@@ -331,28 +312,13 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
 
     let current = query(
         &reopened,
-        QueryRequest {
-            collection_name: "profiles".to_owned(),
-            vector: vec![0.0, 0.0],
-            top_k: 3,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("profiles", vec![0.0, 0.0], 3, None, None, ExplainMode::None),
     )
     .await
     .expect("current query should succeed");
 
     assert_eq!(
-        current
-            .matches
-            .iter()
-            .map(|candidate| candidate.id.as_str())
-            .collect::<Vec<_>>(),
+        ids(&current),
         vec!["gamma", "beta"]
     );
 }
@@ -389,28 +355,13 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
 
     let response = query(
         &engine,
-        QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: Some(FilterExpr::Comparison(FilterComparison {
-                field: "details".to_owned(),
-                operator: FilterOperator::Exists,
-                value: None,
-            })),
-            explain: ExplainMode::Plan,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("documents", vec![1.0, 0.0], 1, None, Some(FilterExpr::exists("details")), ExplainMode::Plan),
     )
     .await
     .expect("exists query should succeed");
 
-    assert_eq!(response.matches.len(), 1);
-    assert_eq!(response.matches[0].id.as_str(), "alpha");
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(response.hits[0].record.pk.label(), "alpha");
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
     assert_eq!(diagnostics.units_pruned, 0);
     assert_eq!(diagnostics.units_scanned, 1);
@@ -423,18 +374,7 @@ async fn surfaces_unknown_collection_errors_from_storage() {
 
     let result = query(
         &engine,
-        QueryRequest {
-            collection_name: "missing".to_owned(),
-            vector: vec![1.0],
-            top_k: 1,
-            snapshot: None,
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: logpose_query::ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        },
+        request("missing", vec![1.0], 1, None, None, ExplainMode::None),
     )
     .await;
 

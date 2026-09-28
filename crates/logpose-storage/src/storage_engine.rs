@@ -7,8 +7,9 @@ use logpose_types::{
     CollectionAssignment, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME,
     DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus, Result, Snapshot,
     WriteOperation,
+    filter::FilterExpr,
     legacy::{LEGACY_PRIMARY_KEY_FIELD, LEGACY_VECTOR_FIELD},
-    record::ClientOp,
+    record::{ClientOp, PartialUpdate},
     schema::{
         CollectionSchema, CreateCollectionSpec, PrimaryKeySpec, PrimaryKeyType, SchemaChange,
         VectorFieldSpec,
@@ -121,6 +122,32 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
         let _ = collection_name;
         let _ = ops;
         Err(unsupported("typed writes"))
+    }
+
+    /// Delete every live record matching `filter`, resolved against the writer's latest state
+    /// and committed as one atomic batch (see [`CollectionHandle::delete_by_filter`]).
+    ///
+    /// [`CollectionHandle::delete_by_filter`]: crate::CollectionHandle::delete_by_filter
+    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+        let _ = collection_name;
+        let _ = filter;
+        Err(unsupported("filter writes"))
+    }
+
+    /// Apply `patch` (its key is ignored) to every live record matching `filter`, as one atomic
+    /// batch (see [`CollectionHandle::update_by_filter`]).
+    ///
+    /// [`CollectionHandle::update_by_filter`]: crate::CollectionHandle::update_by_filter
+    async fn update_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+        patch: PartialUpdate,
+    ) -> Result<CommitAck> {
+        let _ = collection_name;
+        let _ = filter;
+        let _ = patch;
+        Err(unsupported("filter writes"))
     }
 
     /// Load the persisted placement assignment for a collection descriptor.

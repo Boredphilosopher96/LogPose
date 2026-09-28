@@ -8,8 +8,8 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, ScrollOrder, ScrollRequest,
-    SearchRequest, SearchTuning, count_view, metric_value, scroll, scroll_view, search,
+    FilterExpr, RangeBounds, ScrollOrder, ScrollRequest, SearchRequest, SearchTuning, count_view,
+    metric_value, scroll, scroll_view, search,
 };
 use logpose_storage::{IndexPolicy, Projection, read::Direction};
 use logpose_types::{
@@ -102,27 +102,6 @@ fn key(index: u64) -> String {
 
 // ----- Filters and their reference semantics -----------------------------------------------
 
-#[derive(Clone, Debug)]
-enum Operand {
-    Int(i64),
-    Float(f64),
-    Str(String),
-    Bool(bool),
-}
-
-impl Operand {
-    fn scalar(&self) -> ScalarMetadataValue {
-        match self {
-            Self::Int(value) => ScalarMetadataValue::Number((*value).into()),
-            Self::Float(value) => {
-                ScalarMetadataValue::Number(serde_json::Number::from_f64(*value).expect("finite"))
-            }
-            Self::Str(value) => ScalarMetadataValue::String(value.clone()),
-            Self::Bool(value) => ScalarMetadataValue::Bool(*value),
-        }
-    }
-}
-
 /// A scalar key of the model, ordered within its kind.
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 enum Key {
@@ -149,133 +128,188 @@ fn keys_of(row: &Row, field: &str) -> Vec<Key> {
     }
 }
 
+/// The model key of an operand.
+fn operand_key(value: &Value) -> Key {
+    match value {
+        Value::Int64(value) => Key::Int(*value),
+        Value::Float64(value) => Key::Float(*value),
+        Value::String(value) => Key::Str(value.clone()),
+        Value::Bool(value) => Key::Bool(*value),
+        other => unreachable!("no {other:?} operands"),
+    }
+}
+
+/// Whether `key` satisfies every bound of `bounds`.
+fn within(key: &Key, bounds: &RangeBounds) -> bool {
+    let test = |bound: &Option<Value>, holds: fn(&Key, &Key) -> bool| {
+        bound
+            .as_ref()
+            .is_none_or(|bound| holds(key, &operand_key(bound)))
+    };
+    test(&bounds.gt, |key, bound| key > bound)
+        && test(&bounds.gte, |key, bound| key >= bound)
+        && test(&bounds.lt, |key, bound| key < bound)
+        && test(&bounds.lte, |key, bound| key <= bound)
+}
+
 fn model_matches(filter: &FilterExpr, row: &Row) -> bool {
+    if let Some(field) = filter_field(filter)
+        && field == "d"
+    {
+        return dynamic_matches(filter, row.d);
+    }
     match filter {
-        FilterExpr::And { children } => children.iter().all(|child| model_matches(child, row)),
-        FilterExpr::Or { children } => children.iter().any(|child| model_matches(child, row)),
-        FilterExpr::Not { child } => !model_matches(child, row),
-        FilterExpr::Comparison(comparison) if comparison.field == "d" => {
-            dynamic_matches(comparison, row.d)
+        FilterExpr::And(children) => children.iter().all(|child| model_matches(child, row)),
+        FilterExpr::Or(children) => children.iter().any(|child| model_matches(child, row)),
+        FilterExpr::Not(child) => !model_matches(child, row),
+        FilterExpr::Exists { field } => !keys_of(row, field).is_empty(),
+        FilterExpr::IsNull { field } => keys_of(row, field).is_empty(),
+        FilterExpr::Eq { field, value } | FilterExpr::Contains { field, value } => {
+            keys_of(row, field).contains(&operand_key(value))
         }
-        FilterExpr::Comparison(comparison) => {
-            let keys = keys_of(row, &comparison.field);
-            let operand = comparison.value.as_ref().map(|value| match value {
-                ScalarMetadataValue::Number(number) if comparison.field == "f" => {
-                    Key::Float(number.as_f64().expect("f64"))
-                }
-                ScalarMetadataValue::Number(number) => Key::Int(number.as_i64().expect("i64")),
-                ScalarMetadataValue::String(text) => Key::Str(text.clone()),
-                ScalarMetadataValue::Bool(value) => Key::Bool(*value),
-                ScalarMetadataValue::Null => unreachable!("no null operands"),
-            });
-            let any = |test: &dyn Fn(&Key) -> bool| keys.iter().any(test);
-            match (comparison.operator, operand) {
-                (FilterOperator::Exists, _) => !keys.is_empty(),
-                (FilterOperator::IsNull, _) => keys.is_empty(),
-                (FilterOperator::Eq, Some(value)) => keys.contains(&value),
-                (FilterOperator::Ne, Some(value)) => !keys.is_empty() && !keys.contains(&value),
-                (FilterOperator::Lt, Some(value)) => any(&|key| key < &value),
-                (FilterOperator::Lte, Some(value)) => any(&|key| key <= &value),
-                (FilterOperator::Gt, Some(value)) => any(&|key| key > &value),
-                (FilterOperator::Gte, Some(value)) => any(&|key| key >= &value),
-                _ => false,
-            }
+        FilterExpr::Ne { field, value } => {
+            let keys = keys_of(row, field);
+            !keys.is_empty() && !keys.contains(&operand_key(value))
         }
+        FilterExpr::In { field, values } | FilterExpr::ContainsAny { field, values } => {
+            let wanted = values.iter().map(operand_key).collect::<Vec<_>>();
+            keys_of(row, field).iter().any(|key| wanted.contains(key))
+        }
+        FilterExpr::NotIn { field, values } => {
+            let unwanted = values.iter().map(operand_key).collect::<Vec<_>>();
+            let keys = keys_of(row, field);
+            !keys.is_empty() && keys.iter().all(|key| !unwanted.contains(key))
+        }
+        FilterExpr::Range { field, bounds } => keys_of(row, field)
+            .iter()
+            .any(|key| within(key, bounds)),
     }
 }
 
-/// The v1 JSON semantics on `$extra.d`.
-fn dynamic_matches(comparison: &FilterComparison, d: Option<Option<i64>>) -> bool {
-    let operand = comparison.value.as_ref().and_then(|value| match value {
-        ScalarMetadataValue::Number(number) => number.as_i64(),
-        _ => None,
-    });
-    let value = d.flatten();
-    match comparison.operator {
-        FilterOperator::Exists => d.is_some(),
-        FilterOperator::IsNull => d == Some(None),
-        FilterOperator::Eq => d.is_some() && value.is_some() && value == operand,
-        // A JSON null is a scalar that differs from every number.
-        FilterOperator::Ne => d.is_some() && value != operand,
-        FilterOperator::Lt => value.zip(operand).is_some_and(|(v, o)| v < o),
-        FilterOperator::Lte => value.zip(operand).is_some_and(|(v, o)| v <= o),
-        FilterOperator::Gt => value.zip(operand).is_some_and(|(v, o)| v > o),
-        FilterOperator::Gte => value.zip(operand).is_some_and(|(v, o)| v >= o),
+fn filter_field(filter: &FilterExpr) -> Option<&str> {
+    match filter {
+        FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => None,
+        FilterExpr::Exists { field }
+        | FilterExpr::IsNull { field }
+        | FilterExpr::Eq { field, .. }
+        | FilterExpr::Ne { field, .. }
+        | FilterExpr::Contains { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::NotIn { field, .. }
+        | FilterExpr::ContainsAny { field, .. }
+        | FilterExpr::Range { field, .. } => Some(field),
     }
 }
 
-fn comparison(field: &str, operator: FilterOperator, operand: Option<Operand>) -> FilterExpr {
-    FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator,
-        value: operand.map(|operand| operand.scalar()),
-    })
+/// The JSON semantics on `$extra.d`: `ne` and `not_in` need a non-null value.
+fn dynamic_matches(filter: &FilterExpr, d: Option<Option<i64>>) -> bool {
+    let value = d.flatten().map(Key::Int);
+    match filter {
+        FilterExpr::Exists { .. } => d.is_some(),
+        FilterExpr::IsNull { .. } => d == Some(None),
+        FilterExpr::Eq { value: operand, .. } => value == Some(operand_key(operand)),
+        FilterExpr::Ne { value: operand, .. } => {
+            value.is_some_and(|value| value != operand_key(operand))
+        }
+        FilterExpr::In { values, .. } => {
+            value.is_some_and(|value| values.iter().any(|operand| operand_key(operand) == value))
+        }
+        FilterExpr::NotIn { values, .. } => {
+            value.is_some_and(|value| values.iter().all(|operand| operand_key(operand) != value))
+        }
+        FilterExpr::Range { bounds, .. } => value.is_some_and(|value| within(&value, bounds)),
+        other => unreachable!("no {other:?} on d"),
+    }
+}
+
+/// A random bound set: one bound, or a lower and an upper one.
+fn random_bounds(rng: &mut Rng, operand: &mut impl FnMut(&mut Rng) -> Value) -> RangeBounds {
+    let mut bounds = RangeBounds::default();
+    let lower = rng.below(3);
+    let upper = if lower == 2 { rng.below(2) } else { rng.below(3) };
+    match lower {
+        0 => bounds.gt = Some(operand(rng)),
+        1 => bounds.gte = Some(operand(rng)),
+        _ => {}
+    }
+    match upper {
+        0 => bounds.lt = Some(operand(rng)),
+        1 => bounds.lte = Some(operand(rng)),
+        _ => {}
+    }
+    bounds
+}
+
+/// A random comparison on `field` with operands from `operand`: equality, inequality, set
+/// membership, or (when `ordered`) a range.
+fn random_op(
+    rng: &mut Rng,
+    field: &str,
+    ordered: bool,
+    mut operand: impl FnMut(&mut Rng) -> Value,
+) -> FilterExpr {
+    let field = field.to_owned();
+    match rng.below(if ordered { 5 } else { 4 }) {
+        0 => FilterExpr::Eq {
+            field,
+            value: operand(rng),
+        },
+        1 => FilterExpr::Ne {
+            field,
+            value: operand(rng),
+        },
+        2 => FilterExpr::In {
+            field,
+            values: vec![operand(rng), operand(rng)],
+        },
+        3 => FilterExpr::NotIn {
+            field,
+            values: vec![operand(rng), operand(rng)],
+        },
+        _ => FilterExpr::Range {
+            field,
+            bounds: random_bounds(rng, &mut operand),
+        },
+    }
 }
 
 fn random_comparison(rng: &mut Rng) -> FilterExpr {
-    let ordered = [
-        FilterOperator::Eq,
-        FilterOperator::Ne,
-        FilterOperator::Lt,
-        FilterOperator::Lte,
-        FilterOperator::Gt,
-        FilterOperator::Gte,
-    ];
-    let pick = |rng: &mut Rng, ops: &[FilterOperator]| ops[rng.below(ops.len() as u64) as usize];
     let field = ["n", "f", "s", "tags", "flag", "d"][rng.below(6) as usize];
     if rng.below(6) == 0 {
-        let operator = if rng.below(2) == 0 {
-            FilterOperator::Exists
+        return if rng.below(2) == 0 {
+            FilterExpr::exists(field)
         } else {
-            FilterOperator::IsNull
+            FilterExpr::is_null(field)
         };
-        return comparison(field, operator, None);
     }
+    let word = |rng: &mut Rng| Value::String(WORDS[rng.below(5) as usize].to_owned());
     match field {
-        "n" => comparison(
-            "n",
-            pick(rng, &ordered),
-            Some(Operand::Int(rng.below(20) as i64 - 5)),
-        ),
-        "f" => comparison(
-            "f",
-            pick(rng, &ordered),
-            Some(Operand::Float((rng.below(16) as f64) * 0.5 - 2.0)),
-        ),
-        "s" => comparison(
-            "s",
-            pick(rng, &ordered),
-            Some(Operand::Str(WORDS[rng.below(5) as usize].to_owned())),
-        ),
-        "tags" => comparison(
-            "tags",
-            pick(rng, &[FilterOperator::Eq, FilterOperator::Ne]),
-            Some(Operand::Str(WORDS[rng.below(5) as usize].to_owned())),
-        ),
-        "flag" => comparison(
-            "flag",
-            pick(rng, &[FilterOperator::Eq, FilterOperator::Ne]),
-            Some(Operand::Bool(rng.below(2) == 0)),
-        ),
-        _ => comparison(
-            "d",
-            pick(rng, &ordered),
-            Some(Operand::Int(rng.below(10) as i64)),
-        ),
+        "n" => random_op(rng, "n", true, |rng| Value::Int64(rng.below(20) as i64 - 5)),
+        "f" => random_op(rng, "f", true, |rng| {
+            Value::Float64((rng.below(16) as f64) * 0.5 - 2.0)
+        }),
+        "s" => random_op(rng, "s", true, word),
+        "tags" => match rng.below(3) {
+            0 => FilterExpr::Contains {
+                field: "tags".to_owned(),
+                value: word(rng),
+            },
+            1 => FilterExpr::ContainsAny {
+                field: "tags".to_owned(),
+                values: vec![word(rng), word(rng)],
+            },
+            _ => random_op(rng, "tags", false, word),
+        },
+        "flag" => random_op(rng, "flag", false, |rng| Value::Bool(rng.below(2) == 0)),
+        _ => random_op(rng, "d", true, |rng| Value::Int64(rng.below(10) as i64)),
     }
 }
 
 fn random_filter(rng: &mut Rng) -> FilterExpr {
     match rng.below(6) {
-        0 => FilterExpr::And {
-            children: vec![random_comparison(rng), random_comparison(rng)],
-        },
-        1 => FilterExpr::Or {
-            children: vec![random_comparison(rng), random_comparison(rng)],
-        },
-        2 => FilterExpr::Not {
-            child: Box::new(random_comparison(rng)),
-        },
+        0 => FilterExpr::And(vec![random_comparison(rng), random_comparison(rng)]),
+        1 => FilterExpr::Or(vec![random_comparison(rng), random_comparison(rng)]),
+        2 => FilterExpr::Not(Box::new(random_comparison(rng))),
         _ => random_comparison(rng),
     }
 }
@@ -452,6 +486,7 @@ impl Scenario {
                     limit,
                     projection: Projection::scalars(),
                     cursor: cursor.take(),
+                    token: None,
                 },
             )
             .await

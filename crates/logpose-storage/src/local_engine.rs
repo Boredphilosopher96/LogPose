@@ -21,7 +21,8 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, CollectionStats, CommitAck,
     LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole, Result, Snapshot, WriteOperation,
-    record::ClientOp,
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate},
     schema::{CollectionSchema, SchemaChange},
 };
 use logpose_vfs::{Vfs, std_vfs};
@@ -350,6 +351,21 @@ impl StorageEngine for LocalStorageEngine {
     async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
         let handle = self.handle(collection_name)?;
         handle.write(ops).await
+    }
+
+    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+        self.handle(collection_name)?.delete_by_filter(filter).await
+    }
+
+    async fn update_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+        patch: PartialUpdate,
+    ) -> Result<CommitAck> {
+        self.handle(collection_name)?
+            .update_by_filter(filter, patch)
+            .await
     }
 
     async fn write(

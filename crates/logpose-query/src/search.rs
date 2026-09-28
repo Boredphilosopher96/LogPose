@@ -390,7 +390,7 @@ fn vector_field<'a>(view: &'a ReadView, request: &SearchRequest) -> Result<&'a V
     }
     if request.vector.iter().any(|value| !value.is_finite()) {
         return Err(QueryError::Storage(LogPoseError::invalid_field(
-            "vector",
+            "vector.values",
             "query vector components must be finite",
         )));
     }
@@ -417,7 +417,7 @@ struct Context {
 /// # Errors
 ///
 /// Invalid requests ([`QueryError::RequestVectorDimensionMismatch`],
-/// [`QueryError::InvalidPredicate`], `InvalidArgument`), I/O and typed corruption.
+/// `InvalidArgument` naming the request field), I/O and typed corruption.
 pub async fn search(view: &ReadView, request: &SearchRequest) -> Result<SearchOutcome> {
     let started = Instant::now();
     let field = vector_field(view, request)?;

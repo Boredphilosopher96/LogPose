@@ -1,35 +1,47 @@
-//! Filter compilation: a [`FilterExpr`] against a view's schema, evaluated per unit to the
-//! bitmap of live rows it matches.
+//! Filter compilation: a [`FilterExpr`] checked against a view's schema, evaluated per unit to
+//! the bitmap of live rows it matches.
+//!
+//! # Checks
+//!
+//! [`CompiledFilter::compile`] resolves every field path with
+//! [`resolve_field`](logpose_types::filter::resolve_field) and checks every operand against the
+//! field it compares, and reports the first problem as `InvalidArgument` at the node's path
+//! below `filter` (the same paths [`FilterExpr::from_json`] uses, such as
+//! `filter.and[1].range.price.gte`):
+//!
+//! - `and` and `or` need a child, `in`, `not_in`, and `contains_any` a value, and `range` a
+//!   bound, but not both `gt` and `gte` (or `lt` and `lte`);
+//! - `contains` and `contains_any` need an array field, and `range` an ordered one (not `bool`);
+//! - an operand must be of the field's type (an array field's: of its element type). Numbers
+//!   convert between `int64` and `float64` when exact; an `int64` or `timestamp` range bound may
+//!   be any float, which rounds to the matching integer range (`x < 3.5` is `x <= 3`). A dynamic
+//!   key or `json` field compares with a scalar JSON operand; its range bounds are strings or
+//!   numbers.
 //!
 //! # Semantics
 //!
-//! A comparison names a field, resolved with the reading schema:
+//! A declared field's *keys* are its value's index keys: one per array element, one for a
+//! scalar, none for null (or an empty array). `exists` holds when a row has a key and `is_null`
+//! when it has none; `eq` and `contains` when some key equals the operand, `in` and
+//! `contains_any` when some key is one of them, `range` when some key lies within every bound,
+//! and `ne` and `not_in` when the row has a key and none is an operand (SQL-like: nulls never
+//! match). Integers and timestamps compare as integers, floats as floats, strings bytewise. The
+//! primary key has one key, never null.
 //!
-//! - **Declared scalar field.** A row's *keys* are its value's index keys: one per array
-//!   element, one for a scalar, none for null (or an empty array). `exists` holds when a row
-//!   has a key and `is_null` when it has none; `eq v` when some key equals `v`; the ordered
-//!   operators when some key lies in the range; and `ne v` when the row has a key and none
-//!   equals `v` (SQL-like: nulls never match `ne`). The operand is converted to the field's
-//!   type: integers and timestamps compare as integers (a timestamp also accepts an RFC 3339
-//!   string, and a non-integral bound rounds to the matching integer range), floats as floats,
-//!   strings bytewise. An operand of another type never equals a value, so `eq` matches
-//!   nothing and `ne` matches every row with a value.
-//! - **Undeclared name**, with dynamic fields on: the row's `$extra` key of that name, with the
-//!   JSON semantics of the v1 API (`exists` when the key is present, `is_null` when present and
-//!   `null`, `eq`/`ne` by JSON scalar equality, the ordered operators between two strings or
-//!   two numbers). A key the schema declares or retires is shadowed and reads as absent.
-//! - **The primary key**: its one key, never null.
-//! - **A JSON field**: its document, with the `$extra` JSON semantics.
+//! A dynamic key (and a `json` field) has JSON semantics: `exists` when the key is present,
+//! `is_null` when present and `null`, `eq` and `in` by JSON scalar equality, `ne` and `not_in`
+//! when present with a non-null scalar that differs, and the range bounds between two strings
+//! or two numbers.
 //!
 //! `not p` is `live AND NOT p`, so it includes rows where `p`'s field is null; `and` and `or`
 //! are intersection and union.
 //!
 //! # Evaluation
 //!
-//! Per unit, a comparison on a declared field uses the unit's index when one serves the
-//! operator (inverted or sorted for `eq`, `ne`, `exists`, `is_null`; sorted for ranges) and
-//! otherwise scans the column over the rows still in play; `$extra` and the key scan rows.
-//! `and` evaluates its index-served children first and narrows the rows later children scan.
+//! Per unit, a comparison on a declared field uses the unit's index when one serves it (inverted
+//! or sorted for equality, `exists`, and `is_null`; sorted for ranges) and otherwise scans the
+//! column over the rows still in play; `$extra` and the key scan rows. `and` evaluates its
+//! index-served children first and narrows the rows later children scan.
 
 use logpose_storage::{
     SectionNeed, UnitView,
@@ -37,17 +49,20 @@ use logpose_storage::{
     read::{ScalarKey, value_index_keys},
 };
 use logpose_types::{
-    ScalarMetadataValue,
-    filter::{FilterComparison, FilterExpr, FilterOperator},
+    LogPoseError, ScalarMetadataValue,
+    filter::{FilterExpr, FilterTarget, RangeBounds, resolve_field},
     record::PrimaryKey,
-    schema::{CollectionSchema, ElementType, FieldId, FieldRef, FieldType},
-    value::{Timestamp, Value},
+    schema::{CollectionSchema, ElementType, FieldId, FieldRef, FieldType, PrimaryKeyType},
+    value::Value,
 };
 use roaring::RoaringBitmap;
 use serde_json::Value as JsonValue;
 use std::{cmp::Ordering, ops::Bound, sync::Arc};
 
 use crate::{QueryError, Result};
+
+/// The request field filters are named under.
+pub const FILTER_PATH: &str = "filter";
 
 /// A filter compiled against one schema.
 #[derive(Clone, Debug)]
@@ -61,14 +76,8 @@ enum Node {
     And(Vec<Node>),
     Or(Vec<Node>),
     Not(Box<Node>),
-    Typed {
-        field: FieldId,
-        cond: Cond,
-    },
-    Json {
-        target: JsonTarget,
-        comparison: FilterComparison,
-    },
+    Typed { field: FieldId, cond: Cond },
+    Json { target: JsonTarget, cond: JsonCond },
     Key(Cond),
 }
 
@@ -81,11 +90,10 @@ enum JsonTarget {
 /// A condition over a row's index keys.
 #[derive(Clone, Debug)]
 enum Cond {
-    Nothing,
     IsNull,
     Exists,
-    Eq(ScalarKey),
-    Ne(Option<ScalarKey>),
+    AnyOf(Vec<ScalarKey>),
+    NoneOf(Vec<ScalarKey>),
     Range(Bound<ScalarKey>, Bound<ScalarKey>),
 }
 
@@ -93,11 +101,12 @@ impl Cond {
     /// Whether a row with `keys` satisfies the condition.
     fn holds(&self, keys: &[ScalarKey]) -> bool {
         match self {
-            Self::Nothing => false,
             Self::IsNull => keys.is_empty(),
             Self::Exists => !keys.is_empty(),
-            Self::Eq(key) => keys.contains(key),
-            Self::Ne(key) => !keys.is_empty() && key.as_ref().is_none_or(|key| !keys.contains(key)),
+            Self::AnyOf(wanted) => keys.iter().any(|key| wanted.contains(key)),
+            Self::NoneOf(unwanted) => {
+                !keys.is_empty() && keys.iter().all(|key| !unwanted.contains(key))
+            }
             Self::Range(low, high) => keys
                 .iter()
                 .any(|key| (low.as_ref(), high.as_ref()).contains_key(key)),
@@ -109,6 +118,42 @@ impl Cond {
     fn needs_sorted(&self) -> bool {
         matches!(self, Self::Range(..))
     }
+
+    /// Whether the condition can match no row at all (an empty range).
+    fn is_empty_range(&self) -> bool {
+        let Self::Range(low, high) = self else {
+            return false;
+        };
+        let (Some(low_key), Some(high_key)) = (bound_key(low), bound_key(high)) else {
+            return false;
+        };
+        match low_key.cmp(high_key) {
+            Ordering::Greater => true,
+            Ordering::Equal => {
+                matches!(low, Bound::Excluded(_)) || matches!(high, Bound::Excluded(_))
+            }
+            Ordering::Less => false,
+        }
+    }
+}
+
+fn bound_key(bound: &Bound<ScalarKey>) -> Option<&ScalarKey> {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key),
+        Bound::Unbounded => None,
+    }
+}
+
+/// A condition over a JSON value (a dynamic key or a `json` field).
+#[derive(Clone, Debug)]
+enum JsonCond {
+    Exists,
+    IsNull,
+    AnyOf(Vec<ScalarMetadataValue>),
+    NoneOf(Vec<ScalarMetadataValue>),
+    /// `(operator, operand)` pairs that must all hold, the operator one of `gt`, `gte`, `lt`,
+    /// `lte`.
+    Range(Vec<(&'static str, ScalarMetadataValue)>),
 }
 
 trait BoundsExt {
@@ -127,102 +172,28 @@ impl BoundsExt for (Bound<&ScalarKey>, Bound<&ScalarKey>) {
             Bound::Excluded(high) => key < high,
             Bound::Unbounded => true,
         };
-        above && below && low_kind_matches(self.0, key) && low_kind_matches(self.1, key)
+        above && below && kind_matches(self.0, key) && kind_matches(self.1, key)
     }
 }
 
 /// Keys of different kinds never compare: a bound of another kind excludes the key.
-fn low_kind_matches(bound: Bound<&ScalarKey>, key: &ScalarKey) -> bool {
+fn kind_matches(bound: Bound<&ScalarKey>, key: &ScalarKey) -> bool {
     match bound {
         Bound::Included(other) | Bound::Excluded(other) => other.kind() == key.kind(),
         Bound::Unbounded => true,
     }
 }
 
-/// Check a filter's structure: non-empty `and`/`or`, value-less `exists` and `is_null`, a
-/// value for the other operators, and a string or number for the ordered ones.
-///
-/// # Errors
-///
-/// [`QueryError::InvalidPredicate`].
-pub fn validate(expr: &FilterExpr) -> Result<()> {
-    match expr {
-        FilterExpr::And { children } | FilterExpr::Or { children } => {
-            if children.is_empty() {
-                return Err(QueryError::InvalidPredicate(
-                    "logical predicates must include at least one child".to_owned(),
-                ));
-            }
-            children.iter().try_for_each(validate)
-        }
-        FilterExpr::Not { child } => validate(child),
-        FilterExpr::Comparison(comparison) => match comparison.operator {
-            FilterOperator::Exists | FilterOperator::IsNull => {
-                if comparison.value.is_some() {
-                    return Err(QueryError::InvalidPredicate(format!(
-                        "predicate operator '{}' does not accept a value",
-                        operator_name(comparison.operator)
-                    )));
-                }
-                Ok(())
-            }
-            operator => {
-                let Some(value) = comparison.value.as_ref() else {
-                    return Err(QueryError::InvalidPredicate(format!(
-                        "predicate operator '{}' requires a value",
-                        operator_name(operator)
-                    )));
-                };
-                let ordered = matches!(
-                    operator,
-                    FilterOperator::Lt
-                        | FilterOperator::Lte
-                        | FilterOperator::Gt
-                        | FilterOperator::Gte
-                );
-                if ordered
-                    && !matches!(
-                        value,
-                        ScalarMetadataValue::String(_) | ScalarMetadataValue::Number(_)
-                    )
-                {
-                    return Err(QueryError::InvalidPredicate(format!(
-                        "predicate operator '{}' requires a string or number value",
-                        operator_name(operator)
-                    )));
-                }
-                Ok(())
-            }
-        },
-    }
-}
-
-/// The wire name of an operator.
-#[must_use]
-pub fn operator_name(operator: FilterOperator) -> &'static str {
-    match operator {
-        FilterOperator::Eq => "eq",
-        FilterOperator::Ne => "ne",
-        FilterOperator::Lt => "lt",
-        FilterOperator::Lte => "lte",
-        FilterOperator::Gt => "gt",
-        FilterOperator::Gte => "gte",
-        FilterOperator::Exists => "exists",
-        FilterOperator::IsNull => "is_null",
-    }
-}
-
 impl CompiledFilter {
-    /// Validate `expr` and resolve its field names with `schema`.
+    /// Check `expr` against `schema` and resolve its field paths. Errors name the offending
+    /// node below `filter`.
     ///
     /// # Errors
     ///
-    /// [`QueryError::InvalidPredicate`] for a malformed filter or one that compares a vector
-    /// field.
+    /// `InvalidArgument` at the node's path; see the [module documentation](self).
     pub fn compile(schema: &Arc<CollectionSchema>, expr: &FilterExpr) -> Result<Self> {
-        validate(expr)?;
         Ok(Self {
-            root: compile_node(schema, expr)?,
+            root: compile_node(schema, expr, FILTER_PATH)?,
             schema: Arc::clone(schema),
         })
     }
@@ -257,12 +228,7 @@ impl CompiledFilter {
         pins: &PinSet,
     ) -> logpose_types::Result<RoaringBitmap> {
         let live = unit.live();
-        Evaluator {
-            unit,
-            pins,
-            schema: &self.schema,
-        }
-        .eval(&self.root, &live)
+        Evaluator { unit, pins }.eval(&self.root, &live)
     }
 
     /// Whether one row satisfies the filter: the reference semantics the per-unit evaluation
@@ -273,67 +239,234 @@ impl CompiledFilter {
     }
 }
 
-fn compile_node(schema: &CollectionSchema, expr: &FilterExpr) -> Result<Node> {
+fn invalid(path: &str, message: impl Into<String>) -> QueryError {
+    QueryError::Storage(LogPoseError::invalid_field(path, message))
+}
+
+fn compile_node(schema: &CollectionSchema, expr: &FilterExpr, path: &str) -> Result<Node> {
+    let node_path = format!("{path}.{}", expr.operator());
+    let children = |children: &[FilterExpr]| -> Result<Vec<Node>> {
+        if children.is_empty() {
+            return Err(invalid(
+                &node_path,
+                format!("'{}' needs at least one filter", expr.operator()),
+            ));
+        }
+        children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| compile_node(schema, child, &format!("{node_path}[{index}]")))
+            .collect()
+    };
     Ok(match expr {
-        FilterExpr::And { children } => Node::And(
-            children
-                .iter()
-                .map(|child| compile_node(schema, child))
-                .collect::<Result<_>>()?,
-        ),
-        FilterExpr::Or { children } => Node::Or(
-            children
-                .iter()
-                .map(|child| compile_node(schema, child))
-                .collect::<Result<_>>()?,
-        ),
-        FilterExpr::Not { child } => Node::Not(Box::new(compile_node(schema, child)?)),
-        FilterExpr::Comparison(comparison) => {
-            let name = comparison.field.as_str();
-            if name == schema.primary_key().name {
-                let kind = match schema.primary_key_type() {
-                    logpose_types::schema::PrimaryKeyType::Int64 => ElementType::Int64,
-                    logpose_types::schema::PrimaryKeyType::String => ElementType::String,
-                };
-                return Ok(Node::Key(condition(kind, comparison)));
-            }
-            match schema.field(name) {
-                Some(FieldRef::PrimaryKey(_)) => {
-                    return Err(QueryError::InvalidPredicate(format!(
-                        "field '{name}' cannot be filtered"
-                    )));
-                }
-                Some(FieldRef::Vector(_)) => {
-                    return Err(QueryError::InvalidPredicate(format!(
-                        "field '{name}' is a vector field and cannot be filtered"
-                    )));
-                }
-                Some(FieldRef::Scalar(field)) => match element_type(field.field_type) {
-                    Some(element) => Node::Typed {
-                        field: field.id,
-                        cond: condition(element, comparison),
-                    },
-                    None => Node::Json {
-                        target: JsonTarget::Field(field.id),
-                        comparison: comparison.clone(),
-                    },
+        FilterExpr::And(list) => Node::And(children(list)?),
+        FilterExpr::Or(list) => Node::Or(children(list)?),
+        FilterExpr::Not(child) => Node::Not(Box::new(compile_node(schema, child, &node_path)?)),
+        FilterExpr::Exists { field } | FilterExpr::IsNull { field } => {
+            let exists = matches!(expr, FilterExpr::Exists { .. });
+            let target = resolve_field(schema, field).map_err(|message| invalid(&node_path, message))?;
+            leaf(
+                target,
+                if exists { Cond::Exists } else { Cond::IsNull },
+                if exists {
+                    JsonCond::Exists
+                } else {
+                    JsonCond::IsNull
                 },
-                None => {
-                    if schema.dynamic_fields() && !schema.shadows_dynamic_key(name) {
-                        Node::Json {
-                            target: JsonTarget::Dynamic(name.to_owned()),
-                            comparison: comparison.clone(),
-                        }
-                    } else {
-                        Node::Json {
-                            target: JsonTarget::Dynamic(String::new()),
-                            comparison: comparison.clone(),
-                        }
-                    }
-                }
+            )
+        }
+        FilterExpr::Eq { field, value }
+        | FilterExpr::Ne { field, value }
+        | FilterExpr::Contains { field, value } => {
+            let field_path = format!("{node_path}.{field}");
+            let target = target_for(schema, field, expr, &field_path)?;
+            let negated = matches!(expr, FilterExpr::Ne { .. });
+            comparison(target, std::slice::from_ref(value), negated, &field_path, false)?
+        }
+        FilterExpr::In { field, values }
+        | FilterExpr::NotIn { field, values }
+        | FilterExpr::ContainsAny { field, values } => {
+            let field_path = format!("{node_path}.{field}");
+            let target = target_for(schema, field, expr, &field_path)?;
+            if values.is_empty() {
+                return Err(invalid(
+                    &field_path,
+                    format!("'{}' needs at least one value", expr.operator()),
+                ));
             }
+            let negated = matches!(expr, FilterExpr::NotIn { .. });
+            comparison(target, values, negated, &field_path, true)?
+        }
+        FilterExpr::Range { field, bounds } => {
+            let field_path = format!("{node_path}.{field}");
+            let target = target_for(schema, field, expr, &field_path)?;
+            range(target, bounds, &field_path)?
         }
     })
+}
+
+/// The node of a condition on `target`.
+fn leaf(target: FilterTarget<'_>, cond: Cond, json: JsonCond) -> Node {
+    match target {
+        FilterTarget::PrimaryKey(_) => Node::Key(cond),
+        FilterTarget::Scalar(field) if field.field_type == FieldType::Json => Node::Json {
+            target: JsonTarget::Field(field.id),
+            cond: json,
+        },
+        FilterTarget::Scalar(field) => Node::Typed {
+            field: field.id,
+            cond,
+        },
+        FilterTarget::Dynamic(key) => Node::Json {
+            target: JsonTarget::Dynamic(key.to_owned()),
+            cond: json,
+        },
+    }
+}
+
+/// Resolve the field of a comparison and check that the operator fits it.
+fn target_for<'a>(
+    schema: &'a CollectionSchema,
+    field: &'a str,
+    expr: &FilterExpr,
+    field_path: &str,
+) -> Result<FilterTarget<'a>> {
+    let target = resolve_field(schema, field).map_err(|message| invalid(field_path, message))?;
+    let field_type = match target {
+        FilterTarget::Scalar(scalar) => Some(scalar.field_type),
+        FilterTarget::PrimaryKey(_) | FilterTarget::Dynamic(_) => None,
+    };
+    match expr {
+        FilterExpr::Contains { .. } | FilterExpr::ContainsAny { .. }
+            if !matches!(field_type, Some(FieldType::Array(_))) =>
+        {
+            Err(invalid(
+                field_path,
+                format!(
+                    "'{}' needs an array field; '{field}' is not one (use eq or in)",
+                    expr.operator()
+                ),
+            ))
+        }
+        FilterExpr::Range { .. }
+            if matches!(
+                field_type,
+                Some(FieldType::Bool | FieldType::Array(ElementType::Bool))
+            ) =>
+        {
+            Err(invalid(
+                field_path,
+                format!("'range' needs an ordered field; '{field}' is bool"),
+            ))
+        }
+        _ => Ok(target),
+    }
+}
+
+/// The key type a target's operands convert to; `None` for JSON targets.
+fn key_type(target: FilterTarget<'_>) -> Option<ElementType> {
+    match target {
+        FilterTarget::PrimaryKey(field) => Some(match field.key_type {
+            PrimaryKeyType::Int64 => ElementType::Int64,
+            PrimaryKeyType::String => ElementType::String,
+        }),
+        FilterTarget::Scalar(field) => element_type(field.field_type),
+        FilterTarget::Dynamic(_) => None,
+    }
+}
+
+/// An equality-style comparison (`eq`, `ne`, `in`, `not_in`, `contains`, `contains_any`).
+fn comparison(
+    target: FilterTarget<'_>,
+    values: &[Value],
+    negated: bool,
+    field_path: &str,
+    list: bool,
+) -> Result<Node> {
+    let at = |index: usize| {
+        if list {
+            format!("{field_path}[{index}]")
+        } else {
+            field_path.to_owned()
+        }
+    };
+    match key_type(target) {
+        Some(element) => {
+            let keys = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| exact_key(element, value).map_err(|message| invalid(&at(index), message)))
+                .collect::<Result<Vec<_>>>()?;
+            let cond = if negated {
+                Cond::NoneOf(keys)
+            } else {
+                Cond::AnyOf(keys)
+            };
+            Ok(leaf(target, cond, JsonCond::Exists))
+        }
+        None => {
+            let scalars = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| json_scalar(value).map_err(|message| invalid(&at(index), message)))
+                .collect::<Result<Vec<_>>>()?;
+            let cond = if negated {
+                JsonCond::NoneOf(scalars)
+            } else {
+                JsonCond::AnyOf(scalars)
+            };
+            Ok(leaf(target, Cond::Exists, cond))
+        }
+    }
+}
+
+/// A `range` node.
+fn range(target: FilterTarget<'_>, bounds: &RangeBounds, field_path: &str) -> Result<Node> {
+    let named = bounds.named();
+    if named.is_empty() {
+        return Err(invalid(
+            field_path,
+            "'range' needs at least one of gt, gte, lt, lte",
+        ));
+    }
+    if bounds.gt.is_some() && bounds.gte.is_some() {
+        return Err(invalid(field_path, "'range' takes gt or gte, not both"));
+    }
+    if bounds.lt.is_some() && bounds.lte.is_some() {
+        return Err(invalid(field_path, "'range' takes lt or lte, not both"));
+    }
+    let Some(element) = key_type(target) else {
+        let pairs = named
+            .into_iter()
+            .map(|(name, value)| {
+                let bound_path = format!("{field_path}.{name}");
+                let scalar = json_scalar(value).map_err(|message| invalid(&bound_path, message))?;
+                if !matches!(
+                    scalar,
+                    ScalarMetadataValue::String(_) | ScalarMetadataValue::Number(_)
+                ) {
+                    return Err(invalid(
+                        &bound_path,
+                        "a range bound on a JSON value must be a string or a number",
+                    ));
+                }
+                Ok((name, scalar))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(leaf(target, Cond::Exists, JsonCond::Range(pairs)));
+    };
+    let mut low = Bound::Unbounded;
+    let mut high = Bound::Unbounded;
+    for (name, value) in named {
+        let bound_path = format!("{field_path}.{name}");
+        let bound = range_bound(element, name, value).map_err(|message| invalid(&bound_path, message))?;
+        if matches!(name, "gt" | "gte") {
+            low = bound;
+        } else {
+            high = bound;
+        }
+    }
+    Ok(leaf(target, Cond::Range(low, high), JsonCond::Exists))
 }
 
 /// The element type a field's values index as; `None` for JSON.
@@ -349,128 +482,110 @@ fn element_type(field_type: FieldType) -> Option<ElementType> {
     })
 }
 
-/// The condition `comparison` puts on keys of `element` type.
-fn condition(element: ElementType, comparison: &FilterComparison) -> Cond {
-    let operand = comparison.value.as_ref();
-    match comparison.operator {
-        FilterOperator::Exists => Cond::Exists,
-        FilterOperator::IsNull => Cond::IsNull,
-        FilterOperator::Eq => match operand {
-            Some(ScalarMetadataValue::Null) => Cond::IsNull,
-            Some(value) => exact_key(element, value).map_or(Cond::Nothing, Cond::Eq),
-            None => Cond::Nothing,
-        },
-        FilterOperator::Ne => match operand {
-            Some(ScalarMetadataValue::Null) => Cond::Exists,
-            Some(value) => Cond::Ne(exact_key(element, value)),
-            None => Cond::Nothing,
-        },
-        operator => {
-            let Some(value) = operand else {
-                return Cond::Nothing;
-            };
-            range(element, operator, value).unwrap_or(Cond::Nothing)
-        }
-    }
+fn mismatch(element: ElementType, value: &Value) -> String {
+    format!("expected an operand of type {element}, found {}", value.kind())
 }
 
-/// The key equal to `value` in a column of `element` type, if one can be.
-fn exact_key(element: ElementType, value: &ScalarMetadataValue) -> Option<ScalarKey> {
+/// The key equal to `value` in a column of `element` type.
+fn exact_key(element: ElementType, value: &Value) -> std::result::Result<ScalarKey, String> {
     match (element, value) {
-        (ElementType::Bool, ScalarMetadataValue::Bool(value)) => Some(ScalarKey::Bool(*value)),
-        (ElementType::Int64 | ElementType::Timestamp, ScalarMetadataValue::Number(number)) => {
-            integral(number).map(ScalarKey::Int)
+        (_, Value::Null) => Err("a filter operand cannot be null; use is_null or exists".to_owned()),
+        (ElementType::Bool, Value::Bool(value)) => Ok(ScalarKey::Bool(*value)),
+        (ElementType::Int64, Value::Int64(value)) => Ok(ScalarKey::Int(*value)),
+        (ElementType::Int64, Value::Float64(value)) => integral(*value)
+            .map(ScalarKey::Int)
+            .ok_or_else(|| format!("expected an int64 operand, found the non-integral {value}")),
+        (ElementType::Timestamp, Value::Timestamp(value)) => {
+            Ok(ScalarKey::timestamp_micros(value.as_micros()))
         }
-        (ElementType::Timestamp, ScalarMetadataValue::String(text)) => {
-            Timestamp::parse_rfc3339(text)
-                .ok()
-                .map(|timestamp| ScalarKey::timestamp_micros(timestamp.as_micros()))
-        }
-        (ElementType::Float64, ScalarMetadataValue::Number(number)) => number
-            .as_f64()
-            .and_then(|value| ScalarKey::float(value).ok()),
-        (ElementType::String, ScalarMetadataValue::String(text)) => {
-            Some(ScalarKey::string(text.as_str()))
-        }
-        _ => None,
-    }
-}
-
-/// An integer exactly equal to `number`, if there is one.
-fn integral(number: &serde_json::Number) -> Option<i64> {
-    if let Some(value) = number.as_i64() {
-        return Some(value);
-    }
-    let value = number.as_f64()?;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    let exact = value.fract() == 0.0 && value >= i64::MIN as f64 && value < i64::MAX as f64;
-    #[allow(clippy::cast_possible_truncation)]
-    exact.then_some(value as i64)
-}
-
-/// The key range of an ordered comparison in a column of `element` type.
-fn range(
-    element: ElementType,
-    operator: FilterOperator,
-    value: &ScalarMetadataValue,
-) -> Option<Cond> {
-    let (low, high) = match element {
-        ElementType::Int64 | ElementType::Timestamp => {
-            let key = match value {
-                ScalarMetadataValue::Number(number) => number.as_f64()?,
-                ScalarMetadataValue::String(text) if element == ElementType::Timestamp => {
-                    #[allow(clippy::cast_precision_loss)]
-                    let micros = Timestamp::parse_rfc3339(text).ok()?.as_micros() as f64;
-                    micros
-                }
-                _ => return None,
-            };
-            if let Some(exact) = match value {
-                ScalarMetadataValue::Number(number) => integral(number),
-                ScalarMetadataValue::String(text) => Timestamp::parse_rfc3339(text)
-                    .ok()
-                    .map(Timestamp::as_micros),
-                _ => None,
-            } {
-                let key = ScalarKey::Int(exact);
-                bounds(operator, key)
+        (ElementType::Timestamp, Value::Int64(micros)) => Ok(ScalarKey::timestamp_micros(*micros)),
+        (ElementType::Timestamp, Value::Float64(value)) => integral(*value)
+            .map(ScalarKey::timestamp_micros)
+            .ok_or_else(|| format!("expected timestamp microseconds, found the non-integral {value}")),
+        (ElementType::Float64, Value::Float64(value)) => float_key(*value),
+        #[allow(clippy::cast_precision_loss)]
+        (ElementType::Float64, Value::Int64(value)) => {
+            let converted = *value as f64;
+            #[allow(clippy::cast_possible_truncation)]
+            let exact = converted as i64 == *value && converted < 9_223_372_036_854_775_808.0;
+            if exact {
+                float_key(converted)
             } else {
-                // A non-integral bound: x < 3.5 is x <= 3, and x > 3.5 is x >= 4.
-                #[allow(clippy::cast_possible_truncation)]
-                let floor = key.floor() as i64;
-                #[allow(clippy::cast_possible_truncation)]
-                let ceil = key.ceil() as i64;
-                match operator {
-                    FilterOperator::Lt | FilterOperator::Lte => {
-                        (Bound::Unbounded, Bound::Included(ScalarKey::Int(floor)))
-                    }
-                    _ => (Bound::Included(ScalarKey::Int(ceil)), Bound::Unbounded),
-                }
+                Err(format!("int64 operand {value} has no exact float64 form"))
             }
         }
-        ElementType::Float64 => {
-            let ScalarMetadataValue::Number(number) = value else {
-                return None;
-            };
-            bounds(operator, ScalarKey::float(number.as_f64()?).ok()?)
-        }
-        ElementType::String => {
-            let ScalarMetadataValue::String(text) = value else {
-                return None;
-            };
-            bounds(operator, ScalarKey::string(text.as_str()))
-        }
-        ElementType::Bool => return None,
-    };
-    Some(Cond::Range(low, high))
+        (ElementType::String, Value::String(value)) => Ok(ScalarKey::string(value.as_str())),
+        (element, other) => Err(mismatch(element, other)),
+    }
 }
 
-fn bounds(operator: FilterOperator, key: ScalarKey) -> (Bound<ScalarKey>, Bound<ScalarKey>) {
-    match operator {
-        FilterOperator::Lt => (Bound::Unbounded, Bound::Excluded(key)),
-        FilterOperator::Lte => (Bound::Unbounded, Bound::Included(key)),
-        FilterOperator::Gt => (Bound::Excluded(key), Bound::Unbounded),
-        _ => (Bound::Included(key), Bound::Unbounded),
+fn float_key(value: f64) -> std::result::Result<ScalarKey, String> {
+    ScalarKey::float(value).map_err(|_| "a float64 operand must be finite".to_owned())
+}
+
+/// The bound a range operator puts on keys of `element` type. A non-integral float bound of an
+/// integer or timestamp field rounds to the matching integer bound: `> 3.5` is `>= 4`.
+fn range_bound(
+    element: ElementType,
+    operator: &str,
+    value: &Value,
+) -> std::result::Result<Bound<ScalarKey>, String> {
+    let lower = matches!(operator, "gt" | "gte");
+    let inclusive = matches!(operator, "gte" | "lte");
+    if let (ElementType::Int64 | ElementType::Timestamp, Value::Float64(float)) = (element, value)
+        && integral(*float).is_none()
+    {
+        if !float.is_finite() {
+            return Err("a float64 operand must be finite".to_owned());
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let rounded = if lower { float.ceil() } else { float.floor() } as i64;
+        return Ok(Bound::Included(ScalarKey::Int(rounded)));
+    }
+    let key = match (element, value) {
+        (ElementType::Bool, _) => {
+            return Err("'range' needs an ordered field; bool is not one".to_owned());
+        }
+        _ => exact_key(element, value)?,
+    };
+    Ok(if inclusive {
+        Bound::Included(key)
+    } else {
+        Bound::Excluded(key)
+    })
+}
+
+/// An integer exactly equal to `value`, if there is one.
+fn integral(value: f64) -> Option<i64> {
+    #[allow(clippy::cast_precision_loss)]
+    let in_range = value >= i64::MIN as f64 && value < i64::MAX as f64;
+    #[allow(clippy::cast_possible_truncation)]
+    (value.fract() == 0.0 && in_range).then_some(value as i64)
+}
+
+/// A JSON target's operand: a scalar, never null.
+fn json_scalar(value: &Value) -> std::result::Result<ScalarMetadataValue, String> {
+    if value.is_null() {
+        return Err("a filter operand cannot be null; use is_null or exists".to_owned());
+    }
+    let json = value.to_json();
+    match ScalarMetadataValue::from_json(&json) {
+        Some(ScalarMetadataValue::Null) | None => Err(format!(
+            "a JSON value compares with a string, number, or bool operand, found {}",
+            json_kind(&json)
+        )),
+        Some(scalar) => Ok(scalar),
+    }
+}
+
+fn json_kind(json: &JsonValue) -> &'static str {
+    match json {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "bool",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
     }
 }
 
@@ -483,7 +598,7 @@ fn collect_needs(node: &Node, unit: &UnitView<'_>, needs: &mut Vec<SectionNeed>)
         }
         Node::Not(child) => collect_needs(child, unit, needs),
         Node::Typed { field, cond } => {
-            if matches!(cond, Cond::Nothing) {
+            if cond.is_empty_range() {
                 return;
             }
             let need = if unit.has_scalar_index(*field, cond.needs_sorted())
@@ -499,7 +614,6 @@ fn collect_needs(node: &Node, unit: &UnitView<'_>, needs: &mut Vec<SectionNeed>)
         }
         Node::Json { target, .. } => {
             let need = match target {
-                JsonTarget::Dynamic(name) if name.is_empty() => return,
                 JsonTarget::Dynamic(_) => {
                     if !unit.has_dynamic() {
                         return;
@@ -526,6 +640,9 @@ fn may_match(node: &Node, unit: &UnitView<'_>, schema: &CollectionSchema) -> boo
         Node::Or(children) => children.iter().any(|child| may_match(child, unit, schema)),
         Node::Not(_) | Node::Json { .. } | Node::Key(_) => true,
         Node::Typed { field, cond } => {
+            if cond.is_empty_range() {
+                return false;
+            }
             let Some(zone) = unit.zone(*field) else {
                 return true;
             };
@@ -537,21 +654,20 @@ fn may_match(node: &Node, unit: &UnitView<'_>, schema: &CollectionSchema) -> boo
                 return true;
             }
             let decode = |bytes: Option<&[u8]>| {
-                let value = logpose_wal_value(bytes?, declared.field_type)?;
+                let value =
+                    logpose_types::value::codec::decode(bytes?, declared.field_type).ok()?;
                 value_index_keys(&value).into_iter().next()
             };
             let (min, max) = (decode(min), decode(max));
             let rows = unit.row_count();
+            let within = |key: &ScalarKey| match (&min, &max) {
+                (Some(min), Some(max)) => min.kind() != key.kind() || (min <= key && key <= max),
+                _ => null_count < rows,
+            };
             match cond {
-                Cond::Nothing => false,
                 Cond::IsNull => null_count > 0,
-                Cond::Exists | Cond::Ne(_) => null_count < rows,
-                Cond::Eq(key) => match (min, max) {
-                    (Some(min), Some(max)) => {
-                        min.kind() != key.kind() || (&min <= key && key <= &max)
-                    }
-                    _ => null_count < rows,
-                },
+                Cond::Exists | Cond::NoneOf(_) => null_count < rows,
+                Cond::AnyOf(keys) => keys.iter().any(within),
                 Cond::Range(low, high) => match (min, max) {
                     (Some(min), Some(max)) => {
                         let low_ok = match high {
@@ -573,15 +689,9 @@ fn may_match(node: &Node, unit: &UnitView<'_>, schema: &CollectionSchema) -> boo
     }
 }
 
-/// Decode a zone bound stored in the binary value codec.
-fn logpose_wal_value(bytes: &[u8], field_type: FieldType) -> Option<Value> {
-    logpose_types::value::codec::decode(bytes, field_type).ok()
-}
-
 struct Evaluator<'a, 'v> {
     unit: &'a UnitView<'v>,
     pins: &'a PinSet,
-    schema: &'a CollectionSchema,
 }
 
 impl Evaluator<'_, '_> {
@@ -618,13 +728,13 @@ impl Evaluator<'_, '_> {
                 Ok(rows)
             }
             Node::Typed { field, cond } => self.typed(*field, cond, domain),
-            Node::Json { target, comparison } => {
+            Node::Json { target, cond } => {
                 let mut rows = RoaringBitmap::new();
                 match target {
                     JsonTarget::Dynamic(name) => {
-                        if name.is_empty() || !self.unit.has_dynamic() {
+                        if !self.unit.has_dynamic() {
                             // No visible key anywhere: every comparison sees it absent.
-                            if json_matches(None, comparison) {
+                            if json_matches(None, cond) {
                                 return Ok(domain.clone());
                             }
                             return Ok(rows);
@@ -633,7 +743,7 @@ impl Evaluator<'_, '_> {
                         for row in domain {
                             let object = dynamic.object(row)?;
                             let value = object.as_ref().and_then(|object| object.get(name));
-                            if json_matches(value, comparison) {
+                            if json_matches(value, cond) {
                                 rows.insert(row);
                             }
                         }
@@ -642,7 +752,7 @@ impl Evaluator<'_, '_> {
                         let column = self.unit.column(*field, self.pins)?;
                         for row in domain {
                             let value = column.value(row)?.map(Value::into_json);
-                            if json_matches(value.as_ref(), comparison) {
+                            if json_matches(value.as_ref(), cond) {
                                 rows.insert(row);
                             }
                         }
@@ -668,7 +778,7 @@ impl Evaluator<'_, '_> {
     fn index_served(&self, node: &Node) -> bool {
         match node {
             Node::Typed { field, cond } => {
-                matches!(cond, Cond::Nothing)
+                cond.is_empty_range()
                     || self.unit.has_scalar_index(*field, cond.needs_sorted())
                     || (!cond.needs_sorted() && self.unit.has_scalar_index(*field, true))
             }
@@ -686,7 +796,7 @@ impl Evaluator<'_, '_> {
         cond: &Cond,
         domain: &RoaringBitmap,
     ) -> logpose_types::Result<RoaringBitmap> {
-        if matches!(cond, Cond::Nothing) {
+        if cond.is_empty_range() {
             return Ok(RoaringBitmap::new());
         }
         let sorted = cond.needs_sorted();
@@ -696,16 +806,20 @@ impl Evaluator<'_, '_> {
             None => None,
         };
         if let Some(index) = index {
+            let any_of = |keys: &[ScalarKey]| {
+                let mut rows = RoaringBitmap::new();
+                for key in keys {
+                    rows |= index.equals(key);
+                }
+                rows
+            };
             let mut rows = match cond {
-                Cond::Nothing => RoaringBitmap::new(),
                 Cond::IsNull => index.nulls(),
                 Cond::Exists => index.exists(),
-                Cond::Eq(key) => index.equals(key),
-                Cond::Ne(key) => {
+                Cond::AnyOf(keys) => any_of(keys),
+                Cond::NoneOf(keys) => {
                     let mut rows = index.exists();
-                    if let Some(key) = key {
-                        rows -= index.equals(key);
-                    }
+                    rows -= any_of(keys);
                     rows
                 }
                 Cond::Range(low, high) => {
@@ -726,7 +840,6 @@ impl Evaluator<'_, '_> {
                 rows.insert(row);
             }
         }
-        let _ = self.schema;
         Ok(rows)
     }
 }
@@ -739,28 +852,45 @@ fn pk_key(pk: &PrimaryKey) -> ScalarKey {
     }
 }
 
-/// The v1 JSON semantics of one comparison on a possibly absent JSON value.
-fn json_matches(value: Option<&JsonValue>, comparison: &FilterComparison) -> bool {
-    let scalar = || value.and_then(ScalarMetadataValue::from_json);
-    let ordered = |wanted: Ordering| {
-        scalar()
-            .zip(comparison.value.clone())
-            .and_then(|(actual, expected)| compare_scalars(&actual, &expected))
-            .is_some_and(|ordering| ordering == wanted)
+/// The JSON semantics of one condition on a possibly absent JSON value.
+fn json_matches(value: Option<&JsonValue>, cond: &JsonCond) -> bool {
+    let scalar = || {
+        value
+            .and_then(ScalarMetadataValue::from_json)
+            .filter(|scalar| !matches!(scalar, ScalarMetadataValue::Null))
     };
-    match comparison.operator {
-        FilterOperator::Exists => value.is_some(),
-        FilterOperator::IsNull => matches!(value, Some(JsonValue::Null)),
-        FilterOperator::Eq => scalar()
-            .zip(comparison.value.clone())
-            .is_some_and(|(actual, expected)| actual == expected),
-        FilterOperator::Ne => scalar()
-            .zip(comparison.value.clone())
-            .is_some_and(|(actual, expected)| actual != expected),
-        FilterOperator::Lt => ordered(Ordering::Less),
-        FilterOperator::Lte => ordered(Ordering::Less) || ordered(Ordering::Equal),
-        FilterOperator::Gt => ordered(Ordering::Greater),
-        FilterOperator::Gte => ordered(Ordering::Greater) || ordered(Ordering::Equal),
+    match cond {
+        JsonCond::Exists => value.is_some(),
+        JsonCond::IsNull => matches!(value, Some(JsonValue::Null)),
+        JsonCond::AnyOf(wanted) => scalar().is_some_and(|actual| {
+            wanted
+                .iter()
+                .any(|wanted| scalars_equal(&actual, wanted))
+        }),
+        JsonCond::NoneOf(unwanted) => scalar().is_some_and(|actual| {
+            unwanted
+                .iter()
+                .all(|unwanted| !scalars_equal(&actual, unwanted))
+        }),
+        JsonCond::Range(bounds) => scalar().is_some_and(|actual| {
+            bounds.iter().all(|(operator, bound)| {
+                compare_scalars(&actual, bound).is_some_and(|ordering| match *operator {
+                    "gt" => ordering == Ordering::Greater,
+                    "gte" => ordering != Ordering::Less,
+                    "lt" => ordering == Ordering::Less,
+                    _ => ordering != Ordering::Greater,
+                })
+            })
+        }),
+    }
+}
+
+fn scalars_equal(left: &ScalarMetadataValue, right: &ScalarMetadataValue) -> bool {
+    match (left, right) {
+        (ScalarMetadataValue::Number(left), ScalarMetadataValue::Number(right)) => {
+            compare_numbers(left, right) == Ordering::Equal
+        }
+        _ => left == right,
     }
 }
 
@@ -811,18 +941,182 @@ fn row_matches(
                 .unwrap_or_default();
             cond.holds(&keys)
         }
-        Node::Json { target, comparison } => match target {
-            JsonTarget::Dynamic(name) if name.is_empty() => json_matches(None, comparison),
-            JsonTarget::Dynamic(name) => json_matches(record.extra.get(name), comparison),
+        Node::Json { target, cond } => match target {
+            JsonTarget::Dynamic(name) => json_matches(record.extra.get(name), cond),
             JsonTarget::Field(field) => {
                 let value = schema
                     .field_by_id(*field)
                     .and_then(|field| record.fields.get(field.name()))
                     .filter(|value| !value.is_null())
                     .map(Value::to_json);
-                json_matches(value.as_ref(), comparison)
+                json_matches(value.as_ref(), cond)
             }
         },
         Node::Key(cond) => cond.holds(&[pk_key(&record.pk)]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompiledFilter, FILTER_PATH};
+    use logpose_types::{
+        DistanceMetric, LogPoseError,
+        filter::{FilterExpr, RangeBounds},
+        record::Record,
+        schema::{
+            CollectionSchema, CreateCollectionSpec, ElementType, FieldType, PrimaryKeySpec,
+            PrimaryKeyType, ScalarFieldSpec, VectorFieldSpec,
+        },
+        value::Value,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn schema() -> Arc<CollectionSchema> {
+        Arc::new(
+            CreateCollectionSpec {
+                name: "products".to_owned(),
+                primary_key: PrimaryKeySpec {
+                    name: "sku".to_owned(),
+                    key_type: PrimaryKeyType::Int64,
+                },
+                vectors: vec![VectorFieldSpec {
+                    name: "embedding".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Dot,
+                }],
+                fields: vec![
+                    ScalarFieldSpec::new("tenant", FieldType::String),
+                    ScalarFieldSpec::new("price", FieldType::Float64),
+                    ScalarFieldSpec::new("stock", FieldType::Int64),
+                    ScalarFieldSpec::new("tags", FieldType::Array(ElementType::String)),
+                    ScalarFieldSpec::new("active", FieldType::Bool),
+                    ScalarFieldSpec::new("meta", FieldType::Json),
+                ],
+                dynamic_fields: true,
+            }
+            .build_schema()
+            .expect("schema should build"),
+        )
+    }
+
+    fn error_path(filter: &FilterExpr) -> String {
+        match CompiledFilter::compile(&schema(), filter) {
+            Err(crate::QueryError::Storage(LogPoseError::InvalidArgument {
+                field: Some(field),
+                ..
+            })) => field,
+            other => unreachable!("expected an invalid argument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_filters_name_the_node_path() {
+        let cases = [
+            (FilterExpr::and(vec![]), "filter.and"),
+            (
+                FilterExpr::or(vec![FilterExpr::eq("tenant", 3)]),
+                "filter.or[0].eq.tenant",
+            ),
+            (FilterExpr::eq("embedding", 1), "filter.eq.embedding"),
+            (FilterExpr::eq("$extra.tenant", "a"), "filter.eq.$extra.tenant"),
+            (FilterExpr::contains("tenant", "a"), "filter.contains.tenant"),
+            (FilterExpr::gt("active", true), "filter.range.active"),
+            (
+                FilterExpr::range("price", RangeBounds::default()),
+                "filter.range.price",
+            ),
+            (
+                FilterExpr::range(
+                    "price",
+                    RangeBounds {
+                        gt: Some(Value::Float64(1.0)),
+                        gte: Some(Value::Float64(1.0)),
+                        ..RangeBounds::default()
+                    },
+                ),
+                "filter.range.price",
+            ),
+            (
+                FilterExpr::lt("price", "cheap"),
+                "filter.range.price.lt",
+            ),
+            (
+                FilterExpr::in_values("tags", vec![Value::from("a"), Value::Int64(3)]),
+                "filter.in.tags[1]",
+            ),
+            (FilterExpr::in_values("tags", vec![]), "filter.in.tags"),
+            (FilterExpr::eq("stock", Value::Float64(2.5)), "filter.eq.stock"),
+            (FilterExpr::eq("sku", "7"), "filter.eq.sku"),
+            (FilterExpr::eq("tenant", Value::Null), "filter.eq.tenant"),
+            (
+                FilterExpr::eq("color", Value::Json(json!([1]))),
+                "filter.eq.color",
+            ),
+            (
+                FilterExpr::negate(FilterExpr::exists("embedding")),
+                "filter.not.exists",
+            ),
+        ];
+        for (filter, path) in cases {
+            assert_eq!(error_path(&filter), path, "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn filters_follow_the_documented_semantics() {
+        let schema = schema();
+        let record = Record::new(7_i64)
+            .with_field("tenant", Value::from("acme"))
+            .with_field("price", Value::Float64(12.5))
+            .with_field("stock", Value::Int64(3))
+            .with_field(
+                "tags",
+                Value::Array(vec![Value::from("outdoor"), Value::from("sale")]),
+            )
+            .with_field("meta", Value::Json(json!(4)));
+        let mut record = record;
+        record.extra.insert("color".to_owned(), json!("red"));
+        record.extra.insert("gone".to_owned(), json!(null));
+        let matches = |filter: FilterExpr| {
+            CompiledFilter::compile(&schema, &filter)
+                .expect("filter should compile")
+                .matches_record(&record)
+        };
+        assert!(matches(FilterExpr::eq("tenant", "acme")));
+        assert!(!matches(FilterExpr::eq("price", Value::Int64(12))));
+        assert!(matches(FilterExpr::gte("price", Value::Int64(12))));
+        assert!(matches(FilterExpr::lt("stock", Value::Float64(3.5))));
+        assert!(!matches(FilterExpr::lt("stock", Value::Float64(2.5))));
+        assert!(matches(FilterExpr::contains("tags", "sale")));
+        assert!(matches(FilterExpr::contains_any(
+            "tags",
+            vec![Value::from("x"), Value::from("outdoor")]
+        )));
+        assert!(!matches(FilterExpr::not_in(
+            "tags",
+            vec![Value::from("sale")]
+        )));
+        assert!(matches(FilterExpr::in_values(
+            "sku",
+            vec![Value::Int64(1), Value::Int64(7)]
+        )));
+        assert!(matches(FilterExpr::ne("color", Value::Json(json!("blue")))));
+        assert!(matches(FilterExpr::eq("$extra.color", Value::from("red"))));
+        assert!(matches(FilterExpr::is_null("gone")));
+        assert!(!matches(FilterExpr::ne("gone", Value::from("x"))));
+        assert!(!matches(FilterExpr::exists("active")));
+        assert!(!matches(FilterExpr::ne("active", true)));
+        assert!(matches(FilterExpr::negate(FilterExpr::eq("active", true))));
+        assert!(matches(FilterExpr::gt("meta", Value::Int64(3))));
+        assert!(!matches(FilterExpr::range(
+            "stock",
+            RangeBounds {
+                gt: Some(Value::Int64(3)),
+                lt: Some(Value::Int64(3)),
+                ..RangeBounds::default()
+            }
+        )));
+        assert_eq!(FILTER_PATH, "filter");
     }
 }

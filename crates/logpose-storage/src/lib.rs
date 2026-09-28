@@ -93,6 +93,9 @@ pub use segment_v2::IndexPolicy;
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
 };
-pub use tokens::{InvalidSnapshotToken, SnapshotToken, TokenConfig};
+pub use tokens::{
+    InvalidSnapshotToken, SnapshotToken, TOKEN_BYTES, TokenConfig, base64url_decode,
+    base64url_encode, checksum,
+};
 pub use version::{Version, VersionCounters, VersionId};
 pub use writer::{GroupCommitConfig, SchemaChange};

@@ -56,7 +56,7 @@ impl Default for TokenConfig {
 }
 
 /// Bytes of an encoded token before base64: collection id, version id, nonce, CRC.
-const TOKEN_BYTES: usize = 36;
+pub const TOKEN_BYTES: usize = 36;
 
 /// An opaque handle on a pinned snapshot. Clients see it as the base64url (no padding) text of
 /// its 36 bytes: the collection id (16), the version id (8), a random nonce that prevents
@@ -81,7 +81,9 @@ impl SnapshotToken {
         &self.collection_id
     }
 
-    fn to_bytes(&self) -> [u8; TOKEN_BYTES] {
+    /// The token's binary form: the [`TOKEN_BYTES`] bytes its text encodes.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; TOKEN_BYTES] {
         let mut bytes = [0; TOKEN_BYTES];
         bytes[..16].copy_from_slice(self.collection_id.0.as_bytes());
         bytes[16..24].copy_from_slice(&self.version_id.0.to_le_bytes());
@@ -91,7 +93,10 @@ impl SnapshotToken {
         bytes
     }
 
-    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    /// Parse the binary form [`SnapshotToken::to_bytes`] produces; `None` unless `bytes` is
+    /// exactly one token with a valid checksum.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != TOKEN_BYTES {
             return None;
         }
@@ -144,7 +149,15 @@ impl FromStr for SnapshotToken {
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn base64url_encode(bytes: &[u8]) -> String {
+/// The CRC-32C of `bytes`, the checksum of snapshot tokens and scroll cursors.
+#[must_use]
+pub fn checksum(bytes: &[u8]) -> u32 {
+    crc32c::crc32c(bytes)
+}
+
+/// Unpadded base64url text of `bytes`, the form of snapshot tokens and scroll cursors.
+#[must_use]
+pub fn base64url_encode(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut group = [0_u8; 3];
@@ -158,7 +171,9 @@ fn base64url_encode(bytes: &[u8]) -> String {
     text
 }
 
-fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+/// The bytes of canonical unpadded base64url `text`, or `None` if it is not that.
+#[must_use]
+pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
     if text.len() % 4 == 1 {
         return None;
     }

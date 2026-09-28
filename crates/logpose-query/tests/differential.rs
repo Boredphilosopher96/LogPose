@@ -14,8 +14,7 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, SearchRequest, SearchTuning,
-    UnitStrategy, count_view, metric_value, search,
+    FilterExpr, SearchRequest, SearchTuning, UnitStrategy, count_view, metric_value, search,
 };
 use logpose_storage::{IndexPolicy, Projection};
 use logpose_types::{
@@ -61,99 +60,73 @@ fn record(key: &str, row: &Row) -> Record {
     record
 }
 
-fn comparison(
-    field: &str,
-    operator: FilterOperator,
-    value: Option<ScalarMetadataValue>,
-) -> FilterExpr {
-    FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator,
-        value,
-    })
-}
-
 fn random_comparison(rng: &mut Rng) -> FilterExpr {
-    let operators = [
-        FilterOperator::Eq,
-        FilterOperator::Ne,
-        FilterOperator::Lt,
-        FilterOperator::Gte,
-    ];
-    match rng.below(7) {
-        0 => comparison("n", FilterOperator::IsNull, None),
-        1 => comparison("s", FilterOperator::Exists, None),
-        2 | 3 => comparison(
-            "s",
-            [FilterOperator::Eq, FilterOperator::Ne][rng.below(2) as usize],
-            Some(ScalarMetadataValue::String(
-                WORDS[rng.below(4) as usize].to_owned(),
-            )),
-        ),
-        _ => comparison(
-            "n",
-            operators[rng.below(4) as usize],
-            Some(ScalarMetadataValue::Number(
-                (rng.below(12) as i64 - 1).into(),
-            )),
-        ),
+    let word = |rng: &mut Rng| Value::String(WORDS[rng.below(4) as usize].to_owned());
+    let number = |rng: &mut Rng| rng.below(12) as i64 - 1;
+    match rng.below(8) {
+        0 => FilterExpr::is_null("n"),
+        1 => FilterExpr::exists("s"),
+        2 | 3 => {
+            if rng.below(2) == 0 {
+                FilterExpr::eq("s", word(rng))
+            } else {
+                FilterExpr::ne("s", word(rng))
+            }
+        }
+        4 => FilterExpr::in_values("n", vec![Value::Int64(number(rng)), Value::Int64(number(rng))]),
+        _ => match rng.below(4) {
+            0 => FilterExpr::eq("n", number(rng)),
+            1 => FilterExpr::ne("n", number(rng)),
+            2 => FilterExpr::lt("n", number(rng)),
+            _ => FilterExpr::gte("n", number(rng)),
+        },
     }
 }
 
 fn random_filter(rng: &mut Rng) -> FilterExpr {
     match rng.below(6) {
-        0 => FilterExpr::And {
-            children: vec![random_comparison(rng), random_comparison(rng)],
-        },
-        1 => FilterExpr::Or {
-            children: vec![random_comparison(rng), random_comparison(rng)],
-        },
-        2 => FilterExpr::Not {
-            child: Box::new(random_comparison(rng)),
-        },
+        0 => FilterExpr::And(vec![random_comparison(rng), random_comparison(rng)]),
+        1 => FilterExpr::Or(vec![random_comparison(rng), random_comparison(rng)]),
+        2 => FilterExpr::Not(Box::new(random_comparison(rng))),
         _ => random_comparison(rng),
+    }
+}
+
+fn int(value: &Value) -> i64 {
+    match value {
+        Value::Int64(value) => *value,
+        other => unreachable!("{other:?}"),
+    }
+}
+
+fn text(value: &Value) -> &str {
+    match value {
+        Value::String(value) => value,
+        other => unreachable!("{other:?}"),
     }
 }
 
 fn matches(filter: &FilterExpr, row: &Row) -> bool {
     match filter {
-        FilterExpr::And { children } => children.iter().all(|child| matches(child, row)),
-        FilterExpr::Or { children } => children.iter().any(|child| matches(child, row)),
-        FilterExpr::Not { child } => !matches(child, row),
-        FilterExpr::Comparison(comparison) => {
-            let operand = comparison.value.as_ref();
-            match comparison.field.as_str() {
-                "n" => {
-                    let wanted = match operand {
-                        Some(ScalarMetadataValue::Number(number)) => number.as_i64(),
-                        _ => None,
-                    };
-                    match comparison.operator {
-                        FilterOperator::IsNull => row.n.is_none(),
-                        FilterOperator::Exists => row.n.is_some(),
-                        FilterOperator::Eq => row.n.zip(wanted).is_some_and(|(v, w)| v == w),
-                        FilterOperator::Ne => row.n.zip(wanted).is_some_and(|(v, w)| v != w),
-                        FilterOperator::Lt => row.n.zip(wanted).is_some_and(|(v, w)| v < w),
-                        FilterOperator::Gte => row.n.zip(wanted).is_some_and(|(v, w)| v >= w),
-                        other => unreachable!("{other:?}"),
-                    }
-                }
-                _ => {
-                    let wanted = match operand {
-                        Some(ScalarMetadataValue::String(text)) => Some(text.as_str()),
-                        _ => None,
-                    };
-                    let value = row.s.as_deref();
-                    match comparison.operator {
-                        FilterOperator::IsNull => value.is_none(),
-                        FilterOperator::Exists => value.is_some(),
-                        FilterOperator::Eq => value.zip(wanted).is_some_and(|(v, w)| v == w),
-                        FilterOperator::Ne => value.zip(wanted).is_some_and(|(v, w)| v != w),
-                        other => unreachable!("{other:?}"),
-                    }
-                }
-            }
+        FilterExpr::And(children) => children.iter().all(|child| matches(child, row)),
+        FilterExpr::Or(children) => children.iter().any(|child| matches(child, row)),
+        FilterExpr::Not(child) => !matches(child, row),
+        FilterExpr::IsNull { field } if field == "n" => row.n.is_none(),
+        FilterExpr::Exists { field } if field == "s" => row.s.is_some(),
+        FilterExpr::Eq { field, value } if field == "n" => row.n == Some(int(value)),
+        FilterExpr::Ne { field, value } if field == "n" => {
+            row.n.is_some_and(|n| n != int(value))
         }
+        FilterExpr::In { field, values } if field == "n" => {
+            row.n.is_some_and(|n| values.iter().any(|value| int(value) == n))
+        }
+        FilterExpr::Range { field, bounds } if field == "n" => row.n.is_some_and(|n| {
+            bounds.lt.as_ref().is_none_or(|bound| n < int(bound))
+                && bounds.gte.as_ref().is_none_or(|bound| n >= int(bound))
+        }),
+        FilterExpr::Eq { value, .. } => row.s.as_deref() == Some(text(value)),
+        FilterExpr::Ne { value, .. } => row.s.as_deref().is_some_and(|s| s != text(value)),
+        other => unreachable!("{other:?}"),
     }
 }
 

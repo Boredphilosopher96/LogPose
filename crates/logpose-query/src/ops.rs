@@ -6,28 +6,32 @@
 //! - **Scroll by key** merges each unit's ascending key order restricted to its `B`. The first
 //!   page of a scroll that has more pins its view under a snapshot token, which every later page
 //!   reads, so every live row appears exactly once across pages even under concurrent writes.
-//!   A scroll that fits in one page pins nothing.
+//!   A page reads one row past its limit to learn whether more follow, so a scroll that fits in
+//!   one page pins nothing and returns no cursor.
 //! - **Order by a field** yields each unit's rows in `(value, key)` order, from the field's
 //!   sorted index when the unit has one and from its column otherwise, and merges them. Ties
 //!   are broken by key ascending in both directions, and rows without a value come last.
+//!
+//! A [`Cursor`] travels to clients as opaque text ([`Cursor`]'s `Display` and `FromStr`): the
+//! token, the order, a digest of the filter, and the last row's position, with a checksum.
 
 use crate::{QueryError, Result, compile::CompiledFilter};
 use logpose_storage::{
     CollectionReader, FetchPlan, Projection, ReadOptions, ReadView, RowData, SectionNeed,
-    SnapshotToken, UnitView,
+    SnapshotToken, TOKEN_BYTES, UnitView, base64url_decode, base64url_encode, checksum,
     cache::PinSet,
     read::{Direction, ScalarKey, value_index_keys},
 };
 use logpose_types::{
-    CollectionRef, LogPoseError, RowAddr, RowId, UnitId,
+    CollectionRef, LogPoseError, RowAddr, RowId, Snapshot, UnitId,
     filter::FilterExpr,
     record::PrimaryKey,
-    schema::{FieldId, FieldRef, FieldType},
+    schema::{CollectionSchema, FieldId, FieldRef, FieldType},
     value::Value,
 };
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use std::{cmp::Ordering, ops::Bound, sync::Arc};
+use std::{cmp::Ordering, fmt, ops::Bound, str::FromStr, sync::Arc};
 
 /// The order of a scroll.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,13 +57,15 @@ pub enum CursorKey {
     Field(Option<Value>, PrimaryKey),
 }
 
-/// A scroll position: the pinned snapshot, the order, and the last row returned.
+/// A scroll position: the pinned snapshot, the order, the filter, and the last row returned.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cursor {
     /// The snapshot every page reads.
     pub token: SnapshotToken,
     /// The scroll's order.
     pub order: ScrollOrder,
+    /// [`filter_digest`] of the scroll's filter; a page with another filter is refused.
+    pub filter: u32,
     /// The last row returned.
     pub after: CursorKey,
 }
@@ -76,8 +82,11 @@ pub struct ScrollRequest {
     /// What to read of each row.
     pub projection: Projection,
     /// `None` starts a scroll (pinning a snapshot when rows are left after the page); `Some`
-    /// continues one.
+    /// continues one, with the same filter and order.
     pub cursor: Option<Cursor>,
+    /// The pinned snapshot a new scroll reads instead of the current state. A cursor carries
+    /// its own, so this must be `None` with one.
+    pub token: Option<SnapshotToken>,
 }
 
 /// One page of a scroll.
@@ -87,6 +96,8 @@ pub struct ScrollPage {
     pub rows: Vec<RowData>,
     /// Where the next page starts; `None` after the last page.
     pub next: Option<Cursor>,
+    /// The state the page read.
+    pub snapshot: Snapshot,
 }
 
 /// The live rows of `pks` (each `None` when absent), read as `projection` asks.
@@ -172,49 +183,98 @@ pub async fn resolve_view(
         .collect())
 }
 
-/// One page of a scroll. A request without a cursor reads the current state and, when rows are
-/// left after its page, pins the view it read; the page's cursor carries that token, and later
-/// pages read exactly that snapshot. A scroll that fits in one page pins nothing.
+/// A digest of a scroll's filter, which its cursor carries: CRC-32C of the filter's canonical
+/// serialization, 0 without a filter.
+#[must_use]
+pub fn filter_digest(filter: Option<&FilterExpr>) -> u32 {
+    filter.map_or(0, |filter| {
+        checksum(&serde_json::to_vec(filter).unwrap_or_default())
+    })
+}
+
+fn invalid_cursor(message: impl Into<String>) -> QueryError {
+    QueryError::Storage(LogPoseError::invalid_field("cursor", message))
+}
+
+/// One page of a scroll. A request without a cursor reads the current state (or the snapshot
+/// `request.token` pins) and, when rows are left after its page, pins the view it read; the
+/// page's cursor carries that token, and later pages read exactly that snapshot. A scroll that
+/// fits in one page pins nothing.
 ///
 /// # Errors
 ///
 /// As [`CollectionReader::read_view`] (a cursor whose token expired is `SnapshotExpired`),
+/// `InvalidArgument` for a cursor used with another order or filter or together with a token,
 /// an invalid filter or order field, I/O, or typed corruption.
 pub async fn scroll(
     reader: &dyn CollectionReader,
     collection: &CollectionRef,
     request: ScrollRequest,
 ) -> Result<ScrollPage> {
-    let (options, after) = match &request.cursor {
-        Some(cursor) => {
-            if cursor.order != request.order {
-                return Err(QueryError::Storage(LogPoseError::invalid_field(
-                    "cursor",
-                    "the cursor belongs to a scroll with another order",
-                )));
-            }
-            (
-                ReadOptions {
-                    token: Some(cursor.token.clone()),
-                    ..ReadOptions::default()
-                },
-                Some(cursor.after.clone()),
-            )
-        }
-        None => (ReadOptions::default(), None),
+    let view = reader
+        .read_view(collection, scroll_options(&request)?)
+        .await?;
+    scroll_page(&view, request).await
+}
+
+/// The view options of a scroll page: its cursor's token, or the request's for a first page.
+///
+/// # Errors
+///
+/// `InvalidArgument` for a cursor used with another order or filter, or together with a
+/// token.
+pub fn scroll_options(request: &ScrollRequest) -> Result<ReadOptions> {
+    let Some(cursor) = &request.cursor else {
+        return Ok(ReadOptions {
+            token: request.token.clone(),
+            ..ReadOptions::default()
+        });
     };
-    let view = reader.read_view(collection, options).await?;
-    let (rows, last) = scroll_view(
-        &view,
+    if request.token.is_some() {
+        return Err(QueryError::Storage(LogPoseError::invalid_field(
+            "snapshot_token",
+            "a cursor carries its snapshot; a later page takes no snapshot token",
+        )));
+    }
+    if cursor.order != request.order {
+        return Err(invalid_cursor(
+            "the cursor belongs to a scroll with another order",
+        ));
+    }
+    if cursor.filter != filter_digest(request.filter.as_ref()) {
+        return Err(invalid_cursor(
+            "the cursor belongs to a scroll with another filter",
+        ));
+    }
+    Ok(ReadOptions {
+        token: Some(cursor.token.clone()),
+        ..ReadOptions::default()
+    })
+}
+
+/// One page of a scroll over `view`, which [`scroll_options`] of the same request opened.
+///
+/// # Errors
+///
+/// As [`scroll`], apart from opening the view.
+pub async fn scroll_page(view: &ReadView, request: ScrollRequest) -> Result<ScrollPage> {
+    let digest = filter_digest(request.filter.as_ref());
+    let after = request.cursor.as_ref().map(|cursor| cursor.after.clone());
+    let limit = request.limit.max(1) as usize;
+    let mut entries = scroll_entries(
+        view,
         request.filter.as_ref(),
         &request.order,
-        request.limit,
-        request.projection,
+        limit + 1,
         after.as_ref(),
     )
     .await?;
-    let next = match last {
-        Some(after) if rows.len() >= request.limit.max(1) as usize => {
+    let more = entries.len() > limit;
+    entries.truncate(limit);
+    let addrs = entries.iter().map(|entry| entry.addr).collect::<Vec<_>>();
+    let rows = view.rows(&addrs, request.projection).await?;
+    let next = match entries.last() {
+        Some(last) if more => {
             // Pinned only now that a later page will read it: a scroll that fits in one page
             // holds no token.
             let pinned = view.pinned()?;
@@ -224,12 +284,17 @@ pub async fn scroll(
             Some(Cursor {
                 token,
                 order: request.order.clone(),
-                after,
+                filter: digest,
+                after: cursor_key(last, &request.order),
             })
         }
         _ => None,
     };
-    Ok(ScrollPage { rows, next })
+    Ok(ScrollPage {
+        rows,
+        next,
+        snapshot: view.snapshot(),
+    })
 }
 
 /// The next `limit` rows of `view` after `after` in `order`, and the key of the last one.
@@ -245,14 +310,43 @@ pub async fn scroll_view(
     projection: Projection,
     after: Option<&CursorKey>,
 ) -> Result<(Vec<RowData>, Option<CursorKey>)> {
-    let limit = limit.max(1) as usize;
+    let entries = scroll_entries(view, filter, order, limit.max(1) as usize, after).await?;
+    let addrs = entries.iter().map(|entry| entry.addr).collect::<Vec<_>>();
+    let rows = view.rows(&addrs, projection).await?;
+    let last = entries.last().map(|entry| cursor_key(entry, order));
+    Ok((rows, last))
+}
+
+/// The cursor key of `entry` in `order`.
+fn cursor_key(entry: &Entry, order: &ScrollOrder) -> CursorKey {
+    match order {
+        ScrollOrder::Pk => CursorKey::Pk(entry.pk.clone()),
+        ScrollOrder::Field { .. } => {
+            CursorKey::Field(entry.key.as_ref().map(key_value), entry.pk.clone())
+        }
+    }
+}
+
+/// The next `limit` entries of `view` after `after` in `order`.
+async fn scroll_entries(
+    view: &ReadView,
+    filter: Option<&FilterExpr>,
+    order: &ScrollOrder,
+    limit: usize,
+    after: Option<&CursorKey>,
+) -> Result<Vec<Entry>> {
     let filter = filter
         .map(|filter| CompiledFilter::compile(view.schema(), filter))
         .transpose()?
         .map(Arc::new);
     let ordered_field = match order {
         ScrollOrder::Pk => None,
-        ScrollOrder::Field { field, direction } => Some((order_field(view, field)?, *direction)),
+        ScrollOrder::Field { field, direction } => {
+            Some((
+                order_field(view.schema(), field, "order_by[0].field")?,
+                *direction,
+            ))
+        }
     };
     let mut plan = FetchPlan::default();
     let mut units = Vec::new();
@@ -301,10 +395,7 @@ pub async fn scroll_view(
             },
         }),
         _ => {
-            return Err(QueryError::Storage(LogPoseError::invalid_field(
-                "cursor",
-                "the cursor does not fit the scroll's order",
-            )));
+            return Err(invalid_cursor("the cursor does not fit the scroll's order"));
         }
     };
     let entries = view
@@ -340,27 +431,255 @@ pub async fn scroll_view(
     }
     merged.sort_by(|left, right| compare_entries(left, right, direction));
     merged.truncate(limit);
-    let addrs = merged.iter().map(|entry| entry.addr).collect::<Vec<_>>();
-    let rows = view.rows(&addrs, projection).await?;
-    let last = merged.last().map(|entry| match &ordered_field {
-        None => CursorKey::Pk(entry.pk.clone()),
-        Some(_) => CursorKey::Field(entry.key.as_ref().map(key_value), entry.pk.clone()),
-    });
-    Ok((rows, last))
+    Ok(merged)
 }
 
-/// The field a scroll orders by: a declared scalar field that is not an array or JSON.
-fn order_field(view: &ReadView, name: &str) -> Result<FieldId> {
-    match view.schema().field(name) {
+/// The field a scroll or query orders by: a declared scalar field that is not an array or JSON.
+/// `path` names the order in the request for the error.
+///
+/// # Errors
+///
+/// `InvalidArgument` at `path` for any other name.
+pub fn order_field(schema: &CollectionSchema, name: &str, path: &str) -> Result<FieldId> {
+    match schema.field(name) {
         Some(FieldRef::Scalar(field))
             if !matches!(field.field_type, FieldType::Array(_) | FieldType::Json) =>
         {
             Ok(field.id)
         }
         _ => Err(QueryError::Storage(LogPoseError::invalid_field(
-            "order_by",
-            format!("'{name}' is not a scalar field that can be ordered"),
+            path,
+            format!("'{name}' is not a scalar field that can be ordered (arrays and json cannot)"),
         ))),
+    }
+}
+
+/// The order key of a value, as scrolls compare them: `None` for null.
+#[must_use]
+pub fn order_key(value: Option<&Value>) -> Option<ScalarKey> {
+    value.and_then(|value| value_index_keys(value).into_iter().next())
+}
+
+/// Compare two rows by `(key, pk)` in `direction`, rows without a key last and ties by key
+/// ascending: the order of [`ScrollOrder::Field`].
+#[must_use]
+pub fn compare_ordered(
+    left: (Option<&ScalarKey>, &PrimaryKey),
+    right: (Option<&ScalarKey>, &PrimaryKey),
+    direction: Direction,
+) -> Ordering {
+    match (left.0, right.0) {
+        (Some(left_key), Some(right_key)) => {
+            let order = left_key.cmp(right_key);
+            let order = match direction {
+                Direction::Ascending => order,
+                Direction::Descending => order.reverse(),
+            };
+            order.then_with(|| left.1.cmp(right.1))
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.1.cmp(right.1),
+    }
+}
+
+/// Why a cursor's text does not parse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidCursor;
+
+impl fmt::Display for InvalidCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("not a scroll cursor")
+    }
+}
+
+impl std::error::Error for InvalidCursor {}
+
+/// Version byte of the cursor encoding.
+const CURSOR_VERSION: u8 = 1;
+
+impl fmt::Display for Cursor {
+    /// Unpadded base64url of: a version byte, the token's bytes, the filter digest, the order,
+    /// the last row's position, and a CRC-32C of everything before it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut bytes = vec![CURSOR_VERSION];
+        bytes.extend_from_slice(&self.token.to_bytes());
+        bytes.extend_from_slice(&self.filter.to_le_bytes());
+        match &self.order {
+            ScrollOrder::Pk => bytes.push(0),
+            ScrollOrder::Field { field, direction } => {
+                bytes.push(match direction {
+                    Direction::Ascending => 1,
+                    Direction::Descending => 2,
+                });
+                put_bytes(&mut bytes, field.as_bytes());
+            }
+        }
+        match &self.after {
+            CursorKey::Pk(pk) => {
+                bytes.push(0);
+                put_pk(&mut bytes, pk);
+            }
+            CursorKey::Field(None, pk) => {
+                bytes.push(1);
+                put_pk(&mut bytes, pk);
+            }
+            CursorKey::Field(Some(value), pk) => {
+                bytes.push(2);
+                put_value(&mut bytes, value);
+                put_pk(&mut bytes, pk);
+            }
+        }
+        let crc = checksum(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        formatter.write_str(&base64url_encode(&bytes))
+    }
+}
+
+impl FromStr for Cursor {
+    type Err = InvalidCursor;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        let bytes = base64url_decode(text).ok_or(InvalidCursor)?;
+        let (body, crc) = bytes
+            .split_last_chunk::<4>()
+            .ok_or(InvalidCursor)?;
+        if checksum(body) != u32::from_le_bytes(*crc) {
+            return Err(InvalidCursor);
+        }
+        let mut reader = Reader { bytes: body };
+        if reader.byte()? != CURSOR_VERSION {
+            return Err(InvalidCursor);
+        }
+        let token = SnapshotToken::from_bytes(reader.take(TOKEN_BYTES)?).ok_or(InvalidCursor)?;
+        let filter = u32::from_le_bytes(reader.array()?);
+        let order = match reader.byte()? {
+            0 => ScrollOrder::Pk,
+            tag @ (1 | 2) => ScrollOrder::Field {
+                field: reader.string()?,
+                direction: if tag == 1 {
+                    Direction::Ascending
+                } else {
+                    Direction::Descending
+                },
+            },
+            _ => return Err(InvalidCursor),
+        };
+        let after = match reader.byte()? {
+            0 => CursorKey::Pk(reader.pk()?),
+            1 => CursorKey::Field(None, reader.pk()?),
+            2 => {
+                let value = reader.value()?;
+                CursorKey::Field(Some(value), reader.pk()?)
+            }
+            _ => return Err(InvalidCursor),
+        };
+        if !reader.bytes.is_empty() {
+            return Err(InvalidCursor);
+        }
+        Ok(Self {
+            token,
+            order,
+            filter,
+            after,
+        })
+    }
+}
+
+fn put_bytes(bytes: &mut Vec<u8>, data: &[u8]) {
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(data);
+}
+
+fn put_pk(bytes: &mut Vec<u8>, pk: &PrimaryKey) {
+    match pk {
+        PrimaryKey::Int64(value) => {
+            bytes.push(0);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        PrimaryKey::String(value) => {
+            bytes.push(1);
+            put_bytes(bytes, value.as_bytes());
+        }
+    }
+}
+
+fn put_value(bytes: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Bool(value) => {
+            bytes.push(0);
+            bytes.push(u8::from(*value));
+        }
+        Value::Float64(value) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        Value::String(value) => {
+            bytes.push(3);
+            put_bytes(bytes, value.as_bytes());
+        }
+        Value::Timestamp(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value.as_micros().to_le_bytes());
+        }
+        Value::Int64(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        // Order keys are never null, arrays, or JSON; encode them as the null tail.
+        Value::Null | Value::Array(_) | Value::Json(_) => bytes.push(4),
+    }
+}
+
+/// Reads a cursor's fields in order.
+struct Reader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> std::result::Result<&'a [u8], InvalidCursor> {
+        if self.bytes.len() < len {
+            return Err(InvalidCursor);
+        }
+        let (head, rest) = self.bytes.split_at(len);
+        self.bytes = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> std::result::Result<[u8; N], InvalidCursor> {
+        self.take(N)?.try_into().map_err(|_| InvalidCursor)
+    }
+
+    fn byte(&mut self) -> std::result::Result<u8, InvalidCursor> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn string(&mut self) -> std::result::Result<String, InvalidCursor> {
+        let len = u32::from_le_bytes(self.array()?) as usize;
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| InvalidCursor)
+    }
+
+    fn pk(&mut self) -> std::result::Result<PrimaryKey, InvalidCursor> {
+        match self.byte()? {
+            0 => Ok(PrimaryKey::Int64(i64::from_le_bytes(self.array()?))),
+            1 => Ok(PrimaryKey::String(self.string()?)),
+            _ => Err(InvalidCursor),
+        }
+    }
+
+    fn value(&mut self) -> std::result::Result<Value, InvalidCursor> {
+        match self.byte()? {
+            0 => Ok(Value::Bool(self.byte()? != 0)),
+            1 => Ok(Value::Int64(i64::from_le_bytes(self.array()?))),
+            2 => {
+                let value = f64::from_bits(u64::from_le_bytes(self.array()?));
+                Value::float64(value).map_err(|_| InvalidCursor)
+            }
+            3 => Ok(Value::String(self.string()?)),
+            4 => Ok(Value::Null),
+            _ => Err(InvalidCursor),
+        }
     }
 }
 
@@ -376,19 +695,11 @@ fn compare_entries(left: &Entry, right: &Entry, direction: Option<Direction>) ->
     let Some(direction) = direction else {
         return left.pk.cmp(&right.pk);
     };
-    match (&left.key, &right.key) {
-        (Some(left_key), Some(right_key)) => {
-            let order = left_key.cmp(right_key);
-            let order = match direction {
-                Direction::Ascending => order,
-                Direction::Descending => order.reverse(),
-            };
-            order.then_with(|| left.pk.cmp(&right.pk))
-        }
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => left.pk.cmp(&right.pk),
-    }
+    compare_ordered(
+        (left.key.as_ref(), &left.pk),
+        (right.key.as_ref(), &right.pk),
+        direction,
+    )
 }
 
 /// A scalar key back as a value (timestamps come back as integers).

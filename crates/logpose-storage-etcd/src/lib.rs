@@ -20,7 +20,8 @@ use logpose_types::{
     DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError, MaintenanceStatus,
     ResourceKind, Result, Snapshot, WriteOperation,
     error::ROUTING_RETRY_AFTER,
-    record::ClientOp,
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate},
     schema::{CollectionSchema, SchemaChange},
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
@@ -687,6 +688,21 @@ impl StorageEngine for EtcdBackedStorageEngine {
 
     async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
         self.local.write_batch(collection_name, ops).await
+    }
+
+    async fn delete_by_filter(&self, collection_name: &str, filter: FilterExpr) -> Result<CommitAck> {
+        self.local.delete_by_filter(collection_name, filter).await
+    }
+
+    async fn update_by_filter(
+        &self,
+        collection_name: &str,
+        filter: FilterExpr,
+        patch: PartialUpdate,
+    ) -> Result<CommitAck> {
+        self.local
+            .update_by_filter(collection_name, filter, patch)
+            .await
     }
 
     async fn write(
