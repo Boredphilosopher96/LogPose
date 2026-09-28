@@ -8,13 +8,13 @@ use logpose_query::{
 };
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
-    CollectionRef, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, PutRecord, RecordId,
-    Snapshot, WriteOperation,
+    CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Snapshot,
+    record::{PrimaryKey, Record},
+    schema::{CollectionSchema, CreateCollectionSpec, PrimaryKeyType, SchemaChange},
 };
-use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
@@ -55,19 +55,33 @@ pub struct QueryFilter {
     pub value: ScalarMetadataValue,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct JsonlRecord {
-    pub id: String,
-    pub vector: Vec<f32>,
-    #[serde(default = "empty_object")]
-    pub metadata: Value,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectionCreateAction {
     pub collection: CollectionRef,
     pub dimensions: usize,
     pub metric: DistanceMetric,
+}
+
+/// Create a collection from a typed schema document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionSchemaCreateAction {
+    pub collection: CollectionRef,
+    pub schema: PathBuf,
+}
+
+/// Apply one online schema change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionAlterAction {
+    pub collection: CollectionRef,
+    pub change: SchemaChange,
+}
+
+/// Point lookups by primary key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordGetAction {
+    pub collection: CollectionRef,
+    pub keys: Vec<String>,
+    pub output_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,14 +144,24 @@ pub enum Action {
         database_name: String,
     },
     DatabasePolicySet(DatabasePolicySetAction),
+    DatabaseDrop {
+        database_name: String,
+    },
     CollectionCreate(CollectionCreateAction),
+    CollectionCreateFromSchema(CollectionSchemaCreateAction),
+    CollectionList {
+        database_name: String,
+    },
     CollectionShow(CollectionRef),
+    CollectionAlter(CollectionAlterAction),
+    CollectionDrop(CollectionRef),
     CollectionStats(CollectionStatsAction),
     CollectionPlacement(CollectionRef),
     CollectionFlush(CollectionRef),
     CollectionCompact(CollectionRef),
     RecordPut(RecordPutAction),
     RecordDelete(RecordDeleteAction),
+    RecordGet(RecordGetAction),
     Query(QueryAction),
     Inspect {
         collection: CollectionRef,
@@ -633,7 +657,7 @@ pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRe
         })
         .collect();
     Ok(QueryRequest {
-        collection_name: action.collection.collection_name.clone(),
+        collection_name: action.collection.lookup_name(),
         vector: action.vector.0.clone(),
         top_k: action.top_k,
         snapshot,
@@ -644,10 +668,20 @@ pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRe
     })
 }
 
+/// One JSONL input line: its 1-based line number and the natural JSON document on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonlDocument {
+    pub line: usize,
+    pub document: Value,
+}
+
+/// Read a JSONL file of natural JSON documents, one record per line keyed by field name (such
+/// as `{"id": "a", "vector": [0.1, 0.2], "color": "red"}`), into batches of at most
+/// `max_batch_bytes` of input each.
 pub fn read_jsonl_put_batches(
     path: &Path,
     max_batch_bytes: usize,
-) -> anyhow::Result<Vec<Vec<WriteOperation>>> {
+) -> anyhow::Result<Vec<Vec<JsonlDocument>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open JSONL input '{}'", path.display()))?;
     let reader = BufReader::new(file);
@@ -682,13 +716,12 @@ pub fn read_jsonl_put_batches(
             current_batch_bytes = 0;
         }
 
-        let record = serde_json::from_str::<JsonlRecord>(&line)
+        let document = serde_json::from_str::<Value>(&line)
             .with_context(|| format!("failed to parse JSONL record on line {}", index + 1))?;
-        current_batch.push(WriteOperation::Put(PutRecord {
-            id: RecordId::new(record.id),
-            vector: record.vector,
-            metadata: record.metadata,
-        }));
+        current_batch.push(JsonlDocument {
+            line: index + 1,
+            document,
+        });
         current_batch_bytes += line_bytes;
     }
 
@@ -881,8 +914,73 @@ fn scalar_metadata_value_from_json(value: &Value) -> Option<ScalarMetadataValue>
     }
 }
 
-pub fn empty_object() -> Value {
-    Value::Object(serde_json::Map::new())
+/// Records typed by `schema` from JSONL documents; an invalid one is reported with its line.
+pub fn records_from_documents(
+    schema: &CollectionSchema,
+    documents: Vec<JsonlDocument>,
+) -> anyhow::Result<Vec<Record>> {
+    documents
+        .into_iter()
+        .map(|JsonlDocument { line, document }| {
+            Record::from_json(schema, document)
+                .with_context(|| format!("JSONL record on line {line} does not fit the schema"))
+        })
+        .collect()
+}
+
+/// Read a typed collection schema: a JSON document in the shape of the REST create body. The
+/// command line names the collection, so the document's `name` may be left out; when present it
+/// must match.
+pub fn read_collection_spec(path: &Path, name: &str) -> anyhow::Result<CreateCollectionSpec> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read schema file {}", path.display()))?;
+    let mut document: Value = serde_json::from_str(&text)
+        .with_context(|| format!("schema file {} is not valid JSON", path.display()))?;
+    let Some(object) = document.as_object_mut() else {
+        bail!("schema file {} must hold a JSON object", path.display());
+    };
+    match object.get("name").map(Value::as_str) {
+        None => {
+            object.insert("name".to_owned(), Value::from(name));
+        }
+        Some(Some(existing)) if existing == name => {}
+        Some(_) => bail!(
+            "schema file {} names a different collection than '{name}'",
+            path.display()
+        ),
+    }
+    serde_json::from_value(document).with_context(|| {
+        format!(
+            "schema file {} is not a valid collection schema",
+            path.display()
+        )
+    })
+}
+
+/// Parse a `--change` argument: one schema change as JSON.
+pub fn parse_schema_change(value: &str) -> Result<SchemaChange, String> {
+    serde_json::from_str(value).map_err(|error| {
+        format!(
+            "expected one of {{\"add_field\":{{...}}}}, {{\"drop_field\":{{\"name\":...}}}}, or {{\"rename_field\":{{\"from\":...,\"to\":...}}}}: {error}"
+        )
+    })
+}
+
+/// A primary key from its command-line text, typed by the collection's key type.
+pub fn primary_key_from_text(schema: &CollectionSchema, text: &str) -> anyhow::Result<PrimaryKey> {
+    match schema.primary_key_type() {
+        PrimaryKeyType::String => Ok(PrimaryKey::String(text.to_owned())),
+        PrimaryKeyType::Int64 => text
+            .trim()
+            .parse::<i64>()
+            .map(PrimaryKey::Int64)
+            .with_context(|| {
+                format!(
+                    "primary key '{}' of type int64 must be an integer, got '{text}'",
+                    schema.primary_key().name
+                )
+            }),
+    }
 }
 
 pub fn format_command(action: &Action) -> String {
@@ -931,11 +1029,56 @@ pub fn format_command(action: &Action) -> String {
             parts.push("--metric".to_owned());
             parts.push(metric_name(action.metric).to_owned());
         }
+        Action::DatabaseDrop { database_name } => {
+            parts.push("database".to_owned());
+            parts.push("drop".to_owned());
+            parts.push(shell_quote(database_name));
+        }
+        Action::CollectionCreateFromSchema(action) => {
+            parts.push("collection".to_owned());
+            parts.push("create".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            parts.push("--schema".to_owned());
+            parts.push(shell_quote(&action.schema.to_string_lossy()));
+        }
+        Action::CollectionList { database_name } => {
+            parts.push("collection".to_owned());
+            parts.push("list".to_owned());
+            push_database_flag(&mut parts, database_name);
+        }
         Action::CollectionShow(collection) => {
             parts.push("collection".to_owned());
             parts.push("show".to_owned());
             parts.push(shell_quote(&collection.collection_name));
             push_database_flag(&mut parts, &collection.database_name);
+        }
+        Action::CollectionAlter(action) => {
+            parts.push("collection".to_owned());
+            parts.push("alter".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            parts.push("--change".to_owned());
+            parts.push(shell_quote(
+                &serde_json::to_string(&action.change).unwrap_or_default(),
+            ));
+        }
+        Action::CollectionDrop(collection) => {
+            parts.push("collection".to_owned());
+            parts.push("drop".to_owned());
+            parts.push(shell_quote(&collection.collection_name));
+            push_database_flag(&mut parts, &collection.database_name);
+        }
+        Action::RecordGet(action) => {
+            parts.push("record".to_owned());
+            parts.push("get".to_owned());
+            parts.push(shell_quote(&action.collection.collection_name));
+            push_database_flag(&mut parts, &action.collection.database_name);
+            parts.extend(action.keys.iter().map(|key| shell_quote(key)));
+            for field in &action.output_fields {
+                parts.push("--output-field".to_owned());
+                parts.push(shell_quote(field));
+            }
         }
         Action::CollectionStats(action) => {
             parts.push("collection".to_owned());
@@ -1164,21 +1307,15 @@ fn shell_quote(value: &str) -> String {
 }
 
 impl CollectionCreateAction {
+    /// A collection with string primary key `id`, one vector field `vector` of the requested
+    /// dimensions and metric, and dynamic fields on.
     pub fn request(&self) -> CreateCollectionRequest {
-        CreateCollectionRequest {
-            database_name: self.collection.database_name.clone(),
-            name: self.collection.collection_name.clone(),
-            dimensions: self.dimensions,
-            metric: self.metric,
-        }
-    }
-}
-
-impl RecordDeleteAction {
-    pub fn operation(&self) -> WriteOperation {
-        WriteOperation::Delete(DeleteRecord {
-            id: RecordId::new(self.id.clone()),
-        })
+        CreateCollectionRequest::in_database(
+            self.collection.database_name.clone(),
+            self.collection.collection_name.clone(),
+            self.dimensions,
+            self.metric,
+        )
     }
 }
 
@@ -1238,8 +1375,8 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            r#"{"id":"alpha","vector":[1.0],"metadata":{"label":"aaaaaaaaaa"}}
-{"id":"beta","vector":[2.0],"metadata":{"label":"bbbbbbbbbb"}}"#,
+            r#"{"id":"alpha","vector":[1.0],"label":"aaaaaaaaaaaaaaaaaaaaaaa"}
+{"id":"beta","vector":[2.0],"label":"bbbbbbbbbbbbbbbbbbbbbbb"}"#,
         )
         .expect("jsonl should be written");
 
@@ -1260,7 +1397,7 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            r#"{"id":"alpha","vector":[1.0],"metadata":{"label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            r#"{"id":"alpha","vector":[1.0],"label":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
         )
         .expect("jsonl should be written");
 

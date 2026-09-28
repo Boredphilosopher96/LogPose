@@ -270,7 +270,7 @@ fn interactive_collection_create_supports_fuzzy_workflow_search_and_defaults() {
     assert!(stderr.contains("Distance metric search"));
     assert!(stderr.contains("Collection created"));
     assert_eq!(payload["name"], "colors");
-    assert_eq!(payload["metric"], "dot");
+    assert_eq!(payload["schema"]["vectors"][0]["metric"], "dot");
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn interactive_create_shortcut_skips_workflow_picker_and_prefills_known_values()
     assert!(!stderr.contains("Embedding dimensions"));
     assert!(stderr.contains("Distance metric"));
     assert_eq!(payload["name"], "colors");
-    assert_eq!(payload["metric"], "dot");
+    assert_eq!(payload["schema"]["vectors"][0]["metric"], "dot");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn interactive_record_put_supports_fuzzy_file_picker() {
     let input_path = fixture.temp_root.join("records.jsonl");
     fs::write(
         &input_path,
-        r#"{"id":"alpha","vector":[1.0,0.0],"metadata":{"color":"red"}}"#,
+        r#"{"id":"alpha","vector":[1.0,0.0],"color":"red"}"#,
     )
     .expect("jsonl input should be written");
 

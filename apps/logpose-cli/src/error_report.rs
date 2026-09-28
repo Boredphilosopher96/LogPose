@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn field_violations_and_metadata_are_listed_under_the_error() {
         let error = client_error(&LogPoseError::DimensionMismatch {
-            field: "operations[1].vector".to_owned(),
+            field: "records[1].vector".to_owned(),
             record_id: Some("a".to_owned()),
             expected: 3,
             actual: 2,
@@ -93,8 +93,7 @@ mod tests {
             details,
             Some(vec![
                 "code: INVALID_ARGUMENT".to_owned(),
-                "field operations[1].vector: record 'a' expected 3 dimensions but found 2"
-                    .to_owned(),
+                "field records[1].vector: record 'a' expected 3 dimensions but found 2".to_owned(),
                 "metadata: actual_dimensions=2, expected_dimensions=3, record_id=a".to_owned(),
             ])
         );

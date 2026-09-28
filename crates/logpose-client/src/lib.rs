@@ -4,6 +4,9 @@
 //! [`ErrorReason`], code, metadata, field violations, and retry hint the server sent. Requests
 //! are sent once unless the client is given a [`RetryPolicy`] or a [`RedirectPolicy`]; see
 //! [`retry`] for what each retries and when.
+//!
+//! Every collection-scoped call names its collection with a [`CollectionRef`]: the database
+//! and collection names the server requires on every such request.
 
 mod error;
 pub mod retry;
@@ -14,14 +17,22 @@ pub use error::{ClientError, Result, ServerError, ServerErrorKind, grpc_code_nam
 pub use logpose_types::{ErrorCode, ErrorReason, FieldViolation};
 pub use retry::{NodeResolver, RedirectPolicy, RetryPolicy};
 
+use logpose_api_grpc::convert::{
+    collection_from_proto, create_request_to_proto, database_policy_to_proto,
+    json_object_from_proto, metric_from_proto, primary_key_from_proto, primary_key_to_proto,
+    record_from_proto, record_to_proto, schema_change_to_proto, snapshot_from_proto,
+    snapshot_to_proto, update_to_proto,
+};
 use logpose_api_grpc::proto::{
-    self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
-    CoordinationStatusReply, CreateCollectionRequest as ProtoCreateCollectionRequest,
-    FlushCollectionRequest, GetCollectionPlacementRequest, GetCollectionRequest,
-    GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest, GetMetadataRequest,
-    GetRuntimeStatusRequest, InspectCollectionRequest, ListDatabasesRequest,
-    MaintenanceBacklogReply, PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest,
-    ScalarValue, WriteCollectionRequest, log_pose_service_client::LogPoseServiceClient,
+    self, AlterCollectionRequest, CollectionPlacementReply, CommitAckReply,
+    CompactCollectionRequest, CoordinationStatusReply, DeleteRecordsRequest, DropCollectionRequest,
+    DropDatabaseRequest, FlushCollectionRequest, GetCollectionPlacementRequest,
+    GetCollectionRequest, GetCollectionStatsRequest, GetDatabasePolicyRequest, GetDatabaseRequest,
+    GetMetadataRequest, GetRecordsRequest, GetRuntimeStatusRequest, InspectCollectionRequest,
+    ListCollectionsRequest, ListDatabasesRequest, MaintenanceBacklogReply,
+    PutDatabasePolicyRequest, PutDatabaseRequest, QueryCollectionRequest, ScalarValue,
+    SnapshotReply, UpdateRecordsRequest, UpsertRecordsRequest,
+    log_pose_service_client::LogPoseServiceClient,
 };
 use logpose_auth::{AuthenticationMode, DatabaseRole};
 pub use logpose_auth::{DatabaseAccessPolicy, DatabaseRoleBinding};
@@ -36,13 +47,18 @@ use logpose_query::{
 };
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
-    CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
-    CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, MaintenanceBacklog,
-    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
-    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    CollectionId, CollectionPlacement, CollectionStats, CommitAck, CoordinationStatus,
+    MaintenanceBacklog, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus,
+    QueryUnitStats, RecordId, ScalarFieldStats, Snapshot,
+};
+pub use logpose_types::{
+    CollectionRef,
+    record::{PartialUpdate, PrimaryKey, Record},
+    schema::SchemaChange,
 };
 use retry::Operation;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -102,6 +118,17 @@ impl<T> Deref for ScopedCollectionResponse<T> {
     fn deref(&self) -> &Self::Target {
         &self.response
     }
+}
+
+/// The result of a point lookup by primary key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordsResponse {
+    /// The live records found, in request order, projected to the requested fields.
+    pub records: Vec<Record>,
+    /// The requested keys without a live record, in request order.
+    pub missing_keys: Vec<PrimaryKey>,
+    /// The state the lookup read.
+    pub snapshot: Snapshot,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -277,13 +304,13 @@ impl LogPoseClient {
         runtime_status_from_proto(response)
     }
 
-    /// Create or replace one database descriptor.
-    pub async fn set_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
+    /// Create a database if it does not exist, and return its descriptor.
+    pub async fn put_database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
         let response = self
             .call(
                 Operation::Write,
                 PutDatabaseRequest {
-                    descriptor: Some(database_descriptor_to_proto(descriptor)),
+                    database_name: database_name.to_owned(),
                 },
                 |mut client, request| async move { client.put_database(request).await },
             )
@@ -321,76 +348,17 @@ impl LogPoseClient {
             .collect()
     }
 
-    /// Create a collection through the shared service contract.
-    pub async fn create_collection(
-        &self,
-        request: CreateCollectionRequest,
-    ) -> Result<CollectionDescriptor> {
-        let response = self
-            .call(
-                Operation::Write,
-                ProtoCreateCollectionRequest {
-                    name: request.name,
-                    dimensions: request.dimensions as u64,
-                    metric: proto_metric(request.metric) as i32,
-                    database_name: request.database_name,
-                },
-                |mut client, request| async move { client.create_collection(request).await },
-            )
-            .await?;
-        collection_descriptor_from_proto(response)
-    }
-
-    /// Fetch placement metadata for one collection.
-    pub async fn collection_placement(&self, collection_name: &str) -> Result<CollectionPlacement> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        self.collection_placement_in_database(&database_name, &collection_name)
-            .await
-    }
-
-    /// Fetch placement metadata for one collection in an explicit database.
-    pub async fn collection_placement_in_database(
-        &self,
-        database_name: &str,
-        collection_name: &str,
-    ) -> Result<CollectionPlacement> {
-        let response = self
-            .call(
-                Operation::Read,
-                GetCollectionPlacementRequest {
-                    collection_name: collection_name.to_owned(),
-                    database_name: database_name.to_owned(),
-                },
-                |mut client, request| async move { client.get_collection_placement(request).await },
-            )
-            .await?;
-        collection_placement_from_proto(response)
-    }
-
-    /// Fetch collection metadata by name.
-    pub async fn get_collection(&self, collection_name: &str) -> Result<CollectionDescriptor> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        self.get_collection_in_database(&database_name, &collection_name)
-            .await
-    }
-
-    /// Fetch collection metadata by database-qualified identity.
-    pub async fn get_collection_in_database(
-        &self,
-        database_name: &str,
-        collection_name: &str,
-    ) -> Result<CollectionDescriptor> {
-        let response = self
-            .call(
-                Operation::Read,
-                GetCollectionRequest {
-                    collection_name: collection_name.to_owned(),
-                    database_name: database_name.to_owned(),
-                },
-                |mut client, request| async move { client.get_collection(request).await },
-            )
-            .await?;
-        collection_descriptor_from_proto(response)
+    /// Drop an empty database and its access policy.
+    pub async fn drop_database(&self, database_name: &str) -> Result<()> {
+        self.call(
+            Operation::Write,
+            DropDatabaseRequest {
+                database_name: database_name.to_owned(),
+            },
+            |mut client, request| async move { client.drop_database(request).await },
+        )
+        .await?;
+        Ok(())
     }
 
     /// Create or replace one database access policy.
@@ -398,17 +366,19 @@ impl LogPoseClient {
         &self,
         policy: DatabaseAccessPolicy,
     ) -> Result<DatabaseAccessPolicy> {
-        let database_name = policy.database_name.clone();
+        let reply = database_policy_to_proto(policy);
         let response = self
             .call(
                 Operation::Write,
                 PutDatabasePolicyRequest {
-                    policy: Some(database_policy_to_proto(policy)),
+                    database_name: reply.database_name,
+                    authentication_mode: reply.authentication_mode,
+                    role_bindings: reply.role_bindings,
                 },
                 |mut client, request| async move { client.put_database_policy(request).await },
             )
             .await?;
-        database_policy_from_proto(response, &database_name)
+        database_policy_from_proto(response)
     }
 
     /// Read one database access policy.
@@ -422,83 +392,229 @@ impl LogPoseClient {
                 |mut client, request| async move { client.get_database_policy(request).await },
             )
             .await?;
-        database_policy_from_proto(response, database_name)
+        database_policy_from_proto(response)
     }
 
-    /// Persist a write batch durably.
-    pub async fn write(
+    /// Create a collection with a typed schema.
+    pub async fn create_collection(
         &self,
-        collection_name: &str,
-        operations: Vec<WriteOperation>,
-    ) -> Result<CommitAck> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        Ok(self
-            .write_in_database(&database_name, &collection_name, operations)
-            .await?
-            .response)
+        request: CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        let response = self
+            .call(
+                Operation::Write,
+                create_request_to_proto(request.database_name, request.spec),
+                |mut client, request| async move { client.create_collection(request).await },
+            )
+            .await?;
+        Ok(collection_from_proto(response)?)
     }
 
-    /// Persist a write batch durably in an explicit database.
-    pub async fn write_in_database(
+    /// Fetch a collection with its live schema.
+    pub async fn collection(&self, collection: &CollectionRef) -> Result<CollectionDescriptor> {
+        let response = self
+            .call(
+                Operation::Read,
+                GetCollectionRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                },
+                |mut client, request| async move { client.get_collection(request).await },
+            )
+            .await?;
+        Ok(collection_from_proto(response)?)
+    }
+
+    /// List the collections of one database, each with its live schema.
+    pub async fn collections(&self, database_name: &str) -> Result<Vec<CollectionDescriptor>> {
+        let response = self
+            .call(
+                Operation::Read,
+                ListCollectionsRequest {
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.list_collections(request).await },
+            )
+            .await?;
+        response
+            .collections
+            .into_iter()
+            .map(|collection| collection_from_proto(collection).map_err(Into::into))
+            .collect()
+    }
+
+    /// Change a collection's schema online and return the collection with its new schema.
+    pub async fn alter_collection(
         &self,
-        database_name: &str,
-        collection_name: &str,
-        operations: Vec<WriteOperation>,
+        collection: &CollectionRef,
+        change: SchemaChange,
+    ) -> Result<CollectionDescriptor> {
+        let response = self
+            .call(
+                Operation::Write,
+                AlterCollectionRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    change: Some(schema_change_to_proto(change)),
+                },
+                |mut client, request| async move { client.alter_collection(request).await },
+            )
+            .await?;
+        Ok(collection_from_proto(response)?)
+    }
+
+    /// Drop a collection and its data.
+    pub async fn drop_collection(&self, collection: &CollectionRef) -> Result<()> {
+        self.call(
+            Operation::Write,
+            DropCollectionRequest {
+                database_name: collection.database_name.clone(),
+                collection_name: collection.collection_name.clone(),
+            },
+            |mut client, request| async move { client.drop_collection(request).await },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch placement metadata for one collection.
+    pub async fn collection_placement(
+        &self,
+        collection: &CollectionRef,
+    ) -> Result<CollectionPlacement> {
+        let response = self
+            .call(
+                Operation::Read,
+                GetCollectionPlacementRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                },
+                |mut client, request| async move { client.get_collection_placement(request).await },
+            )
+            .await?;
+        collection_placement_from_proto(response)
+    }
+
+    /// Insert or replace whole records as one atomic batch.
+    pub async fn upsert(
+        &self,
+        collection: &CollectionRef,
+        records: Vec<Record>,
     ) -> Result<ScopedCollectionResponse<CommitAck>> {
         let response = self
             .call(
                 Operation::Write,
-                WriteCollectionRequest {
-                    collection_name: collection_name.to_owned(),
-                    operations: operations
-                        .into_iter()
-                        .map(write_operation_to_proto)
-                        .collect::<Vec<_>>(),
-                    database_name: database_name.to_owned(),
+                UpsertRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    records: records.into_iter().map(record_to_proto).collect(),
                 },
-                |mut client, request| async move { client.write_collection(request).await },
+                |mut client, request| async move { client.upsert_records(request).await },
             )
             .await?;
-        Ok(scoped_collection_response(
-            response.database_name,
-            response.collection_name,
-            database_name,
-            collection_name,
-            CommitAck {
-                last_seq_no: response.last_seq_no,
-                applied_ops: response.applied_ops as usize,
+        commit_ack_from_proto(response)
+    }
+
+    /// Change some fields of existing records as one atomic batch. A key without a live
+    /// record fails the batch with `NOT_FOUND`.
+    pub async fn update(
+        &self,
+        collection: &CollectionRef,
+        updates: Vec<PartialUpdate>,
+    ) -> Result<ScopedCollectionResponse<CommitAck>> {
+        let response = self
+            .call(
+                Operation::Write,
+                UpdateRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    records: updates.into_iter().map(update_to_proto).collect(),
+                },
+                |mut client, request| async move { client.update_records(request).await },
+            )
+            .await?;
+        commit_ack_from_proto(response)
+    }
+
+    /// Delete records by primary key as one atomic batch. Missing keys are no-ops.
+    pub async fn delete(
+        &self,
+        collection: &CollectionRef,
+        keys: Vec<PrimaryKey>,
+    ) -> Result<ScopedCollectionResponse<CommitAck>> {
+        let response = self
+            .call(
+                Operation::Write,
+                DeleteRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    keys: keys.into_iter().map(primary_key_to_proto).collect(),
+                },
+                |mut client, request| async move { client.delete_records(request).await },
+            )
+            .await?;
+        commit_ack_from_proto(response)
+    }
+
+    /// Read records by primary key, projected to `output_fields` (every field when empty).
+    pub async fn get(
+        &self,
+        collection: &CollectionRef,
+        keys: Vec<PrimaryKey>,
+        output_fields: Vec<String>,
+    ) -> Result<ScopedCollectionResponse<RecordsResponse>> {
+        let response = self
+            .call(
+                Operation::Read,
+                GetRecordsRequest {
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
+                    keys: keys.into_iter().map(primary_key_to_proto).collect(),
+                    output_fields,
+                },
+                |mut client, request| async move { client.get_records(request).await },
+            )
+            .await?;
+        Ok(ScopedCollectionResponse {
+            database_name: response.database_name,
+            collection_name: response.collection_name,
+            response: RecordsResponse {
+                records: response
+                    .records
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, record)| record_from_proto(record, &format!("records[{index}]")))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                missing_keys: response
+                    .missing_keys
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, key)| {
+                        primary_key_from_proto(Some(key), &format!("missing_keys[{index}]"))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
                 snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
-                    ClientError::InvalidResponse("write response missing write snapshot".to_owned())
+                    ClientError::InvalidResponse("get response missing snapshot".to_owned())
                 })?,
             },
-        ))
+        })
     }
 
-    /// Execute an exact query through the shared service contract.
-    pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse> {
-        let (database_name, collection_name) =
-            split_collection_lookup_key(&request.collection_name);
-        let mut request = request;
-        request.collection_name = collection_name;
-        Ok(self
-            .query_in_database(&database_name, request)
-            .await?
-            .response)
-    }
-
-    /// Execute an exact query through the shared service contract in an explicit database.
-    pub async fn query_in_database(
+    /// Search a collection's first vector field. `request.collection_name` names the
+    /// collection as `database/collection`.
+    pub async fn query(
         &self,
-        database_name: &str,
         request: QueryRequest,
     ) -> Result<ScopedCollectionResponse<QueryResponse>> {
         validate_read_constraints(request.snapshot.as_ref(), request.read_barrier.as_ref())?;
-        let collection_name = request.collection_name.clone();
+        let collection = CollectionRef::parse(&request.collection_name)
+            .map_err(|error| ClientError::InvalidRequest(error.to_string()))?;
         let response = self
             .call(
                 Operation::Read,
                 QueryCollectionRequest {
-                    collection_name: collection_name.clone(),
+                    database_name: collection.database_name,
+                    collection_name: collection.collection_name,
                     vector: request.vector,
                     top_k: request.top_k as u64,
                     snapshot: request.snapshot.map(snapshot_to_proto),
@@ -510,19 +626,16 @@ impl LogPoseClient {
                         .collect::<Result<Vec<_>>>()?,
                     predicate: request.predicate.map(predicate_to_proto).transpose()?,
                     explain: explain_mode_to_proto(request.explain) as i32,
-                    database_name: database_name.to_owned(),
                 },
                 |mut client, request| async move { client.query_collection(request).await },
             )
             .await?;
 
-        Ok(scoped_collection_response(
-            response.database_name,
-            response.collection_name,
-            database_name,
-            &collection_name,
-            QueryResponse {
-                metric: metric_from_proto(response.metric)?,
+        Ok(ScopedCollectionResponse {
+            database_name: response.database_name,
+            collection_name: response.collection_name,
+            response: QueryResponse {
+                metric: metric_from_proto(response.metric, "metric")?,
                 top_k: response.top_k as usize,
                 returned: response.returned as usize,
                 snapshot: response.snapshot.map(snapshot_from_proto).ok_or_else(|| {
@@ -538,42 +651,14 @@ impl LogPoseClient {
                     .map(query_diagnostics_from_proto)
                     .transpose()?,
             },
-        ))
+        })
     }
 
-    /// Fetch collection-level statistics.
-    pub async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        self.stats_in_database(&database_name, &collection_name)
-            .await
-    }
-
-    /// Fetch collection-level statistics in an explicit database.
-    pub async fn stats_in_database(
+    /// Fetch collection-level statistics, at an exact snapshot or behind a read barrier when
+    /// one is given.
+    pub async fn stats(
         &self,
-        database_name: &str,
-        collection_name: &str,
-    ) -> Result<CollectionStats> {
-        self.stats_in_database_for_read(database_name, collection_name, None, None)
-            .await
-    }
-
-    /// Fetch collection-level statistics in an explicit database for one snapshot.
-    pub async fn stats_in_database_at_snapshot(
-        &self,
-        database_name: &str,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        self.stats_in_database_for_read(database_name, collection_name, snapshot, None)
-            .await
-    }
-
-    /// Fetch collection-level statistics in an explicit database for one snapshot or barrier.
-    pub async fn stats_in_database_for_read(
-        &self,
-        database_name: &str,
-        collection_name: &str,
+        collection: &CollectionRef,
         snapshot: Option<Snapshot>,
         read_barrier: Option<Snapshot>,
     ) -> Result<CollectionStats> {
@@ -582,8 +667,8 @@ impl LogPoseClient {
             .call(
                 Operation::Read,
                 GetCollectionStatsRequest {
-                    collection_name: collection_name.to_owned(),
-                    database_name: database_name.to_owned(),
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
                     snapshot: snapshot.map(snapshot_to_proto),
                     read_barrier: read_barrier.map(snapshot_to_proto),
                 },
@@ -614,117 +699,67 @@ impl LogPoseClient {
     }
 
     /// Flush the mutable delta into a new segment.
-    pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        Ok(self
-            .flush_in_database(&database_name, &collection_name)
-            .await?
-            .response)
-    }
-
-    /// Flush the mutable delta into a new segment in an explicit database.
-    pub async fn flush_in_database(
+    pub async fn flush(
         &self,
-        database_name: &str,
-        collection_name: &str,
+        collection: &CollectionRef,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
             .call(
                 Operation::Write,
                 FlushCollectionRequest {
-                    collection_name: collection_name.to_owned(),
-                    database_name: database_name.to_owned(),
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
                 },
                 |mut client, request| async move { client.flush_collection(request).await },
             )
             .await?;
-        let snapshot = snapshot_reply_from_proto(response.clone());
-        Ok(scoped_collection_response(
-            response.database_name,
-            response.collection_name,
-            database_name,
-            collection_name,
-            snapshot,
-        ))
+        Ok(snapshot_reply_from_proto(response))
     }
 
     /// Compact immutable segments.
-    pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        Ok(self
-            .compact_in_database(&database_name, &collection_name)
-            .await?
-            .response)
-    }
-
-    /// Compact immutable segments in an explicit database.
-    pub async fn compact_in_database(
+    pub async fn compact(
         &self,
-        database_name: &str,
-        collection_name: &str,
+        collection: &CollectionRef,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
             .call(
                 Operation::Write,
                 CompactCollectionRequest {
-                    collection_name: collection_name.to_owned(),
-                    database_name: database_name.to_owned(),
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
                 },
                 |mut client, request| async move { client.compact_collection(request).await },
             )
             .await?;
-        let snapshot = snapshot_reply_from_proto(response.clone());
-        Ok(scoped_collection_response(
-            response.database_name,
-            response.collection_name,
-            database_name,
-            collection_name,
-            snapshot,
-        ))
+        Ok(snapshot_reply_from_proto(response))
     }
 
     /// Inspect operator-visible storage state.
     pub async fn inspect(
         &self,
-        collection_name: &str,
-        target: InspectTarget,
-    ) -> Result<InspectReport> {
-        let (database_name, collection_name) = split_collection_lookup_key(collection_name);
-        Ok(self
-            .inspect_in_database(&database_name, &collection_name, target)
-            .await?
-            .response)
-    }
-
-    /// Inspect operator-visible storage state in an explicit database.
-    pub async fn inspect_in_database(
-        &self,
-        database_name: &str,
-        collection_name: &str,
+        collection: &CollectionRef,
         target: InspectTarget,
     ) -> Result<ScopedCollectionResponse<InspectReport>> {
         let response = self
             .call(
                 Operation::Read,
                 InspectCollectionRequest {
-                    collection_name: collection_name.to_owned(),
+                    database_name: collection.database_name.clone(),
+                    collection_name: collection.collection_name.clone(),
                     target: inspect_target_to_proto(&target) as i32,
                     segment_id: inspect_segment_id(&target),
-                    database_name: database_name.to_owned(),
                 },
                 |mut client, request| async move { client.inspect_collection(request).await },
             )
             .await?;
-        Ok(scoped_collection_response(
-            response.database_name,
-            response.collection_name,
-            database_name,
-            collection_name,
-            InspectReport {
+        Ok(ScopedCollectionResponse {
+            database_name: response.database_name,
+            collection_name: response.collection_name,
+            response: InspectReport {
                 target: response.target,
                 payload: serde_json::from_str(&response.payload_json)?,
             },
-        ))
+        })
     }
 }
 
@@ -754,14 +789,6 @@ fn bearer_metadata_value(token: &str) -> Result<MetadataValue<Ascii>> {
     })
 }
 
-fn database_descriptor_to_proto(descriptor: DatabaseDescriptor) -> proto::DatabaseDescriptorReply {
-    proto::DatabaseDescriptorReply {
-        database_id: descriptor.database_id.to_string(),
-        name: descriptor.name,
-        is_default: descriptor.is_default,
-    }
-}
-
 fn database_descriptor_from_proto(
     reply: proto::DatabaseDescriptorReply,
 ) -> Result<DatabaseDescriptor> {
@@ -772,80 +799,61 @@ fn database_descriptor_from_proto(
     })
 }
 
-fn collection_descriptor_from_proto(
-    reply: CollectionDescriptorReply,
-) -> Result<CollectionDescriptor> {
-    Ok(CollectionDescriptor {
-        collection_id: parse_collection_id(&reply.collection_id)?,
-        database_name: reply.database_name,
-        name: reply.name,
-        dimensions: reply.dimensions as usize,
-        metric: metric_from_proto(reply.metric)?,
-        root_path: reply.root_path.into(),
-        remote_blob: reply.remote_blob.map(|remote| RemoteBlobConfig {
-            endpoint: remote.endpoint,
-            bucket: remote.bucket,
-            prefix: remote.prefix,
-        }),
-        flush_threshold_ops: reply.flush_threshold_ops as usize,
-        flush_threshold_bytes: reply.flush_threshold_bytes as usize,
-        compaction_threshold_segments: reply.compaction_threshold_segments as usize,
-    })
-}
-
-fn database_policy_to_proto(policy: DatabaseAccessPolicy) -> proto::DatabaseAccessPolicyReply {
-    proto::DatabaseAccessPolicyReply {
-        database_name: policy.database_name,
-        authentication_mode: authentication_mode_to_proto(policy.authentication_mode) as i32,
-        role_bindings: policy
-            .role_bindings
-            .into_iter()
-            .map(database_role_binding_to_proto)
-            .collect(),
-    }
-}
-
 fn database_policy_from_proto(
     reply: proto::DatabaseAccessPolicyReply,
-    fallback_database: &str,
 ) -> Result<DatabaseAccessPolicy> {
-    let database_name = if reply.database_name.trim().is_empty() {
-        fallback_database.to_owned()
-    } else {
-        reply.database_name
-    };
-
+    let database_name = reply.database_name;
     Ok(DatabaseAccessPolicy {
-        database_name: database_name.clone(),
         authentication_mode: authentication_mode_from_proto(reply.authentication_mode)?,
         role_bindings: reply
             .role_bindings
             .into_iter()
-            .map(|binding| database_role_binding_from_proto(binding, &database_name))
+            .map(|binding| {
+                Ok(DatabaseRoleBinding {
+                    database_name: database_name.clone(),
+                    principal_name: binding.principal_name,
+                    role: database_role_from_proto(binding.role)?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?,
+        database_name,
     })
 }
 
-fn database_role_binding_to_proto(binding: DatabaseRoleBinding) -> proto::DatabaseRoleBindingReply {
-    proto::DatabaseRoleBindingReply {
-        database_name: binding.database_name,
-        principal_name: binding.principal_name,
-        role: database_role_to_proto(binding.role) as i32,
+fn commit_ack_from_proto(reply: CommitAckReply) -> Result<ScopedCollectionResponse<CommitAck>> {
+    Ok(ScopedCollectionResponse {
+        database_name: reply.database_name,
+        collection_name: reply.collection_name,
+        response: CommitAck {
+            last_seq_no: reply.last_seq_no,
+            applied_ops: reply.applied_ops as usize,
+            snapshot: reply.snapshot.map(snapshot_from_proto).ok_or_else(|| {
+                ClientError::InvalidResponse("write response missing write snapshot".to_owned())
+            })?,
+        },
+    })
+}
+
+fn snapshot_reply_from_proto(reply: SnapshotReply) -> ScopedCollectionResponse<Snapshot> {
+    ScopedCollectionResponse {
+        database_name: reply.database_name,
+        collection_name: reply.collection_name,
+        response: Snapshot {
+            manifest_generation: reply.manifest_generation,
+            visible_seq_no: reply.visible_seq_no,
+        },
     }
 }
 
-fn database_role_binding_from_proto(
-    binding: proto::DatabaseRoleBindingReply,
-    fallback_database: &str,
-) -> Result<DatabaseRoleBinding> {
-    Ok(DatabaseRoleBinding {
-        database_name: if binding.database_name.trim().is_empty() {
-            fallback_database.to_owned()
-        } else {
-            binding.database_name
-        },
-        principal_name: binding.principal_name,
-        role: database_role_from_proto(binding.role)?,
+fn query_match_from_proto(candidate: proto::QueryMatch) -> Result<QueryMatch> {
+    let metadata = match candidate.metadata {
+        Some(metadata) => JsonValue::Object(json_object_from_proto(metadata, "metadata")?),
+        None => JsonValue::Object(serde_json::Map::new()),
+    };
+    Ok(QueryMatch {
+        id: RecordId::new(candidate.id),
+        value: candidate.value,
+        metadata,
     })
 }
 
@@ -917,37 +925,6 @@ fn parse_collection_id(value: &str) -> Result<CollectionId> {
     })
 }
 
-fn split_collection_lookup_key(value: &str) -> (String, String) {
-    let parts = value.split('/').collect::<Vec<_>>();
-    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
-        (parts[0].to_owned(), parts[1].to_owned())
-    } else {
-        (DEFAULT_DATABASE_NAME.to_owned(), value.to_owned())
-    }
-}
-
-fn scoped_collection_response<T>(
-    database_name: String,
-    collection_name: String,
-    fallback_database: &str,
-    fallback_collection: &str,
-    response: T,
-) -> ScopedCollectionResponse<T> {
-    ScopedCollectionResponse {
-        database_name: if database_name.trim().is_empty() {
-            fallback_database.to_owned()
-        } else {
-            database_name
-        },
-        collection_name: if collection_name.trim().is_empty() {
-            fallback_collection.to_owned()
-        } else {
-            collection_name
-        },
-        response,
-    }
-}
-
 fn node_role_from_proto(role: i32) -> Result<NodeRole> {
     match proto::NodeRole::try_from(role)
         .map_err(|_| ClientError::InvalidResponse(format!("unknown node role '{role}'")))?
@@ -975,15 +952,6 @@ fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode> {
     }
 }
 
-fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::AuthenticationMode {
-    match mode {
-        AuthenticationMode::Disabled => proto::AuthenticationMode::Disabled,
-        AuthenticationMode::Password => proto::AuthenticationMode::Password,
-        AuthenticationMode::MutualTls => proto::AuthenticationMode::MutualTls,
-        AuthenticationMode::ExternalToken => proto::AuthenticationMode::ExternalToken,
-    }
-}
-
 fn database_role_from_proto(role: i32) -> Result<DatabaseRole> {
     match proto::DatabaseRole::try_from(role)
         .map_err(|_| ClientError::InvalidResponse(format!("unknown database role '{role}'")))?
@@ -994,55 +962,6 @@ fn database_role_from_proto(role: i32) -> Result<DatabaseRole> {
         proto::DatabaseRole::Unspecified => Err(ClientError::InvalidResponse(
             "database role must be set".to_owned(),
         )),
-    }
-}
-
-fn database_role_to_proto(role: DatabaseRole) -> proto::DatabaseRole {
-    match role {
-        DatabaseRole::Owner => proto::DatabaseRole::Owner,
-        DatabaseRole::ReadWrite => proto::DatabaseRole::ReadWrite,
-        DatabaseRole::ReadOnly => proto::DatabaseRole::ReadOnly,
-    }
-}
-
-fn metric_from_proto(metric: i32) -> Result<DistanceMetric> {
-    match proto::DistanceMetric::try_from(metric)
-        .map_err(|_| ClientError::InvalidResponse(format!("unknown distance metric '{metric}'")))?
-    {
-        proto::DistanceMetric::Cosine => Ok(DistanceMetric::Cosine),
-        proto::DistanceMetric::Dot => Ok(DistanceMetric::Dot),
-        proto::DistanceMetric::L2 => Ok(DistanceMetric::L2),
-        proto::DistanceMetric::Unspecified => Err(ClientError::InvalidResponse(
-            "distance metric must be set".to_owned(),
-        )),
-    }
-}
-
-fn proto_metric(metric: DistanceMetric) -> proto::DistanceMetric {
-    match metric {
-        DistanceMetric::Cosine => proto::DistanceMetric::Cosine,
-        DistanceMetric::Dot => proto::DistanceMetric::Dot,
-        DistanceMetric::L2 => proto::DistanceMetric::L2,
-    }
-}
-
-fn write_operation_to_proto(operation: WriteOperation) -> proto::WriteOperation {
-    match operation {
-        WriteOperation::Put(record) => proto::WriteOperation {
-            operation: Some(proto::write_operation::Operation::Put(proto::PutRecord {
-                id: record.id.to_string(),
-                vector: record.vector,
-                metadata_json: serde_json::to_string(&record.metadata)
-                    .expect("put record metadata should serialize"),
-            })),
-        },
-        WriteOperation::Delete(record) => proto::WriteOperation {
-            operation: Some(proto::write_operation::Operation::Delete(
-                proto::DeleteRecord {
-                    id: record.id.to_string(),
-                },
-            )),
-        },
     }
 }
 
@@ -1155,27 +1074,6 @@ fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue> {
     }
 }
 
-fn snapshot_to_proto(snapshot: Snapshot) -> proto::Snapshot {
-    proto::Snapshot {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-    }
-}
-
-fn snapshot_from_proto(snapshot: proto::Snapshot) -> Snapshot {
-    Snapshot {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-    }
-}
-
-fn snapshot_reply_from_proto(snapshot: proto::SnapshotReply) -> Snapshot {
-    Snapshot {
-        manifest_generation: snapshot.manifest_generation,
-        visible_seq_no: snapshot.visible_seq_no,
-    }
-}
-
 fn query_diagnostics_from_proto(diagnostics: proto::QueryDiagnostics) -> Result<QueryDiagnostics> {
     Ok(QueryDiagnostics {
         chosen_plan: query_plan_kind_from_proto(diagnostics.chosen_plan)?,
@@ -1229,14 +1127,6 @@ fn query_stage_timings_from_proto(timings: proto::QueryStageTimings) -> QuerySta
         rerank_micros: timings.rerank_micros,
         merge_micros: timings.merge_micros,
     }
-}
-
-fn query_match_from_proto(candidate: proto::QueryMatch) -> Result<QueryMatch> {
-    Ok(QueryMatch {
-        id: RecordId::new(candidate.id),
-        value: candidate.value,
-        metadata: serde_json::from_str(&candidate.metadata_json)?,
-    })
 }
 
 fn maintenance_status_from_proto(status: proto::MaintenanceStatus) -> Result<MaintenanceStatus> {
@@ -1326,21 +1216,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn split_collection_lookup_key_parses_explicit_database_scope() {
-        let (database_name, collection_name) = split_collection_lookup_key("analytics/documents");
-
-        assert_eq!(database_name, "analytics");
-        assert_eq!(collection_name, "documents");
-    }
-
-    #[test]
-    fn scoped_collection_response_falls_back_to_requested_database_scope() {
-        let response = scoped_collection_response(
-            String::new(),
-            String::new(),
-            "analytics",
-            "documents",
-            CommitAck {
+    fn scoped_collection_responses_serialize_a_flattened_payload() {
+        let response = ScopedCollectionResponse {
+            database_name: "analytics".to_owned(),
+            collection_name: "documents".to_owned(),
+            response: CommitAck {
                 last_seq_no: 7,
                 applied_ops: 2,
                 snapshot: Snapshot {
@@ -1348,37 +1228,13 @@ mod tests {
                     visible_seq_no: 7,
                 },
             },
-        );
-
-        assert_eq!(response.database_name, "analytics");
-        assert_eq!(response.collection_name, "documents");
-        assert_eq!(response.last_seq_no, 7);
-        assert_eq!(response.snapshot.visible_seq_no, 7);
-    }
-
-    #[test]
-    fn scoped_collection_response_serializes_flattened_payload() {
-        let response = scoped_collection_response(
-            "analytics".to_owned(),
-            "documents".to_owned(),
-            "analytics",
-            "documents",
-            CommitAck {
-                last_seq_no: 7,
-                applied_ops: 2,
-                snapshot: Snapshot {
-                    manifest_generation: 3,
-                    visible_seq_no: 7,
-                },
-            },
-        );
+        };
 
         let json = serde_json::to_value(response).expect("response should serialize");
         assert_eq!(json["database_name"], "analytics");
         assert_eq!(json["collection_name"], "documents");
         assert_eq!(json["last_seq_no"], 7);
         assert_eq!(json["applied_ops"], 2);
-        assert_eq!(json["snapshot"]["manifest_generation"], 3);
         assert_eq!(json["snapshot"]["visible_seq_no"], 7);
         assert!(json.get("response").is_none());
     }
