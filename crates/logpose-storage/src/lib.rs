@@ -33,7 +33,8 @@
 //! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
 //! - `segment_v2`: the segment file format, builder, and reader.
 //! - `cache`: the buffer cache of segment section bytes that segment readers load through.
-//! - `flush`, `compaction`, `maintenance`: maintenance jobs and each collection's queue.
+//! - `flush`, `compaction`, `maintenance`, `scheduler`: maintenance jobs, the size-tiered
+//!   compaction policy, flush triggers, and the engine-wide scheduler of job permits.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ pub mod read;
 mod recovery;
 mod root_lock;
 mod runtime;
+mod scheduler;
 mod segment;
 pub mod segment_v2;
 mod state;
@@ -76,8 +78,9 @@ mod version;
 mod writer;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use compaction::CompactionConfig;
 pub use engine::{Engine, EngineConfig, FatalHandler};
-pub use handle::{CollectionHandle, CollectionMeta};
+pub use handle::{CollectionHandle, CollectionMeta, MaintenanceWritten};
 pub use local_engine::LocalStorageEngine;
 pub use memtable::MemtableConfig;
 pub use read::{
@@ -85,6 +88,7 @@ pub use read::{
     RowSetResolver, SectionNeed, UnitView,
 };
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
+pub use scheduler::{MaintenanceScheduler, SchedulerStats};
 pub use segment_v2::IndexPolicy;
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,

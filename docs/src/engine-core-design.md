@@ -736,7 +736,7 @@ PR 5 replaces the PR 3 writer and maintenance mutexes with the single writer tas
 - `ReadBarrierNotSatisfied` and `StorageRootLocked` are variants of the same name. `ReadBarrierNotSatisfied` is `FAILED_PRECONDITION` with no retry hint: a single-node engine acknowledges a write only after publishing it, so waiting never satisfies a barrier that is not already satisfied. Phase 7 replication reintroduces `UNAVAILABLE` with a retry hint for replica lag.
 - `BatchTooLarge` is `TooLarge { what, size, limit }` (`RESOURCE_EXHAUSTED`).
 - `WalWriteFailed { collection, outcome, reason }` (reason `WAL_WRITE_FAILED`, metadata `collection` and `outcome`) is `UNAVAILABLE` when `outcome` is `NotApplied` (the write is definitely absent, and the collection is poisoned until the engine is reopened) and `INTERNAL` when it is `Unknown` (the write may reappear after recovery, like a timeout).
-- `WriteStalled`, `SnapshotExpired`, `TooManySnapshots`, `UnsupportedFormat`, and `NotFetched` do not exist yet. The PR that introduces one adds a variant with its code and reason, and adds it to `fixtures::one_of_each_variant`; the exhaustive match in the `error.rs` tests and the transport mapping tables fail until it does.
+- `SnapshotExpired` and `TooManySnapshots` (PR 6) and `WriteStalled` (PR 11) exist; `WriteStalled { collection, reason }` is `UNAVAILABLE` with reason `WRITE_STALLED`, `collection` metadata, and a one-second retry hint. `UnsupportedFormat` and `NotFetched` do not exist yet. The PR that introduces one adds a variant with its code and reason, and adds it to `fixtures::one_of_each_variant`; the exhaustive match in the `error.rs` tests and the transport mapping tables fail until it does.
 
 ## WAL v2
 
@@ -1922,6 +1922,82 @@ PR 10 replaces the delta log and v1 segments with memtables, deletion vectors, a
 - **Left for later.**
   - PR 11: the size-tiered policy, the maintenance-memory reservation, scheduler priorities, and a write stall when a second memtable would freeze.
   - PR 12: index sections (SQ8, HNSW, scalar) in `SegmentBuilder`, and the `CollectionReader` read path over memtable postings and segment key sections, which retires the exact-scan ANN in `legacy.rs`.
+
+### Implementation Notes (PR 11)
+
+PR 11 replaces the per-collection maintenance queue with the engine-wide scheduler, freezes memtables at their flush triggers with a write stall, and adds the size-tiered compaction policy with the maintenance-memory reservation. Reconciliation, forwarding, the FIFO primary-key rewrite, and the output DV file are unchanged from PR 10. Where this list differs from, or is more specific than, [Size Accounting and Flush Triggers](#size-accounting-and-flush-triggers), [Frozen Memtable](#frozen-memtable), [Flush](#flush), and [Compaction](#compaction), it is the current contract. It supersedes the "at most one memtable is frozen" and "compaction takes every segment" bullets of the PR 10 notes.
+
+- **Layout.**
+  - `scheduler.rs` holds the engine-wide `MaintenanceScheduler`, its `Permit`, and `SchedulerStats`. `Engine::scheduler()` exposes it.
+  - `compaction.rs` holds `CompactionConfig` (`EngineConfig::compaction`), the policy (`Policy`, `Candidate`, `build_bytes`), and the job's build.
+  - `writer/jobs.rs` holds everything maintenance does at the writer: freezing, the stall, planning, beginning a job on its permit, committing it, and ending it.
+  - `maintenance.rs` keeps only the flush triggers.
+  - Deleted: the per-collection job queue and its `maintenance.json`, `Engine::job`, `StorageEngine::recover_maintenance_descriptor` (and the service and etcd wrappers), and the one-job-at-a-time slot of the writer. `compact_state`, which the PR table names, was already deleted by PR 3.
+- **Scheduler.**
+  - A permit is a slot plus, for a compaction, a reservation of its `build_bytes` from the pool of `maintenance_fraction * memory_limit` (the design's `maintenance_memory`).
+  - There are `max(2, maintenance_threads)` slots, one per job thread, so a granted job starts at once. Compactions may hold all but one, so a flush always finds a slot and long compactions never hold back the flush that ends a write stall.
+  - Waiting requests are granted flushes first, then compactions, each in request order. The first waiting compaction that does not fit the free pool blocks later compactions, so a large job is never starved, but it never blocks a flush.
+  - A flush reserves no maintenance memory: its memtable is already charged to the memtable reservation.
+  - A compaction that needs more than the whole pool is declined at once with `TooLarge` (`what = "compaction build memory"`).
+  - A grant is delivered outside the scheduler's lock, as `PermitGranted` to the collection's writer. A permit that cannot be delivered is dropped, and dropping any permit releases it and grants the next request that fits.
+  - Tests pause the scheduler: requests then queue until `step(n)` allows `n` more grants, and `resume()` lets it run freely. This is the manual mode used for the scheduling tests; it steps grants, not job phases, and the job phases are stepped with `CollectionHandle::begin_job` as in PR 10.
+- **Job flow.** Maintenance goes through the writer's control channel:
+  - `PermitGranted { job, permit }`: begin the job (with the pipeline drained) and start its build on a job thread.
+  - `JobDone { job, result, wrote_files, reply }`: commit what the build produced. This is the design's `FlushDone` and `CompactionDone` in one message, because the commit is keyed by the job.
+  - `Flush` and `Compact`: explicit requests.
+  - `BeginJob` and `EndJob`: for tests that step a job by hand, without a permit.
+  - `Quiesce` and `Shutdown`: as before.
+
+  `Tick` is not a message. It is a 100 ms interval inside the writer's select loop, which does not drain the pipeline. It fails requests that stalled past the timeout, runs the age trigger, plans again after a failed job's backoff, and runs the compaction policy over deletion counts that writes changed. The engine's own tick (the token reaper interval) keeps only the global memtable-budget trigger. That trigger now sends the largest memtable's writer an explicit flush without a reply.
+- **Concurrent jobs.** One flush and up to `max_jobs_per_collection` compactions of a collection run at once. Compactions have disjoint inputs, reserved from planning until the job ends. The commit paths already handle each other's effects: a flush's DV file for a segment a compaction removed is superseded, and a compaction builds its manifest on the latest durable one. The build drops its captured inputs before it hands its result to the writer, so the last holder of a retired segment removes its file once the commit publishes.
+- **Freeze, `max_frozen`, and the write stall.**
+  - `MemtableConfig` gains `max_frozen` (2) and `write_stall_timeout` (30 s).
+  - After each group the writer checks the flush triggers. If one fired and fewer than `max_frozen` memtables are frozen, it sets `freeze_pending`. Before it collects the next group it finishes the group in flight and freezes: WAL rotation, a fresh memtable unit, and a publish. It then asks for a flush permit.
+  - Flushes take the oldest frozen memtable, one at a time per collection.
+  - With `max_frozen` memtables frozen and the active one over a trigger, the writer stops receiving requests. Each request carries its submit time on the engine clock. At each tick the writer fails the oldest requests that waited longer than `write_stall_timeout` with the new `WriteStalled`. It holds at most one request off the channel to check its age, since requests arrive in order. A stalled request is never applied and takes no sequence number.
+  - A poisoned or dropped writer never stalls; it answers requests with its refusal.
+  - Freezing allocates the new memtable's unit before the flush job allocates its output unit, so unit numbers differ from PR 10's.
+- **Explicit flush and compaction.**
+  - `CollectionHandle::flush` (and `flush_blocking`) waits until the checkpoint covers every operation visible when it was called. It freezes as needed, and fails if a flush it waits for fails.
+  - `CollectionHandle::compact` (and `compact_blocking`) waits until no background compaction of the collection is planned or running. Background planning is suspended meanwhile. It then plans one job: the first two unreserved segments, plus as many more, in ascending unit order, as fit the whole pool, `max_output_rows`, and `max_output_bytes`. When even the first two need more than the pool, the scheduler declines the job and the call fails with `TooLarge`. With fewer than two segments there is nothing to do. The job answers the requests made before it was planned.
+- **Policy, as built.**
+  - Tiers are computed from live rows with the configured `base_rows` and `tier_ratio`. `ManifestSegment.tier` is still written from the row count at write time, for inspection, and the policy does not read it.
+  - `build_bytes` of a job is the sum over its inputs of `live_rows * (file_len / row_count + 141 * vector_fields)`, plus the largest input's `file_len`: the stored bytes per row stand in for the vectors, scalar columns, and keys the output holds, 141 bytes is the `32 * 4 * 1.1` graph term, and the build reads one input at a time with its sections loaded whole, deleted rows included. Each copied row is decoded only as it is visited (`SegmentReader::for_each_row`), so the build never holds a second, decoded copy of an input.
+  - A background job is capped at half the pool, except that a deletion-driven rewrite of one segment alone may take the whole pool: an output built to half the pool, rewritten alone, holds its live rows beside its whole file, which half the pool never fits, so it could never shed its deleted rows. Smaller segments join a deletion-driven job only while it stays within half the pool. The deletion-driven rule considers only segments of at least `base_rows` rows (a tier-0 segment is merged by the tiered rule soon enough, and a small collection should not be rewritten on every delete), and skips a segment that alone exceeds the whole pool. The tiered rule emits a job only with at least two inputs, so a top-tier segment at the output caps is never rewritten for its size.
+  - A collection's `compaction_threshold_segments` overrides `min_merge` (minimum 2). `usize::MAX` turns its background compaction off; explicit compactions still run.
+  - The writer plans after every job ends, at every tick, and after every commit. It plans only when no job failed within the last second (`RETRY_BACKOFF`), and never beyond `max_jobs_per_collection` compactions.
+- **Maintenance status** is runtime state kept on the handle (`CollectionHandle::maintenance_status`):
+  - `pending` lists the jobs waiting for a permit.
+  - `in_progress` is `flush` while a flush runs, else `compact` while a compaction runs.
+  - `completed_runs` counts jobs that committed or had nothing to do.
+  - `last_error` is the last job's failure.
+
+  Nothing is persisted, because every job is re-planned from the durable state after a restart. A collection created by this engine plans maintenance at once. A recovered collection plans none until its first data-plane access: a write, a legacy read, or an explicit flush or compaction. So a node that only reports status for a collection never runs its jobs. A leftover `maintenance.json` is ignored.
+- **Write amplification.** `CollectionHandle::maintenance_written()` reports the rows and segment bytes that flushes and compactions wrote since the engine opened.
+- **Errors.** `WriteStalled { collection, reason }` is new: `UNAVAILABLE` with reason `WRITE_STALLED`, HTTP 503, `collection` metadata, and a one-second retry hint. It is in the fixtures, both transport tables, the OpenAPI `ErrorReason` enum, and the API error table.
+- **Tests.**
+  - `scheduler/tests.rs`: flush priority over earlier compactions; the slot kept for flushes; a freed slot goes to a waiting flush; the memory pool (compactions wait, never overcommit, and a large one is not overtaken); declining a job larger than the pool; a compaction that does not fit never blocks a flush; cancelled and undelivered permits.
+  - `compaction/tests.rs`: tiers; which segments each rule picks (full tiers in unit order, live-row tiers, deletion-driven with the smallest lower-tier segments, reservations and slot limits); the memory cap at half the pool; `build_bytes`, with the largest input charged whole; a deletion-driven rewrite of a segment built to half the pool; the output caps; the top tier at the cap; background off with explicit still planned; explicit sizing; write amplification simulated over 1,024 flushes (exactly one rewrite per tier climbed with merges of four) and within one rewrite per tier otherwise.
+  - `writer/compaction_tests.rs`, at the engine level:
+    - tiers merging as flushes fill them;
+    - a flush granted before a compaction that asked first;
+    - the write stall engaging and releasing, and `WriteStalled` past the timeout on the manual clock;
+    - the memory pool never overcommitted by three collections compacting at once;
+    - a compaction larger than the pool declined;
+    - an explicit compaction waiting for background ones;
+    - background compaction beside concurrent upserts, updates, and deletes from three clients, with readers checking every version's invariants;
+    - write amplification after 64 flushes (exactly three rewrites per row);
+    - a randomized run of 200 seeds with tiny thresholds (a flush every three operations, tiers of two rows, merges of two), with crashes under every tear mode landing in the middle of background jobs. It checks the live rows against the model after every step and recovery. `LOGPOSE_COMPACTION_RANDOM_SEED` replays chosen seeds;
+    - three compactions of one collection at once beside its flushes, three clients on their own keys, a reader, explicit flushes and compactions, and a crash under a random tear mode in every round while writes and jobs run; each client's keys match its model after every round and recovery, and no write refused with `WriteStalled` is ever applied. `LOGPOSE_CONCURRENT_COMPACTION_SEEDS` and `LOGPOSE_CONCURRENT_COMPACTION_FIRST_SEED` choose the seeds;
+    - a dropped collection releasing its waiting permit requests;
+    - engine drop answering writes held by a stall and explicit flushes waiting for a permit, none of them applied.
+  - `recovery/tests.rs`: a crash at every mutating operation of a compaction that reconciles deletions onto its output, under every tear mode, recovers the same rows from either manifest, with no orphans, the reconciled deletions in force, and a primary-key index that resolves every key. The named compaction crash points keep the inputs.
+  - `writer/tests.rs`: a failed drop cancels the jobs waiting for a permit, and the next tick plans them again.
+  - Service: runtime status aggregates each local collection's maintenance backlog, and control-only and combined status reads never run maintenance.
+- **Left for later.**
+  - PR 12: index sections change what a build holds. `build_bytes` charges the output's stored rows, the largest input's file, and 141 bytes per row and vector field for HNSW neighbour lists, and nothing else. Once flush and compaction build index sections (scalar inverted and sorted indexes, SQ8 codes, HNSW), whichever of PR 11 and PR 12 lands second must extend `build_bytes` with what those builds hold beside the output rows (at least the SQ8 codes, `rows * Σ dim` bytes, each scalar index's postings, and the HNSW build's working set beyond its neighbour lists) and check the estimate against a measured peak. Until then a compaction that builds indexes under-reserves. A flush reserves nothing from the pool because its memtable is already charged, but an index build during a flush allocates beyond the memtable, so that charge needs revisiting too.
+  - PR 13: the storage randomized harness still runs with background maintenance off, because its physical model (segment counts, generations, deleted-row counts) assumes explicit jobs only. Harness v2 should drive background jobs through `Engine::scheduler()` (`pause` and `step`) and hand-stepped jobs (`begin_job`) to enumerate job phases.
+  - PR 14: the service should report maintenance status from `CollectionHandle::maintenance_status` and `maintenance_written` directly once the `StorageEngine` trait is gone.
 
 ## Buffer Cache
 

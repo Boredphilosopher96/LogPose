@@ -17,9 +17,7 @@ use logpose_storage::{
     CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine as _,
 };
 use logpose_storage_etcd as _;
-use logpose_types::{
-    CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
-};
+use logpose_types::{CollectionAssignment, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use rand as _;
 use serde as _;
 use std::{
@@ -503,21 +501,15 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
     assert!(placement.route_reason.contains("data-plane"));
 }
 
-#[tokio::test]
-async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
-    let root = unique_temp_dir("control-status-maintenance");
-    let combined = test_config_with_root(
-        "control-status-maintenance",
+/// Write one record to a new collection on a combined node, stop the node, and lower the
+/// collection's flush threshold on disk, so the recovered memtable is due a flush. Returns the
+/// collection's directory.
+async fn collection_due_a_flush_after_restart(root: PathBuf, label: &str) -> PathBuf {
+    let initial = Arc::new(AppState::new(test_config_with_root(
+        label,
         logpose_types::NodeRole::Combined,
-        root.clone(),
-    );
-    let control = test_config_with_root(
-        "control-status-maintenance",
-        logpose_types::NodeRole::Control,
         root,
-    );
-    let initial = Arc::new(AppState::new(combined));
-
+    )));
     let descriptor = initial
         .control
         .create_collection(CreateCollectionRequest {
@@ -539,113 +531,75 @@ async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
         )
         .await
         .expect("write should succeed");
-
-    fs::write(
-        descriptor.root_path.join("maintenance.json"),
-        serde_json::to_vec_pretty(&MaintenanceStatus {
-            pending: vec!["flush".to_owned()],
-            in_progress: None,
-            last_error: None,
-            completed_runs: 0,
-        })
-        .expect("maintenance json should serialize"),
-    )
-    .expect("maintenance json should be written");
-
     drop(initial);
 
-    let restarted = Arc::new(AppState::new(control));
+    let descriptor_path = descriptor.root_path.join("descriptor.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&descriptor_path).expect("descriptor should be readable"))
+            .expect("descriptor should parse");
+    stored["flush_threshold_ops"] = serde_json::json!(1);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&stored).expect("descriptor should serialize"),
+    )
+    .expect("descriptor should be written");
+    descriptor.root_path
+}
+
+fn segment_files(collection_dir: &std::path::Path) -> usize {
+    fs::read_dir(collection_dir.join("segments"))
+        .expect("segments directory should exist")
+        .count()
+}
+
+/// A control-only node reads the status of a collection whose recovered state is due a flush
+/// and never runs it: maintenance starts only with a data-plane access, which a control node
+/// never makes.
+#[tokio::test]
+async fn control_plane_status_reads_never_run_maintenance() {
+    let root = unique_temp_dir("control-status-maintenance");
+    let collection_dir =
+        collection_due_a_flush_after_restart(root.clone(), "control-status-maintenance").await;
+
+    let restarted = Arc::new(AppState::new(test_config_with_root(
+        "control-status-maintenance",
+        logpose_types::NodeRole::Control,
+        root,
+    )));
     restarted
         .control
         .runtime_status()
         .await
         .expect("runtime status should load");
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    let persisted: MaintenanceStatus = serde_json::from_slice(
-        &fs::read(descriptor.root_path.join("maintenance.json"))
-            .expect("maintenance json should still exist"),
-    )
-    .expect("maintenance json should parse");
-    let segment_count = fs::read_dir(descriptor.root_path.join("segments"))
-        .expect("segments directory should exist")
-        .count();
-
-    assert_eq!(persisted.pending, vec!["flush"]);
-    assert!(persisted.in_progress.is_none());
-    assert_eq!(segment_count, 0);
+    assert_eq!(segment_files(&collection_dir), 0);
+    assert!(!collection_dir.join("maintenance.json").exists());
 }
 
+/// A combined node's status reads report the (runtime) maintenance status without starting
+/// maintenance either.
 #[tokio::test]
-async fn combined_runtime_status_reads_persisted_maintenance_without_resuming_it() {
+async fn combined_runtime_status_reads_never_run_maintenance() {
     let root = unique_temp_dir("combined-status-maintenance");
-    let combined = test_config_with_root(
+    let collection_dir =
+        collection_due_a_flush_after_restart(root.clone(), "combined-status-maintenance").await;
+
+    let restarted = Arc::new(AppState::new(test_config_with_root(
         "combined-status-maintenance",
         logpose_types::NodeRole::Combined,
-        root.clone(),
-    );
-    let initial = Arc::new(AppState::new(combined.clone()));
-
-    let descriptor = initial
-        .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
-        .await
-        .expect("collection should be created");
-    initial
-        .write(
-            "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
-        )
-        .await
-        .expect("write should succeed");
-
-    fs::write(
-        descriptor.root_path.join("maintenance.json"),
-        serde_json::to_vec_pretty(&MaintenanceStatus {
-            pending: vec!["flush".to_owned()],
-            in_progress: None,
-            last_error: None,
-            completed_runs: 0,
-        })
-        .expect("maintenance json should serialize"),
-    )
-    .expect("maintenance json should be written");
-
-    drop(initial);
-
-    let restarted = Arc::new(AppState::new(combined));
+        root,
+    )));
     let status = restarted
         .control
         .runtime_status()
         .await
         .expect("runtime status should load");
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    let persisted: MaintenanceStatus = serde_json::from_slice(
-        &fs::read(descriptor.root_path.join("maintenance.json"))
-            .expect("maintenance json should still exist"),
-    )
-    .expect("maintenance json should parse");
-    let segment_count = fs::read_dir(descriptor.root_path.join("segments"))
-        .expect("segments directory should exist")
-        .count();
-
-    assert_eq!(status.maintenance.collections_with_pending, 1);
-    assert_eq!(status.maintenance.pending_operations, 1);
-    assert_eq!(persisted.pending, vec!["flush"]);
-    assert!(persisted.in_progress.is_none());
-    assert_eq!(segment_count, 0);
+    assert_eq!(status.maintenance.collections_with_pending, 0);
+    assert_eq!(status.maintenance.pending_operations, 0);
+    assert_eq!(segment_files(&collection_dir), 0);
 }
 
 #[tokio::test]
@@ -880,112 +834,6 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
             "unexpected error: {error}"
         );
     }
-}
-
-#[tokio::test]
-async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
-    let config = test_config("control-maintenance");
-    let state = Arc::new(AppState::new(config.clone()));
-    let descriptor = state
-        .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
-        .await
-        .expect("collection should be created");
-
-    fs::write(
-        descriptor.root_path.join("maintenance.json"),
-        serde_json::to_vec_pretty(&MaintenanceStatus {
-            pending: vec!["flush".to_owned(), "compact".to_owned()],
-            in_progress: None,
-            last_error: Some("disk full".to_owned()),
-            completed_runs: 3,
-        })
-        .expect("maintenance json should serialize"),
-    )
-    .expect("maintenance file should be written");
-    // The engine keeps maintenance status resident; a restart picks up the edited file.
-    drop(state);
-    let state = Arc::new(AppState::new(config));
-
-    let status = state
-        .control
-        .runtime_status()
-        .await
-        .expect("runtime status should load");
-
-    assert_eq!(status.maintenance.collections_with_pending, 1);
-    assert_eq!(status.maintenance.pending_operations, 2);
-    assert_eq!(status.maintenance.collections_in_progress, 0);
-    assert_eq!(status.maintenance.collections_with_errors, 1);
-}
-
-#[tokio::test]
-async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs() {
-    let config = test_config("control-maintenance-namespace");
-    let state = Arc::new(AppState::new(config.clone()));
-    let default_descriptor = state
-        .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
-        .await
-        .expect("default namespace collection should be created");
-    let analytics_descriptor = state
-        .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "analytics".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
-        .await
-        .expect("database namespace collection should be created");
-
-    fs::write(
-        default_descriptor.root_path.join("maintenance.json"),
-        serde_json::to_vec_pretty(&MaintenanceStatus {
-            pending: vec!["flush".to_owned()],
-            in_progress: None,
-            last_error: None,
-            completed_runs: 0,
-        })
-        .expect("default maintenance json should serialize"),
-    )
-    .expect("default maintenance file should be written");
-    fs::write(
-        analytics_descriptor.root_path.join("maintenance.json"),
-        serde_json::to_vec_pretty(&MaintenanceStatus {
-            pending: vec!["compact".to_owned()],
-            in_progress: None,
-            last_error: Some("disk full".to_owned()),
-            completed_runs: 0,
-        })
-        .expect("database maintenance json should serialize"),
-    )
-    .expect("database maintenance file should be written");
-    // The engine keeps maintenance status resident; a restart picks up the edited files.
-    drop(state);
-    let state = Arc::new(AppState::new(config));
-
-    let status = state
-        .control
-        .runtime_status()
-        .await
-        .expect("runtime status should load");
-
-    assert_eq!(status.collection_count, 2);
-    assert_eq!(status.maintenance.collections_with_pending, 2);
-    assert_eq!(status.maintenance.pending_operations, 2);
-    assert_eq!(status.maintenance.collections_in_progress, 0);
-    assert_eq!(status.maintenance.collections_with_errors, 1);
 }
 
 #[tokio::test]

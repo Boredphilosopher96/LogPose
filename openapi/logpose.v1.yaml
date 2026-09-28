@@ -924,6 +924,7 @@ components:
           type: integer
         compaction_threshold_segments:
           type: integer
+          description: Segments of one size tier that start a background compaction merging them. The maximum value turns background compaction off.
     DatabaseDescriptor:
       type: object
       required:
@@ -1235,22 +1236,27 @@ components:
         - $ref: "#/components/schemas/QueryResponse"
     MaintenanceStatus:
       type: object
+      description: Runtime maintenance state of a collection since the node opened it; nothing of it is persisted.
       required: [pending, completed_runs]
       properties:
         pending:
           type: array
+          description: Jobs (`flush`, `compact`) waiting for a maintenance permit.
           items:
             type: string
         in_progress:
+          description: "`flush` while a flush runs, otherwise `compact` while a compaction runs."
           oneOf:
             - type: "null"
             - type: string
         last_error:
+          description: The last failed job's error, cleared by the next job that completes.
           oneOf:
             - type: "null"
             - type: string
         completed_runs:
           type: integer
+          description: Flushes and compactions that completed since the node opened the collection.
     ScalarFieldStats:
       type: object
       required: [present_count, null_count, distinct_count, value_counts]
@@ -1417,6 +1423,7 @@ components:
         - STORAGE_ROOT_LOCKED
         - SNAPSHOT_EXPIRED
         - TOO_MANY_SNAPSHOTS
+        - WRITE_STALLED
         - UNAUTHENTICATED
         - PERMISSION_DENIED
         - NOT_OWNER

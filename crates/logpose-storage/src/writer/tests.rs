@@ -917,21 +917,13 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
             assert!(Instant::now() < deadline, "the writers stopped writing");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let flushed = tokio::time::timeout(Duration::from_secs(20), {
-            let handle = Arc::clone(&handle);
-            engine.job(move |core| core.flush_collection(&handle))
-        })
-        .await;
+        let flushed = tokio::time::timeout(Duration::from_secs(20), handle.flush()).await;
         let snapshot = flushed
             .expect("a flush starved behind the writers")
             .expect("flush should succeed");
         assert!(snapshot.manifest_generation > round);
     }
-    let compacted = tokio::time::timeout(Duration::from_secs(20), {
-        let handle = Arc::clone(&handle);
-        engine.job(move |core| core.compact_collection(&handle))
-    })
-    .await;
+    let compacted = tokio::time::timeout(Duration::from_secs(20), handle.compact()).await;
     compacted
         .expect("compaction starved behind the writers")
         .expect("compaction should succeed");
@@ -1050,9 +1042,9 @@ fn inline_preparation_is_bounded_by_rows_and_by_bytes() {
     ));
 }
 
-/// A drop voids the maintenance requests outstanding when it starts. When the drop does not
-/// commit, a later write over the flush threshold requests a flush again: the request that the
-/// drop refused must not leave the writer believing one is still queued.
+/// A drop voids the maintenance jobs waiting for a permit when it starts. When the drop does
+/// not commit, the writer plans them again at its next tick: the job the drop cancelled must
+/// not leave the collection believing a flush is still on its way.
 #[test]
 fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
     let fault = FaultVfs::new(15);
@@ -1073,7 +1065,7 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
         .create_collection(descriptor, None)
         .expect("collection should be created");
     let core = engine.core();
-    let status = || core.maintenance_status(&handle);
+    let status = || handle.maintenance_status();
     let wait_for = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !done() {
@@ -1082,31 +1074,25 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
         }
     };
 
-    // Hold the job slot, so the flush the threshold requests waits in the writer's queue.
-    let (ticket, _) = handle
-        .begin_job(JobKind::Compact)
-        .expect("the slot is free");
+    // Hold every permit, so the flush the threshold plans waits for one.
+    engine.scheduler().pause();
     for id in ["a", "b"] {
         core.write(&handle, vec![put(id, vec![1.0, 0.0])])
             .expect("write");
     }
-    wait_for("the requested flush to begin", &|| {
-        status().in_progress.as_deref() == Some("flush")
+    wait_for("the flush to wait for its permit", &|| {
+        status().pending == ["flush"]
     });
-    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        handle.current().frozen.len(),
+        1,
+        "the trigger froze a and b"
+    );
 
-    // A drop that fails its rename: the waiting flush is refused.
+    // A drop that fails its rename voids the waiting flush.
     vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
-    let dropped = {
-        let engine = engine.clone();
-        std::thread::spawn(move || engine.drop_collection(&reference("requests")))
-    };
-    wait_for("the drop to start", &|| handle.is_dropped());
-    std::thread::sleep(Duration::from_millis(100));
-    drop(ticket);
-    dropped
-        .join()
-        .expect("drop should join")
+    engine
+        .drop_collection(&reference("requests"))
         .expect_err("the rename fails");
     vfs.stop_failing_renames();
     assert!(!handle.is_dropped());
@@ -1115,22 +1101,26 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
         0,
         "nothing was flushed"
     );
-    wait_for("the refused flush to end", &|| {
-        status().in_progress.is_none()
-    });
 
-    // Still over the threshold, so the next publish requests a flush, and it runs. One write
-    // only: the flush freezes the state that write published, and a second write could land
-    // after the freeze and stay in the delta.
-    core.write(&handle, vec![put("c", vec![1.0, 0.0])])
-        .expect("write");
+    // The next tick plans the flush again, and it runs once permits are granted.
+    wait_for("the flush to be planned again", &|| {
+        status().pending == ["flush"]
+    });
+    assert_eq!(
+        engine.scheduler().stats().waiting,
+        1,
+        "the cancelled request is gone from the scheduler"
+    );
+    engine.scheduler().resume();
     wait_for("a flush after the failed drop", &|| {
         handle.current().manifest_generation > 0
     });
     assert_eq!(
         handle.current().checkpoint_seq_no,
-        3,
+        2,
         "the flush checkpointed every write"
     );
-    assert_eq!(visible(&handle).len(), 3, "every write is still visible");
+    assert_eq!(visible(&handle).len(), 2, "every write is still visible");
+    wait_for("the job to end", &|| status().in_progress.is_none());
+    assert_eq!(status().completed_runs, 1);
 }

@@ -1,20 +1,24 @@
 //! Flush: write the oldest frozen memtable as a segment v2 file and every grown deletion vector
 //! as a new DV file, then have the writer publish the manifest that checkpoints them.
 //!
-//! The job runs on a job thread and talks to the collection's writer task:
+//! The job's build runs on a job thread; the collection's writer task begins and commits it:
 //!
-//! 1. **Freeze and begin** (writer). Unless an earlier flush left one frozen, the writer
-//!    freezes the active memtable `F` (rotating the WAL so every later write lands in a newer
-//!    file) and publishes. It then captures `D_F` (`F`'s deleted slots), a new DV generation for
-//!    every segment whose deletion vector grew since its durable generation with a snapshot of
-//!    that vector (`D_S`), `J` (the published `visible_seq_no`), and the job's unit `s`.
-//! 2. **Build** (job thread). `F`'s slots not in `D_F`, in slot order, become the rows of `s`;
+//! 1. **Freeze** (writer). When the active memtable reaches a flush trigger (or an explicit
+//!    flush needs it) and fewer than `max_frozen` memtables are frozen, the writer freezes it as
+//!    `F` (rotating the WAL so every later write lands in a newer file), publishes, and asks the
+//!    scheduler for a flush permit. Flushes of one collection run one at a time, oldest frozen
+//!    memtable first.
+//! 2. **Begin** (writer, on the permit). Capture `D_F` (`F`'s deleted slots), a new DV
+//!    generation for every segment whose deletion vector grew since its durable generation with
+//!    a snapshot of that vector (`D_S`), `J` (the published `visible_seq_no`), and the job's
+//!    unit `s`.
+//! 3. **Build** (job thread). `F`'s slots not in `D_F`, in slot order, become the rows of `s`;
 //!    fields are written as the schema captured at the begin declares them.
-//! 3. **Write** `segments/<s>.seg` and `sync_all` (`FlushAfterSegmentSync`), then each DV file
+//! 4. **Write** `segments/<s>.seg` and `sync_all` (`FlushAfterSegmentSync`), then each DV file
 //!    with `covered_seq_no = J` (`FlushAfterDvSync` after each), then `sync_dir(segments/)`
 //!    (`FlushAfterSegmentsDirSync`). A memtable with no live slot writes no segment: the flush
 //!    is a pure checkpoint.
-//! 4. **Commit** (writer). Manifest `g + 1` = the durable segments with their new DV
+//! 5. **Commit** (writer). Manifest `g + 1` = the durable segments with their new DV
 //!    generations, plus `s`, with checkpoint `L` (`F`'s last operation). Once it is durable
 //!    the writer drops `F`, adds `s` with `F`'s late deletions (slots deleted after the begin,
 //!    mapped to their rows), forwards the primary-key index from `F` to `s`, publishes, and
@@ -34,37 +38,13 @@ use crate::{
     segment::{SegmentHandle, manifest_entry, write_segment},
     segment_v2::{SegmentBuilder, SegmentIdentity},
     version::Version,
-    writer::{FlushStart, FlushedSegment, JobCommit, JobKind, JobWork, row_map},
+    writer::{FlushStart, FlushedSegment, JobCommit, row_map},
 };
-use logpose_types::{LogPoseError, Result, Snapshot, UnitId};
+use logpose_types::{LogPoseError, Result, UnitId};
 use logpose_vfs::CrashPoint;
 use std::sync::Arc;
 
 impl CoreRef {
-    /// Flush every operation the collection had when the call began: the memtables frozen by
-    /// an earlier flush that did not commit, then the active one. Blocking; runs on a job
-    /// thread.
-    pub(crate) fn flush_collection(&self, handle: &Arc<CollectionHandle>) -> Result<Snapshot> {
-        let target = handle.current().visible_seq_no;
-        loop {
-            let (snapshot, flushed) = self.flush_oldest(handle)?;
-            if !flushed || handle.current().checkpoint_seq_no >= target {
-                return Ok(snapshot);
-            }
-        }
-    }
-
-    /// One flush job: the oldest frozen memtable, freezing the active one first if none is
-    /// frozen. Returns whether there was anything to flush.
-    fn flush_oldest(&self, handle: &Arc<CollectionHandle>) -> Result<(Snapshot, bool)> {
-        let (mut ticket, start) = handle.begin_job(JobKind::Flush)?;
-        let JobWork::Flush(work) = start.work else {
-            return Ok((start.version.snapshot(), false));
-        };
-        let commit = self.build_flush(handle, &start.version, start.unit, &work, &mut ticket)?;
-        Ok((ticket.commit(commit)?, true))
-    }
-
     /// Build and write what a flush begun at `version` commits: the segment of unit `unit`
     /// from the frozen memtable's live slots, and the DV files.
     pub(crate) fn build_flush(
@@ -73,7 +53,7 @@ impl CoreRef {
         version: &Version,
         unit: UnitId,
         work: &FlushStart,
-        ticket: &mut JobTicket<'_>,
+        ticket: &mut JobTicket,
     ) -> Result<JobCommit> {
         let vfs = self.vfs.as_ref();
         let dir = &handle.meta().dir;
