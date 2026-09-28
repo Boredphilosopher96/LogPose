@@ -5,9 +5,11 @@
 //! **Policy.** The writer runs [`Policy::plan`] over its unreserved segments, using live rows
 //! (`row_count - dv.len`), whenever the segment set or the deletion counts may have changed:
 //!
-//! 1. **Deletion-driven.** The segment with the most deleted rows among those of at least
-//!    `base_rows` rows whose deleted fraction reaches `deleted_ratio`, plus up to
-//!    `min_merge - 1` of the smallest unreserved segments in the same or a lower tier.
+//! 1. **Deletion-driven.** The segment with the most deleted rows among those whose deleted
+//!    fraction reaches `deleted_ratio` (segments of at least `base_rows` rows) or
+//!    `small_deleted_ratio` with at least `small_deleted_rows` deleted rows (smaller ones). A
+//!    segment of at least `base_rows` rows takes up to `min_merge - 1` of the smallest
+//!    unreserved segments in the same or a lower tier along; a smaller one is rewritten alone.
 //! 2. **Tiered.** For each tier from the lowest (tier 0 holds segments below `base_rows` live
 //!    rows, tier `t >= 1` holds `[base_rows * ratio^(t-1), base_rows * ratio^t)`): once it has
 //!    `min_merge` unreserved segments, take them in ascending unit order until `max_merge`,
@@ -173,8 +175,15 @@ pub struct CompactionConfig {
     pub max_output_rows: u32,
     /// Most `f32` vector bytes in one output. Default 8 GiB.
     pub max_output_bytes: u64,
-    /// Rewrite a segment once this fraction of its rows is deleted. Default 0.2.
+    /// Rewrite a segment of at least `base_rows` rows once this fraction of its rows is
+    /// deleted. Default 0.2.
     pub deleted_ratio: f64,
+    /// Rewrite a segment of fewer than `base_rows` rows once this fraction of its rows is
+    /// deleted, and at least `small_deleted_rows` of them. Default 0.5.
+    pub small_deleted_ratio: f64,
+    /// The fewest deleted rows that get a segment of fewer than `base_rows` rows rewritten for
+    /// its deletions, so a small collection is not rewritten on every delete. Default 64.
+    pub small_deleted_rows: u32,
     /// Most compaction jobs of one collection at once. Default 2.
     pub max_jobs_per_collection: usize,
 }
@@ -189,6 +198,8 @@ impl Default for CompactionConfig {
             max_output_rows: 2_000_000,
             max_output_bytes: 8 << 30,
             deleted_ratio: 0.2,
+            small_deleted_ratio: 0.5,
+            small_deleted_rows: 64,
             max_jobs_per_collection: 2,
         }
     }
@@ -436,6 +447,15 @@ impl Policy {
                 // Too large to rewrite even with the whole pool, so too large for any job.
                 continue;
             }
+            let mut taken = vec![heavy];
+            if heavy.rows < self.config.base_rows {
+                // A small segment is rewritten alone, so the rewrite copies no more rows than
+                // it drops. The tier-0 segments beside it have nothing to reclaim; they wait
+                // for their tier to fill instead of being copied again for every small
+                // segment that reaches the deleted-row floor.
+                plans.push(self.job(&taken, PlanReason::Deletions));
+                continue;
+            }
             let tier = self.tier(heavy.live());
             let mut smaller = free
                 .iter()
@@ -443,7 +463,6 @@ impl Policy {
                 .copied()
                 .collect::<Vec<_>>();
             smaller.sort_by_key(|segment| (segment.live(), segment.unit));
-            let mut taken = vec![heavy];
             for segment in smaller {
                 if taken.len() >= self.config.min_merge {
                     break;
@@ -484,22 +503,35 @@ impl Policy {
         plans
     }
 
-    /// Whether `segment`'s deleted fraction reached `deleted_ratio`. Only segments of at least
-    /// `base_rows` rows qualify: a tier-0 segment is cheap to keep, and the tiered rule merges
-    /// it (dropping its deleted rows) soon enough, so a small collection is not rewritten on
-    /// every delete.
+    /// Whether `segment` holds enough deleted rows to be rewritten for them. A segment of at
+    /// least `base_rows` rows qualifies once its deleted fraction reaches `deleted_ratio`. A
+    /// smaller one needs `small_deleted_ratio` and at least `small_deleted_rows` deleted rows:
+    /// the tiered rule merges it (dropping its deleted rows) once its tier fills, and the floor
+    /// keeps a small collection from being rewritten on every delete. The ratio bounds the
+    /// cost: such a rewrite, of the segment alone, copies no more live rows than the deleted
+    /// rows it drops, and a
+    /// segment that never fills its tier keeps fewer than half its rows (or fewer than the
+    /// floor) deleted.
     #[allow(clippy::cast_precision_loss)]
     fn too_deleted(&self, segment: &Candidate) -> bool {
-        segment.rows >= self.config.base_rows
-            && segment.deleted > 0
-            && segment.deleted as f64 / f64::from(segment.rows.max(1)) >= self.config.deleted_ratio
+        if segment.deleted == 0 {
+            return false;
+        }
+        let fraction = segment.deleted as f64 / f64::from(segment.rows.max(1));
+        if segment.rows >= self.config.base_rows {
+            fraction >= self.config.deleted_ratio
+        } else {
+            segment.deleted >= u64::from(self.config.small_deleted_rows)
+                && fraction >= self.config.small_deleted_ratio
+        }
     }
 
-    /// An explicit compaction over `segments` that avoid `reserved`, if at least two do: the
-    /// first two in ascending unit order, then as many more as fit one job whose build uses at
-    /// most the whole pool (and within `max_output_rows` and `max_output_bytes`). A job whose
-    /// first two inputs already need more than the pool is planned anyway, and the scheduler
-    /// declines it.
+    /// An explicit compaction over `segments` that avoid `reserved`: the first two in ascending
+    /// unit order, then as many more as fit one job whose build uses at most the whole pool
+    /// (and within `max_output_rows` and `max_output_bytes`). A job whose first two inputs
+    /// already need more than the pool is planned anyway, and the scheduler declines it. A
+    /// single segment is rewritten alone if it has deleted rows, so an explicit compaction
+    /// always reclaims them; one without any is left alone.
     pub(crate) fn plan_explicit(
         &self,
         segments: &[Candidate],
@@ -522,7 +554,12 @@ impl Policy {
             }
             taken.push(*segment);
         }
-        (taken.len() >= 2).then(|| explicit.job(&taken, PlanReason::Explicit))
+        let worth = match taken.as_slice() {
+            [] => false,
+            [only] => only.deleted > 0,
+            _ => true,
+        };
+        worth.then(|| explicit.job(&taken, PlanReason::Explicit))
     }
 }
 
