@@ -644,13 +644,19 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Conflict:
-      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`), or a storage failure made the collection read-only until the engine is reopened (`COLLECTION_POISONED`). Retrying does not help.
+      description: The resource already exists (`ALREADY_EXISTS`), or the node or collection is not in the state the request needs (`FAILED_PRECONDITION`), for example the node's role does not serve the operation, a read barrier is not visible on this node (`READ_BARRIER_NOT_SATISFIED`), an exact snapshot is no longer retained because a flush or compaction superseded its manifest generation (`SNAPSHOT_EXPIRED`), or a storage failure made the collection read-only until the engine is reopened (`COLLECTION_POISONED`). Retrying does not help.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     PayloadTooLarge:
       description: The request body exceeds `limits.max_rest_body_bytes` (`RESOURCE_EXHAUSTED`, reason `TOO_LARGE`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TooManyRequests:
+      description: A limit other than a size limit is reached (`RESOURCE_EXHAUSTED`), for example the collection already pins as many snapshots as it allows, or pinned snapshots hold more retired memory than the engine allows (`TOO_MANY_SNAPSHOTS`). Release a snapshot token or retry after tokens expire.
       content:
         application/json:
           schema:
@@ -1393,6 +1399,8 @@ components:
         - WRONG_NODE_ROLE
         - RECONCILIATION_REQUIRED
         - STORAGE_ROOT_LOCKED
+        - SNAPSHOT_EXPIRED
+        - TOO_MANY_SNAPSHOTS
         - UNAUTHENTICATED
         - PERMISSION_DENIED
         - NOT_OWNER

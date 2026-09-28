@@ -271,19 +271,27 @@ async fn assert_recovered(
         .unwrap_or_else(|error| panic!("{context}: stats failed: {error}"));
     assert_eq!(stats.live_record_count, recovered.len(), "{context}");
 
-    // Every snapshot handed out before the crash still reads exactly the state it named.
+    // A snapshot handed out before the crash reads exactly the state it named while its
+    // manifest generation is the recovered one; any other is expired (tokens, which could pin
+    // it, do not survive a restart). It never reads a different state.
     for (snapshot, acked) in &outcome.snapshots {
-        let read = engine
-            .scan_exact(COLLECTION, Some(snapshot.clone()))
-            .await
-            .unwrap_or_else(|error| {
+        let read = engine.scan_exact(COLLECTION, Some(snapshot.clone())).await;
+        if snapshot.manifest_generation == stats.manifest_generation {
+            let read = read.unwrap_or_else(|error| {
                 panic!("{context}: snapshot {snapshot:?} is unreadable after recovery: {error}")
             });
-        assert_eq!(
-            read,
-            expected_visible(&outcome.acked[..*acked]),
-            "{context}: snapshot {snapshot:?} changed across the crash"
-        );
+            assert_eq!(
+                read,
+                expected_visible(&outcome.acked[..*acked]),
+                "{context}: snapshot {snapshot:?} changed across the crash"
+            );
+        } else {
+            let error = read.expect_err("a snapshot of another generation is not retained");
+            assert!(
+                matches!(error, LogPoseError::SnapshotExpired { .. }),
+                "{context}: snapshot {snapshot:?}: {error}"
+            );
+        }
     }
     kept
 }

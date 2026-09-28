@@ -189,7 +189,7 @@ mod tests {
     use logpose_types::error::fixtures::{one_of_each_variant, variant_name};
 
     /// The documented gRPC code of every variant (see `docs/src/api-overview.md`).
-    const EXPECTED: [(&str, Code); 22] = [
+    const EXPECTED: [(&str, Code); 24] = [
         ("InvalidArgument", Code::InvalidArgument),
         ("DimensionMismatch", Code::InvalidArgument),
         ("TooLarge", Code::ResourceExhausted),
@@ -200,6 +200,8 @@ mod tests {
         ("WrongNodeRole", Code::FailedPrecondition),
         ("ReconciliationRequired", Code::FailedPrecondition),
         ("StorageRootLocked", Code::FailedPrecondition),
+        ("SnapshotExpired", Code::FailedPrecondition),
+        ("TooManySnapshots", Code::ResourceExhausted),
         ("Unauthenticated", Code::Unauthenticated),
         ("PermissionDenied", Code::PermissionDenied),
         ("NotOwner", Code::Unavailable),

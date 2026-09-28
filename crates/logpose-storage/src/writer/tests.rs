@@ -377,7 +377,17 @@ async fn an_unfenced_rollback_failure_stops_the_process() {
 async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
     let fault = FaultVfs::new(13);
     let vfs = ControlledVfs::wrap(fault.process());
-    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    // A group waits for a second request, so the schema change and the large write below always
+    // form group N+1 together, whichever reaches the writer first.
+    let grouped = EngineConfig {
+        group: GroupCommitConfig {
+            commit_delay: Duration::from_millis(500),
+            min_group_requests: 2,
+            ..GroupCommitConfig::default()
+        },
+        ..config("boot")
+    };
+    let engine = Engine::open(vfs.clone(), ROOT, grouped).expect("engine should open");
     let handle = create(&engine, "prefix");
     let schema_version = handle.current().schema.schema_version();
     let kept = write(&handle, "kept").await.expect("write should succeed");
@@ -407,7 +417,7 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
     let behind = {
         let handle = Arc::clone(&handle);
         tokio::spawn(async move {
-            let rows = (0..2 * INLINE_PREPARE_ROWS)
+            let rows = (0..2 * super::prepare::INLINE_PREPARE_ROWS)
                 .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
                 .collect();
             let large = handle.write(ops(&handle, rows));
@@ -499,7 +509,7 @@ async fn a_group_prepared_during_a_drop_that_does_not_commit_is_forgotten() {
     // Collected and prepared while `first`'s fsync is held.
     let behind = spawn_write(&handle, "behind".to_owned());
     tokio::time::sleep(Duration::from_millis(200)).await;
-    vfs.fail_renames_to(Some(crate::engine::DROPPED_DIR_SUFFIX));
+    vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
     let dropped = {
         let engine = engine.clone();
         tokio::task::spawn_blocking(move || engine.drop_collection(&reference("undropped")))
@@ -524,7 +534,7 @@ async fn a_group_prepared_during_a_drop_that_does_not_commit_is_forgotten() {
         .await
         .expect("drop should join")
         .expect_err("the drop's rename fails");
-    vfs.fail_renames_to(None);
+    vfs.stop_failing_renames();
     assert!(!handle.is_dropped(), "the collection serves again");
     assert_eq!(
         visible(&handle).keys().collect::<Vec<_>>(),
@@ -783,7 +793,8 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
         .expect("write a");
     // A typed value for an undeclared field is refused... unless it can be dynamic: it moves to
     // `$extra`, which is the v1 behavior for undeclared keys.
-    let (ticket, frozen) = handle.begin_job(JobKind::Flush).expect("flush begins");
+    let (mut ticket, start) = handle.begin_job(JobKind::Flush).expect("flush begins");
+    let frozen = start.version;
     assert_eq!(frozen.visible_seq_no, 1);
 
     // Seq 2..=4, above the flush checkpoint: add `price`, write `b` with a typed price, drop it.
@@ -842,9 +853,18 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
                     crate::legacy_view::legacy_record(&frozen.schema, record).expect("legacy")
                 })
                 .collect::<Vec<_>>(),
-            crate::segment_v1::SegmentPurpose::Flush,
+            crate::segment_v1::SegmentBuild {
+                unit: start.unit,
+                purpose: crate::segment_v1::SegmentPurpose::Flush,
+                origin: crate::manifest::SegmentOrigin::Flush {
+                    first_seq_no: 1,
+                    last_seq_no: 1,
+                },
+                schema_version: frozen.schema.schema_version(),
+            },
         )
         .expect("segment should write");
+    ticket.writing_files();
     ticket
         .commit(JobCommit::Flush {
             checkpoint_seq_no: 1,
@@ -974,8 +994,9 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     assert!(engine.collection(&reference("busy")).is_err());
 }
 
-/// Recovery refuses a WAL whose checkpoint frames are ahead of the manifest: that means
-/// `CURRENT` went backwards, and replaying would resurrect checkpointed state incorrectly.
+/// Recovery refuses a log that `CURRENT` went backwards on: the WAL files below the newer
+/// checkpoint are gone once its manifest is durable, and a checkpoint frame ahead of the
+/// manifest would fail the replay's cross-check if they were not.
 #[test]
 fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let fault = FaultVfs::new(9);
@@ -988,7 +1009,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     // The flush's checkpoint frame rides along with the next group.
     core.write(&handle, vec![put("b", vec![1.0, 0.0])])
         .expect("write b");
-    let current = crate::engine::EngineCore::current_manifest_pointer(handle.descriptor());
+    let current = handle.meta().dir.join(crate::manifest::CURRENT_FILE);
     drop((handle, core));
     drop(engine);
 
@@ -998,7 +1019,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let file = vfs
         .open(&current, logpose_vfs::OpenMode::CreateNew)
         .expect("create CURRENT");
-    file.append(&[std::io::IoSlice::new(b"0")])
+    file.append(&[std::io::IoSlice::new(b"00000000000000000000\n")])
         .expect("write CURRENT");
     file.sync_all().expect("sync CURRENT");
 
@@ -1006,7 +1027,7 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let error = engine
         .collection(&reference("rewound"))
         .expect_err("recovery must refuse");
-    assert!(error.to_string().contains("checkpoint frame"), "{error}");
+    assert!(error.to_string().contains("checkpoint"), "{error}");
 }
 
 /// A directory with the version 1 WAL is rejected with a typed format error.
@@ -1029,4 +1050,123 @@ fn a_version_1_wal_is_an_unsupported_format() {
         .collection(&reference("legacy"))
         .expect_err("a v1 WAL is refused");
     assert!(error.to_string().contains("unexpected WAL file"), "{error}");
+}
+
+/// A group is prepared inline only when it is small in rows and in bytes: a few very large rows
+/// go to the query pool too.
+#[test]
+fn inline_preparation_is_bounded_by_rows_and_by_bytes() {
+    use super::prepare::{INLINE_PREPARE_BYTES, INLINE_PREPARE_ROWS, prepares_inline};
+    assert!(prepares_inline(1, 64));
+    assert!(prepares_inline(
+        INLINE_PREPARE_ROWS - 1,
+        INLINE_PREPARE_BYTES - 1
+    ));
+    assert!(!prepares_inline(INLINE_PREPARE_ROWS, 64));
+    assert!(!prepares_inline(1, INLINE_PREPARE_BYTES));
+    // Four rows of 32k-dimension vectors are half a megabyte: not inline.
+    let rows = (0..4)
+        .map(|index| put(&format!("wide-{index}"), vec![0.5; 32 * 1024]))
+        .collect::<Vec<_>>();
+    let request = WriteRequest::Batch {
+        ops: legacy_ops(
+            &logpose_catalog::CollectionDescriptor::new(
+                "wide",
+                32 * 1024,
+                DistanceMetric::Dot,
+                std::path::Path::new("/c"),
+            ),
+            rows,
+        )
+        .expect("rows map"),
+        ack: tokio::sync::oneshot::channel().0,
+    };
+    assert!(!prepares_inline(
+        request.rows(),
+        request.approximate_bytes()
+    ));
+}
+
+/// A drop voids the maintenance requests outstanding when it starts. When the drop does not
+/// commit, a later write over the flush threshold requests a flush again: the request that the
+/// drop refused must not leave the writer believing one is still queued.
+#[test]
+fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
+    let fault = FaultVfs::new(15);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let engine = Engine::open(vfs.clone(), ROOT, config("boot")).expect("engine should open");
+    let mut descriptor = engine
+        .core()
+        .plan_collection_descriptor(&CreateCollectionRequest::new(
+            "requests",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .expect("descriptor should plan");
+    descriptor.flush_threshold_ops = 2;
+    descriptor.flush_threshold_bytes = usize::MAX;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    let handle = engine
+        .create_collection(descriptor, None)
+        .expect("collection should be created");
+    let core = engine.core();
+    let status = || core.maintenance_status(&handle);
+    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    // Hold the job slot, so the flush the threshold requests waits in the writer's queue.
+    let (ticket, _) = handle
+        .begin_job(JobKind::Compact)
+        .expect("the slot is free");
+    for id in ["a", "b"] {
+        core.write(&handle, vec![put(id, vec![1.0, 0.0])])
+            .expect("write");
+    }
+    wait_for("the requested flush to begin", &|| {
+        status().in_progress.as_deref() == Some("flush")
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    // A drop that fails its rename: the waiting flush is refused.
+    vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
+    let dropped = {
+        let engine = engine.clone();
+        std::thread::spawn(move || engine.drop_collection(&reference("requests")))
+    };
+    wait_for("the drop to start", &|| handle.is_dropped());
+    std::thread::sleep(Duration::from_millis(100));
+    drop(ticket);
+    dropped
+        .join()
+        .expect("drop should join")
+        .expect_err("the rename fails");
+    vfs.stop_failing_renames();
+    assert!(!handle.is_dropped());
+    assert_eq!(
+        handle.current().manifest_generation,
+        0,
+        "nothing was flushed"
+    );
+    wait_for("the refused flush to end", &|| {
+        status().in_progress.is_none()
+    });
+
+    // Still over the threshold, so the next publish requests a flush, and it runs. One write
+    // only: the flush freezes the state that write published, and a second write could land
+    // after the freeze and stay in the delta.
+    core.write(&handle, vec![put("c", vec![1.0, 0.0])])
+        .expect("write");
+    wait_for("a flush after the failed drop", &|| {
+        handle.current().manifest_generation > 0
+    });
+    assert_eq!(
+        visible(&handle).len(),
+        0,
+        "the flush checkpointed every write"
+    );
 }

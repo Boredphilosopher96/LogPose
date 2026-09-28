@@ -7,7 +7,8 @@ use crate::{
     durable_fs::{create_dir_all_synced, sync_parent_dir, write_file_synced},
     error::{io_message, json_message},
     fs_util::{cleanup_file, crash_point},
-    manifest::{RemoteArtifact, RemoteSyncState, SegmentMeta},
+    manifest::{ManifestSegment, RemoteArtifact, RemoteSyncState, SegmentMeta, SegmentOrigin},
+    paths::UnitFiles,
     stats::segment_component_bytes,
 };
 use crc32fast::hash;
@@ -16,37 +17,44 @@ use logpose_index::{
     FlatIndexEntrySource, HnswBuildParams, HnswIndexEntrySource, build_flat_index,
     build_hnsw_index, encode_flat_index, encode_hnsw_index,
 };
-use logpose_types::{QueryUnitArtifactStats, Result, WriteOperation};
+use logpose_types::{QueryUnitArtifactStats, Result, UnitId, WriteOperation};
 use logpose_vfs::Vfs;
 use std::{collections::BTreeSet, io, path::Path};
-use uuid::Uuid;
+
+/// What a v1 segment is for, as recorded in its manifest entry.
+pub(crate) struct SegmentBuild {
+    /// The unit id the writer allocated for the job.
+    pub(crate) unit: UnitId,
+    pub(crate) purpose: SegmentPurpose,
+    pub(crate) origin: SegmentOrigin,
+    /// The schema version the segment's rows were read with.
+    pub(crate) schema_version: u64,
+}
 
 impl EngineCore {
+    /// Write `records` as the v1 segment of `build.unit`, with its sidecars, and return its
+    /// manifest entry. Every file is synced and renamed into place, and its directory synced,
+    /// before this returns, as the manifest publish protocol requires.
     pub(crate) fn write_segment_file(
         &self,
         descriptor: &CollectionDescriptor,
         records: &[SegmentRecord],
-        purpose: SegmentPurpose,
-    ) -> Result<SegmentMeta> {
-        let segment_id = Uuid::new_v4().to_string();
-        let temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.lps.tmp"));
-        let final_path = descriptor
-            .root_path
-            .join("segments")
-            .join(format!("{segment_id}.lps"));
-        let sidecar_temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.flat.json.tmp"));
-        let sidecar_path = Self::flat_index_file_path(descriptor, &segment_id);
-        let hnsw_temp_path = descriptor
-            .root_path
-            .join("tmp")
-            .join(format!("{segment_id}.hnsw.bin.tmp"));
-        let hnsw_path = Self::hnsw_index_file_path(descriptor, &segment_id);
+        build: SegmentBuild,
+    ) -> Result<ManifestSegment> {
+        let SegmentBuild {
+            unit,
+            purpose,
+            origin,
+            schema_version,
+        } = build;
+        let segment_id = unit.to_string();
+        let files = UnitFiles::new(&descriptor.root_path, unit);
+        let temp_path = files.segment_temp;
+        let final_path = files.segment;
+        let sidecar_temp_path = files.flat_temp;
+        let sidecar_path = files.flat;
+        let hnsw_temp_path = files.hnsw_temp;
+        let hnsw_path = files.hnsw;
 
         let mut ids = Vec::new();
         let mut vectors = Vec::new();
@@ -239,7 +247,7 @@ impl EngineCore {
                 },
             });
 
-        Ok(SegmentMeta {
+        let legacy = SegmentMeta {
             segment_id: segment_id.clone(),
             file_name: final_path
                 .file_name()
@@ -257,6 +265,21 @@ impl EngineCore {
             artifacts,
             component_bytes,
             remote,
+        };
+        Ok(ManifestSegment {
+            unit,
+            file_len: segment_bytes as u64,
+            footer_crc: 0,
+            row_count: u32::try_from(records.len()).unwrap_or(u32::MAX),
+            schema_version,
+            min_seq_no: legacy.min_seq_no,
+            max_seq_no: legacy.max_seq_no,
+            origin,
+            tier: 0,
+            dv: None,
+            vectors: Vec::new(),
+            zones: Vec::new(),
+            legacy: Some(legacy),
         })
     }
 }
@@ -477,7 +500,15 @@ mod tests {
                         metadata: json!({"kind":"broken"}),
                     }),
                 }],
-                SegmentPurpose::Flush,
+                SegmentBuild {
+                    unit: UnitId(7),
+                    purpose: SegmentPurpose::Flush,
+                    origin: SegmentOrigin::Flush {
+                        first_seq_no: 1,
+                        last_seq_no: 1,
+                    },
+                    schema_version: 1,
+                },
             )
         });
 

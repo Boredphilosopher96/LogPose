@@ -276,6 +276,7 @@ fn openapi_error_schema_matches_the_error_taxonomy() {
         (404, "NotFound"),
         (409, "Conflict"),
         (413, "PayloadTooLarge"),
+        (429, "TooManyRequests"),
         (500, "Internal"),
         (503, "Unavailable"),
     ]);

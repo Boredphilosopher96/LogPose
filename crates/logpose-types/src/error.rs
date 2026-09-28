@@ -117,6 +117,10 @@ pub enum ErrorReason {
     ReconciliationRequired,
     /// `STORAGE_ROOT_LOCKED`: see [`LogPoseError::StorageRootLocked`].
     StorageRootLocked,
+    /// `SNAPSHOT_EXPIRED`: see [`LogPoseError::SnapshotExpired`].
+    SnapshotExpired,
+    /// `TOO_MANY_SNAPSHOTS`: see [`LogPoseError::TooManySnapshots`].
+    TooManySnapshots,
     /// `UNAUTHENTICATED`: see [`LogPoseError::Unauthenticated`].
     Unauthenticated,
     /// `PERMISSION_DENIED`: see [`LogPoseError::PermissionDenied`].
@@ -143,7 +147,7 @@ pub enum ErrorReason {
 
 impl ErrorReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::InvalidArgument,
         Self::DimensionMismatch,
         Self::TooLarge,
@@ -154,6 +158,8 @@ impl ErrorReason {
         Self::WrongNodeRole,
         Self::ReconciliationRequired,
         Self::StorageRootLocked,
+        Self::SnapshotExpired,
+        Self::TooManySnapshots,
         Self::Unauthenticated,
         Self::PermissionDenied,
         Self::NotOwner,
@@ -181,6 +187,8 @@ impl ErrorReason {
             Self::WrongNodeRole => "WRONG_NODE_ROLE",
             Self::ReconciliationRequired => "RECONCILIATION_REQUIRED",
             Self::StorageRootLocked => "STORAGE_ROOT_LOCKED",
+            Self::SnapshotExpired => "SNAPSHOT_EXPIRED",
+            Self::TooManySnapshots => "TOO_MANY_SNAPSHOTS",
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::NotOwner => "NOT_OWNER",
@@ -476,6 +484,30 @@ pub enum LogPoseError {
         /// Process id recorded in the lock file by the holder, if readable.
         holder_pid: Option<String>,
     },
+    /// A snapshot token, or an exact snapshot, names a collection state that is no longer
+    /// retained: the token expired, was released, or was never issued, or the snapshot's
+    /// manifest generation is neither current nor pinned by a token.
+    ///
+    /// This is `FAILED_PRECONDITION` with no retry hint: the same request can never succeed.
+    /// Restart the read (a scroll restarts from its first page).
+    #[error("snapshot of collection '{collection}' is no longer available: {reason}")]
+    SnapshotExpired {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Why the snapshot cannot be served.
+        reason: String,
+    },
+    /// No more snapshots can be pinned: the collection holds as many tokens as it allows, or
+    /// pinned snapshots already hold more retired memory than the engine allows.
+    ///
+    /// This is `RESOURCE_EXHAUSTED`: release a token, or retry after tokens expire.
+    #[error("collection '{collection}' cannot pin another snapshot: {reason}")]
+    TooManySnapshots {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Which limit was reached.
+        reason: String,
+    },
 
     // ----- Authentication and authorization. -----
     /// The request carries no valid credentials.
@@ -747,7 +779,7 @@ impl LogPoseError {
             Self::InvalidArgument { .. }
             | Self::DimensionMismatch { .. }
             | Self::InvalidConfig { .. } => ErrorCode::InvalidArgument,
-            Self::TooLarge { .. } => ErrorCode::ResourceExhausted,
+            Self::TooLarge { .. } | Self::TooManySnapshots { .. } => ErrorCode::ResourceExhausted,
             Self::NotFound { .. } => ErrorCode::NotFound,
             Self::AlreadyExists { .. } => ErrorCode::AlreadyExists,
             Self::FailedPrecondition { .. }
@@ -755,6 +787,7 @@ impl LogPoseError {
             | Self::ReconciliationRequired { .. }
             | Self::StorageRootLocked { .. }
             | Self::ReadBarrierNotSatisfied { .. }
+            | Self::SnapshotExpired { .. }
             | Self::CollectionPoisoned { .. } => ErrorCode::FailedPrecondition,
             Self::Unauthenticated { .. } => ErrorCode::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
@@ -790,6 +823,8 @@ impl LogPoseError {
             Self::WrongNodeRole { .. } => ErrorReason::WrongNodeRole,
             Self::ReconciliationRequired { .. } => ErrorReason::ReconciliationRequired,
             Self::StorageRootLocked { .. } => ErrorReason::StorageRootLocked,
+            Self::SnapshotExpired { .. } => ErrorReason::SnapshotExpired,
+            Self::TooManySnapshots { .. } => ErrorReason::TooManySnapshots,
             Self::Unauthenticated { .. } => ErrorReason::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorReason::PermissionDenied,
             Self::NotOwner { .. } => ErrorReason::NotOwner,
@@ -887,7 +922,9 @@ impl LogPoseError {
                 put("node_role", role.as_str().to_owned());
             }
             Self::ReconciliationRequired { collection, .. }
-            | Self::CollectionPoisoned { collection, .. } => {
+            | Self::CollectionPoisoned { collection, .. }
+            | Self::SnapshotExpired { collection, .. }
+            | Self::TooManySnapshots { collection, .. } => {
                 put("collection", collection.clone());
             }
             Self::StorageRootLocked {
@@ -1035,6 +1072,14 @@ pub mod fixtures {
                 lock_file: PathBuf::from("/data/LOCK"),
                 holder_pid: Some("42".to_owned()),
             },
+            LogPoseError::SnapshotExpired {
+                collection: "default/docs".to_owned(),
+                reason: "the token expired".to_owned(),
+            },
+            LogPoseError::TooManySnapshots {
+                collection: "default/docs".to_owned(),
+                reason: "it already holds 64 pinned snapshots".to_owned(),
+            },
             LogPoseError::Unauthenticated {
                 message: "missing bearer token".to_owned(),
             },
@@ -1126,9 +1171,11 @@ mod tests {
             LogPoseError::BulkBatchFailed { .. } => 19,
             LogPoseError::Internal { .. } => 20,
             LogPoseError::WalWriteFailed { .. } => 21,
+            LogPoseError::SnapshotExpired { .. } => 22,
+            LogPoseError::TooManySnapshots { .. } => 23,
         }
     }
-    const VARIANT_COUNT: usize = 22;
+    const VARIANT_COUNT: usize = 24;
 
     #[test]
     fn every_variant_is_listed() {
@@ -1194,6 +1241,16 @@ mod tests {
                 "StorageRootLocked",
                 ErrorCode::FailedPrecondition,
                 "STORAGE_ROOT_LOCKED",
+            ),
+            (
+                "SnapshotExpired",
+                ErrorCode::FailedPrecondition,
+                "SNAPSHOT_EXPIRED",
+            ),
+            (
+                "TooManySnapshots",
+                ErrorCode::ResourceExhausted,
+                "TOO_MANY_SNAPSHOTS",
             ),
             (
                 "Unauthenticated",
@@ -1262,6 +1319,26 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::FailedPrecondition);
         assert_eq!(error.retry_after(), None);
         assert_eq!(details.retry_after_ms, None);
+    }
+
+    #[test]
+    fn snapshot_token_errors_name_the_collection_and_are_not_retried_blindly() {
+        let expired = LogPoseError::SnapshotExpired {
+            collection: "default/docs".to_owned(),
+            reason: "the token expired".to_owned(),
+        };
+        assert_eq!(expired.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(expired.reason(), "SNAPSHOT_EXPIRED");
+        assert_eq!(expired.retry_after(), None);
+        assert_eq!(expired.details().metadata["collection"], "default/docs");
+        let exhausted = LogPoseError::TooManySnapshots {
+            collection: "default/docs".to_owned(),
+            reason: "it already holds 64 pinned snapshots".to_owned(),
+        };
+        assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(exhausted.reason(), "TOO_MANY_SNAPSHOTS");
+        assert_eq!(exhausted.details().metadata["collection"], "default/docs");
+        assert!(exhausted.to_string().contains("64 pinned"), "{exhausted}");
     }
 
     #[test]

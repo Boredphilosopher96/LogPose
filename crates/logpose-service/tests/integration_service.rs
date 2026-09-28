@@ -228,7 +228,7 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
 }
 
 #[tokio::test]
-async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
+async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
     let root = unique_temp_dir("service-write-ack-snapshot-after-rotation");
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
@@ -253,25 +253,32 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
         )
         .await
         .expect("write should succeed");
-
     service
-        .flush("documents")
+        .write(
+            "documents",
+            vec![WriteOperation::Put(PutRecord {
+                id: RecordId::new("beta"),
+                vector: vec![2.0, 0.0],
+                metadata: json!({"kind":"keep"}),
+            })],
+        )
         .await
-        .expect("flush should succeed");
+        .expect("write should succeed");
 
+    let request = QueryRequest {
+        collection_name: "documents".to_owned(),
+        vector: vec![1.0, 0.0],
+        top_k: 2,
+        snapshot: Some(ack.snapshot.clone()),
+        read_barrier: None,
+        filters: Vec::new(),
+        predicate: None,
+        explain: ExplainMode::None,
+    };
     let response = service
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 1,
-            snapshot: Some(ack.snapshot.clone()),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-        })
+        .query(request.clone())
         .await
-        .expect("pre-flush write snapshot should still be readable after rotation");
+        .expect("a snapshot of the current generation is exact");
     assert_eq!(response.snapshot, ack.snapshot);
     assert_eq!(
         response
@@ -282,13 +289,42 @@ async fn write_ack_snapshot_remains_usable_after_manifest_rotation() {
         vec!["alpha"]
     );
 
-    let stats = service
-        .stats_at_snapshot("documents", ack.snapshot)
+    service
+        .flush("documents")
         .await
-        .expect("pre-flush write snapshot should still be valid for stats");
-    assert_eq!(stats.manifest_generation, 0);
-    assert_eq!(stats.visible_seq_no, 1);
-    assert_eq!(stats.live_record_count, 1);
+        .expect("flush should succeed");
+
+    let error = service
+        .query(request)
+        .await
+        .expect_err("nothing pins the superseded generation");
+    assert!(
+        matches!(&error, LogPoseError::SnapshotExpired { .. }),
+        "{error:?}"
+    );
+    let error = service
+        .stats_at_snapshot("documents", ack.snapshot.clone())
+        .await
+        .expect_err("stats of the superseded generation expire too");
+    assert!(
+        matches!(&error, LogPoseError::SnapshotExpired { .. }),
+        "{error:?}"
+    );
+    // As a read barrier, the ack is still satisfied: barriers compare positions, not files.
+    let response = service
+        .query(QueryRequest {
+            snapshot: None,
+            read_barrier: Some(ack.snapshot),
+            top_k: 2,
+            collection_name: "documents".to_owned(),
+            vector: vec![1.0, 0.0],
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        })
+        .await
+        .expect("the barrier is satisfied");
+    assert_eq!(response.matches.len(), 2);
 }
 
 #[tokio::test]

@@ -15,8 +15,13 @@
 //! - `local_engine`: the trait implementation over `Engine`.
 //! - `collections`, `catalog`: collection, database and principal descriptor files.
 //! - `paths`: the on-disk layout.
-//! - `recovery`, `state`: recovering a collection's manifest and replaying its WAL.
-//! - `manifest`, `segment_v1`: the v1 manifest and segment file formats.
+//! - `recovery`: the durability barrier, loading the manifest `CURRENT` names, orphan cleanup,
+//!   and replaying the WAL above its checkpoint.
+//! - `state`: resolving a read to the current or a token-pinned `Version`.
+//! - `manifest`: manifest v2 and the `CURRENT` publish protocol.
+//! - `gc`: version-refcounted segment files, the file-removal queue, and orphan cleanup.
+//! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
+//! - `segment_v1`: the v1 segment file format.
 //! - `segment_v2`: the v2 segment file format, builder, and reader (not yet wired in).
 //! - `cache`: the buffer cache of segment section bytes that segment v2 readers load through.
 //! - `flush`, `compaction`, `maintenance`: maintenance jobs and each collection's queue.
@@ -30,6 +35,7 @@ use rand as _;
 
 pub mod cache;
 mod catalog;
+mod clock;
 mod collections;
 mod compaction;
 mod durable_fs;
@@ -37,6 +43,7 @@ mod engine;
 mod error;
 mod flush;
 mod fs_util;
+mod gc;
 mod handle;
 mod legacy_view;
 mod local_engine;
@@ -55,9 +62,11 @@ mod stats;
 mod storage_engine;
 #[cfg(test)]
 mod test_support;
+mod tokens;
 mod version;
 mod writer;
 
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use engine::{Engine, EngineConfig, FatalHandler};
 pub use handle::{CollectionHandle, CollectionMeta};
 pub use local_engine::LocalStorageEngine;
@@ -65,5 +74,6 @@ pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
 };
+pub use tokens::{InvalidSnapshotToken, SnapshotToken, TokenConfig};
 pub use version::{Version, VersionCounters, VersionId};
 pub use writer::{GroupCommitConfig, SchemaChange};

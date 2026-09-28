@@ -288,6 +288,20 @@ fn validate_collection_ref_segment(field_name: &str, value: &str) -> Result<()> 
 /// Monotonic sequence number assigned to durable write operations.
 pub type SeqNo = u64;
 
+/// Identifier of a memtable or a segment of one collection. Allocated from one per-collection
+/// counter (`next_unit_id`, persisted in the manifest) and never reused, even after a failed
+/// maintenance job burned it.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize,
+)]
+pub struct UnitId(pub u32);
+
+impl fmt::Display for UnitId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:08x}", self.0)
+    }
+}
+
 /// Identifier for a collection.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct CollectionId(pub Uuid);

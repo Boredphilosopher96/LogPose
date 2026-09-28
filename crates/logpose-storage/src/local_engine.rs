@@ -18,6 +18,7 @@ use crate::{
     metric::{storage_metric_compare, storage_metric_value},
     resolve::{ResolvedState, resolve_latest_state_for_ids_selected},
     segment_v1::read_segment_file,
+    tokens::SnapshotToken,
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
@@ -151,6 +152,52 @@ impl LocalStorageEngine {
         self.engine
             .collection(&CollectionRef::new(database_name, name))
             .map(|handle| handle.descriptor().clone())
+    }
+
+    /// Pin the current state of `collection_name` for repeatable reads, returning the token and
+    /// the snapshot it names. While the token lives, reads through it (and exact reads of that
+    /// snapshot) see exactly this state, across flushes and compactions (I12).
+    ///
+    /// Fails with [`LogPoseError::TooManySnapshots`] when the collection already holds the most
+    /// pins it allows or pinned snapshots exceed the engine's pinned-memory limit.
+    pub fn pin_snapshot(&self, collection_name: &str) -> Result<(SnapshotToken, Snapshot)> {
+        let handle = self.handle(collection_name)?;
+        handle.ensure_open()?;
+        let version = handle.current();
+        let token = handle.pin_version(Arc::clone(&version))?;
+        Ok((token, version.snapshot()))
+    }
+
+    /// Unpin `token`. Returns whether it was pinned.
+    pub fn release_snapshot(&self, collection_name: &str, token: &SnapshotToken) -> Result<bool> {
+        Ok(self.handle(collection_name)?.release_snapshot(token))
+    }
+
+    /// Every visible record of the state `token` pins, extending the token's expiry. Fails with
+    /// [`LogPoseError::SnapshotExpired`] once the token expired or was released.
+    pub async fn scan_exact_at_token(
+        &self,
+        collection_name: &str,
+        token: SnapshotToken,
+    ) -> Result<Vec<VisibleRecord>> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.scan_exact_internal(handle, token, true, None)
+        })
+        .await
+    }
+
+    /// Statistics of the state `token` pins, extending the token's expiry.
+    pub async fn stats_at_token(
+        &self,
+        collection_name: &str,
+        token: SnapshotToken,
+    ) -> Result<CollectionStats> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |core, handle| {
+            core.collection_stats(handle, token)
+        })
+        .await
     }
 
     fn handle(&self, name: &str) -> Result<Arc<CollectionHandle>> {
@@ -490,12 +537,12 @@ impl EngineCore {
     fn ann_search_selected(
         &self,
         handle: &CollectionHandle,
-        snapshot: Option<Snapshot>,
+        at: impl Into<crate::state::ReadAt>,
         immutable_unit_ids: Vec<String>,
         request: &AnnSearchRequest,
         filter: Option<MetadataFilter>,
     ) -> Result<Vec<AnnCandidate>> {
-        let (state, snapshot) = self.read_state(handle, snapshot)?;
+        let (state, snapshot) = self.read_state(handle, at)?;
         let descriptor = handle.descriptor();
         let metric = descriptor.metric;
         let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
@@ -504,8 +551,7 @@ impl EngineCore {
 
         for segment in state
             .manifest
-            .segments
-            .iter()
+            .legacy_segments()
             .rev()
             .filter(|segment| selected.contains(&segment.segment_id))
         {
@@ -581,12 +627,12 @@ impl EngineCore {
     fn latest_visible_selected(
         &self,
         handle: &CollectionHandle,
-        snapshot: Option<Snapshot>,
+        at: impl Into<crate::state::ReadAt>,
         record_ids: Vec<RecordId>,
         include_mutable: bool,
         immutable_unit_ids: Vec<String>,
     ) -> Result<Vec<VisibleRecord>> {
-        let (state, snapshot) = self.read_state(handle, snapshot)?;
+        let (state, snapshot) = self.read_state(handle, at)?;
         let resolved = resolve_latest_state_for_ids_selected(
             self.vfs.as_ref(),
             handle.descriptor(),
@@ -614,7 +660,7 @@ impl EngineCore {
         match target {
             InspectTarget::Manifest => Ok(InspectReport {
                 target: "manifest".to_owned(),
-                payload: serde_json::to_value(&*version.manifest).map_err(json_message)?,
+                payload: version.manifest.inspect_json(),
             }),
             InspectTarget::Wal => {
                 let mut records = Vec::with_capacity(version.delta.len());
@@ -638,8 +684,7 @@ impl EngineCore {
             InspectTarget::Segment(segment_id) => {
                 let segment = version
                     .manifest
-                    .segments
-                    .iter()
+                    .legacy_segments()
                     .find(|segment| segment.segment_id == segment_id)
                     .ok_or_else(|| {
                         LogPoseError::not_found(ResourceKind::Segment, segment_id.clone())

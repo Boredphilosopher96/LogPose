@@ -40,14 +40,18 @@ pub(crate) use apply::{LogicalState, replay_frame};
 
 use crate::{
     engine::CoreRef,
+    gc::FileHandle,
     handle::{CollectionHandle, PoisonKind},
     maintenance::{MaintenanceOperation, should_compact, should_flush},
-    manifest::{Manifest, SegmentMeta},
+    manifest::{
+        MANIFEST_FORMAT_VERSION, Manifest, ManifestSegment, manifest_path, publish_manifest,
+    },
+    paths::UnitFiles,
     runtime::run_cpu,
     version::{Version, VersionId},
 };
 use logpose_types::{
-    CommitAck, LogPoseError, Result, SeqNo, Snapshot, WriteOutcome,
+    CommitAck, LogPoseError, Result, SeqNo, Snapshot, UnitId, WriteOutcome,
     record::ClientOp,
     schema::{CollectionSchema, ScalarFieldSpec, SchemaError},
 };
@@ -56,8 +60,14 @@ use logpose_wal::{
     WalError, WalFrame, WalWriter,
     codec::{CheckpointPayload, WalPayload},
 };
-use prepare::{INLINE_PREPARE_ROWS, Pending, PreparedRequests};
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc, time::Duration};
+use prepare::{Pending, PreparedRequests, prepares_inline};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{mpsc, oneshot};
 
 /// Group commit settings.
@@ -174,6 +184,15 @@ pub(crate) enum JobKind {
     Compact,
 }
 
+/// What a maintenance job starts from.
+pub(crate) struct JobStart {
+    /// The published (hence durable) state the job works from.
+    pub(crate) version: Arc<Version>,
+    /// The unit id the job's output must use. Allocated for this job alone and never issued
+    /// again, whether or not the job commits.
+    pub(crate) unit: UnitId,
+}
+
 /// What a maintenance job built, for the writer to commit.
 #[derive(Debug)]
 pub(crate) enum JobCommit {
@@ -181,12 +200,12 @@ pub(crate) enum JobCommit {
     /// only schema changes).
     Flush {
         checkpoint_seq_no: SeqNo,
-        segment: Option<SegmentMeta>,
+        segment: Option<ManifestSegment>,
     },
     /// A compaction of `inputs` into `output`.
     Compact {
-        inputs: Vec<String>,
-        output: SegmentMeta,
+        inputs: Vec<UnitId>,
+        output: ManifestSegment,
     },
 }
 
@@ -197,15 +216,16 @@ pub(crate) enum ControlMsg {
     /// an older file; the reply is the published (hence durable) state the job works from.
     BeginJob {
         kind: JobKind,
-        reply: oneshot::Sender<Result<Arc<Version>>>,
+        reply: oneshot::Sender<Result<JobStart>>,
     },
     /// Commit the active job: publish its manifest, then the `Version` over it.
     CommitJob {
         commit: Box<JobCommit>,
         reply: oneshot::Sender<Result<Snapshot>>,
     },
-    /// The active job ended without committing.
-    EndJob,
+    /// The active job ended without committing. `wrote_files` says whether it may have created
+    /// files for its unit, which are then removed: no durable manifest names them.
+    EndJob { wrote_files: bool },
     /// Reply once the pipeline is drained and no job is active (a drop waits for this after it
     /// marked the handle dropped, so nothing is written afterwards). A std channel, because a
     /// drop blocks its caller and may be called from anywhere.
@@ -242,13 +262,22 @@ pub(crate) fn channels(config: &GroupCommitConfig) -> (WriterChannels, WriterInb
 }
 
 /// Everything a writer task starts from: the open WAL, the recovered private state (equal to
-/// the handle's first published `Version`), and the durable manifest.
+/// the handle's first published `Version`), the durable manifest, and the file handles of its
+/// segments.
 pub(crate) struct WriterSeed {
     pub(crate) wal: WalWriter,
     pub(crate) state: LogicalState,
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) next_seq_no: SeqNo,
     pub(crate) version_id: VersionId,
+    /// One handle per segment of `manifest`.
+    pub(crate) live_files: BTreeMap<UnitId, Arc<FileHandle>>,
+    /// The manifest generation kept beside the durable one, if any.
+    pub(crate) previous_generation: Option<u64>,
+    /// The first manifest generation to issue.
+    pub(crate) next_manifest_gen: u64,
+    /// The first unit id to issue.
+    pub(crate) next_unit_id: u32,
 }
 
 /// Start the writer task of `handle` on the engine's writer runtime.
@@ -269,7 +298,11 @@ pub(crate) fn spawn(
         config: group,
         wal: Some(seed.wal),
         state: Some(seed.state),
+        next_manifest_gen: seed.next_manifest_gen,
+        next_unit_id: seed.next_unit_id,
         manifest: seed.manifest,
+        live_files: seed.live_files,
+        previous_generation: seed.previous_generation,
         next_seq_no: seed.next_seq_no,
         next_version_id: seed.version_id.0 + 1,
         pending_checkpoint: None,
@@ -319,15 +352,35 @@ struct Writer {
     state: Option<LogicalState>,
     /// The durable manifest.
     manifest: Arc<Manifest>,
+    /// One handle per segment of the durable manifest (I7).
+    live_files: BTreeMap<UnitId, Arc<FileHandle>>,
+    /// The manifest generation kept beside the durable one (for inspection); the next commit
+    /// removes it.
+    previous_generation: Option<u64>,
+    /// Next manifest generation to try. Advances on every publish attempt, so a generation is
+    /// never written twice, even by a retry.
+    next_manifest_gen: u64,
+    /// Next unit id to allocate; recorded in every manifest.
+    next_unit_id: u32,
     next_seq_no: SeqNo,
     next_version_id: u64,
     /// A checkpoint frame to prepend to the next group, written after a flush commit.
     pending_checkpoint: Option<WalFrame>,
-    active_job: Option<JobKind>,
-    waiting_jobs: VecDeque<(JobKind, oneshot::Sender<Result<Arc<Version>>>)>,
+    active_job: Option<ActiveJob>,
+    waiting_jobs: VecDeque<(JobKind, oneshot::Sender<Result<JobStart>>)>,
     quiesce_waiters: Vec<std::sync::mpsc::SyncSender<()>>,
     /// Whether a flush (0) or compaction (1) was already requested from the scheduler.
     requested: [bool; 2],
+}
+
+/// The maintenance job that holds the collection's job slot.
+#[derive(Clone, Copy, Debug)]
+struct ActiveJob {
+    kind: JobKind,
+    unit: UnitId,
+    /// Whether the job's files are still the job's to clean up. Cleared once a commit made them
+    /// live, or made their durability unknown.
+    owns_files: bool,
 }
 
 impl Writer {
@@ -441,7 +494,11 @@ impl Writer {
         };
         let next_seq_no = self.next_seq_no;
         let rows = requests.iter().map(WriteRequest::rows).sum::<usize>();
-        let (state, prepared, next_seq_no) = if rows < INLINE_PREPARE_ROWS {
+        let bytes = requests
+            .iter()
+            .map(WriteRequest::approximate_bytes)
+            .sum::<usize>();
+        let (state, prepared, next_seq_no) = if prepares_inline(rows, bytes) {
             let (prepared, next) = prepare::prepare(&mut state, next_seq_no, requests);
             (state, prepared, next)
         } else {
@@ -481,6 +538,7 @@ impl Writer {
             Arc::clone(&state.schema),
             Arc::clone(&self.manifest),
             state.delta.clone(),
+            self.live_files.values().cloned().collect(),
         );
         self.next_version_id += 1;
         Some(version)
@@ -709,10 +767,15 @@ impl Writer {
             ControlMsg::CommitJob { commit, reply } => {
                 let result = self.commit_job(*commit).await;
                 let _ = reply.send(result);
-                self.end_job().await;
+                self.end_job(true).await;
             }
-            ControlMsg::EndJob => self.end_job().await,
+            ControlMsg::EndJob { wrote_files } => self.end_job(wrote_files).await,
             ControlMsg::Quiesce { reply } => {
+                // A drop voids every outstanding maintenance request: waiting jobs fail below,
+                // and a job that has not begun is refused. Should the drop not commit, the
+                // next publish over a threshold requests again, instead of a flag left set by a
+                // request that never began blocking every later one.
+                self.requested = [false; 2];
                 if self.active_job.is_none() {
                     let _ = reply.try_send(());
                 } else {
@@ -727,13 +790,25 @@ impl Writer {
         Flow::Continue
     }
 
-    /// Make `kind` the active job and reply with the state it works from.
-    async fn start_job(&mut self, kind: JobKind, reply: oneshot::Sender<Result<Arc<Version>>>) {
-        self.active_job = Some(kind);
+    /// Make `kind` the active job and reply with the state it works from and its unit id.
+    async fn start_job(&mut self, kind: JobKind, reply: oneshot::Sender<Result<JobStart>>) {
         match kind {
             JobKind::Flush => self.requested[0] = false,
             JobKind::Compact => self.requested[1] = false,
         }
+        let Some(next_unit_id) = self.next_unit_id.checked_add(1) else {
+            let _ = reply.send(Err(LogPoseError::internal(
+                "the collection has used every unit id",
+            )));
+            return;
+        };
+        let unit = UnitId(self.next_unit_id);
+        self.next_unit_id = next_unit_id;
+        self.active_job = Some(ActiveJob {
+            kind,
+            unit,
+            owns_files: true,
+        });
         let current = self.handle.current();
         if kind == JobKind::Flush
             && !current.delta.is_empty()
@@ -744,8 +819,12 @@ impl Writer {
             Box::pin(self.start_next_job()).await;
             return;
         }
-        if reply.send(Ok(current)).is_err() {
-            // The job is gone.
+        let start = JobStart {
+            version: current,
+            unit,
+        };
+        if reply.send(Ok(start)).is_err() {
+            // The job is gone before it wrote anything.
             self.active_job = None;
             Box::pin(self.start_next_job()).await;
         }
@@ -798,16 +877,26 @@ impl Writer {
         }
     }
 
-    /// Publish the active job's manifest, then the `Version` over it.
+    /// Publish the active job's manifest, then the `Version` over it; then release what the
+    /// manifest superseded.
+    ///
+    /// The manifest takes the next generation from `next_manifest_gen`, which advances on every
+    /// attempt. A publish that fails before the `CURRENT` rename abandons the job without a
+    /// state change: its generation and unit are burned, and its files and partial manifest are
+    /// removed right away because no durable manifest names them. A publish that fails at or
+    /// after the rename poisons the collection, and nothing is removed.
     async fn commit_job(&mut self, commit: JobCommit) -> Result<Snapshot> {
         if let Some(error) = self.refusal() {
             return Err(error.clone_error());
         }
+        let Some(job) = self.active_job else {
+            return Err(LogPoseError::internal("no maintenance job is active"));
+        };
         let Some(schema) = self.state.as_ref().map(|state| Arc::clone(&state.schema)) else {
             return Err(self.handle.unavailable());
         };
         let durable = Arc::clone(&self.manifest);
-        let (manifest, checkpoint) = match commit {
+        let (segments, checkpoint, removed_units) = match commit {
             JobCommit::Flush {
                 checkpoint_seq_no,
                 segment,
@@ -822,73 +911,76 @@ impl Writer {
                     )));
                 }
                 let mut segments = durable.segments.clone();
-                segments.extend(segment);
-                (
-                    Manifest {
-                        generation: durable.generation + 1,
-                        checkpoint_seq_no,
-                        schema: schema.as_ref().clone(),
-                        segments,
-                    },
-                    Some(checkpoint_seq_no),
-                )
+                if let Some(segment) = segment {
+                    check_job_unit(job, &segment)?;
+                    segments.push(segment);
+                }
+                (segments, Some(checkpoint_seq_no), Vec::new())
             }
             JobCommit::Compact { inputs, output } => {
-                let Some(position) = durable
-                    .segments
-                    .iter()
-                    .position(|segment| inputs.contains(&segment.segment_id))
-                else {
-                    return Err(LogPoseError::internal(
-                        "compaction inputs are no longer in the manifest",
-                    ));
-                };
+                check_job_unit(job, &output)?;
                 let present = durable
                     .segments
                     .iter()
-                    .filter(|segment| inputs.contains(&segment.segment_id))
+                    .filter(|segment| inputs.contains(&segment.unit))
                     .count();
-                if present != inputs.len() {
+                if inputs.is_empty() || present != inputs.len() {
                     return Err(LogPoseError::internal(
                         "compaction inputs are no longer in the manifest",
                     ));
                 }
-                let mut segments = Vec::with_capacity(durable.segments.len() - present + 1);
-                for (index, segment) in durable.segments.iter().enumerate() {
-                    if index == position {
-                        segments.push(output.clone());
-                    }
-                    if !inputs.contains(&segment.segment_id) {
-                        segments.push(segment.clone());
-                    }
-                }
-                (
-                    Manifest {
-                        generation: durable.generation + 1,
-                        checkpoint_seq_no: durable.checkpoint_seq_no,
-                        schema: schema.as_ref().clone(),
-                        segments,
-                    },
-                    None,
-                )
+                let mut segments = durable
+                    .segments
+                    .iter()
+                    .filter(|segment| !inputs.contains(&segment.unit))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // Unit ids ascend with allocation: the job's unit is newer than every unit of
+                // the durable manifest, so the list stays ascending.
+                segments.push(output);
+                (segments, None, inputs)
             }
         };
+        let generation = self.next_manifest_gen;
+        // Orphan cleanup starts the counter above every generation on disk, so a leftover named
+        // with the last generation exhausts it.
+        let Some(next_manifest_gen) = generation.checked_add(1) else {
+            return Err(LogPoseError::internal(
+                "the collection has used every manifest generation",
+            ));
+        };
+        self.next_manifest_gen = next_manifest_gen;
+        let manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            collection_id: durable.collection_id.clone(),
+            generation,
+            epoch: durable.epoch,
+            checkpoint_seq_no: checkpoint.unwrap_or(durable.checkpoint_seq_no),
+            schema: schema.as_ref().clone(),
+            next_unit_id: self.next_unit_id,
+            next_dv_gen: durable.next_dv_gen,
+            segments,
+            totals: durable.totals,
+        }
+        .with_totals();
 
         let core = self.core.clone();
-        let descriptor = self.handle.descriptor().clone();
+        let dir = self.handle.meta().dir.clone();
         let to_publish = manifest.clone();
         let published = self
             .core
             .runtime()
             .io
-            .run(move || core.publish_manifest(&descriptor, &to_publish))
+            .run(move || publish_manifest(core.vfs.as_ref(), &dir, &to_publish))
             .await;
         match published {
             Ok(Ok(())) => {}
             Ok(Err(failure)) => {
                 if failure.current_unknown {
                     // The rename may be visible in the page cache but not on disk: nothing may
-                    // be built on either manifest until a reopen's barrier settles it.
+                    // be built on either manifest, and no file of either may be removed, until
+                    // a reopen's durability barrier settles it.
+                    self.disown_job_files();
                     self.poison(
                         PoisonKind::ReadOnly,
                         format!(
@@ -896,10 +988,19 @@ impl Writer {
                             manifest.generation, failure.error
                         ),
                     );
+                } else {
+                    // `CURRENT` is unchanged, so no durable manifest names the partial manifest
+                    // or the job's files: remove them before the job hears of the failure.
+                    let dir = &self.handle.meta().dir;
+                    let mut garbage = UnitFiles::new(dir, job.unit).all();
+                    garbage.push(manifest_path(dir, generation));
+                    self.core.gc.remove(garbage);
+                    self.disown_job_files();
                 }
                 return Err(failure.error);
             }
             Err(error) => {
+                self.disown_job_files();
                 self.poison(
                     PoisonKind::ReadOnly,
                     format!("the manifest publish job failed: {error}"),
@@ -908,7 +1009,29 @@ impl Writer {
             }
         }
 
+        // The manifest is durable: install it.
+        self.disown_job_files();
+        let superseded_generation = self.previous_generation.replace(durable.generation);
         self.manifest = Arc::new(manifest);
+        let dir = self.handle.meta().dir.clone();
+        for segment in &self.manifest.segments {
+            if !self.live_files.contains_key(&segment.unit) {
+                let files = UnitFiles::new(&dir, segment.unit).published();
+                self.live_files.insert(
+                    segment.unit,
+                    Arc::new(FileHandle::new(segment.unit, files, self.core.gc.clone())),
+                );
+            }
+        }
+        let mut retired = Vec::with_capacity(removed_units.len());
+        for unit in removed_units {
+            if let Some(file) = self.live_files.remove(&unit) {
+                // Marked while this reference is still held, so the last holder (this writer,
+                // a reader, or a pinned snapshot) sees the mark and removes the files.
+                file.mark_obsolete();
+                retired.push(file);
+            }
+        }
         if let Some(checkpoint) = checkpoint
             && let Some(state) = self.state.as_mut()
         {
@@ -920,13 +1043,72 @@ impl Writer {
             return Err(self.handle.unavailable());
         };
         let version = self.handle.publish(version);
+        // Older versions still hold the retired files until readers and tokens let go.
+        drop(retired);
+        if let Some(superseded) = superseded_generation {
+            self.core.gc.remove([manifest_path(&dir, superseded)]);
+        }
+        if let Some(checkpoint) = checkpoint {
+            self.remove_checkpointed_wal(checkpoint).await;
+        }
         self.after_publish(&version);
         Ok(version.snapshot())
     }
 
-    /// The active job is over; start the next waiting one.
-    async fn end_job(&mut self) {
-        self.active_job = None;
+    /// The active job's files are no longer its to remove.
+    fn disown_job_files(&mut self) {
+        if let Some(job) = self.active_job.as_mut() {
+            job.owns_files = false;
+        }
+    }
+
+    /// Delete the WAL files a durable manifest with checkpoint `checkpoint` made obsolete, on
+    /// the I/O pool. Only after that manifest is durable: every operation in them is in a
+    /// segment. A failure only delays the removal to the next checkpoint or open.
+    async fn remove_checkpointed_wal(&mut self, checkpoint: SeqNo) {
+        let Some(mut wal) = self.wal.take() else {
+            return;
+        };
+        let removed = self
+            .core
+            .runtime()
+            .io
+            .run(move || {
+                let result = wal.remove_checkpointed(checkpoint);
+                (wal, result)
+            })
+            .await;
+        match removed {
+            Ok((wal, result)) => {
+                self.wal = Some(wal);
+                if let Err(error) = result {
+                    tracing::warn!(
+                        collection = %self.handle.descriptor().lookup_name(),
+                        %error,
+                        "failed to remove checkpointed WAL files; the next checkpoint retries"
+                    );
+                }
+            }
+            Err(error) => self.poison(
+                PoisonKind::Failed {
+                    rollback_failed: false,
+                },
+                format!("the WAL cleanup job failed: {error}"),
+            ),
+        }
+    }
+
+    /// The active job is over; remove what it wrote if no manifest names it, and start the next
+    /// waiting job.
+    async fn end_job(&mut self, wrote_files: bool) {
+        if let Some(job) = self.active_job.take()
+            && job.owns_files
+            && wrote_files
+        {
+            self.core
+                .gc
+                .remove(UnitFiles::new(&self.handle.meta().dir, job.unit).all());
+        }
         self.start_next_job().await;
     }
 
@@ -1016,6 +1198,17 @@ fn fail_all(pending: Vec<Pending>, error: impl Fn() -> LogPoseError) {
 
 fn shutting_down() -> LogPoseError {
     LogPoseError::unavailable("the storage engine is shutting down")
+}
+
+/// Fail unless `segment` is the active job's unit.
+fn check_job_unit(job: ActiveJob, segment: &ManifestSegment) -> Result<()> {
+    if segment.unit != job.unit {
+        return Err(LogPoseError::internal(format!(
+            "the {:?} job was allocated unit {} but committed unit {}",
+            job.kind, job.unit, segment.unit
+        )));
+    }
+    Ok(())
 }
 
 /// A checkpoint frame naming `manifest`'s generation and checkpoint.

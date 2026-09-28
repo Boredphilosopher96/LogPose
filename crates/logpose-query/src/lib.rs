@@ -225,8 +225,35 @@ impl ResolvedCollectionDescriptor {
     }
 }
 
+/// Attempts of a query that pinned no snapshot, when a flush or compaction supersedes the
+/// snapshot it resolved between two of its storage calls.
+const IMPLICIT_SNAPSHOT_ATTEMPTS: usize = 3;
+
 /// Execute a storage-backed exact query for a single vector.
+///
+/// A query without an explicit snapshot reads the snapshot current when it starts. Storage
+/// retains an unpinned snapshot only while its manifest generation is current, so if a flush or
+/// compaction publishes between the query's storage calls, the query restarts on the new
+/// snapshot (at most three attempts in all). A query with an explicit snapshot
+/// fails with [`LogPoseError::SnapshotExpired`] instead: its caller asked for that state.
 pub async fn query_exact<S>(storage: &S, request: QueryRequest) -> Result<QueryResponse>
+where
+    S: StorageEngine + ?Sized,
+{
+    let mut attempt = 1;
+    loop {
+        match query_exact_once(storage, request.clone()).await {
+            Err(QueryError::Storage(LogPoseError::SnapshotExpired { .. }))
+                if request.snapshot.is_none() && attempt < IMPLICIT_SNAPSHOT_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn query_exact_once<S>(storage: &S, request: QueryRequest) -> Result<QueryResponse>
 where
     S: StorageEngine + ?Sized,
 {
@@ -2438,6 +2465,159 @@ mod tests {
         ) -> logpose_types::Result<InspectReport> {
             Err(LogPoseError::internal("not implemented"))
         }
+    }
+
+    /// Delegates to [`FilteredStorageEngine`], but its first `expire` scans fail as if a flush
+    /// had superseded the query's snapshot.
+    struct ExpiringStorage {
+        expire: std::sync::atomic::AtomicUsize,
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ExpiringStorage {
+        fn new(expire: usize) -> Self {
+            Self {
+                expire: std::sync::atomic::AtomicUsize::new(expire),
+                scans: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageEngine for ExpiringStorage {
+        async fn engine_name(&self) -> &'static str {
+            "expiring"
+        }
+
+        async fn create_collection(
+            &self,
+            request: CreateCollectionRequest,
+        ) -> logpose_types::Result<CollectionDescriptor> {
+            FilteredStorageEngine.create_collection(request).await
+        }
+
+        async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
+            FilteredStorageEngine.open_collection(name).await
+        }
+
+        async fn write(
+            &self,
+            collection_name: &str,
+            operations: Vec<WriteOperation>,
+        ) -> logpose_types::Result<CommitAck> {
+            FilteredStorageEngine
+                .write(collection_name, operations)
+                .await
+        }
+
+        async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+            FilteredStorageEngine.snapshot(collection_name).await
+        }
+
+        async fn scan_exact(
+            &self,
+            collection_name: &str,
+            snapshot: Option<Snapshot>,
+        ) -> logpose_types::Result<Vec<VisibleRecord>> {
+            use std::sync::atomic::Ordering;
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            let expired = self
+                .expire
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if expired {
+                return Err(LogPoseError::SnapshotExpired {
+                    collection: collection_name.to_owned(),
+                    reason: "a flush superseded the generation".to_owned(),
+                });
+            }
+            FilteredStorageEngine
+                .scan_exact(collection_name, snapshot)
+                .await
+        }
+
+        async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+            FilteredStorageEngine.flush(collection_name).await
+        }
+
+        async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+            FilteredStorageEngine.compact(collection_name).await
+        }
+
+        async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
+            FilteredStorageEngine.stats(collection_name).await
+        }
+
+        async fn inspect(
+            &self,
+            collection_name: &str,
+            target: InspectTarget,
+        ) -> logpose_types::Result<InspectReport> {
+            FilteredStorageEngine.inspect(collection_name, target).await
+        }
+    }
+
+    fn expiring_request(snapshot: Option<Snapshot>) -> QueryRequest {
+        QueryRequest {
+            collection_name: "filtered".to_owned(),
+            vector: vec![1.0, 0.0],
+            top_k: 2,
+            snapshot,
+            read_barrier: None,
+            filters: Vec::new(),
+            predicate: None,
+            explain: ExplainMode::None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_without_a_snapshot_restarts_when_its_snapshot_is_superseded() {
+        let storage = ExpiringStorage::new(2);
+        let response = query_exact(&storage, expiring_request(None))
+            .await
+            .expect("the third attempt reads the current snapshot");
+        assert_eq!(response.returned, 2);
+        assert_eq!(storage.scans.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let storage = ExpiringStorage::new(usize::MAX);
+        let error = query_exact(&storage, expiring_request(None))
+            .await
+            .expect_err("the attempts are bounded");
+        assert!(
+            matches!(
+                error,
+                QueryError::Storage(LogPoseError::SnapshotExpired { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            storage.scans.load(std::sync::atomic::Ordering::SeqCst),
+            IMPLICIT_SNAPSHOT_ATTEMPTS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_with_an_explicit_snapshot_fails_when_it_expired() {
+        let storage = ExpiringStorage::new(1);
+        let error = query_exact(
+            &storage,
+            expiring_request(Some(Snapshot {
+                manifest_generation: 3,
+                visible_seq_no: 8,
+            })),
+        )
+        .await
+        .expect_err("the caller asked for that state");
+        assert!(
+            matches!(
+                error,
+                QueryError::Storage(LogPoseError::SnapshotExpired { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(storage.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     struct FilteredStorageEngine;

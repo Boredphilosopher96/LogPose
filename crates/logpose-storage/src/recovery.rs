@@ -1,25 +1,39 @@
 //! Open and recover: build a collection's first `Version` from its manifest and the WAL above
-//! the manifest's checkpoint, start its writer task, and load historical states for snapshots
-//! of older manifest generations.
+//! the manifest's checkpoint, and start its writer task.
 //!
-//! Recovery replays every WAL frame through the same `apply` the writer uses, starting from the
-//! manifest's schema and following the `SchemaChange` frames in the log, so each batch is read
-//! with the schema that was current at its sequence number.
+//! `open_collection` runs, in order:
+//!
+//! 1. The **durability barrier**: sync the collection directory and its data directories, so
+//!    recovery reasons only about what is on disk (the WAL layer syncs `wal/` and its files
+//!    inside `WalRecovery::open`, after its fence check).
+//! 2. Read `CURRENT` and load the manifest it names; a version 1 layout fails here.
+//! 3. **Orphan cleanup** relative to that manifest, before any id can be issued again.
+//! 4. WAL recovery: fence check, WAL barrier, tail repair, and replay of every frame above the
+//!    checkpoint through the same `apply` the writer uses, starting from the manifest's schema
+//!    and following the `SchemaChange` frames in the log, so each batch is read with the schema
+//!    that was current at its sequence number. WAL files at or below the checkpoint are then
+//!    deleted.
+//! 5. `Version` 1 and the writer task, seeded with the manifest's id counters.
+//!
+//! Every file change before the writer starts (orphan removal, tail truncation, WAL cleanup)
+//! removes or adds only bytes no durable state references, and each runs after the barrier, so
+//! recovery that crashes at any point and runs again converges to the same state (I11).
 
 use crate::{
     engine::{CoreRef, EngineCore},
     fs_util::read_json,
+    gc::{FileHandle, durability_barrier, remove_orphans},
     handle::{CollectionHandle, CollectionMeta},
     maintenance::MaintenanceState,
-    manifest::Manifest,
-    state::{CollectionState, resolve_snapshot},
+    manifest::{Manifest, load_manifest, manifest_corrupt, read_current},
+    paths::UnitFiles,
     version::{DeltaLog, Version, VersionId},
     writer::{self, LogicalState, WriterSeed, checkpoint_frame, replay_frame},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionRef, CorruptionKind, LogPoseError, Result, SeqNo, Snapshot};
-use logpose_wal::{WalRecovery, WalWriter, read_committed};
-use std::{path::Path, sync::Arc};
+use logpose_types::{CollectionRef, CorruptionKind, LogPoseError, Result, UnitId};
+use logpose_wal::{WalRecovery, WalWriter};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 /// The outcome of recovering one collection directory at engine open.
 pub(crate) enum RecoveredCollection {
@@ -36,10 +50,20 @@ pub(crate) enum RecoveredCollection {
     Unreadable { error: String },
 }
 
+/// What a collection's writer starts from besides its WAL and state.
+pub(crate) struct DurableStart {
+    pub(crate) manifest: Arc<Manifest>,
+    /// The manifest generation kept beside the durable one, if any.
+    pub(crate) previous_generation: Option<u64>,
+    /// The first manifest generation the writer may issue.
+    pub(crate) next_manifest_gen: u64,
+    /// The first unit id the writer may issue.
+    pub(crate) next_unit_id: u32,
+}
+
 impl CoreRef {
     /// Recover the collection in `dir`: read its descriptor, placement, and maintenance status,
-    /// load the current manifest, recover the WAL above its checkpoint (fence check, durability
-    /// barrier, tail repair, replay), build `Version` 1, and start the writer task.
+    /// then recover its files (see the module docs), build `Version` 1, and start the writer.
     pub(crate) fn recover_collection(&self, dir: &Path) -> RecoveredCollection {
         let descriptor_path = dir.join("descriptor.json");
         let mut descriptor =
@@ -83,13 +107,15 @@ impl CoreRef {
         let assignment = self.load_collection_assignment(&descriptor)?;
         let persisted = self.load_maintenance_status(&descriptor)?;
         let (jobs, resume, changed) = MaintenanceState::recovered(persisted);
+        let durable = self.recover_manifest(&descriptor)?;
         if changed {
             self.persist_maintenance_status(&descriptor, jobs.status())?;
         }
-        let manifest = Arc::new(self.load_manifest(&descriptor, None)?);
-        let (state, wal) = self.recover_wal(&descriptor, &manifest)?;
+        let (state, mut wal) = self.recover_wal(&descriptor, &durable.manifest)?;
+        // Every operation in these files is in a segment of the durable manifest.
+        wal.remove_checkpointed(durable.manifest.checkpoint_seq_no)?;
         let meta = Arc::new(CollectionMeta::new(descriptor, assignment));
-        let handle = self.start_collection(meta, manifest, state, wal, jobs)?;
+        let handle = self.start_collection(meta, durable, state, wal, jobs)?;
         // Persisted maintenance resumes on the first data-plane access, not here: a node that
         // only reports status for a collection it does not serve must never run its jobs.
         if !resume.is_empty() {
@@ -98,21 +124,70 @@ impl CoreRef {
         Ok(handle)
     }
 
+    /// The durability barrier, the manifest `CURRENT` names, and orphan cleanup relative to it.
+    fn recover_manifest(&self, descriptor: &CollectionDescriptor) -> Result<DurableStart> {
+        let dir = &descriptor.root_path;
+        let vfs = self.vfs.as_ref();
+        durability_barrier(vfs, dir)?;
+        let generation = read_current(vfs, dir)?;
+        let manifest = load_manifest(vfs, dir, generation)?;
+        if manifest.collection_id != descriptor.collection_id {
+            return Err(manifest_corrupt(
+                &dir.join("CURRENT"),
+                format!(
+                    "manifest {generation} belongs to collection {}, not {}",
+                    manifest.collection_id, descriptor.collection_id
+                ),
+            ));
+        }
+        let cleanup = remove_orphans(vfs, dir, &manifest)?;
+        if !cleanup.removed.is_empty() {
+            tracing::info!(
+                collection = %descriptor.lookup_name(),
+                removed = cleanup.removed.len(),
+                "recovery removed files no durable manifest references"
+            );
+        }
+        Ok(DurableStart {
+            manifest: Arc::new(manifest),
+            previous_generation: cleanup.previous_generation,
+            next_manifest_gen: cleanup.next_manifest_gen,
+            next_unit_id: cleanup.next_unit_id,
+        })
+    }
+
     /// Publish `Version` 1 over the recovered state and start the writer task.
     pub(crate) fn start_collection(
         &self,
         meta: Arc<CollectionMeta>,
-        manifest: Arc<Manifest>,
+        durable: DurableStart,
         state: LogicalState,
         wal: WalWriter,
         jobs: MaintenanceState,
     ) -> Result<Arc<CollectionHandle>> {
+        let DurableStart {
+            manifest,
+            previous_generation,
+            next_manifest_gen,
+            next_unit_id,
+        } = durable;
+        let live_files = manifest
+            .units()
+            .map(|unit| {
+                let files = UnitFiles::new(&meta.dir, unit).published();
+                (
+                    unit,
+                    Arc::new(FileHandle::new(unit, files, self.gc.clone())),
+                )
+            })
+            .collect::<BTreeMap<UnitId, _>>();
         let version = Version::build(
             VersionId(1),
             Arc::clone(&meta),
             Arc::clone(&state.schema),
             Arc::clone(&manifest),
             state.delta.clone(),
+            live_files.values().cloned().collect(),
         );
         let next_seq_no = wal.next_seq_no();
         if version.visible_seq_no.checked_add(1) != Some(next_seq_no) {
@@ -127,7 +202,12 @@ impl CoreRef {
             });
         }
         let (channels, inbox) = writer::channels(&self.group_commit);
-        let handle = Arc::new(CollectionHandle::new(version, channels, jobs));
+        let handle = Arc::new(CollectionHandle::new(
+            version,
+            channels,
+            jobs,
+            Arc::clone(&self.tokens),
+        ));
         writer::spawn(
             self.clone(),
             Arc::clone(&handle),
@@ -138,6 +218,10 @@ impl CoreRef {
                 manifest,
                 next_seq_no,
                 version_id: VersionId(1),
+                live_files,
+                previous_generation,
+                next_manifest_gen,
+                next_unit_id,
             },
         );
         Ok(handle)
@@ -182,68 +266,7 @@ impl EngineCore {
         let wal = recovery.into_writer(&checkpoint_frame(manifest)?)?;
         Ok((state, wal))
     }
-
-    /// The state as of manifest `generation` and sequence number `through`, for snapshots of an
-    /// older generation: that manifest plus the WAL frames in `checkpoint + 1..=through`, which
-    /// must already be durable (published). Reads the live WAL without modifying it.
-    pub(crate) fn load_historical_state(
-        &self,
-        descriptor: &CollectionDescriptor,
-        generation: u64,
-        through: SeqNo,
-    ) -> Result<CollectionState> {
-        let manifest = self.load_manifest(descriptor, Some(generation))?;
-        let checkpoint = manifest.checkpoint_seq_no;
-        let mut state = LogicalState {
-            schema: Arc::new(manifest.schema.clone()),
-            delta: DeltaLog::default(),
-        };
-        for frame in read_committed(
-            self.vfs.as_ref(),
-            &Self::wal_dir(descriptor),
-            checkpoint,
-            through,
-        )? {
-            replay_frame(&mut state, checkpoint, frame)?;
-        }
-        Ok(CollectionState {
-            manifest: Arc::new(manifest),
-            schema: state.schema,
-            delta: state.delta,
-        })
-    }
-
-    /// The state a read of `snapshot` runs against, and the resolved snapshot.
-    ///
-    /// The current manifest generation reads the published `Version` without any file access;
-    /// an older generation is loaded from disk until snapshot tokens replace historical reads.
-    pub(crate) fn read_state(
-        &self,
-        handle: &CollectionHandle,
-        snapshot: Option<Snapshot>,
-    ) -> Result<(CollectionState, Snapshot)> {
-        handle.ensure_open()?;
-        let version = handle.current();
-        let state = match &snapshot {
-            Some(snapshot) if snapshot.manifest_generation != version.manifest_generation => {
-                if snapshot.visible_seq_no > version.visible_seq_no {
-                    return Err(LogPoseError::invalid_field(
-                        "snapshot",
-                        format!(
-                            "invalid snapshot: visible sequence {} exceeds maximum {}",
-                            snapshot.visible_seq_no, version.visible_seq_no
-                        ),
-                    ));
-                }
-                self.load_historical_state(
-                    handle.descriptor(),
-                    snapshot.manifest_generation,
-                    snapshot.visible_seq_no,
-                )?
-            }
-            _ => version.state(),
-        };
-        let snapshot = resolve_snapshot(&state, snapshot)?;
-        Ok((state, snapshot))
-    }
 }
+
+#[cfg(test)]
+mod tests;

@@ -2,9 +2,14 @@
 //! its writer task.
 
 use crate::{
+    clock::Clock,
+    engine::EngineCore,
     maintenance::MaintenanceState,
+    tokens::{SnapshotToken, TokenConfig, TokenRegistry},
     version::Version,
-    writer::{ControlMsg, JobCommit, JobKind, SchemaChange, WriteRequest, WriterChannels},
+    writer::{
+        ControlMsg, JobCommit, JobKind, JobStart, SchemaChange, WriteRequest, WriterChannels,
+    },
 };
 use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
@@ -16,7 +21,7 @@ use std::{
     fmt,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
@@ -75,6 +80,41 @@ struct Poison {
     reason: String,
 }
 
+/// Engine-wide snapshot-token state every collection handle shares.
+pub(crate) struct TokenContext {
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) config: TokenConfig,
+    /// The engine, to total the retired memory every collection's pins hold.
+    core: Weak<EngineCore>,
+}
+
+impl TokenContext {
+    pub(crate) fn new(clock: Arc<dyn Clock>, config: TokenConfig, core: Weak<EngineCore>) -> Self {
+        Self {
+            clock,
+            config,
+            core,
+        }
+    }
+
+    /// Whether pinned snapshots, engine-wide, hold more retired memory than the limit.
+    fn memory_exceeded(&self) -> bool {
+        self.core
+            .upgrade()
+            .is_some_and(|core| core.pinned_retired_bytes() > self.config.memory_limit)
+    }
+}
+
+impl fmt::Debug for TokenContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenContext")
+            .field("clock", &self.clock)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 /// One resident collection, shared by readers, writers, and maintenance jobs.
 ///
 /// Readers call [`CollectionHandle::current`] and hold the returned `Arc<Version>` for a whole
@@ -99,13 +139,24 @@ pub struct CollectionHandle {
     /// Serializes writes of `maintenance.json` and holds the status version last written, so
     /// the jobs lock is never held across the file's fsync.
     pub(crate) status_file: Mutex<u64>,
+    /// Pinned snapshots.
+    tokens: TokenRegistry,
+    token_context: Arc<TokenContext>,
 }
 
 impl CollectionHandle {
-    pub(crate) fn new(version: Version, writer: WriterChannels, jobs: MaintenanceState) -> Self {
+    pub(crate) fn new(
+        version: Version,
+        writer: WriterChannels,
+        jobs: MaintenanceState,
+        token_context: Arc<TokenContext>,
+    ) -> Self {
         let meta = Arc::clone(&version.meta);
         let (visible, _) = watch::channel(version.visible_seq_no);
+        let tokens = TokenRegistry::new(meta.id.clone(), meta.descriptor.lookup_name());
         Self {
+            tokens,
+            token_context,
             meta,
             current: ArcSwap::from_pointee(version),
             visible,
@@ -164,6 +215,72 @@ impl CollectionHandle {
             visible_manifest_generation: version.manifest_generation,
             visible_seq_no: version.visible_seq_no,
         })
+    }
+
+    /// Pin the current `Version` and return a token for it, so later reads can see exactly
+    /// this state (I12). The pin lives until it is released or `ttl` passes without a use.
+    ///
+    /// Fails with [`LogPoseError::TooManySnapshots`] when the collection already holds the most
+    /// pins it allows, or when pinned snapshots hold more retired memory than the engine allows.
+    pub fn pin_snapshot(&self) -> Result<SnapshotToken> {
+        self.ensure_open()?;
+        self.pin_version(self.current())
+    }
+
+    /// Pin `version`, a version of this collection a request already holds.
+    pub fn pin_version(&self, version: Arc<Version>) -> Result<SnapshotToken> {
+        self.ensure_open()?;
+        if version.meta.id != self.meta.id {
+            return Err(LogPoseError::internal(
+                "cannot pin a version of another collection",
+            ));
+        }
+        let context = &self.token_context;
+        self.tokens.pin(
+            version,
+            context.clock.now(),
+            &context.config,
+            context.memory_exceeded(),
+        )
+    }
+
+    /// The `Version` `token` pins, extending the token's expiry. Fails with
+    /// [`LogPoseError::SnapshotExpired`] when the token expired, was released, or was never
+    /// issued for this collection. Hold the returned `Arc` for the whole request.
+    pub fn snapshot_version(&self, token: &SnapshotToken) -> Result<Arc<Version>> {
+        self.ensure_open()?;
+        let context = &self.token_context;
+        self.tokens
+            .resolve(token, context.clock.now(), context.config.ttl)
+    }
+
+    /// Unpin `token`. Returns whether it was pinned. A released token fails like an expired one.
+    pub fn release_snapshot(&self, token: &SnapshotToken) -> bool {
+        self.tokens.release(token)
+    }
+
+    /// Snapshots pinned now, including expired ones the reaper has not dropped yet.
+    #[must_use]
+    pub fn pinned_snapshots(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Bytes of retired delta batches that only this collection's pinned snapshots hold.
+    #[must_use]
+    pub fn pinned_retired_bytes(&self) -> u64 {
+        self.tokens
+            .retired_bytes(self.current.load().checkpoint_seq_no)
+    }
+
+    /// The token-pinned version an exact legacy `Snapshot` names, if one is pinned.
+    pub(crate) fn pinned_version_for(&self, snapshot: &Snapshot) -> Option<Arc<Version>> {
+        let context = &self.token_context;
+        self.tokens
+            .find(snapshot, context.clock.now(), context.config.ttl)
+    }
+
+    pub(crate) fn tokens(&self) -> &TokenRegistry {
+        &self.tokens
     }
 
     /// Durably commit `ops` as one atomic batch. Returns once the batch's WAL group is synced
@@ -232,20 +349,21 @@ impl CollectionHandle {
     /// Start a maintenance job, waiting for any other job of this collection to end first.
     /// Returns the published state the job works from and a ticket that ends the job when it
     /// is committed or dropped. Blocking; for job threads only.
-    pub(crate) fn begin_job(&self, kind: JobKind) -> Result<(JobTicket<'_>, Arc<Version>)> {
+    pub(crate) fn begin_job(&self, kind: JobKind) -> Result<(JobTicket<'_>, JobStart)> {
         self.ensure_writable()?;
         let (reply, replied) = oneshot::channel();
         self.writer
             .control
             .send(ControlMsg::BeginJob { kind, reply })
             .map_err(|_| self.unavailable())?;
-        let version = replied.blocking_recv().map_err(|_| self.unavailable())??;
+        let start = replied.blocking_recv().map_err(|_| self.unavailable())??;
         Ok((
             JobTicket {
                 handle: self,
                 open: true,
+                wrote_files: false,
             },
-            version,
+            start,
         ))
     }
 
@@ -383,9 +501,17 @@ impl CollectionHandle {
 pub(crate) struct JobTicket<'a> {
     handle: &'a CollectionHandle,
     open: bool,
+    /// Whether the job may have created files for its unit.
+    wrote_files: bool,
 }
 
 impl JobTicket<'_> {
+    /// Record that the job is about to create files for its unit, so that they are removed
+    /// if it ends without committing.
+    pub(crate) fn writing_files(&mut self) {
+        self.wrote_files = true;
+    }
+
     /// Publish what the job built. Blocking.
     pub(crate) fn commit(mut self, commit: JobCommit) -> Result<Snapshot> {
         self.open = false;
@@ -407,7 +533,9 @@ impl JobTicket<'_> {
 impl Drop for JobTicket<'_> {
     fn drop(&mut self) {
         if self.open {
-            let _ = self.handle.writer.control.send(ControlMsg::EndJob);
+            let _ = self.handle.writer.control.send(ControlMsg::EndJob {
+                wrote_files: self.wrote_files,
+            });
         }
     }
 }

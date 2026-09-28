@@ -1,11 +1,13 @@
 use logpose_query::{
     ExplainMode, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, query_exact,
 };
-use logpose_storage::{CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine};
+use logpose_storage::{
+    CreateCollectionRequest, InspectTarget, LocalStorageEngine, SnapshotToken, StorageEngine,
+};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionId, CollectionStats, CommitAck,
-    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, NodeRole, PutRecord, RecordId, SeqNo,
-    Snapshot, VisibleRecord, WriteOperation,
+    DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric, LogPoseError, NodeRole, PutRecord,
+    RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{FaultPlan, FaultVfs, TearMode, Vfs};
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
@@ -190,11 +192,22 @@ impl ExpectedModel {
         }
     }
 
-    fn record_flush(&mut self) {
+    /// A flush that the engine published as `generation`. Generations only grow, but can skip
+    /// numbers a failed or interrupted publish burned.
+    fn record_flush(&mut self, generation: u64) {
         if self.mutable_op_count() == 0 {
+            assert_eq!(
+                generation, self.manifest_generation,
+                "an empty flush publishes nothing"
+            );
             return;
         }
-        self.manifest_generation += 1;
+        assert!(
+            generation > self.manifest_generation,
+            "flush generation {generation} must follow {}",
+            self.manifest_generation
+        );
+        self.manifest_generation = generation;
         self.checkpoint_seq_no = self.next_seq_no;
         self.segment_count += 1;
         self.generation_states.insert(
@@ -206,11 +219,18 @@ impl ExpectedModel {
         );
     }
 
-    fn record_compact(&mut self) {
+    /// A compaction that the engine published as `generation`.
+    fn record_compact(&mut self, generation: u64) {
         if self.segment_count <= 1 {
+            assert_eq!(generation, self.manifest_generation, "nothing to compact");
             return;
         }
-        self.manifest_generation += 1;
+        assert!(
+            generation > self.manifest_generation,
+            "compaction generation {generation} must follow {}",
+            self.manifest_generation
+        );
+        self.manifest_generation = generation;
         self.segment_count = 1;
         self.generation_states.insert(
             self.manifest_generation,
@@ -361,7 +381,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
     let mut rng = StdRng::seed_from_u64(seed);
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
-    let mut snapshots = Vec::new();
+    let mut snapshots: Vec<PinnedSnapshot> = Vec::new();
 
     trace.push(StorageAction::CreateCollection);
     let descriptor =
@@ -424,7 +444,35 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                     });
                 let expected = model.current_snapshot();
                 assert_eq_with_context(seed, &trace, "snapshot mismatch", &expected, &snapshot);
-                snapshots.push(snapshot.clone());
+                // Pin every snapshot while at most `MAX_PINNED` are pinned; the oldest pin is
+                // released to make room, and its snapshot then lives only as long as its
+                // generation is current.
+                let (token, pinned) =
+                    engine
+                        .pin_snapshot(COLLECTION_NAME)
+                        .unwrap_or_else(|error| {
+                            panic_with_context(seed, &trace, format!("pin failed: {error}"))
+                        });
+                assert_eq_with_context(seed, &trace, "pinned snapshot", &snapshot, &pinned);
+                let pinned_count = snapshots
+                    .iter()
+                    .filter(|entry| entry.token.is_some())
+                    .count();
+                if pinned_count >= MAX_PINNED
+                    && let Some(oldest) = snapshots.iter_mut().find(|entry| entry.token.is_some())
+                    && let Some(token) = oldest.token.take()
+                {
+                    let released = engine
+                        .release_snapshot(COLLECTION_NAME, &token)
+                        .unwrap_or_else(|error| {
+                            panic_with_context(seed, &trace, format!("release failed: {error}"))
+                        });
+                    assert!(released, "seed={seed}: the oldest pin was still pinned");
+                }
+                snapshots.push(PinnedSnapshot {
+                    snapshot: snapshot.clone(),
+                    token: Some(token),
+                });
                 assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
                 assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
                 assert_stats_match(&engine, &model, Some(snapshot), seed, &trace).await;
@@ -436,22 +484,21 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
             }
             StorageAction::ScanSnapshot { snapshot_index } => {
-                let snapshot = snapshots.get(snapshot_index).cloned().unwrap_or_else(|| {
+                if snapshot_index >= snapshots.len() {
                     panic_with_context(
                         seed,
                         &trace,
                         format!("missing snapshot index {snapshot_index}"),
-                    )
-                });
-                assert_scan_matches_snapshot(&engine, &model, &snapshot, seed, &trace).await;
-                assert_exact_queries_match_snapshot(&engine, &model, &snapshot, seed, &trace).await;
-                assert_stats_match(&engine, &model, Some(snapshot), seed, &trace).await;
+                    );
+                }
+                assert_snapshot_reads(&engine, &model, &snapshots, snapshot_index, seed, &trace)
+                    .await;
             }
             StorageAction::Flush => {
                 let snapshot = engine.flush(COLLECTION_NAME).await.unwrap_or_else(|error| {
                     panic_with_context(seed, &trace, format!("flush failed: {error}"))
                 });
-                model.record_flush();
+                model.record_flush(snapshot.manifest_generation);
                 let expected = model.current_snapshot();
                 assert_eq_with_context(
                     seed,
@@ -481,7 +528,7 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                     .unwrap_or_else(|error| {
                         panic_with_context(seed, &trace, format!("compact failed: {error}"))
                     });
-                model.record_compact();
+                model.record_compact(snapshot.manifest_generation);
                 let expected = model.current_snapshot();
                 assert_eq_with_context(
                     seed,
@@ -527,6 +574,10 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 // One engine owns a root at a time: the old one releases it before the reopen.
                 drop(engine);
                 engine = backend.open_engine();
+                // Pins live in memory: a restart ends them.
+                for entry in &mut snapshots {
+                    entry.token = None;
+                }
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, None, seed, &trace).await;
@@ -548,14 +599,81 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
                 assert_current_scan_matches(&engine, &model, seed, &trace).await;
                 assert_current_exact_queries_match(&engine, &model, seed, &trace).await;
                 assert_stats_match(&engine, &model, None, seed, &trace).await;
-                // Every snapshot handed out before the crash still reads what it named.
-                for snapshot in &snapshots {
-                    assert_scan_matches_snapshot(&engine, &model, snapshot, seed, &trace).await;
-                    assert_exact_queries_match_snapshot(&engine, &model, snapshot, seed, &trace)
-                        .await;
-                    assert_stats_match(&engine, &model, Some(snapshot.clone()), seed, &trace).await;
+                // Every snapshot handed out before the crash reads what it named while its
+                // generation is current, and is expired otherwise: pins end with the process.
+                for entry in &mut snapshots {
+                    entry.token = None;
+                }
+                for index in 0..snapshots.len() {
+                    assert_snapshot_reads(&engine, &model, &snapshots, index, seed, &trace).await;
                 }
             }
+        }
+    }
+}
+
+/// A snapshot the harness handed out, and the token that pins it, if one still does.
+#[derive(Clone, Debug)]
+struct PinnedSnapshot {
+    snapshot: Snapshot,
+    token: Option<SnapshotToken>,
+}
+
+/// Most snapshots the harness keeps pinned at once.
+const MAX_PINNED: usize = 16;
+
+/// A snapshot reads exactly the state it named while its generation is current or a pinned
+/// version of its generation covers it (its own token, or a later pin taken before the next
+/// flush or compaction); any other is expired.
+async fn assert_snapshot_reads(
+    engine: &LocalStorageEngine,
+    model: &ExpectedModel,
+    snapshots: &[PinnedSnapshot],
+    index: usize,
+    seed: u64,
+    trace: &[StorageAction],
+) {
+    let entry = &snapshots[index];
+    let snapshot = &entry.snapshot;
+    let covered = snapshots.iter().any(|other| {
+        other.token.is_some()
+            && other.snapshot.manifest_generation == snapshot.manifest_generation
+            && other.snapshot.visible_seq_no >= snapshot.visible_seq_no
+    });
+    if let Some(token) = &entry.token {
+        let actual = engine
+            .scan_exact_at_token(COLLECTION_NAME, token.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic_with_context(seed, trace, format!("token scan failed: {error}"))
+            });
+        let expected = model.expected_visible(snapshot.visible_seq_no);
+        assert_eq_with_context(seed, trace, "token scan mismatch", &expected, &actual);
+    }
+    if covered || snapshot.manifest_generation == model.manifest_generation {
+        assert_scan_matches_snapshot(engine, model, snapshot, seed, trace).await;
+        assert_exact_queries_match_snapshot(engine, model, snapshot, seed, trace).await;
+        assert_stats_match(engine, model, Some(snapshot.clone()), seed, trace).await;
+        return;
+    }
+    let scan = engine
+        .scan_exact(COLLECTION_NAME, Some(snapshot.clone()))
+        .await;
+    let stats = engine
+        .stats_snapshot(COLLECTION_NAME, Some(snapshot.clone()))
+        .await;
+    for (what, error) in [("scan", scan.err()), ("stats", stats.err())] {
+        match error {
+            Some(LogPoseError::SnapshotExpired { .. }) => {}
+            other => panic_with_context(
+                seed,
+                trace,
+                format!(
+                    "{what} of unpinned snapshot {snapshot:?} (current generation {}) must \
+                     expire, got {other:?}",
+                    model.manifest_generation
+                ),
+            ),
         }
     }
 }
@@ -617,15 +735,15 @@ async fn crash_and_recover(
             interrupted_write(&engine, model, operations, seed, trace).await
         }
         CrashDuring::Flush => match engine.flush(COLLECTION_NAME).await {
-            Ok(_) => {
-                model.record_flush();
+            Ok(snapshot) => {
+                model.record_flush(snapshot.manifest_generation);
                 Interrupted::Nothing
             }
             Err(_) => Interrupted::Maintenance(MaintenanceKind::Flush),
         },
         CrashDuring::Compact => match engine.compact(COLLECTION_NAME).await {
-            Ok(_) => {
-                model.record_compact();
+            Ok(snapshot) => {
+                model.record_compact(snapshot.manifest_generation);
                 Interrupted::Nothing
             }
             Err(_) => Interrupted::Maintenance(MaintenanceKind::Compact),
@@ -687,10 +805,10 @@ async fn crash_and_recover(
                     panic_with_context(seed, trace, format!("recovery failed: {error}"))
                 })
                 .manifest_generation;
-            if generation == model.manifest_generation + 1 {
+            if generation > model.manifest_generation {
                 match kind {
-                    MaintenanceKind::Flush => model.record_flush(),
-                    MaintenanceKind::Compact => model.record_compact(),
+                    MaintenanceKind::Flush => model.record_flush(generation),
+                    MaintenanceKind::Compact => model.record_compact(generation),
                 }
             }
             if generation != model.manifest_generation {
@@ -699,7 +817,7 @@ async fn crash_and_recover(
                     trace,
                     format!(
                         "recovered manifest generation {generation}, but the interrupted \
-                         operation leaves {} (not published) or one more (published)",
+                         operation leaves {} (not published) or a newer one (published)",
                         model.manifest_generation
                     ),
                 );
