@@ -8,10 +8,11 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{FilterExpr, QueryRequest, VectorQuery, query};
-use logpose_storage::{
-    CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine, StorageEngine,
+use logpose_storage::{CreateCollectionRequest, Engine, EngineConfig, IndexPolicy};
+use logpose_types::{
+    CollectionRef, DistanceMetric,
+    record::{ClientOp, Record},
 };
-use logpose_types::{CollectionRef, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use rayon as _;
 use roaring as _;
 use serde as _;
@@ -35,13 +36,13 @@ impl Rng {
     }
 }
 
-fn setup(runtime: &Runtime) -> LocalStorageEngine {
+fn setup(runtime: &Runtime) -> Engine {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
     let root = std::env::temp_dir().join(format!("logpose-search-bench-{unique}"));
-    let engine = LocalStorageEngine::with_config(
+    let engine = Engine::open_local(
         &root,
         EngineConfig {
             index: IndexPolicy {
@@ -53,12 +54,15 @@ fn setup(runtime: &Runtime) -> LocalStorageEngine {
     )
     .expect("engine");
     runtime.block_on(async {
-        engine
-            .create_collection(CreateCollectionRequest::new(
+        let descriptor = engine
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
                 "bench",
                 DIMENSIONS,
                 DistanceMetric::L2,
             ))
+            .expect("plan");
+        let handle = engine
+            .create_collection(descriptor, None)
             .await
             .expect("create");
         let mut rng = Rng(7);
@@ -66,17 +70,16 @@ fn setup(runtime: &Runtime) -> LocalStorageEngine {
             let operations = (0..1_000)
                 .map(|offset| {
                     let index = chunk * 1_000 + offset;
-                    WriteOperation::Put(PutRecord {
-                        id: RecordId::new(format!("row-{index:06}")),
-                        vector: (0..DIMENSIONS).map(|_| rng.next()).collect(),
-                        metadata: json!({ "bucket": index % 10 }),
-                    })
+                    let mut record = Record::new(format!("row-{index:06}"))
+                        .with_vector("vector", (0..DIMENSIONS).map(|_| rng.next()).collect());
+                    record.extra.insert("bucket".to_owned(), json!(index % 10));
+                    ClientOp::Upsert(record)
                 })
                 .collect();
-            engine.write("bench", operations).await.expect("write");
+            handle.write(operations).await.expect("write");
         }
-        engine.flush("bench").await.expect("flush");
-        engine.compact("bench").await.expect("compact");
+        handle.flush().await.expect("flush");
+        handle.compact().await.expect("compact");
     });
     engine
 }
