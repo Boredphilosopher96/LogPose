@@ -418,6 +418,49 @@ fn a_flush_whose_commit_poisons_answers_its_waiters_with_its_own_error() {
     engine.scheduler().resume();
 }
 
+/// A failure unrelated to a running flush (a WAL fsync) poisons the collection: the explicit
+/// compaction fails at once, and the explicit flush is left to the running flush, which
+/// answers it with `CollectionPoisoned` when it ends, so it never waits for a flush that does
+/// not run.
+#[test]
+fn an_unrelated_poisoning_leaves_the_explicit_flush_to_the_running_flush() {
+    let vfs = ControlledVfs::wrap(FaultVfs::new(7).process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(&vfs, config(&clock));
+    let handle = create(&engine, usize::MAX, usize::MAX);
+    let (ticket, start, compacted, mut flushed) = stepped_flush_with_waiters(&engine, &handle);
+
+    vfs.fail_file_syncs_containing(".wal", 1);
+    let cause = handle
+        .write_blocking(vec![upsert("d", 4.0)])
+        .expect_err("the WAL fsync fails");
+    assert!(handle.is_poisoned(), "{cause:?}");
+    assert_poisoned(
+        &compacted
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the compaction fails"),
+    );
+    handle
+        .tick_writer(Duration::from_secs(30))
+        .expect("the writer ticks");
+    assert!(
+        matches!(flushed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the explicit flush waits for the running flush"
+    );
+
+    // The running flush ends without committing: its waiter gets the refusal.
+    drop(start);
+    drop(ticket);
+    assert_poisoned(
+        &flushed
+            .blocking_recv()
+            .expect("the writer answers")
+            .expect_err("the flush fails"),
+    );
+    engine.scheduler().resume();
+}
+
 /// Only failures in a row poison: a flush that succeeds resets the count and clears the error,
 /// so round after round of fewer than `max_flush_failures` failures never poisons.
 #[test]
