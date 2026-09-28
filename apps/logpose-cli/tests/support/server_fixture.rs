@@ -111,6 +111,7 @@ impl TestServerFixture {
                 limits: Default::default(),
                 snapshots: Default::default(),
                 index: Default::default(),
+                drain_timeout_ms: logpose_config::DEFAULT_DRAIN_TIMEOUT_MS,
             }));
             let mut server = runtime.spawn(async move {
                 let rest_listener = tokio::net::TcpListener::from_std(rest_listener)

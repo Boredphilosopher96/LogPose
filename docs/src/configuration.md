@@ -24,6 +24,15 @@ When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is 
 
 `storage_root` belongs to one server process at a time. On startup the server takes an exclusive lock on `storage_root/LOCK` and holds it until exit; a second server pointed at the same directory exits with an error naming the directory and the pid holding it. The lock is released automatically when the owning process exits, so a stale `LOCK` file needs no cleanup. The lock is an advisory `flock`, so `storage_root` must live on a filesystem that supports it: startup fails with an error naming `LOCK` on filesystems that reject file locks, and network mounts that only lock locally (for example NFS mounted with `nolock`) cannot keep servers on different hosts apart.
 
+The optional `drain_timeout_ms` (default `20000`) bounds how long a server that
+received `SIGTERM` or `SIGINT` waits for the requests in flight. Connections
+still open after it, such as a client that never finishes sending a request,
+are closed, and the server stops anyway. `0` closes them at once. Keep it below
+the stop deadline of the process supervisor (for example the Kubernetes
+`terminationGracePeriodSeconds`, 30 seconds by default), so the storage engine
+closes before the supervisor kills the process. See
+[Operations](operations.md) for the whole shutdown sequence.
+
 ## Request Size Limits
 
 The optional `[limits]` table caps request and response sizes on both API
