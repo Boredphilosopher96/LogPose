@@ -23,6 +23,7 @@ use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, DistanceMetric, EtcdMetadataConfig,
     LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId,
     legacy::record_from_put,
+    schema::{FieldType, ScalarFieldSpec, SchemaChange},
 };
 use serde as _;
 use serde_json::json;
@@ -137,6 +138,61 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(runtime.collections[0].ownership_epoch, Some(1));
     assert_eq!(runtime.collections[0].route_kind, "recorded");
     assert!(matches!(stats_error, LogPoseError::NotOwner { .. }));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_schema_changes_reach_the_catalog_other_nodes_describe").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("alter-catalog");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-alter-catalog";
+    let state_a = Arc::new(AppState::new(test_config(
+        "alter-node-a",
+        unique_temp_dir("etcd-alter-node-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    state_a
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created through authoritative metadata");
+    let altered = state_a
+        .alter_collection_with_auth(
+            &RequestAuth::default(),
+            "documents",
+            SchemaChange::AddField(ScalarFieldSpec::new("color", FieldType::String)),
+        )
+        .await
+        .expect("the owner should apply the schema change");
+    assert!(altered.schema.scalar_field("color").is_some());
+
+    let state_b = Arc::new(AppState::new(test_config(
+        "alter-node-b",
+        unique_temp_dir("etcd-alter-node-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let remote = state_b
+        .get_collection("documents")
+        .await
+        .expect("another node should describe the collection from the catalog");
+    assert_eq!(
+        remote.schema, altered.schema,
+        "a node that does not own the collection describes its live schema"
+    );
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }

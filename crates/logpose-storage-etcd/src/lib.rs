@@ -99,6 +99,18 @@ impl EtcdBackedStorageEngine {
     ) -> Result<CollectionDescriptor> {
         match self.local.open_collection(&descriptor.lookup_name()).await {
             Ok(local_descriptor) if local_descriptor.matches_serving_identity(&descriptor) => {
+                if local_descriptor.schema.schema_version() > descriptor.schema.schema_version() {
+                    // The owner serves a newer schema than the catalog holds: an alter whose
+                    // catalog update failed. Heal it so other nodes describe the live schema;
+                    // a failure here only leaves the catalog stale until the next attempt.
+                    let _ = self
+                        .etcd
+                        .publish_collection_schema(
+                            &descriptor.lookup_name(),
+                            &local_descriptor.schema,
+                        )
+                        .await;
+                }
                 Ok(local_descriptor)
             }
             Ok(_) | Err(_) => Ok(descriptor),
@@ -627,8 +639,18 @@ impl StorageEngine for EtcdBackedStorageEngine {
         self.local.schema(collection_name).await
     }
 
+    /// Apply the change through the local writer, then publish the new schema to the catalog
+    /// so every node describes the live schema. The engine's schema is authoritative: when the
+    /// catalog update fails the change still stands, and the owner republishes the schema the
+    /// next time it describes the collection.
     async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
-        self.local.alter_schema(collection_name, change).await
+        let ack = self.local.alter_schema(collection_name, change).await?;
+        let schema = self.local.schema(collection_name).await?;
+        let _ = self
+            .etcd
+            .publish_collection_schema(collection_name, &schema)
+            .await;
+        Ok(ack)
     }
 
     async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
@@ -938,6 +960,52 @@ impl EtcdPlacementStore {
                 ),
             })
         }
+    }
+
+    /// Replace the schema of a ready collection descriptor with `schema` when it is newer
+    /// than the stored one. Guarded by the descriptor's mod revision, so a concurrent drop or
+    /// a newer schema is never overwritten; a lost race is retried a few times.
+    async fn publish_collection_schema(
+        &self,
+        collection_name: &str,
+        schema: &CollectionSchema,
+    ) -> Result<()> {
+        const ATTEMPTS: usize = 3;
+        let descriptor_key = self.descriptor_key(collection_name);
+        for _ in 0..ATTEMPTS {
+            let Some((mut stored, revision)) =
+                self.get_descriptor_with_revision(collection_name).await?
+            else {
+                return Ok(());
+            };
+            if !stored.ready || stored.descriptor.schema.schema_version() >= schema.schema_version()
+            {
+                return Ok(());
+            }
+            stored.descriptor.schema = schema.clone();
+            let value = serde_json::to_string(&stored).map_err(json_encode_message)?;
+            let txn = Txn::new()
+                .when([Compare::mod_revision(
+                    descriptor_key.clone(),
+                    CompareOp::Equal,
+                    revision,
+                )])
+                .and_then([TxnOp::put(
+                    descriptor_key.clone(),
+                    value,
+                    Some(PutOptions::new()),
+                )]);
+            let mut client = self.client().await?;
+            if client.txn(txn).await.map_err(etcd_message)?.succeeded() {
+                return Ok(());
+            }
+        }
+        Err(LogPoseError::Unavailable {
+            message: format!(
+                "the catalog schema of collection '{collection_name}' kept changing during an update"
+            ),
+            retry_after: Some(ROUTING_RETRY_AFTER),
+        })
     }
 
     async fn get_assignment(&self, collection_name: &str) -> Result<Option<CollectionAssignment>> {
