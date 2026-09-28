@@ -417,6 +417,9 @@ impl Runner {
             Action::Reopen => self.reopen()?,
             other => self.attempt(other, false)?,
         }
+        if self.session.setup.maintenance == Maintenance::Stepped {
+            self.session.settle()?;
+        }
         self.drop_dead_views();
         let running = self.session.engine().scheduler().stats().running;
         self.stats.peak_jobs = self.stats.peak_jobs.max(running);
@@ -464,6 +467,7 @@ impl Runner {
                 Ok(())
             }
             Action::Compact => {
+                let flushes = self.session.engine().scheduler().stats().flushes_granted;
                 let handle = self.session.handle().clone();
                 let result = self
                     .session
@@ -471,14 +475,8 @@ impl Runner {
                 let compacted = result.is_ok() && !armed;
                 self.stats.explicit_compactions += 1;
                 self.maintenance_result("compact", result.map(drop), armed)?;
-                let segments = self.session.handle().current().counters.segment_count;
-                if compacted
-                    && self.session.setup.maintenance == Maintenance::Stepped
-                    && segments > 1
-                {
-                    return fail(format!(
-                        "an explicit compaction with no job running left {segments} segments"
-                    ));
+                if compacted && self.session.setup.maintenance == Maintenance::Stepped {
+                    self.check_compacted(flushes)?;
                 }
                 Ok(())
             }
@@ -565,6 +563,30 @@ impl Runner {
                 fail("nested fault actions are not supported")
             }
         }
+    }
+
+    /// After an explicit compaction that succeeded in a hand-stepped run: at most one segment
+    /// is left. The compaction takes every segment present when the writer plans it, and a
+    /// flush that commits after that adds one, which is why this holds only with no flush
+    /// running beside it: the runner holds no job open, and the engine's own flushes were
+    /// settled before the action and cannot start during it (one past its backoff was
+    /// requested at the settle, and the clock does not move). `flushes` is the flush permits
+    /// granted before the call.
+    fn check_compacted(&self, flushes: u64) -> Check {
+        let granted = self.session.engine().scheduler().stats().flushes_granted - flushes;
+        if granted > 0 {
+            return fail(format!(
+                "{granted} background flushes ran during an explicit compaction of a settled \
+                 hand-stepped run"
+            ));
+        }
+        let segments = self.session.handle().current().counters.segment_count;
+        if segments > 1 {
+            return fail(format!(
+                "an explicit compaction with no job running left {segments} segments"
+            ));
+        }
+        Ok(())
     }
 
     /// After an explicit flush that succeeded: the durable checkpoint covers everything that
@@ -1072,7 +1094,11 @@ impl Runner {
         self.faulted = true;
         let outcome = self.attempt(during, true);
         // Background jobs may still be running into the failure.
-        self.session.wait_for_jobs()?;
+        if self.session.setup.maintenance == Maintenance::Stepped {
+            self.session.settle()?;
+        } else {
+            self.session.wait_for_jobs()?;
+        }
         fault.set_plan(FaultPlan::default());
         outcome?;
         self.stats.failed_syncs += 1;
@@ -1093,10 +1119,22 @@ impl Runner {
         Ok(())
     }
 
+    /// Drop the jobs this runner holds open, as a restart must before it closes the engine. In
+    /// a hand-stepped run, then settle the engine's own flush of the memtable an abandoned
+    /// flush left frozen: it runs to its end (or into a planned crash) now, instead of racing
+    /// the close, which cancels it if it has not begun yet.
+    fn end_jobs(&mut self) -> Check {
+        self.jobs.clear();
+        if self.session.setup.maintenance == Maintenance::Stepped {
+            self.session.settle()?;
+        }
+        Ok(())
+    }
+
     /// Drop the engine (no crash) and open it again in the same boot. The durability barrier
     /// settles what an earlier failure left unknown.
     fn reopen(&mut self) -> Check {
-        self.jobs.clear();
+        self.end_jobs()?;
         self.drop_views();
         self.session.close();
         self.session.open()?;
@@ -1120,11 +1158,11 @@ impl Runner {
         if let Some(action) = during {
             self.attempt(action, true)?;
         }
+        // Background jobs run into the crash too.
+        self.end_jobs()?;
         if self.session.setup.maintenance != Maintenance::Stepped {
-            // Background jobs run into the crash too.
             self.session.wait_for_jobs()?;
         }
-        self.jobs.clear();
         self.drop_views();
         self.session.close();
         fault.crash();
