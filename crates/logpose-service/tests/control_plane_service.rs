@@ -10,7 +10,7 @@ use logpose_auth::{
     Principal, PrincipalKind,
 };
 use logpose_catalog as _;
-use logpose_core::AppState;
+use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, QueryRequest};
 use logpose_service as _;
 use logpose_storage::{
@@ -18,7 +18,8 @@ use logpose_storage::{
 };
 use logpose_storage_etcd as _;
 use logpose_types::{
-    CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId, WriteOperation,
+    CollectionAssignment, DistanceMetric, MaintenanceStatus, PutRecord, RecordId,
+    legacy::record_from_put,
 };
 use rand as _;
 use serde as _;
@@ -40,29 +41,32 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
 
     let descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
             vec![
-                WriteOperation::Put(PutRecord {
+                record_from_put(PutRecord {
                     id: RecordId::new("alpha"),
                     vector: vec![1.0, 0.0],
                     metadata: serde_json::json!({"kind":"keep"}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("beta"),
                     vector: vec![0.0, 1.0],
                     metadata: serde_json::json!({"kind":"keep"}),
-                }),
+                })
+                .expect("record"),
             ],
         )
         .await
@@ -114,22 +118,22 @@ async fn control_plane_reconstructs_runtime_status_after_restart() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Cosine,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Cosine,
+        ))
         .await
         .expect("collection should be created");
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "events".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "events".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -175,12 +179,12 @@ async fn control_plane_reports_non_default_database_collection_identity() {
 
     let descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "analytics".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "analytics".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -214,44 +218,52 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
 
     let default_descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("default namespace collection should be created");
     let analytics_descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "analytics".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "analytics".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("database namespace collection should be created");
 
     state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("default-alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"namespace":"default"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("default-alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"namespace":"default"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("default namespace write should succeed");
     state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "analytics/documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("analytics-alpha"),
-                vector: vec![0.0, 1.0],
-                metadata: serde_json::json!({"namespace":"analytics"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("analytics-alpha"),
+                    vector: vec![0.0, 1.0],
+                    metadata: serde_json::json!({"namespace":"analytics"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("database namespace write should succeed");
@@ -315,12 +327,12 @@ async fn data_only_nodes_reject_control_plane_collection_creation() {
 
     let error = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect_err("data-only nodes should reject collection creation");
 
@@ -339,13 +351,17 @@ async fn control_only_nodes_reject_app_state_data_plane_operations() {
     )));
 
     let error = state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect_err("control-only nodes should reject direct data-plane writes");
@@ -362,12 +378,12 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
 
     let error = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect_err("control-only nodes should reject collection creation");
 
@@ -400,12 +416,12 @@ async fn control_only_restarts_preserve_persisted_data_assignment() {
     let initial = Arc::new(AppState::new(combined));
     initial
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     drop(initial);
@@ -451,22 +467,26 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
     let initial = Arc::new(AppState::new(combined));
     initial
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     initial
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -520,22 +540,26 @@ async fn control_plane_status_reads_do_not_resume_persisted_maintenance() {
 
     let descriptor = initial
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     initial
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -589,22 +613,26 @@ async fn combined_runtime_status_reads_persisted_maintenance_without_resuming_it
 
     let descriptor = initial
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     initial
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -658,22 +686,26 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
     )));
     initial
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     initial
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: serde_json::json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: serde_json::json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -705,13 +737,17 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
 
     let errors = vec![
         restarted
-            .write(
+            .upsert_records_with_auth(
+                &RequestAuth::default(),
                 "documents",
-                vec![WriteOperation::Put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })],
+                vec![
+                    record_from_put(PutRecord {
+                        id: RecordId::new("beta"),
+                        vector: vec![0.0, 1.0],
+                        metadata: serde_json::json!({"kind":"keep"}),
+                    })
+                    .expect("record"),
+                ],
             )
             .await
             .expect_err("write should be rejected")
@@ -770,12 +806,12 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
     let root = unique_temp_dir("raw-local-status");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     engine
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     // One engine owns a storage root at a time; the node opens its own.
@@ -816,12 +852,12 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
     engine
         .create_collection_with_assignment(
-            CreateCollectionRequest {
-                database_name: "default".to_owned(),
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            },
+            CreateCollectionRequest::in_database(
+                "default".to_owned(),
+                "documents".to_owned(),
+                2,
+                DistanceMetric::Dot,
+            ),
             CollectionAssignment {
                 assigned_node: "local-control-assignment".to_owned(),
                 assigned_role: logpose_types::NodeRole::Control,
@@ -849,13 +885,17 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
 
     let errors = vec![
         state
-            .write(
+            .upsert_records_with_auth(
+                &RequestAuth::default(),
                 "documents",
-                vec![WriteOperation::Put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })],
+                vec![
+                    record_from_put(PutRecord {
+                        id: RecordId::new("alpha"),
+                        vector: vec![1.0, 0.0],
+                        metadata: serde_json::json!({"kind":"keep"}),
+                    })
+                    .expect("record"),
+                ],
             )
             .await
             .expect_err("write should be rejected")
@@ -886,12 +926,12 @@ async fn runtime_status_aggregates_pending_and_error_maintenance_counts() {
     let state = Arc::new(AppState::new(config.clone()));
     let descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -928,22 +968,22 @@ async fn runtime_status_distinguishes_duplicate_namespaced_maintenance_backlogs(
     let state = Arc::new(AppState::new(config.clone()));
     let default_descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("default namespace collection should be created");
     let analytics_descriptor = state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "analytics".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "analytics".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("database namespace collection should be created");
 

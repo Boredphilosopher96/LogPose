@@ -4,7 +4,7 @@ use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
 use logpose_catalog::{CollectionDescriptor, DEFAULT_COMPACTION_THRESHOLD_SEGMENTS};
-use logpose_core::AppState;
+use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
     ExplainMode, MetadataFilter, QueryDiagnostics, QueryMatch, QueryPlanKind, QueryRequest,
     QueryResponse, ScalarMetadataValue,
@@ -13,6 +13,7 @@ use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
     MaintenanceStatus, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    legacy::client_op_from_write,
 };
 use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 use serde as _;
@@ -40,6 +41,21 @@ const RECORD_DIMENSIONS: usize = 2;
 const RECORD_ID_POOL: usize = 6;
 const EXACT_QUERY_TOP_K: usize = 3;
 const EXACT_QUERY_VECTORS: [[f32; RECORD_DIMENSIONS]; 3] = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+
+/// Apply legacy write operations as one mixed client batch.
+async fn write_legacy(
+    state: &AppState,
+    collection_name: &str,
+    operations: Vec<WriteOperation>,
+) -> logpose_service::Result<logpose_types::CommitAck> {
+    let operations = operations
+        .into_iter()
+        .map(|operation| client_op_from_write(operation).expect("legacy operation converts"))
+        .collect();
+    state
+        .write_with_auth(&RequestAuth::default(), collection_name, operations)
+        .await
+}
 
 #[derive(Clone, Debug)]
 enum ServiceAction {
@@ -445,8 +461,7 @@ pub async fn run_background_maintenance_stays_off() {
     };
 
     for slot in 0..segments {
-        state
-            .write(COLLECTION_NAME, put(slot))
+        write_legacy(&state, COLLECTION_NAME, put(slot))
             .await
             .expect("write should succeed");
         let snapshot = state
@@ -456,8 +471,7 @@ pub async fn run_background_maintenance_stays_off() {
         assert_eq!(snapshot.manifest_generation, slot + 1);
     }
     // On a collection that kept the default thresholds, this write queues a compaction.
-    let ack = state
-        .write(COLLECTION_NAME, put(segments))
+    let ack = write_legacy(&state, COLLECTION_NAME, put(segments))
         .await
         .expect("write should succeed");
     assert_eq!(
@@ -486,7 +500,13 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
     let mut model = ExpectedModel::new();
     let mut trace = Vec::new();
     let mut snapshots = Vec::new();
-    model.register_collection(descriptor.collection_id.to_string(), descriptor.metric);
+    let metric = descriptor
+        .schema
+        .vectors()
+        .first()
+        .expect("collection has a vector field")
+        .metric;
+    model.register_collection(descriptor.collection_id.to_string(), metric);
 
     for _ in 0..steps {
         let action = next_action(&mut rng, snapshots.len(), model.segment_count);
@@ -504,8 +524,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                         })
                     })
                     .collect::<Vec<_>>();
-                let ack = state
-                    .write(COLLECTION_NAME, operations.clone())
+                let ack = write_legacy(&state, COLLECTION_NAME, operations.clone())
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(seed, &trace, format!("write failed: {error}"))
@@ -517,8 +536,7 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                 let operations = vec![WriteOperation::Delete(DeleteRecord {
                     id: RecordId::new(id),
                 })];
-                let ack = state
-                    .write(COLLECTION_NAME, operations.clone())
+                let ack = write_legacy(&state, COLLECTION_NAME, operations.clone())
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(seed, &trace, format!("delete failed: {error}"))
@@ -786,7 +804,9 @@ async fn assert_snapshot_expired_everywhere(
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/v1/collections/{COLLECTION_NAME}/query"))
+                .uri(format!(
+                    "/v2/databases/default/collections/{COLLECTION_NAME}/query"
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -878,7 +898,9 @@ async fn assert_query_parity(
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/v1/collections/{COLLECTION_NAME}/query"))
+                .uri(format!(
+                    "/v2/databases/default/collections/{COLLECTION_NAME}/query"
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -1022,7 +1044,9 @@ async fn assert_query_parity(
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/v1/collections/{COLLECTION_NAME}/query"))
+                .uri(format!(
+                    "/v2/databases/default/collections/{COLLECTION_NAME}/query"
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -1215,10 +1239,10 @@ async fn assert_stats_parity(
             axum::http::Request::builder()
                 .uri(match snapshot.clone() {
                     Some(snapshot) => format!(
-                        "/v1/collections/{COLLECTION_NAME}/stats?snapshot_manifest_generation={}&snapshot_visible_seq_no={}",
+                        "/v2/databases/default/collections/{COLLECTION_NAME}/stats?snapshot_manifest_generation={}&snapshot_visible_seq_no={}",
                         snapshot.manifest_generation, snapshot.visible_seq_no
                     ),
-                    None => format!("/v1/collections/{COLLECTION_NAME}/stats"),
+                    None => format!("/v2/databases/default/collections/{COLLECTION_NAME}/stats"),
                 })
                 .body(Body::empty())
                 .expect("request should build"),
@@ -1538,7 +1562,7 @@ async fn assert_inspect_segment_parity(
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!(
-                    "/v1/collections/{COLLECTION_NAME}/inspect?target=segment&segment_id={segment_id}"
+                    "/v2/databases/default/collections/{COLLECTION_NAME}/inspect?target=segment&segment_id={segment_id}"
                 ))
                 .body(Body::empty())
                 .expect("request should build"),
@@ -1590,13 +1614,19 @@ async fn assert_inspect_segment_parity(
 
 fn inspect_request(target: InspectTarget) -> axum::http::Request<Body> {
     let uri = match target {
-        InspectTarget::Manifest => "/v1/collections/randomized/inspect?target=manifest".to_owned(),
-        InspectTarget::Wal => "/v1/collections/randomized/inspect?target=wal".to_owned(),
+        InspectTarget::Manifest => {
+            "/v2/databases/default/collections/randomized/inspect?target=manifest".to_owned()
+        }
+        InspectTarget::Wal => {
+            "/v2/databases/default/collections/randomized/inspect?target=wal".to_owned()
+        }
         InspectTarget::Segment(segment_id) => {
-            format!("/v1/collections/randomized/inspect?target=segment&segment_id={segment_id}")
+            format!(
+                "/v2/databases/default/collections/randomized/inspect?target=segment&segment_id={segment_id}"
+            )
         }
         InspectTarget::Maintenance => {
-            "/v1/collections/randomized/inspect?target=maintenance".to_owned()
+            "/v2/databases/default/collections/randomized/inspect?target=maintenance".to_owned()
         }
     };
 

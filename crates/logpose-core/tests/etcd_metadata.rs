@@ -21,7 +21,8 @@ use logpose_storage_etcd::{
 };
 use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, DistanceMetric, EtcdMetadataConfig,
-    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
+    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId,
+    legacy::record_from_put,
 };
 use serde as _;
 use serde_json::json;
@@ -75,13 +76,17 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         cluster_name,
     )));
     state_a
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("authoritative owner should serve local writes");
@@ -1147,13 +1152,17 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .expect("collection should be created by the owner");
 
     owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1225,24 +1234,32 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .await
         .expect("follower runtime status should load");
     let owner_error = owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect_err("promoted old owner must reject writes");
     let follower_ack = follower
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("gamma"),
-                vector: vec![0.5, 0.5],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("gamma"),
+                    vector: vec![0.5, 0.5],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("promoted owner with local state should accept writes");
@@ -1346,13 +1363,17 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         .expect("collection should be created by the owner");
 
     let pre_promotion_ack = owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1382,13 +1403,17 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
     assert!(matches!(promoted, PromotionResult::Applied(_)));
 
     let post_promotion_ack = follower
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("promoted owner with mirrored local state should accept writes");
@@ -1509,13 +1534,17 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
         .await
         .expect("collection should be created by the owner");
     owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("owner should serve writes before owner metadata is removed");
@@ -1570,8 +1599,7 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         "documents",
-        2,
-        DistanceMetric::Dot,
+        logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
         unique_temp_dir("etcd-owner-promotion-pending").as_path(),
     )
     .without_root_path();

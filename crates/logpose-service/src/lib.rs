@@ -34,7 +34,8 @@ use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
-    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
+    CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, LocalStorageEngine,
+    StorageEngine,
 };
 use logpose_storage_etcd::{
     EtcdCoordinationClient, LeadershipLease, LeadershipRecord, LeaseKeepAlive, MembershipRecord,
@@ -44,7 +45,9 @@ use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
     MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus,
-    ResourceKind, Snapshot, WriteOperation,
+    ResourceKind, Snapshot,
+    record::{ClientOp, PartialUpdate, PrimaryKey, Record},
+    schema::{CollectionSchema, SchemaChange},
 };
 use std::{
     fmt,
@@ -506,16 +509,113 @@ impl LogPoseDataService {
             .await
     }
 
-    /// Persist a write batch.
-    pub async fn write(
+    /// List the collections of one database, each with its live schema.
+    pub async fn list_collections_in_database(
+        &self,
+        database_name: &str,
+    ) -> Result<Vec<logpose_catalog::CollectionDescriptor>> {
+        let mut descriptors = self.storage.list_collections().await?;
+        descriptors.retain(|descriptor| descriptor.database_name == database_name);
+        Ok(descriptors)
+    }
+
+    /// Drop a collection, fenced by `leader_fence` when metadata lives in a shared store.
+    pub async fn drop_collection(
         &self,
         collection_name: &str,
-        operations: Vec<WriteOperation>,
+        leader_fence: Option<LeadershipFence>,
+    ) -> Result<()> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.storage
+            .drop_collection(&descriptor.lookup_name(), leader_fence)
+            .await
+    }
+
+    /// Change a collection's schema online and return the collection with its new schema.
+    pub async fn alter_collection(
+        &self,
+        collection_name: &str,
+        change: SchemaChange,
+    ) -> Result<logpose_catalog::CollectionDescriptor> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        let lookup_name = descriptor.lookup_name();
+        self.storage.alter_schema(&lookup_name, change).await?;
+        self.storage.open_collection(&lookup_name).await
+    }
+
+    /// The collection's live schema.
+    pub async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.storage.schema(&descriptor.lookup_name()).await
+    }
+
+    /// Commit upserts, partial updates, and deletes by key as one atomic batch. Validation
+    /// errors name the operation as `operations[i]`.
+    pub async fn write(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
+        self.write_batch(collection_name, ops, "operations").await
+    }
+
+    /// Insert or replace whole records as one atomic batch. Validation errors name the
+    /// offending field as `records[i].<field>`.
+    pub async fn upsert(&self, collection_name: &str, records: Vec<Record>) -> Result<CommitAck> {
+        self.write_batch(
+            collection_name,
+            records.into_iter().map(ClientOp::Upsert).collect(),
+            "records",
+        )
+        .await
+    }
+
+    /// Change some fields of existing records as one atomic batch. A key without a live record
+    /// fails the batch with `NOT_FOUND`. Validation errors name `records[i].<field>`.
+    pub async fn update(
+        &self,
+        collection_name: &str,
+        updates: Vec<PartialUpdate>,
+    ) -> Result<CommitAck> {
+        self.write_batch(
+            collection_name,
+            updates.into_iter().map(ClientOp::Update).collect(),
+            "records",
+        )
+        .await
+    }
+
+    /// Delete records by primary key as one atomic batch. A key without a live record is a
+    /// no-op. Validation errors name `keys[i]`.
+    pub async fn delete(&self, collection_name: &str, keys: Vec<PrimaryKey>) -> Result<CommitAck> {
+        self.write_batch(
+            collection_name,
+            keys.into_iter().map(ClientOp::Delete).collect(),
+            "keys",
+        )
+        .await
+    }
+
+    /// Point lookups by primary key, projected to `output_fields` (every field when empty).
+    pub async fn get_records(
+        &self,
+        collection_name: &str,
+        keys: Vec<PrimaryKey>,
+        output_fields: Vec<String>,
+    ) -> Result<FetchedRecords> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.storage
+            .get_records(&descriptor.lookup_name(), keys, output_fields)
+            .await
+    }
+
+    async fn write_batch(
+        &self,
+        collection_name: &str,
+        ops: Vec<ClientOp>,
+        field: &str,
     ) -> Result<CommitAck> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         self.storage
-            .write(&descriptor.lookup_name(), operations)
+            .write_batch(&descriptor.lookup_name(), ops)
             .await
+            .map_err(|error| error.with_field_prefix(field))
     }
 
     /// Execute a filtered exact query.
@@ -757,16 +857,7 @@ impl LogPoseControlService {
         &self,
         request: CreateCollectionRequest,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        match self.config.node_role {
-            NodeRole::Data | NodeRole::Control => {
-                return Err(LogPoseError::WrongNodeRole {
-                    node: self.config.node_name.clone(),
-                    role: self.config.node_role,
-                    operation: "control-plane collection lifecycle mutations".to_owned(),
-                });
-            }
-            NodeRole::Combined => {}
-        }
+        self.require_collection_lifecycle_role()?;
         let leader_fence = self.require_local_control_plane_leader().await?;
         let assignment = self.initial_assignment();
         if self.config.metadata.backend == MetadataBackend::Etcd
@@ -781,6 +872,43 @@ impl LogPoseControlService {
         self.data
             .create_collection_with_assignment(request, assignment, leader_fence)
             .await
+    }
+
+    /// Drop a collection through the control-plane surface.
+    pub async fn drop_collection(&self, collection_name: &str) -> Result<()> {
+        self.require_collection_lifecycle_role()?;
+        let leader_fence = self.require_local_control_plane_leader().await?;
+        self.data
+            .drop_collection(collection_name, leader_fence)
+            .await
+    }
+
+    /// Delete a database and its access policy from the local catalog. Refuses the default
+    /// database and a database that still holds a collection.
+    pub async fn drop_database(&self, database_name: &str) -> Result<()> {
+        match self.config.node_role {
+            NodeRole::Data => {
+                return Err(LogPoseError::WrongNodeRole {
+                    node: self.config.node_name.clone(),
+                    role: self.config.node_role,
+                    operation: "control-plane database mutations".to_owned(),
+                });
+            }
+            NodeRole::Control | NodeRole::Combined => {}
+        }
+        self.require_local_control_plane_leader().await?;
+        self.catalog.delete_database(database_name)
+    }
+
+    fn require_collection_lifecycle_role(&self) -> Result<()> {
+        match self.config.node_role {
+            NodeRole::Data | NodeRole::Control => Err(LogPoseError::WrongNodeRole {
+                node: self.config.node_name.clone(),
+                role: self.config.node_role,
+                operation: "control-plane collection lifecycle mutations".to_owned(),
+            }),
+            NodeRole::Combined => Ok(()),
+        }
     }
 
     /// Create or replace one database-scoped access policy.
@@ -1313,6 +1441,7 @@ mod tests {
     use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
     use logpose_types::{
         AnnSearchRequest, CollectionStats, CommitAck, DistanceMetric, Snapshot, VisibleRecord,
+        WriteOperation, legacy::record_from_put,
     };
     use serde_json::json;
     use std::{
@@ -1441,9 +1570,8 @@ mod tests {
             ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
                 let suffix = self.next_id.fetch_add(1, Ordering::Relaxed);
                 Ok(logpose_catalog::CollectionDescriptor::new(
-                    request.name,
-                    request.dimensions,
-                    request.metric,
+                    request.name().to_owned(),
+                    request.spec.build_schema()?,
                     self.root.join(format!("collection-{suffix}")),
                 ))
             }
@@ -1545,18 +1673,18 @@ mod tests {
         }));
 
         let descriptor = service
-            .create_collection(CreateCollectionRequest {
-                database_name: "default".to_owned(),
-                name: "documents".to_owned(),
-                dimensions: 2,
-                metric: DistanceMetric::Dot,
-            })
+            .create_collection(CreateCollectionRequest::in_database(
+                "default".to_owned(),
+                "documents".to_owned(),
+                2,
+                DistanceMetric::Dot,
+            ))
             .await
             .expect("plain storage create should still succeed");
 
         assert_eq!(descriptor.name, "documents");
-        assert_eq!(descriptor.dimensions, 2);
-        assert_eq!(descriptor.metric, DistanceMetric::Dot);
+        assert_eq!(descriptor.schema.vectors()[0].dimensions, 2);
+        assert_eq!(descriptor.schema.vectors()[0].metric, DistanceMetric::Dot);
     }
 
     #[tokio::test]
@@ -1749,6 +1877,14 @@ mod tests {
                 self.inner.write(collection_name, operations).await
             }
 
+            async fn write_batch(
+                &self,
+                collection_name: &str,
+                operations: Vec<ClientOp>,
+            ) -> logpose_types::Result<CommitAck> {
+                self.inner.write_batch(collection_name, operations).await
+            }
+
             async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
                 let snapshot = self.inner.snapshot(collection_name).await?;
                 if self.armed.swap(false, Ordering::SeqCst) {
@@ -1840,13 +1976,14 @@ mod tests {
             ))
             .await
             .expect("collection should be created");
-        let put = WriteOperation::Put(logpose_types::PutRecord {
+        let put = record_from_put(logpose_types::PutRecord {
             id: logpose_types::RecordId::new("first"),
             vector: vec![1.0, 0.0],
             metadata: json!({}),
-        });
+        })
+        .expect("record");
         let ack = service
-            .write("documents", vec![put])
+            .upsert("documents", vec![put])
             .await
             .expect("write should succeed");
 

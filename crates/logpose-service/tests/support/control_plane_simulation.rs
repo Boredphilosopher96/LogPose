@@ -3,10 +3,12 @@ use http_body_util::BodyExt;
 use logpose_api_grpc::proto::log_pose_service_server::LogPoseService;
 use logpose_api_grpc::{GrpcLogPoseService, proto};
 use logpose_auth as _;
-use logpose_core::AppState;
+use logpose_core::{AppState, RequestAuth};
 use logpose_query::{ExplainMode, QueryRequest};
 use logpose_storage::CreateCollectionRequest;
-use logpose_types::{DistanceMetric, NodeRole, PutRecord, RecordId, WriteOperation};
+use logpose_types::{
+    DistanceMetric, NodeRole, PutRecord, RecordId, WriteOperation, legacy::client_op_from_write,
+};
 use serde as _;
 use serde_json::{Value, json};
 use std::{
@@ -18,6 +20,21 @@ use std::{
 };
 use tonic::Request;
 use tower::util::ServiceExt;
+
+/// Apply legacy write operations as one mixed client batch.
+async fn write_legacy(
+    state: &AppState,
+    collection_name: &str,
+    operations: Vec<WriteOperation>,
+) -> logpose_service::Result<logpose_types::CommitAck> {
+    let operations = operations
+        .into_iter()
+        .map(|operation| client_op_from_write(operation).expect("legacy operation converts"))
+        .collect();
+    state
+        .write_with_auth(&RequestAuth::default(), collection_name, operations)
+        .await
+}
 
 #[derive(Clone, Debug)]
 enum Step {
@@ -286,9 +303,7 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
             }
             Step::WriteBatch(collection_name, records) => {
                 let operations = model.record_write_batch(name, collection_name, records);
-                harness
-                    .state
-                    .write(collection_name, operations)
+                write_legacy(&harness.state, collection_name, operations)
                     .await
                     .unwrap_or_else(|error| {
                         panic_with_context(&trace, format!("write failed: {error}"))
@@ -311,18 +326,17 @@ async fn run_scenario(name: &str, steps: Vec<Step>) {
                 assert_data_matches(&harness, &model, collection_name, &trace).await;
             }
             Step::ExpectWriteRejected(collection_name) => {
-                let error = harness
-                    .state
-                    .write(
-                        collection_name,
-                        vec![WriteOperation::Put(PutRecord {
-                            id: RecordId::new(format!("{collection_name}-rejected")),
-                            vector: vec![1.0, 0.0],
-                            metadata: json!({"scenario": name}),
-                        })],
-                    )
-                    .await
-                    .expect_err("data-plane write should be rejected");
+                let error = write_legacy(
+                    &harness.state,
+                    collection_name,
+                    vec![WriteOperation::Put(PutRecord {
+                        id: RecordId::new(format!("{collection_name}-rejected")),
+                        vector: vec![1.0, 0.0],
+                        metadata: json!({"scenario": name}),
+                    })],
+                )
+                .await
+                .expect_err("data-plane write should be rejected");
                 assert!(
                     error.to_string().contains("data-plane operations")
                         || error.to_string().contains("not locally served"),
@@ -877,7 +891,7 @@ async fn rest_runtime_status(harness: &Harness) -> Result<Value, String> {
         .clone()
         .oneshot(
             axum::http::Request::builder()
-                .uri("/v1/runtime/status")
+                .uri("/v2/runtime/status")
                 .body(Body::empty())
                 .expect("request should build"),
         )
@@ -903,9 +917,9 @@ async fn rest_collection_placement(
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!(
-                    "/v1/collections/{}/placement?database={}",
-                    encode_collection_path_segment(&bare_collection_name),
-                    encode_collection_query_value(&database_name)
+                    "/v2/databases/{}/collections/{}/placement",
+                    encode_collection_path_segment(&database_name),
+                    encode_collection_path_segment(&bare_collection_name)
                 ))
                 .body(Body::empty())
                 .expect("request should build"),
@@ -929,9 +943,9 @@ async fn rest_collection_stats(harness: &Harness, collection_name: &str) -> Resu
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!(
-                    "/v1/collections/{}/stats?database={}",
-                    encode_collection_path_segment(&bare_collection_name),
-                    encode_collection_query_value(&database_name)
+                    "/v2/databases/{}/collections/{}/stats",
+                    encode_collection_path_segment(&database_name),
+                    encode_collection_path_segment(&bare_collection_name)
                 ))
                 .body(Body::empty())
                 .expect("request should build"),
@@ -960,13 +974,13 @@ async fn rest_collection_query(
             axum::http::Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/v1/collections/{}/query",
+                    "/v2/databases/{}/collections/{}/query",
+                    encode_collection_path_segment(&database_name),
                     encode_collection_path_segment(&bare_collection_name)
                 ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "database_name": database_name,
                         "vector": [1.0, 0.0],
                         "top_k": top_k
                     })
@@ -1108,10 +1122,6 @@ fn encode_collection_path_segment(collection_name: &str) -> String {
         .replace('%', "%25")
         .replace('/', "%2F")
         .replace(' ', "%20")
-}
-
-fn encode_collection_query_value(value: &str) -> String {
-    value.replace('%', "%25").replace(' ', "%20")
 }
 
 #[allow(clippy::panic)]

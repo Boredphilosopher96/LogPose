@@ -7,11 +7,15 @@ use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
 use logpose_service::{LogPoseControlService, LogPoseDataService, Result as ServiceResult};
-use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
+use logpose_storage::{
+    CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, LocalStorageEngine,
+};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
-    LogPoseError, MetadataBackend, NodeMetadata, NodeRole, Snapshot, WriteOperation,
+    LogPoseError, MetadataBackend, NodeMetadata, NodeRole, Snapshot,
+    record::{ClientOp, PartialUpdate, PrimaryKey, Record},
+    schema::{CollectionSchema, SchemaChange},
 };
 use serde::Serialize;
 #[cfg(test)]
@@ -245,33 +249,168 @@ impl AppState {
         self.data.get_collection(collection_name).await
     }
 
-    /// Persist one write batch after enforcing database write access when auth is enabled.
+    /// List the collections of one database, with their live schemas, after enforcing
+    /// database read access.
+    pub async fn list_collections_with_auth(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+    ) -> ServiceResult<Vec<logpose_catalog::CollectionDescriptor>> {
+        self.require_database_permission(auth, database_name, DatabasePermission::ReadOnly)
+            .await?;
+        self.database_shared(database_name).await?;
+        self.data.list_collections_in_database(database_name).await
+    }
+
+    /// Change a collection's schema online after enforcing database write access. The change
+    /// goes through the collection's writer, so this node must own the collection.
+    pub async fn alter_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        change: SchemaChange,
+    ) -> ServiceResult<logpose_catalog::CollectionDescriptor> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadWrite)
+            .await?;
+        self.control
+            .require_local_write_ownership(collection_name)
+            .await?;
+        self.data.alter_collection(collection_name, change).await
+    }
+
+    /// Drop a collection after enforcing database write access.
+    pub async fn drop_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<()> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadWrite)
+            .await?;
+        self.require_control_plane_collection_mutation()?;
+        self.control.drop_collection(collection_name).await
+    }
+
+    /// Drop an empty database and its access policy after enforcing operator access.
+    pub async fn drop_database_with_auth(
+        &self,
+        auth: &RequestAuth,
+        database_name: &str,
+    ) -> ServiceResult<()> {
+        self.require_operator(auth).await?;
+        self.require_control_plane_database_mutation()?;
+        let leader_fence = self.control.require_local_control_plane_leader().await?;
+        match &self.shared_catalog {
+            SharedCatalog::Local => self.control.drop_database(database_name).await,
+            SharedCatalog::Etcd(catalog) => {
+                let leader_fence = required_leadership_fence(leader_fence)?;
+                catalog
+                    .delete_database(database_name, &leader_fence.node_id, leader_fence.lease_id)
+                    .await?;
+                // The local catalog caches the database for local collections; drop it too.
+                match self.control.catalog_store().delete_database(database_name) {
+                    Ok(()) | Err(LogPoseError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// The collection's live schema, after enforcing database read access. REST reads it to
+    /// parse natural JSON documents before a write.
+    pub async fn collection_schema_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+    ) -> ServiceResult<Arc<CollectionSchema>> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadOnly)
+            .await?;
+        self.require_local_data_plane_collection(collection_name)
+            .await?;
+        self.data.schema(collection_name).await
+    }
+
+    /// Apply a mixed batch of client operations atomically, after enforcing database write
+    /// access. Errors name `operations[i].<field>`.
     pub async fn write_with_auth(
         &self,
         auth: &RequestAuth,
         collection_name: &str,
-        operations: Vec<WriteOperation>,
+        operations: Vec<ClientOp>,
     ) -> ServiceResult<CommitAck> {
-        let collection = parse_collection_reference(collection_name)?;
-        self.require_database_permission(
-            auth,
-            &collection.database_name,
-            DatabasePermission::ReadWrite,
-        )
-        .await?;
-        self.write(collection_name, operations).await
+        self.require_writer(auth, collection_name).await?;
+        self.data.write(collection_name, operations).await
     }
 
-    /// Persist one write batch through the data-plane surface.
-    pub async fn write(
+    /// Insert or replace whole records as one atomic batch, after enforcing database write
+    /// access. Errors name `records[i].<field>`.
+    pub async fn upsert_records_with_auth(
         &self,
+        auth: &RequestAuth,
         collection_name: &str,
-        operations: Vec<WriteOperation>,
+        records: Vec<Record>,
     ) -> ServiceResult<CommitAck> {
+        self.require_writer(auth, collection_name).await?;
+        self.data.upsert(collection_name, records).await
+    }
+
+    /// Change some fields of existing records as one atomic batch, after enforcing database
+    /// write access. A key without a live record fails the batch with `NOT_FOUND`.
+    pub async fn update_records_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        updates: Vec<PartialUpdate>,
+    ) -> ServiceResult<CommitAck> {
+        self.require_writer(auth, collection_name).await?;
+        self.data.update(collection_name, updates).await
+    }
+
+    /// Delete records by primary key as one atomic batch, after enforcing database write
+    /// access. Missing keys are no-ops.
+    pub async fn delete_records_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        keys: Vec<PrimaryKey>,
+    ) -> ServiceResult<CommitAck> {
+        self.require_writer(auth, collection_name).await?;
+        self.data.delete(collection_name, keys).await
+    }
+
+    /// Point lookups by primary key, after enforcing database read access.
+    pub async fn get_records_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        keys: Vec<PrimaryKey>,
+        output_fields: Vec<String>,
+    ) -> ServiceResult<FetchedRecords> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadOnly)
+            .await?;
+        self.require_local_data_plane_collection(collection_name)
+            .await?;
+        self.data
+            .get_records(collection_name, keys, output_fields)
+            .await
+    }
+
+    async fn require_writer(&self, auth: &RequestAuth, collection_name: &str) -> ServiceResult<()> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadWrite)
+            .await?;
         self.control
             .require_local_write_ownership(collection_name)
-            .await?;
-        self.data.write(collection_name, operations).await
+            .await
+    }
+
+    async fn require_collection_permission(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        permission: DatabasePermission,
+    ) -> ServiceResult<()> {
+        let collection = parse_collection_reference(collection_name)?;
+        self.require_database_permission(auth, &collection.database_name, permission)
+            .await
     }
 
     /// Execute a query after enforcing database read access when auth is enabled.
@@ -875,12 +1014,12 @@ mod tests {
         let descriptor = state
             .create_collection_with_auth(
                 &RequestAuth::bearer_token("writer-token"),
-                CreateCollectionRequest {
-                    database_name: "analytics".to_owned(),
-                    name: "documents".to_owned(),
-                    dimensions: 2,
-                    metric: DistanceMetric::Dot,
-                },
+                CreateCollectionRequest::in_database(
+                    "analytics",
+                    "documents",
+                    2,
+                    DistanceMetric::Dot,
+                ),
             )
             .await
             .expect("database-scoped policy should authorize the request");
