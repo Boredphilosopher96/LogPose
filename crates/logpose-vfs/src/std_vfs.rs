@@ -53,14 +53,30 @@ impl Vfs for StdVfs {
     }
 
     fn list(&self, dir: &Path) -> io::Result<Vec<DirEntry>> {
+        // An entry removed or renamed away between `readdir` and the `stat` of its type or
+        // length (a `CURRENT.tmp` a manifest publish renames, a WAL file a checkpoint removes)
+        // is left out, as a listing taken a moment later would leave it out, instead of failing
+        // the whole listing with `NotFound`.
+        fn vanished<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+            match result {
+                Ok(value) => Ok(Some(value)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
         let mut entries = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let Some(file_type) = vanished(entry.file_type())? else {
+                continue;
+            };
             let len = if file_type.is_dir() {
                 0
             } else {
-                entry.metadata()?.len()
+                match vanished(entry.metadata())? {
+                    Some(metadata) => metadata.len(),
+                    None => continue,
+                }
             };
             entries.push(DirEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
@@ -248,6 +264,40 @@ mod tests {
         assert!(!exists(&vfs, &dir.join("missing").join("child")).expect("exists"));
         vfs.sync_dir(&dir).expect("dir sync should succeed");
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Files renamed and removed while the directory is listed are left out of the listing,
+    /// never an error (the storage harness's I7 check listed a collection directory while the
+    /// engine's background flush renamed `CURRENT.tmp` into place, and failed with `NotFound`).
+    #[test]
+    fn listing_leaves_out_files_removed_while_it_runs() {
+        let dir = unique_dir("logpose-std-vfs-list");
+        let vfs = StdVfs;
+        fs::write(dir.join("stable"), b"x").expect("stable file");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (dir, stop) = (dir.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut round = 0_u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let temp = dir.join(format!("f{}.tmp", round % 8));
+                    let done = dir.join(format!("f{}", round % 8));
+                    let _ = fs::write(&temp, b"y");
+                    let _ = fs::rename(&temp, &done);
+                    let _ = fs::remove_file(&done);
+                    round += 1;
+                }
+            })
+        };
+        for _ in 0..5_000 {
+            let entries = vfs
+                .list(&dir)
+                .expect("a listing never fails for a file that vanished");
+            assert!(entries.iter().any(|entry| entry.name == "stable"));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().expect("churn thread");
         let _ = fs::remove_dir_all(dir);
     }
 

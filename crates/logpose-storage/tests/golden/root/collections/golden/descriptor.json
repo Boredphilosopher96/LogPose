@@ -1,0 +1,30 @@
+{
+  "collection_id": "00000000-0000-0000-0123-456789abcdef",
+  "database_name": "default",
+  "name": "golden",
+  "schema": {
+    "schema_version": 1,
+    "next_field_id": 2,
+    "primary_key": {
+      "id": 0,
+      "name": "id",
+      "type": "string"
+    },
+    "vectors": [
+      {
+        "id": 1,
+        "name": "vector",
+        "dimensions": 3,
+        "metric": "dot"
+      }
+    ],
+    "fields": [],
+    "dynamic_fields": true,
+    "retired_names": []
+  },
+  "root_path": "/golden/collections/golden",
+  "remote_blob": null,
+  "flush_threshold_ops": 18446744073709551615,
+  "flush_threshold_bytes": 18446744073709551615,
+  "compaction_threshold_segments": 18446744073709551615
+}

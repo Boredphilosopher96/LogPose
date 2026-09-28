@@ -410,6 +410,20 @@ impl Engine {
         handles
     }
 
+    /// A validated descriptor for `request` under this engine's root, with default thresholds,
+    /// for [`create_collection`](Self::create_collection) (callers may change its thresholds
+    /// first).
+    ///
+    /// # Errors
+    ///
+    /// The collection already exists, or the request is invalid.
+    pub fn plan_collection_descriptor(
+        &self,
+        request: &crate::CreateCollectionRequest,
+    ) -> Result<CollectionDescriptor> {
+        self.core().plan_collection_descriptor(request)
+    }
+
     /// Durably create a collection from a validated descriptor and register it.
     ///
     /// Blocking. Fails if a collection with the same `(database, name)` exists or is being

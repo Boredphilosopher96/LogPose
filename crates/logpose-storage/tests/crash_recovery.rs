@@ -1,6 +1,7 @@
-//! Crash-recovery tests on `FaultVfs`: exhaustive crash enumeration over a small scenario that
-//! covers writes, flush (segment write, manifest publish, WAL rotation) and compaction, plus one
-//! test per crash point the legacy engine implements.
+//! Crash-recovery tests on `FaultVfs`: crashes while creating and dropping a collection, one
+//! test per named crash point with its documented outcome, and failed WAL fsyncs. The
+//! exhaustive crash enumeration (every operation of a scenario under every tear mode, with
+//! recovery idempotence against a clean recovery) is harness v2's (`tests/harness/crash.rs`).
 //!
 //! Every test checks the recovery contract: every acknowledged batch is present, an
 //! unacknowledged batch is either entirely present or entirely absent, and the engine keeps
@@ -33,10 +34,7 @@ use uuid as _;
 mod scan;
 use scan::ScanExt;
 
-use logpose_storage::{
-    CreateCollectionRequest, Engine, EngineConfig, GroupCommitConfig, LocalStorageEngine,
-    StorageEngine,
-};
+use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, DeleteRecord, DistanceMetric,
     LogPoseError, NodeRole, PutRecord, RecordId, SeqNo, Snapshot, VisibleRecord, WriteOperation,
@@ -45,11 +43,10 @@ use logpose_types::{
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::IoSlice,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 const ROOT: &str = "/storage";
@@ -180,24 +177,6 @@ impl Harness {
             }
         }
         outcome
-    }
-
-    /// Drop the engine (the crashed process), apply the crash model, and reopen with a crash
-    /// planned `crash_after_ops` operations into recovery. The interrupted open may fail, or
-    /// succeed with the collection registered as failed; either way the process then dies.
-    fn crash_then_crash_during_recovery(&mut self, crash_after_ops: u64, tear: TearMode) {
-        self.engine = None;
-        self.fault.crash();
-        self.fault.set_plan(FaultPlan {
-            crash_after_ops: Some(crash_after_ops),
-            tear,
-            ..FaultPlan::default()
-        });
-        drop(LocalStorageEngine::with_vfs(
-            self.fault.process(),
-            ROOT,
-            None,
-        ));
     }
 
     /// Drop the engine (the crashed process), apply the crash model, and reopen.
@@ -340,89 +319,6 @@ async fn assert_engine_keeps_working(
         expected_visible(&kept),
         "{context}: state after recovery, more work and a second crash"
     );
-}
-
-async fn ops_after_setup(seed: u64, steps: &[Step]) -> (u64, u64) {
-    let harness = Harness::new(seed).await;
-    let setup_ops = harness.fault.mutating_ops();
-    let outcome = harness.run(steps).await;
-    assert!(
-        outcome.failed_step.is_none(),
-        "clean run failed: {outcome:?}"
-    );
-    (setup_ops, harness.fault.mutating_ops() - setup_ops)
-}
-
-/// Crash before every mutating operation of the scenario, under every tear mode.
-#[tokio::test]
-async fn every_crash_point_of_writes_flush_rotation_and_compaction_recovers_acked_batches() {
-    let steps = scenario();
-    let (setup_ops, scenario_ops) = ops_after_setup(0, &steps).await;
-    assert!(
-        scenario_ops > 50,
-        "scenario should exercise many operations"
-    );
-
-    for tear in TearMode::ALL {
-        for k in 0..=scenario_ops {
-            let seed = k * 4 + tear as u64;
-            let mut harness = Harness::new(seed).await;
-            harness.fault.set_plan(FaultPlan {
-                crash_after_ops: Some(setup_ops + k),
-                tear,
-                ..FaultPlan::default()
-            });
-            let outcome = harness.run(&steps).await;
-            let context = format!(
-                "tear={tear:?} crash_after_ops={k} failed_step={:?}",
-                outcome.failed_step
-            );
-            harness.crash_and_reopen();
-            let kept = assert_recovered(&harness, &outcome, &context).await;
-            assert_engine_keeps_working(&mut harness, kept, &context).await;
-        }
-    }
-}
-
-/// Crash during the scenario, then crash again at every operation of the recovery that follows,
-/// then recover cleanly (I11: a crash during recovery is recovered like any other).
-#[tokio::test]
-async fn a_crash_during_recovery_is_recovered() {
-    let steps = scenario();
-    let (setup_ops, scenario_ops) = ops_after_setup(1, &steps).await;
-
-    // Crash points inside the flushes, where recovery has the most to do.
-    for tear in TearMode::ALL {
-        for k in (0..=scenario_ops).step_by(3) {
-            let seed = k * 4 + tear as u64;
-            let plan = FaultPlan {
-                crash_after_ops: Some(setup_ops + k),
-                tear,
-                ..FaultPlan::default()
-            };
-            let mut harness = Harness::new(seed).await;
-            harness.fault.set_plan(plan.clone());
-            let outcome = harness.run(&steps).await;
-
-            // Count what recovery does on this state, on a throwaway copy of the same run.
-            // Recovery runs inside `open`.
-            let recovery_ops = {
-                let mut probe = Harness::new(seed).await;
-                probe.fault.set_plan(plan);
-                probe.run(&steps).await;
-                probe.crash_and_reopen();
-                probe.fault.mutating_ops()
-            };
-
-            for recovery_crash in 0..recovery_ops {
-                harness.crash_then_crash_during_recovery(recovery_crash, tear);
-            }
-            harness.crash_and_reopen();
-            let context = format!("tear={tear:?} crash_after_ops={k} then recovery crashes");
-            let kept = assert_recovered(&harness, &outcome, &context).await;
-            assert_engine_keeps_working(&mut harness, kept, &context).await;
-        }
-    }
 }
 
 /// Crash before every mutating operation of creating a collection: afterwards the collection
@@ -955,153 +851,4 @@ fn active_wal_path(harness: &Harness) -> PathBuf {
         .collect::<Vec<_>>();
     wal_files.sort();
     wal_files.pop().expect("the collection has a WAL file")
-}
-
-/// Batches per group in the single-group sweep.
-const GROUP_WRITERS: usize = 6;
-
-/// An engine whose writer waits until `GROUP_WRITERS` batches are queued before it commits,
-/// so that concurrent batches deterministically form one fsync group.
-fn grouping_engine(fault: &Arc<FaultVfs>) -> LocalStorageEngine {
-    let config = EngineConfig {
-        group: GroupCommitConfig {
-            commit_delay: Duration::from_secs(30),
-            min_group_requests: GROUP_WRITERS,
-            ..GroupCommitConfig::default()
-        },
-        ..EngineConfig::default()
-    };
-    LocalStorageEngine::from_engine(
-        Engine::open(fault.process(), ROOT, config).expect("engine should open"),
-    )
-}
-
-/// Write one group: `GROUP_WRITERS` concurrent two-operation batches. Returns each batch's
-/// result.
-async fn write_group(engine: &LocalStorageEngine, round: usize) -> Vec<bool> {
-    let tasks = (0..GROUP_WRITERS)
-        .map(|writer| {
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                engine
-                    .write(
-                        COLLECTION,
-                        vec![
-                            put(&format!("r{round}-w{writer}-a"), writer as f32),
-                            put(&format!("r{round}-w{writer}-b"), writer as f32),
-                        ],
-                    )
-                    .await
-                    .is_ok()
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut acked = Vec::new();
-    for task in tasks {
-        acked.push(task.await.expect("writer should join"));
-    }
-    acked
-}
-
-fn group_ids(round: usize) -> BTreeSet<String> {
-    (0..GROUP_WRITERS)
-        .flat_map(|writer| {
-            [
-                format!("r{round}-w{writer}-a"),
-                format!("r{round}-w{writer}-b"),
-            ]
-        })
-        .collect()
-}
-
-async fn grouping_harness(seed: u64) -> (Arc<FaultVfs>, LocalStorageEngine) {
-    let fault = FaultVfs::new(seed);
-    let engine = grouping_engine(&fault);
-    let mut descriptor = engine
-        .plan_collection_descriptor(&CreateCollectionRequest::new(
-            COLLECTION,
-            2,
-            DistanceMetric::Dot,
-        ))
-        .expect("descriptor should plan");
-    descriptor.flush_threshold_ops = usize::MAX;
-    descriptor.flush_threshold_bytes = usize::MAX;
-    descriptor.compaction_threshold_segments = usize::MAX;
-    engine
-        .create_collection_from_descriptor(descriptor, None)
-        .expect("collection should be created");
-    assert!(
-        write_group(&engine, 0).await.iter().all(|acked| *acked),
-        "the setup group commits"
-    );
-    (fault, engine)
-}
-
-/// Crash before every mutating operation of one group commit holding several concurrent
-/// batches, under every tear mode. The group is one append and one fsync, so recovery keeps it
-/// whole or not at all (I3), keeps it whenever any of its batches was acknowledged, and always
-/// keeps the group committed before it (I8).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_crash_point_of_one_group_commit_keeps_the_group_whole() {
-    let (group_ops, group_syncs) = {
-        let (fault, engine) = grouping_harness(0).await;
-        let (ops, syncs) = (fault.mutating_ops(), fault.file_syncs());
-        assert!(write_group(&engine, 1).await.iter().all(|acked| *acked));
-        (fault.mutating_ops() - ops, fault.file_syncs() - syncs)
-    };
-    assert_eq!(
-        group_syncs, 1,
-        "{GROUP_WRITERS} concurrent batches share one fsync"
-    );
-    assert!(group_ops >= 2, "a group is at least an append and a sync");
-
-    for tear in TearMode::ALL {
-        for k in 0..=group_ops {
-            let context = format!("tear={tear:?} crash_after_ops={k}");
-            let (fault, engine) = grouping_harness(k * 4 + tear as u64).await;
-            fault.set_plan(FaultPlan {
-                crash_after_ops: Some(fault.mutating_ops() + k),
-                tear,
-                ..FaultPlan::default()
-            });
-            let acked = write_group(&engine, 1).await;
-            drop(engine);
-            fault.crash();
-            let engine = grouping_engine(&fault);
-            let recovered = engine
-                .scan_exact(COLLECTION, None)
-                .await
-                .unwrap_or_else(|error| panic!("{context}: recovery failed: {error}"))
-                .into_iter()
-                .map(|record| record.id.as_str().to_owned())
-                .collect::<BTreeSet<_>>();
-            let setup = group_ids(0);
-            let group = group_ids(1);
-            assert!(
-                recovered.is_superset(&setup),
-                "{context}: the earlier group is kept"
-            );
-            let kept = recovered
-                .difference(&setup)
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            assert!(
-                kept.is_empty() || kept == group,
-                "{context}: the group is kept whole or not at all, got {kept:?}"
-            );
-            if acked.iter().any(|acked| *acked) {
-                assert_eq!(kept, group, "{context}: an acknowledged group survives");
-            }
-            let visible = engine
-                .snapshot(COLLECTION)
-                .await
-                .expect("snapshot")
-                .visible_seq_no;
-            assert_eq!(
-                visible,
-                (setup.len() + kept.len()) as SeqNo,
-                "{context}: visibility ends at a group boundary"
-            );
-        }
-    }
 }
