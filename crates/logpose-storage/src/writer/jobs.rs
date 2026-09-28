@@ -27,7 +27,10 @@
 //! `COMPACTION_RETRY_BACKOFF_MAX`. Once `max_flush_failures` flushes fail in a row, or one fails
 //! in a way no retry can fix (corrupt data, a full or read-only device), the collection is
 //! poisoned: writes, stalled ones included, fail at once with `CollectionPoisoned` instead of
-//! stalling against a device that cannot take a flush, and reads keep serving.
+//! stalling against a device that cannot take a flush, and reads keep serving. The explicit
+//! requests the failing job answers (its explicit flushes, or the compactions it runs for) get
+//! the job's own error; every other waiting request gets `CollectionPoisoned`, whose reason
+//! names that error.
 
 use super::*;
 use crate::{
@@ -45,6 +48,10 @@ use std::{
     io,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// An explicit flush: the sequence number it waits for the checkpoint to reach, and its reply
+/// (`None` for the memtable-budget trigger's).
+type FlushWaiter = (SeqNo, Option<SnapshotReply>);
 
 /// How long background flushes wait after a failed flush (or freeze) before they are tried
 /// again.
@@ -1405,6 +1412,14 @@ impl Writer {
             // Dropping the permit releases its slot and memory to the next waiting job.
             drop(running.permit);
         }
+        // A flush settles the explicit flushes. They are taken before the failure is reported,
+        // so that when it poisons the collection they still get this flush's own error, as the
+        // job's other waiters do, and not the `CollectionPoisoned` that other waiters get.
+        let flush_waiters = if entry.kind == JobKind::Flush {
+            std::mem::take(&mut self.flush_waiters)
+        } else {
+            Vec::new()
+        };
         match &outcome {
             Outcome::Committed(_) | Outcome::Nothing => self.job_succeeded(entry.kind),
             Outcome::Failed(error) => self.job_failed(entry.kind, error),
@@ -1415,7 +1430,7 @@ impl Writer {
             let _ = reply.send(self.answer(&outcome));
         }
         if entry.kind == JobKind::Flush {
-            self.settle_flush_waiters(&outcome);
+            self.settle_flush_waiters(flush_waiters, &outcome);
         }
         if self.running_jobs() == 0 {
             for waiter in self.quiesce_waiters.drain(..) {
@@ -1517,11 +1532,13 @@ impl Writer {
         self.poison(PoisonKind::ReadOnly, reason);
     }
 
-    /// After a flush ended: answer the explicit flushes the checkpoint now covers, or fail them
-    /// all if the flush failed.
-    fn settle_flush_waiters(&mut self, outcome: &Outcome) {
+    /// After a flush ended: answer the explicit flushes `waiters` (taken from `flush_waiters`)
+    /// with the flush's own error if it failed, and otherwise those the checkpoint now covers.
+    /// The rest wait for the next flush, unless the writer refuses work by now: no flush runs
+    /// again, so they get the refusal.
+    fn settle_flush_waiters(&mut self, waiters: Vec<FlushWaiter>, outcome: &Outcome) {
         if let Outcome::Failed(error) = outcome {
-            for (_, reply) in self.flush_waiters.drain(..) {
+            for (_, reply) in waiters {
                 if let Some(reply) = reply {
                     let _ = reply.send(Err(error.clone()));
                 }
@@ -1530,34 +1547,60 @@ impl Writer {
         }
         let checkpoint = self.manifest.checkpoint_seq_no;
         let snapshot = self.handle.current().snapshot();
-        let mut waiting = Vec::new();
-        for (target, reply) in self.flush_waiters.drain(..) {
+        let refusal = self.refusal();
+        for (target, reply) in waiters {
             if target <= checkpoint {
                 if let Some(reply) = reply {
                     let _ = reply.send(Ok(snapshot.clone()));
                 }
+            } else if let Some(refusal) = &refusal {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(refusal.clone_error()));
+                }
             } else {
-                waiting.push((target, reply));
+                self.flush_waiters.push((target, reply));
             }
         }
-        self.flush_waiters = waiting;
     }
 
     /// Fail every explicit request and cancel every job that has not begun: the collection was
-    /// dropped or poisoned.
+    /// dropped or poisoned. The requests get the refusal (`CollectionPoisoned`, whose reason
+    /// names the failure that poisoned the collection, or `NotFound`).
+    ///
+    /// The explicit flushes are the exception while a flush runs: that flush answers them when
+    /// it ends, so when its own failure is what poisoned the collection (a manifest publish or a
+    /// WAL rotation that failed), they get that failure, as its other waiters do. A flush that
+    /// ends after an unrelated poisoning fails on the refusal and answers them with it.
     pub(super) fn fail_waiters(&mut self) {
         self.cancel_waiting_jobs();
         let error = self.handle.unavailable();
-        self.fail_explicit_requests(&error);
+        let flushing = self
+            .jobs
+            .values()
+            .any(|job| job.kind == JobKind::Flush && matches!(job.phase, Phase::Running(_)));
+        if !flushing {
+            self.fail_flush_waiters(&error);
+        }
+        self.fail_other_explicit_requests(&error);
     }
 
     /// Answer every explicit flush and compaction still waiting with `error`.
     fn fail_explicit_requests(&mut self, error: &LogPoseError) {
+        self.fail_flush_waiters(error);
+        self.fail_other_explicit_requests(error);
+    }
+
+    /// Answer every explicit flush still waiting with `error`.
+    fn fail_flush_waiters(&mut self, error: &LogPoseError) {
         for (_, reply) in std::mem::take(&mut self.flush_waiters) {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(error.clone()));
             }
         }
+    }
+
+    /// Answer every explicit compaction and hand-stepped flush still waiting with `error`.
+    fn fail_other_explicit_requests(&mut self, error: &LogPoseError) {
         for reply in std::mem::take(&mut self.compact_waiters) {
             let _ = reply.send(Err(error.clone()));
         }
