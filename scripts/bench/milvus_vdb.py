@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pymilvus
 from pymilvus import DataType, MilvusClient
 
 REPORT_SCHEMA = "logpose-vdb-report/1"
@@ -178,7 +179,7 @@ def load(client: MilvusClient, args: argparse.Namespace, dataset: Dataset) -> di
     index_params.add_index(field_name=dataset.scalar_field, index_type=args.scalar_index)
     # Creating the collection with its indexes also loads it, as VectorDBBench does
     # before inserting.
-    client.create_collection(name, schema=schema, index_params=index_params)
+    client.create_collection(name, schema=schema, index_params=index_params, consistency_level=args.consistency_level)
 
     base = dataset.base()
     ranks = dataset.ranks()
@@ -234,6 +235,7 @@ def search_ids(client: MilvusClient, args: argparse.Namespace, dataset: Dataset,
         anns_field=VECTOR_FIELD,
         output_fields=[],
         search_params={"metric_type": metric_type(dataset.metric), "params": {"ef": ef}},
+        consistency_level=args.consistency_level,
     )
     return [int(hit["id"]) for hit in result[0]]
 
@@ -304,10 +306,12 @@ def run_case(client: MilvusClient, args: argparse.Namespace, dataset: Dataset, i
     truth = dataset.truths[index]
     queries = dataset.queries
     for warm in range(min(args.warmup, len(queries))):
-        search_ids(client, args, dataset, queries[warm], expr, args.ef[0])
+        search_ids(client, args, dataset, queries[warm], expr, max(args.ef[0], dataset.k))
 
+    # Milvus rejects an HNSW search whose ef is below its limit (k), so the sweep starts at k.
+    efs = list(dict.fromkeys(max(ef, dataset.k) for ef in args.ef))
     sweep = []
-    for ef in args.ef:
+    for ef in efs:
         latencies = []
         recalls = []
         started = time.monotonic()
@@ -369,6 +373,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--hnsw-m", type=int, default=16)
     parser.add_argument("--hnsw-ef-construction", type=int, default=200)
     parser.add_argument("--scalar-index", default="STL_SORT", help="Milvus index type for the rank field")
+    parser.add_argument(
+        "--consistency-level",
+        default="Bounded",
+        choices=["Strong", "Bounded", "Session", "Eventually"],
+        help="consistency level of the collection and of every search; the data is flushed and indexed before any search, so every level sees all of it",
+    )
     parser.add_argument("--ef", default="16,24,32,48,64,96,128,192,256,384,512,768,1024")
     parser.add_argument("--target-recall", type=float, default=0.95)
     parser.add_argument("--concurrency", default="1,4,8")
@@ -402,7 +412,8 @@ def main(argv: list[str]) -> int:
         "recall is mean recall@k against exact ground truth computed by logpose-bench vdb-prepare",
         "latency is measured by the client around each pymilvus search call, so it includes Python serialization and loopback transport",
         "each concurrent client is its own Python process with its own connection, on the same machine as the server",
-        f"searches use the collection's default consistency level; the scalar field has a {args.scalar_index} index",
+        f"the collection and every search use consistency level {args.consistency_level}; every row is flushed and indexed before the first search",
+        f"the scalar field has a {args.scalar_index} index",
     ]
     if dataset.manifest.get("synthetic"):
         notes.append("the dataset is synthetic (embedding-like, see dataset.generator); it mirrors only the shape of the public dataset named in dataset.mirrors")
@@ -411,7 +422,7 @@ def main(argv: list[str]) -> int:
         "system": "milvus",
         "system_version": version,
         "endpoint": args.uri,
-        "driver": "scripts/bench/milvus_vdb.py",
+        "driver": f"scripts/bench/milvus_vdb.py (pymilvus {pymilvus.__version__})",
         "started_at_unix": started_at,
         "total_seconds": time.monotonic() - started,
         "machine": machine_info(),
@@ -422,6 +433,7 @@ def main(argv: list[str]) -> int:
             "ef_construction": args.hnsw_ef_construction,
             "quantization": "none (HNSW over f32)",
             "scalar_index": args.scalar_index,
+            "consistency_level": args.consistency_level,
         },
         "target_recall": args.target_recall,
         "load": load_report,

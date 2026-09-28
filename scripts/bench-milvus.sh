@@ -29,13 +29,15 @@
 #   HNSW_M, HNSW_EF_CONSTRUCTION   graph parameters for both systems (16, 200)
 #   OUTPUT_DIR           where summaries go (default: benches/baselines)
 #   PYTHON               Python with pymilvus and numpy; by default a venv is
-#                        created under LOGPOSE_BENCH_DATA
+#                        created under LOGPOSE_BENCH_DATA with the pymilvus
+#                        version pinned below
 #   CARGO_BUILD_JOBS     passed through to cargo
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 data_root="${LOGPOSE_BENCH_DATA:-${HOME}/.cache/logpose-bench}"
 milvus_image="${MILVUS_IMAGE:-milvusdb/milvus:v2.6.24}"
+pymilvus_version="3.0.2"
 duration="${BENCH_DURATION:-20}"
 concurrency="${BENCH_CONCURRENCY:-1,4,8}"
 target_recall="${BENCH_TARGET_RECALL:-0.95}"
@@ -57,6 +59,10 @@ log() {
 mkdir -p "${data_root}/datasets" "${data_root}/results"
 
 target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
+# cargo resolves a relative CARGO_TARGET_DIR against the directory it runs in.
+if [[ "${target_dir}" != /* ]]; then
+  target_dir="${repo_root}/${target_dir}"
+fi
 log "building logpose-server and logpose-bench (release)"
 (cd "${repo_root}" && cargo build --release -p logpose-server -p logpose-bench)
 bench_bin="${target_dir}/release/logpose-bench"
@@ -66,10 +72,11 @@ python_bin="${PYTHON:-}"
 if [[ -z "${python_bin}" && "${SKIP_MILVUS:-0}" != "1" ]]; then
   venv="${data_root}/venv"
   if [[ ! -x "${venv}/bin/python" ]]; then
-    log "creating Python venv with pymilvus and numpy in ${venv}"
+    log "creating Python venv in ${venv}"
     python3 -m venv "${venv}"
-    "${venv}/bin/pip" install --quiet pymilvus numpy
   fi
+  # A no-op when the pinned version is already installed.
+  "${venv}/bin/pip" install --quiet "pymilvus==${pymilvus_version}" numpy
   python_bin="${venv}/bin/python"
 fi
 summary_python="${python_bin:-python3}"
@@ -85,6 +92,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# Exit on a signal too, so the EXIT trap stops the server and removes the container.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_port() {
   local port="$1"

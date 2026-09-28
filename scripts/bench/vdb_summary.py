@@ -6,9 +6,11 @@ Reads the `logpose-vdb-report/1` reports written by `logpose-bench vdb-run` and
 
 - a JSON document holding both reports unchanged plus run resources, and
 - a Markdown summary with one table per case at the ef each system needed to
-  reach the target recall.
+  reach the target recall, led by the caveats needed to read it.
 
-Only the Python standard library is needed.
+`--render` rewrites the Markdown of an existing comparison JSON, for example after
+a correction recorded in its `corrections` list. Only the Python standard library
+is needed.
 """
 
 from __future__ import annotations
@@ -57,6 +59,44 @@ def by_clients(case: dict) -> dict[int, dict]:
     return {run["clients"]: run for run in case.get("concurrency", [])}
 
 
+def load_average(value: str | None) -> float | None:
+    try:
+        return float(str(value).split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def caveats(comparison: dict) -> list[str]:
+    """What a reader must know before comparing the numbers."""
+    systems = comparison["systems"]
+    machine = comparison["machine"]
+    resources = comparison["resources"]
+    items = list(comparison.get("caveats") or [])
+    cpus = machine.get("logical_cpus")
+    loads = {
+        SYSTEM_LABELS[name]: load_average(resources.get(f"{name}_loadavg_at_start"))
+        for name in ("logpose", "milvus")
+        if name in systems
+    }
+    busy = {label: load for label, load in loads.items() if load is not None and cpus and load > cpus / 2}
+    if busy:
+        at = ", ".join(f"{load:.1f} when {label} started" for label, load in busy.items())
+        items.append(
+            f"The machine was busy with other work: the 1-minute load average was {at}, on {cpus} logical CPUs. "
+            "The two systems did not see the same contention, so neither the absolute numbers nor their ratios "
+            "are what either system reaches on a quiet machine."
+        )
+    if "milvus" in systems:
+        items.append(
+            "LogPose is driven by a Rust gRPC client and Milvus by `pymilvus`, one Python process per client. "
+            "Every client runs on the same machine as the server and takes CPU from it."
+        )
+    if comparison["dataset"].get("synthetic"):
+        items.append("The vectors are synthetic, so recall and speed may differ on the public datasets.")
+    items.extend(comparison.get("corrections") or [])
+    return items
+
+
 def markdown(comparison: dict) -> str:
     systems = comparison["systems"]
     dataset = comparison["dataset"]
@@ -85,6 +125,13 @@ def markdown(comparison: dict) -> str:
     add("")
     add(f"Recall is mean recall@{dataset['k']} against exact ground truth. Each system's `ef` is the smallest swept value with recall of at least {target}.")
     add("")
+    items = caveats(comparison)
+    if items:
+        add("## Caveats")
+        add("")
+        for item in items:
+            add(f"- {item}")
+        add("")
 
     add("## Setup")
     add("")
@@ -178,15 +225,30 @@ def markdown(comparison: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render(path: str, md: str) -> int:
+    comparison = json.loads(Path(path).read_text())
+    if comparison.get("schema") != COMPARISON_SCHEMA:
+        raise ValueError(f"{path} is not a {COMPARISON_SCHEMA} document")
+    Path(md).write_text(markdown(comparison))
+    print(f"wrote {md}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--logpose", required=True, help="LogPose report")
+    parser.add_argument("--render", metavar="JSON", help="only rewrite --md from this existing comparison JSON")
+    parser.add_argument("--logpose", help="LogPose report")
     parser.add_argument("--milvus", help="Milvus report")
     parser.add_argument("--milvus-missing-reason", help="why Milvus was not run, for a LogPose-only summary")
     parser.add_argument("--resource", action="append", default=[], help="key=value recorded under resources")
-    parser.add_argument("--json", required=True, help="combined JSON output")
+    parser.add_argument("--caveat", action="append", default=[], help="caveat listed at the top of the summary")
+    parser.add_argument("--json", help="combined JSON output")
     parser.add_argument("--md", required=True, help="Markdown output")
     args = parser.parse_args(argv)
+    if args.render:
+        return render(args.render, args.md)
+    if not args.logpose or not args.json:
+        parser.error("--logpose and --json are required unless --render is given")
 
     systems = {"logpose": load_report(args.logpose)}
     if args.milvus:
@@ -208,6 +270,8 @@ def main(argv: list[str]) -> int:
         "target_recall": targets.pop(),
         "resources": resources,
         "milvus_missing_reason": args.milvus_missing_reason,
+        "caveats": args.caveat,
+        "corrections": [],
         "systems": systems,
     }
     Path(args.json).parent.mkdir(parents=True, exist_ok=True)

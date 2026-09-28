@@ -182,7 +182,7 @@ Two subcommands run VectorDBBench-style workloads against a running server over 
 LOGPOSE_BENCH_DATA=$HOME/.cache/logpose-bench scripts/bench-milvus.sh cohere-100k openai-50k
 ```
 
-It needs Docker for Milvus (`SKIP_MILVUS=1` runs LogPose alone) and Python 3 with `venv`; it creates a venv with `pymilvus` and `numpy` under `LOGPOSE_BENCH_DATA`.
+It needs Docker for Milvus (`SKIP_MILVUS=1` runs LogPose alone) and Python 3 with `venv`; it creates a venv with `pymilvus` (pinned to 3.0.2) and `numpy` under `LOGPOSE_BENCH_DATA`.
 
 ## Non-Negotiable Harness Rules
 
