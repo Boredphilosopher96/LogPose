@@ -1137,8 +1137,11 @@ mod tests {
         vfs.create_dir_all(Path::new("/db")).expect("mkdir");
         vfs.sync_dir(Path::new("/")).expect("sync root");
         write_synced(vfs.as_ref(), Path::new("/db/a"), b"synced");
-        let file = vfs.open(Path::new("/db/a"), OpenMode::Append).expect("open");
-        file.append(&[io::IoSlice::new(&[7; 9000])]).expect("append");
+        let file = vfs
+            .open(Path::new("/db/a"), OpenMode::Append)
+            .expect("open");
+        file.append(&[io::IoSlice::new(&[7; 9000])])
+            .expect("append");
         vfs.set_plan(FaultPlan {
             tear: TearMode::ReorderedPages,
             ..FaultPlan::default()

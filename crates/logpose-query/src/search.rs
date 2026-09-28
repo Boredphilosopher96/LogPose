@@ -241,10 +241,17 @@ impl Ord for Candidate {
     }
 }
 
-/// Keeps the `limit` closest candidates.
+/// Keeps the `limit` closest candidates, and, with [`TopK::with_ties`], every other candidate
+/// exactly as close as the farthest one kept.
+///
+/// Results with equal values are ordered by key, which only the projection reads, so a cut
+/// over exact distances must not choose among rows tied at its boundary by unit and row: it
+/// keeps all of them, and the key order picks after projection.
 struct TopK {
     limit: usize,
     heap: BinaryHeap<Candidate>,
+    /// Candidates beyond `limit` at exactly the distance of the farthest one in `heap`.
+    ties: Option<Vec<Candidate>>,
 }
 
 impl TopK {
@@ -252,6 +259,15 @@ impl TopK {
         Self {
             limit,
             heap: BinaryHeap::with_capacity(limit + 1),
+            ties: None,
+        }
+    }
+
+    /// A cut over exact distances that keeps every candidate tied with its farthest one.
+    fn with_ties(limit: usize) -> Self {
+        Self {
+            ties: Some(Vec::new()),
+            ..Self::new(limit)
         }
     }
 
@@ -261,14 +277,47 @@ impl TopK {
         }
         if self.heap.len() < self.limit {
             self.heap.push(candidate);
-        } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
-            self.heap.pop();
-            self.heap.push(candidate);
+            return;
+        }
+        let Some(worst) = self.heap.peek().map(|worst| worst.distance) else {
+            return;
+        };
+        match candidate.distance.total_cmp(&worst) {
+            Ordering::Less => {
+                self.heap.push(candidate);
+                if let Some(evicted) = self.heap.pop() {
+                    let farthest = self.heap.peek().map(|worst| worst.distance);
+                    if let Some(ties) = &mut self.ties {
+                        if farthest
+                            .is_some_and(|farthest| farthest.total_cmp(&evicted.distance).is_eq())
+                        {
+                            ties.push(evicted);
+                        } else {
+                            ties.clear();
+                        }
+                    }
+                }
+            }
+            Ordering::Equal => match &mut self.ties {
+                Some(ties) => ties.push(candidate),
+                None => {
+                    if self.heap.peek().is_some_and(|worst| candidate < *worst) {
+                        self.heap.pop();
+                        self.heap.push(candidate);
+                    }
+                }
+            },
+            Ordering::Greater => {}
         }
     }
 
     fn into_sorted(self) -> Vec<Candidate> {
-        self.heap.into_sorted_vec()
+        let mut sorted = self.heap.into_sorted_vec();
+        if let Some(mut ties) = self.ties {
+            ties.sort();
+            sorted.extend(ties);
+        }
+        sorted
     }
 }
 
@@ -550,7 +599,7 @@ pub async fn search(view: &ReadView, request: &SearchRequest) -> Result<SearchOu
                         exact_stage(unit, output, &rerank_pins, &second_context)
                     })
                     .collect::<Vec<logpose_types::Result<_>>>();
-                let mut top = TopK::new(limit);
+                let mut top = TopK::with_ties(limit);
                 let mut reranked = 0;
                 let mut vectors: HashMap<(UnitId, RowId), f32> = HashMap::new();
                 for result in per_unit {
@@ -667,7 +716,7 @@ fn unit_first_stage(
     }
     if unit.is_memtable() {
         let vectors = unit.vector_rows(context.field, pins)?;
-        let mut top = TopK::new(context.budget);
+        let mut top = TopK::with_ties(context.budget);
         for row in &allowed {
             if let Some(vector) = vectors.get(row)? {
                 top.push(Candidate {
@@ -860,7 +909,7 @@ fn exact_stage(
         rows_to_score.len()
     };
     let vectors = unit.vector_rows(context.field, pins)?;
-    let mut top = TopK::new(context.budget);
+    let mut top = TopK::with_ties(context.budget);
     let mut values = HashMap::with_capacity(rows_to_score.len().min(context.budget * 2));
     for row in rows_to_score {
         let Some(vector) = vectors.get(row)? else {

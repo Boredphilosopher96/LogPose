@@ -638,3 +638,57 @@ async fn rerank_orders_candidates_sq8_cannot_tell_apart() {
     let expected = metric_value(DistanceMetric::L2, &query, &nearest);
     assert!(close(hit.value, expected), "{} vs {expected}", hit.value);
 }
+
+/// Results with equal values are ordered by key, however many rows tie: every cut over exact
+/// distances (a memtable's scan, an exact segment scan, the global finalists) keeps the rows
+/// tied at its boundary. Here twelve rows share one vector, in three segments and the memtable,
+/// written in descending key order so that the smallest keys land last in every unit; a cut
+/// that broke ties by unit and row returned `t01` (found by the harness v2 model check,
+/// seed 1072).
+#[tokio::test]
+async fn rows_tied_beyond_every_candidate_cut_are_ordered_by_key() {
+    let fixture = Fixture::new(
+        "ties",
+        4,
+        DistanceMetric::Dot,
+        IndexPolicy {
+            graph_min_rows: u32::MAX,
+            sq8_min_rows: u32::MAX,
+            ..IndexPolicy::default()
+        },
+        &[],
+    )
+    .await;
+    let tied = vec![1.0, 2.0, 0.0, 0.0];
+    let far = vec![-1.0, -1.0, 0.0, 0.0];
+    for unit in 0..4 {
+        let mut records = Vec::new();
+        for index in (0..5).rev() {
+            let key = format!("t{:02}", unit * 5 + index);
+            records.push(Record::new(key).with_vector("vector", tied.clone()));
+            records.push(
+                Record::new(format!("u{:02}", unit * 5 + index)).with_vector("vector", far.clone()),
+            );
+        }
+        fixture.upsert(records).await;
+        if unit < 3 {
+            fixture.flush().await;
+        }
+    }
+    let view = fixture.view().await;
+    for top_k in [1, 2, 3, 7] {
+        let outcome = search(&view, &SearchRequest::new(vec![1.0, 1.0, 0.0, 0.0], top_k))
+            .await
+            .expect("search");
+        let keys = outcome
+            .hits
+            .iter()
+            .map(|hit| hit.row.record.pk.clone())
+            .collect::<Vec<_>>();
+        let wanted = (0..top_k)
+            .map(|index| PrimaryKey::from(format!("t{index:02}").as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, wanted, "top {top_k}");
+        assert!(outcome.hits.iter().all(|hit| hit.value == 3.0));
+    }
+}

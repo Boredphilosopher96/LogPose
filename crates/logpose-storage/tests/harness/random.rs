@@ -24,7 +24,10 @@ use std::{
 
 /// Seeds that once found a bug, with their mode; they run first in every test of that mode.
 /// See the "Implementation Notes (PR 13)" of the engine design for what each one found.
-const REGRESSIONS: &[(Maintenance, u64)] = &[];
+const REGRESSIONS: &[(Maintenance, u64)] = &[
+    // Exact search broke ties at a candidate cut by row instead of by key.
+    (Maintenance::Stepped, 1072),
+];
 
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name)
@@ -211,7 +214,10 @@ pub fn run_seeds(backend: Backend, maintenance: Maintenance, default_count: u64)
     total
 }
 
-#[allow(clippy::panic, reason = "a failed run reports its seed, setup, and trace")]
+#[allow(
+    clippy::panic,
+    reason = "a failed run reports its seed, setup, and trace"
+)]
 fn report(failure: &Failure) -> ! {
     let trace = |actions: &[Action]| {
         actions
@@ -230,8 +236,9 @@ fn report(failure: &Failure) -> ! {
                 actions.len(),
                 trace(&actions)
             ),
-            None => "\n(the failure did not reproduce on replay, so it was not minimized)"
-                .to_owned(),
+            None => {
+                "\n(the failure did not reproduce on replay, so it was not minimized)".to_owned()
+            }
         }
     };
     panic!(
@@ -251,7 +258,10 @@ fn random_actions_with_hand_stepped_jobs_match_the_model() {
     let stats = run_seeds(Backend::Fault, Maintenance::Stepped, 12);
     assert!(stats.jobs_committed > 0, "{stats:?}");
     assert!(stats.crashes > 0 && stats.token_reads > 0, "{stats:?}");
-    assert!(stats.scrolls_finished > 0 && stats.filter_writes > 0, "{stats:?}");
+    assert!(
+        stats.scrolls_finished > 0 && stats.filter_writes > 0,
+        "{stats:?}"
+    );
 }
 
 #[test]

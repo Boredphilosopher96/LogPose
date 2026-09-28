@@ -29,13 +29,13 @@ use crate::{
 };
 use logpose_query::{ScrollOrder, scroll_view};
 use logpose_storage::{GroupCommitConfig, JobKind, Projection, ReadOptions, SteppedJob};
+use logpose_storage::{SchemaChange, SnapshotToken};
 use logpose_types::{
     DistanceMetric, SeqNo,
     record::{ClientOp, PrimaryKey, Record},
     schema::{FieldType, ScalarFieldSpec},
     value::Value,
 };
-use logpose_storage::{SchemaChange, SnapshotToken};
 use logpose_vfs::{FaultPlan, FaultVfs, TearMode, Vfs};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -91,9 +91,11 @@ impl Observer {
                     let seq = view.visible_seq_no();
                     let known = seen
                         .lock()
-                        .map(|seen: std::sync::MutexGuard<'_, Vec<(SeqNo, Vec<Record>)>>| {
-                            seen.last().is_some_and(|(last, _)| *last == seq)
-                        })
+                        .map(
+                            |seen: std::sync::MutexGuard<'_, Vec<(SeqNo, Vec<Record>)>>| {
+                                seen.last().is_some_and(|(last, _)| *last == seq)
+                            },
+                        )
                         .unwrap_or(true);
                     if known {
                         std::thread::sleep(Duration::from_micros(200));
@@ -176,7 +178,9 @@ impl Ctx {
     }
 
     fn last(&self) -> &Model {
-        self.history.last().expect("the history starts with the created collection")
+        self.history
+            .last()
+            .expect("the history starts with the created collection")
     }
 
     fn record(&self, index: u64, x: f32) -> Record {
@@ -184,7 +188,9 @@ impl Ctx {
         let mut record =
             Record::new(key(index)).with_vector(model.vector_name(), vec![x, 1.0, 0.0, 0.0]);
         if model.schema.scalar_field("n").is_some() {
-            record.fields.insert("n".to_owned(), Value::Int64(index as i64));
+            record
+                .fields
+                .insert("n".to_owned(), Value::Int64(index as i64));
         }
         record
     }
@@ -461,7 +467,9 @@ pub struct Coverage {
 }
 
 fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok().and_then(|value| value.parse().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
 }
 
 /// Check the recovered collection against the history: I8 and I14.
@@ -500,7 +508,9 @@ fn check_recovered(
             ));
         }
         let Some(model) = history.iter().find(|model| model.visible_seq_no == *seq) else {
-            return Err(format!("I3: a reader saw sequence {seq}, which ends no request"));
+            return Err(format!(
+                "I3: a reader saw sequence {seq}, which ends no request"
+            ));
         };
         if *records != model.records() {
             return Err(format!(
@@ -525,7 +535,9 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
         let history = ctx.history.clone();
         ctx.close();
         // The clean run recovers its final state.
-        ctx.session.open().unwrap_or_else(|error| fail(context(error)));
+        ctx.session
+            .open()
+            .unwrap_or_else(|error| fail(context(error)));
         check_recovered(&ctx.session, &history, history.len() - 1, &[])
             .unwrap_or_else(|error| fail(context(format!("clean run: {error}"))));
         ops
@@ -535,10 +547,12 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
     let mut coverage = Coverage::default();
     for k in 0..=ops {
         for tear in TearMode::ALL {
-            let detail = |message: String| context(format!("crash after {k} ops, {tear:?}: {message}"));
+            let detail =
+                |message: String| context(format!("crash after {k} ops, {tear:?}: {message}"));
             let run_seed = seed.wrapping_mul(1_000_003) ^ (k * 4 + tear as u64);
             let mut ctx = Ctx::new(run_seed).unwrap_or_else(|error| fail(detail(error)));
-            (scenario.setup)(&mut ctx).unwrap_or_else(|error| fail(detail(format!("setup: {error}"))));
+            (scenario.setup)(&mut ctx)
+                .unwrap_or_else(|error| fail(detail(format!("setup: {error}"))));
             let fault = ctx.fault();
             fault.set_plan(FaultPlan {
                 crash_after_ops: Some(fault.mutating_ops() + k),
@@ -554,7 +568,9 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
             let image = fault.fork();
 
             // Recover, and check I8 and I14.
-            ctx.session.open().unwrap_or_else(|error| fail(detail(format!("recovery: {error}"))));
+            ctx.session
+                .open()
+                .unwrap_or_else(|error| fail(detail(format!("recovery: {error}"))));
             let recovery_ops = fault.mutating_ops();
             let kept = check_recovered(&ctx.session, &history, acked, &observed)
                 .unwrap_or_else(|error| fail(detail(error)));
@@ -624,7 +640,10 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
     coverage
 }
 
-#[allow(clippy::panic, reason = "a failed check reports the scenario and crash point")]
+#[allow(
+    clippy::panic,
+    reason = "a failed check reports the scenario and crash point"
+)]
 fn fail(message: String) -> ! {
     panic!("{message}");
 }
@@ -634,7 +653,9 @@ fn fail(message: String) -> ! {
 /// Rows `k00..k05` in a segment, then `k06`, `k07` in the memtable, a segment row deleted and
 /// one updated (deletion bits for the next flush's DV file).
 fn rows_in_a_segment_and_the_memtable(ctx: &mut Ctx) -> Step {
-    let ops = (0..6).map(|index| ctx.upsert(index, index as f32)).collect();
+    let ops = (0..6)
+        .map(|index| ctx.upsert(index, index as f32))
+        .collect();
     ctx.write(ops)?;
     ctx.flush()?;
     let ops = vec![ctx.upsert(6, 6.0), ctx.upsert(7, 7.0)];
@@ -853,7 +874,9 @@ pub fn scenarios() -> Vec<Scenario> {
 }
 
 fn flush_body_from_empty(ctx: &mut Ctx) -> Step {
-    let ops = (0..3).map(|index| ctx.upsert(index, index as f32)).collect();
+    let ops = (0..3)
+        .map(|index| ctx.upsert(index, index as f32))
+        .collect();
     ctx.write(ops)?;
     ctx.flush()?;
     let ops = vec![ctx.delete(0), ctx.upsert(3, 3.0)];
@@ -925,7 +948,10 @@ pub fn group_commit(seed: u64) -> Coverage {
         assert!(write_group(&ctx, 1).iter().all(|(_, acked)| *acked));
         (fault.mutating_ops() - ops, fault.file_syncs() - syncs)
     };
-    assert_eq!(group_syncs, 1, "{GROUP_WRITERS} concurrent batches share one fsync");
+    assert_eq!(
+        group_syncs, 1,
+        "{GROUP_WRITERS} concurrent batches share one fsync"
+    );
     let mut coverage = Coverage::default();
     for k in 0..=group_ops {
         for tear in TearMode::ALL {
@@ -945,7 +971,9 @@ pub fn group_commit(seed: u64) -> Coverage {
             let results = write_group(&ctx, 1);
             ctx.close();
             fault.crash();
-            ctx.session.open().unwrap_or_else(|error| fail(format!("{detail}: {error}")));
+            ctx.session
+                .open()
+                .unwrap_or_else(|error| fail(format!("{detail}: {error}")));
             // Either the whole group or none of it, in whatever order its batches took.
             let whole = apply_group(&base, &results);
             let history = vec![base, whole];
@@ -1007,7 +1035,10 @@ fn every_crash_point_of_gc_after_a_token_release_recovers_a_prefix() {
 #[test]
 fn every_crash_point_of_writes_from_an_empty_collection_recovers_a_prefix() {
     let coverage = enumerate(&scenarios()[8], 19);
-    assert!(coverage.unacked_kept > 0 && coverage.recovery_crashes > 0, "{coverage:?}");
+    assert!(
+        coverage.unacked_kept > 0 && coverage.recovery_crashes > 0,
+        "{coverage:?}"
+    );
 }
 
 #[allow(dead_code, reason = "the name is part of the root layout")]

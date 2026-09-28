@@ -116,7 +116,9 @@ impl SteppedJob {
             return Ok(());
         }
         let Some(start) = self.start.take() else {
-            return Err(LogPoseError::internal("the stepped job's build already failed"));
+            return Err(LogPoseError::internal(
+                "the stepped job's build already failed",
+            ));
         };
         let Some(ticket) = self.ticket.as_mut() else {
             return Err(LogPoseError::internal("the stepped job already ended"));

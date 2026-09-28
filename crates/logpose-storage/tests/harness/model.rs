@@ -90,7 +90,9 @@ impl Model {
     /// The record a reader of the current schema sees for `row`.
     pub fn visible(&self, pk: &PrimaryKey, row: &Row) -> Record {
         let mut record = Record::new(pk.clone());
-        record.vectors.insert(self.vector_name(), row.vector.clone());
+        record
+            .vectors
+            .insert(self.vector_name(), row.vector.clone());
         for (id, value) in &row.typed {
             if let Some(FieldRef::Scalar(field)) = self.schema.field_by_id(*id) {
                 record.fields.insert(field.name.clone(), value.clone());
@@ -361,8 +363,10 @@ pub fn metric_value(metric: DistanceMetric, query: &[f32], vector: &[f32]) -> f3
             .map(|(left, right)| (left - right) * (left - right))
             .sum::<f32>()
             .sqrt(),
-        DistanceMetric::Dot | DistanceMetric::Cosine => {
-            query.iter().zip(vector).map(|(left, right)| left * right).sum()
-        }
+        DistanceMetric::Dot | DistanceMetric::Cosine => query
+            .iter()
+            .zip(vector)
+            .map(|(left, right)| left * right)
+            .sum(),
     }
 }

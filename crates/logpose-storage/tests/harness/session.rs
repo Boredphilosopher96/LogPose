@@ -4,8 +4,8 @@
 
 use logpose_storage::{
     CollectionHandle, CompactionConfig, CreateCollectionRequest, Engine, EngineConfig,
-    GroupCommitConfig, IndexPolicy, ManualClock, MemtableConfig, ReadOptions, ReadView, RuntimeConfig, SchemaChange,
-    TokenConfig,
+    GroupCommitConfig, IndexPolicy, ManualClock, MemtableConfig, ReadOptions, ReadView,
+    RuntimeConfig, SchemaChange, TokenConfig,
 };
 use logpose_types::{
     CollectionRef, DistanceMetric,

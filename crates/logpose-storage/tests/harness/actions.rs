@@ -23,8 +23,8 @@ use crate::{
     session::{Maintenance, Session, TTL},
 };
 use logpose_query::{
-    Cursor, FilterExpr, ScrollOrder, ScrollRequest, SearchRequest, count_view, scroll,
-    scroll_view, search,
+    Cursor, FilterExpr, ScrollOrder, ScrollRequest, SearchRequest, count_view, scroll, scroll_view,
+    search,
 };
 use logpose_storage::{
     JobKind, Projection, ReadOptions, ReadView, RowData, SchemaChange, SnapshotToken, SteppedJob,
@@ -43,7 +43,9 @@ pub enum Read {
     Get(Vec<PrimaryKey>),
     Count(Option<FilterExpr>),
     /// Every live row by key, `limit` rows per page of one view.
-    Scan { limit: u32 },
+    Scan {
+        limit: u32,
+    },
     /// Every matching row by a declared field, `limit` rows per page of one view.
     OrderBy {
         field: String,
@@ -381,9 +383,9 @@ impl Runner {
                 if filter
                     .as_ref()
                     .is_some_and(|filter| !filter_declared(&self.model, filter))
-                    || by
-                        .as_ref()
-                        .is_some_and(|(field, _)| self.model.schema.scalar_field(field).is_none()) =>
+                    || by.as_ref().is_some_and(|(field, _)| {
+                        self.model.schema.scalar_field(field).is_none()
+                    }) =>
             {
                 Ok(())
             }
@@ -394,12 +396,16 @@ impl Runner {
             Action::Flush | Action::Compact if !self.jobs.is_empty() => Ok(()),
             Action::Flush => {
                 let handle = self.session.handle().clone();
-                let result = self.session.call("flush", move || handle.flush_blocking())?;
+                let result = self
+                    .session
+                    .call("flush", move || handle.flush_blocking())?;
                 self.maintenance_result("flush", result.map(drop), armed)
             }
             Action::Compact => {
                 let handle = self.session.handle().clone();
-                let result = self.session.call("compact", move || handle.compact_blocking())?;
+                let result = self
+                    .session
+                    .call("compact", move || handle.compact_blocking())?;
                 self.maintenance_result("compact", result.map(drop), armed)
             }
             Action::BeginJob(kind) => {
@@ -469,7 +475,8 @@ impl Runner {
                     .view(&ReadOptions::default())
                     .map_err(|error| format!("read view: {error}"))?;
                 let model = self.model.clone();
-                self.checker().check_read(&view, &model, read)
+                self.checker()
+                    .check_read(&view, &model, read)
                     .map_err(|error| format!("{read:?} at the current state: {error}"))
             }
             Action::ReadAt(id, read) => self.read_at(*id, read),
@@ -488,7 +495,12 @@ impl Runner {
 
     /// A maintenance call's result: success, or an error only when something was injected
     /// (a crash, a failed sync) or the collection is poisoned.
-    fn maintenance_result(&mut self, what: &str, result: logpose_types::Result<()>, armed: bool) -> Check {
+    fn maintenance_result(
+        &mut self,
+        what: &str,
+        result: logpose_types::Result<()>,
+        armed: bool,
+    ) -> Check {
         match result {
             Ok(()) => Ok(()),
             Err(_) if armed => Ok(()),
@@ -587,10 +599,7 @@ impl Runner {
     }
 
     fn write(&mut self, ops: &[ClientOp], armed: bool) -> Check {
-        let expected = self
-            .model
-            .apply_batch(ops)
-            .map(|next| (next, ops.len()));
+        let expected = self.model.apply_batch(ops).map(|next| (next, ops.len()));
         let handle = self.session.handle().clone();
         let batch = ops.to_vec();
         let result = self
@@ -606,10 +615,7 @@ impl Runner {
 
     /// I1: a view opened right after an ack reflects the whole batch.
     fn check_acked_keys(&self, ops: &[ClientOp]) -> Check {
-        let keys = ops
-            .iter()
-            .map(|op| op.pk().clone())
-            .collect::<Vec<_>>();
+        let keys = ops.iter().map(|op| op.pk().clone()).collect::<Vec<_>>();
         let view = self
             .session
             .view(&ReadOptions::default())
@@ -621,7 +627,8 @@ impl Runner {
                 self.model.visible_seq_no
             ));
         }
-        self.checker().check_get(&view, &self.model, &keys)
+        self.checker()
+            .check_get(&view, &self.model, &keys)
             .map_err(|error| format!("I1: {error}"))
     }
 
@@ -636,7 +643,12 @@ impl Runner {
         self.settle_write(result, Ok((next, deleted)), armed)
     }
 
-    fn update_by_filter(&mut self, filter: &FilterExpr, patch: &PartialUpdate, armed: bool) -> Check {
+    fn update_by_filter(
+        &mut self,
+        filter: &FilterExpr,
+        patch: &PartialUpdate,
+        armed: bool,
+    ) -> Check {
         let expected = self.model.update_by_filter(filter, patch);
         let handle = self.session.handle().clone();
         let (request, update) = (filter.clone(), patch.clone());
@@ -706,7 +718,9 @@ impl Runner {
         let live = !pinned.dead && now < pinned.expires;
         pinned.dead = true;
         if live && !released {
-            return fail(format!("releasing live token {id} found nothing to release"));
+            return fail(format!(
+                "releasing live token {id} found nothing to release"
+            ));
         }
         Ok(())
     }
@@ -740,7 +754,8 @@ impl Runner {
                         model.visible_seq_no
                     ));
                 }
-                self.checker().check_read(&view, &model, read)
+                self.checker()
+                    .check_read(&view, &model, read)
                     .map_err(|error| format!("I12: {read:?} at token {id}: {error}"))
             }
             Err(LogPoseError::SnapshotExpired { .. }) if !live => {
@@ -808,7 +823,11 @@ impl Runner {
         let request = Self::scroll_request(&open, None);
         let page = self
             .session
-            .block_on(scroll(self.session.engine(), &crate::session::reference(), request))
+            .block_on(scroll(
+                self.session.engine(),
+                &crate::session::reference(),
+                request,
+            ))
             .map_err(|error| format!("scroll {id} first page: {error}"))?;
         self.next_id = self.next_id.max(id + 1);
         self.scrolls.push(open);
@@ -845,7 +864,9 @@ impl Runner {
                 self.scrolls.remove(index);
                 Ok(())
             }
-            Ok(_) => fail(format!("scroll {id} continued past a restart or its expiry")),
+            Ok(_) => fail(format!(
+                "scroll {id} continued past a restart or its expiry"
+            )),
             Err(error) => fail(format!("scroll {id} next page: {error}")),
         }
     }
@@ -872,8 +893,7 @@ impl Runner {
             ));
         }
         for row in &page.rows {
-            check_row(&scroll.model, row)
-                .map_err(|error| format!("I12: scroll {id}: {error}"))?;
+            check_row(&scroll.model, row).map_err(|error| format!("I12: scroll {id}: {error}"))?;
         }
         scroll.returned = to;
         let token = scroll.cursor.as_ref().map(|cursor| cursor.token.clone());
@@ -1038,7 +1058,12 @@ impl Runner {
     /// Check the invariants of the published version and that the visible state equals the
     /// model.
     pub fn check_state(&self) -> Check {
-        if self.session.fatal.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        if self
+            .session
+            .fatal
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
             return fail("the engine called its fatal handler");
         }
         self.checker().state_equals(&self.model)
@@ -1060,7 +1085,6 @@ impl Runner {
             visible_seq_no: session.handle().visible_seq_no(),
         }
     }
-
 }
 
 /// Checks of what the engine serves against a model, over one session.
@@ -1305,7 +1329,9 @@ impl<'a> Checker<'a> {
                 _ => right.total_cmp(left),
             });
             if values != sorted || outcome.hits.len() > k {
-                return fail(format!("{context}: hits out of order or too many: {values:?}"));
+                return fail(format!(
+                    "{context}: hits out of order or too many: {values:?}"
+                ));
             }
             return Ok(());
         }

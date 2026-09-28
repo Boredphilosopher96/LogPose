@@ -267,10 +267,7 @@ impl Generator {
         let model = &runner.model;
         let (during, window) = match self.below(10) {
             0..=2 => (Some(Action::Write(self.batch(model))), 4),
-            3 => (
-                self.filter(model).map(Action::DeleteByFilter),
-                4,
-            ),
+            3 => (self.filter(model).map(Action::DeleteByFilter), 4),
             4 => (Some(Action::Alter(self.schema_change(model))), 4),
             5..=7 => (Some(self.job_step(runner)), 70),
             _ => (None, 3),
