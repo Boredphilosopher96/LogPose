@@ -6,7 +6,10 @@
 //! object) and read the way a reader reads them (names from the current schema, shadowed
 //! `$extra` keys hidden), so schema changes, dynamic-field shadowing, and partial updates of
 //! rows written under an older schema follow the same rules as the engine without the model
-//! sharing any of its code beyond the schema type itself.
+//! sharing any of its code beyond the schema types: `CollectionSchema` validation, schema
+//! changes, and `PartialUpdate::apply_to`, which have unit tests of their own. Which names
+//! shadow `$extra` keys the model tracks itself, from the schema changes it applies, so the
+//! schema's retired-name bookkeeping is checked rather than trusted.
 
 use logpose_query::{FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue};
 use logpose_storage::SchemaChange;
@@ -17,7 +20,10 @@ use logpose_types::{
     value::Value,
 };
 use serde_json::{Map, Value as Json};
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+};
 
 /// One live row as a write stored it.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,9 +53,45 @@ pub struct Model {
     pub schema: CollectionSchema,
     pub rows: BTreeMap<PrimaryKey, Row>,
     pub visible_seq_no: SeqNo,
+    /// Every name the schema has declared since the collection was created: the names that
+    /// shadow `$extra` keys. The design's rule (a key is hidden when the reading schema declares
+    /// or retires it, and a retired name stays retired until it is declared again) makes this
+    /// exactly the declared names plus the retired ones. The model keeps the set itself, from the
+    /// schema changes it applies, rather than asking `CollectionSchema`, so a mistake in the
+    /// schema's retired-name bookkeeping shows up as a difference from the engine.
+    pub shadowed: BTreeSet<String>,
+}
+
+/// The names `schema` declares or retires.
+fn named(schema: &CollectionSchema) -> BTreeSet<String> {
+    let mut names = schema.retired_names().clone();
+    names.insert(schema.primary_key().name.clone());
+    names.extend(schema.vectors().iter().map(|field| field.name.clone()));
+    names.extend(schema.fields().iter().map(|field| field.name.clone()));
+    names
 }
 
 impl Model {
+    /// The model of a collection just created with `schema` at `visible_seq_no`.
+    pub fn new(schema: CollectionSchema, visible_seq_no: SeqNo) -> Self {
+        let shadowed = named(&schema);
+        Self {
+            schema,
+            rows: BTreeMap::new(),
+            visible_seq_no,
+            shadowed,
+        }
+    }
+
+    /// `extra` as a reader sees it: without the keys the schema shadows.
+    fn visible_extra(&self, extra: &Map<String, Json>) -> Map<String, Json> {
+        extra
+            .iter()
+            .filter(|(key, _)| !self.shadowed.contains(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -90,9 +132,7 @@ impl Model {
                 record.fields.insert(field.name.clone(), value.clone());
             }
         }
-        let mut extra = row.extra.clone();
-        self.schema.retain_visible_dynamic(&mut extra);
-        record.extra = extra;
+        record.extra = self.visible_extra(&row.extra);
         record
     }
 
@@ -110,6 +150,13 @@ impl Model {
 
     /// The row a write of `record` stores, with sequence range `seq`.
     fn store(&self, record: Record, seq: (SeqNo, SeqNo)) -> Result<Row, Refusal> {
+        // A write never stores a dynamic key a reader would hide (the schema's own validation
+        // says the same; the model does not rely on it).
+        if let Some(key) = record.extra.keys().find(|key| self.shadowed.contains(*key)) {
+            return Err(Refusal::Invalid(format!(
+                "'{key}' is a declared or retired name"
+            )));
+        }
         let record = self
             .schema
             .validate_record(record)
@@ -184,6 +231,16 @@ impl Model {
         change
             .apply_to(&mut next.schema)
             .map_err(|error| Refusal::Invalid(error.to_string()))?;
+        // Declared names shadow from now on; dropped and renamed-away ones stay shadowed.
+        match change {
+            SchemaChange::AddField(spec) => {
+                next.shadowed.insert(spec.name.clone());
+            }
+            SchemaChange::RenameField { to, .. } => {
+                next.shadowed.insert(to.clone());
+            }
+            SchemaChange::DropField { .. } => {}
+        }
         next.visible_seq_no += 1;
         Ok(next)
     }

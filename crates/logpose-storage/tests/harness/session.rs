@@ -100,6 +100,8 @@ pub struct Session {
     engine: Option<Engine>,
     handle: Option<Arc<CollectionHandle>>,
     runtime: tokio::runtime::Runtime,
+    /// Flush and compaction permits granted by engines already closed.
+    granted: (u64, u64),
 }
 
 impl Session {
@@ -158,6 +160,7 @@ impl Session {
             engine: None,
             handle: None,
             runtime,
+            granted: (0, 0),
         })
     }
 
@@ -267,8 +270,43 @@ impl Session {
 
     /// Drop the collection handle and the engine (waiting for every engine task).
     pub fn close(&mut self) {
+        if let Some(engine) = &self.engine {
+            let stats = engine.scheduler().stats();
+            self.granted.0 += stats.flushes_granted;
+            self.granted.1 += stats.compactions_granted;
+        }
         self.handle = None;
         self.engine = None;
+    }
+
+    /// Flush and compaction permits the scheduler granted over every engine this session
+    /// opened.
+    pub fn permits_granted(&self) -> (u64, u64) {
+        let now = self.engine.as_ref().map_or((0, 0), |engine| {
+            let stats = engine.scheduler().stats();
+            (stats.flushes_granted, stats.compactions_granted)
+        });
+        (self.granted.0 + now.0, self.granted.1 + now.1)
+    }
+
+    /// The names of every segment file under the storage root.
+    pub fn segment_files(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        let vfs = self.vfs();
+        let mut names = std::collections::BTreeSet::new();
+        let mut dirs = vec![self.root()];
+        while let Some(dir) = dirs.pop() {
+            let entries = vfs
+                .list(&dir)
+                .map_err(|error| format!("list {}: {error}", dir.display()))?;
+            for entry in entries {
+                if entry.is_dir {
+                    dirs.push(dir.join(&entry.name));
+                } else if entry.name.ends_with(".seg") {
+                    names.insert(entry.name);
+                }
+            }
+        }
+        Ok(names)
     }
 
     pub fn is_open(&self) -> bool {

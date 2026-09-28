@@ -28,14 +28,15 @@ use logpose_query::{
 };
 use logpose_storage::{
     JobKind, Projection, ReadOptions, ReadView, RowData, SchemaChange, SnapshotToken, SteppedJob,
-    read::Direction,
+    Version, read::Direction,
 };
+use logpose_types::SeqNo;
 use logpose_types::{
     LogPoseError, ResourceKind, WriteOutcome,
     record::{ClientOp, PartialUpdate, PrimaryKey, Record},
 };
 use logpose_vfs::{FaultPlan, TearMode};
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{fmt, time::Duration};
 
 /// A read, checked against a model.
 #[derive(Clone, Debug)]
@@ -196,6 +197,9 @@ struct Pinned {
     expires: Duration,
     /// Released by the harness, or lost with a restart: reads must fail.
     dead: bool,
+    /// A view of the pinned version while the token lives, whose segment files must exist
+    /// (I7): a file is deleted only once no live version references it.
+    view: Option<ReadView>,
 }
 
 /// An open scroll.
@@ -235,6 +239,12 @@ pub struct Stats {
     pub expired_reads: u64,
     pub scrolls_finished: u64,
     pub searches: u64,
+    pub explicit_compactions: u64,
+    /// Scheduler permits granted over the run (background jobs and explicit requests).
+    pub flushes_granted: u64,
+    pub compactions_granted: u64,
+    /// Segment files checked to exist for a live version (I7).
+    pub files_checked: u64,
 }
 
 impl Stats {
@@ -257,6 +267,10 @@ impl Stats {
         self.expired_reads += other.expired_reads;
         self.scrolls_finished += other.scrolls_finished;
         self.searches += other.searches;
+        self.explicit_compactions += other.explicit_compactions;
+        self.flushes_granted += other.flushes_granted;
+        self.compactions_granted += other.compactions_granted;
+        self.files_checked += other.files_checked;
     }
 }
 
@@ -275,12 +289,18 @@ pub struct Runner {
     scrolls: Vec<Scroll>,
     pub next_id: u64,
     pub stats: Stats,
+    /// The highest manifest generation and checkpoint published so far, across restarts:
+    /// neither ever goes back, since a manifest is durable before its version is published.
+    generation: u64,
+    checkpoint: SeqNo,
 }
 
 impl Drop for Runner {
     fn drop(&mut self) {
-        // A stepped job holds the engine open; end it before the session drops the engine.
+        // A stepped job or a view holds the engine open; end them before the session drops the
+        // engine.
         self.jobs.clear();
+        self.drop_views();
     }
 }
 
@@ -304,6 +324,36 @@ impl Runner {
             scrolls: Vec::new(),
             next_id: 1,
             stats: Stats::default(),
+            generation: 0,
+            checkpoint: 0,
+        }
+    }
+
+    /// The run's stats, with the scheduler permits granted so far.
+    pub fn stats(&self) -> Stats {
+        let (flushes, compactions) = self.session.permits_granted();
+        Stats {
+            flushes_granted: flushes,
+            compactions_granted: compactions,
+            ..self.stats
+        }
+    }
+
+    /// Drop every held view (before the engine closes).
+    fn drop_views(&mut self) {
+        for pinned in &mut self.tokens {
+            pinned.view = None;
+        }
+    }
+
+    /// Drop the views of tokens that died or expired: the harness must not keep a version
+    /// alive longer than the engine's own pins would.
+    fn drop_dead_views(&mut self) {
+        let now = self.session.clock_now();
+        for pinned in &mut self.tokens {
+            if pinned.dead || now >= pinned.expires {
+                pinned.view = None;
+            }
         }
     }
 
@@ -364,6 +414,7 @@ impl Runner {
             Action::Reopen => self.reopen()?,
             other => self.attempt(other, false)?,
         }
+        self.drop_dead_views();
         self.check_state()
     }
 
@@ -396,17 +447,35 @@ impl Runner {
             Action::Flush | Action::Compact if !self.jobs.is_empty() => Ok(()),
             Action::Flush => {
                 let handle = self.session.handle().clone();
+                let before = handle.current();
                 let result = self
                     .session
                     .call("flush", move || handle.flush_blocking())?;
-                self.maintenance_result("flush", result.map(drop), armed)
+                let flushed = result.is_ok() && !armed;
+                self.maintenance_result("flush", result.map(drop), armed)?;
+                if flushed {
+                    self.check_flushed(&before)?;
+                }
+                Ok(())
             }
             Action::Compact => {
                 let handle = self.session.handle().clone();
                 let result = self
                     .session
                     .call("compact", move || handle.compact_blocking())?;
-                self.maintenance_result("compact", result.map(drop), armed)
+                let compacted = result.is_ok() && !armed;
+                self.stats.explicit_compactions += 1;
+                self.maintenance_result("compact", result.map(drop), armed)?;
+                let segments = self.session.handle().current().counters.segment_count;
+                if compacted
+                    && self.session.setup.maintenance == Maintenance::Stepped
+                    && segments > 1
+                {
+                    return fail(format!(
+                        "an explicit compaction with no job running left {segments} segments"
+                    ));
+                }
+                Ok(())
             }
             Action::BeginJob(kind) => {
                 if self.poisoned || self.jobs.iter().any(|job| job.kind() == *kind) {
@@ -491,6 +560,37 @@ impl Runner {
                 fail("nested fault actions are not supported")
             }
         }
+    }
+
+    /// After an explicit flush that succeeded: the durable checkpoint covers everything that
+    /// was visible. With no background job, the memtables are empty afterwards, and a flush
+    /// with nothing to write published no manifest.
+    fn check_flushed(&self, before: &Version) -> Check {
+        let after = self.session.handle().current();
+        if after.checkpoint_seq_no < self.model.visible_seq_no {
+            return fail(format!(
+                "an explicit flush left the checkpoint at {}, below the visible sequence number {}",
+                after.checkpoint_seq_no, self.model.visible_seq_no
+            ));
+        }
+        if self.session.setup.maintenance != Maintenance::Stepped {
+            return Ok(());
+        }
+        if after.counters.memtable_rows != 0 {
+            return fail(format!(
+                "an explicit flush left {} memtable rows",
+                after.counters.memtable_rows
+            ));
+        }
+        let nothing = before.checkpoint_seq_no == self.model.visible_seq_no
+            && before.counters.memtable_rows == 0;
+        if nothing && after.manifest_generation != before.manifest_generation {
+            return fail(format!(
+                "a flush with nothing to write published manifest generation {} over {}",
+                after.manifest_generation, before.manifest_generation
+            ));
+        }
+        Ok(())
     }
 
     /// A maintenance call's result: success, or an error only when something was injected
@@ -704,6 +804,14 @@ impl Runner {
             .handle()
             .pin_snapshot()
             .map_err(|error| format!("pin: {error}"))?;
+        // Resolving the token now leaves its expiry where the pin put it (the clock is manual).
+        let view = self
+            .session
+            .view(&ReadOptions {
+                token: Some(token.clone()),
+                ..ReadOptions::default()
+            })
+            .map_err(|error| format!("view of a new token: {error}"))?;
         let id = self.next_id;
         self.next_id += 1;
         self.tokens.push(Pinned {
@@ -712,6 +820,7 @@ impl Runner {
             model: self.model.clone(),
             expires: self.session.clock_now() + TTL,
             dead: false,
+            view: Some(view),
         });
         Ok(())
     }
@@ -724,6 +833,7 @@ impl Runner {
         let released = self.session.handle().release_snapshot(&pinned.token);
         let live = !pinned.dead && now < pinned.expires;
         pinned.dead = true;
+        pinned.view = None;
         if live && !released {
             return fail(format!(
                 "releasing live token {id} found nothing to release"
@@ -981,6 +1091,7 @@ impl Runner {
     /// settles what an earlier failure left unknown.
     fn reopen(&mut self) -> Check {
         self.jobs.clear();
+        self.drop_views();
         self.session.close();
         self.session.open()?;
         self.stats.reopens += 1;
@@ -1008,6 +1119,7 @@ impl Runner {
             self.session.wait_for_jobs()?;
         }
         self.jobs.clear();
+        self.drop_views();
         self.session.close();
         fault.crash();
         self.stats.crashes += 1;
@@ -1064,7 +1176,7 @@ impl Runner {
 
     /// Check the invariants of the published version and that the visible state equals the
     /// model.
-    pub fn check_state(&self) -> Check {
+    pub fn check_state(&mut self) -> Check {
         if self
             .session
             .fatal
@@ -1073,7 +1185,50 @@ impl Runner {
         {
             return fail("the engine called its fatal handler");
         }
-        self.checker().state_equals(&self.model)
+        self.checker().state_equals(&self.model)?;
+        let version = self.session.handle().current();
+        if version.manifest_generation < self.generation
+            || version.checkpoint_seq_no < self.checkpoint
+        {
+            return fail(format!(
+                "the published manifest went back from generation {} (checkpoint {}) to {} \
+                 (checkpoint {})",
+                self.generation,
+                self.checkpoint,
+                version.manifest_generation,
+                version.checkpoint_seq_no
+            ));
+        }
+        self.generation = version.manifest_generation;
+        self.checkpoint = version.checkpoint_seq_no;
+        self.check_files()
+    }
+
+    /// I7: every segment of the current version and of every version a live token pins is on
+    /// disk.
+    fn check_files(&mut self) -> Check {
+        let current = self
+            .session
+            .view(&ReadOptions::default())
+            .map_err(|error| format!("read view: {error}"))?;
+        let mut wanted = std::collections::BTreeSet::new();
+        for view in std::iter::once(&current)
+            .chain(self.tokens.iter().filter_map(|pinned| pinned.view.as_ref()))
+        {
+            for unit in view.units() {
+                if !unit.is_memtable() {
+                    wanted.insert(format!("{:08x}.seg", unit.id().0));
+                }
+            }
+        }
+        let present = self.session.segment_files()?;
+        if let Some(missing) = wanted.iter().find(|name| !present.contains(*name)) {
+            return fail(format!(
+                "I7: segment file {missing} was deleted while a live version references it"
+            ));
+        }
+        self.stats.files_checked += wanted.len() as u64;
+        Ok(())
     }
 
     /// Checks over this runner's session.
@@ -1086,11 +1241,10 @@ impl Runner {
     /// The model of the collection `session` holds now, with no rows: the schema and sequence
     /// number of a collection that was just created.
     pub fn new_model(session: &Session) -> Model {
-        Model {
-            schema: (*session.handle().current().schema).clone(),
-            rows: BTreeMap::new(),
-            visible_seq_no: session.handle().visible_seq_no(),
-        }
+        Model::new(
+            (*session.handle().current().schema).clone(),
+            session.handle().visible_seq_no(),
+        )
     }
 }
 

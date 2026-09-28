@@ -103,7 +103,7 @@ pub fn run(setup: Setup, seed: u64, steps: usize) -> Result<Stats, Failure> {
             actions.push(action.clone());
             runner.execute(&action)?;
         }
-        Ok(runner.stats)
+        Ok(runner.stats())
     }));
     let message = match outcome {
         Ok(Ok(stats)) => return Ok(stats),
@@ -197,6 +197,22 @@ pub fn minimize(failure: &Failure) -> Option<(Vec<Action>, String)> {
     Some((actions, message))
 }
 
+/// The test that runs `maintenance` on `backend`, for replay commands.
+fn test_name(backend: Backend, maintenance: Maintenance) -> &'static str {
+    match (backend, maintenance) {
+        (Backend::Std, _) => "random::random_actions_on_the_real_filesystem_match_the_model",
+        (Backend::Fault, Maintenance::Stepped) => {
+            "random::random_actions_with_hand_stepped_jobs_match_the_model"
+        }
+        (Backend::Fault, Maintenance::Paused) => {
+            "random::random_actions_with_stepped_background_jobs_match_the_model"
+        }
+        (Backend::Fault, Maintenance::Free) => {
+            "random::random_actions_racing_free_background_jobs_match_the_model"
+        }
+    }
+}
+
 /// Run every seed of `maintenance` on `backend`; on a failure, shrink it and panic with the
 /// seed, the setup, and the trace. Returns the summed stats.
 pub fn run_seeds(backend: Backend, maintenance: Maintenance, default_count: u64) -> Stats {
@@ -241,14 +257,23 @@ fn report(failure: &Failure) -> ! {
             }
         }
     };
+    // Hand-stepped runs replay exactly; with background jobs the scheduler's timing varies,
+    // so a replay usually, but not always, fails the same way.
+    let exact = if failure.setup.maintenance == Maintenance::Stepped {
+        ""
+    } else {
+        " (background jobs: timing-dependent, may not reproduce exactly)"
+    };
     panic!(
-        "seed {} failed ({:?}): {}\nreplay: LOGPOSE_HARNESS_FIRST_SEED={} LOGPOSE_HARNESS_SEEDS=1 \
-         cargo test -p logpose-storage --test harness {:?}{shrunk}\nfull trace:\n{}",
+        "seed {} failed ({:?}): {}\nreplay{exact}: LOGPOSE_HARNESS_FIRST_SEED={} \
+         LOGPOSE_HARNESS_SEEDS=1 LOGPOSE_HARNESS_STEPS={} cargo test -p logpose-storage --test \
+         harness {} -- --exact{shrunk}\nfull trace:\n{}",
         failure.seed,
         failure.setup,
         failure.message,
         failure.seed,
-        failure.setup.maintenance,
+        steps(),
+        test_name(failure.setup.backend, failure.setup.maintenance),
         trace(&failure.actions)
     );
 }
@@ -268,12 +293,21 @@ fn random_actions_with_hand_stepped_jobs_match_the_model() {
 fn random_actions_with_stepped_background_jobs_match_the_model() {
     let stats = run_seeds(Backend::Fault, Maintenance::Paused, 12);
     assert!(stats.steps_granted > 0 && stats.crashes > 0, "{stats:?}");
+    // Background compactions ran, not only explicit ones.
+    assert!(
+        stats.compactions_granted > stats.explicit_compactions,
+        "{stats:?}"
+    );
 }
 
 #[test]
 fn random_actions_racing_free_background_jobs_match_the_model() {
     let stats = run_seeds(Backend::Fault, Maintenance::Free, 12);
     assert!(stats.crashes > 0, "{stats:?}");
+    assert!(
+        stats.compactions_granted > stats.explicit_compactions,
+        "{stats:?}"
+    );
 }
 
 #[test]
