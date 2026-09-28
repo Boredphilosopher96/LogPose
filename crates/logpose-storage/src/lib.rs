@@ -35,6 +35,8 @@
 //! - `cache`: the buffer cache of segment section bytes that segment readers load through.
 //! - `flush`, `compaction`, `maintenance`, `scheduler`: maintenance jobs, the size-tiered
 //!   compaction policy, flush triggers, and the engine-wide scheduler of job permits.
+//! - `stepped`: maintenance jobs whose begin, build, and commit the caller runs one at a time,
+//!   for deterministic-interleaving tests.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
 
 #[cfg(test)]
@@ -70,6 +72,7 @@ mod scheduler;
 mod segment;
 pub mod segment_v2;
 mod state;
+mod stepped;
 mod storage_engine;
 #[cfg(test)]
 mod test_support;
@@ -90,6 +93,7 @@ pub use read::{
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use scheduler::{MaintenanceScheduler, SchedulerStats};
 pub use segment_v2::IndexPolicy;
+pub use stepped::{JobKind, SteppedJob};
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
 };

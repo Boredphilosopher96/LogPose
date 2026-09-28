@@ -530,8 +530,8 @@ impl CollectionHandle {
     /// Begin a maintenance job without a scheduler permit, for a test to build and commit by
     /// hand (a flush waits for a running flush; a compaction takes every unreserved segment).
     /// Returns the published state the job works from and a ticket that ends the job when it
-    /// is committed or dropped. Blocking.
-    #[cfg(test)]
+    /// is committed or dropped. Blocking. [`Engine::begin_job`](crate::Engine::begin_job)
+    /// wraps it.
     pub(crate) fn begin_job(
         self: &Arc<Self>,
         kind: JobKind,
@@ -730,9 +730,8 @@ impl JobTicket {
         });
     }
 
-    /// Publish what the job built and wait for the outcome. Blocking; for tests that step a
-    /// job by hand.
-    #[cfg(test)]
+    /// Publish what the job built and wait for the outcome. Blocking; for jobs stepped by hand
+    /// ([`SteppedJob`](crate::SteppedJob)).
     pub(crate) fn commit(mut self, commit: JobCommit) -> Result<Snapshot> {
         self.open = false;
         let (reply, replied) = oneshot::channel();

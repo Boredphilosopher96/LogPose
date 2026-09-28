@@ -247,8 +247,10 @@ pub(crate) struct Queued {
 
 /// A maintenance job that publishes a manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum JobKind {
+pub enum JobKind {
+    /// Write the oldest frozen memtable as a segment, with the grown deletion vectors.
     Flush,
+    /// Merge segments into one, dropping their deleted rows.
     Compact,
 }
 
