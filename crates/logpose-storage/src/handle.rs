@@ -15,7 +15,9 @@ use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, ResourceKind,
-    Result, SeqNo, Snapshot, record::ClientOp,
+    Result, SeqNo, Snapshot,
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate},
 };
 use std::{
     collections::VecDeque,
@@ -345,6 +347,36 @@ impl CollectionHandle {
     /// [`CollectionHandle::alter_schema`] for threads outside any async runtime.
     pub fn alter_schema_blocking(&self, change: SchemaChange) -> Result<CommitAck> {
         self.submit_blocking(|ack| WriteRequest::AlterSchema { change, ack })
+    }
+
+    /// Delete every live row matching `filter`, resolved once against the writer's latest
+    /// state (every earlier write included) to a fixed key set that commits as one atomic
+    /// batch. The ack's `applied_ops` is the number of rows deleted; none matching uses no
+    /// sequence number.
+    ///
+    /// # Errors
+    ///
+    /// As [`CollectionHandle::write`], plus `FailedPrecondition` when the engine has no
+    /// [`RowSetResolver`](crate::RowSetResolver) and the resolver's errors.
+    pub async fn delete_by_filter(&self, filter: FilterExpr) -> Result<CommitAck> {
+        self.submit(|ack| WriteRequest::DeleteByFilter { filter, ack })
+            .await
+    }
+
+    /// Apply `patch` (its key is ignored) to every live row matching `filter`, resolved like
+    /// [`CollectionHandle::delete_by_filter`]. The ack's `applied_ops` is the number of rows
+    /// updated.
+    ///
+    /// # Errors
+    ///
+    /// As [`CollectionHandle::delete_by_filter`], plus the validation errors of the updates.
+    pub async fn update_by_filter(
+        &self,
+        filter: FilterExpr,
+        patch: PartialUpdate,
+    ) -> Result<CommitAck> {
+        self.submit(|ack| WriteRequest::UpdateByFilter { filter, patch, ack })
+            .await
     }
 
     async fn submit(

@@ -21,7 +21,7 @@ mod tests;
 pub(crate) use arena::BLOCK_ROWS;
 pub(crate) use arena::VectorArena;
 pub(crate) use column::MemColumn;
-pub(crate) use index::{IndexFlavor, MemScalarIndex};
+pub(crate) use index::{IndexFlavor, MemScalarIndex, index_keys};
 
 use logpose_types::{
     RowId, SeqNo, UnitId,
@@ -304,10 +304,6 @@ impl MemtableData {
     }
 
     /// The slot holding `pk`'s latest row in this memtable, live or dead.
-    #[allow(
-        dead_code,
-        reason = "the read path serves gets and filters from memtables"
-    )]
     pub(crate) fn find(&self, pk: &PrimaryKey) -> Option<RowId> {
         self.pk_to_slot.get(pk).copied()
     }
@@ -321,10 +317,6 @@ impl MemtableData {
     }
 
     /// The vector of `field` at `slot`, `None` when it is null or the field has no arena.
-    #[allow(
-        dead_code,
-        reason = "the read path serves gets and filters from memtables"
-    )]
     pub(crate) fn vector(&self, field: FieldId, slot: RowId) -> Option<&[f32]> {
         self.vectors
             .iter()
@@ -334,20 +326,12 @@ impl MemtableData {
 
     /// The value of scalar `field` at `slot`; `None` for null, a slot before the field existed,
     /// or a field the memtable has no column for.
-    #[allow(
-        dead_code,
-        reason = "the read path serves gets and filters from memtables"
-    )]
     pub(crate) fn value(&self, field: FieldId, slot: RowId) -> Option<Value> {
         let (_, first, column) = self.columns.iter().find(|(id, _, _)| *id == field)?;
         column.get(slot.checked_sub(*first)?)
     }
 
     /// The postings of `field` of `flavor`, if the field has such an index.
-    #[allow(
-        dead_code,
-        reason = "the read path serves gets and filters from memtables"
-    )]
     pub(crate) fn index(&self, field: FieldId, flavor: IndexFlavor) -> Option<&MemScalarIndex> {
         self.indexes
             .iter()
@@ -387,9 +371,31 @@ impl MemtableData {
     }
 
     /// Keys in ascending order with their latest slot.
-    #[allow(dead_code, reason = "the read path scrolls memtables by key")]
     pub(crate) fn keys(&self) -> impl Iterator<Item = (&PrimaryKey, RowId)> + '_ {
         self.pk_to_slot.iter().map(|(pk, slot)| (pk, *slot))
+    }
+
+    /// Keys in `range`, ascending, with their latest slot.
+    pub(crate) fn keys_range(
+        &self,
+        range: (std::ops::Bound<PrimaryKey>, std::ops::Bound<PrimaryKey>),
+    ) -> impl Iterator<Item = (&PrimaryKey, RowId)> + '_ {
+        self.pk_to_slot
+            .range::<_, PrimaryKey>(range)
+            .map(|(pk, slot)| (pk, *slot))
+    }
+
+    /// The `$extra` object stored at `slot` (before shadowing), or `None`.
+    pub(crate) fn dynamic_object(
+        &self,
+        slot: RowId,
+    ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+        match self.dynamic.get(slot as usize) {
+            Some(Some(bytes)) => crate::segment_v2::dynamic::decode_object(bytes)
+                .map(Some)
+                .map_err(|error| format!("slot {slot} has invalid dynamic bytes: {}", error.0)),
+            _ => Ok(None),
+        }
     }
 }
 

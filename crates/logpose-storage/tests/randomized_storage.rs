@@ -19,6 +19,8 @@ use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
+#[path = "support/scan.rs"]
+mod scan;
 #[path = "support/randomized.rs"]
 mod support;
 

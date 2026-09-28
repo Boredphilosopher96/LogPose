@@ -11,9 +11,11 @@ use crate::{
     handle::{CollectionHandle, TokenContext},
     maintenance::MaintenanceOperation,
     memtable::MemtableConfig,
+    read::RowSetResolver,
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
+    segment_v2::IndexPolicy,
     tokens::TokenConfig,
     version::Version,
     writer::{ControlMsg, GroupCommitConfig},
@@ -82,6 +84,12 @@ pub struct EngineConfig {
     /// The engine-wide clock token expiry is measured on; `None` uses the monotonic system
     /// clock. Tests inject a [`ManualClock`](crate::ManualClock).
     pub clock: Option<Arc<dyn Clock>>,
+    /// Which index sections flush and compaction write (graph and SQ8 thresholds, HNSW
+    /// parameters, scalar indexes).
+    pub index: IndexPolicy,
+    /// Resolves filters of delete-by-filter and update-by-filter requests; `logpose-query`
+    /// implements it and the service injects it. Without one, filter writes are refused.
+    pub resolver: Option<Arc<dyn RowSetResolver>>,
 }
 
 impl Default for EngineConfig {
@@ -100,6 +108,8 @@ impl Default for EngineConfig {
             on_fatal: None,
             tokens: TokenConfig::default(),
             clock: None,
+            index: IndexPolicy::default(),
+            resolver: None,
         }
     }
 }
@@ -121,6 +131,8 @@ impl fmt::Debug for EngineConfig {
             .field("on_fatal", &self.on_fatal.is_some())
             .field("tokens", &self.tokens)
             .field("clock", &self.clock)
+            .field("index", &self.index)
+            .field("resolver", &self.resolver.is_some())
             .finish()
     }
 }
@@ -175,6 +187,10 @@ pub(crate) struct EngineCore {
     pub(crate) memtable: MemtableConfig,
     /// See [`EngineConfig::strict_invariants`].
     pub(crate) strict_invariants: bool,
+    /// See [`EngineConfig::index`].
+    pub(crate) index: IndexPolicy,
+    /// See [`EngineConfig::resolver`].
+    pub(crate) resolver: Option<Arc<dyn RowSetResolver>>,
     /// See [`EngineConfig::memory_limit`].
     memory_limit: u64,
     /// See [`EngineConfig::maintenance_fraction`].
@@ -279,6 +295,8 @@ impl Engine {
             vfs,
             memtable: config.memtable,
             strict_invariants: config.strict_invariants,
+            index: config.index,
+            resolver: config.resolver,
             memory_limit: config.memory_limit,
             maintenance_fraction: config.maintenance_fraction,
             collections: RwLock::new(BTreeMap::new()),
@@ -1003,6 +1021,13 @@ impl CoreRef {
                 id,
             },
         }
+    }
+}
+
+impl CoreRef {
+    /// The engine state this reference tracks.
+    pub(crate) fn arc(&self) -> &Arc<EngineCore> {
+        &self.core
     }
 }
 

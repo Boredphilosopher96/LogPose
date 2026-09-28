@@ -58,13 +58,15 @@ use crate::{
     },
     memtable::MemtableData,
     paths::{SEGMENTS_DIR, segment_path},
+    read::{FetchPlan, ReadView, RowSetResolver, SectionNeed},
     runtime::run_cpu,
     segment::SegmentHandle,
     version::{Version, VersionId},
 };
 use logpose_types::{
     CommitAck, LogPoseError, Result, RowAddr, SeqNo, Snapshot, UnitId, WriteOutcome,
-    record::{ClientOp, PrimaryKey},
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate, PrimaryKey},
     schema::{CollectionSchema, ScalarFieldSpec, SchemaError},
 };
 use logpose_vfs::{CrashPoint, is_crashed};
@@ -152,19 +154,43 @@ pub(crate) enum WriteRequest {
     Batch { ops: Vec<ClientOp>, ack: Ack },
     /// A schema change; a batch of one.
     AlterSchema { change: SchemaChange, ack: Ack },
+    /// Delete every live row matching a filter. Resolved once, against the writer's latest
+    /// state, to a fixed key set that commits as one batch.
+    DeleteByFilter { filter: FilterExpr, ack: Ack },
+    /// Apply `patch` (its key is ignored) to every live row matching a filter; resolved like
+    /// [`WriteRequest::DeleteByFilter`].
+    UpdateByFilter {
+        filter: FilterExpr,
+        patch: PartialUpdate,
+        ack: Ack,
+    },
 }
 
 impl WriteRequest {
     fn ack(self) -> Ack {
         match self {
-            Self::Batch { ack, .. } | Self::AlterSchema { ack, .. } => ack,
+            Self::Batch { ack, .. }
+            | Self::AlterSchema { ack, .. }
+            | Self::DeleteByFilter { ack, .. }
+            | Self::UpdateByFilter { ack, .. } => ack,
         }
+    }
+
+    /// Whether the request is resolved against the writer's state before it is prepared,
+    /// which makes it a group of its own.
+    fn is_filter(&self) -> bool {
+        matches!(
+            self,
+            Self::DeleteByFilter { .. } | Self::UpdateByFilter { .. }
+        )
     }
 
     fn rows(&self) -> usize {
         match self {
             Self::Batch { ops, .. } => ops.len(),
-            Self::AlterSchema { .. } => 1,
+            Self::AlterSchema { .. }
+            | Self::DeleteByFilter { .. }
+            | Self::UpdateByFilter { .. } => 1,
         }
     }
 
@@ -195,7 +221,9 @@ impl WriteRequest {
                     ClientOp::Delete(_) => 64,
                 })
                 .sum(),
-            Self::AlterSchema { .. } => 256,
+            Self::AlterSchema { .. }
+            | Self::DeleteByFilter { .. }
+            | Self::UpdateByFilter { .. } => 256,
         }
     }
 }
@@ -392,6 +420,7 @@ pub(crate) fn spawn(
         waiting_jobs: VecDeque::new(),
         quiesce_waiters: Vec::new(),
         requested: [false; 2],
+        held: None,
     };
     runtime.spawn(writer.run());
 }
@@ -453,6 +482,9 @@ struct Writer {
     quiesce_waiters: Vec<std::sync::mpsc::SyncSender<()>>,
     /// Whether a flush (0) or compaction (1) was already requested from the scheduler.
     requested: [bool; 2],
+    /// A request taken from the channel while collecting a group that must start a group of its
+    /// own (a filter request); handled before the channel is read again.
+    held: Option<WriteRequest>,
 }
 
 /// The maintenance job that holds the collection's job slot.
@@ -503,34 +535,10 @@ impl Writer {
                 }
                 request = self.requests.recv() => {
                     let Some(request) = request else { break };
-                    let requests = self.collect(request).await;
-                    if let Some(error) = self.refusal() {
-                        for request in requests {
-                            let _ = request.ack().send(Err(error.clone_error()));
-                        }
-                        continue;
+                    self.handle_request(request, &mut inflight).await;
+                    while let Some(held) = self.held.take() {
+                        self.handle_request(held, &mut inflight).await;
                     }
-                    // The private state before this group, to restore if the group is never
-                    // appended: the log must not skip the sequence numbers it took.
-                    let before = self
-                        .state
-                        .as_mut()
-                        .map(|state| (state.savepoint(), self.next_seq_no));
-                    let prepared = self.prepare(requests).await;
-                    if let Some(io) = inflight.take() {
-                        self.finish(io).await;
-                    }
-                    match prepared {
-                        Some((prepared, version)) => {
-                            inflight = self.start(prepared, version, before);
-                        }
-                        None => {
-                            if let Some(state) = self.state.as_mut() {
-                                state.release_savepoint();
-                            }
-                        }
-                    }
-                    self.rewrite_slice();
                 }
             }
         }
@@ -538,6 +546,104 @@ impl Writer {
             self.finish(io).await;
         }
         self.stop();
+    }
+
+    /// Collect a group starting at `first`, prepare it, and start its I/O once the group in
+    /// flight is published.
+    async fn handle_request(&mut self, first: WriteRequest, inflight: &mut Option<InFlight>) {
+        let mut requests = self.collect(first).await;
+        if let Some(error) = self.refusal() {
+            for request in requests {
+                let _ = request.ack().send(Err(error.clone_error()));
+            }
+            return;
+        }
+        if requests.len() == 1 && requests[0].is_filter() {
+            let Some(request) = requests.pop() else {
+                return;
+            };
+            match self.resolve_filter_request(request).await {
+                Some(batch) => requests.push(batch),
+                None => return,
+            }
+        }
+        // The private state before this group, to restore if the group is never
+        // appended: the log must not skip the sequence numbers it took.
+        let before = self
+            .state
+            .as_mut()
+            .map(|state| (state.savepoint(), self.next_seq_no));
+        let prepared = self.prepare(requests).await;
+        if let Some(io) = inflight.take() {
+            self.finish(io).await;
+        }
+        match prepared {
+            Some((prepared, version)) => {
+                *inflight = self.start(prepared, version, before);
+            }
+            None => {
+                if let Some(state) = self.state.as_mut() {
+                    state.release_savepoint();
+                }
+            }
+        }
+        self.rewrite_slice();
+    }
+
+    /// Resolve a filter request against the private state, which includes every earlier
+    /// request (prepared groups whose I/O is still in flight too), into a batch over the
+    /// matching keys. Returns `None` after answering the request itself: with its error, or
+    /// right away when no row matches (nothing is logged and no sequence number is used).
+    async fn resolve_filter_request(&mut self, request: WriteRequest) -> Option<WriteRequest> {
+        let (filter, patch, ack) = match request {
+            WriteRequest::DeleteByFilter { filter, ack } => (filter, None, ack),
+            WriteRequest::UpdateByFilter { filter, patch, ack } => (filter, Some(patch), ack),
+            other => return Some(other),
+        };
+        let Some(resolver) = self.core.resolver.clone() else {
+            let _ = ack.send(Err(LogPoseError::failed_precondition(
+                "filter writes need a row-set resolver, and this engine has none",
+            )));
+            return None;
+        };
+        let Some(state) = self.state.as_ref() else {
+            let _ = ack.send(Err(self.handle.unavailable()));
+            return None;
+        };
+        let version = Arc::new(state.version(
+            VersionId(self.next_version_id),
+            Arc::clone(self.handle.meta()),
+            Arc::clone(&self.manifest),
+        ));
+        let view = ReadView::new(version, Arc::downgrade(self.core.arc()), None);
+        let keys = match resolve_keys(resolver.as_ref(), &view, &filter).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                let _ = ack.send(Err(error));
+                return None;
+            }
+        };
+        if keys.is_empty() {
+            let current = self.handle.current();
+            let _ = ack.send(Ok(CommitAck {
+                last_seq_no: current.visible_seq_no,
+                applied_ops: 0,
+                snapshot: current.snapshot(),
+            }));
+            return None;
+        }
+        let ops = keys
+            .into_iter()
+            .map(|pk| match &patch {
+                None => ClientOp::Delete(pk),
+                Some(patch) => {
+                    let mut update = patch.clone();
+                    update.pk = pk;
+                    ClientOp::Update(update)
+                }
+            })
+            .collect();
+        Some(WriteRequest::Batch { ops, ack })
     }
 
     /// Why the writer refuses new work, if it does.
@@ -551,8 +657,13 @@ impl Writer {
         None
     }
 
-    /// Take `first` and whatever else is queued, up to the group limits.
+    /// Take `first` and whatever else is queued, up to the group limits. A filter request is
+    /// a group of its own: it is resolved against the state every earlier request left, so a
+    /// filter request met while collecting is held for the next group.
     async fn collect(&mut self, first: WriteRequest) -> Vec<WriteRequest> {
+        if first.is_filter() {
+            return vec![first];
+        }
         let mut bytes = first.approximate_bytes();
         let mut group = vec![first];
         let full = |group: &Vec<WriteRequest>, bytes: usize| {
@@ -561,6 +672,10 @@ impl Writer {
         };
         while !full(&group, bytes) {
             match self.requests.try_recv() {
+                Ok(request) if request.is_filter() => {
+                    self.held = Some(request);
+                    return group;
+                }
                 Ok(request) => {
                     bytes += request.approximate_bytes();
                     group.push(request);
@@ -572,6 +687,10 @@ impl Writer {
             let deadline = tokio::time::Instant::now() + self.config.commit_delay;
             while group.len() < self.config.min_group_requests && !full(&group, bytes) {
                 match tokio::time::timeout_at(deadline, self.requests.recv()).await {
+                    Ok(Some(request)) if request.is_filter() => {
+                        self.held = Some(request);
+                        return group;
+                    }
                     Ok(Some(request)) => {
                         bytes += request.approximate_bytes();
                         group.push(request);
@@ -1858,6 +1977,41 @@ pub(crate) fn checkpoint_frame(manifest: &Manifest) -> Result<WalFrame> {
     .encode()
     .map_err(|error| LogPoseError::internal(format!("invalid WAL checkpoint frame: {error}")))?;
     Ok(WalFrame::checkpoint(manifest.checkpoint_seq_no, payload)?)
+}
+
+/// The keys of the live rows `filter` matches in `view`, in unit order.
+async fn resolve_keys(
+    resolver: &dyn RowSetResolver,
+    view: &ReadView,
+    filter: &FilterExpr,
+) -> Result<Vec<PrimaryKey>> {
+    let matches = resolver.resolve(view, filter).await?;
+    let mut plan = FetchPlan::default();
+    for (unit, rows) in &matches {
+        if !rows.is_empty() {
+            plan.push(*unit, SectionNeed::Pk);
+        }
+    }
+    let (pins, _) = view.fetch(&plan).await?;
+    let mut keys = Vec::new();
+    for (unit, rows) in matches {
+        if rows.is_empty() {
+            continue;
+        }
+        let unit_view = view
+            .unit(unit)
+            .ok_or_else(|| LogPoseError::internal(format!("unit {unit} is not in the view")))?;
+        let pks = unit_view.pks(&pins)?;
+        for row in &rows {
+            if unit_view.is_deleted(row) {
+                continue;
+            }
+            keys.push(pks.pk_at(row).ok_or_else(|| {
+                LogPoseError::internal(format!("row {row} of unit {unit} has no key"))
+            })?);
+        }
+    }
+    Ok(keys)
 }
 
 /// Every row image a segment's rows hold, for partial updates.

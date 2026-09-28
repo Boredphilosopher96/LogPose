@@ -266,3 +266,74 @@ impl VfsFile for ControlledFile {
         self.inner.set_len(len)
     }
 }
+
+/// Test-only scans of every live row, in the v1 record shape and sorted by id, read straight
+/// from a `Version` (the read path proper lives in `logpose-query`, which unit tests cannot
+/// link against this crate's types).
+impl crate::engine::EngineCore {
+    pub(crate) fn scan_exact_internal(
+        &self,
+        handle: &crate::handle::CollectionHandle,
+        at: impl Into<crate::state::ReadAt>,
+        _include_mutable: bool,
+        _segments: Option<std::collections::BTreeSet<String>>,
+    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
+        let (version, _) = self.read_state(handle, at)?;
+        scan_version(&version)
+    }
+}
+
+/// Every live row of `version` as a v1 record, sorted by id.
+pub(crate) fn scan_version(
+    version: &crate::version::Version,
+) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
+    let mut records = version
+        .live_images()
+        .into_iter()
+        .map(|(seq_no, image)| {
+            let put = crate::legacy_view::legacy_put(&version.schema, &image)?;
+            Ok(logpose_types::VisibleRecord {
+                id: put.id,
+                vector: put.vector,
+                metadata: put.metadata,
+                seq_no,
+            })
+        })
+        .collect::<logpose_types::Result<Vec<_>>>()?;
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(records)
+}
+
+impl crate::LocalStorageEngine {
+    /// Every live record of the current state, or of an exact snapshot.
+    pub(crate) async fn scan_exact(
+        &self,
+        collection_name: &str,
+        snapshot: Option<logpose_types::Snapshot>,
+    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
+        let handle = self
+            .engine()
+            .collection(&crate::collections::collection_ref_from_lookup(
+                collection_name,
+            ))?;
+        self.engine()
+            .core()
+            .scan_exact_internal(&handle, snapshot, true, None)
+    }
+
+    /// Every live record of the state `token` pins, extending its expiry.
+    pub(crate) async fn scan_exact_at_token(
+        &self,
+        collection_name: &str,
+        token: crate::SnapshotToken,
+    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
+        let handle = self
+            .engine()
+            .collection(&crate::collections::collection_ref_from_lookup(
+                collection_name,
+            ))?;
+        self.engine()
+            .core()
+            .scan_exact_internal(&handle, token, true, None)
+    }
+}

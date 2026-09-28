@@ -11,17 +11,16 @@ use crate::{
     durable_fs::path_exists,
     engine::{CoreRef, Engine, EngineConfig, not_found},
     handle::CollectionHandle,
-    legacy::MetadataFilter,
     legacy_view::legacy_ops,
     maintenance::MaintenanceOperation,
+    read::{BoxFuture, CollectionReader, ReadOptions, ReadView},
     tokens::SnapshotToken,
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
-    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, CollectionStats, CommitAck,
+    LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole, Result, Snapshot, WriteOperation,
 };
 use logpose_vfs::{Vfs, std_vfs};
 use std::{path::Path, sync::Arc};
@@ -46,6 +45,28 @@ impl LocalStorageEngine {
     /// Creates the root directory if needed and fails if another engine holds the root.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         Self::with_blob_store(root, None)
+    }
+
+    /// Open a local storage engine on the real filesystem with `config`.
+    ///
+    /// Creates the root directory if needed and fails if another engine holds the root.
+    pub fn with_config(root: impl AsRef<Path>, config: EngineConfig) -> Result<Self> {
+        Ok(Self::from_engine(Engine::open(std_vfs(), root, config)?))
+    }
+
+    /// Open a local storage engine on the real filesystem that resolves delete-by-filter and
+    /// update-by-filter requests with `resolver` (the service injects `logpose-query`'s).
+    ///
+    /// Creates the root directory if needed and fails if another engine holds the root.
+    pub fn with_resolver(
+        root: impl AsRef<Path>,
+        resolver: Arc<dyn crate::read::RowSetResolver>,
+    ) -> Result<Self> {
+        let config = EngineConfig {
+            resolver: Some(resolver),
+            ..EngineConfig::default()
+        };
+        Ok(Self::from_engine(Engine::open(std_vfs(), root, config)?))
     }
 
     /// Open a local storage engine on the real filesystem with an optional blob-store
@@ -156,20 +177,6 @@ impl LocalStorageEngine {
         Ok(self.handle(collection_name)?.release_snapshot(token))
     }
 
-    /// Every visible record of the state `token` pins, extending the token's expiry. Fails with
-    /// [`LogPoseError::SnapshotExpired`] once the token expired or was released.
-    pub async fn scan_exact_at_token(
-        &self,
-        collection_name: &str,
-        token: SnapshotToken,
-    ) -> Result<Vec<VisibleRecord>> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| {
-            core.scan_exact_internal(handle, token, true, None)
-        })
-        .await
-    }
-
     /// Statistics of the state `token` pins, extending the token's expiry.
     pub async fn stats_at_token(
         &self,
@@ -185,6 +192,20 @@ impl LocalStorageEngine {
 
     fn handle(&self, name: &str) -> Result<Arc<CollectionHandle>> {
         self.engine.collection(&collection_ref_from_lookup(name))
+    }
+
+    /// Resume a recovered collection's persisted maintenance on its first data-plane access,
+    /// in the background: resuming persists the maintenance status (blocking I/O).
+    fn resume_in_background(&self, handle: &Arc<CollectionHandle>) {
+        if handle.take_maintenance_resume() {
+            let core = self.engine.core();
+            let resumed = Arc::clone(handle);
+            let _ = self
+                .engine
+                .runtime()
+                .io
+                .execute(move || core.resume_maintenance(&resumed));
+        }
     }
 
     /// Run data-plane work for `handle` on the I/O pool. The first data-plane access of a
@@ -249,6 +270,20 @@ impl LocalStorageEngine {
             core.collection_stats(handle, snapshot)
         })
         .await
+    }
+}
+
+impl CollectionReader for LocalStorageEngine {
+    fn read_view<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        options: ReadOptions,
+    ) -> BoxFuture<'a, Result<ReadView>> {
+        Box::pin(async move {
+            let handle = self.engine.collection(collection)?;
+            self.resume_in_background(&handle);
+            self.engine.core().read_view_of(&handle, &options)
+        })
     }
 }
 
@@ -326,16 +361,7 @@ impl StorageEngine for LocalStorageEngine {
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
         let handle = self.handle(collection_name)?;
-        if handle.take_maintenance_resume() {
-            let core = self.engine.core();
-            let resumed = Arc::clone(&handle);
-            // Resuming persists the maintenance status: blocking I/O, so not on this worker.
-            let _ = self
-                .engine
-                .runtime()
-                .io
-                .execute(move || core.resume_maintenance(&resumed));
-        }
+        self.resume_in_background(&handle);
         let ops = legacy_ops(handle.descriptor(), operations)?;
         handle.write(ops).await
     }
@@ -344,73 +370,6 @@ impl StorageEngine for LocalStorageEngine {
         let handle = self.handle(collection_name)?;
         handle.ensure_open()?;
         Ok(handle.current().snapshot())
-    }
-
-    async fn scan_exact(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| {
-            core.scan_exact_internal(handle, snapshot, true, None)
-        })
-        .await
-    }
-
-    async fn scan_exact_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| {
-            core.scan_exact_internal(
-                handle,
-                snapshot,
-                include_mutable,
-                Some(immutable_unit_ids.into_iter().collect()),
-            )
-        })
-        .await
-    }
-
-    async fn ann_search_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        immutable_unit_ids: Vec<String>,
-        request: AnnSearchRequest,
-        filter: Option<MetadataFilter>,
-    ) -> Result<Vec<AnnCandidate>> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| {
-            core.ann_search_selected(handle, snapshot, immutable_unit_ids, &request, filter)
-        })
-        .await
-    }
-
-    async fn latest_visible_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        record_ids: Vec<RecordId>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |core, handle| {
-            core.latest_visible_selected(
-                handle,
-                snapshot,
-                record_ids,
-                include_mutable,
-                immutable_unit_ids,
-            )
-        })
-        .await
     }
 
     async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
