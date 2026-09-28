@@ -916,6 +916,72 @@ async fn etcd_membership_leases_expire_after_state_drop() {
 }
 
 #[tokio::test]
+async fn etcd_stop_coordination_revokes_membership_and_leadership_at_once() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_stop_coordination_revokes_membership_and_leadership_at_once")
+            .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("stop-coordination");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-stop-coordination";
+    let root_dir = unique_temp_dir("etcd-stop-coordination");
+    let mut config = test_config(
+        "stopping-a",
+        root_dir.path().to_path_buf(),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    config.node_role = NodeRole::Combined;
+    // Leases this long cannot expire during the test: only a revoke removes them.
+    config.metadata.etcd.membership_ttl_secs = 60;
+    config.metadata.etcd.leadership_ttl_secs = 60;
+    let state = Arc::new(AppState::new(config));
+    let (membership_lease_id, leadership_lease_id) = wait_for_local_leadership(&state).await;
+
+    state.control.stop_coordination().await;
+
+    assert!(!lease_is_granted(&endpoints, membership_lease_id).await);
+    assert!(!lease_is_granted(&endpoints, leadership_lease_id).await);
+    assert!(
+        visible_leader(&endpoints, &key_prefix, cluster_name)
+            .await
+            .is_none(),
+        "a stopped node must not leave its leader key for the next leader to wait out"
+    );
+    let coordination = state
+        .control
+        .coordination_status()
+        .await
+        .expect("coordination state should be present");
+    assert!(!coordination.is_local_leader, "{coordination:?}");
+    assert!(!coordination.membership_registered, "{coordination:?}");
+    assert_eq!(coordination.leader_node, None, "{coordination:?}");
+
+    let error = state
+        .put_database_with_auth(
+            &RequestAuth::default(),
+            logpose_catalog::DatabaseDescriptor::new("after-stop"),
+        )
+        .await
+        .expect_err("a node that stopped coordinating must refuse control mutations");
+    assert!(
+        matches!(
+            &error,
+            LogPoseError::NotLeader {
+                leader_node: None,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_rejoining_node_re_registers_membership_after_restart() {
     let Some(endpoints) =
         etcd_endpoints_or_skip("etcd_rejoining_node_re_registers_membership_after_restart").await

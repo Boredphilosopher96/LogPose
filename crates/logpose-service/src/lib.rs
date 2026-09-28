@@ -57,13 +57,11 @@ use std::{
     fmt,
     net::IpAddr,
     path::Path,
-    sync::{
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak},
 };
 use tokio::{
     runtime::Handle,
+    sync::watch,
     task::JoinHandle,
     time::{Duration, Instant, interval, sleep},
 };
@@ -92,14 +90,33 @@ enum CoordinationRuntime {
 #[derive(Debug)]
 struct EtcdRuntime {
     snapshot: Arc<RwLock<CoordinationStatus>>,
-    shutdown: Arc<AtomicBool>,
+    /// Stops the coordination loop when set to `true`, or when dropped with the runtime.
+    stop: watch::Sender<bool>,
+    /// The coordination loop, until [`EtcdRuntime::stop`] waits for it.
+    task: Mutex<Option<JoinHandle<()>>>,
+    /// How long [`EtcdRuntime::stop`] waits for the loop to give up its leases.
+    stop_timeout: Duration,
 }
 
-impl Drop for EtcdRuntime {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+impl EtcdRuntime {
+    /// Stop the coordination loop and wait, at most `stop_timeout`, for it to revoke this
+    /// node's membership and leadership leases.
+    async fn stop(&self) {
+        self.stop.send_replace(true);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = tokio::time::timeout(self.stop_timeout, task).await;
+        }
     }
 }
+
+/// How many etcd round trips [`EtcdRuntime::stop`] waits for: the one a tick has in flight,
+/// and the revokes of the membership and leadership leases.
+const STOP_ROUND_TRIPS: u32 = 3;
 
 impl CoordinationRuntime {
     /// Start the coordination loop with etcd metadata. While the node is a registered member,
@@ -121,32 +138,43 @@ impl CoordinationRuntime {
             leadership_lease_id: None,
             last_error: None,
         }));
-        let runtime = Arc::new(EtcdRuntime {
-            snapshot: Arc::clone(&snapshot),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        });
         let client = EtcdCoordinationClient::new(config.metadata.etcd.clone())
             .expect("invalid etcd coordination configuration");
         let node_name = config.node_name.clone();
         let node_role = config.node_role;
         let tick = coordination_tick(&config.metadata.etcd);
-        let shutdown = Arc::clone(&runtime.shutdown);
-        match Handle::try_current() {
+        let (stop, stopped) = watch::channel(false);
+        let task = match Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(async move {
+                let snapshot = Arc::clone(&snapshot);
+                Some(handle.spawn(async move {
                     run_coordination_loop(
-                        client, snapshot, shutdown, node_name, node_role, tick, reconciler,
+                        client, snapshot, stopped, node_name, node_role, tick, reconciler,
                     )
                     .await;
-                });
+                }))
             }
             Err(error) => {
                 coordination_write(&snapshot).last_error = Some(format!(
                     "etcd coordination loop did not start because no tokio runtime was available: {error}"
                 ));
+                None
             }
+        };
+        Self::Etcd(Arc::new(EtcdRuntime {
+            snapshot,
+            stop,
+            task: Mutex::new(task),
+            stop_timeout: Duration::from_millis(config.metadata.etcd.timeout_ms) * STOP_ROUND_TRIPS,
+        }))
+    }
+
+    /// Stop coordinating: give up this node's membership and leadership, so another node can
+    /// lead at once instead of after the leases expire.
+    async fn stop(&self) {
+        if let Self::Etcd(runtime) = self {
+            runtime.stop().await;
         }
-        Self::Etcd(runtime)
     }
 
     async fn snapshot(&self) -> Option<CoordinationStatus> {
@@ -237,7 +265,7 @@ impl Reconciliation {
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
     snapshot: Arc<RwLock<CoordinationStatus>>,
-    shutdown: Arc<AtomicBool>,
+    mut stop: watch::Receiver<bool>,
     node_name: String,
     node_role: NodeRole,
     tick: Duration,
@@ -249,12 +277,11 @@ async fn run_coordination_loop(
     let mut reconciliation = Reconciliation::default();
     let mut ticker = interval(tick);
     loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        ticker.tick().await;
-        if shutdown.load(Ordering::SeqCst) {
-            break;
+        // A stop request, or its sender dropped with the service, ends the loop between ticks.
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stop| *stop) => break,
+            _ = ticker.tick() => {}
         }
         let mut pending_error = None;
 
@@ -367,6 +394,8 @@ async fn run_coordination_loop(
     // steps is safe: each etcd change is one guarded transaction, and whatever it leaves
     // pending the next pass resolves.
     reconciliation.stop();
+    // Stop advertising the claims before revoking them, as a tick does with the ones it lost.
+    demote_lost_claims(&snapshot, &node_name, None, None);
     if let Some(lease) = leadership_lease.take() {
         let _ = client.revoke_lease(lease.lease_id).await;
     }
@@ -1390,6 +1419,14 @@ impl LogPoseControlService {
     /// Return the current distributed coordination status when one exists.
     pub async fn coordination_status(&self) -> Option<CoordinationStatus> {
         self.coordination.snapshot().await
+    }
+
+    /// Stop etcd coordination and revoke this node's membership and control-plane leadership
+    /// leases, so another node can lead at once instead of after they expire. Call it once the
+    /// node serves no more requests: control-plane mutations fail with `NOT_LEADER` afterwards.
+    /// It waits for a few etcd round trips at most, and does nothing without etcd metadata.
+    pub async fn stop_coordination(&self) {
+        self.coordination.stop().await;
     }
 
     fn local_placement(
