@@ -3,7 +3,11 @@ openapi: 3.1.0
 info:
   title: LogPose REST API
   version: 0.1.0
-  description: Versioned REST surface for LogPose metadata, data workflows, and operator actions.
+  description: >-
+    Versioned REST surface for LogPose metadata, data workflows, and operator actions.
+    Every database-scoped route names its database in the path, and every collection-scoped
+    route names its collection below it: `/v2/databases/{database}/collections/{collection}`.
+    Records are natural JSON documents keyed by field name and typed by the collection schema.
 servers:
   - url: http://127.0.0.1:8080
 paths:
@@ -18,7 +22,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
-  /v1/metadata:
+  /v2/metadata:
     get:
       summary: Cluster metadata
       operationId: getMetadata
@@ -29,7 +33,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MetadataResponse"
-  /v1/runtime/status:
+  /v2/runtime/status:
     get:
       summary: Get runtime status
       operationId: getRuntimeStatus
@@ -56,7 +60,7 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/databases:
+  /v2/databases:
     get:
       summary: List databases
       operationId: listDatabases
@@ -68,9 +72,7 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/DatabaseDescriptor"
+                $ref: "#/components/schemas/DatabaseList"
         "400":
           $ref: "#/components/responses/InvalidArgument"
         "401":
@@ -85,16 +87,17 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/databases/{name}:
+  /v2/databases/{database}:
     get:
       summary: Get a database descriptor
       operationId: getDatabase
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
       responses:
@@ -119,25 +122,21 @@ paths:
         "503":
           $ref: "#/components/responses/Unavailable"
     put:
-      summary: Create or replace a database descriptor
+      summary: Create a database
+      description: "Operator only. Idempotent: an existing database is returned unchanged."
       operationId: putDatabase
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/DatabaseDescriptor"
       responses:
         "200":
-          description: Database descriptor written
+          description: The database descriptor, created if it did not exist
           content:
             application/json:
               schema:
@@ -152,31 +151,30 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections:
-    post:
-      summary: Create a collection
-      operationId: createCollection
+    delete:
+      summary: Drop a database
+      description: "Operator only. Deletes the database descriptor and its access policy. The default database cannot be dropped, and a database that still holds a collection is `FAILED_PRECONDITION` (409): drop its collections first."
+      operationId: dropDatabase
       security:
         - bearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateCollectionRequest"
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
       responses:
-        "201":
-          description: Collection created
+        "200":
+          description: Database dropped
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CollectionDescriptor"
+                $ref: "#/components/schemas/DroppedDatabase"
         "400":
           $ref: "#/components/responses/InvalidArgument"
         "401":
@@ -187,22 +185,21 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
-        "413":
-          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/databases/{name}/policy:
+  /v2/databases/{database}/policy:
     get:
       summary: Get a database access policy
       operationId: getDatabasePolicy
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
       responses:
@@ -232,9 +229,10 @@ paths:
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
       requestBody:
@@ -242,7 +240,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/DatabaseAccessPolicy"
+              $ref: "#/components/schemas/DatabasePolicyRequest"
       responses:
         "200":
           description: Database access policy written
@@ -266,31 +264,26 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}:
+  /v2/databases/{database}/collections:
     get:
-      summary: Get collection metadata
-      operationId: getCollection
+      summary: List collections
+      operationId: listCollections
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-        - name: database
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
       responses:
         "200":
-          description: Collection descriptor
+          description: The collections of the database, each with its live schema
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CollectionDescriptor"
+                $ref: "#/components/schemas/CollectionList"
         "400":
           $ref: "#/components/responses/InvalidArgument"
         "401":
@@ -305,24 +298,195 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/placement:
+    post:
+      summary: Create a collection
+      description: "Creates a collection with a typed schema (engine plan decision D4). Schema errors name the request field, such as `vectors[0].dimensions` or `fields[2].index`."
+      operationId: createCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCollectionRequest"
+      responses:
+        "201":
+          description: Collection created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Collection"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}:
+    get:
+      summary: Get a collection
+      operationId: getCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The collection with its live schema
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Collection"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    patch:
+      summary: Change a collection schema
+      description: "Applies one online schema change, ordered with the writes around it: add a nullable scalar field (rows written before it read null), drop a field, or rename a field. The name a drop or rename removes becomes retired: `$extra` keys stored under it stay hidden, and records cannot store it dynamically, until a field with the name is added again. Errors name the change field, such as `add_field.nullable` or `rename_field.to`."
+      operationId: alterCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SchemaChange"
+      responses:
+        "200":
+          description: The collection with its new schema
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Collection"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    delete:
+      summary: Drop a collection
+      description: "Durably removes the collection and all its data."
+      operationId: dropCollection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Collection dropped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionContext"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/placement:
     get:
       summary: Get collection placement
       operationId: getCollectionPlacement
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-        - name: database
-          in: query
-          required: false
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
-            default: default
       responses:
         "200":
           description: Collection placement summary
@@ -344,16 +508,24 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/writes:
+  /v2/databases/{database}/collections/{collection}/records/upsert:
     post:
-      summary: Write a mixed put/delete batch
-      operationId: writeCollection
+      summary: Upsert records
+      description: "Inserts or replaces whole records as one atomic batch. Each record is a natural JSON document keyed by field name and typed by the schema. Validation errors name the record field, such as `records[2].price` or `records[0].tags[1]`."
+      operationId: upsertRecords
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
       requestBody:
@@ -361,10 +533,10 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/WriteCollectionRequest"
+              $ref: "#/components/schemas/UpsertRecordsRequest"
       responses:
         "200":
-          description: Write committed
+          description: Write acknowledgement
           content:
             application/json:
               schema:
@@ -385,16 +557,171 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/query:
+  /v2/databases/{database}/collections/{collection}/records/update:
+    post:
+      summary: Update records
+      description: "Changes some fields of existing records as one atomic batch. Each document holds the primary key and the fields to change: a value replaces the field, `null` clears it, and vectors not sent are kept. A key without a live record fails the whole batch with `NOT_FOUND` (resource type `record`)."
+      operationId: updateRecords
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRecordsRequest"
+      responses:
+        "200":
+          description: Write acknowledgement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionCommitAck"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/records/delete:
+    post:
+      summary: Delete records
+      description: "Deletes records by primary key as one atomic batch. A key without a live record is a no-op."
+      operationId: deleteRecords
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteRecordsRequest"
+      responses:
+        "200":
+          description: Write acknowledgement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionCommitAck"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/records/get:
+    post:
+      summary: Get records
+      description: "Reads records by primary key from the current state. `output_fields` projects each record."
+      operationId: getRecords
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: database
+          in: path
+          required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetRecordsRequest"
+      responses:
+        "200":
+          description: The live records found and the keys without one
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionRecords"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/PermissionDenied"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v2/databases/{database}/collections/{collection}/query:
     post:
       summary: Execute a planner-controlled vector query
+      description: "Searches the first vector field of the collection."
       operationId: queryCollection
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
       requestBody:
@@ -426,46 +753,47 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/stats:
+  /v2/databases/{database}/collections/{collection}/stats:
     get:
       summary: Get collection stats
       operationId: getCollectionStats
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-        - name: database
-          in: query
-          required: false
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
-            default: default
         - name: snapshot_manifest_generation
           in: query
           required: false
-          description: Historical manifest generation to inspect. Must be provided together with `snapshot_visible_seq_no`.
+          description: "Historical manifest generation to inspect. Must be provided together with `snapshot_visible_seq_no`."
           schema:
             type: integer
         - name: snapshot_visible_seq_no
           in: query
           required: false
-          description: Historical visible sequence number to inspect. Must be provided together with `snapshot_manifest_generation`.
+          description: "Historical visible sequence number to inspect. Must be provided together with `snapshot_manifest_generation`."
           schema:
             type: integer
         - name: read_barrier_manifest_generation
           in: query
           required: false
-          description: Lower-bound manifest generation that must already be visible on the current owner. Must be provided together with `read_barrier_visible_seq_no`. Cannot be combined with the exact snapshot parameters. Promoted owners fail read barriers closed until replica freshness metadata exists.
+          description: "Lower-bound manifest generation that must already be visible on the current owner. Must be provided together with `read_barrier_visible_seq_no`. Cannot be combined with the exact snapshot parameters. Promoted owners fail read barriers closed until replica freshness metadata exists."
           schema:
             type: integer
         - name: read_barrier_visible_seq_no
           in: query
           required: false
-          description: Lower-bound visible sequence number that must already be visible on the current owner. Must be provided together with `read_barrier_manifest_generation`. Cannot be combined with the exact snapshot parameters. Promoted owners fail read barriers closed until replica freshness metadata exists.
+          description: "Lower-bound visible sequence number that must already be visible on the current owner. Must be provided together with `read_barrier_manifest_generation`. Cannot be combined with the exact snapshot parameters. Promoted owners fail read barriers closed until replica freshness metadata exists."
           schema:
             type: integer
       responses:
@@ -489,24 +817,25 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/flush:
+  /v2/databases/{database}/collections/{collection}/flush:
     post:
       summary: Flush the mutable delta into a new segment
       operationId: flushCollection
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-        - name: database
-          in: query
-          required: false
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
-            default: default
       responses:
         "200":
           description: Flush snapshot
@@ -528,24 +857,25 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/compact:
+  /v2/databases/{database}/collections/{collection}/compact:
     post:
       summary: Compact immutable segments
       operationId: compactCollection
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
           schema:
             type: string
-        - name: database
-          in: query
-          required: false
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
-            default: default
       responses:
         "200":
           description: Compaction snapshot
@@ -567,16 +897,23 @@ paths:
           $ref: "#/components/responses/Internal"
         "503":
           $ref: "#/components/responses/Unavailable"
-  /v1/collections/{name}/inspect:
+  /v2/databases/{database}/collections/{collection}/inspect:
     get:
       summary: Inspect collection storage state
       operationId: inspectCollection
       security:
         - bearerAuth: []
       parameters:
-        - name: name
+        - name: database
           in: path
           required: true
+          description: "Database name."
+          schema:
+            type: string
+        - name: collection
+          in: path
+          required: true
+          description: "Collection name."
           schema:
             type: string
         - name: target
@@ -585,15 +922,11 @@ paths:
           schema:
             type: string
             enum: [manifest, wal, segment, maintenance]
-        - name: database
-          in: query
-          required: false
-          schema:
-            type: string
-            default: default
+            default: manifest
         - name: segment_id
           in: query
           required: false
+          description: The segment to inspect; required when `target` is `segment`.
           schema:
             type: string
       responses:
@@ -864,29 +1197,208 @@ components:
             - type: "null"
         maintenance:
           $ref: "#/components/schemas/MaintenanceBacklog"
-    CreateCollectionRequest:
+    DatabaseRoleBindingRequest:
       type: object
-      required: [name, dimensions, metric]
+      additionalProperties: false
+      required: [principal_name, role]
+      properties:
+        principal_name:
+          type: string
+        role:
+          $ref: "#/components/schemas/DatabaseRole"
+    DatabasePolicyRequest:
+      type: object
+      description: A database access policy. The path names the database, so the body does not.
+      additionalProperties: false
+      required: [authentication_mode]
+      properties:
+        authentication_mode:
+          $ref: "#/components/schemas/AuthenticationMode"
+        role_bindings:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/DatabaseRoleBindingRequest"
+    DatabaseList:
+      type: object
+      required: [databases]
+      properties:
+        databases:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseDescriptor"
+    DroppedDatabase:
+      type: object
+      required: [database_name]
       properties:
         database_name:
           type: string
-          default: default
+    PrimaryKeyType:
+      type: string
+      enum: [string, int64]
+    FieldType:
+      type: string
+      description: A scalar field type. Arrays are flat, hold one element type, and cannot hold null. `timestamp` values are RFC 3339 strings, or integer microseconds since the Unix epoch, in years 0000 through 9999; reads return RFC 3339 in UTC.
+      enum:
+        - bool
+        - int64
+        - float64
+        - string
+        - timestamp
+        - json
+        - array<bool>
+        - array<int64>
+        - array<float64>
+        - array<string>
+        - array<timestamp>
+    FieldIndex:
+      type: string
+      description: Scalar index. `auto` picks `inverted` for bool, string, and arrays, `inverted_and_sorted` for numbers and timestamps, and `none` for json; a stored schema never holds `auto`.
+      enum: [auto, none, inverted, sorted, inverted_and_sorted]
+    FieldName:
+      type: string
+      description: "A declared field name: `[A-Za-z_][A-Za-z0-9_]{0,63}`, unique across the collection. `$extra` is reserved."
+    PrimaryKeySpec:
+      type: object
+      additionalProperties: false
+      required: [name, type]
+      properties:
         name:
-          type: string
+          $ref: "#/components/schemas/FieldName"
+        type:
+          $ref: "#/components/schemas/PrimaryKeyType"
+    VectorFieldSpec:
+      type: object
+      additionalProperties: false
+      required: [name, dimensions]
+      properties:
+        name:
+          $ref: "#/components/schemas/FieldName"
         dimensions:
           type: integer
           minimum: 1
           maximum: 65536
         metric:
           $ref: "#/components/schemas/DistanceMetric"
-    CollectionDescriptor:
+    ScalarFieldSpec:
       type: object
+      additionalProperties: false
+      required: [name, type]
+      properties:
+        name:
+          $ref: "#/components/schemas/FieldName"
+        type:
+          $ref: "#/components/schemas/FieldType"
+        index:
+          $ref: "#/components/schemas/FieldIndex"
+        nullable:
+          type: boolean
+          default: true
+          description: Whether records may omit the field or set it to null. Fields added to an existing collection must be nullable.
+    CreateCollectionRequest:
+      type: object
+      description: "A typed schema (engine plan decision D4): one primary key, at least one vector field, typed scalar fields, and the `$extra` dynamic field for undeclared keys. Unknown keys are rejected."
+      additionalProperties: false
+      required: [name, primary_key, vectors]
+      properties:
+        name:
+          type: string
+          description: Collection name, unique in its database.
+        primary_key:
+          $ref: "#/components/schemas/PrimaryKeySpec"
+        vectors:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/VectorFieldSpec"
+        fields:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/ScalarFieldSpec"
+        dynamic_fields:
+          type: boolean
+          default: true
+          description: Whether undeclared keys are kept in the `$extra` dynamic field. When false, an undeclared key is rejected.
+    PrimaryKeyField:
+      type: object
+      required: [id, name, type]
+      properties:
+        id:
+          type: integer
+          description: Stable field id; never reused.
+        name:
+          type: string
+        type:
+          $ref: "#/components/schemas/PrimaryKeyType"
+    VectorField:
+      type: object
+      required: [id, name, dimensions, metric]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        dimensions:
+          type: integer
+        metric:
+          $ref: "#/components/schemas/DistanceMetric"
+    ScalarField:
+      type: object
+      required: [id, name, type, index, nullable]
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        type:
+          $ref: "#/components/schemas/FieldType"
+        index:
+          $ref: "#/components/schemas/FieldIndex"
+        nullable:
+          type: boolean
+    CollectionSchema:
+      type: object
+      required:
+        - schema_version
+        - next_field_id
+        - primary_key
+        - vectors
+        - fields
+        - dynamic_fields
+        - retired_names
+      properties:
+        schema_version:
+          type: integer
+          description: Grows by one with every schema change; a new collection starts at 1.
+        next_field_id:
+          type: integer
+          description: The id the next added field receives.
+        primary_key:
+          $ref: "#/components/schemas/PrimaryKeyField"
+        vectors:
+          type: array
+          items:
+            $ref: "#/components/schemas/VectorField"
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScalarField"
+        dynamic_fields:
+          type: boolean
+        retired_names:
+          type: array
+          description: Names declared once and then dropped or renamed away. `$extra` keys under these names stay hidden until a field with the name is declared again.
+          items:
+            type: string
+    Collection:
+      type: object
+      description: A collection with its live schema.
       required:
         - collection_id
         - database_name
         - name
-        - dimensions
-        - metric
+        - schema
         - root_path
         - remote_blob
         - flush_threshold_ops
@@ -900,10 +1412,8 @@ components:
           type: string
         name:
           type: string
-        dimensions:
-          type: integer
-        metric:
-          $ref: "#/components/schemas/DistanceMetric"
+        schema:
+          $ref: "#/components/schemas/CollectionSchema"
         root_path:
           type: string
         remote_blob:
@@ -924,6 +1434,123 @@ components:
           type: integer
         compaction_threshold_segments:
           type: integer
+    CollectionList:
+      type: object
+      required: [collections]
+      properties:
+        collections:
+          type: array
+          items:
+            $ref: "#/components/schemas/Collection"
+    SchemaChange:
+      description: One online schema change, as an object with exactly one key.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [add_field]
+          properties:
+            add_field:
+              $ref: "#/components/schemas/ScalarFieldSpec"
+        - type: object
+          additionalProperties: false
+          required: [drop_field]
+          properties:
+            drop_field:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+        - type: object
+          additionalProperties: false
+          required: [rename_field]
+          properties:
+            rename_field:
+              type: object
+              additionalProperties: false
+              required: [from, to]
+              properties:
+                from:
+                  type: string
+                to:
+                  type: string
+    PrimaryKey:
+      description: A primary key, typed by the schema.
+      oneOf:
+        - type: integer
+          format: int64
+        - type: string
+          minLength: 1
+          maxLength: 1024
+    Record:
+      type: object
+      description: "A natural JSON document keyed by field name: the primary key, each vector field (an array of finite numbers; cosine vectors are normalized to unit length when written), each scalar field typed by the schema, and, with dynamic fields on, any undeclared key, which is kept in `$extra` as JSON. Nothing is coerced: a string never becomes a number. `$extra` itself is reserved, and a retired name cannot be stored."
+      additionalProperties: true
+    UpsertRecordsRequest:
+      type: object
+      additionalProperties: false
+      required: [records]
+      properties:
+        records:
+          type: array
+          description: Whole records; each needs its primary key, every vector field, and every non-nullable field.
+          items:
+            $ref: "#/components/schemas/Record"
+    UpdateRecordsRequest:
+      type: object
+      additionalProperties: false
+      required: [records]
+      properties:
+        records:
+          type: array
+          description: Partial documents; each holds the primary key and the fields to change. A value replaces a field and `null` clears it (or removes a dynamic key).
+          items:
+            $ref: "#/components/schemas/Record"
+    DeleteRecordsRequest:
+      type: object
+      additionalProperties: false
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/PrimaryKey"
+    GetRecordsRequest:
+      type: object
+      additionalProperties: false
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/PrimaryKey"
+        output_fields:
+          type: array
+          default: []
+          description: "Fields to return: declared field names, `$extra` for every visible dynamic key, or (with dynamic fields on) single dynamic keys. The primary key is always returned. Empty returns every field."
+          items:
+            type: string
+    RecordsResponse:
+      type: object
+      required: [records, missing_keys, snapshot]
+      properties:
+        records:
+          type: array
+          description: The live records found, in request order.
+          items:
+            $ref: "#/components/schemas/Record"
+        missing_keys:
+          type: array
+          description: The requested keys without a live record, in request order.
+          items:
+            $ref: "#/components/schemas/PrimaryKey"
+        snapshot:
+          $ref: "#/components/schemas/Snapshot"
+    CollectionRecords:
+      allOf:
+        - $ref: "#/components/schemas/CollectionContext"
+        - $ref: "#/components/schemas/RecordsResponse"
     DatabaseDescriptor:
       type: object
       required:
@@ -938,49 +1565,6 @@ components:
           type: string
         is_default:
           type: boolean
-    PutOperation:
-      type: object
-      required: [op, id, vector, metadata]
-      properties:
-        op:
-          type: string
-          enum: [put]
-        id:
-          type: string
-          minLength: 1
-          description: Record key; at most 1,024 bytes of UTF-8.
-        vector:
-          type: array
-          description: Exactly the collection's dimension count of finite numbers.
-          items:
-            type: number
-        metadata:
-          type: [object, "null"]
-          description: Stored as dynamic fields; keys cannot be `id`, `vector`, or `$extra`.
-    DeleteOperation:
-      type: object
-      required: [op, id]
-      properties:
-        op:
-          type: string
-          enum: [delete]
-        id:
-          type: string
-    WriteOperation:
-      oneOf:
-        - $ref: "#/components/schemas/PutOperation"
-        - $ref: "#/components/schemas/DeleteOperation"
-    WriteCollectionRequest:
-      type: object
-      required: [operations]
-      properties:
-        database_name:
-          type: string
-          default: default
-        operations:
-          type: array
-          items:
-            $ref: "#/components/schemas/WriteOperation"
     CommitAck:
       type: object
       required: [last_seq_no, applied_ops, snapshot]
@@ -1075,9 +1659,6 @@ components:
       type: object
       required: [vector, top_k]
       properties:
-        database_name:
-          type: string
-          default: default
         vector:
           type: array
           items:
@@ -1111,10 +1692,12 @@ components:
       properties:
         id:
           type: string
+          description: The primary key as text.
         value:
           type: number
         metadata:
-          description: The record's metadata, any JSON value (including null).
+          type: object
+          description: The record's scalar fields and visible `$extra` keys, as JSON.
     QueryStageTimings:
       type: object
       required:
@@ -1418,7 +2001,7 @@ components:
       properties:
         field:
           type: string
-          description: Path of the field in the request, such as `operations[2].vector`.
+          description: Path of the field in the request, such as `records[2].price`, `keys[0]`, or `vectors[0].dimensions`.
         description:
           type: string
     ErrorDetails:
