@@ -70,7 +70,8 @@ fn wal_len(path: &Path) -> usize {
 
 #[tokio::test]
 async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() {
-    let root = support::unique_temp_dir("storage-wal-one-frame");
+    let root_dir = support::unique_temp_dir("storage-wal-one-frame");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let active = create_documents(&engine).await;
 
@@ -109,7 +110,8 @@ async fn multi_op_batch_is_committed_as_one_wal_frame_with_contiguous_seq_nos() 
 
 #[tokio::test]
 async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
-    let root = support::unique_temp_dir("storage-wal-torn-batch");
+    let root_dir = support::unique_temp_dir("storage-wal-torn-batch");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let active = create_documents(&engine).await;
 
@@ -141,7 +143,8 @@ async fn batch_torn_at_any_byte_is_invisible_as_a_whole() {
 
 #[tokio::test]
 async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
-    let root = support::unique_temp_dir("storage-wal-torn-append");
+    let root_dir = support::unique_temp_dir("storage-wal-torn-append");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let active = create_documents(&engine).await;
 
@@ -187,7 +190,8 @@ async fn torn_tail_then_append_then_reopen_keeps_every_acknowledged_write() {
 
 #[tokio::test]
 async fn garbage_tail_is_truncated_before_the_next_write() {
-    let root = support::unique_temp_dir("storage-wal-garbage-tail");
+    let root_dir = support::unique_temp_dir("storage-wal-garbage-tail");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let active = create_documents(&engine).await;
 
@@ -223,7 +227,8 @@ async fn garbage_tail_is_truncated_before_the_next_write() {
 
 #[tokio::test]
 async fn multi_op_batches_survive_reopen_flush_and_rotation() {
-    let root = support::unique_temp_dir("storage-wal-batch-flush");
+    let root_dir = support::unique_temp_dir("storage-wal-batch-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     create_documents(&engine).await;
 
@@ -313,7 +318,8 @@ async fn multi_op_batches_survive_reopen_flush_and_rotation() {
 
 #[tokio::test]
 async fn a_flush_after_a_torn_tail_rotates_then_deletes_the_repaired_file() {
-    let root = support::unique_temp_dir("storage-wal-torn-flush");
+    let root_dir = support::unique_temp_dir("storage-wal-torn-flush");
+    let root = root_dir.path().to_path_buf();
     let engine = open(&root);
     let active = create_documents(&engine).await;
 

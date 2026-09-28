@@ -25,4 +25,5 @@ tonic-types.workspace = true
 [dev-dependencies]
 logpose-config = { path = "../logpose-config" }
 logpose-core = { path = "../logpose-core" }
+tempfile.workspace = true
 tokio-stream.workspace = true

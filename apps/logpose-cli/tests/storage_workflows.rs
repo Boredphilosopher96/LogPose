@@ -19,12 +19,7 @@ use logpose_types as _;
 use ratatui as _;
 use serde as _;
 use serde_json as _;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::Path, process::Command};
 use tokio as _;
 use walkdir as _;
 
@@ -365,28 +360,21 @@ storage_root = ".logpose-test""#;
         .expect("cli command should run")
 }
 
-struct TempRoot {
-    path: PathBuf,
-}
+/// A fresh temp directory named `logpose-{prefix}-…`, removed when it drops, also when the
+/// test panics.
+struct TempRoot(tempfile::TempDir);
 
 impl TempRoot {
     fn new(prefix: &str) -> Self {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-        fs::create_dir_all(&path).expect("temp dir should be created");
-        Self { path }
+        Self(
+            tempfile::Builder::new()
+                .prefix(&format!("logpose-{prefix}-"))
+                .tempdir()
+                .expect("temp dir should be created"),
+        )
     }
 
     fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        self.0.path()
     }
 }

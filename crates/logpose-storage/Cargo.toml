@@ -33,3 +33,4 @@ uuid.workspace = true
 [dev-dependencies]
 logpose-query = { path = "../logpose-query" }
 rand = "0.10.1"
+tempfile.workspace = true

@@ -1285,6 +1285,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -1311,6 +1312,7 @@ dependencies = [
  "logpose-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",
@@ -1371,6 +1373,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "walkdir",
 ]
@@ -1389,6 +1392,7 @@ dependencies = [
  "logpose-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -1421,6 +1425,7 @@ dependencies = [
  "logpose-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1450,6 +1455,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1487,6 +1493,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tonic",
@@ -1514,6 +1521,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1535,6 +1543,7 @@ dependencies = [
  "protoc-bin-vendored",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1558,6 +1567,9 @@ dependencies = [
 [[package]]
 name = "logpose-vfs"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "logpose-wal"

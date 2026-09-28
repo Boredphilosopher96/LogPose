@@ -14,11 +14,10 @@ use logpose_types::{
     value::Value,
 };
 use std::{
-    fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use tempfile::TempDir;
 
 /// A deterministic generator (SplitMix64).
 #[derive(Clone, Debug)]
@@ -70,16 +69,13 @@ pub fn near(rng: &mut Rng, center: &[f32], spread: f32) -> Vec<f32> {
         .collect()
 }
 
-pub fn unique_temp_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time should move forward")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("logpose-{name}-{unique}"));
-    if path.exists() {
-        fs::remove_dir_all(&path).expect("stale temp dir should be removable");
-    }
-    path
+/// A fresh directory named `logpose-{name}-…` under the system temp directory, removed when
+/// the returned guard drops, also when the test panics.
+pub fn unique_temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-{name}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
 
 /// A typed collection on its own local engine.
@@ -87,7 +83,9 @@ pub struct Fixture {
     pub engine: Engine,
     pub handle: Arc<CollectionHandle>,
     pub reference: CollectionRef,
-    pub root: PathBuf,
+    /// The engine's storage root, removed when the fixture drops. Declared last, so it drops
+    /// after the engine.
+    pub dir: TempDir,
 }
 
 impl Fixture {
@@ -100,9 +98,9 @@ impl Fixture {
         policy: IndexPolicy,
         fields: &[(&str, FieldType)],
     ) -> Self {
-        let root = unique_temp_dir(label);
+        let dir = unique_temp_dir(label);
         let engine = Engine::open_local(
-            &root,
+            dir.path(),
             EngineConfig {
                 index: policy,
                 resolver: Some(logpose_query::resolver()),
@@ -110,7 +108,26 @@ impl Fixture {
             },
         )
         .expect("engine should open");
-        Self::create(engine, root, dims, metric, fields).await
+        Self::create(engine, dir, dims, metric, fields).await
+    }
+
+    /// The engine's storage root.
+    pub fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Drop the engine and hand back its storage root, which stays until the returned guard
+    /// drops, for tests that change files on disk and reopen.
+    pub fn close(self) -> TempDir {
+        let Self {
+            engine,
+            handle,
+            dir,
+            ..
+        } = self;
+        drop(handle);
+        drop(engine);
+        dir
     }
 
     /// Reopen on the same root (the previous engine must be dropped).
@@ -128,7 +145,7 @@ impl Fixture {
 
     async fn create(
         engine: Engine,
-        root: PathBuf,
+        dir: TempDir,
         dims: usize,
         metric: DistanceMetric,
         fields: &[(&str, FieldType)],
@@ -155,7 +172,7 @@ impl Fixture {
             engine,
             handle,
             reference,
-            root,
+            dir,
         }
     }
 

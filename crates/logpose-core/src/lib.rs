@@ -1012,10 +1012,7 @@ mod tests {
     use logpose_config::BootstrapTokenConfig;
     use logpose_storage::CreateCollectionRequest;
     use logpose_types::DistanceMetric;
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use tempfile::TempDir;
 
     #[test]
     fn rejects_reserved_anonymous_local_node_name_at_runtime_bootstrap() {
@@ -1050,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_collection_with_auth_binds_policy_checks_to_database_name() {
-        let state = AppState::new(auth_test_config(
+        let (config, _root) = auth_test_config(
             "core-auth-database-scope",
             vec![
                 BootstrapTokenConfig {
@@ -1070,7 +1067,8 @@ mod tests {
                     ),
                 },
             ],
-        ));
+        );
+        let state = AppState::new(config);
         state
             .control
             .set_database_access_policy(DatabaseAccessPolicy {
@@ -1104,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_database_authentication_mode_allows_unauthenticated_database_access() {
-        let state = AppState::new(auth_test_config(
+        let (config, _root) = auth_test_config(
             "core-auth-disabled-mode",
             vec![BootstrapTokenConfig {
                 token: "operator-token".to_owned(),
@@ -1114,7 +1112,8 @@ mod tests {
                     AccessTier::Operator,
                 ),
             }],
-        ));
+        );
+        let state = AppState::new(config);
         state
             .control
             .set_database_access_policy(DatabaseAccessPolicy {
@@ -1144,7 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_principals_override_bootstrap_access_tier_during_authentication() {
-        let state = AppState::new(auth_test_config(
+        let (config, _root) = auth_test_config(
             "core-auth-persisted-principal",
             vec![BootstrapTokenConfig {
                 token: "operator-token".to_owned(),
@@ -1154,7 +1153,8 @@ mod tests {
                     AccessTier::Operator,
                 ),
             }],
-        ));
+        );
+        let state = AppState::new(config);
         state
             .control
             .catalog_store()
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_principal_overrides_survive_local_restart() {
-        let config = auth_test_config(
+        let (config, _root) = auth_test_config(
             "core-auth-persisted-principal-restart",
             vec![BootstrapTokenConfig {
                 token: "operator-token".to_owned(),
@@ -1223,20 +1223,23 @@ mod tests {
         );
     }
 
-    fn auth_test_config(label: &str, bootstrap_tokens: Vec<BootstrapTokenConfig>) -> LogPoseConfig {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let storage_root = std::env::temp_dir().join(format!("logpose-core-{label}-{suffix}"));
-        fs::create_dir_all(&storage_root).expect("auth test storage root should be created");
+    /// A node configuration with `bootstrap_tokens`, and its storage root's guard: keep the
+    /// guard alive for as long as a node runs on the configuration, restarts included.
+    fn auth_test_config(
+        label: &str,
+        bootstrap_tokens: Vec<BootstrapTokenConfig>,
+    ) -> (LogPoseConfig, TempDir) {
+        let storage_root = tempfile::Builder::new()
+            .prefix(&format!("logpose-core-{label}-"))
+            .tempdir()
+            .expect("auth test storage root should be created");
 
         let mut config = LogPoseConfig {
             node_name: label.to_owned(),
-            storage_root,
+            storage_root: storage_root.path().to_path_buf(),
             ..LogPoseConfig::default()
         };
         config.auth.bootstrap_tokens = bootstrap_tokens;
-        config
+        (config, storage_root)
     }
 }

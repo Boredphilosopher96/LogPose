@@ -26,11 +26,10 @@ use logpose_types::{
 use serde as _;
 use serde_json::{Value, json};
 use std::{
-    fs,
     net::{SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use thiserror as _;
 use tokio_stream as _;
@@ -41,7 +40,11 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     let temp_root = unique_temp_dir("client-grpc");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
@@ -330,7 +333,11 @@ async fn grpc_client_manages_typed_schemas_and_records() {
     let temp_root = unique_temp_dir("client-grpc-typed");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
@@ -544,7 +551,11 @@ async fn grpc_client_round_trips_database_policy_over_grpc() {
     let temp_root = unique_temp_dir("client-grpc-policy");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
@@ -592,7 +603,11 @@ async fn grpc_client_round_trips_database_descriptors_over_grpc() {
     let temp_root = unique_temp_dir("client-grpc-namespace");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
@@ -640,7 +655,11 @@ async fn grpc_client_reads_runtime_status_and_collection_placement() {
     let temp_root = unique_temp_dir("client-runtime-status");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     state
         .control
@@ -690,7 +709,9 @@ async fn grpc_client_requires_auth_token_for_runtime_status_when_server_auth_is_
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
     let state = Arc::new(AppState::new(auth_test_config(
-        &temp_root, rest_addr, grpc_addr,
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
     )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
@@ -727,7 +748,9 @@ async fn grpc_client_enforces_read_only_token_permissions() {
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
     let state = Arc::new(AppState::new(auth_test_config(
-        &temp_root, rest_addr, grpc_addr,
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
     )));
 
     state
@@ -779,7 +802,7 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
     let state = Arc::new(AppState::new(test_config_with_role(
-        &temp_root,
+        temp_root.path(),
         rest_addr,
         grpc_addr,
         logpose_types::NodeRole::Data,
@@ -825,7 +848,11 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
     let temp_root = unique_temp_dir("client-grpc-cooperative");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
 
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
@@ -924,7 +951,11 @@ async fn grpc_client_counts_scrolls_scans_and_writes_by_filter() {
     let temp_root = unique_temp_dir("client-grpc-scroll");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
-    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let state = Arc::new(AppState::new(test_config(
+        temp_root.path(),
+        rest_addr,
+        grpc_addr,
+    )));
     let server = tokio::spawn(logpose_api_grpc::serve(state));
     wait_for_port(grpc_addr).await;
     let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
@@ -1178,12 +1209,11 @@ async fn wait_for_port(address: SocketAddr) {
     );
 }
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-    fs::create_dir_all(&dir).expect("temp dir should be created");
-    dir
+/// A fresh temp directory named `logpose-{prefix}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-{prefix}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }

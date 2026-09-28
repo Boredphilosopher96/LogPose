@@ -167,6 +167,8 @@ cargo run --release -p logpose-bench -- --base-fvecs sift_base.fvecs --query-fve
 cargo run --release -p logpose-bench -- --help
 ```
 
+Without `--data-dir`, the harness runs the engine in a fresh `logpose-bench-<pid>-<nanos>` directory under the system temp directory and deletes it when the run ends, after the engine closes, also when the run fails with an error. A directory passed with `--data-dir` is created if missing and never deleted.
+
 The JSON report records the machine, configuration, and per-case results. Committed baselines live in `benches/baselines/`; see its README for how to reproduce them. Compare new engine work against the latest baseline at the same preset and seed.
 
 ## Non-Negotiable Harness Rules
@@ -191,6 +193,23 @@ LogPose uses one consistency rule for test organization:
 - place async, filesystem, workflow, harness, snapshot, and future simulation tests in crate-level `tests/`
 
 This keeps production files focused while still allowing private units to stay close to the code they exercise.
+
+## Temporary Directories
+
+Every directory or file a test, benchmark, or harness creates on the real filesystem is removed when the test ends, also when it fails or panics. A test run must leave nothing behind in the system temp directory.
+
+- Create it with the `tempfile` crate (a dev-dependency of every crate that needs one), through the crate's helper such as `unique_temp_dir(label)`. The helpers name it `logpose-<label>-<random>` so a directory seen while a test runs can be traced to its test. Never hand-roll `std::env::temp_dir().join(...)`, and do not remove directories by hand at the end of a test: the guard does it, including on panic.
+- Hold the `TempDir` guard for as long as anything uses the directory, including across a simulated crash and reopen. Helpers that build a node configuration return the guard beside it, as in `let (config, _root) = test_config("label");`. Bind it to a named variable such as `_root`, never to `_`, which drops it at once.
+- Declare the guard before the engine or node that uses the directory, or as the last field of a fixture struct, so the engine closes before the directory is removed.
+- A harness that keeps a failing case's directory for debugging keeps it only on failure and prints its path. The storage and service harnesses replay a failure from its seed instead, so they remove the directory either way.
+
+Tests honor `TMPDIR`. To check that a run leaks nothing, point it at an empty directory and check that the directory is still empty afterwards:
+
+```bash
+export TMPDIR="$(mktemp -d)"
+cargo test --workspace
+ls -A "$TMPDIR"
+```
 
 ## CI Philosophy
 

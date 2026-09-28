@@ -64,6 +64,8 @@ use std::{
     ops::Deref,
     sync::{Arc, Mutex, PoisonError},
 };
+#[cfg(test)]
+use tempfile as _;
 use tonic::{
     Request, Response, Status,
     codegen::InterceptedService,

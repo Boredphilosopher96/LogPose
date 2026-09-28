@@ -3,13 +3,12 @@ use logpose_client::LogPoseClient;
 use logpose_config::{AuthConfig, BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
 use std::{
-    fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{Arc, mpsc},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 
@@ -21,6 +20,9 @@ pub struct TestServerFixture {
     pub auth_token: Option<String>,
     runtime: Runtime,
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Removes `temp_root` when the fixture drops. Declared last, so the server and its
+    /// runtime are gone first.
+    _temp_dir: tempfile::TempDir,
 }
 
 const STARTUP_ATTEMPTS: usize = 5;
@@ -77,7 +79,8 @@ impl TestServerFixture {
         grpc_host: &str,
         auth: AuthConfig,
     ) -> Self {
-        let temp_root = unique_temp_dir(node_name);
+        let temp_dir = unique_temp_dir(node_name);
+        let temp_root = temp_dir.path().to_path_buf();
         let storage_root = temp_root.join("data");
         let readiness_auth_token = auth
             .bootstrap_tokens
@@ -149,6 +152,7 @@ impl TestServerFixture {
                         auth_token: readiness_auth_token.clone(),
                         runtime,
                         server,
+                        _temp_dir: temp_dir,
                     };
                 }
                 Err(_error) if attempt + 1 < STARTUP_ATTEMPTS => {
@@ -297,7 +301,6 @@ impl Drop for TestServerFixture {
     fn drop(&mut self) {
         self.server.abort();
         let _ = self.runtime.block_on(async { (&mut self.server).await });
-        let _ = fs::remove_dir_all(&self.temp_root);
     }
 }
 
@@ -492,12 +495,11 @@ fn dial_address(address: SocketAddr) -> SocketAddr {
     }
 }
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("logpose-{prefix}-{suffix}"));
-    fs::create_dir_all(&dir).expect("temp dir should be created");
-    dir
+/// A fresh temp directory named `logpose-{prefix}-…`, removed when the returned
+/// guard drops, also when the test panics.
+fn unique_temp_dir(prefix: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("logpose-{prefix}-"))
+        .tempdir()
+        .expect("temp dir should be created")
 }
