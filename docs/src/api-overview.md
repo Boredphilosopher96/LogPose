@@ -121,6 +121,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | `STORAGE_ROOT_LOCKED`        | `FAILED_PRECONDITION` | `storage_root`, `holder_pid`                                    | no         |
 | `SNAPSHOT_EXPIRED`           | `FAILED_PRECONDITION` | `collection`                                                    | no         |
 | `TOO_MANY_SNAPSHOTS`         | `RESOURCE_EXHAUSTED`  | `collection`                                                    | no         |
+| `WRITE_STALLED`              | `UNAVAILABLE`         | `collection`                                                    | 1 s        |
 | `UNAUTHENTICATED`            | `UNAUTHENTICATED`     |                                                                 | no         |
 | `PERMISSION_DENIED`          | `PERMISSION_DENIED`   |                                                                 | no         |
 | `NOT_OWNER`                  | `UNAVAILABLE`         | `collection`, `node`, `owner_node` when known                   | 1 s        |

@@ -62,6 +62,12 @@ pub struct MemtableConfig {
     /// Share of the engine's `memory_limit` that every collection's memtables may hold
     /// together; past it the engine flushes the largest. Default 0.125.
     pub global_fraction: f64,
+    /// Most memtables frozen and waiting for their flush at once. With this many frozen, an
+    /// active memtable that reaches a trigger stalls writes until a flush commits. Default 2.
+    pub max_frozen: usize,
+    /// How long a write may wait through a write stall before it fails with
+    /// `WriteStalled`. Default 30 seconds.
+    pub write_stall_timeout: Duration,
 }
 
 impl Default for MemtableConfig {
@@ -71,6 +77,8 @@ impl Default for MemtableConfig {
             max_rows: 1_000_000,
             max_age: Duration::from_secs(10 * 60),
             global_fraction: 0.125,
+            max_frozen: 2,
+            write_stall_timeout: Duration::from_secs(30),
         }
     }
 }

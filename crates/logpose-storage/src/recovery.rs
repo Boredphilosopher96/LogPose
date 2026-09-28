@@ -31,7 +31,6 @@ use crate::{
     fs_util::read_json,
     gc::{durability_barrier, remove_orphans},
     handle::{CollectionHandle, CollectionMeta},
-    maintenance::MaintenanceState,
     manifest::{Manifest, load_manifest, manifest_corrupt, read_current},
     memtable::MemtableData,
     segment::SegmentHandle,
@@ -75,7 +74,7 @@ pub(crate) struct DurableStart {
 }
 
 impl CoreRef {
-    /// Recover the collection in `dir`: read its descriptor, placement, and maintenance status,
+    /// Recover the collection in `dir`: read its descriptor and placement,
     /// then recover its files (see the module docs), build `Version` 1, and start the writer.
     pub(crate) fn recover_collection(&self, dir: &Path) -> RecoveredCollection {
         let descriptor_path = dir.join("descriptor.json");
@@ -118,24 +117,17 @@ impl CoreRef {
 
     fn open_collection(&self, descriptor: CollectionDescriptor) -> Result<Arc<CollectionHandle>> {
         let assignment = self.load_collection_assignment(&descriptor)?;
-        let persisted = self.load_maintenance_status(&descriptor)?;
-        let (jobs, resume, changed) = MaintenanceState::recovered(persisted);
         let mut durable = self.recover_manifest(&descriptor)?;
-        if changed {
-            self.persist_maintenance_status(&descriptor, jobs.status())?;
-        }
         let state = self.recover_segments(&descriptor, &mut durable)?;
         let (state, mut wal) = self.recover_wal(&descriptor, &durable.manifest, state)?;
         // Every operation in these files is in a segment of the durable manifest.
         wal.remove_checkpointed(durable.manifest.checkpoint_seq_no)?;
         let meta = Arc::new(CollectionMeta::new(descriptor, assignment));
-        let handle = self.start_collection(meta, durable, state, wal, jobs)?;
-        // Persisted maintenance resumes on the first data-plane access, not here: a node that
-        // only reports status for a collection it does not serve must never run its jobs.
-        if !resume.is_empty() {
-            handle.arm_maintenance_resume();
-        }
-        Ok(handle)
+        // Maintenance starts on the first data-plane access, not here: a node that only
+        // reports status for a collection it does not serve must never run its jobs. The first
+        // tick after that plans whatever the recovered state is due (a replayed memtable over
+        // a flush trigger, segments the policy would merge).
+        self.start_collection(meta, durable, state, wal, false)
     }
 
     /// The durability barrier, the manifest `CURRENT` names, and orphan cleanup relative to it.
@@ -237,7 +229,7 @@ impl CoreRef {
         durable: DurableStart,
         state: LogicalState,
         wal: WalWriter,
-        jobs: MaintenanceState,
+        armed: bool,
     ) -> Result<Arc<CollectionHandle>> {
         let DurableStart {
             manifest,
@@ -266,7 +258,7 @@ impl CoreRef {
         let handle = Arc::new(CollectionHandle::new(
             version,
             channels,
-            jobs,
+            armed,
             Arc::clone(&self.tokens),
         ));
         writer::spawn(

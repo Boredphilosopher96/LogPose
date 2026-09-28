@@ -8,13 +8,12 @@ use crate::{
     error::{io_message, json_message},
     fs_util::{atomic_write, cleanup_dir, read_json},
     handle::{CollectionHandle, CollectionMeta},
-    maintenance::MaintenanceState,
     manifest::{Manifest, publish_manifest},
     recovery::{DurableStart, new_state},
     writer::{PkIndex, checkpoint_frame},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionAssignment, CollectionRef, MaintenanceStatus, Result, UnitId};
+use logpose_types::{CollectionAssignment, CollectionRef, Result, UnitId};
 use logpose_wal::{WalRecovery, WalWriter};
 use std::{
     path::{Path, PathBuf},
@@ -94,7 +93,6 @@ impl EngineCore {
         let manifest = Manifest::empty(descriptor.collection_id.clone(), descriptor.schema()?);
         publish_manifest(self.vfs.as_ref(), &descriptor.root_path, &manifest)
             .map_err(|failure| failure.error)?;
-        self.persist_maintenance_status(descriptor, &MaintenanceStatus::default())?;
         let wal = WalRecovery::open(
             Arc::clone(&self.vfs),
             Self::wal_dir(descriptor),
@@ -175,7 +173,7 @@ impl CoreRef {
             },
             state,
             wal,
-            MaintenanceState::default(),
+            true,
         )?;
         reservation.commit(Arc::clone(&handle));
         Ok(handle)

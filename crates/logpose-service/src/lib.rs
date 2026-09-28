@@ -570,22 +570,12 @@ impl LogPoseDataService {
         self.storage.stats_descriptor(descriptor, snapshot).await
     }
 
-    /// Load persisted maintenance state without reconstructing full stats.
+    /// The collection's maintenance status (runtime state) without reconstructing full stats.
     pub async fn maintenance_status_descriptor(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
         self.storage.maintenance_status_descriptor(descriptor).await
-    }
-
-    /// Resume persisted maintenance for a descriptor when the current runtime can serve it.
-    pub async fn recover_maintenance_descriptor(
-        &self,
-        descriptor: &logpose_catalog::CollectionDescriptor,
-    ) -> Result<()> {
-        self.storage
-            .recover_maintenance_descriptor(descriptor)
-            .await
     }
 
     /// Flush the mutable delta to a new segment.
@@ -1860,6 +1850,214 @@ mod tests {
         assert_eq!(stats.live_record_count, 2);
 
         drop(service);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The runtime status sums each local collection's maintenance status (runtime state the
+    /// engine keeps): collections with jobs waiting and how many, collections with a job
+    /// running, and collections whose last job failed, telling apart collections of the same
+    /// name in different databases.
+    #[tokio::test]
+    async fn runtime_status_aggregates_every_local_collections_maintenance_backlog() {
+        /// A local engine that reports a chosen maintenance status per collection.
+        struct FixedMaintenance {
+            inner: LocalStorageEngine,
+            statuses: std::collections::BTreeMap<String, MaintenanceStatus>,
+        }
+
+        #[async_trait]
+        impl StorageEngine for FixedMaintenance {
+            async fn engine_name(&self) -> &'static str {
+                "fixed-maintenance"
+            }
+
+            async fn create_collection(
+                &self,
+                request: CreateCollectionRequest,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                self.inner.create_collection(request).await
+            }
+
+            async fn create_collection_with_assignment(
+                &self,
+                request: CreateCollectionRequest,
+                assignment: CollectionAssignment,
+                leader_fence: Option<LeadershipFence>,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                self.inner
+                    .create_collection_with_assignment(request, assignment, leader_fence)
+                    .await
+            }
+
+            async fn open_collection(
+                &self,
+                name: &str,
+            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
+                self.inner.open_collection(name).await
+            }
+
+            async fn has_local_collection(&self, name: &str) -> logpose_types::Result<bool> {
+                self.inner.has_local_collection(name).await
+            }
+
+            async fn local_collection_matches_descriptor(
+                &self,
+                descriptor: &logpose_catalog::CollectionDescriptor,
+            ) -> logpose_types::Result<bool> {
+                self.inner
+                    .local_collection_matches_descriptor(descriptor)
+                    .await
+            }
+
+            async fn list_collections(
+                &self,
+            ) -> logpose_types::Result<Vec<logpose_catalog::CollectionDescriptor>> {
+                self.inner.list_collections().await
+            }
+
+            async fn collection_assignment_descriptor(
+                &self,
+                descriptor: &logpose_catalog::CollectionDescriptor,
+            ) -> logpose_types::Result<CollectionAssignment> {
+                self.inner
+                    .collection_assignment_descriptor(descriptor)
+                    .await
+            }
+
+            async fn write(
+                &self,
+                collection_name: &str,
+                operations: Vec<WriteOperation>,
+            ) -> logpose_types::Result<CommitAck> {
+                self.inner.write(collection_name, operations).await
+            }
+
+            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                self.inner.snapshot(collection_name).await
+            }
+
+            async fn scan_exact(
+                &self,
+                collection_name: &str,
+                snapshot: Option<Snapshot>,
+            ) -> logpose_types::Result<Vec<VisibleRecord>> {
+                self.inner.scan_exact(collection_name, snapshot).await
+            }
+
+            async fn ann_search_selected(
+                &self,
+                collection_name: &str,
+                snapshot: Option<Snapshot>,
+                immutable_unit_ids: Vec<String>,
+                request: AnnSearchRequest,
+                filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
+            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
+                self.inner
+                    .ann_search_selected(
+                        collection_name,
+                        snapshot,
+                        immutable_unit_ids,
+                        request,
+                        filter,
+                    )
+                    .await
+            }
+
+            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                self.inner.flush(collection_name).await
+            }
+
+            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
+                self.inner.compact(collection_name).await
+            }
+
+            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
+                self.inner.stats(collection_name).await
+            }
+
+            async fn maintenance_status_descriptor(
+                &self,
+                descriptor: &logpose_catalog::CollectionDescriptor,
+            ) -> logpose_types::Result<MaintenanceStatus> {
+                Ok(self
+                    .statuses
+                    .get(&descriptor.lookup_name())
+                    .cloned()
+                    .unwrap_or_default())
+            }
+
+            async fn inspect(
+                &self,
+                collection_name: &str,
+                target: InspectTarget,
+            ) -> logpose_types::Result<InspectReport> {
+                self.inner.inspect(collection_name, target).await
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "logpose-service-maintenance-backlog-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        let status =
+            |pending: &[&str], in_progress: Option<&str>, error: Option<&str>| MaintenanceStatus {
+                pending: pending.iter().map(|label| (*label).to_owned()).collect(),
+                in_progress: in_progress.map(str::to_owned),
+                last_error: error.map(str::to_owned),
+                completed_runs: 0,
+            };
+        let storage = Arc::new(FixedMaintenance {
+            inner: LocalStorageEngine::new(root.join("data")).expect("engine should open"),
+            statuses: [
+                (
+                    "default/documents".to_owned(),
+                    status(&["flush", "compact"], None, Some("disk full")),
+                ),
+                (
+                    "analytics/documents".to_owned(),
+                    status(&["compact"], Some("flush"), None),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        let data = Arc::new(LogPoseDataService::new(
+            Arc::clone(&storage) as Arc<dyn StorageEngine>
+        ));
+        let control = LogPoseControlService::new(
+            data,
+            local_catalog_store(root.join("catalog")).expect("catalog store should open"),
+            LogPoseConfig::default(),
+            BuildInfo::current(),
+        );
+        for database in ["default", "analytics"] {
+            control
+                .create_collection(CreateCollectionRequest {
+                    database_name: database.to_owned(),
+                    name: "documents".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Dot,
+                })
+                .await
+                .expect("collection should be created");
+        }
+
+        let runtime = control
+            .runtime_status()
+            .await
+            .expect("runtime status should load");
+        assert_eq!(runtime.collection_count, 2);
+        assert_eq!(runtime.maintenance.collections_with_pending, 2);
+        assert_eq!(runtime.maintenance.pending_operations, 3);
+        assert_eq!(runtime.maintenance.collections_in_progress, 1);
+        assert_eq!(runtime.maintenance.collections_with_errors, 1);
+
+        drop(control);
         drop(storage);
         let _ = std::fs::remove_dir_all(&root);
     }
