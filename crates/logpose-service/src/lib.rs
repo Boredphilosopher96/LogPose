@@ -1941,16 +1941,26 @@ mod tests {
         assert_eq!(backlog.collections_with_errors, 1);
     }
 
+    /// Poll `done` until it holds, failing after ten seconds.
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// The runtime status covers every local collection, telling apart collections of the same
-    /// name in different databases, and reads each one's maintenance status from its handle.
-    #[tokio::test]
+    /// name in different databases, and reads each one's maintenance status from its own
+    /// handle: a flush waiting on one of them shows up once, and only for that collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_status_reports_every_local_collection() {
         let root = temp_root("runtime-status");
         let data = Arc::new(LogPoseDataService::local(&root).expect("service should open"));
         let engine = data.engine().clone();
         let control = LogPoseControlService::new(
-            data,
-            Arc::new(engine),
+            Arc::clone(&data),
+            Arc::new(engine.clone()),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );
@@ -1982,7 +1992,174 @@ mod tests {
         );
         assert_eq!(runtime.maintenance, MaintenanceBacklog::default());
 
-        drop(control);
+        // Hold every maintenance permit, so an explicit flush of one collection waits.
+        engine.scheduler().pause();
+        data.upsert(
+            "analytics/documents",
+            vec![Record::new("first").with_vector("vector", vec![1.0, 0.0])],
+        )
+        .await
+        .expect("write should succeed");
+        let flush = tokio::spawn({
+            let data = Arc::clone(&data);
+            async move { data.flush("analytics/documents").await }
+        });
+        let analytics = engine
+            .collection(&CollectionRef::new("analytics", "documents"))
+            .expect("the collection is open");
+        wait_until("the flush to wait for its permit", || {
+            analytics.maintenance_status().pending == ["flush"]
+        })
+        .await;
+        let waiting = analytics.maintenance_status();
+        let runtime = control
+            .runtime_status()
+            .await
+            .expect("runtime status should load");
+        assert_eq!(runtime.maintenance.collections_with_pending, 1);
+        assert_eq!(runtime.maintenance.pending_operations, 1);
+        assert_eq!(
+            runtime.maintenance.collections_in_progress,
+            usize::from(waiting.in_progress.is_some())
+        );
+        assert_eq!(runtime.maintenance.collections_with_errors, 0);
+
+        engine.scheduler().resume();
+        flush
+            .await
+            .expect("the flush task should finish")
+            .expect("the flush should succeed");
+        let runtime = control
+            .runtime_status()
+            .await
+            .expect("runtime status should load");
+        assert_eq!(runtime.maintenance, MaintenanceBacklog::default());
+
+        drop((control, analytics, data, engine));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dropped collection is gone for every call, including calls holding its old
+    /// descriptor, and its name can be reused: the new collection is a different one (another
+    /// id) and starts empty.
+    #[tokio::test]
+    async fn a_dropped_collection_can_be_recreated_empty_under_the_same_name() {
+        let root = temp_root("drop-recreate");
+        let service = LogPoseDataService::local(&root).expect("service should open");
+        let request = || CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot);
+        let first = service
+            .create_collection(request())
+            .await
+            .expect("collection should be created");
+        service
+            .upsert(
+                "documents",
+                vec![Record::new("old").with_vector("vector", vec![1.0, 0.0])],
+            )
+            .await
+            .expect("write should succeed");
+        service.flush("documents").await.expect("flush");
+
+        service
+            .drop_collection("documents", None)
+            .await
+            .expect("drop should succeed");
+        for error in [
+            service.get_collection("documents").await.map(|_| ()),
+            service.stats("documents").await.map(|_| ()),
+            service.stats_descriptor(&first, None).await.map(|_| ()),
+            service.drop_collection("documents", None).await,
+        ] {
+            let error = error.expect_err("a dropped collection is gone");
+            assert!(matches!(error, LogPoseError::NotFound { .. }), "{error}");
+        }
+
+        let second = service
+            .create_collection(request())
+            .await
+            .expect("the name can be reused");
+        assert_ne!(second.collection_id, first.collection_id);
+        let error = service
+            .stats_descriptor(&first, None)
+            .await
+            .expect_err("the old descriptor names the dropped collection, not the new one");
+        assert!(matches!(error, LogPoseError::NotFound { .. }), "{error}");
+        let stats = service.stats("documents").await.expect("stats");
+        assert_eq!(stats.live_record_count, 0);
+        assert_eq!(stats.segment_count, 0);
+        let fetched = service
+            .get_records("documents", vec![PrimaryKey::from("old")], Vec::new())
+            .await
+            .expect("get should succeed");
+        assert_eq!(fetched.records, vec![None]);
+        service
+            .upsert(
+                "documents",
+                vec![Record::new("new").with_vector("vector", vec![0.0, 1.0])],
+            )
+            .await
+            .expect("the new collection takes writes");
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A drop while writes are in flight waits for them: each write either commits before the
+    /// drop or fails with `NotFound`, never with an unknown outcome, and a collection created
+    /// again under the name holds none of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_during_writes_fails_them_cleanly() {
+        let root = temp_root("drop-during-writes");
+        let service = Arc::new(LogPoseDataService::local(&root).expect("service should open"));
+        let request = || CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot);
+        service
+            .create_collection(request())
+            .await
+            .expect("collection should be created");
+        let writers = (0..4)
+            .map(|writer| {
+                let service = Arc::clone(&service);
+                tokio::spawn(async move {
+                    let mut committed = 0_usize;
+                    loop {
+                        let record = Record::new(format!("w{writer}-{committed}"))
+                            .with_vector("vector", vec![1.0, 0.0]);
+                        match service.upsert("documents", vec![record]).await {
+                            Ok(_) => committed += 1,
+                            Err(error) => return (committed, error),
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        wait_until("the writers to commit", || {
+            service
+                .engine()
+                .collection(&CollectionRef::new_default("documents"))
+                .is_ok_and(|handle| handle.visible_seq_no() >= 20)
+        })
+        .await;
+
+        service
+            .drop_collection("documents", None)
+            .await
+            .expect("drop should succeed");
+        let mut committed = 0;
+        for writer in writers {
+            let (count, error) = writer.await.expect("writer task");
+            committed += count;
+            assert!(matches!(error, LogPoseError::NotFound { .. }), "{error}");
+        }
+        assert!(committed >= 20, "the writers committed before the drop");
+
+        service
+            .create_collection(request())
+            .await
+            .expect("the name can be reused");
+        let stats = service.stats("documents").await.expect("stats");
+        assert_eq!(stats.live_record_count, 0);
+
+        drop(service);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
