@@ -6,7 +6,7 @@ use std::sync::{Mutex, PoisonError};
 use rayon::prelude::*;
 
 use super::distance::RowQuery;
-use super::search::{BuildBuffers, Links, Mode, Scored, SearchStats, Walk, descend};
+use super::search::{BuildBuffers, Descent, Links, Mode, Scored, SearchStats, Walk};
 use super::{AllRows, GraphError, HnswGraph, HnswParams, SearchScratch, VectorSource};
 
 /// Rows inserted on one thread before the parallel phase, so that early
@@ -57,26 +57,24 @@ where
         row: target.row,
     };
     let mut stats = SearchStats::default();
-    let SearchScratch { beam, build } = scratch;
+    let SearchScratch { beam, build, .. } = scratch;
     let start = Scored {
         dist: source.distance_between(target.row, target.entry),
         row: target.entry,
     };
-    let (closest, _) = descend(
+    let descent = Descent {
         links,
-        &query,
-        None::<&AllRows>,
-        start,
-        target.level + 1..=target.top,
-        &mut beam.neighbors,
-        &mut stats,
-    );
+        query: &query,
+        filter: None::<&AllRows>,
+        low: target.level + 1,
+        top: target.top,
+        rows: target.rows,
+    };
+    descent.run(start, beam, &mut build.layer, &mut stats);
     let linked = target.level.min(target.top) + 1;
     if build.selected.len() < linked {
         build.selected.resize_with(linked, Vec::new);
     }
-    build.layer.clear();
-    build.layer.push(closest);
     let ef = params.build_ef();
     for level in (0..linked).rev() {
         beam.reset(target.rows);

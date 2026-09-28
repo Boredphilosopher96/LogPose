@@ -2,9 +2,8 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::ops::RangeInclusive;
 
-use super::{FilterStrategy, HnswGraph, QueryDistance, RowFilter};
+use super::{AllRows, FilterStrategy, HnswGraph, QueryDistance, RowFilter};
 
 /// Read access to adjacency lists, shared by the frozen graph and the
 /// locked lists used during parallel builds.
@@ -260,6 +259,8 @@ pub(super) struct BuildBuffers {
 #[derive(Clone, Debug, Default)]
 pub struct SearchScratch {
     pub(super) beam: BeamState,
+    /// Layer-0 entry rows found by a query's descent.
+    entries: Vec<Scored>,
     pub(super) build: BuildBuffers,
 }
 
@@ -415,45 +416,142 @@ where
     }
 }
 
-/// Greedy descent over `levels`, highest first. Level 0 is never visited.
+/// Beam width on the entry layer: the lowest layer a descent crosses before
+/// its full beam search (layer 1 for queries and for rows inserted at level
+/// 0).
 ///
-/// Returns the closest row found and, when `filter` is given, the closest
-/// matching row seen on the way down, which seeds filtered layer-0 searches
-/// whose matches lie far from the query.
-pub(super) fn descend<L, Q, F>(
-    links: &L,
-    query: &Q,
-    filter: Option<&F>,
-    start: Scored,
-    levels: RangeInclusive<usize>,
-    buffer: &mut Vec<u32>,
-    stats: &mut SearchStats,
-) -> (Scored, Option<Scored>)
+/// Greedy routing (a beam of one) is enough on the sparse top layers but not
+/// on the entry layer. On data whose clusters are almost equidistant
+/// (well-separated blobs in 64 or more dimensions), a single greedy path over
+/// the entry layer can stop in a cluster ranked 5th to 20th nearest to the
+/// query's own, with no layer-0 link into it, and a layer-0 beam of 64 rows
+/// fills with that cluster and never leaves it. A wider beam expands several
+/// of that cluster's entry-layer rows and their long links, which usually
+/// reach the right cluster, and all of them seed the next layer.
+///
+/// The width is fixed rather than tied to `M`: a larger `M` already gives
+/// every entry-layer row more links (graphs with `M` of 32 or 64 stranded
+/// no query in those measurements even without the beam), so a beam of `M`
+/// rows would only add distance work, and a smaller `M` needs the beam at
+/// least as much. The beam lowers the failure rate but does not remove it
+/// on every graph: routing between almost equidistant clusters stays
+/// probabilistic. See
+/// `docs/src/engine-core-design.md`, "Implementation Notes (HNSW Entry
+/// Beam)", for the measurements.
+pub(super) const ENTRY_BEAM: usize = 16;
+
+/// Descent through the upper layers `low..=top` (level 0 is never visited)
+/// to the entry rows of the layer below.
+///
+/// Layers above `low` are walked greedily, as in the paper; the entry layer
+/// `low` is searched with a beam of [`ENTRY_BEAM`] rows, and every row it
+/// keeps seeds the next layer. A single greedy path can stop in the wrong
+/// cluster of clustered data, where the next layer's beam may never leave
+/// it.
+pub(super) struct Descent<'a, L: ?Sized, Q: ?Sized, F: ?Sized> {
+    pub(super) links: &'a L,
+    pub(super) query: &'a Q,
+    /// When given, the closest matching row evaluated on the way down is
+    /// returned; it seeds filtered searches whose matches lie far from the
+    /// query.
+    pub(super) filter: Option<&'a F>,
+    /// Entry layer, the lowest layer visited (at least 1).
+    pub(super) low: usize,
+    /// Top layer, where `start` sits.
+    pub(super) top: usize,
+    /// Rows addressable in the graph (visited-set size).
+    pub(super) rows: usize,
+}
+
+impl<L, Q, F> Descent<'_, L, Q, F>
 where
     L: Links + ?Sized,
     Q: QueryDistance + ?Sized,
     F: RowFilter + ?Sized,
 {
-    let mut current = start;
-    let mut best_match = filter
-        .filter(|filter| filter.contains(start.row))
-        .map(|_| start);
-    let (low, top) = levels.into_inner();
-    for level in (low.max(1)..=top).rev() {
+    /// Descends from `start` and replaces `entries` with the entry rows for
+    /// the layer below `low`, closest first (just `start` when `low > top`).
+    /// Uses `state` as scratch, so the caller must reset it afterwards.
+    /// Returns the closest matching row seen when a filter is given.
+    pub(super) fn run(
+        &self,
+        start: Scored,
+        state: &mut BeamState,
+        entries: &mut Vec<Scored>,
+        stats: &mut SearchStats,
+    ) -> Option<Scored> {
+        entries.clear();
+        let mut best_match = self
+            .filter
+            .filter(|filter| filter.contains(start.row))
+            .map(|_| start);
+        let low = self.low.max(1);
+        if low > self.top {
+            entries.push(start);
+            return best_match;
+        }
+        let mut current = start;
+        for level in (low + 1..=self.top).rev() {
+            current = self.greedy(current, level, &mut state.neighbors, &mut best_match, stats);
+        }
+        // The entry-layer beam counts toward the distance work only: the
+        // other counters describe layer 0.
+        let mut walk_stats = SearchStats::default();
+        state.reset(self.rows);
+        state.seed(current, &AllRows, &mut walk_stats);
+        let walk = Walk {
+            links: self.links,
+            level: low,
+            query: self.query,
+            filter: &AllRows,
+            mode: Mode::Admit,
+            ef: ENTRY_BEAM,
+        };
+        walk.run(state, &mut walk_stats);
+        stats.distance_computations += walk_stats.distance_computations;
+        let queues = &mut state.queues;
+        if let Some(filter) = self.filter {
+            for &hit in queues
+                .results
+                .iter()
+                .chain(&queues.evicted)
+                .chain(&queues.deferred)
+            {
+                if best_match.is_none_or(|best| hit < best) && filter.contains(hit.row) {
+                    best_match = Some(hit);
+                }
+            }
+        }
+        entries.extend(queues.results.drain());
+        entries.sort_unstable();
+        best_match
+    }
+
+    /// Greedy walk on one layer: moves to the closest neighbor until none is
+    /// closer than the current row.
+    fn greedy(
+        &self,
+        start: Scored,
+        level: usize,
+        buffer: &mut Vec<u32>,
+        best_match: &mut Option<Scored>,
+        stats: &mut SearchStats,
+    ) -> Scored {
+        let mut current = start;
         loop {
             let mut improved = false;
-            links.neighbors_into(current.row, level, buffer);
+            self.links.neighbors_into(current.row, level, buffer);
             for &row in buffer.iter() {
                 let candidate = Scored {
-                    dist: query.distance(row),
+                    dist: self.query.distance(row),
                     row,
                 };
                 stats.distance_computations += 1;
-                if let Some(filter) = filter
+                if let Some(filter) = self.filter
                     && best_match.is_none_or(|best| candidate < best)
                     && filter.contains(row)
                 {
-                    best_match = Some(candidate);
+                    *best_match = Some(candidate);
                 }
                 if candidate < current {
                     current = candidate;
@@ -461,11 +559,10 @@ where
                 }
             }
             if !improved {
-                break;
+                return current;
             }
         }
     }
-    (current, best_match)
 }
 
 /// A search that can be extended to a larger `ef` without restarting.
@@ -505,8 +602,11 @@ where
                     .max(1),
             },
         };
-        let state = &mut scratch.beam;
-        state.reset(graph.len());
+        let SearchScratch {
+            beam: state,
+            entries,
+            ..
+        } = scratch;
         let mut stats = SearchStats::default();
         if let Some(entry) = graph.entry_point() {
             let start = Scored {
@@ -514,19 +614,24 @@ where
                 row: entry,
             };
             stats.distance_computations += 1;
-            let (closest, closest_match) = descend(
-                graph,
+            let descent = Descent {
+                links: graph,
                 query,
-                Some(filter),
-                start,
-                1..=graph.max_level(),
-                &mut state.neighbors,
-                &mut stats,
-            );
-            state.seed(closest, filter, &mut stats);
+                filter: Some(filter),
+                low: 1,
+                top: graph.max_level(),
+                rows: graph.len(),
+            };
+            let closest_match = descent.run(start, state, entries, &mut stats);
+            state.reset(graph.len());
+            for &seed in entries.iter() {
+                state.seed(seed, filter, &mut stats);
+            }
             if let Some(seed) = closest_match {
                 state.seed(seed, filter, &mut stats);
             }
+        } else {
+            state.reset(graph.len());
         }
         Self {
             graph,
