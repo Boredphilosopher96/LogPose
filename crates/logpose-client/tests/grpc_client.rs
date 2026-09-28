@@ -7,7 +7,7 @@ use logpose_auth::{
 use logpose_catalog as _;
 use logpose_client::{
     ClientError, CreateCollectionRequest, DatabaseAccessPolicy, DatabaseDescriptor,
-    DatabaseRoleBinding, LogPoseClient,
+    DatabaseRoleBinding, ErrorCode, ErrorReason, LogPoseClient, ServerError,
 };
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
@@ -27,7 +27,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror as _;
-use tonic as _;
+use tokio_stream as _;
+use tonic_types as _;
 
 #[tokio::test]
 async fn grpc_client_runs_metadata_and_collection_workflows() {
@@ -477,10 +478,11 @@ async fn grpc_client_requires_auth_token_for_runtime_status_when_server_auth_is_
         .runtime_status()
         .await
         .expect_err("runtime status should require auth");
-    assert!(matches!(
-        unauthenticated,
-        ClientError::Status(status) if status.code() == tonic::Code::Unauthenticated
-    ));
+    assert_eq!(unauthenticated.reason(), Some(ErrorReason::Unauthenticated));
+    assert_eq!(
+        unauthenticated.status().map(tonic::Status::code),
+        Some(tonic::Code::Unauthenticated)
+    );
 
     let status = LogPoseClient::connect_with_auth(endpoint, Some("operator-secret"))
         .await
@@ -542,10 +544,11 @@ async fn grpc_client_enforces_read_only_token_permissions() {
         )
         .await
         .expect_err("read-only token should not write");
-    assert!(matches!(
-        write_error,
-        ClientError::Status(status) if status.code() == tonic::Code::PermissionDenied
-    ));
+    assert_eq!(write_error.reason(), Some(ErrorReason::PermissionDenied));
+    assert_eq!(
+        write_error.server_error().and_then(ServerError::error_code),
+        Some(ErrorCode::PermissionDenied)
+    );
 
     server.abort();
     let _ = server.await;
@@ -580,15 +583,17 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
         .await
         .expect_err("data-only node should reject collection creation");
 
-    assert!(
-        matches!(error, ClientError::Status(_)),
-        "expected status error, got {error:?}"
-    );
-    let ClientError::Status(status) = error else {
-        return;
+    let ClientError::Server(error) = error else {
+        unreachable!("expected a typed server error, got {error:?}");
     };
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains(
+    assert_eq!(error.reason(), Some(ErrorReason::WrongNodeRole));
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.metadata().get("node_role").map(String::as_str),
+        Some("data")
+    );
+    assert!(!error.is_retryable());
+    assert!(error.message().contains(
         "is running as 'data' and cannot accept control-plane collection lifecycle mutations"
     ));
 
