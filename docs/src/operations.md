@@ -87,7 +87,14 @@ cluster_name = "default"
 With `metadata.backend = "etcd"`, LogPose now treats etcd as the authoritative
 source for collection descriptors and assignments; each node's storage engine
 holds the data of the collections it serves, and collection creates and drops
-are fenced by the control-plane leader's lease. Collections created before
+are fenced by the control-plane leader's lease. A create or drop completes even
+when its client disconnects. A create interrupted between its steps (its process
+died, or etcd failed after the local create) answers describes with
+`RECONCILIATION_REQUIRED` until the leader resolves it, which needs no operator:
+when the leader gains leadership, and every 30 seconds while it leads, it marks
+the create ready if its engine holds the collection and rolls it back otherwise.
+Only the node a pending create is placed on can resolve it, so one placed on a
+node that no longer leads waits until that node leads again. Collections created before
 the etcd metadata path is enabled are not auto-backfilled from local
 `placement.json` files; migrate them by recreating them through the control
 plane or by explicitly backfilling metadata before flipping an existing storage

@@ -58,12 +58,13 @@ use std::{
     net::IpAddr,
     path::Path,
     sync::{
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::{
     runtime::Handle,
+    task::JoinHandle,
     time::{Duration, Instant, interval, sleep},
 };
 
@@ -101,7 +102,10 @@ impl Drop for EtcdRuntime {
 }
 
 impl CoordinationRuntime {
-    fn new(config: &LogPoseConfig) -> Self {
+    /// Start the coordination loop with etcd metadata. While the node leads, the loop has
+    /// `reconciler` resolve pending collection metadata; it holds the catalog weakly, so the
+    /// loop never keeps the engine open after the service is dropped.
+    fn new(config: &LogPoseConfig, reconciler: Option<Weak<EtcdCollectionCatalog>>) -> Self {
         if config.metadata.backend != MetadataBackend::Etcd {
             return Self::Local;
         }
@@ -129,8 +133,10 @@ impl CoordinationRuntime {
         match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    run_coordination_loop(client, snapshot, shutdown, node_name, node_role, tick)
-                        .await;
+                    run_coordination_loop(
+                        client, snapshot, shutdown, node_name, node_role, tick, reconciler,
+                    )
+                    .await;
                 });
             }
             Err(error) => {
@@ -158,13 +164,64 @@ fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
     Duration::from_secs((ttl_secs / 3).max(1))
 }
 
+/// How often a leader resolves pending collection metadata after the pass it runs on gaining
+/// leadership.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// When the leader resolves pending collection metadata (creates that stopped between their
+/// steps): once it gains leadership, then every [`RECONCILE_INTERVAL`] while it leads. A pass
+/// runs as a task of its own, one at a time, so it never delays the lease keep-alives.
+#[derive(Default)]
+struct Reconciliation {
+    /// The leadership lease the last pass ran under; another lease is newly gained leadership.
+    lease_id: Option<i64>,
+    last_started: Option<Instant>,
+    running: Option<JoinHandle<()>>,
+}
+
+impl Reconciliation {
+    /// Start a pass if one is due and `fence`, the node's current leadership, is set.
+    fn tick(&mut self, reconciler: &Weak<EtcdCollectionCatalog>, fence: Option<LeadershipFence>) {
+        let Some(fence) = fence else {
+            self.lease_id = None;
+            return;
+        };
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|pass| !pass.is_finished())
+        {
+            return;
+        }
+        let gained = self.lease_id != Some(fence.lease_id);
+        let due = gained
+            || self
+                .last_started
+                .is_none_or(|started| started.elapsed() >= RECONCILE_INTERVAL);
+        if !due {
+            return;
+        }
+        // The catalog is gone once the service is dropped.
+        let Some(catalog) = reconciler.upgrade() else {
+            return;
+        };
+        self.lease_id = Some(fence.lease_id);
+        self.last_started = Some(Instant::now());
+        // The pass reports what it did and why it failed itself; the next one retries.
+        self.running = Some(tokio::spawn(async move {
+            let _ = catalog.reconcile_pending(&fence).await;
+        }));
+    }
+}
+
 /// Drive etcd membership and controller leadership for this node.
 ///
 /// Each tick refreshes the leases the node holds, drops any claim etcd no
 /// longer backs (a dead lease, or a membership or leader key that is missing
 /// or owned by someone else), and re-acquires what is missing in the same
 /// tick. Losing membership also gives up leadership, because a node that is
-/// not a registered member must not lead.
+/// not a registered member must not lead. While the node leads, it has
+/// `reconciler` resolve pending collection metadata (see [`Reconciliation`]).
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
     snapshot: Arc<RwLock<CoordinationStatus>>,
@@ -172,10 +229,12 @@ async fn run_coordination_loop(
     node_name: String,
     node_role: NodeRole,
     tick: Duration,
+    reconciler: Option<Weak<EtcdCollectionCatalog>>,
 ) {
     let campaigns = matches!(node_role, NodeRole::Combined | NodeRole::Control);
     let mut membership_lease_id: Option<i64> = None;
     let mut leadership_lease: Option<LeadershipLease> = None;
+    let mut reconciliation = Reconciliation::default();
     let mut ticker = interval(tick);
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -283,6 +342,17 @@ async fn run_coordination_loop(
             &leader,
             pending_error,
         );
+        if let Some(reconciler) = &reconciler {
+            let fence = coordination_read(&snapshot)
+                .is_local_leader
+                .then_some(leadership_lease.as_ref())
+                .flatten()
+                .map(|lease| LeadershipFence {
+                    node_id: node_name.clone(),
+                    lease_id: lease.lease_id,
+                });
+            reconciliation.tick(reconciler, fence);
+        }
     }
 
     if let Some(lease) = leadership_lease.take() {
@@ -434,7 +504,7 @@ enum CollectionCatalog {
     /// The engine's own descriptors are authoritative (a single node).
     Local,
     /// Etcd is authoritative; the engine serves the collections this node owns.
-    Etcd(EtcdCollectionCatalog),
+    Etcd(Arc<EtcdCollectionCatalog>),
 }
 
 /// The data plane: collection lifecycle, writes, reads, and maintenance over the storage
@@ -472,7 +542,10 @@ impl LogPoseDataService {
     /// An invalid etcd configuration.
     pub fn with_etcd(engine: Engine, config: EtcdMetadataConfig) -> Result<Self> {
         Ok(Self {
-            catalog: CollectionCatalog::Etcd(EtcdCollectionCatalog::new(engine.clone(), config)?),
+            catalog: CollectionCatalog::Etcd(Arc::new(EtcdCollectionCatalog::new(
+                engine.clone(),
+                config,
+            )?)),
             engine,
         })
     }
@@ -498,6 +571,14 @@ impl LogPoseDataService {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// The etcd collection catalog, with etcd metadata.
+    fn etcd_catalog(&self) -> Option<&Arc<EtcdCollectionCatalog>> {
+        match &self.catalog {
+            CollectionCatalog::Local => None,
+            CollectionCatalog::Etcd(catalog) => Some(catalog),
+        }
     }
 
     /// Create a collection placed on this node as a data node.
@@ -1039,7 +1120,8 @@ impl LogPoseControlService {
     /// database, principal, and access-policy catalog is the data service's engine's.
     #[must_use]
     pub fn new(data: Arc<LogPoseDataService>, config: LogPoseConfig, build: BuildInfo) -> Self {
-        let coordination = CoordinationRuntime::new(&config);
+        let coordination =
+            CoordinationRuntime::new(&config, data.etcd_catalog().map(Arc::downgrade));
         let coordination_client = if config.metadata.backend == MetadataBackend::Etcd {
             Some(
                 EtcdCoordinationClient::new(config.metadata.etcd.clone())

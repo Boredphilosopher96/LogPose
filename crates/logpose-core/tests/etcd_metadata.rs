@@ -2392,6 +2392,200 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
 
 /// Config with TTLs short enough that the coordination loop ticks every second, and its
 /// storage root's guard: keep the guard alive for as long as a node runs on the configuration.
+/// A create that stopped after writing its pending metadata (its process died before the
+/// local collection) is rolled back by the node once it leads: the metadata is removed and the
+/// name can be created again.
+#[tokio::test]
+async fn etcd_leader_rolls_back_a_pending_create_without_local_state() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_leader_rolls_back_a_pending_create_without_local_state").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("reconcile-roll-back");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-reconcile-roll-back";
+    let root_dir = unique_temp_dir("etcd-reconcile-roll-back");
+    let collection = CollectionRef::new_default("documents");
+    let collection_keys = format!(
+        "{key_prefix}/clusters/{cluster_name}/collections/{}",
+        collection.lookup_name()
+    );
+    let descriptor = CollectionDescriptor::new_in_database(
+        "default",
+        "documents",
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+            .spec
+            .build_schema()
+            .expect("schema"),
+        root_dir.path(),
+    )
+    .without_root_path();
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd client should connect");
+    for (key, value) in [
+        (
+            format!("{collection_keys}/assignment"),
+            serde_json::to_string(&CollectionAssignment {
+                assigned_node: "node-a".to_owned(),
+                assigned_role: NodeRole::Combined,
+            })
+            .expect("assignment should serialize"),
+        ),
+        (
+            format!("{collection_keys}/descriptor"),
+            json!({ "descriptor": descriptor, "ready": false }).to_string(),
+        ),
+        (
+            format!("{collection_keys}/shards/0/owner"),
+            json!({
+                "database_name": "default",
+                "collection_name": "documents",
+                "shard_id": "0",
+                "owner_node_id": "node-a",
+                "epoch": 1,
+            })
+            .to_string(),
+        ),
+    ] {
+        client
+            .put(key, value, None)
+            .await
+            .expect("pending metadata should be seeded");
+    }
+
+    let state = Arc::new(AppState::new(test_config(
+        "node-a",
+        root_dir.path().to_path_buf(),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    wait_for_local_leadership(&state).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let keys = client
+            .get(
+                collection_keys.clone(),
+                Some(
+                    etcd_client::GetOptions::new()
+                        .with_prefix()
+                        .with_count_only(),
+                ),
+            )
+            .await
+            .expect("metadata should be readable")
+            .count();
+        if keys == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the leader to roll the pending create back"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let created = state
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("the name can be created again");
+    assert_ne!(created.collection_id, descriptor.collection_id);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+/// A create that stopped after its local collection, before marking the metadata ready, is
+/// rolled forward when the node gains leadership: here the node loses its leadership lease
+/// and wins the leadership back.
+#[tokio::test]
+async fn etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership() {
+    let Some(endpoints) = etcd_endpoints_or_skip(
+        "etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership",
+    )
+    .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("reconcile-roll-forward");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-reconcile-roll-forward";
+    let (config, _root) = short_ttl_config(
+        "node-a",
+        "etcd-reconcile-roll-forward",
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    );
+    let state = Arc::new(AppState::new(config));
+    let (_, leadership_lease_id) = wait_for_local_leadership(&state).await;
+    let created = state
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created");
+
+    // Put the metadata back in the state the create left it in before its last step.
+    let descriptor_key =
+        format!("{key_prefix}/clusters/{cluster_name}/collections/default/documents/descriptor");
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd client should connect");
+    let response = client
+        .get(descriptor_key.clone(), None)
+        .await
+        .expect("descriptor should be readable");
+    let mut stored: serde_json::Value = serde_json::from_slice(
+        response
+            .kvs()
+            .first()
+            .expect("descriptor should exist")
+            .value(),
+    )
+    .expect("descriptor should decode");
+    stored["ready"] = json!(false);
+    client
+        .put(descriptor_key, stored.to_string(), None)
+        .await
+        .expect("descriptor should be rewritten");
+    let error = state
+        .get_collection("documents")
+        .await
+        .expect_err("a pending create is not served");
+    assert!(
+        matches!(error, LogPoseError::ReconciliationRequired { .. }),
+        "{error:?}"
+    );
+
+    revoke_lease_out_of_band(&endpoints, leadership_lease_id).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let described = loop {
+        match state.get_collection("documents").await {
+            Ok(described) => break described,
+            Err(error) => assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the leader to roll the pending create forward: {error}"
+            ),
+        }
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(described.collection_id, created.collection_id);
+    let (_, regained_lease_id) = wait_for_local_leadership(&state).await;
+    assert_ne!(regained_lease_id, leadership_lease_id);
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
 fn short_ttl_config(
     node_name: &str,
     temp_label: &str,
