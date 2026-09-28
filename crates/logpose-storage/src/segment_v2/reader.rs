@@ -1534,7 +1534,7 @@ impl<S: SectionSource + Clone + 'static> SegmentReader<S> {
     }
 
     /// [`fetch`](Self::fetch), with a loader that also decodes a whole index
-    /// section and attaches the decoded form before the cache charges it
+    /// or key section and attaches the decoded form before the cache charges it
     /// ([`SegmentUnit::load_decoded`]). Other units load as with `fetch`.
     pub fn fetch_decoded(&self, unit: &SegmentUnit, executor: &dyn LoadExecutor) -> Fetch {
         let source = self.source.clone();

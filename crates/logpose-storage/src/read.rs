@@ -374,9 +374,9 @@ impl ReadView {
             };
             match need {
                 SectionNeed::Pk => {
-                    section(SectionKind::PkColumn, None, false);
-                    section(SectionKind::PkSorted, None, false);
-                    section(SectionKind::PkFilter, None, false);
+                    section(SectionKind::PkColumn, None, true);
+                    section(SectionKind::PkSorted, None, true);
+                    section(SectionKind::PkFilter, None, true);
                 }
                 SectionNeed::ScalarIndex(field) => {
                     section(SectionKind::ScalarInverted, Some(*field), true);

@@ -215,9 +215,9 @@ impl SegmentUnit {
 }
 
 impl SegmentUnit {
-    /// [`load`](Self::load), then, for a whole index section, decode it and
-    /// attach the decoded form (`index::attach_decoded`) so the cache charges
-    /// it and every hit reuses it. A payload that verifies but does not
+    /// [`load`](Self::load), then, for a whole index or key section, decode it
+    /// and attach the decoded form (`index::attach_decoded`) so the cache
+    /// charges it and every hit reuses it. A payload that verifies but does not
     /// decode is [`SegmentError::Corrupt`] in the section.
     ///
     /// # Errors
@@ -231,7 +231,7 @@ impl SegmentUnit {
     ) -> Result<AlignedBytes, SegmentError> {
         let bytes = self.load(source, file_len)?;
         if matches!(self.part, Part::Whole) {
-            attach_decoded(self.entry.section_kind(), row_count, &bytes)
+            attach_decoded(&self.entry, row_count, &bytes)
                 .map_err(|detail| SegmentError::corrupt(self.region(), detail))?;
         }
         Ok(bytes)

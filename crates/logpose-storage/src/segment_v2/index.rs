@@ -588,18 +588,35 @@ pub enum DecodedScalarIndex {
     Sorted(SortedIndex),
 }
 
-/// Decode an index section's payload into the form readers attach to it.
-/// Returns `Ok(None)` for kinds that have no decoded form.
+/// Decode an index or key section's payload into the form readers attach to
+/// it, so the cache charges the decoded form with the bytes. Other kinds are
+/// left as they are.
 ///
 /// # Errors
 ///
 /// A description of the defect.
 pub(crate) fn attach_decoded(
-    kind: Option<SectionKind>,
+    entry: &super::format::SectionEntry,
     row_count: u32,
     bytes: &crate::cache::AlignedBytes,
 ) -> Result<(), String> {
-    match kind {
+    let rows = row_count as usize;
+    match entry.section_kind() {
+        // The key sections decode into owned copies of about their size.
+        Some(SectionKind::PkColumn) => {
+            let column =
+                super::PkColumn::decode(bytes, entry.encoding, rows).map_err(|error| error.0)?;
+            bytes.attach(column, bytes.len() as u64);
+        }
+        Some(SectionKind::PkSorted) => {
+            let sorted =
+                super::PkSorted::decode(bytes, entry.encoding, rows).map_err(|error| error.0)?;
+            bytes.attach(sorted, bytes.len() as u64);
+        }
+        Some(SectionKind::PkFilter) => {
+            let filter = super::PkFilter::decode(bytes, entry.encoding).map_err(|error| error.0)?;
+            bytes.attach(filter, bytes.len() as u64);
+        }
         Some(SectionKind::VectorGraph) => {
             let graph = SegmentGraph::decode(bytes, row_count)?;
             let heap = graph.heap_bytes();
@@ -627,6 +644,7 @@ pub(crate) fn attach_decoded(
     }
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
