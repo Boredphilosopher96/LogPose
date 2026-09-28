@@ -12,13 +12,17 @@ use etcd_client::{
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_storage::{
-    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
+    CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, LocalStorageEngine,
+    StorageEngine,
 };
 use logpose_types::{
     AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
     CommitAck, CorruptionKind, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence,
     LogPoseError, MaintenanceStatus, RecordId, ResourceKind, Result, Snapshot, VisibleRecord,
-    WriteOperation, error::ROUTING_RETRY_AFTER,
+    WriteOperation,
+    error::ROUTING_RETRY_AFTER,
+    record::{ClientOp, PrimaryKey},
+    schema::{CollectionSchema, SchemaChange},
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
 use protoc_bin_vendored as _;
@@ -341,6 +345,63 @@ impl EtcdCatalogStore {
             .map_err(|error| stored_invalid(kv.key(), error))?;
         Ok(policy)
     }
+
+    /// Delete one shared database descriptor and its access policy.
+    ///
+    /// Fails with `FAILED_PRECONDITION` for the default database and for a database that still
+    /// holds a collection, `NOT_FOUND` for a missing database, and `NOT_LEADER` when the fence
+    /// no longer holds.
+    pub async fn delete_database(
+        &self,
+        database_name: &str,
+        leader_node_id: &str,
+        leader_lease_id: i64,
+    ) -> Result<()> {
+        validate_database_name(database_name)?;
+        if database_name == DEFAULT_DATABASE_NAME {
+            return Err(LogPoseError::failed_precondition(
+                "the default database cannot be dropped",
+            ));
+        }
+        if let Some(stored) = self
+            .etcd
+            .list_descriptors()
+            .await?
+            .into_iter()
+            .find(|stored| stored.descriptor.database_name == database_name)
+        {
+            return Err(LogPoseError::failed_precondition(format!(
+                "database '{database_name}' still holds collection '{}'; drop its collections first",
+                stored.descriptor.name
+            )));
+        }
+        let descriptor_key = self.etcd.database_descriptor_key(database_name);
+        let policy_key = self.etcd.database_policy_key(database_name);
+        let leadership_key = self.etcd.leadership_key();
+        let leadership_value = self
+            .etcd
+            .leadership_value(leader_node_id, leader_lease_id)?;
+        let txn = Txn::new()
+            .when([
+                Compare::value(leadership_key, CompareOp::Equal, leadership_value),
+                Compare::version(descriptor_key.clone(), CompareOp::Greater, 0),
+            ])
+            .and_then([
+                TxnOp::delete(policy_key, Some(DeleteOptions::new())),
+                TxnOp::delete(descriptor_key, Some(DeleteOptions::new())),
+            ]);
+        let mut client = self.etcd.client().await?;
+        let response = client.txn(txn).await.map_err(etcd_message)?;
+        if response.succeeded() {
+            return Ok(());
+        }
+        // Tell a missing database from a lost leadership.
+        self.get_database(database_name).await?;
+        Err(LogPoseError::NotLeader {
+            node: leader_node_id.to_owned(),
+            leader_node: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -434,7 +495,11 @@ impl StorageEngine for EtcdBackedStorageEngine {
             }
             Err(error) => match self
                 .etcd
-                .delete_collection_metadata_if_revision_matches(&collection_name, metadata_revision)
+                .delete_collection_metadata_if_revision_matches(
+                    &collection_name,
+                    metadata_revision,
+                    None,
+                )
                 .await
             {
                 Ok(()) => Err(error),
@@ -507,6 +572,69 @@ impl StorageEngine for EtcdBackedStorageEngine {
             }),
             Err(error) => Err(error),
         }
+    }
+
+    async fn drop_collection(
+        &self,
+        collection_name: &str,
+        leader_fence: Option<LeadershipFence>,
+    ) -> Result<()> {
+        let leader_fence = leader_fence.ok_or_else(|| {
+            LogPoseError::internal(
+                "etcd-backed collection drops require a control-plane leadership fence",
+            )
+        })?;
+        let collection_name = canonical_collection_lookup_name(collection_name);
+        let revision = self
+            .etcd
+            .collection_metadata_revision(&collection_name)
+            .await?;
+        // The local drop commits first. A drop that removed the local collection and then
+        // failed to remove the metadata leaves only metadata, which a retry removes.
+        let local = match self.local.drop_collection(&collection_name, None).await {
+            Ok(()) => true,
+            Err(LogPoseError::NotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        match revision {
+            Some(revision) => {
+                self.etcd
+                    .delete_collection_metadata_if_revision_matches(
+                        &collection_name,
+                        revision,
+                        Some(&leader_fence),
+                    )
+                    .await
+            }
+            None if local => Ok(()),
+            None => Err(LogPoseError::not_found(
+                ResourceKind::Collection,
+                collection_name,
+            )),
+        }
+    }
+
+    async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
+        self.local.schema(collection_name).await
+    }
+
+    async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
+        self.local.alter_schema(collection_name, change).await
+    }
+
+    async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
+        self.local.write_batch(collection_name, ops).await
+    }
+
+    async fn get_records(
+        &self,
+        collection_name: &str,
+        keys: Vec<PrimaryKey>,
+        output_fields: Vec<String>,
+    ) -> Result<FetchedRecords> {
+        self.local
+            .get_records(collection_name, keys, output_fields)
+            .await
     }
 
     async fn write(
@@ -952,38 +1080,78 @@ impl EtcdPlacementStore {
         Ok(descriptors)
     }
 
+    /// The mod revisions of a collection's metadata keys, or `None` when it has no
+    /// descriptor. A missing assignment or owner key reads as revision 0, which is what etcd
+    /// compares a missing key against.
+    async fn collection_metadata_revision(
+        &self,
+        collection_name: &str,
+    ) -> Result<Option<CollectionMetadataRevision>> {
+        let collection = collection_ref_from_lookup_name(collection_name);
+        let keys = [
+            self.assignment_key(collection_name),
+            self.descriptor_key(collection_name),
+            self.shard_owner_key(&collection, "0"),
+        ];
+        let mut client = self.client().await?;
+        let mut revisions = [0_i64; 3];
+        for (key, revision) in keys.into_iter().zip(revisions.iter_mut()) {
+            let response = client.get(key, None).await.map_err(etcd_message)?;
+            *revision = response.kvs().first().map_or(0, |kv| kv.mod_revision());
+        }
+        let [
+            assignment_mod_revision,
+            descriptor_mod_revision,
+            owner_mod_revision,
+        ] = revisions;
+        Ok(
+            (descriptor_mod_revision != 0).then_some(CollectionMetadataRevision {
+                assignment_mod_revision,
+                descriptor_mod_revision,
+                owner_mod_revision,
+            }),
+        )
+    }
+
     async fn delete_collection_metadata_if_revision_matches(
         &self,
         collection_name: &str,
         revision: CollectionMetadataRevision,
+        leader_fence: Option<&LeadershipFence>,
     ) -> Result<()> {
         let assignment_key = self.assignment_key(collection_name);
         let descriptor_key = self.descriptor_key(collection_name);
         let owner_key =
             self.shard_owner_key(&collection_ref_from_lookup_name(collection_name), "0");
-        let txn = Txn::new()
-            .when([
-                Compare::mod_revision(
-                    assignment_key.clone(),
-                    CompareOp::Equal,
-                    revision.assignment_mod_revision,
-                ),
-                Compare::mod_revision(
-                    descriptor_key.clone(),
-                    CompareOp::Equal,
-                    revision.descriptor_mod_revision,
-                ),
-                Compare::mod_revision(
-                    owner_key.clone(),
-                    CompareOp::Equal,
-                    revision.owner_mod_revision,
-                ),
-            ])
-            .and_then([
-                TxnOp::delete(assignment_key, Some(DeleteOptions::new())),
-                TxnOp::delete(descriptor_key, Some(DeleteOptions::new())),
-                TxnOp::delete(owner_key, Some(DeleteOptions::new())),
-            ]);
+        let mut compares = vec![
+            Compare::mod_revision(
+                assignment_key.clone(),
+                CompareOp::Equal,
+                revision.assignment_mod_revision,
+            ),
+            Compare::mod_revision(
+                descriptor_key.clone(),
+                CompareOp::Equal,
+                revision.descriptor_mod_revision,
+            ),
+            Compare::mod_revision(
+                owner_key.clone(),
+                CompareOp::Equal,
+                revision.owner_mod_revision,
+            ),
+        ];
+        if let Some(fence) = leader_fence {
+            compares.push(Compare::value(
+                self.leadership_key(),
+                CompareOp::Equal,
+                self.leadership_value(&fence.node_id, fence.lease_id)?,
+            ));
+        }
+        let txn = Txn::new().when(compares).and_then([
+            TxnOp::delete(assignment_key, Some(DeleteOptions::new())),
+            TxnOp::delete(descriptor_key, Some(DeleteOptions::new())),
+            TxnOp::delete(owner_key, Some(DeleteOptions::new())),
+        ]);
         let mut client = self.client().await?;
         let response = client.txn(txn).await.map_err(etcd_message)?;
         if response.succeeded() {
@@ -1809,8 +1977,7 @@ mod tests {
         let descriptor = CollectionDescriptor::new_in_database(
             "analytics",
             "documents",
-            2,
-            DistanceMetric::Dot,
+            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
             Path::new("/tmp/storage-etcd-tests"),
         );
 

@@ -468,8 +468,7 @@ impl PlannerStorage {
     ) -> Self {
         let descriptor = CollectionDescriptor::new(
             "documents",
-            2,
-            DistanceMetric::Dot,
+            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
             Path::new("/tmp/planner-storage"),
         );
         let snapshot = Snapshot {
@@ -552,8 +551,7 @@ impl DeleteAwarePlannerStorage {
     fn new() -> Self {
         let descriptor = CollectionDescriptor::new(
             "documents",
-            2,
-            DistanceMetric::Dot,
+            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
             Path::new("/tmp/delete-aware-planner-storage"),
         );
         let snapshot = Snapshot {
@@ -641,8 +639,7 @@ impl ShadowingPlannerStorage {
     fn new() -> Self {
         let descriptor = CollectionDescriptor::new(
             "documents",
-            2,
-            DistanceMetric::Dot,
+            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
             Path::new("/tmp/shadowing-planner-storage"),
         );
         let snapshot = Snapshot {
@@ -764,8 +761,7 @@ impl MixedImmutableIndexPlannerStorage {
     fn new() -> Self {
         let descriptor = CollectionDescriptor::new(
             "documents",
-            2,
-            DistanceMetric::Dot,
+            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
             Path::new("/tmp/mixed-immutable-planner-storage"),
         );
         let snapshot = Snapshot {

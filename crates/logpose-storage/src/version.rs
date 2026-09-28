@@ -244,6 +244,50 @@ impl Version {
     }
 }
 
+impl Version {
+    /// The live row of `pk`, keyed by field id (read it with [`Version::schema`]): a point
+    /// lookup over the units, newest first, the way readers do it, never through the writer's
+    /// primary-key index. By I5 at most one unit holds a live row for the key.
+    ///
+    /// Blocking: a segment probe reads its key sections, and the row, through the buffer
+    /// cache, so call this on the I/O pool.
+    pub(crate) fn lookup(
+        &self,
+        pk: &logpose_types::record::PrimaryKey,
+    ) -> Result<Option<logpose_wal::codec::RowImage>> {
+        for memtable in self.memtables().rev() {
+            if let Some(slot) = memtable.find(pk)
+                && !self.is_deleted(RowAddr {
+                    unit: memtable.unit,
+                    row: slot,
+                })
+            {
+                return memtable
+                    .row_image(slot)
+                    .map(Some)
+                    .map_err(LogPoseError::internal);
+            }
+        }
+        for segment in self.segments.iter().rev() {
+            // A segment without the key says nothing about older ones.
+            let Some(row) = segment
+                .reader()
+                .find_row(pk)
+                .map_err(|error| crate::segment::segment_error(segment.path(), error))?
+            else {
+                continue;
+            };
+            if !self.is_deleted(RowAddr {
+                unit: segment.unit,
+                row,
+            }) {
+                return segment.row_images(&[row]).map(|mut images| images.pop());
+            }
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 impl Version {
     /// The live row of `pk` with its sequence number: a point lookup over the units, newest

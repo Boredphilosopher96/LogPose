@@ -8,7 +8,6 @@
 //! fields (under their current names) the metadata object. Deleted with the legacy trait
 //! (PR 14).
 
-use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     LogPoseError, PutRecord, RecordId, Result, WriteOperation, legacy::client_op_from_write,
     record::ClientOp, schema::CollectionSchema,
@@ -17,12 +16,9 @@ use logpose_wal::codec::{RowImage, WirePk};
 use serde_json::Value as JsonValue;
 
 /// Map a v1 batch to client operations for the writer, with the v1 error messages for the
-/// checks only the v1 shape has (an empty batch, the configured dimensions, non-object
-/// metadata). Schema validation, duplicate ids and cosine normalization happen in the writer.
-pub(crate) fn legacy_ops(
-    descriptor: &CollectionDescriptor,
-    operations: Vec<WriteOperation>,
-) -> Result<Vec<ClientOp>> {
+/// checks only the v1 shape has (an empty batch, non-object metadata). Schema validation,
+/// duplicate ids and cosine normalization happen in the writer.
+pub(crate) fn legacy_ops(operations: Vec<WriteOperation>) -> Result<Vec<ClientOp>> {
     if operations.is_empty() {
         return Err(LogPoseError::invalid_field(
             "operations",
@@ -33,13 +29,12 @@ pub(crate) fn legacy_ops(
         .into_iter()
         .enumerate()
         .map(|(index, operation)| {
-            let prefix = format!("operations[{index}]");
-            descriptor
-                .validate_operation(&operation)
-                .map_err(|error| error.with_field_prefix(&prefix))?;
             let id = operation.id().clone();
             client_op_from_write(operation).map_err(|error| {
-                LogPoseError::invalid_field(prefix, format!("record '{id}' is invalid: {error}"))
+                LogPoseError::invalid_field(
+                    format!("operations[{index}]"),
+                    format!("record '{id}' is invalid: {error}"),
+                )
             })
         })
         .collect()

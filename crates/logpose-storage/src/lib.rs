@@ -79,7 +79,7 @@ pub use local_engine::LocalStorageEngine;
 pub use memtable::MemtableConfig;
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use storage_engine::{
-    BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
+    BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, StorageEngine,
 };
 pub use tokens::{InvalidSnapshotToken, SnapshotToken, TokenConfig};
 pub use version::{Version, VersionCounters, VersionId};

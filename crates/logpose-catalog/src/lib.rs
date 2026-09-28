@@ -1,9 +1,8 @@
 //! Metadata and collection catalog abstractions.
 
 use logpose_types::{
-    CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, DistanceMetric,
-    LogPoseError, RemoteBlobConfig, WriteOperation, default_database_id, legacy,
-    schema::CollectionSchema,
+    CollectionId, CollectionRef, DEFAULT_DATABASE_NAME, DatabaseId, DatabaseRef, LogPoseError,
+    RemoteBlobConfig, default_database_id, schema::CollectionSchema,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -73,7 +72,12 @@ impl DatabaseDescriptor {
     }
 }
 
-/// Logical collection metadata scaffold.
+/// A collection's identity, configuration, and schema.
+///
+/// The `schema` a descriptor file (or the metadata store) holds is the schema the collection
+/// was created with. Online schema changes are ordered with writes, so the engine owns the
+/// live schema: it is in the collection's manifest and WAL, and every descriptor the engine or
+/// the API returns carries the live schema instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionDescriptor {
     /// Stable collection identifier.
@@ -83,10 +87,8 @@ pub struct CollectionDescriptor {
     pub database_name: String,
     /// Human-readable collection name.
     pub name: String,
-    /// Embedding dimensions expected for the collection.
-    pub dimensions: usize,
-    /// Distance metric configured for the collection.
-    pub metric: DistanceMetric,
+    /// The collection's typed schema; see the type documentation for which version.
+    pub schema: CollectionSchema,
     /// Local filesystem root for this collection.
     pub root_path: PathBuf,
     /// Optional remote blob-store configuration for immutable artifacts.
@@ -100,21 +102,15 @@ pub struct CollectionDescriptor {
 }
 
 impl CollectionDescriptor {
-    /// Construct a collection descriptor rooted under the provided collections directory.
+    /// Construct a descriptor in the default database, rooted under the provided collections
+    /// directory.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
-        dimensions: usize,
-        metric: DistanceMetric,
+        schema: CollectionSchema,
         collections_root: impl AsRef<Path>,
     ) -> Self {
-        Self::new_in_database(
-            DEFAULT_DATABASE_NAME,
-            name,
-            dimensions,
-            metric,
-            collections_root,
-        )
+        Self::new_in_database(DEFAULT_DATABASE_NAME, name, schema, collections_root)
     }
 
     /// Construct a collection descriptor inside one database.
@@ -122,8 +118,7 @@ impl CollectionDescriptor {
     pub fn new_in_database(
         database_name: impl Into<String>,
         name: impl Into<String>,
-        dimensions: usize,
-        metric: DistanceMetric,
+        schema: CollectionSchema,
         collections_root: impl AsRef<Path>,
     ) -> Self {
         let collection_id = CollectionId::default();
@@ -131,8 +126,7 @@ impl CollectionDescriptor {
             collection_id: collection_id.clone(),
             database_name: database_name.into(),
             name: name.into(),
-            dimensions,
-            metric,
+            schema,
             root_path: collections_root.as_ref().join(collection_id.to_string()),
             remote_blob: None,
             flush_threshold_ops: DEFAULT_FLUSH_THRESHOLD_OPS,
@@ -162,50 +156,23 @@ impl CollectionDescriptor {
     }
 
     /// Return whether two descriptors refer to the same serveable collection identity.
+    ///
+    /// The schema is not part of the identity: it changes online, and a descriptor from the
+    /// metadata store carries the creation schema while the engine's carries the live one.
     #[must_use]
     pub fn matches_serving_identity(&self, other: &Self) -> bool {
         self.collection_id == other.collection_id
             && self.database_name == other.database_name
             && self.name == other.name
-            && self.dimensions == other.dimensions
-            && self.metric == other.metric
             && self.remote_blob == other.remote_blob
             && self.flush_threshold_ops == other.flush_threshold_ops
             && self.flush_threshold_bytes == other.flush_threshold_bytes
             && self.compaction_threshold_segments == other.compaction_threshold_segments
     }
 
-    /// The collection's typed schema.
-    ///
-    /// Collections are still created through the v1 request, so every
-    /// collection has the legacy schema derived from `dimensions` and
-    /// `metric`: string primary key `id`, one vector field `vector`, and
-    /// dynamic fields on (see [`legacy::legacy_schema`]). The schema is
-    /// derived rather than stored because it cannot change yet; once schema
-    /// changes land, the schema moves to the manifest, not this descriptor.
-    pub fn schema(&self) -> logpose_types::Result<CollectionSchema> {
-        legacy::legacy_schema(self.dimensions, self.metric).map_err(|error| {
-            LogPoseError::invalid_field(
-                "dimensions",
-                format!("collection '{}' has an invalid schema: {error}", self.name),
-            )
-        })
-    }
-
-    /// Validate collection-level configuration values.
+    /// Validate collection-level configuration values. The schema is valid by construction.
     pub fn validate(&self) -> logpose_types::Result<()> {
-        self.validated_schema().map(|_| ())
-    }
-
-    /// Validate configuration values and return the collection schema.
-    fn validated_schema(&self) -> logpose_types::Result<CollectionSchema> {
         self.collection_ref().validate()?;
-        if self.dimensions == 0 {
-            return Err(LogPoseError::invalid_field(
-                "dimensions",
-                "dimensions must be greater than 0",
-            ));
-        }
         if self.flush_threshold_ops == 0 {
             return Err(LogPoseError::invalid_field(
                 "flush_threshold_ops",
@@ -224,42 +191,7 @@ impl CollectionDescriptor {
                 "compaction_threshold_segments must be greater than 1",
             ));
         }
-        self.schema()
-    }
-
-    /// Validate an operation against this collection's schema.
-    ///
-    /// The operation is mapped to the v2 model with
-    /// [`legacy::validate_write`] and checked like any v2 write: the key is
-    /// a non-empty string of at most 1,024 bytes, the vector has the
-    /// configured dimensions and finite components, and metadata is a JSON
-    /// object (or null) whose keys become dynamic fields, so it cannot use
-    /// the names `id` or `vector`, or the reserved name `$extra`.
-    pub fn validate_operation(&self, operation: &WriteOperation) -> logpose_types::Result<()> {
-        let schema = self.validated_schema()?;
-        operation.validate_dimensions(self.dimensions)?;
-        legacy::validate_write(&schema, operation.clone())
-            .map(|_| ())
-            .map_err(|error| {
-                let message = format!("record '{}' is invalid: {error}", operation.id());
-                match legacy_error_field(&error) {
-                    Some(field) => LogPoseError::invalid_field(field, message),
-                    None => LogPoseError::invalid_argument(message),
-                }
-            })
-    }
-}
-
-/// The v1 request field a legacy validation error is about: `id`, `vector`, or
-/// `metadata` (with the dynamic key, as `metadata.<key>`).
-fn legacy_error_field(error: &legacy::LegacyError) -> Option<String> {
-    match error {
-        legacy::LegacyError::MetadataNotObject { .. } => Some("metadata".to_owned()),
-        legacy::LegacyError::Record(error) => error.field_name().map(|field| match field {
-            legacy::LEGACY_PRIMARY_KEY_FIELD | legacy::LEGACY_VECTOR_FIELD => field.to_owned(),
-            key => format!("metadata.{key}"),
-        }),
-        legacy::LegacyError::NotLegacyShaped { .. } => None,
+        Ok(())
     }
 }
 
@@ -303,6 +235,12 @@ pub trait CatalogStore: Send + Sync {
 
     /// List every database descriptor.
     fn list_databases(&self) -> logpose_types::Result<Vec<DatabaseDescriptor>>;
+
+    /// Delete a database descriptor and its access policy.
+    ///
+    /// Fails with `FAILED_PRECONDITION` for the default database and for a database that still
+    /// holds a collection, and with `NOT_FOUND` when the database does not exist.
+    fn delete_database(&self, database_name: &str) -> logpose_types::Result<()>;
 
     /// Create or replace a principal descriptor.
     fn put_principal(&self, principal: Principal) -> logpose_types::Result<Principal>;
@@ -367,14 +305,15 @@ mod tests {
         assert!(error.to_string().contains("is_default"));
     }
 
+    fn schema() -> CollectionSchema {
+        logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
+            .expect("schema should build")
+    }
+
     #[test]
     fn collection_descriptor_defaults_to_default_database() {
-        let descriptor = CollectionDescriptor::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-            Path::new("/tmp/catalog-validation"),
-        );
+        let descriptor =
+            CollectionDescriptor::new("events", schema(), Path::new("/tmp/catalog-validation"));
 
         assert_eq!(descriptor.database_name, DEFAULT_DATABASE_NAME);
         assert_eq!(
@@ -383,8 +322,7 @@ mod tests {
                 "collection_id": descriptor.collection_id.to_string(),
                 "database_name": DEFAULT_DATABASE_NAME,
                 "name": "events",
-                "dimensions": 2,
-                "metric": "dot",
+                "schema": serde_json::to_value(schema()).expect("schema serializes"),
                 "root_path": descriptor.root_path,
                 "remote_blob": null,
                 "flush_threshold_ops": DEFAULT_FLUSH_THRESHOLD_OPS,
@@ -392,6 +330,16 @@ mod tests {
                 "compaction_threshold_segments": DEFAULT_COMPACTION_THRESHOLD_SEGMENTS,
             })
         );
+    }
+
+    #[test]
+    fn descriptors_round_trip_their_schema_through_json() {
+        let descriptor =
+            CollectionDescriptor::new("events", schema(), Path::new("/tmp/catalog-validation"));
+        let json = serde_json::to_string(&descriptor).expect("descriptor serializes");
+        let decoded: CollectionDescriptor =
+            serde_json::from_str(&json).expect("descriptor deserializes");
+        assert_eq!(decoded, descriptor);
     }
 
     #[test]
@@ -404,8 +352,7 @@ mod tests {
         let collection_error = CollectionDescriptor::new_in_database(
             "analytics",
             "docs/v2",
-            2,
-            DistanceMetric::Dot,
+            schema(),
             Path::new("/tmp/catalog-validation"),
         )
         .validate()
@@ -423,8 +370,7 @@ mod tests {
         let collection_error = CollectionDescriptor::new_in_database(
             ".",
             "events",
-            2,
-            DistanceMetric::Dot,
+            schema(),
             Path::new("/tmp/catalog-validation"),
         )
         .validate()
@@ -437,8 +383,7 @@ mod tests {
         let descriptor = CollectionDescriptor::new_in_database(
             "analytics",
             "events",
-            2,
-            DistanceMetric::Dot,
+            schema(),
             Path::new("/tmp/catalog-validation"),
         );
 
@@ -449,7 +394,7 @@ mod tests {
     fn rejects_non_positive_maintenance_thresholds() {
         let root = Path::new("/tmp/catalog-validation");
 
-        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        let mut descriptor = CollectionDescriptor::new("events", schema(), root);
         descriptor.flush_threshold_ops = 0;
         assert!(
             descriptor
@@ -459,7 +404,7 @@ mod tests {
                 .contains("flush_threshold_ops")
         );
 
-        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        let mut descriptor = CollectionDescriptor::new("events", schema(), root);
         descriptor.flush_threshold_bytes = 0;
         assert!(
             descriptor
@@ -469,7 +414,7 @@ mod tests {
                 .contains("flush_threshold_bytes")
         );
 
-        let mut descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        let mut descriptor = CollectionDescriptor::new("events", schema(), root);
         descriptor.compaction_threshold_segments = 1;
         assert!(
             descriptor
@@ -481,104 +426,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_dimensions() {
+    fn serving_identity_ignores_runtime_root_path_and_schema_changes() {
         let root = Path::new("/tmp/catalog-validation");
-        let descriptor = CollectionDescriptor::new("events", 0, DistanceMetric::Dot, root);
-
-        assert!(
-            descriptor
-                .validate()
-                .expect_err("zero dimensions should fail")
-                .to_string()
-                .contains("dimensions")
-        );
-    }
-
-    #[test]
-    fn serving_identity_ignores_runtime_root_path() {
-        let root = Path::new("/tmp/catalog-validation");
-        let descriptor = CollectionDescriptor::new("events", 2, DistanceMetric::Dot, root);
+        let descriptor = CollectionDescriptor::new("events", schema(), root);
         let stripped = descriptor.without_root_path();
 
         assert!(descriptor.matches_serving_identity(&stripped));
         assert_eq!(stripped.root_path, PathBuf::new());
-    }
 
-    #[test]
-    fn collection_schema_is_the_legacy_schema() {
-        let descriptor = CollectionDescriptor::new("docs", 3, DistanceMetric::L2, "/tmp/logpose");
-        let schema = descriptor.schema().expect("schema should build");
-        assert_eq!(schema.primary_key().name, "id");
-        assert_eq!(schema.vectors()[0].name, "vector");
-        assert_eq!(schema.vectors()[0].dimensions, 3);
-        assert_eq!(schema.vectors()[0].metric, DistanceMetric::L2);
-        assert!(schema.dynamic_fields());
-    }
-
-    #[test]
-    fn rejects_dimensions_above_the_schema_limit() {
-        let descriptor =
-            CollectionDescriptor::new("docs", 65_537, DistanceMetric::L2, "/tmp/logpose");
-        let error = descriptor
-            .validate()
-            .expect_err("too many dimensions should fail");
-        assert!(error.to_string().contains("65537 dimensions"), "{error}");
-    }
-
-    #[test]
-    fn validates_operations_through_the_schema() {
-        use logpose_types::{DeleteRecord, PutRecord, RecordId};
-
-        let descriptor = CollectionDescriptor::new("docs", 2, DistanceMetric::L2, "/tmp/logpose");
-        let put = |id: &str, vector: Vec<f32>, metadata| {
-            WriteOperation::Put(PutRecord {
-                id: RecordId::new(id),
-                vector,
-                metadata,
-            })
-        };
-        descriptor
-            .validate_operation(&put("a", vec![1.0, 2.0], serde_json::json!({ "k": 1 })))
-            .expect("valid put");
-        descriptor
-            .validate_operation(&put("a", vec![1.0, 2.0], serde_json::Value::Null))
-            .expect("null metadata is allowed");
-        descriptor
-            .validate_operation(&WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("a"),
-            }))
-            .expect("valid delete");
-
-        let wrong_dimensions = descriptor
-            .validate_operation(&put("a", vec![1.0], serde_json::Value::Null))
-            .expect_err("wrong dimensions");
-        assert_eq!(
-            wrong_dimensions.to_string(),
-            "record 'a' expected 2 dimensions but found 1"
-        );
-
-        for (operation, message) in [
-            (
-                put("a", vec![f32::NAN, 0.0], serde_json::Value::Null),
-                "component 0 is not a finite f32",
-            ),
-            (
-                put("", vec![1.0, 2.0], serde_json::Value::Null),
-                "must not be an empty string",
-            ),
-            (
-                put("a", vec![1.0, 2.0], serde_json::json!("text")),
-                "metadata must be a JSON object or null",
-            ),
-            (
-                put("a", vec![1.0, 2.0], serde_json::json!({ "vector": 1 })),
-                "dynamic key 'vector' collides",
-            ),
-        ] {
-            let error = descriptor
-                .validate_operation(&operation)
-                .expect_err("invalid operation");
-            assert!(error.to_string().contains(message), "{error}");
-        }
+        let mut altered = descriptor.clone();
+        altered
+            .schema
+            .rename_field("vector", "embedding")
+            .expect("rename");
+        assert!(descriptor.matches_serving_identity(&altered));
     }
 }

@@ -560,11 +560,18 @@ where
         .open_collection(collection_name)
         .await
         .map_err(|error| qualify_collection_error(error, collection_name))?;
+    // Search runs over the first vector field of the live schema, the vector the legacy read
+    // paths return.
+    let vector = descriptor.schema.vectors().first().ok_or_else(|| {
+        QueryError::Storage(LogPoseError::internal(format!(
+            "collection '{collection_name}' has no vector field"
+        )))
+    })?;
     let resolved = ResolvedCollectionDescriptor {
+        dimensions: vector.dimensions as usize,
+        metric: vector.metric,
         database_name: descriptor.database_name,
         collection_name: descriptor.name,
-        dimensions: descriptor.dimensions,
-        metric: descriptor.metric,
     };
     ensure_collection_reference_matches_descriptor(&reference, &resolved, collection_name)?;
     Ok(resolved)
@@ -2244,8 +2251,7 @@ mod tests {
             Ok(CollectionDescriptor::new_in_database(
                 "analytics",
                 "profiles",
-                2,
-                DistanceMetric::Dot,
+                logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                 Path::new("/tmp"),
             ))
         }
@@ -2294,8 +2300,7 @@ mod tests {
                 collection_id: CollectionDescriptor::new_in_database(
                     "analytics",
                     "profiles",
-                    2,
-                    DistanceMetric::Dot,
+                    logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                     Path::new("/tmp"),
                 )
                 .collection_id,
@@ -2366,8 +2371,7 @@ mod tests {
         async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
             Ok(CollectionDescriptor::new(
                 name,
-                2,
-                DistanceMetric::Dot,
+                logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                 Path::new("/tmp"),
             ))
         }
@@ -2412,8 +2416,7 @@ mod tests {
             Ok(CollectionStats {
                 collection_id: CollectionDescriptor::new(
                     "broken",
-                    2,
-                    DistanceMetric::Dot,
+                    logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                     Path::new("/tmp"),
                 )
                 .collection_id,
@@ -2640,8 +2643,7 @@ mod tests {
         async fn open_collection(&self, name: &str) -> logpose_types::Result<CollectionDescriptor> {
             Ok(CollectionDescriptor::new(
                 name,
-                2,
-                DistanceMetric::Dot,
+                logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                 Path::new("/tmp"),
             ))
         }
@@ -2700,8 +2702,7 @@ mod tests {
             Ok(CollectionStats {
                 collection_id: CollectionDescriptor::new(
                     "filtered",
-                    2,
-                    DistanceMetric::Dot,
+                    logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
                     Path::new("/tmp"),
                 )
                 .collection_id,

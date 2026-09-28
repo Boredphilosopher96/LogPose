@@ -640,6 +640,31 @@ impl EngineCore {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Run `f` while `database_name` holds no collection, open, failed, or being created or
+    /// dropped. The collection map stays write-locked across `f`, so no create in the database
+    /// can reserve its name meanwhile; `f` must be short.
+    ///
+    /// Fails with `FAILED_PRECONDITION` when the database holds a collection.
+    pub(crate) fn with_empty_database<T>(
+        &self,
+        database_name: &str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let collections = self.write_collections();
+        if let Some(reference) = collections
+            .keys()
+            .find(|reference| reference.database_name == database_name)
+        {
+            return Err(LogPoseError::failed_precondition(format!(
+                "database '{database_name}' still holds collection '{}'; drop its collections first",
+                reference.collection_name
+            )));
+        }
+        let result = f();
+        drop(collections);
+        result
+    }
+
     pub(crate) fn collection(&self, reference: &CollectionRef) -> Result<Arc<CollectionHandle>> {
         match self.read_collections().get(reference) {
             Some(CollectionSlot::Open(handle)) => Ok(Arc::clone(handle)),
@@ -677,7 +702,7 @@ impl EngineCore {
         let mut descriptors = Vec::new();
         for slot in self.read_collections().values() {
             match slot {
-                CollectionSlot::Open(handle) => descriptors.push(handle.descriptor().clone()),
+                CollectionSlot::Open(handle) => descriptors.push(handle.describe()),
                 CollectionSlot::Failed(failed) => match &failed.descriptor {
                     Some(descriptor) => descriptors.push(descriptor.clone()),
                     None => return Err(failed.error.clone()),
@@ -880,7 +905,7 @@ impl CoreRef {
         }
     }
 
-    fn drop_collection(&self, reference: &CollectionRef) -> Result<()> {
+    pub(crate) fn drop_collection(&self, reference: &CollectionRef) -> Result<()> {
         let slot = {
             let mut collections = self.write_collections();
             match collections.get(reference) {

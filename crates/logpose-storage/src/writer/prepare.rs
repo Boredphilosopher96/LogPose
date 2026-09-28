@@ -15,7 +15,9 @@ use logpose_types::{
 };
 use logpose_wal::{
     MAX_FRAME_PAYLOAD, WalFrame,
-    codec::{RowImage, RowOp, SchemaChangePayload, WalPayload, WirePk, WriteBatchPayload},
+    codec::{
+        RowImage, RowImageError, RowOp, SchemaChangePayload, WalPayload, WirePk, WriteBatchPayload,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -134,6 +136,9 @@ pub(crate) fn prepare(
 
 /// Validate a client batch and build its frame. Nothing is applied yet; the state is only read
 /// (to merge partial updates with the rows they change).
+///
+/// Validation errors name the operation by its position in the batch (`[2]`, `[2].price`);
+/// the API prefixes the request field that holds the batch.
 fn batch_frame(
     state: &mut LogicalState,
     first_seq_no: SeqNo,
@@ -142,7 +147,7 @@ fn batch_frame(
 ) -> Result<(WalFrame, Change)> {
     if ops.is_empty() {
         return Err(LogPoseError::invalid_field(
-            "operations",
+            "",
             "write batch must include at least one operation",
         ));
     }
@@ -153,18 +158,15 @@ fn batch_frame(
         let pk = op.pk().clone();
         if !seen.insert(WirePk::from(pk.clone())) {
             return Err(LogPoseError::invalid_field(
-                format!("operations[{index}].id"),
-                format!("write batch includes duplicate record id '{pk}'"),
+                format!("[{index}]"),
+                format!("write batch includes primary key {pk} more than once"),
             ));
         }
         let op = match op {
-            ClientOp::Update(update) => RowOp::Put(
-                merge_update(state, &schema, update, fetched).map_err(|error| match error {
-                    Merge::Invalid(error) => invalid_record(index, &pk, error),
-                    Merge::Failed(error) => error,
-                })?,
-            ),
-            other => row_op(&schema, other).map_err(|error| invalid_record(index, &pk, error))?,
+            ClientOp::Update(update) => {
+                RowOp::Put(merge_update(state, &schema, update, fetched, index)?)
+            }
+            other => row_op(&schema, other, index)?,
         };
         row_ops.push(op);
     }
@@ -187,80 +189,87 @@ fn batch_frame(
     ))
 }
 
-/// Validate an upsert or a delete and turn it into a blind write.
-fn row_op(schema: &CollectionSchema, op: ClientOp) -> std::result::Result<RowOp, String> {
+/// Validate an upsert or a delete, the `index`th operation of its batch, and turn it into a
+/// blind write.
+fn row_op(schema: &CollectionSchema, op: ClientOp, index: usize) -> Result<RowOp> {
     match op {
-        ClientOp::Upsert(record) => RowImage::from_record(schema, record)
-            .map(RowOp::Put)
-            .map_err(|error| error.to_string()),
+        ClientOp::Upsert(record) => {
+            let pk = record.pk.clone();
+            RowImage::from_record(schema, record)
+                .map(RowOp::Put)
+                .map_err(|error| row_image_error(&error, index, &pk))
+        }
         ClientOp::Delete(pk) => {
-            schema
-                .validate_primary_key(&pk)
-                .map_err(|error| error.to_string())?;
+            schema.validate_primary_key(&pk).map_err(|error| {
+                LogPoseError::invalid_field(format!("[{index}]"), error.to_string())
+            })?;
             Ok(RowOp::Delete(pk.into()))
         }
-        ClientOp::Update(_) => Err("a partial update needs the row it changes".to_owned()),
+        ClientOp::Update(_) => Err(LogPoseError::internal(
+            "a partial update needs the row it changes",
+        )),
     }
 }
 
-/// Why a partial update could not be merged.
-enum Merge {
-    /// The update does not fit the schema, or the merged row does not.
-    Invalid(String),
-    /// The key has no live row, or its row could not be read.
-    Failed(LogPoseError),
-}
-
-/// Merge a partial update with the key's live row into the full row image a blind `Put` logs.
-/// The old row is read with the current schema, so values of dropped fields are gone and
-/// `$extra` keys the schema declares or retires are removed from the merged row (they are not
-/// promoted into the typed field).
+/// Merge a partial update, the `index`th operation of its batch, with the key's live row into
+/// the full row image a blind `Put` logs. The old row is read with the current schema, so
+/// values of dropped fields are gone and `$extra` keys the schema declares or retires are
+/// removed from the merged row (they are not promoted into the typed field).
+///
+/// An update of a key without a live row fails with `NotFound` for the record.
 fn merge_update(
     state: &mut LogicalState,
     schema: &CollectionSchema,
     update: PartialUpdate,
     fetched: &FetchedRows,
-) -> std::result::Result<RowImage, Merge> {
+    index: usize,
+) -> Result<RowImage> {
+    let pk = update.pk.clone();
+    let path = format!("[{index}]");
     let update = schema
         .validate_update(update)
-        .map_err(|error| Merge::Invalid(error.to_string()))?;
+        .map_err(|error| error.to_error(&path, Some(&pk)))?;
     let addr = state
         .resolve(&update.pk)
-        .map_err(|error| Merge::Failed(LogPoseError::internal(error.to_string())))?
-        .ok_or_else(|| {
-            Merge::Failed(LogPoseError::not_found(
-                ResourceKind::Record,
-                update.pk.to_string(),
-            ))
-        })?;
+        .map_err(|error| LogPoseError::internal(error.to_string()))?
+        .ok_or_else(|| LogPoseError::not_found(ResourceKind::Record, pk.label()))?;
     let old = match state.memtable(addr.unit) {
         Some(memtable) => memtable
             .row_image(addr.row)
-            .map_err(|error| Merge::Failed(LogPoseError::internal(error)))?,
+            .map_err(LogPoseError::internal)?,
         None => match fetched.get(&addr) {
             Some(Ok(image)) => image.clone(),
-            Some(Err(error)) => return Err(Merge::Failed(error.clone())),
+            Some(Err(error)) => return Err(error.clone()),
             None => {
-                return Err(Merge::Failed(LogPoseError::internal(format!(
+                return Err(LogPoseError::internal(format!(
                     "the row {addr} a partial update changes was not fetched"
-                ))));
+                )));
             }
         },
     };
     let mut record = old
         .to_record(schema)
-        .map_err(|error| Merge::Failed(LogPoseError::internal(error.to_string())))?;
+        .map_err(|error| LogPoseError::internal(error.to_string()))?;
     update
         .apply_to(&mut record)
-        .map_err(|error| Merge::Invalid(error.to_string()))?;
-    RowImage::from_record(schema, record).map_err(|error| Merge::Invalid(error.to_string()))
+        .map_err(|error| error.to_error(&path, Some(&pk)))?;
+    RowImage::from_record(schema, record).map_err(|error| row_image_error(&error, index, &pk))
 }
 
-fn invalid_record(index: usize, pk: &PrimaryKey, error: String) -> LogPoseError {
-    LogPoseError::invalid_field(
-        format!("operations[{index}]"),
-        format!("record '{pk}' is invalid: {error}"),
-    )
+/// The wire error of a record, the `index`th operation of its batch, that cannot become a row
+/// image: it names the offending field below `[index]`.
+fn row_image_error(error: &RowImageError, index: usize, pk: &PrimaryKey) -> LogPoseError {
+    let path = format!("[{index}]");
+    match error {
+        RowImageError::InvalidRecord(error) => error.to_error(&path, Some(pk)),
+        RowImageError::ZeroNormVector { field } | RowImageError::Encode { field, .. } => {
+            LogPoseError::invalid_field(
+                format!("{path}.{field}"),
+                format!("record {pk} is invalid: {error}"),
+            )
+        }
+        other => LogPoseError::internal(format!("record {pk} could not be encoded: {other}")),
+    }
 }
 
 /// Validate a schema change and build its frame. Returns the new schema, not yet applied.
@@ -271,7 +280,7 @@ fn schema_frame(
 ) -> Result<(WalFrame, CollectionSchema)> {
     let mut next = schema.clone();
     change.apply_to(&mut next).map_err(|error| {
-        LogPoseError::invalid_argument(format!("invalid schema change {change:?}: {error}"))
+        LogPoseError::invalid_field(change.error_field(&error), error.to_string())
     })?;
     let payload = WalPayload::SchemaChange(SchemaChangePayload { schema: next });
     let bytes = encode(&payload)?;

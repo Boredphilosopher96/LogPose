@@ -184,7 +184,14 @@ impl EngineCore {
         filter: Option<MetadataFilter>,
     ) -> Result<Vec<AnnCandidate>> {
         let (version, _) = self.read_state(handle, at)?;
-        let metric = handle.descriptor().metric;
+        // The legacy read paths search the first vector field of the reading schema, the one
+        // `legacy_put` returns as the record's vector.
+        let metric = version
+            .schema
+            .vectors()
+            .first()
+            .map(|field| field.metric)
+            .ok_or_else(|| LogPoseError::internal("a collection schema has no vector field"))?;
         let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
         let selection = Selection {
             mutable: false,

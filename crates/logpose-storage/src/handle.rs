@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, ResourceKind,
-    Result, SeqNo, Snapshot, record::ClientOp,
+    Result, SeqNo, Snapshot, record::ClientOp, schema::CollectionSchema,
 };
 use std::{
     collections::VecDeque,
@@ -192,10 +192,18 @@ impl CollectionHandle {
         &self.meta
     }
 
-    /// The persisted descriptor.
+    /// The persisted descriptor, whose schema is the one the collection was created with.
     #[must_use]
     pub fn descriptor(&self) -> &CollectionDescriptor {
         &self.meta.descriptor
+    }
+
+    /// The descriptor with the live schema: the schema of the current `Version`.
+    #[must_use]
+    pub fn describe(&self) -> CollectionDescriptor {
+        let mut descriptor = self.meta.descriptor.clone();
+        descriptor.schema = CollectionSchema::clone(&self.current().schema);
+        descriptor
     }
 
     /// Pin the current `Version`. Never blocks.

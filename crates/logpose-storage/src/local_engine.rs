@@ -6,7 +6,8 @@
 //! pool. Reads of the current state use the published `Version` and read no metadata files.
 
 use crate::{
-    BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
+    BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget,
+    StorageEngine, Version,
     collections::collection_ref_from_lookup,
     durable_fs::path_exists,
     engine::{CoreRef, Engine, EngineConfig, not_found},
@@ -22,6 +23,8 @@ use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
     CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
     RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    record::{ClientOp, PrimaryKey, Projection},
+    schema::{CollectionSchema, SchemaChange},
 };
 use logpose_vfs::{Vfs, std_vfs};
 use std::{path::Path, sync::Arc};
@@ -187,6 +190,23 @@ impl LocalStorageEngine {
         self.engine.collection(&collection_ref_from_lookup(name))
     }
 
+    /// The handle of `name` for a write. The first write to a recovered collection resumes its
+    /// persisted maintenance, as a v1 state load did.
+    fn writable_handle(&self, name: &str) -> Result<Arc<CollectionHandle>> {
+        let handle = self.handle(name)?;
+        if handle.take_maintenance_resume() {
+            let core = self.engine.core();
+            let resumed = Arc::clone(&handle);
+            // Resuming persists the maintenance status: blocking I/O, so not on this worker.
+            let _ = self
+                .engine
+                .runtime()
+                .io
+                .execute(move || core.resume_maintenance(&resumed));
+        }
+        Ok(handle)
+    }
+
     /// Run data-plane work for `handle` on the I/O pool. The first data-plane access of a
     /// recovered collection resumes its persisted maintenance, as a v1 state load did.
     async fn data_io<T: Send + 'static>(
@@ -282,7 +302,7 @@ impl StorageEngine for LocalStorageEngine {
     }
 
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        self.handle(name).map(|handle| handle.descriptor().clone())
+        self.handle(name).map(|handle| handle.describe())
     }
 
     async fn has_local_collection(&self, name: &str) -> Result<bool> {
@@ -320,24 +340,58 @@ impl StorageEngine for LocalStorageEngine {
             })
     }
 
+    async fn drop_collection(
+        &self,
+        collection_name: &str,
+        _leader_fence: Option<LeadershipFence>,
+    ) -> Result<()> {
+        let reference = collection_ref_from_lookup(collection_name);
+        self.engine
+            .io(move |core| core.drop_collection(&reference))
+            .await
+    }
+
+    async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
+        let handle = self.handle(collection_name)?;
+        handle.ensure_open()?;
+        Ok(Arc::clone(&handle.current().schema))
+    }
+
+    async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
+        let handle = self.writable_handle(collection_name)?;
+        handle.alter_schema(change).await
+    }
+
+    async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
+        let handle = self.writable_handle(collection_name)?;
+        handle.write(ops).await
+    }
+
+    async fn get_records(
+        &self,
+        collection_name: &str,
+        keys: Vec<PrimaryKey>,
+        output_fields: Vec<String>,
+    ) -> Result<FetchedRecords> {
+        let handle = self.handle(collection_name)?;
+        self.data_io(handle, move |_, handle| {
+            handle.ensure_open()?;
+            get_records(&handle.current(), &keys, &output_fields)
+        })
+        .await
+    }
+
     async fn write(
         &self,
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
-        let handle = self.handle(collection_name)?;
-        if handle.take_maintenance_resume() {
-            let core = self.engine.core();
-            let resumed = Arc::clone(&handle);
-            // Resuming persists the maintenance status: blocking I/O, so not on this worker.
-            let _ = self
-                .engine
-                .runtime()
-                .io
-                .execute(move || core.resume_maintenance(&resumed));
-        }
-        let ops = legacy_ops(handle.descriptor(), operations)?;
-        handle.write(ops).await
+        let handle = self.writable_handle(collection_name)?;
+        let ops = legacy_ops(operations)?;
+        handle
+            .write(ops)
+            .await
+            .map_err(|error| error.with_field_prefix("operations"))
     }
 
     async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
@@ -474,6 +528,40 @@ impl StorageEngine for LocalStorageEngine {
     }
 }
 
+/// Point lookups of `keys` in `version`, projected to `output_fields`. Blocking.
+///
+/// This is the engine's current point-lookup primitive over one published state; the read
+/// path's `CollectionReader::get` replaces it.
+fn get_records(
+    version: &Version,
+    keys: &[PrimaryKey],
+    output_fields: &[String],
+) -> Result<FetchedRecords> {
+    let schema = Arc::clone(&version.schema);
+    let projection = Projection::resolve(&schema, output_fields)?;
+    let mut records = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        schema.validate_primary_key(key).map_err(|error| {
+            LogPoseError::invalid_field(format!("keys[{index}]"), error.to_string())
+        })?;
+        let record = match version.lookup(key)? {
+            Some(image) => Some(projection.apply(image.to_record(&schema).map_err(|error| {
+                LogPoseError::internal(format!(
+                    "record {key} cannot be read with schema version {}: {error}",
+                    schema.schema_version()
+                ))
+            })?)),
+            None => None,
+        };
+        records.push(record);
+    }
+    Ok(FetchedRecords {
+        schema,
+        snapshot: version.snapshot(),
+        records,
+    })
+}
+
 impl CoreRef {
     /// Commit v1 `operations` as one batch through the collection's writer. Blocking; for
     /// threads outside any async runtime (tests, job threads).
@@ -483,8 +571,10 @@ impl CoreRef {
         handle: &Arc<CollectionHandle>,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
-        let ops = legacy_ops(handle.descriptor(), operations)?;
-        handle.write_blocking(ops)
+        let ops = legacy_ops(operations)?;
+        handle
+            .write_blocking(ops)
+            .map_err(|error| error.with_field_prefix("operations"))
     }
 }
 

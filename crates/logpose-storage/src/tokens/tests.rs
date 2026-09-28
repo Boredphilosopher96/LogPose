@@ -31,8 +31,7 @@ fn test_meta(name: &str) -> Arc<CollectionMeta> {
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         name,
-        2,
-        DistanceMetric::Dot,
+        legacy_schema(2, DistanceMetric::Dot).expect("schema"),
         PathBuf::from("/c"),
     );
     Arc::new(CollectionMeta::new(descriptor, None))

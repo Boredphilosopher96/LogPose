@@ -2000,7 +2000,12 @@ async fn duplicate_id_batch_rejects_without_committing_anything() {
         )
         .await
         .expect_err("duplicate batch should fail");
-    assert!(error.to_string().contains("duplicate"));
+    assert!(error.to_string().contains("more than once"), "{error}");
+    assert_eq!(
+        error.details().field_violations[0].field,
+        "operations[1]",
+        "the second operation repeats the key"
+    );
 
     let visible = engine
         .scan_exact("items", None)
