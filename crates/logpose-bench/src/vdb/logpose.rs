@@ -252,7 +252,9 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
         }))
         .await
         .map_err(|status| anyhow!("flush failed: {status}"))?;
-    wait_for_maintenance(&mut client).await?;
+    // The explicit compaction waits for background compactions, merges every segment it can,
+    // cancels the background graph builds of the segments it merges, and builds the graphs of
+    // what it settles on before it returns; the wait covers anything planned after it.
     client
         .inner
         .compact_collection(client.collection_request(|database_name, collection_name| {

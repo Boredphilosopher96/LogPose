@@ -1777,3 +1777,164 @@ fn wal_file_count(root: &std::path::Path) -> usize {
         .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
         .count()
 }
+
+/// A segment is searchable before its graph lands (its SQ8 codes are scanned and reranked in
+/// f32) and after (its graph is walked), with the same top hits: the index build changes how a
+/// search runs, never what it returns beyond approximation.
+#[test]
+fn a_segment_answers_the_same_before_and_after_its_graph_lands() {
+    use logpose_storage::{EngineConfig, IndexPolicy, JobKind};
+
+    const DIM: usize = 16;
+    const ROWS: u32 = 3_000;
+    let root_dir = support::unique_temp_dir("storage-graph-lands");
+    let engine = Engine::open_local(
+        root_dir.path(),
+        EngineConfig {
+            index: IndexPolicy {
+                graph_min_rows: 256,
+                sq8_min_rows: 64,
+                ..IndexPolicy::default()
+            },
+            ..EngineConfig::default()
+        },
+    )
+    .expect("engine should open");
+    let mut descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::new(
+            "graphs",
+            DIM,
+            DistanceMetric::L2,
+        ))
+        .expect("descriptor");
+    descriptor.flush_threshold_ops = usize::MAX;
+    descriptor.flush_threshold_bytes = usize::MAX;
+    descriptor.compaction_threshold_segments = usize::MAX;
+    let collection = engine
+        .create_collection_blocking(descriptor, None)
+        .expect("collection");
+    // 30 clusters of 100 rows with a deterministic spread.
+    let vector = |row: u32| -> Vec<f32> {
+        let cluster = row % 30;
+        (0..DIM as u32)
+            .map(|dim| {
+                let center = ((cluster * 37 + dim * 11) % 29) as f32;
+                let noise = ((row * 7_919 + dim * 104_729) % 1_000) as f32 / 1_000.0;
+                center + noise
+            })
+            .collect()
+    };
+    let rows = (0..ROWS).collect::<Vec<_>>();
+    for batch in rows.chunks(500) {
+        collection
+            .write_blocking(
+                batch
+                    .iter()
+                    .map(|row| db::put(&format!("r{row:05}"), vector(*row)))
+                    .collect(),
+            )
+            .expect("write");
+    }
+    collection.flush_blocking().expect("flush");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let reference = logpose_types::CollectionRef::parse("graphs").expect("name");
+    let search = |query: &[f32]| -> (Vec<String>, Vec<String>) {
+        let request = logpose_query::QueryRequest {
+            vector: Some(logpose_query::VectorQuery {
+                field: None,
+                values: query.to_vec(),
+            }),
+            top_k: 10,
+            ef: Some(128),
+            explain: logpose_query::ExplainMode::Plan,
+            output_fields: vec!["id".to_owned()],
+            ..logpose_query::QueryRequest::default()
+        };
+        let response = runtime
+            .block_on(logpose_query::query(&engine, &reference, request))
+            .expect("query")
+            .value;
+        let strategies = response
+            .diagnostics
+            .map(|diagnostics| diagnostics.unit_scan_mix.into_keys().collect())
+            .unwrap_or_default();
+        let hits = response
+            .hits
+            .into_iter()
+            .map(|hit| hit.record.pk.label())
+            .collect();
+        (hits, strategies)
+    };
+    let exact = |query: &[f32]| -> Vec<String> {
+        let mut scored = (0..ROWS)
+            .map(|row| {
+                let distance = vector(row)
+                    .iter()
+                    .zip(query)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>();
+                (distance, format!("r{row:05}"))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().take(10).map(|(_, id)| id).collect()
+    };
+    let queries = (0..20_u32)
+        .map(|index| {
+            vector(index * 149 + 7)
+                .into_iter()
+                .map(|value| value + 0.013)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let recall = |hits: &[Vec<String>]| -> f64 {
+        let found = queries
+            .iter()
+            .zip(hits)
+            .map(|(query, hits)| {
+                let truth = exact(query);
+                hits.iter().filter(|id| truth.contains(id)).count()
+            })
+            .sum::<usize>();
+        found as f64 / (queries.len() * 10) as f64
+    };
+
+    let mut before = Vec::new();
+    for query in &queries {
+        let (hits, strategies) = search(query);
+        // The empty active memtable reports `empty`.
+        assert_eq!(
+            strategies,
+            ["empty", "exact_sq8"],
+            "no graph yet: the codes are scanned"
+        );
+        before.push(hits);
+    }
+    let job = engine
+        .begin_job(&collection, JobKind::Index)
+        .expect("begin index build");
+    assert!(job.has_work());
+    job.commit().expect("commit index build");
+    let mut after = Vec::new();
+    for query in &queries {
+        let (hits, strategies) = search(query);
+        assert_eq!(
+            strategies,
+            ["empty", "graph_admit"],
+            "the graph landed and is walked"
+        );
+        after.push(hits);
+    }
+    let (recall_before, recall_after) = (recall(&before), recall(&after));
+    assert!(
+        recall_before >= 0.95,
+        "recall without the graph {recall_before}"
+    );
+    assert!(recall_after >= 0.95, "recall with the graph {recall_after}");
+    drop(collection);
+    drop(engine);
+}

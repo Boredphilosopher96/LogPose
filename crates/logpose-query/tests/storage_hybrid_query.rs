@@ -143,6 +143,11 @@ async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
         .flush()
         .await
         .expect("flush should succeed");
+    // A flushed segment gets its graph from an index build, which the compaction runs.
+    handle(&engine, "documents")
+        .compact()
+        .await
+        .expect("compaction should succeed");
 
     let response = query(&engine, request("documents", 10, None))
         .await
@@ -167,6 +172,11 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
         .flush()
         .await
         .expect("flush should succeed");
+    // A flushed segment gets its graph from an index build, which the compaction runs.
+    handle(&engine, "documents")
+        .compact()
+        .await
+        .expect("compaction should succeed");
 
     // 750 `keep` rows are within the exact-scan limit: an exact scan over SQ8 codes.
     let selective = query(
@@ -212,6 +222,11 @@ async fn memtable_rows_merge_with_segment_walks_and_supersede_stale_rows() {
         .flush()
         .await
         .expect("flush should succeed");
+    // A flushed segment gets its graph from an index build, which the compaction runs.
+    handle(&engine, "profiles")
+        .compact()
+        .await
+        .expect("compaction should succeed");
     handle(&engine, "profiles")
         .write(vec![put(
             "doc-01500",

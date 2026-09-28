@@ -327,7 +327,7 @@ fn background_index_builds_follow_flushes_of_large_enough_segments() {
     assert!(!graphs[0].1, "40 rows are below graph_min_rows");
     assert!(graphs[1].1);
     assert!(engine.scheduler().stats().index_builds_granted >= 1);
-    assert_eq!(handle.maintenance_written().index_bytes > 0, true);
+    assert!(handle.maintenance_written().index_bytes > 0);
 }
 
 /// Index build crash analysis, exhaustively: a crash at every mutating operation of an index
