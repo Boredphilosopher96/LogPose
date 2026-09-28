@@ -505,7 +505,7 @@ fn manifest_generation(harness: &Harness) -> u64 {
         .manifest_generation
 }
 
-/// One test per crash point the legacy engine implements, asserting the outcome from the crash
+/// One test per crash point a sequential scenario reaches, asserting the outcome from the crash
 /// analysis: before `CURRENT` is durably renamed the flush or compaction is invisible; after, it
 /// is complete; a WAL frame is durable exactly when its fsync returned.
 #[tokio::test]

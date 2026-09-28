@@ -599,14 +599,6 @@ impl LogPoseDataService {
         }
     }
 
-    /// Return whether this node's engine serves the collection.
-    pub fn has_local_collection(&self, collection_name: &str) -> Result<bool> {
-        Ok(self
-            .engine
-            .collection(&CollectionRef::parse(collection_name)?)
-            .is_ok())
-    }
-
     /// Return whether this node's engine serves exactly the collection `descriptor` names (the
     /// same collection id).
     pub fn local_collection_matches_descriptor(
