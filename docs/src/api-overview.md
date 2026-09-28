@@ -917,7 +917,8 @@ curl -X POST http://127.0.0.1:8080/v2/databases/analytics/collections/products/q
 | `top_k`          | integer  | yes      | Results to return, 1 to 10,000                                                                                     |
 | `output_fields`  | string[] | no       | Fields each hit returns, as `records/get` projects them; empty returns every scalar field and `$extra`, no vectors |
 | `ef`             | integer  | no       | Beam width of graph walks, 1 to 4,096 (default 64, and at least four candidates per result); vector search only    |
-| `explain`        | string   | no       | `"none"`, `"plan"`, or `"profile"`                                                                                 |
+| `rerank_factor`  | integer  | no       | Candidates per result each segment reranks exactly in f32, 1 to 64 (default 4); vector search only                 |
+| `explain`        | string   | no       | `"none"`, `"plan"` (the plan tree with estimated and actual work), or `"profile"` (also measured times)            |
 | `snapshot`       | object   | no       | Read one exact snapshot; see snapshot retention above                                                              |
 | `snapshot_token` | string   | no       | Read exactly the state this token pins; cannot be combined with `snapshot`                                        |
 | `pin`            | boolean  | no       | Pin the state read and return its `snapshot_token`                                                                 |
@@ -928,7 +929,8 @@ Name only the primary key in `output_fields` to get keys and scores alone;
 the default returns whole records. A collection with several vector fields
 needs `vector.field`. Validation errors name the request field: `top_k`,
 `vector.field`, `vector.values` (`DIMENSION_MISMATCH` for the wrong length),
-`order_by[0].field`, `ef`, `output_fields[2]`, or the filter node.
+`order_by[0].field`, `ef`, `rerank_factor`, `output_fields[2]`, or the filter
+node.
 
 **Response** (`200`):
 
@@ -947,7 +949,7 @@ needs `vector.field`. Validation errors name the request field: `top_k`,
   ],
   "diagnostics": {
     "chosen_plan": "hybrid_exact_ann_merge",
-    "planner_reason": "unit 00000003 graph_admit: 48000 matching rows exceed the exact-scan limit 2048; selectivity 1.000; unit 00000007 memtable_scan: memtables are scanned exactly",
+    "planner_reason": "unit 00000003 graph_admit: cheapest at selectivity 1.0000: graph_admit 303us vs exact_scan 2180us; unit 00000007 memtable_scan: memtables are scanned exactly",
     "estimated_selectivity": 1.0,
     "units_considered": 2,
     "units_pruned": 0,
@@ -959,15 +961,40 @@ needs `vector.field`. Validation errors name the request field: `top_k`,
     "rerank_count": 1,
     "unit_scan_mix": { "graph_admit": 1, "memtable_scan": 1 },
     "stage_timings": {
-      "planning_micros": 90,
+      "planning_micros": 12,
       "prefilter_micros": 0,
-      "candidate_generation_micros": 340,
+      "candidate_generation_micros": 310,
       "postfilter_micros": 35,
       "rerank_micros": 45,
-      "merge_micros": 0
-    }
+      "merge_micros": 2
+    },
+    "plan": {
+      "operator": "project",
+      "detail": "k=5",
+      "estimated": { "rows": 5, "distances": 0, "hops": 0, "resident_bytes": 0, "cold_bytes": 0, "micros": 0.0 },
+      "actual": { "rows": 2, "distances": 0, "hops": 0, "resident_bytes": 0, "cold_bytes": 0, "micros": 35.0 },
+      "children": [ { "operator": "merge", "detail": "units=2 k=5", "children": [ "..." ] } ]
+    },
+    "plan_text": "Project k=5 (est rows=5) (actual rows=2 35us)\n└─ Merge units=2 k=5 ..."
   }
 }
+```
+
+`plan_text` renders the same tree, one operator per line:
+
+```text
+Project k=5 (est rows=5) (actual rows=2 35us)
+└─ Merge units=2 k=5 (est rows=5) (actual rows=2 2us)
+   ├─ Rerank f32 keep=5 (est rows=5 dist=20 0us) (actual rows=5 dist=20 21us)
+   │  └─ TopK k=20 (est rows=20) (actual rows=20)
+   │     └─ GraphScan unit=00000003 admit ef=64 (est rows=20 dist=894 hops=65 resident=111.8KiB 303us) (actual rows=20 dist=911 hops=66 280us)
+   │        │  reason: cheapest at selectivity 1.0000: graph_admit 303us vs exact_scan 2180us
+   │        └─ MaskDeletes deleted=0 (est rows=48000) (actual rows=48000)
+   │           └─ SegmentSource unit=00000003 segment rows=48000 (est rows=48000) (actual rows=48000)
+   └─ ExactScan unit=00000007 f32 keep=5 (est rows=5 dist=50 2us) (actual rows=5 dist=50 3us)
+      │  reason: memtables are scanned exactly
+      └─ MaskDeletes deleted=0 (est rows=50) (actual rows=50)
+         └─ SegmentSource unit=00000007 memtable rows=50 (est rows=50) (actual rows=50)
 ```
 
 <!-- markdownlint-disable MD060 -->
@@ -990,24 +1017,41 @@ rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
 ```
 
 The gRPC request holds the same fields: `VectorQuery vector`, `Filter filter`,
-`repeated OrderBy order_by`, `top_k`, `output_fields`, `ef` (0 for the
-default), and the snapshot fields. Each `QueryHit` holds the projected
-`Record` and an optional `score`, and `metric` is unspecified for a scan.
+`repeated OrderBy order_by`, `top_k`, `output_fields`, `ef` and
+`rerank_factor` (0 for the defaults), and the snapshot fields. Each `QueryHit`
+holds the projected `Record` and an optional `score`, and `metric` is
+unspecified for a scan. `QueryDiagnostics.plan` is a `PlanNode` tree
+(`PlanOperator operator`, `detail`, `reason`, `PlanOperatorStats estimated`
+and `actual`, `children`), and `plan_text` its rendering.
 
-#### Query Plan Kinds
+#### Query Plans and EXPLAIN
 
 The planner chooses a strategy per unit from the exact number of live rows
-the filter matches there (`n`) and the unit's live rows (`N`). Memtables are
-scanned exactly. A segment without a graph, or whose `n` is at most 2,048 (or
-the candidate budget, four candidates per result), is scanned exactly over its
-filter bitmap: over SQ8 codes when it has them, then reranked in f32. Otherwise
-it walks its HNSW graph over SQ8 codes: ACORN-1 style when `n / N` is below
-0.3, else a walk that admits only matching rows; a walk that comes back short,
-or whose visited rows match the filter far less often than `n / N` predicts,
-widens its beam and continues. Every unit's candidates are reranked in f32 and
-merged into one top-k. `unit_scan_mix` counts units per strategy
-(`memtable_scan`, `exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`,
-`pruned`, `empty`); `chosen_plan` summarizes them:
+the filter matches there (`n`, from the filter's bitmap). Memtables are
+scanned exactly. For a segment it prices each strategy with a cost model in
+distance computations, graph hops, and bytes touched (resident, read at
+random, or cold), calibrated on the benchmark harness, and runs the cheapest:
+an exact scan of the filter bitmap over SQ8 codes (split into morsels scanned
+in parallel when it is large), an HNSW walk over SQ8 codes that admits only
+matching rows, or an ACORN-1 style walk. A segment without codes is scanned in
+f32, and one whose `n` is at most its candidate budget (`top_k *
+rerank_factor`) is always scanned exactly. A walk that comes back short, or
+whose visited rows match the filter far less often than `n / N` predicts,
+widens its beam and continues; once widening would take it past the exact
+scan's price, the segment is scanned exactly instead. Each segment's
+candidates are reranked in f32, and a heap merge takes the global top-k.
+
+With `explain`, `plan` is the operator tree: `project` over `merge` over one
+branch per unit, `rerank` over `top_k` over `exact_scan` or `graph_scan` over
+`mask_deletes` over `bitmap_probe` (with a filter) over `segment_source` (a
+memtable branch has no rerank; a scan without a vector has `ordered_scan`
+under `merge`). Every operator carries the planner's `estimated` work (rows,
+distances, hops, resident and cold bytes, and the cost model's price in
+`micros`) and the `actual` work counted while running (times in `profile`
+mode only), and each strategy its `reason`, which names the alternatives and
+their prices. `unit_scan_mix` counts units per strategy (`memtable_scan`,
+`exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`, `pruned`, `empty`);
+`chosen_plan` summarizes them:
 
 | Plan Kind                          | Description                                             |
 |------------------------------------|---------------------------------------------------------|
@@ -1017,13 +1061,11 @@ merged into one top-k. `unit_scan_mix` counts units per strategy
 | `cooperative_filtered_ann`         | Filtered segment graph walks (ACORN-1 or admit-only)    |
 | `hybrid_exact_ann_merge`           | Segment graph walks merged with memtable scans          |
 | `ordered_scan`                     | No vector: rows read in `order_by` order                |
-| `vector_first_exact`               | No longer produced                                      |
-| `tiny_population_exact_fallback`   | No longer produced                                      |
 
 With a vector, `order_by` sorts the `top_k` hits the search found; it does not
 search for the best records by that field. The diagnostics of a scan report
-only `ordered_scan`, the units considered, and (with `profile`) the scan's
-time.
+`ordered_scan`, the units considered, the plan tree, and (with `profile`) the
+scan's time.
 
 ### Collection Stats
 

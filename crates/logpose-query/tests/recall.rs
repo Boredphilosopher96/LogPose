@@ -362,6 +362,11 @@ async fn qps_100k_top10_ef64() {
         (&all[1], 500),
         (&all[5], 500),
     ];
+    let sequential = std::env::var_os("LOGPOSE_QPS_SEQUENTIAL").is_some();
+    let tuning = SearchTuning {
+        parallel: !sequential,
+        ..SearchTuning::default()
+    };
     for (case, count) in measured {
         let warm = measure(
             &view,
@@ -374,15 +379,20 @@ async fn qps_100k_top10_ef64() {
         .await;
         let started = Instant::now();
         let mut stages = [0_u64; 4];
+        let mut operators: std::collections::BTreeMap<&str, f64> = Default::default();
         for query in &queries[..count] {
             let request = SearchRequest {
                 ef: Some(64),
                 filter: case.filter.clone(),
+                tuning,
                 ..SearchRequest::new(query.clone(), K)
             };
             let outcome = search(&view, &request)
                 .await
                 .expect("search should succeed");
+            for node in outcome.plan.walk() {
+                *operators.entry(node.operator.name()).or_default() += node.actual.micros;
+            }
             let timings = outcome.timings;
             let micros = [
                 timings.planning,
@@ -417,6 +427,14 @@ async fn qps_100k_top10_ef64() {
             per_query[1],
             per_query[2],
             per_query[3]
+        );
+        println!(
+            "    mean micros per operator: {}",
+            operators
+                .iter()
+                .map(|(name, micros)| format!("{name} {:.0}", micros / count as f64))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 }

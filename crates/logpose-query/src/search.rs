@@ -66,9 +66,13 @@ pub const RERANK_FACTOR: usize = 4;
 pub const MAX_RERANK_FACTOR: usize = 64;
 /// The widest a walk escalates, as a multiple of its starting beam.
 pub const MAX_EF_MULTIPLIER: usize = 8;
-/// Rows of `B` per morsel of a parallel exact scan: a scan of more than two morsels splits
-/// into morsels scanned in parallel on the query pool.
-pub const SCAN_MORSEL_ROWS: u32 = 8_192;
+/// An exact scan the cost model prices above this many microseconds splits into morsels
+/// scanned in parallel on the query pool; a hand-off to another worker costs tens of
+/// microseconds.
+pub const PARALLEL_SCAN_MICROS: f64 = 150.0;
+/// Estimated microseconds of work per morsel of a parallel exact scan (at most two morsels
+/// per query-pool thread).
+pub const MORSEL_MICROS: f64 = 100.0;
 /// Units run their candidates stage in parallel when more than one has more live rows than
 /// this; smaller units run inline, where a hand-off to another worker would cost more than
 /// they do.
@@ -1307,13 +1311,12 @@ fn unit_candidates(
         .params()
         .query(context.metric.sq8(), &context.query)
         .map_err(|error| LogPoseError::internal(format!("sq8 query: {error}")))?;
-    let codes = sq8.codes();
-    let estimate = |row: RowId| -> f32 {
-        let start = row as usize * dims;
-        codes
-            .get(start..start + dims)
-            .map_or(f32::INFINITY, |code| sq8_distance(&sq8_query, code))
+    let codes = Codes {
+        codes: sq8.codes(),
+        dims,
+        query: &sq8_query,
     };
+    let estimate = |row: RowId| -> f32 { codes.estimate(row) };
 
     let mut report = UnitReport::new(unit, UnitStrategy::ExactSq8, matched, &decision.reason);
     let (candidates, scan_node) = match (decision.chosen.choice, usable_graph) {
@@ -1370,7 +1373,8 @@ fn unit_candidates(
                     report.walk_abandoned = true;
                     report.reason = format!("{}; {why}", decision.reason);
                     let started = Instant::now();
-                    let candidates = sq8_scan(&allowed, unit.id(), &estimate, context);
+                    let morsels = scan_morsels(context, decision.exact.micros);
+                    let candidates = sq8_scan(&allowed, unit.id(), &codes, context, morsels);
                     report.distances += matched;
                     let node = PlanNode::new(
                         Operator::ExactScan,
@@ -1393,10 +1397,11 @@ fn unit_candidates(
         }
         _ => {
             let started = Instant::now();
-            let candidates = sq8_scan(&allowed, unit.id(), &estimate, context);
+            let count = scan_morsels(context, decision.exact.micros);
+            let candidates = sq8_scan(&allowed, unit.id(), &codes, context, count);
             report.distances = matched;
-            let morsels = if parallel(context, matched) {
-                format!(" morsels={}", unit.row_count().div_ceil(SCAN_MORSEL_ROWS))
+            let morsels = if count > 1 {
+                format!(" morsels={count}")
             } else {
                 String::new()
             };
@@ -1487,38 +1492,107 @@ fn memtable_scan(
     })
 }
 
-/// Whether an exact scan of `rows` rows runs in parallel morsels.
-fn parallel(context: &Context, rows: u64) -> bool {
-    context.tuning.parallel && rows > 2 * u64::from(SCAN_MORSEL_ROWS)
+/// Rows an exact scan scores per kernel call.
+const SCAN_BATCH: usize = 64;
+
+/// A segment's SQ8 codes (`dims` bytes per row) and the query prepared for them.
+struct Codes<'a> {
+    codes: &'a [u8],
+    dims: usize,
+    query: &'a Sq8Query,
 }
 
-/// The best `budget` rows of `allowed` by their SQ8 estimates, scanned in parallel morsels
-/// when there are many.
+impl Codes<'_> {
+    /// The distance of `row`'s code (lower is closer).
+    fn estimate(&self, row: RowId) -> f32 {
+        let start = row as usize * self.dims;
+        self.codes
+            .get(start..start + self.dims)
+            .map_or(f32::INFINITY, |code| {
+                self.distance(self.query.estimate(code))
+            })
+    }
+
+    /// An SQ8 estimate as a distance, clamped: an estimate that overflowed is "far".
+    fn distance(&self, estimate: f32) -> f32 {
+        let distance = match self.query.metric() {
+            Sq8Metric::Dot => -estimate,
+            Sq8Metric::L2Squared => estimate,
+        };
+        if distance.is_finite() {
+            distance
+        } else {
+            f32::MAX
+        }
+    }
+}
+
+/// Morsels an exact scan priced at `micros` splits into (1: not split).
+fn scan_morsels(context: &Context, micros: f64) -> usize {
+    if !context.tuning.parallel || micros <= PARALLEL_SCAN_MICROS {
+        return 1;
+    }
+    let most = rayon::current_num_threads().max(1) * 2;
+    ((micros / MORSEL_MICROS).ceil() as usize).clamp(1, most)
+}
+
+/// The best `budget` rows of `allowed` by their SQ8 estimates, split into `morsels` row ranges
+/// scanned in parallel.
 fn sq8_scan(
     allowed: &RoaringBitmap,
     unit: UnitId,
-    estimate: &(impl Fn(RowId) -> f32 + Sync),
+    codes: &Codes<'_>,
     context: &Context,
+    morsels: usize,
 ) -> Vec<Candidate> {
     let scan = |rows: roaring::bitmap::Iter<'_>| {
         let mut top = TopK::new(context.budget);
+        let mut batch = [0_u32; SCAN_BATCH];
+        let mut estimates = [0.0_f32; SCAN_BATCH];
+        let mut len = 0;
+        // One kernel dispatch per batch: its setup costs as much as scoring a 128-dimension
+        // code, so scoring row by row would pay it for every row.
+        let mut flush = |batch: &[u32], top: &mut TopK| {
+            let estimates = &mut estimates[..batch.len()];
+            codes.query.estimate_rows(codes.codes, batch, estimates);
+            for (&row, &estimate) in batch.iter().zip(estimates.iter()) {
+                top.offer(unit, row, codes.distance(estimate), |_| None);
+            }
+        };
         for row in rows {
-            top.offer(unit, row, estimate(row), |_| None);
+            batch[len] = row;
+            len += 1;
+            if len == SCAN_BATCH {
+                flush(&batch, &mut top);
+                len = 0;
+            }
         }
+        flush(&batch[..len], &mut top);
         top
     };
-    if !parallel(context, allowed.len()) {
+    if morsels <= 1 {
         return scan(allowed.iter()).into_sorted();
     }
-    let last = allowed.max().unwrap_or(0);
-    let morsels = (0..=last / SCAN_MORSEL_ROWS).collect::<Vec<_>>();
-    let tops = morsels
-        .into_par_iter()
-        .map(|morsel| {
-            let start = morsel * SCAN_MORSEL_ROWS;
-            let end = start.saturating_add(SCAN_MORSEL_ROWS);
-            scan(allowed.range(start..end))
+    let (Some(first), Some(last)) = (allowed.min(), allowed.max()) else {
+        return Vec::new();
+    };
+    let span = u64::from(last - first) + 1;
+    let step = span.div_ceil(morsels as u64);
+    let ranges = (0..morsels as u64)
+        .filter_map(|index| {
+            let start = u64::from(first) + index * step;
+            let end = (start + step).min(u64::from(last) + 1);
+            (start < end).then(|| {
+                (
+                    u32::try_from(start).unwrap_or(u32::MAX),
+                    u32::try_from(end).unwrap_or(u32::MAX),
+                )
+            })
         })
+        .collect::<Vec<_>>();
+    let tops = ranges
+        .into_par_iter()
+        .map(|(start, end)| scan(allowed.range(start..end)))
         .collect::<Vec<_>>();
     let mut top = TopK::new(context.budget);
     for part in tops {
@@ -1742,20 +1816,6 @@ fn best_rows(neighbors: &[logpose_index::graph::Neighbor]) -> Vec<u32> {
         .collect::<Vec<_>>();
     rows.sort_unstable();
     rows
-}
-
-/// SQ8 estimate as a distance, clamped: an estimate that overflowed is "far".
-fn sq8_distance(query: &Sq8Query, code: &[u8]) -> f32 {
-    let estimate = query.estimate(code);
-    let distance = match query.metric() {
-        Sq8Metric::Dot => -estimate,
-        Sq8Metric::L2Squared => estimate,
-    };
-    if distance.is_finite() {
-        distance
-    } else {
-        f32::MAX
-    }
 }
 
 thread_local! {
