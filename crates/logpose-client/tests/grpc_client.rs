@@ -189,11 +189,12 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
 
     let stats = client.stats(&qualified).await.expect("stats should reload");
     assert_eq!(stats.live_record_count, 2);
-    assert_eq!(stats.deleted_record_count, 1);
+    // The compaction rewrote the lone segment without its deleted row.
+    assert_eq!(stats.deleted_record_count, 0);
     assert_eq!(stats.mutable_op_count, 2);
     assert_eq!(stats.segment_count, 1);
-    // The explicit flush is a completed job; a compaction of one segment has nothing to do.
-    assert_eq!(stats.maintenance.completed_runs, 1);
+    // The explicit flush and the compaction are completed jobs.
+    assert_eq!(stats.maintenance.completed_runs, 2);
     assert!(stats.maintenance.in_progress.is_none());
     assert_eq!(stats.query_units.len(), 2);
     let immutable = stats
