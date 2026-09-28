@@ -10,7 +10,7 @@ use crate::{
 };
 use jobs::FLUSH_RETRY_BACKOFF;
 use logpose_types::{
-    DistanceMetric, ErrorCode, Snapshot,
+    CollectionRef, DistanceMetric, ErrorCode, Snapshot,
     record::{PrimaryKey, Record},
 };
 use logpose_vfs::{CrashPoint, FaultVfs};
@@ -265,6 +265,102 @@ fn a_flush_on_a_full_device_poisons_the_collection_at_once() {
         .expect_err("a poisoned collection refuses writes");
     assert_poisoned(&error);
     assert_eq!(live(&handle), ["a", "b"]);
+}
+
+/// Only failures in a row poison: a flush that succeeds resets the count and clears the error,
+/// so round after round of fewer than `max_flush_failures` failures never poisons.
+#[test]
+fn a_flush_that_succeeds_resets_the_failures_in_a_row() {
+    let fault = FaultVfs::new(6);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(
+        &vfs,
+        EngineConfig {
+            memtable: MemtableConfig {
+                max_flush_failures: 3,
+                ..MemtableConfig::default()
+            },
+            ..config(&clock)
+        },
+    );
+    let handle = create(&engine, 2, usize::MAX);
+    for round in 0..3_u64 {
+        // The next two flushes fail at their segment's sync; the third succeeds.
+        vfs.fail_file_syncs_containing(".seg", 2);
+        let (first, second) = (format!("{round}a"), format!("{round}b"));
+        write(&handle, vec![upsert(&first, 1.0), upsert(&second, 2.0)]);
+        wait_for("the first failed flush", || failures(&handle, "flush") == 1);
+        clock.advance(FLUSH_RETRY_BACKOFF);
+        wait_for("the second failed flush", || {
+            failures(&handle, "flush") == 2
+        });
+        assert!(!handle.is_poisoned(), "round {round}");
+        clock.advance(FLUSH_RETRY_BACKOFF);
+        wait_for("the flush to succeed", || {
+            handle.current().checkpoint_seq_no == 2 * (round + 1)
+        });
+        wait_idle(&engine, &handle);
+        assert_eq!(
+            handle.maintenance_status().last_error,
+            None,
+            "round {round}"
+        );
+    }
+    assert!(!handle.is_poisoned());
+    assert_eq!(live(&handle).len(), 6);
+}
+
+/// A collection poisoned by failing flushes keeps every acknowledged write in its WAL: after a
+/// reopen in the same process it holds exactly the acknowledged rows, none of the refused
+/// ones, and flushes and writes work again.
+#[test]
+fn a_reopen_after_poisoning_recovers_exactly_the_acknowledged_writes() {
+    let fault = FaultVfs::new(7);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let clock = Arc::new(ManualClock::new());
+    let config = EngineConfig {
+        memtable: MemtableConfig {
+            max_flush_failures: 2,
+            ..MemtableConfig::default()
+        },
+        ..config(&clock)
+    };
+    let engine = open(&vfs, config.clone());
+    let handle = create(&engine, 2, usize::MAX);
+    write(&handle, vec![upsert("a", 1.0), upsert("b", 2.0)]);
+    wait_for("the first flush", || {
+        handle.current().checkpoint_seq_no == 2
+    });
+
+    vfs.fail_file_syncs_containing(".seg", u32::MAX);
+    write(&handle, vec![upsert("c", 3.0), delete("a")]);
+    wait_for("the first failed flush", || failures(&handle, "flush") == 1);
+    // Acknowledged into the active memtable while the frozen one waits.
+    write(&handle, vec![upsert("d", 4.0)]);
+    clock.advance(FLUSH_RETRY_BACKOFF);
+    wait_for("the collection to be poisoned", || handle.is_poisoned());
+    for ops in [vec![upsert("e", 5.0)], vec![delete("b")]] {
+        assert_poisoned(
+            &handle
+                .write_blocking(ops)
+                .expect_err("a poisoned collection refuses writes"),
+        );
+    }
+    assert_eq!(live(&handle), ["b", "c", "d"]);
+    drop(handle);
+    drop(engine);
+
+    vfs.fail_file_syncs_containing(".seg", 0);
+    let engine = open(&vfs, config);
+    let handle = engine
+        .collection(&CollectionRef::new_default(NAME))
+        .expect("the collection reopens");
+    assert!(!handle.is_poisoned());
+    assert_eq!(live(&handle), ["b", "c", "d"]);
+    handle.flush_blocking().expect("flushes work again");
+    write(&handle, vec![upsert("e", 5.0)]);
+    assert_eq!(live(&handle), ["b", "c", "d", "e"]);
 }
 
 /// A compaction that keeps failing is retried after a backoff of its own, which doubles with
