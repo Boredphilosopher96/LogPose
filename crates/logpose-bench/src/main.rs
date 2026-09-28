@@ -1,9 +1,12 @@
 //! `logpose-bench`: the benchmark harness and scoreboard for LogPose engines.
 //!
-//! It generates or loads a dataset, computes exact ground truth in the
-//! harness, drives a [`target::BenchTarget`] through ingest, flush, filtered and
-//! unfiltered search, and freshness probes, then writes a JSON report and
-//! prints a summary table.
+//! Without a subcommand it generates or loads a dataset, computes exact ground
+//! truth in the harness, drives a [`target::BenchTarget`] through ingest, flush,
+//! filtered and unfiltered search, and freshness probes, then writes a JSON
+//! report and prints a summary table.
+//!
+//! The `vdb-prepare` and `vdb-run` subcommands run VectorDBBench-style workloads
+//! against a running server for comparison with other databases (see [`vdb`]).
 
 mod dataset;
 mod filter;
@@ -13,9 +16,10 @@ mod report;
 mod rng;
 mod runner;
 mod target;
+mod vdb;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use dataset::{FvecsSpec, Metric, SyntheticSpec, generate_synthetic, load_fvecs_dataset};
 use filter::{FilterMode, FilterStyle};
 use report::RunConfig;
@@ -92,10 +96,25 @@ enum TargetKind {
     LocalEngine,
 }
 
+/// VectorDBBench-style workloads against a running server.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Prepare a dataset directory with exact ground truth, shared by every driver.
+    VdbPrepare(vdb::PrepareArgs),
+    /// Load a prepared dataset into a running LogPose server and run every case.
+    VdbRun(vdb::RunArgs),
+}
+
 /// Benchmark a LogPose engine on ingest, freshness, latency, recall, memory, and I/O.
 #[derive(Debug, Parser)]
-#[command(name = "logpose-bench", version)]
+#[command(
+    name = "logpose-bench",
+    version,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Scale preset; explicit flags override its values.
     #[arg(long, value_enum, default_value_t = Preset::Smoke)]
     preset: Preset,
@@ -183,6 +202,24 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    match &cli.command {
+        Some(Command::VdbPrepare(args)) => return vdb::prepare(args),
+        Some(Command::VdbRun(args)) => {
+            let report = vdb::run(args)?;
+            println!("report written to {}", args.output.display());
+            for case in &report.cases {
+                println!(
+                    "{}: ef {} recall {:.4} (target {}met)",
+                    case.name,
+                    case.chosen_ef,
+                    case.chosen_recall,
+                    if case.met_target { "" } else { "not " }
+                );
+            }
+            return Ok(());
+        }
+        None => {}
+    }
     let preset = cli.preset.values();
     let n = cli.n.unwrap_or(preset.n);
     let queries = cli.queries.unwrap_or(preset.queries);
