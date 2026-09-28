@@ -385,6 +385,35 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
     assert_eq!(version.manifest.units().last(), Some(UnitId(9)));
 }
 
+/// A leftover whose name uses the last manifest generation leaves no generation to issue after
+/// it: a flush then fails cleanly instead of overflowing the counter.
+#[test]
+fn a_leftover_at_the_last_generation_fails_the_next_publish_cleanly() {
+    let fault = FaultVfs::new(85);
+    let engine = open(fault.process());
+    let handle = create(&engine);
+    let dir = handle.meta().dir.clone();
+    drop(handle);
+    drop(engine);
+    let vfs = fault.process();
+    let file = vfs
+        .open(&manifest_path(&dir, u64::MAX), OpenMode::CreateNew)
+        .expect("plant");
+    file.append(&[IoSlice::new(b"orphan")]).expect("write");
+    file.sync_all().expect("sync");
+
+    let engine = open(fault.process());
+    let handle = open_handle(&engine);
+    write(&engine, &handle, "a", 1.0);
+    let error = engine
+        .core()
+        .flush_collection(&handle)
+        .expect_err("no manifest generation is left");
+    assert!(matches!(error, LogPoseError::Internal { .. }), "{error}");
+    assert!(!handle.is_poisoned());
+    assert_eq!(rows(&engine).len(), 1, "the write stays readable");
+}
+
 /// A version 1 layout (a `CURRENT` that is not a 21-byte pointer) fails the collection's open
 /// with manifest corruption and changes nothing.
 #[test]

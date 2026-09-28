@@ -942,7 +942,14 @@ impl Writer {
             }
         };
         let generation = self.next_manifest_gen;
-        self.next_manifest_gen += 1;
+        // Orphan cleanup starts the counter above every generation on disk, so a leftover named
+        // with the last generation exhausts it.
+        let Some(next_manifest_gen) = generation.checked_add(1) else {
+            return Err(LogPoseError::internal(
+                "the collection has used every manifest generation",
+            ));
+        };
+        self.next_manifest_gen = next_manifest_gen;
         let manifest = Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
             collection_id: durable.collection_id.clone(),
