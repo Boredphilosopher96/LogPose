@@ -725,7 +725,8 @@ fn generate_put_batch(rng: &mut StdRng) -> Vec<TestRecord> {
             TestRecord {
                 id: format!("id-{slot}"),
                 vector: vec![
-                    rng.random_range(0..=10u64) as f32 + (slot as f32 / 10.0),
+                    // Never zero, so no vector is all zeros (cosine collections reject those).
+                    rng.random_range(1..=10u64) as f32 + (slot as f32 / 10.0),
                     rng.random_range(0..=10u64) as f32 + (version as f32 / 1000.0),
                 ],
                 metadata: json!({
