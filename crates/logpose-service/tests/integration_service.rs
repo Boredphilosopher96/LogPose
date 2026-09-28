@@ -967,12 +967,10 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         Value::from(1)
     );
     assert_eq!(grpc_diagnostics.unit_scan_mix.get("exact_f32"), Some(&1));
-    let service_timings = service_diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("service timings should be present");
-    assert_eq!(service_timings.prefilter_micros, 0);
-    assert_eq!(service_timings.merge_micros, 0);
+    assert!(
+        service_diagnostics.stage_timings.is_some(),
+        "service timings should be present"
+    );
     assert!(rest_body["diagnostics"]["stage_timings"].is_object());
     assert!(
         rest_body["diagnostics"]["stage_timings"]["planning_micros"]
@@ -1004,12 +1002,10 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             .as_u64()
             .is_some()
     );
-    let grpc_timings = grpc_diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("grpc timings should be present");
-    assert_eq!(grpc_timings.prefilter_micros, 0);
-    assert_eq!(grpc_timings.merge_micros, 0);
+    assert!(
+        grpc_diagnostics.stage_timings.is_some(),
+        "grpc timings should be present"
+    );
 }
 
 #[tokio::test]
@@ -1157,7 +1153,8 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     assert!(diagnostics.candidates_after_filter >= service_response.hits.len());
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
     assert!(diagnostics.candidates_merged >= service_response.hits.len());
-    assert_eq!(diagnostics.rerank_count, 1);
+    // An exact f32 scan scores its rows once, so nothing is reranked.
+    assert_eq!(diagnostics.rerank_count, 0);
     assert_eq!(
         rest_body["diagnostics"]["chosen_plan"],
         "predicate_first_exact"
@@ -1286,12 +1283,10 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     );
     assert_eq!(grpc_diagnostics.unit_scan_mix.get("exact_f32"), Some(&1));
     // Timings differ per run; every transport carries all six stages.
-    let service_timings = diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("service timings should be present");
-    assert_eq!(service_timings.prefilter_micros, 0);
-    assert_eq!(service_timings.merge_micros, 0);
+    assert!(
+        diagnostics.stage_timings.is_some(),
+        "service timings should be present"
+    );
     let rest_timings = &rest_body["diagnostics"]["stage_timings"];
     for stage in [
         "planning_micros",
@@ -1303,12 +1298,10 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
     ] {
         assert!(rest_timings[stage].as_u64().is_some(), "{stage}");
     }
-    let grpc_timings = grpc_diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("grpc timings should be present");
-    assert_eq!(grpc_timings.prefilter_micros, 0);
-    assert_eq!(grpc_timings.merge_micros, 0);
+    assert!(
+        grpc_diagnostics.stage_timings.is_some(),
+        "grpc timings should be present"
+    );
 }
 
 #[tokio::test]

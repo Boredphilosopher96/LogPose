@@ -3155,7 +3155,10 @@ mod tests {
         let text = diagnostics["plan_text"].as_str().expect("plan text");
         assert!(text.starts_with("Project k=1"), "{text}");
         assert!(text.contains("ExactScan"), "{text}");
-        assert!(text.contains("BitmapProbe eq kind via"), "{text}");
+        assert!(
+            text.contains("BitmapProbe eq $extra.kind via $extra"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

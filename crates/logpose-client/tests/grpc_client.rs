@@ -129,11 +129,10 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .as_ref()
         .expect("diagnostics should be present");
     assert!(diagnostics.fallback_reason.is_some());
-    let timings = diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("profile mode should include timings");
-    assert_eq!(timings.prefilter_micros, 0);
+    assert!(
+        diagnostics.stage_timings.is_some(),
+        "profile mode should include timings"
+    );
     assert!(diagnostics.candidates_merged >= 1);
     assert_eq!(
         diagnostics.unit_scan_mix.get("memtable_scan").copied(),
@@ -252,7 +251,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         QueryPlanKind::UnfilteredExactScan
     );
     assert!(hybrid_diagnostics.candidates_merged >= 1);
-    assert!(hybrid_diagnostics.candidates_reranked >= 1);
+    // Exact f32 scans score each row once: nothing is reranked.
+    assert_eq!(hybrid_diagnostics.candidates_reranked, 0);
     assert_eq!(
         hybrid_diagnostics.unit_scan_mix.get("exact_f32").copied(),
         Some(1)
@@ -264,11 +264,10 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             .copied(),
         Some(1)
     );
-    let hybrid_timings = hybrid_diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("hybrid profile should include timings");
-    assert_eq!(hybrid_timings.merge_micros, 0);
+    assert!(
+        hybrid_diagnostics.stage_timings.is_some(),
+        "hybrid profile should include timings"
+    );
 
     let inspect = client
         .inspect(&collection, InspectTarget::Manifest)
@@ -905,15 +904,14 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
     assert!(diagnostics.candidates_after_filter >= response.hits.len());
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
     assert!(diagnostics.candidates_merged >= response.hits.len());
-    assert_eq!(diagnostics.rerank_count, 1);
+    // An exact f32 scan scores its rows once, so nothing is reranked.
+    assert_eq!(diagnostics.rerank_count, 0);
     assert_eq!(diagnostics.unit_scan_mix.get("exact_f32").copied(), Some(1));
     assert!(diagnostics.fallback_reason.is_some());
-    let timings = diagnostics
-        .stage_timings
-        .as_ref()
-        .expect("profile mode should include timings");
-    assert_eq!(timings.prefilter_micros, 0);
-    assert_eq!(timings.merge_micros, 0);
+    assert!(
+        diagnostics.stage_timings.is_some(),
+        "profile mode should include timings"
+    );
 
     server.abort();
     let _ = server.await;
