@@ -30,7 +30,7 @@ use tonic as _;
 use tower as _;
 
 use logpose_auth::{DatabaseAccessPolicy, Principal};
-use logpose_catalog::{CatalogStore, DatabaseDescriptor};
+use logpose_catalog::DatabaseDescriptor;
 use logpose_config::LogPoseConfig;
 use logpose_query::{
     CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
@@ -1010,7 +1010,6 @@ impl LogPoseDataService {
 #[derive(Clone)]
 pub struct LogPoseControlService {
     data: Arc<LogPoseDataService>,
-    catalog: Arc<dyn CatalogStore>,
     config: LogPoseConfig,
     build: BuildInfo,
     coordination: CoordinationRuntime,
@@ -1022,7 +1021,6 @@ impl fmt::Debug for LogPoseControlService {
         formatter
             .debug_struct("LogPoseControlService")
             .field("data_service", &"<LogPoseDataService>")
-            .field("catalog_store", &"<dyn CatalogStore>")
             .field("node_name", &self.config.node_name)
             .field("node_role", &self.config.node_role)
             .field(
@@ -1037,14 +1035,10 @@ impl fmt::Debug for LogPoseControlService {
 }
 
 impl LogPoseControlService {
-    /// Build a control-plane service over a shared data service and runtime config.
+    /// Build a control-plane service over a shared data service and runtime config. The
+    /// database, principal, and access-policy catalog is the data service's engine's.
     #[must_use]
-    pub fn new(
-        data: Arc<LogPoseDataService>,
-        catalog: Arc<dyn CatalogStore>,
-        config: LogPoseConfig,
-        build: BuildInfo,
-    ) -> Self {
+    pub fn new(data: Arc<LogPoseDataService>, config: LogPoseConfig, build: BuildInfo) -> Self {
         let coordination = CoordinationRuntime::new(&config);
         let coordination_client = if config.metadata.backend == MetadataBackend::Etcd {
             Some(
@@ -1056,7 +1050,6 @@ impl LogPoseControlService {
         };
         Self {
             data,
-            catalog,
             config,
             build,
             coordination,
@@ -1064,10 +1057,11 @@ impl LogPoseControlService {
         }
     }
 
-    /// The catalog store behind this control plane.
+    /// The engine whose database, principal, and access-policy catalog this control plane
+    /// serves. Its catalog calls run on the engine's I/O pool.
     #[must_use]
-    pub fn catalog_store(&self) -> &Arc<dyn CatalogStore> {
-        &self.catalog
+    pub fn catalog(&self) -> &Engine {
+        self.data.engine()
     }
 
     /// Create a collection through the control-plane surface.
@@ -1115,7 +1109,7 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.delete_database(database_name)
+        self.catalog().delete_database(database_name).await
     }
 
     fn require_collection_lifecycle_role(&self) -> Result<()> {
@@ -1145,7 +1139,7 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.put_database_access_policy(policy)
+        self.catalog().put_database_access_policy(policy).await
     }
 
     /// Create or replace one database descriptor.
@@ -1161,17 +1155,17 @@ impl LogPoseControlService {
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.put_database(descriptor)
+        self.catalog().put_database(descriptor).await
     }
 
     /// Read one database descriptor.
     pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        self.catalog.get_database(database_name)
+        self.catalog().get_database(database_name).await
     }
 
     /// List every database descriptor.
     pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.catalog.list_databases()
+        self.catalog().list_databases().await
     }
 
     /// Read one database-scoped access policy.
@@ -1179,12 +1173,14 @@ impl LogPoseControlService {
         &self,
         database_name: &str,
     ) -> Result<DatabaseAccessPolicy> {
-        self.catalog.get_database_access_policy(database_name)
+        self.catalog()
+            .get_database_access_policy(database_name)
+            .await
     }
 
     /// Read one persisted principal descriptor.
     pub async fn principal(&self, principal_name: &str) -> Result<Principal> {
-        self.catalog.get_principal(principal_name)
+        self.catalog().get_principal(principal_name).await
     }
 
     /// Return the placement summary for one collection.
@@ -1281,13 +1277,15 @@ impl LogPoseControlService {
         })
     }
 
-    /// Persist configured bootstrap principals into the catalog store.
+    /// Persist the configured bootstrap principals that the catalog does not hold yet. Runs
+    /// at bootstrap, outside any request, so it uses the catalog's blocking calls.
     pub fn sync_bootstrap_principals(&self) -> Result<()> {
         for token in &self.config.auth.bootstrap_tokens {
-            match self.catalog.get_principal(&token.principal.name) {
+            match self.catalog().get_principal_blocking(&token.principal.name) {
                 Ok(_) => {}
                 Err(LogPoseError::NotFound { .. }) => {
-                    self.catalog.put_principal(token.principal.clone())?;
+                    self.catalog()
+                        .put_principal_blocking(token.principal.clone())?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1788,12 +1786,8 @@ mod tests {
             )
             .expect("the etcd catalog should build"),
         );
-        let control = LogPoseControlService::new(
-            data,
-            Arc::new(engine),
-            LogPoseConfig::default(),
-            BuildInfo::current(),
-        );
+        let control =
+            LogPoseControlService::new(data, LogPoseConfig::default(), BuildInfo::current());
 
         let status = control
             .runtime_status()
@@ -1955,7 +1949,6 @@ mod tests {
         let engine = data.engine().clone();
         let control = LogPoseControlService::new(
             Arc::clone(&data),
-            Arc::new(engine.clone()),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );

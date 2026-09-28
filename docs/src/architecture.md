@@ -24,7 +24,7 @@ The engine's design, with its invariants and file formats, is in [Engine Core De
 
 `logpose-server` is one process. It builds a single shared `AppState` and serves both REST and gRPC from that same runtime state.
 
-- `crates/logpose-core` bootstraps the runtime: it opens one storage `Engine` on `storage_root` and shares it between the data plane and the local catalog of databases and principals
+- `crates/logpose-core` bootstraps the runtime: it opens one storage `Engine` on `storage_root` and shares it between the data plane and the local catalog of databases and principals; the catalog's descriptor files are read and written on the engine's I/O pool, never on a request handler's runtime worker
 - `crates/logpose-service` contains the shared control-plane and data-plane services; the data plane resolves a collection's descriptor from its collection catalog, then calls the engine's `CollectionHandle` for writes, schema changes, flushes, compactions, statistics, and inspection, and `logpose-query` for reads
 - `crates/logpose-api-rest` and `crates/logpose-api-grpc` expose transport-parity views over those services
 
