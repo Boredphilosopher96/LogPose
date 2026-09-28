@@ -5,16 +5,23 @@ use etcd_client as _;
 use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
-use logpose_query::{QueryRequest, QueryResponse};
+use logpose_query::{
+    CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
+    ScrollRecordsResponse, WithSchema,
+};
 use logpose_service::{
     FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
-use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
+use logpose_storage::{
+    CreateCollectionRequest, EngineConfig, InspectReport, InspectTarget, LocalStorageEngine,
+    TokenConfig,
+};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,
     LogPoseError, MetadataBackend, NodeMetadata, NodeRole, Snapshot,
-    record::{ClientOp, PartialUpdate, PrimaryKey, Record},
+    filter::FilterExpr,
+    record::{ClientOp, PartialUpdate, PrimaryKey, Record, RecordPatch},
     schema::{CollectionSchema, SchemaChange},
 };
 use serde::Serialize;
@@ -99,8 +106,18 @@ impl AppState {
         })?;
         let build = BuildInfo::current();
         // One engine owns the storage root; the data plane and the catalog share it.
-        let local =
-            LocalStorageEngine::with_resolver(&config.storage_root, logpose_query::resolver())?;
+        let local = LocalStorageEngine::with_config(
+            &config.storage_root,
+            EngineConfig {
+                resolver: Some(logpose_query::resolver()),
+                tokens: TokenConfig {
+                    ttl: std::time::Duration::from_millis(config.snapshots.token_ttl_ms),
+                    max_per_collection: config.snapshots.max_tokens_per_collection,
+                    ..TokenConfig::default()
+                },
+                ..EngineConfig::default()
+            },
+        )?;
         let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
             MetadataBackend::Local => Arc::new(local.clone()),
             MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::with_local(
@@ -414,29 +431,88 @@ impl AppState {
             .await
     }
 
-    /// Execute a query after enforcing database read access when auth is enabled.
-    pub async fn query_with_auth(
+    /// Delete every live record matching `filter` as one atomic batch, after enforcing
+    /// database write access.
+    pub async fn delete_by_filter_with_auth(
         &self,
         auth: &RequestAuth,
-        request: QueryRequest,
-    ) -> ServiceResult<QueryResponse> {
-        let collection = parse_collection_reference(&request.collection_name)?;
-        self.require_database_permission(
-            auth,
-            &collection.database_name,
-            DatabasePermission::ReadOnly,
-        )
-        .await?;
-        self.query(request).await
+        collection_name: &str,
+        filter: FilterExpr,
+    ) -> ServiceResult<CommitAck> {
+        self.require_writer(auth, collection_name).await?;
+        self.data.delete_by_filter(collection_name, filter).await
     }
 
-    /// Execute a query through the data-plane surface.
-    pub async fn query(&self, request: QueryRequest) -> ServiceResult<QueryResponse> {
-        let placement = self
-            .require_local_data_plane_collection(&request.collection_name)
+    /// Apply `patch` to every live record matching `filter` as one atomic batch, after
+    /// enforcing database write access.
+    pub async fn update_by_filter_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        filter: FilterExpr,
+        patch: RecordPatch,
+    ) -> ServiceResult<CommitAck> {
+        self.require_writer(auth, collection_name).await?;
+        self.data
+            .update_by_filter(collection_name, filter, patch)
+            .await
+    }
+
+    /// Search (or scan) a collection after enforcing database read access when auth is
+    /// enabled.
+    pub async fn query_collection_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        request: QueryRequest,
+    ) -> ServiceResult<WithSchema<QueryResponse>> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadOnly)
             .await?;
-        reject_promoted_read_barriers(&placement, request.read_barrier.as_ref())?;
-        self.data.query(request).await
+        self.query_collection(collection_name, request).await
+    }
+
+    /// Search (or scan) a collection through the data-plane surface.
+    pub async fn query_collection(
+        &self,
+        collection_name: &str,
+        request: QueryRequest,
+    ) -> ServiceResult<WithSchema<QueryResponse>> {
+        let placement = self
+            .require_local_data_plane_collection(collection_name)
+            .await?;
+        reject_promoted_read_barriers(&placement, request.read.read_barrier.as_ref())?;
+        self.data.query_collection(collection_name, request).await
+    }
+
+    /// Count the live records matching a filter, after enforcing database read access.
+    pub async fn count_records_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        request: CountRecordsRequest,
+    ) -> ServiceResult<CountRecordsResponse> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadOnly)
+            .await?;
+        let placement = self
+            .require_local_data_plane_collection(collection_name)
+            .await?;
+        reject_promoted_read_barriers(&placement, request.read.read_barrier.as_ref())?;
+        self.data.count_records(collection_name, request).await
+    }
+
+    /// One page of a scroll through the records matching a filter, after enforcing database
+    /// read access.
+    pub async fn scroll_records_with_auth(
+        &self,
+        auth: &RequestAuth,
+        collection_name: &str,
+        request: ScrollRecordsRequest,
+    ) -> ServiceResult<WithSchema<ScrollRecordsResponse>> {
+        self.require_collection_permission(auth, collection_name, DatabasePermission::ReadOnly)
+            .await?;
+        self.require_local_data_plane_collection(collection_name)
+            .await?;
+        self.data.scroll_records(collection_name, request).await
     }
 
     /// Capture a read snapshot through the data-plane surface.

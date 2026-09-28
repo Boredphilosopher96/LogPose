@@ -921,6 +921,7 @@ impl Runner {
             limit: scroll.limit,
             projection: Projection::full(),
             cursor,
+            token: None,
         }
     }
 
@@ -1556,13 +1557,19 @@ impl<'a> Checker<'a> {
 /// Whether every field `filter` compares is a declared scalar field of `model`.
 fn filter_declared(model: &Model, filter: &FilterExpr) -> bool {
     match filter {
-        FilterExpr::And { children } | FilterExpr::Or { children } => {
+        FilterExpr::And(children) | FilterExpr::Or(children) => {
             children.iter().all(|child| filter_declared(model, child))
         }
-        FilterExpr::Not { child } => filter_declared(model, child),
-        FilterExpr::Comparison(comparison) => {
-            model.schema.scalar_field(&comparison.field).is_some()
-        }
+        FilterExpr::Not(child) => filter_declared(model, child),
+        FilterExpr::Exists { field }
+        | FilterExpr::IsNull { field }
+        | FilterExpr::Eq { field, .. }
+        | FilterExpr::Ne { field, .. }
+        | FilterExpr::Range { field, .. }
+        | FilterExpr::In { field, .. }
+        | FilterExpr::NotIn { field, .. }
+        | FilterExpr::Contains { field, .. }
+        | FilterExpr::ContainsAny { field, .. } => model.schema.scalar_field(field).is_some(),
     }
 }
 

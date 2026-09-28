@@ -9,16 +9,19 @@ use std::collections::BTreeSet;
 
 /// The fields a read returns, resolved against the schema of the state it reads.
 ///
-/// The primary key is always returned. A projection built from an empty field list returns
-/// every field: all vectors, every non-null scalar field, and every visible `$extra` key.
+/// The primary key is always returned. A projection built from an empty field list (the
+/// default) returns every non-null scalar field and every visible `$extra` key, but no vector:
+/// a vector is returned only when named, which keeps the default response small.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Projection {
-    /// `None` returns every field.
+    /// `None` returns every field, vectors included.
     selected: Option<Selected>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Selected {
+    /// Whether every scalar field is returned.
+    all_scalars: bool,
     /// Declared vector and scalar fields, by current name.
     declared: BTreeSet<String>,
     /// Whether every visible `$extra` key is returned.
@@ -28,17 +31,30 @@ struct Selected {
 }
 
 impl Projection {
-    /// A projection that returns every field.
+    /// A projection that returns every field, vectors included.
     #[must_use]
     pub fn all() -> Self {
         Self::default()
+    }
+
+    /// The default projection: every scalar field and `$extra` key, and no vector.
+    #[must_use]
+    pub fn scalars() -> Self {
+        Self {
+            selected: Some(Selected {
+                all_scalars: true,
+                all_extra: true,
+                ..Selected::default()
+            }),
+        }
     }
 
     /// Resolve `output_fields` against `schema`.
     ///
     /// Each name is a declared field (the primary key, a vector, or a scalar field), `$extra`
     /// for every visible dynamic key, or, when dynamic fields are enabled, one dynamic key.
-    /// An empty list returns every field.
+    /// An empty list is [`Projection::scalars`]: every scalar field and `$extra` key, no
+    /// vector.
     ///
     /// # Errors
     ///
@@ -48,7 +64,7 @@ impl Projection {
     /// hidden.
     pub fn resolve(schema: &CollectionSchema, output_fields: &[String]) -> crate::Result<Self> {
         if output_fields.is_empty() {
-            return Ok(Self::all());
+            return Ok(Self::scalars());
         }
         let mut selected = Selected::default();
         for (index, name) in output_fields.iter().enumerate() {
@@ -88,7 +104,7 @@ impl Projection {
         })
     }
 
-    /// Whether this projection returns every field.
+    /// Whether this projection returns every field, vectors included.
     #[must_use]
     pub fn is_all(&self) -> bool {
         self.selected.is_none()
@@ -116,12 +132,85 @@ impl Projection {
         record
             .vectors
             .retain(|name, _| selected.declared.contains(name));
-        record
-            .fields
-            .retain(|name, _| selected.declared.contains(name));
+        if !selected.all_scalars {
+            record
+                .fields
+                .retain(|name, _| selected.declared.contains(name));
+        }
         if !selected.all_extra {
             record.extra.retain(|key, _| selected.extra.contains(key));
         }
         record
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Projection;
+    use crate::{
+        DistanceMetric,
+        record::Record,
+        schema::{
+            CollectionSchema, CreateCollectionSpec, FieldType, PrimaryKeySpec, PrimaryKeyType,
+            ScalarFieldSpec, VectorFieldSpec,
+        },
+        value::Value,
+    };
+    use serde_json::json;
+
+    fn schema() -> CollectionSchema {
+        CreateCollectionSpec {
+            name: "items".to_owned(),
+            primary_key: PrimaryKeySpec {
+                name: "sku".to_owned(),
+                key_type: PrimaryKeyType::Int64,
+            },
+            vectors: vec![VectorFieldSpec {
+                name: "embedding".to_owned(),
+                dimensions: 2,
+                metric: DistanceMetric::Dot,
+            }],
+            fields: vec![
+                ScalarFieldSpec::new("tenant", FieldType::String),
+                ScalarFieldSpec::new("price", FieldType::Float64),
+            ],
+            dynamic_fields: true,
+        }
+        .build_schema()
+        .expect("schema should build")
+    }
+
+    fn record() -> Record {
+        let mut record = Record::new(7_i64)
+            .with_vector("embedding", vec![1.0, 0.0])
+            .with_field("tenant", Value::from("acme"))
+            .with_field("price", Value::Float64(2.5));
+        record.extra.insert("color".to_owned(), json!("red"));
+        record
+    }
+
+    #[test]
+    fn the_default_projection_returns_scalars_and_extra_but_no_vectors() {
+        let schema = schema();
+        let projection = Projection::resolve(&schema, &[]).expect("resolve");
+        assert!(!projection.selects_vectors(&schema));
+        assert!(!projection.is_all());
+        let projected = projection.apply(record());
+        assert!(projected.vectors.is_empty());
+        assert_eq!(projected.fields.len(), 2);
+        assert_eq!(projected.extra.get("color"), Some(&json!("red")));
+    }
+
+    #[test]
+    fn a_named_vector_is_returned() {
+        let schema = schema();
+        let names = ["embedding".to_owned(), "tenant".to_owned()];
+        let projection = Projection::resolve(&schema, &names).expect("resolve");
+        assert!(projection.selects_vectors(&schema));
+        let projected = projection.apply(record());
+        assert_eq!(projected.vectors.len(), 1);
+        assert_eq!(projected.fields.len(), 1);
+        assert!(projected.extra.is_empty());
+        assert_eq!(Projection::all().apply(record()), record());
     }
 }

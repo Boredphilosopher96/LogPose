@@ -275,6 +275,84 @@ impl PartialUpdate {
     }
 }
 
+/// A change to some fields applied to every record a filter matches: a
+/// [`PartialUpdate`] without a primary key, with the same meaning for each
+/// entry.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordPatch {
+    /// Vectors to replace.
+    #[serde(default)]
+    pub vectors: BTreeMap<String, Vec<f32>>,
+    /// Scalar fields to replace or clear.
+    #[serde(default)]
+    pub fields: BTreeMap<String, Value>,
+    /// Dynamic keys to replace or remove.
+    #[serde(default)]
+    pub extra: Map<String, JsonValue>,
+}
+
+impl RecordPatch {
+    /// Whether the patch changes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vectors.is_empty() && self.fields.is_empty() && self.extra.is_empty()
+    }
+
+    /// Parse a user JSON document with the keys to change, routed like
+    /// [`Record::from_json`], and validate it. The document must not name
+    /// the primary key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::PatchSetsPrimaryKey`] for a document that names
+    /// the primary key, or the errors of [`RecordPatch::validate`].
+    pub fn from_json(schema: &CollectionSchema, json: JsonValue) -> Result<Self, RecordError> {
+        let document = parse::parse_document(schema, json)?;
+        if document.pk.is_some() {
+            return Err(RecordError::PatchSetsPrimaryKey {
+                field: schema.primary_key().name.clone(),
+            });
+        }
+        Self {
+            vectors: document.vectors,
+            fields: document.fields,
+            extra: document.extra,
+        }
+        .validate(schema)
+    }
+
+    /// Check the patch against `schema` as [`CollectionSchema::validate_update`]
+    /// checks an update, and return it in canonical form.
+    ///
+    /// # Errors
+    ///
+    /// The [`RecordError`]s of [`CollectionSchema::validate_update`] other than
+    /// those about the key.
+    pub fn validate(self, schema: &CollectionSchema) -> Result<Self, RecordError> {
+        let placeholder = match schema.primary_key_type() {
+            PrimaryKeyType::Int64 => PrimaryKey::Int64(0),
+            PrimaryKeyType::String => PrimaryKey::String("_".to_owned()),
+        };
+        let update = schema.validate_update(self.into_update(placeholder))?;
+        Ok(Self {
+            vectors: update.vectors,
+            fields: update.fields,
+            extra: update.extra,
+        })
+    }
+
+    /// The update of the record with key `pk`.
+    #[must_use]
+    pub fn into_update(self, pk: PrimaryKey) -> PartialUpdate {
+        PartialUpdate {
+            pk,
+            vectors: self.vectors,
+            fields: self.fields,
+            extra: self.extra,
+        }
+    }
+}
+
 /// One client write in a batch, before it is validated against the
 /// writer's schema and resolved into a full row image.
 #[derive(Clone, Debug, PartialEq)]

@@ -8,7 +8,7 @@ use crate::{
     model::Model,
     session::{Backend, DIMS, Maintenance},
 };
-use logpose_query::{FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue};
+use logpose_query::FilterExpr;
 use logpose_storage::{JobKind, SchemaChange};
 use logpose_types::{
     record::{ClientOp, PartialUpdate, PrimaryKey, Record},
@@ -405,42 +405,34 @@ impl Generator {
             return None;
         }
         let (name, field_type) = fields[self.below(fields.len() as u64) as usize].clone();
-        let operator = self.pick(&[
-            FilterOperator::Eq,
-            FilterOperator::Ne,
-            FilterOperator::Lt,
-            FilterOperator::Lte,
-            FilterOperator::Gt,
-            FilterOperator::Gte,
-            FilterOperator::Exists,
-            FilterOperator::IsNull,
-        ]);
-        let value = match operator {
-            FilterOperator::Exists | FilterOperator::IsNull => None,
-            _ => Some(match field_type {
-                FieldType::String => ScalarMetadataValue::String(self.pick(&WORDS).to_owned()),
-                _ => ScalarMetadataValue::Number((self.below(9) as i64 - 1).into()),
-            }),
+        let operator = self.pick(&["eq", "ne", "lt", "lte", "gt", "gte", "exists", "is_null"]);
+        if matches!(operator, "exists" | "is_null") {
+            return Some(if operator == "exists" {
+                FilterExpr::exists(name)
+            } else {
+                FilterExpr::is_null(name)
+            });
+        }
+        let value = match field_type {
+            FieldType::String => Value::String(self.pick(&WORDS).to_owned()),
+            _ => Value::Int64(self.below(9) as i64 - 1),
         };
-        Some(FilterExpr::Comparison(FilterComparison {
-            field: name,
-            operator,
-            value,
-        }))
+        Some(match operator {
+            "eq" => FilterExpr::eq(name, value),
+            "ne" => FilterExpr::ne(name, value),
+            "lt" => FilterExpr::lt(name, value),
+            "lte" => FilterExpr::lte(name, value),
+            "gt" => FilterExpr::gt(name, value),
+            _ => FilterExpr::gte(name, value),
+        })
     }
 
     pub fn filter(&mut self, model: &Model) -> Option<FilterExpr> {
         let first = self.comparison(model)?;
         Some(match self.below(6) {
-            0 => FilterExpr::And {
-                children: vec![first, self.comparison(model)?],
-            },
-            1 => FilterExpr::Or {
-                children: vec![first, self.comparison(model)?],
-            },
-            2 => FilterExpr::Not {
-                child: Box::new(first),
-            },
+            0 => FilterExpr::And(vec![first, self.comparison(model)?]),
+            1 => FilterExpr::Or(vec![first, self.comparison(model)?]),
+            2 => FilterExpr::Not(Box::new(first)),
             _ => first,
         })
     }

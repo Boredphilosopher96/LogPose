@@ -7,14 +7,11 @@ use async_trait as _;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use logpose_catalog as _;
 use logpose_index as _;
-use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryRequest, ScalarMetadataValue,
-    query,
-};
+use logpose_query::{FilterExpr, QueryRequest, VectorQuery, query};
 use logpose_storage::{
     CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine, StorageEngine,
 };
-use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{CollectionRef, DistanceMetric, PutRecord, RecordId, WriteOperation};
 use rayon as _;
 use roaring as _;
 use serde as _;
@@ -86,22 +83,14 @@ fn setup(runtime: &Runtime) -> LocalStorageEngine {
 
 fn request(vector: Vec<f32>, filtered: bool) -> QueryRequest {
     QueryRequest {
-        collection_name: "bench".to_owned(),
-        vector,
-        top_k: 10,
-        snapshot: None,
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: filtered.then(|| {
-            FilterExpr::Comparison(FilterComparison {
-                field: "bucket".to_owned(),
-                operator: FilterOperator::Eq,
-                value: Some(ScalarMetadataValue::Number(3.into())),
-            })
+        vector: Some(VectorQuery {
+            field: None,
+            values: vector,
         }),
-        explain: ExplainMode::None,
-        snapshot_token: None,
-        pin: false,
+        top_k: 10,
+        filter: filtered.then(|| FilterExpr::eq("bucket", 3_i64)),
+        output_fields: vec!["$extra".to_owned()],
+        ..QueryRequest::default()
     }
 }
 
@@ -109,6 +98,7 @@ fn search_benchmarks(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("runtime");
     let engine = setup(&runtime);
     let mut rng = Rng(11);
+    let collection = CollectionRef::parse("bench").expect("name");
     let queries = (0..64)
         .map(|_| (0..DIMENSIONS).map(|_| rng.next()).collect::<Vec<f32>>())
         .collect::<Vec<_>>();
@@ -118,9 +108,13 @@ fn search_benchmarks(criterion: &mut Criterion) {
             bench.iter(|| {
                 next = (next + 1) % queries.len();
                 let response = runtime
-                    .block_on(query(&engine, request(queries[next].clone(), filtered)))
+                    .block_on(query(
+                        &engine,
+                        &collection,
+                        request(queries[next].clone(), filtered),
+                    ))
                     .expect("query");
-                black_box(response.matches.len())
+                black_box(response.value.hits.len())
             });
         });
     }

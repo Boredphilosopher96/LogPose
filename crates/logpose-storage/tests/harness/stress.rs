@@ -11,10 +11,7 @@
 //! `LOGPOSE_STRESS_SECS` sets how long the writers run (default 3; nightly runs raise it).
 
 use crate::session::{Backend, Maintenance, Session, Setup, reference};
-use logpose_query::{
-    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, ScrollOrder, count_view,
-    scroll_view,
-};
+use logpose_query::{FilterExpr, ScrollOrder, count_view, scroll_view};
 use logpose_storage::{CollectionHandle, Engine, Projection, ReadOptions, SchemaChange};
 use logpose_types::{
     DistanceMetric, SeqNo,
@@ -125,20 +122,10 @@ fn writer(
         let result = if rng.random_range(0..20) == 0 {
             // Delete this writer's rows with a small `n`.
             let below = rng.random_range(0..8);
-            let filter = FilterExpr::And {
-                children: vec![
-                    FilterExpr::Comparison(FilterComparison {
-                        field: "w".to_owned(),
-                        operator: FilterOperator::Eq,
-                        value: Some(ScalarMetadataValue::Number((id as i64).into())),
-                    }),
-                    FilterExpr::Comparison(FilterComparison {
-                        field: "n".to_owned(),
-                        operator: FilterOperator::Lt,
-                        value: Some(ScalarMetadataValue::Number(below.into())),
-                    }),
-                ],
-            };
+            let filter = FilterExpr::And(vec![
+                FilterExpr::eq("w", id as i64),
+                FilterExpr::lt("n", below),
+            ]);
             next.retain(|key, (_, n)| {
                 let keep = *n >= below;
                 if !keep {
@@ -287,11 +274,7 @@ fn reader(
             .iter()
             .filter(|row| matches!(row.record.fields.get("n"), Some(Value::Int64(n)) if *n < 5))
             .count() as u64;
-        let filter = FilterExpr::Comparison(FilterComparison {
-            field: "n".to_owned(),
-            operator: FilterOperator::Lt,
-            value: Some(ScalarMetadataValue::Number(5.into())),
-        });
+        let filter = FilterExpr::lt("n", 5_i64);
         let counted = runtime
             .block_on(count_view(&view, Some(&filter)))
             .map_err(|error| format!("count: {error}"))?;

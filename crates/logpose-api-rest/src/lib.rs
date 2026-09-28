@@ -13,8 +13,11 @@ use yaml_rust2 as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
-    response::IntoResponse,
+    http::{
+        HeaderMap, Method, StatusCode, Uri,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
+    response::{IntoResponse, Response},
     routing::{MethodRouter, get, post},
 };
 use error::{ApiError, ApiJson, ApiPath, ApiQuery};
@@ -22,11 +25,15 @@ pub use error::{ErrorBody, http_status};
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::{ExplainMode, FilterExpr, MetadataFilter, QueryRequest, ScalarMetadataValue};
+use logpose_query::{
+    CountRecordsRequest, CountRecordsResponse, ExplainMode, OrderBy, QueryRequest, ReadConsistency,
+    ScrollRecordsRequest, VectorQuery,
+};
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_types::{
     CollectionRef, CommitAck, LogPoseError, ResourceKind, Snapshot,
-    record::{PartialUpdate, PrimaryKey, Record},
+    filter::FilterExpr,
+    record::{PartialUpdate, PrimaryKey, Record, RecordPatch},
     schema::{CollectionSchema, CreateCollectionSpec, FieldType, SchemaChange},
     value::Value as TypedValue,
 };
@@ -72,6 +79,8 @@ fn routes() -> Vec<(String, MethodRouter<Arc<AppState>>)> {
         (collection("/records/update"), post(update_records)),
         (collection("/records/delete"), post(delete_records)),
         (collection("/records/get"), post(get_records)),
+        (collection("/records/count"), post(count_records)),
+        (collection("/records/scroll"), post(scroll_records)),
         (collection("/query"), post(query_collection)),
         (collection("/stats"), get(get_collection_stats)),
         (collection("/flush"), post(flush_collection)),
@@ -365,25 +374,54 @@ async fn update_records(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(body): ApiJson<RecordsBody>,
+    ApiJson(body): ApiJson<UpdateBody>,
 ) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let schema = state
         .collection_schema_with_auth(&auth, &path.key())
         .await?;
-    let updates = body
-        .records
-        .into_iter()
-        .enumerate()
-        .map(|(index, document)| {
-            let key = document_key(&schema, &document);
-            PartialUpdate::from_json(&schema, document)
-                .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let ack = state
-        .update_records_with_auth(&auth, &path.key(), updates)
-        .await?;
+    let ack = match (body.records, body.filter, body.patch) {
+        (Some(records), None, None) => {
+            let updates = records
+                .into_iter()
+                .enumerate()
+                .map(|(index, document)| {
+                    let key = document_key(&schema, &document);
+                    PartialUpdate::from_json(&schema, document)
+                        .map_err(|error| error.to_error(&format!("records[{index}]"), key.as_ref()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            state
+                .update_records_with_auth(&auth, &path.key(), updates)
+                .await?
+        }
+        (None, Some(filter), Some(patch)) => {
+            let filter = FilterExpr::from_json(&schema, filter, "filter")?;
+            let patch = RecordPatch::from_json(&schema, patch)
+                .map_err(|error| error.to_error("patch", None))?;
+            state
+                .update_by_filter_with_auth(&auth, &path.key(), filter, patch)
+                .await?
+        }
+        (Some(_), _, _) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "records",
+                "an update takes records or a filter and a patch, not both",
+            )));
+        }
+        (None, None, _) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "records",
+                "an update needs records, or a filter and a patch",
+            )));
+        }
+        (None, Some(_), None) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "patch",
+                "an update by filter needs a patch",
+            )));
+        }
+    };
     Ok(Json(path.scoped(ack)))
 }
 
@@ -391,13 +429,38 @@ async fn delete_records(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(body): ApiJson<KeysBody>,
+    ApiJson(body): ApiJson<DeleteBody>,
 ) -> Result<Json<CollectionScopedResponse<CommitAck>>, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    let keys = primary_keys_from_json(body.keys)?;
-    let ack = state
-        .delete_records_with_auth(&auth, &path.key(), keys)
-        .await?;
+    let ack = match (body.keys, body.filter) {
+        (Some(keys), None) => {
+            let keys = primary_keys_from_json(keys)?;
+            state
+                .delete_records_with_auth(&auth, &path.key(), keys)
+                .await?
+        }
+        (None, Some(filter)) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            let filter = FilterExpr::from_json(&schema, filter, "filter")?;
+            state
+                .delete_by_filter_with_auth(&auth, &path.key(), filter)
+                .await?
+        }
+        (Some(_), Some(_)) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "keys",
+                "a delete takes keys or a filter, not both",
+            )));
+        }
+        (None, None) => {
+            return Err(ApiError(LogPoseError::invalid_field(
+                "keys",
+                "a delete needs keys or a filter",
+            )));
+        }
+    };
     Ok(Json(path.scoped(ack)))
 }
 
@@ -406,7 +469,7 @@ async fn get_records(
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiJson(body): ApiJson<GetRecordsBody>,
-) -> Result<Json<CollectionScopedResponse<RecordsResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let keys = primary_keys_from_json(body.keys)?;
     let fetched = state
@@ -420,60 +483,151 @@ async fn get_records(
             None => missing_keys.push(key.to_json()),
         }
     }
-    Ok(Json(path.scoped(RecordsResponse {
-        records,
-        missing_keys,
-        snapshot: fetched.snapshot,
-    })))
+    bounded_json(
+        &state,
+        "get records response",
+        &path.scoped(RecordsResponse {
+            records,
+            missing_keys,
+            snapshot: fetched.snapshot,
+        }),
+    )
+}
+
+async fn count_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<CountBody>,
+) -> Result<Json<CollectionScopedResponse<CountRecordsResponse>>, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
+    let response = state
+        .count_records_with_auth(
+            &auth,
+            &path.key(),
+            CountRecordsRequest {
+                filter,
+                read: ReadConsistency {
+                    snapshot: body.snapshot,
+                    read_barrier: body.read_barrier,
+                    snapshot_token: body.snapshot_token,
+                    pin: body.pin,
+                },
+            },
+        )
+        .await?;
+    Ok(Json(path.scoped(response)))
+}
+
+async fn scroll_records(
+    headers: HeaderMap,
+    ApiPath(path): ApiPath<CollectionPath>,
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<ScrollBody>,
+) -> Result<Response, ApiError> {
+    let auth = request_auth_from_headers(&headers)?;
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
+    let page = state
+        .scroll_records_with_auth(
+            &auth,
+            &path.key(),
+            ScrollRecordsRequest {
+                filter,
+                order_by: body.order_by,
+                page_size: body.page_size,
+                output_fields: body.output_fields,
+                cursor: body.cursor,
+                snapshot_token: body.snapshot_token,
+            },
+        )
+        .await?;
+    bounded_json(
+        &state,
+        "scroll response",
+        &path.scoped(page.value.to_json(&page.schema)),
+    )
 }
 
 async fn query_collection(
     headers: HeaderMap,
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
-    ApiJson(request): ApiJson<QueryCollectionBody>,
-) -> Result<Json<CollectionScopedResponse<logpose_query::QueryResponse>>, ApiError> {
+    ApiJson(body): ApiJson<QueryCollectionBody>,
+) -> Result<Response, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
-    if request.top_k == 0 {
-        return Err(ApiError(LogPoseError::invalid_field(
-            "top_k",
-            "top_k must be greater than 0",
-        )));
-    }
-    let filters = request
-        .filters
-        .into_iter()
-        .map(|(field, value)| {
-            let field_name = field.clone();
-            ScalarMetadataValue::from_json(&value)
-                .map(|value| MetadataFilter { field, value })
-                .ok_or_else(|| {
-                    ApiError(LogPoseError::invalid_field(
-                        format!("filters.{field_name}"),
-                        "query filters must contain only scalar JSON values",
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
+    let filter = match body.filter {
+        Some(filter) => {
+            let schema = state
+                .collection_schema_with_auth(&auth, &path.key())
+                .await?;
+            Some(FilterExpr::from_json(&schema, filter, "filter")?)
+        }
+        None => None,
+    };
     let response = state
-        .query_with_auth(
+        .query_collection_with_auth(
             &auth,
+            &path.key(),
             QueryRequest {
-                collection_name: path.key(),
-                vector: request.vector,
-                top_k: request.top_k,
-                snapshot: request.snapshot,
-                read_barrier: request.read_barrier,
-                filters,
-                predicate: request.predicate,
-                explain: request.explain,
-                snapshot_token: request.snapshot_token,
-                pin: request.pin,
+                vector: body.vector,
+                filter,
+                order_by: body.order_by,
+                top_k: body.top_k,
+                output_fields: body.output_fields,
+                ef: body.ef,
+                explain: body.explain,
+                read: ReadConsistency {
+                    snapshot: body.snapshot,
+                    read_barrier: body.read_barrier,
+                    snapshot_token: body.snapshot_token,
+                    pin: body.pin,
+                },
             },
         )
         .await?;
-    Ok(Json(path.scoped(response)))
+    bounded_json(
+        &state,
+        "query response",
+        &path.scoped(response.value.to_json(&response.schema)),
+    )
+}
+
+/// `body` as a JSON response, unless it is larger than the configured REST body limit: a
+/// read response is bounded like a request, so a large `top_k`, page, or projection fails with
+/// a typed `TOO_LARGE` (HTTP 413).
+fn bounded_json<T: Serialize>(
+    state: &AppState,
+    what: &str,
+    body: &T,
+) -> Result<Response, ApiError> {
+    let bytes = serde_json::to_vec(body)
+        .map_err(|error| ApiError(LogPoseError::internal(format!("encode {what}: {error}"))))?;
+    let limit = state.config.limits.max_rest_body_bytes;
+    if bytes.len() > limit {
+        return Err(ApiError(LogPoseError::TooLarge {
+            what: format!("{what}; ask for fewer results or output fields"),
+            size: u64::try_from(bytes.len()).ok(),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }));
+    }
+    Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
 async fn get_collection_stats(
@@ -572,10 +726,58 @@ struct RecordsBody {
     records: Vec<Value>,
 }
 
+/// Keys to delete, or a filter whose matches to delete.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct KeysBody {
-    keys: Vec<Value>,
+struct DeleteBody {
+    #[serde(default)]
+    keys: Option<Vec<Value>>,
+    #[serde(default)]
+    filter: Option<Value>,
+}
+
+/// Partial documents to apply by key, or a filter and the patch to apply to its matches.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateBody {
+    #[serde(default)]
+    records: Option<Vec<Value>>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    patch: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CountBody {
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    snapshot: Option<Snapshot>,
+    #[serde(default)]
+    read_barrier: Option<Snapshot>,
+    #[serde(default)]
+    snapshot_token: Option<String>,
+    #[serde(default)]
+    pin: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScrollBody {
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
+    #[serde(default)]
+    page_size: Option<u32>,
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    snapshot_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,19 +846,25 @@ struct CollectionStatsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct QueryCollectionBody {
-    vector: Vec<f32>,
+    #[serde(default)]
+    vector: Option<VectorQuery>,
+    #[serde(default)]
+    filter: Option<Value>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
     top_k: usize,
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default)]
+    ef: Option<usize>,
+    #[serde(default)]
+    explain: ExplainMode,
     #[serde(default)]
     snapshot: Option<Snapshot>,
     #[serde(default)]
     read_barrier: Option<Snapshot>,
-    #[serde(default)]
-    filters: Map<String, Value>,
-    #[serde(default)]
-    predicate: Option<FilterExpr>,
-    #[serde(default)]
-    explain: ExplainMode,
     #[serde(default)]
     snapshot_token: Option<String>,
     #[serde(default)]
@@ -784,7 +992,7 @@ mod tests {
     };
     use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryResponse, QueryStageTimings};
-    use logpose_types::{DistanceMetric, RecordId};
+    use logpose_types::DistanceMetric;
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -796,18 +1004,21 @@ mod tests {
 
     #[test]
     fn query_response_serializes_ann_diagnostics_fields() {
-        let payload = serde_json::to_value(QueryResponse {
-            metric: DistanceMetric::Dot,
+        let schema = logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot)
+            .expect("legacy schema should build");
+        let mut record = Record::new("alpha");
+        record.extra.insert("kind".to_owned(), json!("keep"));
+        let payload = QueryResponse {
+            vector_field: Some("vector".to_owned()),
+            metric: Some(DistanceMetric::Dot),
             top_k: 2,
-            returned: 1,
             snapshot: Snapshot {
                 manifest_generation: 7,
                 visible_seq_no: 11,
             },
-            matches: vec![logpose_query::QueryMatch {
-                id: RecordId::new("alpha"),
-                value: 42.0,
-                metadata: json!({"kind":"keep"}),
+            hits: vec![logpose_query::QueryHit {
+                record,
+                score: Some(42.0),
             }],
             diagnostics: Some(QueryDiagnostics {
                 chosen_plan: QueryPlanKind::CooperativeFilteredAnn,
@@ -838,8 +1049,15 @@ mod tests {
                 }),
             }),
             snapshot_token: None,
-        })
-        .expect("query response should serialize");
+        }
+        .to_json(&schema);
+        assert_eq!(
+            payload["hits"][0]["record"],
+            json!({ "id": "alpha", "kind": "keep" })
+        );
+        assert_eq!(payload["hits"][0]["score"], Value::from(42.0));
+        assert_eq!(payload["returned"], 1);
+        assert_eq!(payload["metric"], "dot");
 
         assert_eq!(
             payload["diagnostics"]["chosen_plan"],
@@ -1049,11 +1267,11 @@ mod tests {
     }
 
     fn match_ids(body: &Value) -> Vec<&str> {
-        body["matches"]
+        body["hits"]
             .as_array()
-            .expect("matches should be an array")
+            .expect("hits should be an array")
             .iter()
-            .map(|candidate| candidate["id"].as_str().expect("id should be a string"))
+            .map(|hit| hit["record"]["id"].as_str().expect("id should be a string"))
             .collect()
     }
 
@@ -1434,7 +1652,7 @@ mod tests {
             (
                 "POST",
                 "/query".to_owned(),
-                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1})),
                 true,
             ),
             (
@@ -1530,7 +1748,7 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/query"),
-            Some(json!({"vector": [1.0, 0.0], "top_k": 3, "filters": {"kind": "keep"}})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 3, "filter": {"eq": {"kind": "keep"}}})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1620,7 +1838,7 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/query"),
-            Some(json!({"vector": [1.0, 0.0], "top_k": 1, "read_barrier": write["snapshot"]})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1, "read_barrier": write["snapshot"]})),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1629,7 +1847,7 @@ mod tests {
             flush["manifest_generation"]
         );
         assert_eq!(body["snapshot"]["visible_seq_no"], flush["visible_seq_no"]);
-        assert_eq!(body["matches"][0]["id"], "alpha");
+        assert_eq!(body["hits"][0]["record"]["id"], "alpha");
 
         let (status, body) = call(
             &app,
@@ -1649,7 +1867,7 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 1,
                 "read_barrier": {"manifest_generation": 0, "visible_seq_no": 2}
             })),
@@ -1931,7 +2149,7 @@ mod tests {
                 "query",
                 "POST",
                 format!("{DOCS}/query"),
-                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1})),
             ),
             ("stats", "GET", format!("{DOCS}/stats"), None),
             ("flush", "POST", format!("{DOCS}/flush"), None),
@@ -2298,7 +2516,6 @@ mod tests {
             body["records"][0],
             json!({
                 "sku": 1,
-                "embedding": [0.6, 0.0, 0.8],
                 "tenant": "acme",
                 "price": 9.5,
                 "tags": ["a", "b"],
@@ -2306,10 +2523,24 @@ mod tests {
                 "attrs": {"size": 3, "big": u64::MAX},
                 "color": "red"
             }),
-            "cosine vectors are normalized, timestamps are RFC 3339 in UTC, and $extra keys \
-             are flattened into the document"
+            "no vectors by default, timestamps are RFC 3339 in UTC, and $extra keys are \
+             flattened into the document"
         );
         assert_eq!(body["records"][1]["updated_at"], "1970-01-01T00:00:00Z");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{products}/records/get"),
+            Some(json!({"keys": [1], "output_fields": ["embedding"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"][0],
+            json!({"sku": 1, "embedding": [0.6, 0.0, 0.8]}),
+            "a named vector is returned, normalized for cosine"
+        );
 
         let (status, body) = call(
             &app,
@@ -2336,7 +2567,7 @@ mod tests {
             &app,
             "POST",
             &format!("{products}/records/get"),
-            Some(json!({"keys": [1]})),
+            Some(json!({"keys": [1], "output_fields": ["embedding", "price", "tags", "$extra"]})),
         )
         .await;
         let record = &body["records"][0];
@@ -2458,7 +2689,10 @@ mod tests {
                 &app,
                 "POST",
                 &format!("{extremes}/records/get"),
-                Some(json!({"keys": [i64::MAX, i64::MIN, i64::MAX, 7]})),
+                Some(json!({
+                    "keys": [i64::MAX, i64::MIN, i64::MAX, 7],
+                    "output_fields": ["v", "n", "f", "at", "ns", "doc", "$extra"]
+                })),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{stage}: {body}");
@@ -2673,7 +2907,7 @@ mod tests {
         .await;
         assert_eq!(
             body["records"][0],
-            json!({"id": "alpha", "vector": [1.0, 0.0], "size": 1}),
+            json!({"id": "alpha", "size": 1}),
             "the added field reads null on the old row, and the $extra key it names is hidden"
         );
 
@@ -2728,7 +2962,9 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/records/get"),
-            Some(json!({"keys": ["alpha", "beta"]})),
+            Some(
+                json!({"keys": ["alpha", "beta"], "output_fields": ["vector", "colour", "$extra"]}),
+            ),
         )
         .await;
         assert_eq!(
@@ -2744,7 +2980,9 @@ mod tests {
             &app,
             "POST",
             &format!("{DOCS}/records/get"),
-            Some(json!({"keys": ["alpha", "beta"]})),
+            Some(
+                json!({"keys": ["alpha", "beta"], "output_fields": ["vector", "colour", "$extra"]}),
+            ),
         )
         .await;
         assert_eq!(
@@ -2773,9 +3011,9 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 5,
-                "filters": {"score": 9_007_199_254_740_993_u64}
+                "filter": {"eq": {"score": 9_007_199_254_740_993_u64}}
             })),
         )
         .await;
@@ -2806,9 +3044,9 @@ mod tests {
             "POST",
             &format!("{DOCS}/query"),
             Some(json!({
-                "vector": [1.0, 0.0],
+                "vector": {"values": [1.0, 0.0]},
                 "top_k": 1,
-                "predicate": {"kind": "comparison", "field": "kind", "operator": "eq", "value": "keep"},
+                "filter": {"eq": {"kind": "keep"}},
                 "explain": "profile"
             })),
         )
@@ -2852,19 +3090,21 @@ mod tests {
         let app = router(Arc::new(AppState::new(test_config("rest-query-errors"))));
         create_documents(&app).await;
         let query = format!("{DOCS}/query");
-        for request in [
-            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "comparison", "field": "kind", "operator": "eq"}}),
-            json!({"vector": [1.0, 0.0], "top_k": 1, "predicate": {"kind": "and", "children": []}}),
-            json!({"vector": [1.0, 0.0], "top_k": 1, "filters": {"kind": {"nested": true}}}),
+        for (filter, path) in [
+            (json!({"eq": {}}), "filter.eq"),
+            (json!({"and": []}), "filter.and"),
+            (json!({"eq": {"kind": {"nested": true}}}), "filter.eq.kind"),
         ] {
+            let request = json!({"vector": {"values": [1.0, 0.0]}, "top_k": 1, "filter": filter});
             let (status, body) = call(&app, "POST", &query, Some(request)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(violation(&body), path, "{body}");
         }
         let (status, body) = call(
             &app,
             "POST",
             &query,
-            Some(json!({"vector": [1.0, 0.0], "top_k": 0})),
+            Some(json!({"vector": {"values": [1.0, 0.0]}, "top_k": 0})),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -2872,7 +3112,7 @@ mod tests {
         assert!(
             body["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("top_k must be greater than 0"))
+                .is_some_and(|message| message.contains("top_k must be 1 to"))
         );
     }
 
@@ -3018,5 +3258,867 @@ mod tests {
         let path = std::env::temp_dir().join(format!("logpose-api-rest-{label}-{suffix}"));
         fs::create_dir_all(&path).expect("temp dir should be created");
         path
+    }
+
+    // ----- Search, count, scroll, and filter writes -----
+
+    const ITEMS: &str = "/v2/databases/default/collections/items";
+
+    /// Two vector fields, typed scalar fields, and dynamic fields.
+    fn items_spec() -> Value {
+        json!({
+            "name": "items",
+            "primary_key": {"name": "sku", "type": "int64"},
+            "vectors": [
+                {"name": "embedding", "dimensions": 3, "metric": "dot"},
+                {"name": "thumb", "dimensions": 2, "metric": "l2"}
+            ],
+            "fields": [
+                {"name": "tenant", "type": "string"},
+                {"name": "price", "type": "float64"},
+                {"name": "stock", "type": "int64"},
+                {"name": "tags", "type": "array<string>"}
+            ],
+            "dynamic_fields": true
+        })
+    }
+
+    /// Item `sku`: even skus belong to `acme` and odd ones to `globex`, the price is
+    /// `1.5 * sku`, the stock `sku % 7` (none for multiples of 5), the tag `t{sku % 3}`, the
+    /// `$extra` color red for multiples of 4 and blue otherwise, and the embedding's dot product
+    /// with `[1, 0, 0]` is `sku`.
+    fn item(sku: i64) -> Value {
+        let mut item = json!({
+            "sku": sku,
+            "embedding": [sku as f64, 1.0, 0.0],
+            "thumb": [0.0, sku as f64],
+            "tenant": if sku % 2 == 0 { "acme" } else { "globex" },
+            "price": sku as f64 * 1.5,
+            "tags": [format!("t{}", sku % 3)],
+            "color": if sku % 4 == 0 { "red" } else { "blue" }
+        });
+        if sku % 5 != 0 {
+            item["stock"] = json!(sku % 7);
+        }
+        item
+    }
+
+    async fn create_items(app: &Router, skus: std::ops::RangeInclusive<i64>) {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(items_spec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        upsert_items(app, skus).await;
+    }
+
+    async fn upsert_items(app: &Router, skus: std::ops::RangeInclusive<i64>) {
+        let records = skus.map(item).collect::<Vec<_>>();
+        let (status, body) = call(
+            app,
+            "POST",
+            &format!("{ITEMS}/records/upsert"),
+            Some(json!({ "records": records })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn hit_skus(body: &Value) -> Vec<i64> {
+        body["hits"]
+            .as_array()
+            .expect("hits should be an array")
+            .iter()
+            .map(|hit| {
+                hit["record"]["sku"]
+                    .as_i64()
+                    .expect("sku should be an integer")
+            })
+            .collect()
+    }
+
+    fn record_skus(body: &Value) -> Vec<i64> {
+        body["records"]
+            .as_array()
+            .expect("records should be an array")
+            .iter()
+            .map(|record| record["sku"].as_i64().expect("sku should be an integer"))
+            .collect()
+    }
+
+    /// Every page of a scroll with `request` (a first page), and the skus it returned.
+    async fn scroll_all(app: &Router, request: Value) -> (Vec<Value>, Vec<i64>) {
+        let mut pages = Vec::new();
+        let mut skus = Vec::new();
+        let mut request = request;
+        loop {
+            let (status, page) = call(
+                app,
+                "POST",
+                &format!("{ITEMS}/records/scroll"),
+                Some(request.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            skus.extend(record_skus(&page));
+            let next = page["next_cursor"].clone();
+            pages.push(page);
+            if next.is_null() {
+                break;
+            }
+            request["cursor"] = next;
+            if let Some(object) = request.as_object_mut() {
+                object.remove("snapshot_token");
+            }
+        }
+        (pages, skus)
+    }
+
+    #[tokio::test]
+    async fn read_responses_above_the_body_limit_are_a_typed_413() {
+        let mut config = test_config("rest-p6c-response-limit");
+        config.limits.max_rest_body_bytes = 4096;
+        let app = router(Arc::new(AppState::new(config)));
+        create_items(&app, 1..=5).await;
+        for first in (6..=40).step_by(5) {
+            upsert_items(&app, first..=first + 4).await;
+        }
+        let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
+        let keys = (1..=40).collect::<Vec<i64>>();
+        let fields = json!(["embedding", "thumb", "tenant", "price", "tags", "$extra"]);
+        for (path, body) in [
+            (
+                "query",
+                json!({"vector": vector, "top_k": 40, "output_fields": fields}),
+            ),
+            ("query", json!({"top_k": 40, "output_fields": fields})),
+            (
+                "records/scroll",
+                json!({"page_size": 40, "output_fields": fields}),
+            ),
+            (
+                "records/get",
+                json!({"keys": keys, "output_fields": fields}),
+            ),
+        ] {
+            let (status, error) = call(&app, "POST", &format!("{ITEMS}/{path}"), Some(body)).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {error}");
+            assert_eq!(error["details"]["reason"], "TOO_LARGE", "{path}: {error}");
+            assert_eq!(error["details"]["metadata"]["limit_bytes"], "4096");
+        }
+        // A small enough answer is served.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/query"),
+            Some(json!({"vector": vector, "top_k": 2})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![40, 39]);
+    }
+
+    #[tokio::test]
+    async fn queries_search_a_named_vector_field_with_typed_filters_orders_and_projections() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-query"))));
+        create_items(&app, 1..=40).await;
+        let query = format!("{ITEMS}/query");
+
+        // A vector search: acme items with 15 <= price < 45 are skus 10 to 28, best first.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "embedding", "values": [1.0, 0.0, 0.0]},
+                "filter": {"and": [
+                    {"eq": {"tenant": "acme"}},
+                    {"range": {"price": {"gte": 15, "lt": 45}}}
+                ]},
+                "top_k": 3,
+                "output_fields": ["price"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["vector_field"], "embedding");
+        assert_eq!(body["metric"], "dot");
+        assert_eq!(body["returned"], 3);
+        assert_eq!(
+            body["hits"],
+            json!([
+                {"score": 28.0, "record": {"sku": 28, "price": 42.0}},
+                {"score": 26.0, "record": {"sku": 26, "price": 39.0}},
+                {"score": 24.0, "record": {"sku": 24, "price": 36.0}}
+            ])
+        );
+
+        // The other vector field, by name: L2 distance to [0, 3] is smallest for sku 3.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "thumb", "values": [0.0, 3.0]},
+                "top_k": 2,
+                "output_fields": ["sku"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["metric"], "l2");
+        assert_eq!(hit_skus(&body)[0], 3);
+        assert_eq!(body["hits"][0]["record"], json!({"sku": 3}));
+
+        // No vector: a filtered scan in `order_by` order, without scores.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "filter": {"contains": {"tags": "t0"}},
+                "order_by": [{"field": "price", "direction": "desc"}],
+                "top_k": 4,
+                "output_fields": ["price"],
+                "explain": "plan"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![39, 36, 33, 30]);
+        assert!(body["hits"][0].get("score").is_none(), "{body}");
+        assert!(body.get("vector_field").is_none(), "{body}");
+        assert_eq!(body["diagnostics"]["chosen_plan"], "ordered_scan");
+
+        // With a vector, `order_by` reorders the hits: stock ascending, no stock last.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "vector": {"field": "embedding", "values": [1.0, 0.0, 0.0]},
+                "order_by": [{"field": "stock"}],
+                "top_k": 5,
+                "output_fields": ["stock"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![36, 37, 38, 39, 40]);
+
+        // `$extra` keys filter by path, and `in` and `not_in` take lists.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &query,
+            Some(json!({
+                "filter": {"and": [
+                    {"eq": {"$extra.color": "red"}},
+                    {"not_in": {"sku": [4, 8]}},
+                    {"in": {"tenant": ["acme", "initech"]}}
+                ]},
+                "top_k": 100,
+                "output_fields": ["sku"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![12, 16, 20, 24, 28, 32, 36, 40]);
+
+        // A pinned query returns the token of the state it read.
+        let (status, body) =
+            call(&app, "POST", &query, Some(json!({"top_k": 1, "pin": true}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["snapshot_token"].is_string(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn counts_and_scrolls_agree_and_scroll_pages_follow_the_order() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-scroll"))));
+        create_items(&app, 1..=40).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": {"eq": {"tenant": "globex"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["database_name"], "default");
+        assert_eq!(body["collection_name"], "items");
+        assert_eq!(body["count"], 20);
+        assert!(body.get("snapshot_token").is_none(), "{body}");
+        let (_, all) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(all["count"], 40);
+
+        let (pages, skus) = scroll_all(
+            &app,
+            json!({
+                "filter": {"eq": {"tenant": "globex"}},
+                "page_size": 6,
+                "output_fields": ["tenant"]
+            }),
+        )
+        .await;
+        assert_eq!(skus, (1..=39).step_by(2).collect::<Vec<_>>());
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page["records"].as_array().map_or(0, Vec::len))
+                .collect::<Vec<_>>(),
+            vec![6, 6, 6, 2]
+        );
+        assert_eq!(
+            pages[0]["records"][0],
+            json!({"sku": 1, "tenant": "globex"})
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| page["snapshot"] == pages[0]["snapshot"])
+        );
+
+        // Ordered by price descending, in pages of 15, and a scroll that fits one page.
+        let (pages, skus) = scroll_all(
+            &app,
+            json!({
+                "order_by": [{"field": "price", "direction": "desc"}],
+                "page_size": 15,
+                "output_fields": ["sku"]
+            }),
+        )
+        .await;
+        assert_eq!(skus, (1..=40).rev().collect::<Vec<_>>());
+        assert_eq!(pages.len(), 3);
+        let (pages, skus) = scroll_all(&app, json!({"page_size": 40})).await;
+        assert_eq!((pages.len(), skus.len()), (1, 40));
+    }
+
+    #[tokio::test]
+    async fn scroll_cursors_read_the_pinned_state_through_writes_flushes_and_compactions() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-pinned"))));
+        create_items(&app, 1..=40).await;
+        let (status, _) = call(&app, "POST", &format!("{ITEMS}/flush"), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let acme = json!({"eq": {"tenant": "acme"}});
+        let (status, counted) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme, "pin": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{counted}");
+        assert_eq!(counted["count"], 20);
+        let token = counted["snapshot_token"].clone();
+        assert!(token.is_string(), "{counted}");
+
+        let first = json!({
+            "filter": acme,
+            "page_size": 7,
+            "snapshot_token": token,
+            "output_fields": ["price"]
+        });
+        let (status, page) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(first.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(record_skus(&page), vec![2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(page["snapshot"], counted["snapshot"]);
+        let cursor = page["next_cursor"].clone();
+        assert!(cursor.is_string(), "{page}");
+
+        // Change what the pinned state holds: deletes, updates, new rows, a flush, a compaction.
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"range": {"sku": {"gte": 16, "lte": 24}}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 9);
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({"filter": acme, "patch": {"price": 0.5}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        upsert_items(&app, 41..=60).await;
+        for step in ["flush", "compact"] {
+            let (status, body) = call(&app, "POST", &format!("{ITEMS}/{step}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{step}: {body}");
+        }
+
+        // A cursor with another filter, or with a token, is refused.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"filter": {"eq": {"tenant": "globex"}}, "cursor": cursor})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "cursor");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"filter": acme, "cursor": cursor, "snapshot_token": token})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "snapshot_token");
+
+        // The rest of the pages read exactly the pinned state.
+        let (pages, rest) = scroll_all(
+            &app,
+            json!({"filter": acme, "page_size": 7, "cursor": cursor, "output_fields": ["price"]}),
+        )
+        .await;
+        let mut scrolled = record_skus(&page);
+        scrolled.extend(rest);
+        assert_eq!(scrolled, (2..=40).step_by(2).collect::<Vec<_>>());
+        assert_eq!(
+            scrolled.len() as u64,
+            counted["count"].as_u64().unwrap_or_default()
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|next| next["snapshot"] == counted["snapshot"])
+        );
+        assert_eq!(pages[0]["records"][0], json!({"sku": 16, "price": 24.0}));
+
+        // The current state shows the changes.
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme})),
+        )
+        .await;
+        assert_eq!(now["count"], 25);
+        let (_, through_token) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"filter": acme, "snapshot_token": token})),
+        )
+        .await;
+        assert_eq!(through_token["count"], 20);
+    }
+
+    #[tokio::test]
+    async fn expired_scroll_cursors_and_tokens_fail_with_snapshot_expired() {
+        let mut config = test_config("rest-p6c-expiry");
+        config.snapshots.token_ttl_ms = 200;
+        let app = router(Arc::new(AppState::new(config)));
+        create_items(&app, 1..=10).await;
+        let (status, page) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"page_size": 3})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let cursor = page["next_cursor"].clone();
+        assert!(cursor.is_string(), "{page}");
+        let (_, counted) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"pin": true})),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/scroll"),
+            Some(json!({"page_size": 3, "cursor": cursor})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["details"]["reason"], "SNAPSHOT_EXPIRED");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"snapshot_token": counted["snapshot_token"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["details"]["reason"], "SNAPSHOT_EXPIRED");
+    }
+
+    #[tokio::test]
+    async fn deletes_and_updates_by_filter_commit_every_match_as_one_batch() {
+        let app = router(Arc::new(AppState::new(test_config(
+            "rest-p6c-filter-writes",
+        ))));
+        create_items(&app, 1..=40).await;
+        let (_, before) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"pin": true})),
+        )
+        .await;
+
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"range": {"price": {"lt": 15}}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 9);
+        // One batch: the nine deletes take consecutive sequence numbers and become visible
+        // together.
+        assert_eq!(
+            ack["last_seq_no"].as_u64(),
+            before["snapshot"]["visible_seq_no"]
+                .as_u64()
+                .map(|seq| seq + 9)
+        );
+        assert_eq!(ack["snapshot"]["visible_seq_no"], ack["last_seq_no"]);
+        let (_, got) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/get"),
+            Some(json!({"keys": (1..=10).collect::<Vec<_>>(), "output_fields": ["sku"]})),
+        )
+        .await;
+        assert_eq!(got["missing_keys"], json!([1, 2, 3, 4, 5, 6, 7, 8, 9]));
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(now["count"], 31);
+        let (_, then) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({"snapshot_token": before["snapshot_token"]})),
+        )
+        .await;
+        assert_eq!(then["count"], 40);
+
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({
+                "filter": {"eq": {"tenant": "acme"}},
+                "patch": {"stock": 100, "color": "green"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 16);
+        for filter in [
+            json!({"eq": {"stock": 100}}),
+            json!({"eq": {"$extra.color": "green"}}),
+        ] {
+            let (_, counted) = call(
+                &app,
+                "POST",
+                &format!("{ITEMS}/records/count"),
+                Some(json!({ "filter": filter })),
+            )
+            .await;
+            assert_eq!(counted["count"], 16, "{filter}");
+        }
+
+        // An invalid patch changes nothing, and a filter without a match commits nothing.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/update"),
+            Some(json!({"filter": {"eq": {"tenant": "acme"}}, "patch": {"price": "free"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(violation(&body), "patch.price");
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/delete"),
+            Some(json!({"filter": {"eq": {"tenant": "initech"}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ack}");
+        assert_eq!(ack["applied_ops"], 0);
+        let (_, now) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/records/count"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(now["count"], 31);
+    }
+
+    #[tokio::test]
+    async fn search_count_scroll_and_filter_write_errors_name_the_request_field() {
+        let app = router(Arc::new(AppState::new(test_config("rest-p6c-errors"))));
+        create_items(&app, 1..=5).await;
+        let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
+        let query = |extra: Value| {
+            let mut body = json!({"vector": vector, "top_k": 3});
+            if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+                body.extend(extra);
+            }
+            body
+        };
+        let mut deep = json!({"eq": {"sku": 1}});
+        for _ in 0..40 {
+            deep = json!({ "not": deep });
+        }
+        let too_deep = format!("filter{}", ".not".repeat(32));
+        let cases = [
+            ("records/count", json!({"filter": deep}), too_deep.as_str()),
+            (
+                "records/count",
+                json!({"filter": {"in": {"sku": vec![1; 10_000]}}}),
+                "filter",
+            ),
+            ("query", query(json!({"top_k": 0})), "top_k"),
+            ("query", query(json!({"top_k": 10_001})), "top_k"),
+            (
+                "query",
+                json!({"vector": {"values": [1.0, 0.0, 0.0]}, "top_k": 1}),
+                "vector.field",
+            ),
+            (
+                "query",
+                json!({"vector": {"field": "tenant", "values": [1.0]}, "top_k": 1}),
+                "vector.field",
+            ),
+            ("query", json!({"top_k": 1, "ef": 16}), "ef"),
+            ("query", query(json!({"ef": 0})), "ef"),
+            (
+                "query",
+                query(json!({"order_by": [{"field": "tags"}]})),
+                "order_by[0].field",
+            ),
+            (
+                "query",
+                query(json!({"order_by": [{"field": "price"}, {"field": "stock"}]})),
+                "order_by[1]",
+            ),
+            (
+                "query",
+                query(json!({"output_fields": ["$extra", "embedding", 7]})),
+                "",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"price": "cheap"}}})),
+                "filter.eq.price",
+            ),
+            ("query", query(json!({"filter": {"and": []}})), "filter.and"),
+            (
+                "query",
+                query(json!({"filter": {"or": [{"in": {"tags": ["a", 3]}}]}})),
+                "filter.or[0].in.tags[1]",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"range": {"stock": {"gt": 1, "gte": 2}}}})),
+                "filter.range.stock",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"contains": {"tenant": "acme"}}})),
+                "filter.contains.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"not": {"exists": "embedding"}}})),
+                "filter.not.exists",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"$extra.tenant": "acme"}}})),
+                "filter.eq.$extra.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"eq": {"tenant": null}}})),
+                "filter.eq.tenant",
+            ),
+            (
+                "query",
+                query(json!({"filter": {"like": {"tenant": "a%"}}})),
+                "filter",
+            ),
+            (
+                "records/count",
+                json!({"filter": {"range": {"price": {"above": 3}}}}),
+                "filter.range.price.above",
+            ),
+            (
+                "records/count",
+                json!({"snapshot_token": "not-a-token"}),
+                "snapshot_token",
+            ),
+            ("records/scroll", json!({"page_size": 0}), "page_size"),
+            (
+                "records/scroll",
+                json!({"cursor": "not-a-cursor"}),
+                "cursor",
+            ),
+            (
+                "records/scroll",
+                json!({"order_by": [{"field": "sku"}]}),
+                "order_by[0].field",
+            ),
+            (
+                "records/delete",
+                json!({"keys": [1], "filter": {"eq": {"sku": 1}}}),
+                "keys",
+            ),
+            ("records/delete", json!({}), "keys"),
+            (
+                "records/delete",
+                json!({"filter": {"eq": {"sku": "one"}}}),
+                "filter.eq.sku",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}}),
+                "patch",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}, "patch": {"sku": 2}}),
+                "patch.sku",
+            ),
+            (
+                "records/update",
+                json!({"filter": {"eq": {"sku": 1}}, "patch": {"embedding": [1.0]}}),
+                "patch.embedding",
+            ),
+        ];
+        for (operation, body, field) in cases {
+            let (status, reply) = call(
+                &app,
+                "POST",
+                &format!("{ITEMS}/{operation}"),
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{operation} {body}: {reply}"
+            );
+            if !field.is_empty() {
+                assert_eq!(violation(&reply), field, "{operation} {body}: {reply}");
+            }
+        }
+
+        // A query vector of the wrong length is a dimension mismatch at `vector.values`.
+        let (status, reply) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/query"),
+            Some(json!({"vector": {"field": "embedding", "values": [1.0]}, "top_k": 1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert_eq!(reply["details"]["reason"], "DIMENSION_MISMATCH");
+        assert_eq!(violation(&reply), "vector.values");
+    }
+
+    #[tokio::test]
+    async fn a_filter_update_too_large_for_one_wal_frame_is_too_large_and_changes_nothing() {
+        let state = Arc::new(AppState::new(test_config("rest-p6c-too-large")));
+        let app = router(Arc::clone(&state));
+        // 2,048 dimensions: each updated row image carries its 8 KiB vector, so 9,000 rows
+        // exceed a 64 MiB frame.
+        let dims = 2048;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(json!({
+                "name": "wide",
+                "primary_key": {"name": "id", "type": "int64"},
+                "vectors": [{"name": "vector", "dimensions": dims, "metric": "l2"}],
+                "fields": [{"name": "group", "type": "int64"}]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for batch in 0..9_i64 {
+            let records = (batch * 1000..(batch + 1) * 1000)
+                .map(|id| {
+                    Record::new(id)
+                        .with_vector("vector", vec![(id % 97) as f32; dims])
+                        .with_field("group", TypedValue::Int64(1))
+                })
+                .collect();
+            state
+                .upsert_records_with_auth(&RequestAuth::default(), "default/wide", records)
+                .await
+                .expect("seed batch should commit");
+        }
+        let wide = "/v2/databases/default/collections/wide";
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/update"),
+            Some(json!({"filter": {"eq": {"group": 1}}, "patch": {"group": 2}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert_eq!(body["details"]["reason"], "TOO_LARGE");
+        let (_, counted) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/count"),
+            Some(json!({"filter": {"eq": {"group": 1}}})),
+        )
+        .await;
+        assert_eq!(counted["count"], 9000);
+        let (status, ack) = call(
+            &app,
+            "POST",
+            &format!("{wide}/records/delete"),
+            Some(json!({"filter": {"eq": {"group": 1}}})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a delete of the same rows fits: {ack}"
+        );
+        assert_eq!(ack["applied_ops"], 9000);
     }
 }

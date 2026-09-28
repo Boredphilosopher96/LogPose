@@ -302,6 +302,26 @@ impl ReadView {
         })
     }
 
+    /// Unpin the snapshot token this view was opened with or pinned under, for a request that
+    /// knows no later request needs it (the last page of a scroll that pinned its own). The
+    /// view itself still reads its state; later requests with the token fail like an expired
+    /// one. Returns whether a pin was released: `false` without a token, when it was already
+    /// released or expired, or once the engine shut down or the collection was dropped.
+    pub fn release(&self) -> bool {
+        let Some(token) = &self.token else {
+            return false;
+        };
+        let Some(core) = self.core.upgrade() else {
+            return false;
+        };
+        match core.collection(&self.version.meta.reference) {
+            Ok(handle) if handle.meta().id == self.version.meta.id => {
+                handle.release_snapshot(token)
+            }
+            _ => false,
+        }
+    }
+
     /// Row counters: live rows are `total_rows - deleted_rows`.
     #[must_use]
     pub fn counters(&self) -> VersionCounters {

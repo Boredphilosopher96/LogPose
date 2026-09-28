@@ -1,7 +1,7 @@
 use crate::{
     action::{
-        Action, CollectionCreateAction, CollectionStatsAction, ExplainArg, MetricArg, QueryAction,
-        RecordDeleteAction, RecordPutAction, WorkflowDefinition, WorkflowKind,
+        Action, CollectionCreateAction, CollectionStatsAction, ExplainArg, FilterInput, MetricArg,
+        QueryAction, RecordDeleteAction, RecordPutAction, WorkflowDefinition, WorkflowKind,
         collect_picker_files, collection_lookup_name, collection_ref_from_lookup_or_namespace,
         explain_choices, format_command, format_filter, format_predicate, metric_choices,
         parse_filter_list, parse_query_vector, parse_where_list, picker_choice, rank_path_choices,
@@ -21,7 +21,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use logpose_config::LogPoseConfig;
-use logpose_query::FilterExpr;
 use logpose_storage::InspectTarget;
 use logpose_types::CollectionRef;
 use ratatui::{
@@ -329,7 +328,8 @@ fn action_from_scripted_prompts(
             }
             Ok(Action::RecordDelete(RecordDeleteAction {
                 collection: collection_ref,
-                id,
+                id: Some(id),
+                filter: FilterInput::default(),
             }))
         }
         WorkflowKind::Query => {
@@ -381,8 +381,8 @@ fn action_from_scripted_prompts(
                     0,
                 )?
             };
-            let predicate_json = args.predicate_json.clone().or(ui
-                .prompt_optional_string("FilterExpr JSON path (optional)", Some("predicate.json"))?
+            let filter_json = args.filter_json.clone().or(ui
+                .prompt_optional_string("Filter JSON path (optional)", Some("filter.json"))?
                 .map(PathBuf::from));
             let (snapshot_manifest_generation, snapshot_visible_seq_no) = build_snapshot_fields(
                 ui.prompt_optional_parsed(
@@ -438,10 +438,18 @@ fn action_from_scripted_prompts(
             Ok(Action::Query(QueryAction {
                 collection: collection_ref_for_namespace(&args.namespace, &collection),
                 top_k,
-                vector,
-                filters,
-                where_clauses,
-                predicate_json,
+                vector: Some(vector),
+                vector_field: None,
+                filter: FilterInput {
+                    filters,
+                    where_clauses,
+                    filter_json,
+                },
+                order_by: None,
+                output_fields: Vec::new(),
+                ef: None,
+                snapshot_token: None,
+                pin: false,
                 explain,
                 snapshot_manifest_generation,
                 snapshot_visible_seq_no,
@@ -1068,12 +1076,12 @@ impl FormState {
                     None,
                 ),
                 path_field(
-                    "predicate_json",
-                    "FilterExpr JSON path",
-                    "Optional predicate document path.",
-                    "predicate.json",
+                    "filter_json",
+                    "Filter JSON path",
+                    "Optional filter document path.",
+                    "filter.json",
                     false,
-                    args.predicate_json
+                    args.filter_json
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned()),
                 ),
@@ -1314,7 +1322,8 @@ impl FormState {
             })),
             WorkflowKind::RecordDelete => Ok(Action::RecordDelete(RecordDeleteAction {
                 collection: required_collection("collection")?,
-                id: required("id")?,
+                id: Some(required("id")?.to_owned()),
+                filter: FilterInput::default(),
             })),
             WorkflowKind::Query => {
                 let (snapshot_manifest_generation, snapshot_visible_seq_no) =
@@ -1338,11 +1347,21 @@ impl FormState {
                     top_k: required("top_k")?
                         .parse::<usize>()
                         .context("top_k must be a positive integer")?,
-                    vector: parse_query_vector(&required("vector")?).map_err(anyhow::Error::msg)?,
-                    filters: parse_optional_filters(field("filters")?)?,
-                    where_clauses: parse_optional_predicates(field("where")?)?,
+                    vector: Some(
+                        parse_query_vector(&required("vector")?).map_err(anyhow::Error::msg)?,
+                    ),
+                    vector_field: None,
+                    filter: FilterInput {
+                        filters: parse_optional_filters(field("filters")?)?,
+                        where_clauses: parse_optional_predicates(field("where")?)?,
+                        filter_json: optional_path("filter_json")?,
+                    },
+                    order_by: None,
+                    output_fields: Vec::new(),
+                    ef: None,
+                    snapshot_token: None,
+                    pin: false,
                     explain: parse_explain(field("explain")?)?,
-                    predicate_json: optional_path("predicate_json")?,
                     snapshot_manifest_generation,
                     snapshot_visible_seq_no,
                     read_barrier_manifest_generation,
@@ -1616,7 +1635,7 @@ impl InteractiveApp {
                     vector: None,
                     filters: Vec::new(),
                     where_clauses: Vec::new(),
-                    predicate_json: None,
+                    filter_json: None,
                     explain: None,
                     segment_id: None,
                 };
@@ -1913,6 +1932,8 @@ impl InteractiveApp {
             Action::RecordPut(action) => Some(collection_label(&action.collection)),
             Action::RecordDelete(action) => Some(collection_label(&action.collection)),
             Action::Query(action) => Some(collection_label(&action.collection)),
+            Action::Count(action) => Some(collection_label(&action.collection)),
+            Action::Scroll(action) => Some(collection_label(&action.collection)),
             Action::Inspect { collection, .. } => Some(collection_label(collection)),
             Action::Status
             | Action::ConfigShow
@@ -3117,11 +3138,16 @@ fn confirmation_prompt(action: &Action) -> Option<String> {
             "Compact collection '{}' now?",
             collection_label(collection)
         )),
-        Action::RecordDelete(action) => Some(format!(
-            "Delete record '{}' from collection '{}' now?",
-            action.id,
-            collection_label(&action.collection)
-        )),
+        Action::RecordDelete(action) => Some(match &action.id {
+            Some(id) => format!(
+                "Delete record '{id}' from collection '{}' now?",
+                collection_label(&action.collection)
+            ),
+            None => format!(
+                "Delete every matching record from collection '{}' now?",
+                collection_label(&action.collection)
+            ),
+        }),
         _ => None,
     }
 }
@@ -3265,7 +3291,7 @@ fn filter_to_value(filter: &crate::action::QueryFilter) -> String {
     format_filter(filter)
 }
 
-fn predicate_to_value(predicate: &FilterExpr) -> String {
+fn predicate_to_value(predicate: &serde_json::Value) -> String {
     // Same reasoning as `filter_to_value`: format the predicate literal
     // directly so apostrophes and other shell-significant characters
     // survive round-tripping into the TUI form.
@@ -3298,7 +3324,7 @@ fn parse_optional_filters(value: &str) -> anyhow::Result<Vec<crate::action::Quer
     }
 }
 
-fn parse_optional_predicates(value: &str) -> anyhow::Result<Vec<FilterExpr>> {
+fn parse_optional_predicates(value: &str) -> anyhow::Result<Vec<serde_json::Value>> {
     if value.trim().is_empty() {
         Ok(Vec::new())
     } else {
@@ -3609,7 +3635,7 @@ mod tests {
             vector: None,
             filters: Vec::new(),
             where_clauses: Vec::new(),
-            predicate_json: None,
+            filter_json: None,
             explain: None,
             segment_id: None,
         }
@@ -3677,8 +3703,8 @@ mod tests {
             .expect("action should build");
         assert!(matches!(action, Action::Query(_)), "expected query action");
         if let Action::Query(action) = action {
-            assert_eq!(action.filters.len(), 2);
-            assert_eq!(action.where_clauses.len(), 2);
+            assert_eq!(action.filter.filters.len(), 2);
+            assert_eq!(action.filter.where_clauses.len(), 2);
         }
     }
 
@@ -3901,7 +3927,8 @@ mod tests {
     fn destructive_actions_require_confirmation_prompt() {
         let action = Action::RecordDelete(RecordDeleteAction {
             collection: NamespaceArgs::default().collection_ref("colors"),
-            id: "alpha".to_owned(),
+            id: Some("alpha".to_owned()),
+            filter: FilterInput::default(),
         });
         let prompt = confirmation_prompt(&action).expect("delete prompt should exist");
         assert!(prompt.contains("Delete record 'alpha'"));
@@ -4087,7 +4114,7 @@ mod tests {
                         vector: None,
                         filters: Vec::new(),
                         where_clauses: Vec::new(),
-                        predicate_json: None,
+                        filter_json: None,
                         explain: None,
                         segment_id: None,
                     },

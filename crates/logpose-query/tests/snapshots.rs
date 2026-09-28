@@ -7,8 +7,8 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryRequest, QueryResponse,
-    ScalarMetadataValue, ScrollOrder, ScrollRequest, SearchRequest, count, query, scroll, search,
+    FilterExpr, QueryRequest, QueryResponse, ReadConsistency, ScrollOrder, ScrollRequest,
+    SearchRequest, VectorQuery, count, scroll, search,
 };
 use logpose_storage::{
     CollectionReader, EngineConfig, IndexPolicy, LocalStorageEngine, Projection, ReadOptions,
@@ -16,7 +16,7 @@ use logpose_storage::{
     segment_v2::{FileSource, SectionKind, SegmentReader},
 };
 use logpose_types::{
-    CorruptionKind, DistanceMetric, LogPoseError,
+    CollectionRef, CorruptionKind, DistanceMetric, LogPoseError,
     record::{PartialUpdate, PrimaryKey},
     schema::FieldType,
     value::Value,
@@ -33,26 +33,34 @@ mod support;
 use support::{Fixture, Rng, record};
 
 fn eq(field: &str, value: i64) -> FilterExpr {
-    FilterExpr::Comparison(FilterComparison {
-        field: field.to_owned(),
-        operator: FilterOperator::Eq,
-        value: Some(ScalarMetadataValue::Number(value.into())),
-    })
+    FilterExpr::eq(field, value)
 }
 
 fn request(vector: Vec<f32>, token: Option<String>, pin: bool) -> QueryRequest {
     QueryRequest {
-        collection_name: "items".to_owned(),
-        vector,
+        vector: Some(VectorQuery {
+            field: None,
+            values: vector,
+        }),
         top_k: 5,
-        snapshot: None,
-        read_barrier: None,
-        filters: Vec::new(),
-        predicate: None,
-        explain: ExplainMode::None,
-        snapshot_token: token,
-        pin,
+        output_fields: vec!["group".to_owned()],
+        read: ReadConsistency {
+            snapshot_token: token,
+            pin,
+            ..ReadConsistency::default()
+        },
+        ..QueryRequest::default()
     }
+}
+
+async fn query(
+    reader: &dyn CollectionReader,
+    request: QueryRequest,
+) -> logpose_query::Result<QueryResponse> {
+    let collection = CollectionRef::parse("items").expect("name");
+    logpose_query::query(reader, &collection, request)
+        .await
+        .map(|result| result.value)
 }
 
 async fn rows(fixture: &Fixture, rng: &mut Rng, from: usize, count: usize) {
@@ -113,7 +121,7 @@ async fn implicit_snapshot_queries_never_expire_under_steady_flushing() {
             while served < 150 {
                 let mut unfiltered = request(rng.vector(8), None, false);
                 if served % 3 == 0 {
-                    unfiltered.predicate = Some(eq("group", (served % 5) as i64));
+                    unfiltered.filter = Some(eq("group", (served % 5) as i64));
                 }
                 query(&fixture.engine, unfiltered)
                     .await
@@ -188,6 +196,7 @@ async fn pinned_tokens_read_exactly_the_pinned_state() {
             limit: u32::MAX,
             projection: Projection::scalars(),
             cursor: None,
+            token: None,
         },
     )
     .await
@@ -278,7 +287,7 @@ async fn pinned_tokens_read_exactly_the_pinned_state() {
 }
 
 fn assert_same(left: &QueryResponse, right: &QueryResponse) {
-    assert_eq!(left.matches, right.matches);
+    assert_eq!(left.hits, right.hits);
     assert_eq!(left.snapshot, right.snapshot);
 }
 
@@ -497,6 +506,7 @@ async fn a_scroll_that_fits_in_one_page_pins_nothing() {
         limit,
         projection: Projection::scalars(),
         cursor,
+        token: None,
     };
     for _ in 0..70 {
         let whole = scroll(&fixture.engine, &fixture.reference, page(100, None))
@@ -519,8 +529,8 @@ async fn a_scroll_that_fits_in_one_page_pins_nothing() {
     assert!(second.next.is_none());
     assert_eq!(
         fixture.handle.pinned_snapshots(),
-        1,
-        "the cursor's token only"
+        0,
+        "the last page releases the scroll's pin"
     );
 }
 
@@ -667,7 +677,7 @@ async fn a_read_barrier_holds_for_the_pinned_state_a_token_reads() {
     assert!(barrier.visible_seq_no > pinned.snapshot.visible_seq_no);
 
     let mut behind = request(probe.clone(), Some(token.clone()), false);
-    behind.read_barrier = Some(barrier.clone());
+    behind.read.read_barrier = Some(barrier.clone());
     let error = query(&fixture.engine, behind)
         .await
         .expect_err("the pinned state is behind the barrier");
@@ -680,13 +690,13 @@ async fn a_read_barrier_holds_for_the_pinned_state_a_token_reads() {
     );
 
     let mut met = request(probe.clone(), Some(token), false);
-    met.read_barrier = Some(pinned.snapshot.clone());
+    met.read.read_barrier = Some(pinned.snapshot.clone());
     let reply = query(&fixture.engine, met)
         .await
         .expect("the barrier is met");
     assert_eq!(reply.snapshot, pinned.snapshot);
     let mut current = request(probe, None, false);
-    current.read_barrier = Some(barrier.clone());
+    current.read.read_barrier = Some(barrier.clone());
     let reply = query(&fixture.engine, current)
         .await
         .expect("the current state meets it");
