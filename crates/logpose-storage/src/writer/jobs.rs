@@ -23,7 +23,7 @@
 
 use super::*;
 use crate::{
-    compaction::{Candidate, RowShape},
+    compaction::{Candidate, RowShape, flush_build_bytes},
     dv::{DvFile, dv_path, write_dv_file},
     fs_util::crash_point,
     handle::JobTicket,
@@ -249,7 +249,18 @@ impl Writer {
         if !self.background_allowed() && self.flush_waiters.is_empty() {
             return;
         }
-        if let Err(error) = self.request_job(JobKind::Flush, 0, Vec::new()) {
+        // The flush builds the oldest frozen memtable; its reservation covers the builder's
+        // copy of the rows and the index sections, which the memtable reservation does not.
+        let bytes = self.state.as_ref().map_or(0, |state| {
+            state.frozen.first().map_or(0, |memtable| {
+                flush_build_bytes(
+                    memtable.slot_count(),
+                    memtable.bytes().payload,
+                    RowShape::of(&state.schema),
+                )
+            })
+        });
+        if let Err(error) = self.request_job(JobKind::Flush, bytes, Vec::new()) {
             tracing::warn!(%error, "the scheduler refused a flush");
         }
         self.update_status();
