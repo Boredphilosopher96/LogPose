@@ -28,10 +28,11 @@
 //! match). Integers and timestamps compare as integers, floats as floats, strings bytewise. The
 //! primary key has one key, never null.
 //!
-//! A dynamic key (and a `json` field) has JSON semantics: `exists` when the key is present,
-//! `is_null` when present and `null`, `eq` and `in` by JSON scalar equality, `ne` and `not_in`
-//! when present with a non-null scalar that differs, and the range bounds between two strings
-//! or two numbers.
+//! A dynamic key has JSON semantics: `exists` when the key is present, `is_null` when present
+//! and `null`, `eq` and `in` by JSON scalar equality, `ne` and `not_in` when present with a
+//! non-null scalar that differs, and the range bounds between two strings or two numbers. A
+//! `json` field compares the same way, but is a declared field: `exists` when it has a value and
+//! `is_null` when it has none.
 //!
 //! `not p` is `live AND NOT p`, so it includes rows where `p`'s field is null; `and` and `or`
 //! are intersection and union.
@@ -770,8 +771,11 @@ impl Evaluator<'_, '_> {
                     JsonTarget::Field(field) => {
                         let column = self.unit.column(*field, self.pins)?;
                         for row in domain {
-                            let value = column.value(row)?.map(Value::into_json);
-                            if json_matches(value.as_ref(), cond) {
+                            let value = column
+                                .value(row)?
+                                .filter(|value| !value.is_null())
+                                .map(Value::into_json);
+                            if json_field_matches(value.as_ref(), cond) {
                                 rows.insert(row);
                             }
                         }
@@ -871,7 +875,18 @@ fn pk_key(pk: &PrimaryKey) -> ScalarKey {
     }
 }
 
-/// The JSON semantics of one condition on a possibly absent JSON value.
+/// The semantics of one condition on a declared `json` field's value (`None` when null): a
+/// declared field, so `exists` when it has a value and `is_null` when it has none; comparisons
+/// as [`json_matches`].
+fn json_field_matches(value: Option<&JsonValue>, cond: &JsonCond) -> bool {
+    match cond {
+        JsonCond::Exists => value.is_some(),
+        JsonCond::IsNull => value.is_none(),
+        _ => json_matches(value, cond),
+    }
+}
+
+/// The JSON semantics of one condition on a possibly absent dynamic key.
 fn json_matches(value: Option<&JsonValue>, cond: &JsonCond) -> bool {
     let scalar = || {
         value
@@ -965,7 +980,7 @@ fn row_matches(
                     .and_then(|field| record.fields.get(field.name()))
                     .filter(|value| !value.is_null())
                     .map(Value::to_json);
-                json_matches(value.as_ref(), cond)
+                json_field_matches(value.as_ref(), cond)
             }
         },
         Node::Key(cond) => cond.holds(&[pk_key(&record.pk)]),
@@ -1131,6 +1146,15 @@ mod tests {
         assert!(!matches(FilterExpr::ne("active", true)));
         assert!(matches(FilterExpr::negate(FilterExpr::eq("active", true))));
         assert!(matches(FilterExpr::gt("meta", Value::Int64(3))));
+        // A declared json field is null when it has no value, like any declared field.
+        assert!(matches(FilterExpr::exists("meta")));
+        assert!(!matches(FilterExpr::is_null("meta")));
+        let without_meta = Record::new(8_i64);
+        let compiled = |filter: FilterExpr| {
+            CompiledFilter::compile(&schema, &filter).expect("filter should compile")
+        };
+        assert!(compiled(FilterExpr::is_null("meta")).matches_record(&without_meta));
+        assert!(!compiled(FilterExpr::exists("meta")).matches_record(&without_meta));
         assert!(!matches(FilterExpr::range(
             "stock",
             RangeBounds {
