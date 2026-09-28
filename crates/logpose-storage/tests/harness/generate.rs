@@ -28,7 +28,7 @@ const DYNAMIC: [&str; 3] = ["x", "y", "z"];
 /// Names for added and renamed fields.
 const NAMES: [&str; 6] = ["x", "y", "z", "p", "q", "r"];
 /// String values, chosen so that bytewise order and prefixes matter.
-const WORDS: [&str; 5] = ["a", "ab", "b", "ba", "c"];
+const WORDS: [&str; 5] = ["a", "ab", "b", "bc", "c"];
 
 pub fn key(index: u64) -> PrimaryKey {
     PrimaryKey::from(format!("k{index:02}").as_str())
