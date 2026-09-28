@@ -2390,15 +2390,13 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
-/// Config with TTLs short enough that the coordination loop ticks every second, and its
-/// storage root's guard: keep the guard alive for as long as a node runs on the configuration.
 /// A create that stopped after writing its pending metadata (its process died before the
-/// local collection) is rolled back by the node once it leads: the metadata is removed and the
-/// name can be created again.
+/// local collection) is rolled back by its node once the node registers: the metadata is
+/// removed and the name can be created again.
 #[tokio::test]
-async fn etcd_leader_rolls_back_a_pending_create_without_local_state() {
+async fn etcd_node_rolls_back_a_pending_create_without_local_state() {
     let Some(endpoints) =
-        etcd_endpoints_or_skip("etcd_leader_rolls_back_a_pending_create_without_local_state").await
+        etcd_endpoints_or_skip("etcd_node_rolls_back_a_pending_create_without_local_state").await
     else {
         return;
     };
@@ -2501,13 +2499,14 @@ async fn etcd_leader_rolls_back_a_pending_create_without_local_state() {
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
-/// A create that stopped after its local collection, before marking the metadata ready, is
-/// rolled forward when the node gains leadership: here the node loses its leadership lease
-/// and wins the leadership back.
+/// A create that stopped after its local collection, before marking the metadata ready (here,
+/// because its node lost the leadership that fences that step), is rolled forward by its node
+/// while another node leads: only the node a collection is placed on sees its local state.
+/// Re-registering the node's membership starts a pass at once.
 #[tokio::test]
-async fn etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership() {
+async fn etcd_follower_rolls_forward_its_pending_create_while_another_node_leads() {
     let Some(endpoints) = etcd_endpoints_or_skip(
-        "etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership",
+        "etcd_follower_rolls_forward_its_pending_create_while_another_node_leads",
     )
     .await
     else {
@@ -2524,7 +2523,7 @@ async fn etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership() {
         cluster_name,
     );
     let state = Arc::new(AppState::new(config));
-    let (_, leadership_lease_id) = wait_for_local_leadership(&state).await;
+    let (membership_lease_id, _) = wait_for_local_leadership(&state).await;
     let created = state
         .control
         .create_collection(CreateCollectionRequest::new(
@@ -2535,12 +2534,37 @@ async fn etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership() {
         .await
         .expect("collection should be created");
 
-    // Put the metadata back in the state the create left it in before its last step.
-    let descriptor_key =
-        format!("{key_prefix}/clusters/{cluster_name}/collections/default/documents/descriptor");
+    // Another node takes the leadership: its record replaces node-a's on a lease of its own.
     let mut client = Client::connect(endpoints.clone(), None)
         .await
         .expect("etcd client should connect");
+    let other_lease = client
+        .lease_grant(60, None)
+        .await
+        .expect("etcd should grant a lease")
+        .id();
+    client
+        .put(
+            format!("{key_prefix}/clusters/{cluster_name}/controllers/leader"),
+            serde_json::to_string(&LeadershipRecord {
+                node_id: "node-b".to_owned(),
+                lease_id: other_lease,
+            })
+            .expect("leadership record should serialize"),
+            Some(PutOptions::new().with_lease(other_lease)),
+        )
+        .await
+        .expect("the leader key should be replaced");
+    wait_for_runtime_status(&state, |status| {
+        status.coordination.as_ref().is_some_and(|coordination| {
+            !coordination.is_local_leader && coordination.leader_node.as_deref() == Some("node-b")
+        })
+    })
+    .await;
+
+    // Put the metadata back in the state the create left it in before its last step.
+    let descriptor_key =
+        format!("{key_prefix}/clusters/{cluster_name}/collections/default/documents/descriptor");
     let response = client
         .get(descriptor_key.clone(), None)
         .await
@@ -2567,25 +2591,36 @@ async fn etcd_leader_rolls_forward_a_pending_create_on_regaining_leadership() {
         "{error:?}"
     );
 
-    revoke_lease_out_of_band(&endpoints, leadership_lease_id).await;
+    revoke_lease_out_of_band(&endpoints, membership_lease_id).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     let described = loop {
         match state.get_collection("documents").await {
             Ok(described) => break described,
             Err(error) => assert!(
                 Instant::now() < deadline,
-                "timed out waiting for the leader to roll the pending create forward: {error}"
+                "timed out waiting for the node to roll the pending create forward: {error}"
             ),
         }
         sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(described.collection_id, created.collection_id);
-    let (_, regained_lease_id) = wait_for_local_leadership(&state).await;
-    assert_ne!(regained_lease_id, leadership_lease_id);
+    let status = state
+        .control
+        .runtime_status()
+        .await
+        .expect("runtime status should load");
+    let coordination = status
+        .coordination
+        .expect("coordination state should be present");
+    assert!(!coordination.is_local_leader, "{coordination:?}");
+    assert_eq!(coordination.leader_node.as_deref(), Some("node-b"));
 
+    let _ = client.lease_revoke(other_lease).await;
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
 
+/// Config with TTLs short enough that the coordination loop ticks every second, and its
+/// storage root's guard: keep the guard alive for as long as a node runs on the configuration.
 fn short_ttl_config(
     node_name: &str,
     temp_label: &str,

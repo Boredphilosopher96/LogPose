@@ -4,12 +4,14 @@
 //! A create writes pending metadata, creates the local collection, and marks the metadata
 //! ready. It runs as a task of its own, so a caller that stops waiting (a client that hung up,
 //! a request timeout) no longer leaves it half done. A create can still stop between its steps
-//! when its process dies or etcd fails after the local create. Its metadata then stays pending,
-//! and every node describes the collection as needing reconciliation.
+//! when its process dies, etcd fails after the local create, or its node loses the leadership
+//! that fences the create's last step. Its metadata then stays pending, and every node
+//! describes the collection as needing reconciliation.
 //!
-//! [`EtcdCollectionCatalog::reconcile_pending`] resolves such metadata on the leader, for the
-//! collections placed on the leader itself (a create places the collection on the leader that
-//! runs it, and only that node can see whether the local step happened):
+//! [`EtcdCollectionCatalog::reconcile_pending`] resolves such metadata on the node the
+//! collection is placed on (a create places the collection on the leader that runs it, and
+//! only that node can see whether the local step happened), whether or not that node still
+//! leads:
 //!
 //! - the local collection exists, opened, with the pending collection id: the create is rolled
 //!   forward (the metadata is marked ready);
@@ -17,9 +19,14 @@
 //!   dropped (the create was never acknowledged, so no write reached it), then the metadata is
 //!   removed.
 //!
-//! Both changes are fenced by the leader's lease and guarded by the metadata's mod revisions,
-//! so a pass never races a create or drop on another node or a newer leader. Pending metadata
-//! of a create or drop still in flight on this node, or placed on another node, is left alone.
+//! Both changes are fenced by the node's membership lease (so a process that is no longer the
+//! registered incarnation of the node changes nothing) and guarded by the metadata's mod
+//! revisions, so a pass never races a create, drop, or placement change made elsewhere. The
+//! leader's lease is not needed: no other node acts on pending metadata placed on this one,
+//! since describes, drops, and creates of its name all refuse it while it is pending. Pending
+//! metadata of a create or drop still in flight on this node, or placed on another node, is
+//! left alone. Pending metadata placed on a node that never registers again stays pending
+//! until an operator removes its keys.
 
 use super::*;
 use std::{future::Future, sync::PoisonError};
@@ -112,24 +119,22 @@ impl EtcdCollectionCatalog {
             .contains_key(name)
     }
 
-    /// Resolve the pending metadata of creates that stopped between their steps, as the leader
-    /// `leader_fence` names. Each one placed on this node is rolled forward (marked ready) when
-    /// the local collection exists, opened, with the pending collection id, and rolled back
+    /// Resolve the pending metadata of creates that stopped between their steps and are placed
+    /// on the node `member` names, this one. Each is rolled forward (marked ready) when the
+    /// local collection exists, opened, with the pending collection id, and rolled back
     /// otherwise: a local collection of that id that failed to open is dropped (the create was
-    /// never acknowledged, so no write reached it), then the metadata is removed. Both changes
-    /// are fenced by the leader's lease and guarded by the metadata's mod revisions. Pending
-    /// metadata placed on another node, whose local state only that node sees, and that of a
-    /// create or drop in flight on this node are left alone. The control plane runs this when
-    /// the node gains leadership and periodically while it leads.
+    /// never acknowledged, so no write reached it), then the metadata is removed. The etcd
+    /// changes are fenced by the node's membership lease and guarded by the metadata's mod
+    /// revisions; the node need not lead. Pending metadata placed on another node, whose local
+    /// state only that node sees, and that of a create or drop in flight on this node are left
+    /// alone. The coordination loop runs this when the node registers its membership and
+    /// periodically while it stays registered.
     ///
     /// # Errors
     ///
     /// Etcd failures and undecodable metadata while listing it. A collection that fails to
     /// resolve is reported in [`ReconcileReport::failed`] instead.
-    pub async fn reconcile_pending(
-        &self,
-        leader_fence: &LeadershipFence,
-    ) -> Result<ReconcileReport> {
+    pub async fn reconcile_pending(&self, member: &MembershipFence) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let listed = self
             .etcd
@@ -146,12 +151,12 @@ impl EtcdCollectionCatalog {
             let placed_here = metadata
                 .assignment
                 .as_ref()
-                .is_some_and(|assignment| assignment.assigned_node == leader_fence.node_id);
+                .is_some_and(|assignment| assignment.assigned_node == member.node_id);
             if !placed_here || self.in_flight(&name) {
                 report.skipped.push(name);
                 continue;
             }
-            match self.resolve_pending(&metadata, leader_fence).await {
+            match self.resolve_pending(&metadata, member).await {
                 Ok(Resolution::RolledForward) => {
                     tracing::info!(collection = %name, "rolled a pending collection create forward");
                     report.rolled_forward.push(name);
@@ -176,7 +181,7 @@ impl EtcdCollectionCatalog {
     async fn resolve_pending(
         &self,
         metadata: &CollectionMetadata,
-        leader_fence: &LeadershipFence,
+        member: &MembershipFence,
     ) -> Result<Resolution> {
         let reference = collection_ref_from_lookup_name(&metadata.name);
         let collection_id = &metadata.stored.descriptor.collection_id;
@@ -187,7 +192,7 @@ impl EtcdCollectionCatalog {
                         &metadata.name,
                         &metadata.stored.descriptor,
                         metadata.revision,
-                        leader_fence,
+                        Fence::Member(member),
                     )
                     .await?;
                 return Ok(Resolution::RolledForward);
@@ -197,7 +202,10 @@ impl EtcdCollectionCatalog {
             Ok(_) | Err(LogPoseError::NotFound { .. }) => {}
             Err(error) => {
                 // A local collection of this name that failed to open. When it is this
-                // create's, it goes with the rollback.
+                // create's, it goes with the rollback. Its drop is a local decision about a
+                // collection placed here that was never acknowledged, so it is not fenced; a
+                // failed metadata removal after it leaves pending metadata without a local
+                // collection, which the next pass rolls back.
                 let failed_is_ours = self
                     .engine
                     .list_collections()
@@ -216,7 +224,7 @@ impl EtcdCollectionCatalog {
             .delete_collection_metadata_if_revision_matches(
                 &metadata.name,
                 metadata.revision,
-                Some(leader_fence),
+                Some(Fence::Member(member)),
             )
             .await?;
         Ok(Resolution::RolledBack)

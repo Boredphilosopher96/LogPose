@@ -42,7 +42,7 @@ use logpose_storage::{
 };
 use logpose_storage_etcd::{
     EtcdCollectionCatalog, EtcdCoordinationClient, LeadershipLease, LeadershipRecord,
-    LeaseKeepAlive, MembershipRecord, ShardOwnership,
+    LeaseKeepAlive, MembershipFence, MembershipRecord, ShardOwnership,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
@@ -102,9 +102,10 @@ impl Drop for EtcdRuntime {
 }
 
 impl CoordinationRuntime {
-    /// Start the coordination loop with etcd metadata. While the node leads, the loop has
-    /// `reconciler` resolve pending collection metadata; it holds the catalog weakly, so the
-    /// loop never keeps the engine open after the service is dropped.
+    /// Start the coordination loop with etcd metadata. While the node is a registered member,
+    /// the loop has `reconciler` resolve the pending metadata of the collections placed on it;
+    /// it holds the catalog weakly, so the loop never keeps the engine open after the service
+    /// is dropped.
     fn new(config: &LogPoseConfig, reconciler: Option<Weak<EtcdCollectionCatalog>>) -> Self {
         if config.metadata.backend != MetadataBackend::Etcd {
             return Self::Local;
@@ -164,24 +165,34 @@ fn coordination_tick(config: &logpose_types::EtcdMetadataConfig) -> Duration {
     Duration::from_secs((ttl_secs / 3).max(1))
 }
 
-/// How often a leader resolves pending collection metadata after the pass it runs on gaining
-/// leadership.
+/// How often a node resolves the pending metadata of the collections placed on it, after the
+/// pass it runs on registering its membership.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// When the leader resolves pending collection metadata (creates that stopped between their
-/// steps): once it gains leadership, then every [`RECONCILE_INTERVAL`] while it leads. A pass
-/// runs as a task of its own, one at a time, so it never delays the lease keep-alives.
+/// When a node resolves the pending metadata of the collections placed on it (creates that
+/// stopped between their steps): once it registers its membership, then every
+/// [`RECONCILE_INTERVAL`] while it stays registered, whether or not it leads. Only the node a
+/// collection is placed on sees whether its local step happened, so a create interrupted by a
+/// lost leadership converges while another node leads. A pass runs as a task of its own, one
+/// at a time, so it never delays the lease keep-alives.
 #[derive(Default)]
 struct Reconciliation {
-    /// The leadership lease the last pass ran under; another lease is newly gained leadership.
+    /// The membership lease the last pass ran under; another lease is a new registration.
     lease_id: Option<i64>,
     last_started: Option<Instant>,
     running: Option<JoinHandle<()>>,
 }
 
 impl Reconciliation {
-    /// Start a pass if one is due and `fence`, the node's current leadership, is set.
-    fn tick(&mut self, reconciler: &Weak<EtcdCollectionCatalog>, fence: Option<LeadershipFence>) {
+    /// Stop the pass that is running, if any.
+    fn stop(&mut self) {
+        if let Some(pass) = self.running.take() {
+            pass.abort();
+        }
+    }
+
+    /// Start a pass if one is due and `fence`, the node's current membership, is set.
+    fn tick(&mut self, reconciler: &Weak<EtcdCollectionCatalog>, fence: Option<MembershipFence>) {
         let Some(fence) = fence else {
             self.lease_id = None;
             return;
@@ -220,8 +231,9 @@ impl Reconciliation {
 /// longer backs (a dead lease, or a membership or leader key that is missing
 /// or owned by someone else), and re-acquires what is missing in the same
 /// tick. Losing membership also gives up leadership, because a node that is
-/// not a registered member must not lead. While the node leads, it has
-/// `reconciler` resolve pending collection metadata (see [`Reconciliation`]).
+/// not a registered member must not lead. While the node is a member, it has
+/// `reconciler` resolve the pending metadata of the collections placed on it
+/// (see [`Reconciliation`]).
 async fn run_coordination_loop(
     client: EtcdCoordinationClient,
     snapshot: Arc<RwLock<CoordinationStatus>>,
@@ -343,18 +355,18 @@ async fn run_coordination_loop(
             pending_error,
         );
         if let Some(reconciler) = &reconciler {
-            let fence = coordination_read(&snapshot)
-                .is_local_leader
-                .then_some(leadership_lease.as_ref())
-                .flatten()
-                .map(|lease| LeadershipFence {
-                    node_id: node_name.clone(),
-                    lease_id: lease.lease_id,
-                });
+            let fence = membership_lease_id.map(|lease_id| MembershipFence {
+                node_id: node_name.clone(),
+                lease_id,
+            });
             reconciliation.tick(reconciler, fence);
         }
     }
 
+    // A pass still running holds the catalog, and so the engine, open. Stopping it between its
+    // steps is safe: each etcd change is one guarded transaction, and whatever it leaves
+    // pending the next pass resolves.
+    reconciliation.stop();
     if let Some(lease) = leadership_lease.take() {
         let _ = client.revoke_lease(lease.lease_id).await;
     }

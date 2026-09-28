@@ -18,11 +18,13 @@ const ETCD_ENDPOINTS_ENV: &str = "LOGPOSE_TEST_ETCD_ENDPOINTS";
 /// The node the tests' catalog runs on, which leads.
 const NODE: &str = "node-a";
 
-/// A catalog over a fresh engine and a fresh etcd key prefix, and the leadership of `NODE`.
+/// A catalog over a fresh engine and a fresh etcd key prefix, the membership of `NODE`, and
+/// its leadership.
 struct Fixture {
     catalog: EtcdCollectionCatalog,
     coordination: EtcdCoordinationClient,
     fence: LeadershipFence,
+    member: MembershipFence,
     endpoints: Vec<String>,
     key_prefix: String,
     /// Last, so the engine inside `catalog` closes before its root is removed.
@@ -58,8 +60,12 @@ impl Fixture {
             EtcdCollectionCatalog::new(engine, config.clone()).expect("catalog should build");
         let coordination =
             EtcdCoordinationClient::new(config).expect("coordination client should build");
-        // Creates and reconciliation are fenced by the leader's lease: take the leadership of
-        // this fresh prefix before anything else.
+        // Reconciliation is fenced by the node's membership lease, and creates by the leader's:
+        // register the node and take the leadership of this fresh prefix before anything else.
+        let membership = coordination
+            .register_membership(NODE, NodeRole::Combined)
+            .await
+            .expect("etcd should register the node");
         let lease = coordination
             .try_acquire_leadership(NODE)
             .await
@@ -71,6 +77,10 @@ impl Fixture {
             fence: LeadershipFence {
                 node_id: NODE.to_owned(),
                 lease_id: lease.lease_id,
+            },
+            member: MembershipFence {
+                node_id: NODE.to_owned(),
+                lease_id: membership.lease_id,
             },
             endpoints,
             key_prefix,
@@ -116,9 +126,10 @@ impl Fixture {
             .collection(&CollectionRef::new_default(name))
     }
 
-    /// Give up the leadership and remove the test's keys.
+    /// Give up the leadership and the membership and remove the test's keys.
     async fn finish(self) {
         let _ = self.coordination.revoke_lease(self.fence.lease_id).await;
+        let _ = self.coordination.revoke_lease(self.member.lease_id).await;
         if let Ok(mut client) = Client::connect(self.endpoints.clone(), None).await {
             let _ = client
                 .delete(
@@ -210,7 +221,7 @@ async fn a_drop_completes_after_its_caller_stops_waiting() {
 
 /// A create that stopped after writing its pending metadata, before its local collection (its
 /// process died), is rolled back by the leader: the metadata is removed and the name can be
-/// created again. A pass under a fence that is not the leader's changes nothing.
+/// created again. A pass under a fence that is not the node's membership changes nothing.
 #[tokio::test]
 async fn the_reconciler_rolls_back_a_create_stopped_before_its_local_collection() {
     let Some(fixture) = Fixture::new("roll-back").await else {
@@ -228,9 +239,9 @@ async fn the_reconciler_rolls_back_a_create_stopped_before_its_local_collection(
     assert!(fixture.pending("documents").await);
     assert!(fixture.local("documents").is_err());
 
-    let stale = LeadershipFence {
+    let stale = MembershipFence {
         node_id: NODE.to_owned(),
-        lease_id: fixture.fence.lease_id + 1,
+        lease_id: fixture.member.lease_id + 1,
     };
     let report = fixture
         .catalog
@@ -242,7 +253,7 @@ async fn the_reconciler_rolls_back_a_create_stopped_before_its_local_collection(
 
     let report = fixture
         .catalog
-        .reconcile_pending(&fixture.fence)
+        .reconcile_pending(&fixture.member)
         .await
         .expect("the pass runs");
     assert_eq!(
@@ -286,7 +297,7 @@ async fn the_reconciler_rolls_forward_a_create_stopped_after_its_local_collectio
 
     let report = fixture
         .catalog
-        .reconcile_pending(&fixture.fence)
+        .reconcile_pending(&fixture.member)
         .await
         .expect("the pass runs");
     assert_eq!(
@@ -306,11 +317,73 @@ async fn the_reconciler_rolls_forward_a_create_stopped_after_its_local_collectio
     assert_eq!(
         fixture
             .catalog
-            .reconcile_pending(&fixture.fence)
+            .reconcile_pending(&fixture.member)
             .await
             .expect("the pass runs"),
         ReconcileReport::default()
     );
+    fixture.finish().await;
+}
+
+/// A create whose node loses the leadership before its last step cannot mark its metadata
+/// ready: the step is fenced by the leader's lease. The node rolls it forward while another
+/// node leads, since only it sees that the local collection exists.
+#[tokio::test]
+async fn the_reconciler_rolls_forward_a_create_whose_node_lost_the_leadership() {
+    let Some(fixture) = Fixture::new("lost-leadership").await else {
+        return;
+    };
+    let (reached, resume) = fixture.catalog.interrupt_at(Step::LocalChanged);
+    let caller = tokio::spawn(fixture.create("documents"));
+    reached.await.expect("the create reaches the step");
+    fixture
+        .coordination
+        .revoke_lease(fixture.fence.lease_id)
+        .await
+        .expect("the leadership is given up");
+    let other_leader = fixture
+        .coordination
+        .try_acquire_leadership("node-b")
+        .await
+        .expect("etcd should grant the leadership")
+        .expect("the leadership is vacant");
+    resume.send(true).expect("the create waits to resume");
+    let error = caller
+        .await
+        .expect("the caller runs")
+        .expect_err("the create lost its fence");
+    assert!(
+        matches!(error, LogPoseError::ReconciliationRequired { .. }),
+        "{error:?}"
+    );
+    fixture.settle().await;
+    assert!(fixture.pending("documents").await);
+    let local = fixture
+        .local("documents")
+        .expect("the local collection exists");
+
+    let report = fixture
+        .catalog
+        .reconcile_pending(&fixture.member)
+        .await
+        .expect("the pass runs");
+    assert_eq!(
+        report,
+        ReconcileReport {
+            rolled_forward: vec!["default/documents".to_owned()],
+            ..ReconcileReport::default()
+        }
+    );
+    let described = fixture
+        .catalog
+        .describe("documents")
+        .await
+        .expect("the collection is ready");
+    assert_eq!(described.collection_id, local.meta().id);
+    let _ = fixture
+        .coordination
+        .revoke_lease(other_leader.lease_id)
+        .await;
     fixture.finish().await;
 }
 
@@ -348,7 +421,7 @@ async fn the_reconciler_leaves_creates_in_flight_and_placed_elsewhere() {
 
     let report = fixture
         .catalog
-        .reconcile_pending(&fixture.fence)
+        .reconcile_pending(&fixture.member)
         .await
         .expect("the pass runs");
     assert_eq!(

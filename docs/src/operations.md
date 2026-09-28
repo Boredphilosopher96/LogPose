@@ -89,13 +89,16 @@ source for collection descriptors and assignments; each node's storage engine
 holds the data of the collections it serves, and collection creates and drops
 are fenced by the control-plane leader's lease. A create or drop completes even
 when its client disconnects. A create interrupted between its steps (its process
-died, or etcd failed after the local create) answers describes with
-`RECONCILIATION_REQUIRED` until the leader resolves it, which needs no operator:
-when the leader gains leadership, and every 30 seconds while it leads, it marks
-the create ready if its engine holds the collection and rolls it back otherwise.
-Only the node a pending create is placed on can resolve it, so one placed on a
-node that no longer leads waits until that node leads again. Collections created before
-the etcd metadata path is enabled are not auto-backfilled from local
+died, etcd failed after the local create, or its node lost the leadership) answers
+describes with
+`RECONCILIATION_REQUIRED` until the node it is placed on resolves it, which
+needs no operator: when that node registers with etcd, and every 30 seconds
+while it stays registered, whether or not it leads, it marks the create ready if
+its engine holds the collection and rolls it back otherwise. Only that node can
+resolve it, so a create placed on a node that never comes back stays pending,
+and its name cannot be created again, until an operator deletes its keys under
+`<key_prefix>/clusters/<cluster_name>/collections/<database>/<collection>/`.
+Collections created before the etcd metadata path is enabled are not auto-backfilled from local
 `placement.json` files; migrate them by recreating them through the control
 plane or by explicitly backfilling metadata before flipping an existing storage
 root to the etcd backend.
