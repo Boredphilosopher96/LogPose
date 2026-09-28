@@ -49,5 +49,7 @@ jobs:
           echo "etcd did not become ready at ${LOGPOSE_TEST_ETCD_ENDPOINTS}" >&2
           exit 1
 
+      # The storage harness v2 suites (randomized model checking, crash equivalence, job
+      # interleavings, stress) run in the Randomized Storage workflow, time-bounded.
       - name: Run workspace tests
-        run: cargo test --workspace -- --skip randomized_storage_scenarios_match_the_expected_model --skip randomized_service_scenarios_match_the_expected_model --skip diagnostics_status_snapshot_contract --skip diagnostics_placement_snapshot_contract --skip query_and_inspect_snapshot_contract
+        run: cargo test --workspace -- --skip random::random_actions --skip crash::every_crash_point --skip interleave::every_ --skip stress::concurrent_writers --skip randomized_service_scenarios_match_the_expected_model --skip diagnostics_status_snapshot_contract --skip diagnostics_placement_snapshot_contract --skip query_and_inspect_snapshot_contract
