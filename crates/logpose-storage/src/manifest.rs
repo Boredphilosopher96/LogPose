@@ -13,7 +13,9 @@
 //!
 //! Each [`ManifestSegment`] describes one segment v2 file (`segments/<unit:08x>.seg`): its
 //! length and footer CRC (checked when the segment is opened), row count, sequence range, size
-//! tier, per-field summaries, and the deletion-vector file generation in force for it, if any.
+//! tier, per-field summaries, the deletion-vector file generation in force for it, if any, and
+//! its index sidecar (`segments/<unit:08x>.idx.<sidecar unit:08x>`, the vector graphs an
+//! index-build job added after the segment was written), if its build ran.
 
 use crate::{durable_fs::read_file, fs_util::crash_point};
 use logpose_types::{
@@ -26,8 +28,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The manifest format this build writes and reads.
-pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 2;
+/// The manifest format this build writes and reads. Version 3 added index sidecars.
+pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 3;
 /// First bytes of every manifest file.
 const MANIFEST_MAGIC: &[u8; 8] = b"LPMANIF2";
 /// Bytes before the payload.
@@ -88,6 +90,10 @@ pub(crate) struct ManifestSegment {
     pub(crate) tier: u8,
     /// The deletion vector file in force, if the segment had deleted rows at a checkpoint.
     pub(crate) dv: Option<DvRef>,
+    /// The segment's index sidecar, once its index build ran (it may hold no graph, when no
+    /// field had enough distinct vectors). `None` until then: the segment is searched without a
+    /// graph, and the writer plans the build.
+    pub(crate) index: Option<IndexRef>,
     /// Per vector field summary.
     pub(crate) vectors: Vec<VectorSummary>,
     /// Per scalar field zone map.
@@ -112,6 +118,16 @@ pub(crate) struct DvRef {
     pub(crate) generation: u64,
     pub(crate) cardinality: u32,
     pub(crate) covered_seq_no: SeqNo,
+}
+
+/// An index sidecar named by the manifest: `segments/<segment:08x>.idx.<unit:08x>`, where
+/// `unit` is the unit id the index-build job that wrote it was allocated (so no attempt ever
+/// reuses a name). Its length and footer CRC are checked when the segment is opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct IndexRef {
+    pub(crate) unit: UnitId,
+    pub(crate) file_len: u64,
+    pub(crate) footer_crc: u32,
 }
 
 /// Per vector field summary of a segment.
@@ -203,6 +219,11 @@ impl Manifest {
                         "generation": dv.generation,
                         "cardinality": dv.cardinality,
                         "covered_seq_no": dv.covered_seq_no,
+                    })),
+                    "index": segment.index.map(|index| serde_json::json!({
+                        "unit": index.unit.to_string(),
+                        "file_len": index.file_len,
+                        "footer_crc": index.footer_crc,
                     })),
                     "vectors": segment.vectors.iter().map(|vector| serde_json::json!({
                         "field_id": vector.field_id,

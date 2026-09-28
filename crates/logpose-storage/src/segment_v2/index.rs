@@ -9,9 +9,13 @@
 //!   asks for them (`logpose-index` scalar payloads);
 //! - `VectorSq8` for a vector field with at least `sq8_min_rows` non-null
 //!   vectors (`logpose-index` SQ8 params plus one code per row, zero codes
-//!   for null rows);
-//! - `VectorGraph` for a vector field with at least `graph_min_rows`
-//!   distinct non-null vectors.
+//!   for null rows).
+//!
+//! Both are one or two passes over the rows, so a flush stays bounded by its
+//! memtable's size. `VectorGraph` sections are not built with the segment:
+//! the engine's index-build job reads a written segment's vectors back and
+//! builds each field's graph with [`build_graph_section`] into an index
+//! sidecar ([`write_index_sidecar`](super::write_index_sidecar)).
 //!
 //! The graph is built over *distinct* vectors, not rows: exact duplicates
 //! would otherwise collapse into mutually unreachable islands (with 100
@@ -44,13 +48,13 @@ use super::{
     vector::VectorBuf,
 };
 use logpose_index::{
-    graph::{F32Metric, F32Vectors, HnswGraph, HnswParams},
+    graph::{F32Metric, F32Vectors, GraphError, HnswGraph, HnswParams},
     scalar::{InvertedIndex, KeyKind, ScalarIndexBuilder, ScalarKey, SortedIndex},
     sq8::{Sq8Params, Sq8Section, write_codes_section},
 };
 use logpose_types::{
     DistanceMetric,
-    schema::{ElementType, FieldType},
+    schema::{ElementType, FieldId, FieldType},
 };
 use std::collections::HashMap;
 
@@ -65,9 +69,11 @@ const GRAPH_IDENTITY: u32 = 1;
 /// Which index sections a segment build writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexPolicy {
-    /// Write a `VectorGraph` when a vector field has at least this many
-    /// distinct non-null vectors; smaller segments are searched exactly.
-    /// Default 20,000.
+    /// Build a segment's `VectorGraph` sidecar in the background as soon as
+    /// a vector field has at least this many non-null vectors (and SQ8
+    /// codes). Smaller segments get theirs once the collection is quiet (see
+    /// `CompactionConfig::quiet_after`) or an explicit compaction settles it;
+    /// until then they are searched by SQ8 scan. Default 20,000.
     pub graph_min_rows: u32,
     /// Write `VectorSq8` codes when a vector field has at least this many
     /// non-null vectors. Default 1,024.
@@ -161,14 +167,10 @@ impl SegmentBuilder {
                 }
             }
             for vector in vectors {
-                let Some(field) = schema
-                    .vectors()
-                    .iter()
-                    .find(|field| field.id == vector.field)
-                else {
+                if !schema.vectors().iter().any(|field| field.id == vector.field) {
                     continue;
-                };
-                sections.extend(vector_sections(vector, field.metric, policy)?);
+                }
+                sections.extend(sq8_section(vector, policy)?);
             }
         }
         let mut report = IndexBuildReport::default();
@@ -186,7 +188,7 @@ fn encode(error: impl std::fmt::Display) -> SegmentError {
 
 fn section(
     kind: IndexSectionKind,
-    field: logpose_types::schema::FieldId,
+    field: FieldId,
     aux32: u32,
     aux64: u64,
     payload: Vec<u8>,
@@ -273,110 +275,172 @@ fn scalar_builder(column: &ColumnBuf) -> Result<Option<ScalarIndexBuilder>, Segm
     Ok(Some(builder))
 }
 
-/// The SQ8 and graph sections of one vector field.
-fn vector_sections(
+/// The SQ8 section of one vector field, or `None` below `sq8_min_rows` non-null vectors or
+/// for a range too wide for SQ8 (searches then use the f32 vectors). The bounds are found in
+/// one pass over the builder's bytes and the codes in a second, so the build holds the codes
+/// and their encoded payload, not an f32 copy of the vectors.
+fn sq8_section(
     vector: &VectorBuf,
-    metric: DistanceMetric,
     policy: &IndexPolicy,
-) -> Result<Vec<IndexSection>, SegmentError> {
+) -> Result<Option<IndexSection>, SegmentError> {
     let dim = vector.dim as usize;
     let rows = vector.rows;
     let non_null = u64::from(rows).saturating_sub(vector.nulls.len());
-    let mut sections = Vec::new();
-    if non_null == 0 || dim == 0 {
-        return Ok(sections);
+    if non_null == 0 || dim == 0 || non_null < u64::from(policy.sq8_min_rows) {
+        return Ok(None);
     }
     let stride = dim * 4;
-    let row_bytes = |row: u32| &vector.data[row as usize * stride..(row as usize + 1) * stride];
-    let row_f32s = |row: u32| -> Vec<f32> {
-        row_bytes(row)
+    let live_rows = || (0..rows).filter(|row| !vector.nulls.contains(*row));
+    let values = |row: u32| {
+        vector.data[row as usize * stride..(row as usize + 1) * stride]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
     };
-    let live_rows = || (0..rows).filter(|row| !vector.nulls.contains(*row));
-
-    let mut has_codes = false;
-    if non_null >= u64::from(policy.sq8_min_rows) {
-        let mut training = Vec::with_capacity(non_null as usize * dim);
-        for row in live_rows() {
-            training.extend(row_f32s(row));
-        }
-        // A range too wide for f32 (or any other training failure) leaves the field
-        // without codes; searches then use the f32 vectors.
-        if let Ok(params) = Sq8Params::train(&training, dim) {
-            drop(training);
-            let mut codes = vec![0_u8; rows as usize * dim];
-            let mut ok = true;
-            for row in live_rows() {
-                let start = row as usize * dim;
-                if params
-                    .encode_into(&row_f32s(row), &mut codes[start..start + dim])
-                    .is_err()
-                {
-                    ok = false;
-                    break;
-                }
+    let mut min = vec![f32::INFINITY; dim];
+    let mut max = vec![f32::NEG_INFINITY; dim];
+    for row in live_rows() {
+        for ((low, high), value) in min.iter_mut().zip(max.iter_mut()).zip(values(row)) {
+            if !value.is_finite() {
+                return Ok(None);
             }
-            if ok {
-                has_codes = true;
-                let mut payload = Vec::new();
-                write_codes_section(&params, u64::from(rows), &codes, &mut payload)
-                    .map_err(encode)?;
-                sections.push(section(
-                    IndexSectionKind::VectorSq8,
-                    vector.field,
-                    vector.dim,
-                    u64::from(rows),
-                    payload,
-                ));
-            }
+            *low = low.min(value);
+            *high = high.max(value);
         }
     }
+    // A range too wide for f32 leaves the field without codes.
+    let Ok(params) = Sq8Params::from_bounds(min, max) else {
+        return Ok(None);
+    };
+    let mut codes = vec![0_u8; rows as usize * dim];
+    let mut row_values = Vec::with_capacity(dim);
+    for row in live_rows() {
+        row_values.clear();
+        row_values.extend(values(row));
+        let start = row as usize * dim;
+        if params
+            .encode_into(&row_values, &mut codes[start..start + dim])
+            .is_err()
+        {
+            return Ok(None);
+        }
+    }
+    let mut payload = Vec::new();
+    write_codes_section(&params, u64::from(rows), &codes, &mut payload).map_err(encode)?;
+    Ok(Some(section(
+        IndexSectionKind::VectorSq8,
+        vector.field,
+        vector.dim,
+        u64::from(rows),
+        payload,
+    )))
+}
 
-    // Walks traverse SQ8 codes, so a field without codes (a range too wide for them) gets no
-    // graph either: it would never be walked, and inspect would report it as `hnsw`.
-    if has_codes && non_null >= u64::from(policy.graph_min_rows) {
-        // One node per distinct vector, in order of first appearance.
+/// The input of one field's graph build: every row's vector, row-major, as a segment stores
+/// it (zeros for null rows).
+#[derive(Debug)]
+pub struct GraphInput {
+    /// The vector field.
+    pub field: FieldId,
+    /// Its dimension.
+    pub dim: u32,
+    /// Its metric.
+    pub metric: DistanceMetric,
+    /// Rows in the segment.
+    pub rows: u32,
+    /// `rows * dim` values.
+    pub values: Vec<f32>,
+    /// Rows without a vector; they are in no graph node.
+    pub nulls: roaring::RoaringBitmap,
+}
+
+/// Build the `VectorGraph` section of one field of a segment: an HNSW graph over its distinct
+/// non-null vectors, wrapped with the node-to-rows map (see the module docs). `None` when the
+/// field has fewer than `min_nodes` distinct vectors (at least two). The graph builds on the
+/// current `rayon` pool (the engine installs its maintenance pool) and polls `cancelled`
+/// before every insert.
+///
+/// The build holds `input.values` (one f32 copy of the field), a map from each distinct vector
+/// to its rows while it deduplicates, and the graph's link lists; with duplicates it moves the
+/// distinct vectors into a second, smaller buffer and drops the first.
+///
+/// # Errors
+///
+/// [`SegmentError::Cancelled`] once `cancelled` returned `true`, and
+/// [`SegmentError::Encode`] if the graph cannot be built or encoded.
+pub fn build_graph_section(
+    input: GraphInput,
+    params: HnswParams,
+    min_nodes: u32,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<IndexSection>, SegmentError> {
+    let GraphInput {
+        field,
+        dim,
+        metric,
+        rows,
+        values,
+        nulls,
+    } = input;
+    let width = dim as usize;
+    if width == 0 || values.len() != rows as usize * width {
+        return Err(SegmentError::Encode(format!(
+            "graph input of field {field} holds {} values for {rows} rows of dimension {dim}",
+            values.len()
+        )));
+    }
+    // One node per distinct vector, in order of first appearance.
+    let mut node_rows: Vec<Vec<u32>> = Vec::new();
+    {
         let mut node_of: HashMap<&[u8], u32> = HashMap::new();
-        let mut node_rows: Vec<Vec<u32>> = Vec::new();
-        for row in live_rows() {
+        let bytes: &[u8] = bytemuck::cast_slice(&values);
+        for row in (0..rows).filter(|row| !nulls.contains(*row)) {
+            let at = row as usize * width * 4;
             let next = u32::try_from(node_rows.len()).map_err(encode)?;
-            let node = *node_of.entry(row_bytes(row)).or_insert(next);
+            let node = *node_of.entry(&bytes[at..at + width * 4]).or_insert(next);
             if node == next {
                 node_rows.push(Vec::new());
             }
             node_rows[node as usize].push(row);
         }
-        drop(node_of);
-        if node_rows.len() as u64 >= u64::from(policy.graph_min_rows) {
-            let mut data = Vec::with_capacity(node_rows.len() * dim);
-            for rows_of_node in &node_rows {
-                data.extend(row_f32s(rows_of_node[0]));
-            }
-            let graph_metric = match metric {
-                DistanceMetric::L2 => F32Metric::L2Squared,
-                DistanceMetric::Cosine | DistanceMetric::Dot => F32Metric::NegativeDot,
-            };
-            let source = F32Vectors::new(dim, data, graph_metric).map_err(encode)?;
-            let graph = HnswGraph::build_parallel(&source, policy.hnsw).map_err(encode)?;
-            drop(source);
-            let identity = node_rows.len() == rows as usize
-                && node_rows
-                    .iter()
-                    .enumerate()
-                    .all(|(node, rows)| rows.len() == 1 && rows[0] as usize == node);
-            let payload = encode_graph_section(rows, &node_rows, identity, &graph)?;
-            sections.push(section(
-                IndexSectionKind::VectorGraph,
-                vector.field,
-                vector.dim,
-                u64::from(rows),
-                payload,
-            ));
-        }
     }
-    Ok(sections)
+    if (node_rows.len() as u64) < u64::from(min_nodes.max(2)) {
+        return Ok(None);
+    }
+    let identity = node_rows.len() == rows as usize
+        && node_rows
+            .iter()
+            .enumerate()
+            .all(|(node, rows)| rows.len() == 1 && rows[0] as usize == node);
+    let data = if identity {
+        values
+    } else {
+        let mut data = Vec::with_capacity(node_rows.len() * width);
+        for rows_of_node in &node_rows {
+            let at = rows_of_node[0] as usize * width;
+            data.extend_from_slice(&values[at..at + width]);
+        }
+        drop(values);
+        data
+    };
+    let graph_metric = match metric {
+        DistanceMetric::L2 => F32Metric::L2Squared,
+        DistanceMetric::Cosine | DistanceMetric::Dot => F32Metric::NegativeDot,
+    };
+    let source = F32Vectors::new(width, data, graph_metric).map_err(encode)?;
+    let graph = match HnswGraph::build_parallel_cancellable(&source, params, cancelled) {
+        Ok(graph) => graph,
+        Err(GraphError::Cancelled) => return Err(SegmentError::Cancelled),
+        Err(error) => return Err(encode(error)),
+    };
+    drop(source);
+    let payload = encode_graph_section(rows, &node_rows, identity, &graph)?;
+    Ok(Some(section(
+        IndexSectionKind::VectorGraph,
+        field,
+        dim,
+        u64::from(rows),
+        payload,
+    )))
 }
 
 fn encode_graph_section(
@@ -739,15 +803,16 @@ mod tests {
         }
     }
 
-    /// A vector field whose range is too wide for SQ8 gets neither codes nor a graph: walks
-    /// traverse codes, so its segments are scanned exactly in f32.
+    /// A segment's own index sections are SQ8 codes and scalar indexes, never a graph (the
+    /// index-build job adds that later). A vector field whose range is too wide for SQ8 gets
+    /// no codes: walks traverse codes, so its segments are scanned exactly in f32.
     #[test]
-    fn a_field_without_sq8_codes_gets_no_graph() {
+    fn segments_get_sq8_codes_but_no_graph_and_wide_fields_get_neither() {
         #[allow(clippy::cast_precision_loss)]
         let ordinary = built(|row| vec![row as f32, (row * row) as f32]);
         let kinds = ordinary.iter().map(|(kind, _)| *kind).collect::<Vec<_>>();
         assert!(kinds.contains(&IndexSectionKind::VectorSq8), "{kinds:?}");
-        assert!(kinds.contains(&IndexSectionKind::VectorGraph), "{kinds:?}");
+        assert!(!kinds.contains(&IndexSectionKind::VectorGraph), "{kinds:?}");
 
         #[allow(clippy::cast_precision_loss)]
         let wide = built(|row| {
@@ -761,5 +826,113 @@ mod tests {
             )),
             "{wide:?}"
         );
+    }
+
+    /// The codes are the ones training on an f32 copy produced: the streaming bounds equal
+    /// `Sq8Params::train`'s.
+    #[test]
+    fn streamed_sq8_bounds_match_training() {
+        #[allow(clippy::cast_precision_loss)]
+        let vector = |row: u32| vec![(row as f32).sin() * 3.0, row as f32 - 7.5];
+        let mut buf = VectorBuf::new(FieldId(1), 2);
+        let mut training = Vec::new();
+        for row in 0..40_u32 {
+            let values = vector(row);
+            for value in &values {
+                buf.data.extend_from_slice(&value.to_le_bytes());
+            }
+            if row % 7 == 3 {
+                buf.nulls.insert(row);
+            } else {
+                training.extend(values);
+            }
+            buf.rows += 1;
+        }
+        let policy = IndexPolicy {
+            sq8_min_rows: 2,
+            ..IndexPolicy::default()
+        };
+        let section = sq8_section(&buf, &policy).expect("builds").expect("codes");
+        let parsed = Sq8Section::parse(&section.payload).expect("parses");
+        let trained = Sq8Params::train(&training, 2).expect("trains");
+        assert_eq!(parsed.params().min(), trained.min());
+        assert_eq!(parsed.params().max(), trained.max());
+    }
+
+    fn graph_input(values: Vec<f32>, nulls: &[u32]) -> GraphInput {
+        let rows = u32::try_from(values.len() / 2).expect("fits");
+        GraphInput {
+            field: FieldId(1),
+            dim: 2,
+            metric: DistanceMetric::L2,
+            rows,
+            values,
+            nulls: nulls.iter().copied().collect(),
+        }
+    }
+
+    /// A graph section covers every non-null row through its node map: duplicates share a
+    /// node, null rows are in none, and a field with too few distinct vectors gets no graph.
+    #[test]
+    fn graph_sections_map_distinct_vectors_to_their_rows() {
+        // 50 distinct vectors on rows 0..50, each repeated on row + 50; rows 100 and 101 null.
+        #[allow(clippy::cast_precision_loss)]
+        let mut values = (0..100_u32)
+            .flat_map(|row| {
+                let node = row % 50;
+                [node as f32, (node * node % 17) as f32]
+            })
+            .collect::<Vec<_>>();
+        values.extend([0.0; 4]);
+        let section = build_graph_section(
+            graph_input(values.clone(), &[100, 101]),
+            HnswParams::default(),
+            10,
+            &|| false,
+        )
+        .expect("builds")
+        .expect("a graph");
+        assert_eq!(section.kind, IndexSectionKind::VectorGraph);
+        let graph = SegmentGraph::decode(&section.payload, 102).expect("decodes");
+        assert_eq!(graph.graph.len(), 50);
+        assert!(!graph.nodes.is_identity());
+        let mut covered = (0..50)
+            .flat_map(|node| graph.nodes.rows(node))
+            .collect::<Vec<_>>();
+        covered.sort_unstable();
+        assert_eq!(covered, (0..100).collect::<Vec<_>>());
+
+        // Too few distinct vectors for the floor: no graph.
+        let none = build_graph_section(
+            graph_input(values.clone(), &[100, 101]),
+            HnswParams::default(),
+            51,
+            &|| false,
+        )
+        .expect("builds");
+        assert!(none.is_none());
+
+        // Distinct rows without nulls: an identity map.
+        #[allow(clippy::cast_precision_loss)]
+        let distinct = (0..64_u32)
+            .flat_map(|row| [row as f32, (row % 5) as f32])
+            .collect::<Vec<_>>();
+        let section = build_graph_section(
+            graph_input(distinct, &[]),
+            HnswParams::default(),
+            2,
+            &|| false,
+        )
+        .expect("builds")
+        .expect("a graph");
+        let graph = SegmentGraph::decode(&section.payload, 64).expect("decodes");
+        assert!(graph.nodes.is_identity());
+
+        // Cancelled: a typed error, nothing built.
+        let cancelled =
+            build_graph_section(graph_input(values, &[100, 101]), HnswParams::default(), 2, &|| {
+                true
+            });
+        assert!(matches!(cancelled, Err(SegmentError::Cancelled)));
     }
 }

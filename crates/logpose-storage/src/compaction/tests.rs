@@ -25,6 +25,7 @@ fn config() -> CompactionConfig {
         small_deleted_ratio: 0.5,
         small_deleted_rows: 64,
         max_jobs_per_collection: 2,
+        quiet_after: std::time::Duration::from_secs(10),
     }
 }
 
@@ -242,15 +243,94 @@ fn build_bytes_count_stored_rows_and_the_index_builds() {
         indexed_scalar_fields: 3,
     };
     let inputs = [segment(1, 10, 5), segment(2, 20, 0)];
-    // Per row: an f32 copy and an SQ8 code of every dimension (5 * 96), the graph build and its
-    // encoding per vector field (2 * (3 * 141 + 64)), and the scalar indexes (3 * 32).
-    let index = 5 * 96 + 2 * (3 * 141 + 64) + 3 * 32;
+    // Per row: the SQ8 code of every dimension and its payload (2 * 96), and the scalar indexes
+    // (3 * 32). No graph: that is the index build's.
+    let index = 2 * 96 + 3 * 32;
     assert_eq!(shape.index_bytes_per_row(), index);
     // 5 + 20 live rows at (100 stored + index) bytes each, plus the larger input's 2,000-byte
     // file.
     assert_eq!(build_bytes(&inputs, shape), 25 * (100 + index) + 2_000);
-    // A flush holds the builder's copy of the memtable's payload and the same index build.
+    // A flush holds the builder's copy of the memtable's payload and the same index sections.
     assert_eq!(flush_build_bytes(25, 7_000, shape), 7_000 + 25 * index);
+    // An index build holds the f32 vectors (4 * 96), and per vector field the deduplication
+    // map and the graph's build and encoding (2 * (32 + 3 * 141 + 64)), for every row.
+    let graph = 4 * 96 + 2 * (32 + 3 * 141 + 64);
+    assert_eq!(shape.graph_bytes_per_row(), graph);
+    assert_eq!(index_build_bytes(30, shape), 30 * graph);
+}
+
+/// An output's index build must fit the whole pool, or it could never get its graph: merges
+/// stop short of that, in the background and in explicit compactions.
+#[test]
+fn outputs_stay_small_enough_for_their_index_build() {
+    let shape = RowShape {
+        vector_fields: 1,
+        vector_dims: 8,
+        indexed_scalar_fields: 0,
+    };
+    // Segments of 10 rows at 100 stored bytes: merging them costs little, but a graph build
+    // holds 32 + 487 + 32 = 551 bytes a row, so 20 rows' (11,020 bytes) fit a 14,000-byte pool
+    // and 30 rows' (16,530) do not.
+    let policy = Policy::new(config(), 2, 14_000, shape);
+    let segments = (1..=3).map(|unit| segment(unit, 10, 0)).collect::<Vec<_>>();
+    assert_eq!(index_build_bytes(20, shape), 20 * 551);
+    let plan = policy
+        .plan_explicit(&segments, &BTreeSet::new())
+        .expect("a plan");
+    assert_eq!(units(&plan), [1, 2], "a third segment's graph would not fit the pool");
+}
+
+/// An explicit compaction merges the segments with the fewest live rows first, so repeated
+/// jobs converge on as few segments as the pool allows.
+#[test]
+fn an_explicit_compaction_merges_the_smallest_segments_first() {
+    // Half of a 7,000-byte pool is what matters for background jobs; an explicit one may use
+    // it all: 10-row segments cost 1,000 bytes each, plus the largest input read whole.
+    let policy = policy(config(), 7_000);
+    let segments = [
+        segment(1, 40, 0),
+        segment(2, 10, 0),
+        segment(3, 20, 0),
+        segment(4, 10, 0),
+    ];
+    let plan = policy
+        .plan_explicit(&segments, &BTreeSet::new())
+        .expect("a plan");
+    // 10 + 10 + 20 rows (4,000) plus the 2,000-byte input fit; the 40-row segment does not.
+    assert_eq!(units(&plan), [2, 3, 4]);
+    assert_eq!(plan.build_bytes, 4_000 + 2_000);
+}
+
+/// A quiet collection merges its segments below the graph threshold, smallest first, and
+/// leaves a lone one (and every larger one) alone.
+#[test]
+fn a_quiet_collection_merges_the_segments_below_the_graph_threshold() {
+    let policy = Policy {
+        graph_min_rows: 50,
+        ..policy(config(), u64::MAX)
+    };
+    let segments = [
+        segment(1, 400, 0),
+        segment(2, 30, 0),
+        segment(3, 10, 0),
+        segment(4, 60, 20),
+        segment(5, 20, 0),
+    ];
+    let plans = policy.plan_quiet(&segments, &BTreeSet::new(), 2);
+    assert_eq!(plans.len(), 1);
+    // Segment 4 has 40 live rows: below the threshold too.
+    assert_eq!(units(&plans[0]), [2, 3, 4, 5]);
+    assert_eq!(plans[0].reason, PlanReason::Quiet);
+    let reserved = [UnitId(2), UnitId(3), UnitId(4)].into_iter().collect();
+    assert!(
+        policy.plan_quiet(&segments, &reserved, 2).is_empty(),
+        "a lone small segment is left for its graph"
+    );
+    let off = Policy::new(config(), usize::MAX, u64::MAX, RowShape::default());
+    assert!(
+        off.plan_quiet(&segments, &BTreeSet::new(), 2).is_empty(),
+        "background compaction off"
+    );
 }
 
 /// The build reads each input whole, deleted rows included, so a rewrite of a mostly deleted

@@ -766,8 +766,9 @@ async fn crash_after_wal_tail_repair_keeps_the_repair() {
 
 /// Every crash point a sequential run can reach is reached by a clean run, so the named tests
 /// above cannot silently stop testing anything. `CompactionAfterDvSync` needs a deletion that
-/// lands while a compaction runs (the storage unit tests step it); the GC, recovery, and
-/// rollback points have tests of their own.
+/// lands while a compaction runs (the storage unit tests step it); the index-build points need
+/// a segment with SQ8 codes (`index_build/tests.rs` steps them); the GC, recovery, and rollback
+/// points have tests of their own.
 #[tokio::test]
 async fn clean_run_reaches_every_implemented_crash_point() {
     let harness = Harness::new(70).await;

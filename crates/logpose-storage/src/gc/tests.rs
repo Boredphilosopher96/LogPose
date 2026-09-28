@@ -51,6 +51,7 @@ fn manifest(generation: u64, units: &[u32]) -> Manifest {
             },
             tier: 0,
             dv: None,
+            index: None,
             vectors: Vec::new(),
             zones: Vec::new(),
         })

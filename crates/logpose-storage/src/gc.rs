@@ -20,7 +20,7 @@ use crate::{
     dv::parse_dv_file_name,
     engine::{CoreRef, EngineCore},
     manifest::{CURRENT_TEMP_FILE, Manifest, manifests_dir, parse_manifest_file_name},
-    paths::{SEGMENTS_DIR, parse_segment_file_name},
+    paths::{SEGMENTS_DIR, parse_index_file_name, parse_segment_file_name},
 };
 use logpose_types::{LogPoseError, Result, UnitId};
 use logpose_vfs::{CrashPoint, Vfs, parent_dir};
@@ -354,6 +354,11 @@ pub(crate) fn remove_orphans(
         .iter()
         .filter_map(|segment| segment.dv.map(|dv| (segment.unit, dv.generation)))
         .collect::<HashSet<_>>();
+    let live_indexes = manifest
+        .segments
+        .iter()
+        .filter_map(|segment| segment.index.map(|index| (segment.unit, index.unit)))
+        .collect::<HashSet<_>>();
     let mut cleanup = OrphanCleanup {
         next_manifest_gen: manifest.generation + 1,
         next_unit_id: manifest.next_unit_id,
@@ -389,6 +394,10 @@ pub(crate) fn remove_orphans(
         } else if let Some((unit, generation)) = parse_dv_file_name(&name) {
             cleanup.next_dv_gen = cleanup.next_dv_gen.max(generation.saturating_add(1));
             !live_dvs.contains(&(unit, generation))
+        } else if let Some((segment, unit)) = parse_index_file_name(&name) {
+            // An index sidecar is named by the job's unit too, which no later job may reuse.
+            cleanup.next_unit_id = cleanup.next_unit_id.max(unit.0.saturating_add(1));
+            !live_indexes.contains(&(segment, unit))
         } else {
             false
         };

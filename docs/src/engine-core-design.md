@@ -1425,7 +1425,7 @@ impl HnswGraph {
 }
 ```
 
-Small-segment policy: `VectorGraph` is written only when the segment has at least `graph_min_rows` non-null vectors for that field (default 20,000, calibrated by the Phase 0 harness); below it, search is an exact SIMD scan. `VectorSq8` is written when there are at least `sq8_min_rows` (default 1,024); below it, exact scans use f32 directly. A flush of a default 64 MiB memtable at 768 dimensions produces about 21,000 rows, so flush outputs sit near the threshold and compaction outputs are always above it.
+Small-segment policy: `VectorSq8` is written with the segment when there are at least `sq8_min_rows` non-null vectors (default 1,024); below it, exact scans use f32 directly. `VectorGraph` is not written with the segment at all (see [Implementation Notes (Load Path)](#implementation-notes-load-path)): a background index build adds it later in an index sidecar, as soon as the segment has at least `graph_min_rows` non-null vectors for that field (default 20,000, calibrated by the Phase 0 harness), or at any size once the collection is quiet. Until the graph lands, search scans the SQ8 codes and reranks in f32.
 
 ### Scalar Column Encodings
 
@@ -1554,8 +1554,16 @@ pub struct ManifestSegment {
     pub origin: SegmentOrigin, // Flush { memtable_seq_range } | Compaction { inputs: Vec<UnitId> }
     pub tier: u8,
     pub dv: Option<DvRef>,
+    pub index: Option<IndexRef>,     // the index sidecar, once the segment's index build ran
     pub vectors: Vec<VectorSummary>, // per field: has_graph, has_sq8, non_null
     pub zones: Vec<FieldZone>,       // per field: min, max, null_count, distinct_estimate
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct IndexRef {
+    pub unit: UnitId,   // the index-build job's unit: segments/<segment>.idx.<unit>
+    pub file_len: u64,
+    pub footer_crc: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1621,7 +1629,7 @@ The flush of frozen memtable `F` (unit `m`, frozen at last sequence number `L`).
 
 1. **Freeze** (writer). As in [Frozen Memtable](#frozen-memtable): `F` joins `frozen`, the WAL rotates so the new file starts at `L + 1`, a `Version` is published, a permit is requested.
 2. **Begin** (writer, when the permit arrives and `F` is the oldest frozen memtable; flushes are serialized per collection). First complete and publish any in-flight group. Then capture a `FlushInput`: `Arc<MemtableData>` for `F`, `D_F` (the snapshot of `deletes[m]`), `D_S` (snapshots of every segment's deletion vector), the segment list, the schema, a new unit id `s`, and DV generations for each segment whose cardinality differs from its durable generation. Let `J` be `visible_seq_no` now (`J >= L`).
-3. **Build** (maintenance pool). Iterate `F`'s slots in order, skipping slots set in `D_F`. Assign row ids densely. Build pk, sorted pk, filter, row meta, columns (for fields declared in the captured schema), dynamic blocks, SQ8, graph (if at least `graph_min_rows`), scalar indexes, and stats; the three index kinds from PR 12 on. Record `slot_to_row: Arc<[u32]>` (`u32::MAX` for skipped slots). If no slot is live, steps 3 and 4 produce nothing and the flush is a pure checkpoint: no segment is added.
+3. **Build** (job thread). Iterate `F`'s slots in order, skipping slots set in `D_F`. Assign row ids densely. Build pk, sorted pk, filter, row meta, columns (for fields declared in the captured schema), dynamic blocks, SQ8, scalar indexes, and stats. No graph: the segment's index build adds it after the flush commits ([Implementation Notes (Load Path)](#implementation-notes-load-path)), so a flush costs one or two passes over its memtable and never waits behind a graph build on the maintenance pool. Record `slot_to_row: Arc<[u32]>` (`u32::MAX` for skipped slots). If no slot is live, steps 3 and 4 produce nothing and the flush is a pure checkpoint: no segment is added.
 4. **Write segment** (I/O pool). Stream sections to `segments/<s:08x>.seg` (`CreateNew`), then `sync_all`. `crash_point(FlushAfterSegmentSync)`.
 5. **Write DV files** (I/O pool). For each segment with a new generation: write `segments/<id>.dv.<gen>` from `D_S` with `covered_seq_no = J`, `sync_all`. `crash_point(FlushAfterDvSync)`.
 6. **Sync directory.** `sync_dir(segments/)`. `crash_point(FlushAfterSegmentsDirSync)`.
@@ -1677,7 +1685,7 @@ The writer runs the policy after every commit that changes the segment set, over
 1. **Deletion-driven.** If any segment has `dv.len / row_count >= deleted_ratio`, pick the one with the most deleted rows; add up to `min_merge - 1` of the smallest unreserved segments in the same or lower tier. Emit a job.
 2. **Tiered.** For each tier from the lowest: if at least `min_merge` unreserved segments are in it, take them in ascending unit order until `max_merge`, `max_output_rows`, or `max_output_bytes` would be exceeded. Emit a job.
 3. Never emit more than `max_jobs_per_collection` concurrent jobs, and never reserve a segment twice.
-4. Size every job to fit its memory reservation. A graph build holds the output's f32 vectors and the graph under construction: `build_bytes = rows * (Σ dim * 4 + 32 * 4 * 1.1)` for the vector fields, plus the output's scalar columns. A 2M-row output at 768 dimensions needs about 6.4 GB, which does not fit beside a 9 GB hot set in a 16 GB budget. The scheduler grants a compaction permit only with a reservation of `build_bytes` from the engine-wide `maintenance_memory` pool, and the policy caps the output so that `build_bytes` is at most half the pool (two jobs can run). At `memory_limit = 16 GB` that caps 768-dimension outputs near 500k rows, so 10M rows settle into about 20 top-tier segments; at 32 GB, near 1M rows. `max_output_rows` is the upper bound when memory is plentiful.
+4. Size every job to fit its memory reservation. The build holds the output's rows and its SQ8 codes (`build_bytes`); the output's graph is built afterwards by its index build, which holds its f32 vectors and the graph under construction (`index_build_bytes`). The scheduler grants a compaction permit only with a reservation of `build_bytes` from the engine-wide `maintenance_memory` pool, and the policy caps the output so that `build_bytes` is at most half the pool (two jobs can run) and `index_build_bytes` at most the whole pool (the graph must be buildable). At `memory_limit = 16 GB` and 768 dimensions that caps background outputs near 300k rows and explicit ones near 600k (the graph cap is near 880k); `max_output_rows` is the upper bound when memory is plentiful. See [Implementation Notes (Load Path)](#implementation-notes-load-path) for why merges are planned to fit the pool rather than streamed.
 
 Write amplification: a row is rewritten once per tier it climbs, about `log_4(max_output / 32,768)`, so roughly 2 to 3 compactions plus the flush. The engine counts bytes written by flush and by compaction and reports the ratio to bytes ingested, which the Phase 2 exit criterion measures.
 
@@ -1686,7 +1694,7 @@ Write amplification: a row is rewritten once per tier it climbs, about `log_4(ma
 For inputs `I_1..I_n` (ascending unit ids):
 
 1. **Begin** (writer, on permit, which carries the job's memory reservation). Complete and publish any in-flight group. Reserve the inputs. Capture `D0_i` (snapshot of `deletes[I_i]`) for each input, the current schema, and a new unit id `o`.
-2. **Build** (maintenance pool, reads through the I/O pool with `CacheMode::Bypass`, so compaction does not evict hot data). For each input in order, for each row `r` not in `D0_i`: append the row to the output (dropping fields the schema dropped, filling null for fields it added) and set `map_i[r] = next output row`; set `map_i[r] = u32::MAX` for rows in `D0_i`. Retrain SQ8 and build the graph over the output. Record `pks` and `sources` in output row order.
+2. **Build** (maintenance pool, reads through the I/O pool with `CacheMode::Bypass`, so compaction does not evict hot data). For each input in order, for each row `r` not in `D0_i`: append the row to the output (dropping fields the schema dropped, filling null for fields it added) and set `map_i[r] = next output row`; set `map_i[r] = u32::MAX` for rows in `D0_i`. Retrain SQ8 over the output (the graph comes from the output's index build). Record `pks` and `sources` in output row order.
 3. **Write** (I/O pool). Stream `segments/<o:08x>.seg`, `sync_all`, `sync_dir(segments/)`. `crash_point(CompactionAfterOutputSync)`.
 4. **Reconcile** (writer, on `CompactionDone`). Complete and publish any in-flight group. For each input, `delta_i = deletes[I_i] now AND NOT D0_i`. For each `r` in `delta_i`, set bit `map_i[r]` in `DV_o`. Every such `map_i[r]` is valid, because `r` was not in `D0_i`, so it was copied.
 5. **Write output DV** (writer, I/O pool). If `DV_o` is not empty: allocate `d` from `next_dv_gen`, write `segments/<o:08x>.dv.<d:016x>` with `covered_seq_no = visible_seq_no`, `sync_all`, `sync_dir(segments/)`. `crash_point(CompactionAfterDvSync)`.
@@ -1772,7 +1780,7 @@ The GC worker runs on the `IoPool`, calls `remove_file`, `crash_point(GcAfterRem
 
 A removal is not durable until its directory is synced, so after a crash a removed file may reappear. Neither outcome matters, because nothing references an obsolete file. Orphan cleanup runs during recovery, after the durability barrier, after `CURRENT` and its manifest `M` are loaded, and before the writer starts (so before any unit id, DV generation, or manifest generation can be reused). It deletes relative to `M`, so it is only safe because the barrier has made `M`'s selection by `CURRENT` durable; otherwise a `CURRENT` rename seen only in the page cache could lead it to delete the segments of the manifest that is actually durable:
 
-1. `segments/`: remove every `.seg` whose unit is not in `M`, every `.dv.<gen>` whose `(unit, gen)` is not named by `M`, and every `.tmp`.
+1. `segments/`: remove every `.seg` whose unit is not in `M`, every `.dv.<gen>` whose `(unit, gen)` is not named by `M`, every `.idx.<unit>` index sidecar whose `(segment, unit)` is not named by `M`, and every `.tmp`.
 2. `manifests/`: remove every generation other than `M.generation` and the newest generation below it (generations can have gaps after a failed publish), including every generation above `M.generation`.
 3. `wal/`: remove every file whose successor starts at or below `M.checkpoint_seq_no + 1`.
 4. Remove `CURRENT.tmp`.
@@ -2562,7 +2570,8 @@ Why the index sections move to PR 12: flush (PR 10) and compaction (PR 11) would
 7. **The segment section table is at the end of the file.** Phase 2's layout sketch places the section table in the header. Compaction output is streamed, so section lengths are unknown when the header is written; the header keeps what is known up front (row count, schema hash, sequence range) and the footer points at the table.
 8. **Memtable indexes are persistent maps of two-tier bitmaps.** Phase 3 task 3 sketches `BTreeMap<Value, RoaringBitmap>`. A `Version` must hold an O(1) snapshot of the memtable while the writer keeps appending, so the map is `imbl::OrdMap` and each posting a `CowBitmap`; a `BTreeMap` would have to be cloned per published `Version`.
 9. **Snapshot-token expiry is sliding and can come early.** D7 says tokens expire after a TTL. Here every use extends the TTL (so an active scroll never loses its snapshot), and the reaper may expire the oldest tokens early when pinned retired memtables exceed `token_memory_limit`. Both keep D7's intent (bounded retention) while making long scrolls usable and memory bounded.
-10. **Compaction output size is bounded by memory, not only by `max_output_rows`.** The plan assumes large segments; at 16 GB and 768 dimensions the maintenance-memory reservation caps outputs near 500k rows, so 10M rows live in about 20 top-tier segments instead of 5. Search fans out to more graphs, which the Phase 4 benchmark must measure; the alternative, building graphs over rows that do not fit in memory, would violate D1's budget.
+10. **Compaction output size is bounded by memory, not only by `max_output_rows`.** The plan assumes large segments; at 16 GB and 768 dimensions the maintenance-memory reservation caps background outputs near 300k rows and explicit ones near 600k, so 10M rows live in about 20 to 30 top-tier segments instead of 5. Search fans out to more graphs, which the Phase 4 benchmark must measure; the alternative, building graphs over rows that do not fit in memory, would violate D1's budget.
+11. **Graphs are built after the segment, in an index sidecar.** The plan has flush and compaction build a segment's HNSW graph inline. That made a flush as slow as a graph build (and queued it behind other graph builds on the one-thread maintenance pool), so bulk loads stalled writes. A segment is now written with its SQ8 codes and scalar indexes only, and a background index-build job adds the graph in `segments/<unit>.idx.<job unit>`, published by a manifest that names it ([Implementation Notes (Load Path)](#implementation-notes-load-path)). A segment reads with SQ8 codes until its graph lands.
 
 ## Review Log
 

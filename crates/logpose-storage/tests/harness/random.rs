@@ -290,6 +290,8 @@ fn report(failure: &Failure) -> ! {
 fn random_actions_with_hand_stepped_jobs_match_the_model() {
     let stats = run_seeds(Backend::Fault, Maintenance::Stepped, 12);
     assert!(stats.jobs_committed > 0, "{stats:?}");
+    // Seeds with index sections step index builds that commit graphs.
+    assert!(stats.indexes_committed > 0, "{stats:?}");
     assert!(stats.crashes > 0 && stats.token_reads > 0, "{stats:?}");
     assert!(
         stats.scrolls_finished > 0 && stats.filter_writes > 0,
@@ -301,9 +303,14 @@ fn random_actions_with_hand_stepped_jobs_match_the_model() {
 fn random_actions_with_stepped_background_jobs_match_the_model() {
     let stats = run_seeds(Backend::Fault, Maintenance::Paused, 12);
     assert!(stats.steps_granted > 0 && stats.crashes > 0, "{stats:?}");
-    // Background compactions ran, not only explicit ones.
+    // Background compactions ran, not only explicit ones, and index builds. Stepped permits
+    // go to flushes and compactions first, so index builds (last in line) also run by hand.
     assert!(
         stats.compactions_granted > stats.explicit_compactions,
+        "{stats:?}"
+    );
+    assert!(
+        stats.index_builds_granted + stats.indexes_committed > 0,
         "{stats:?}"
     );
 }
@@ -316,6 +323,7 @@ fn random_actions_racing_free_background_jobs_match_the_model() {
         stats.compactions_granted > stats.explicit_compactions,
         "{stats:?}"
     );
+    assert!(stats.index_builds_granted > 0, "{stats:?}");
 }
 
 #[test]

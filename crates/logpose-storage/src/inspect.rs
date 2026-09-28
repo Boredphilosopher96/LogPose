@@ -189,12 +189,9 @@ fn record_json(version: &Version, image: &RowImage) -> Result<JsonValue> {
     Ok(record.to_json(&version.schema))
 }
 
-/// The `inspect segment` report: the manifest entry, the section table, and every row.
-fn inspect_segment(version: &Version, segment: &Arc<SegmentHandle>) -> Result<InspectReport> {
-    let reader = segment.reader();
-    let deleted = version.deletes.len_of(segment.unit);
-    let sections = reader
-        .sections()
+/// A section table as JSON for `inspect`.
+fn sections_json(sections: &[crate::segment_v2::SectionEntry]) -> Vec<JsonValue> {
+    sections
         .iter()
         .map(|section| {
             json!({
@@ -207,7 +204,25 @@ fn inspect_segment(version: &Version, segment: &Arc<SegmentHandle>) -> Result<In
                 "length": section.length,
             })
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// The `inspect segment` report: the manifest entry, the section table (and the index
+/// sidecar's, once the segment has one), and every row.
+fn inspect_segment(version: &Version, segment: &Arc<SegmentHandle>) -> Result<InspectReport> {
+    let reader = segment.reader();
+    let deleted = version.deletes.len_of(segment.unit);
+    let sections = sections_json(reader.sections());
+    let index_sidecar = segment.index_file().map(|index| {
+        json!({
+            "file_name": index
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            "file_len": index.reader().file_len(),
+            "sections": sections_json(index.reader().sections()),
+        })
+    });
     let mut records = Vec::new();
     for (row, stored) in (0_u32..).zip(segment.read_rows()?) {
         records.push(json!({
@@ -244,6 +259,7 @@ fn inspect_segment(version: &Version, segment: &Arc<SegmentHandle>) -> Result<In
                 "index_kind": index_kind(segment),
             },
             "sections": sections,
+            "index_sidecar": index_sidecar,
             "records": records,
         }),
     })

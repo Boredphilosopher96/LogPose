@@ -1546,3 +1546,35 @@ fn release_duplicate_heavy_connectivity() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cancelled_parallel_build_stops_early_with_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let data = clustered(4_000, 16, 16, 0, 11);
+    // Cancelled before it starts: no insert runs.
+    let polls = AtomicUsize::new(0);
+    let result = HnswGraph::build_parallel_cancellable(&data.vectors, params(8, 32, 1), &|| {
+        polls.fetch_add(1, Ordering::Relaxed);
+        true
+    });
+    assert_eq!(result.err(), Some(GraphError::Cancelled));
+    assert_eq!(polls.load(Ordering::Relaxed), 1, "stops at the first poll");
+
+    // Cancelled part way: the remaining rows are skipped and the build reports it.
+    let polls = AtomicUsize::new(0);
+    let result = HnswGraph::build_parallel_cancellable(&data.vectors, params(8, 32, 1), &|| {
+        polls.fetch_add(1, Ordering::Relaxed) >= 1_000
+    });
+    assert_eq!(result.err(), Some(GraphError::Cancelled));
+
+    // Never cancelled: a complete graph.
+    let graph = HnswGraph::build_parallel_cancellable(&data.vectors, params(8, 32, 1), &|| false)
+        .expect("uncancelled build");
+    assert_eq!(graph.len(), data.vectors.len());
+    assert_valid(&graph);
+}

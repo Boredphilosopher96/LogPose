@@ -1,25 +1,29 @@
-//! The engine-wide maintenance scheduler: permits for flush and compaction jobs.
+//! The engine-wide maintenance scheduler: permits for flush, compaction, and index-build jobs.
 //!
-//! A collection's writer decides that a job is due (a frozen memtable to flush, or a set of
-//! segments the compaction policy picked) and asks the scheduler for a permit. The scheduler
-//! grants permits in priority order and within two limits:
+//! A collection's writer decides that a job is due (a frozen memtable to flush, a set of
+//! segments the compaction policy picked, or a segment whose vector graphs are missing) and
+//! asks the scheduler for a permit. The scheduler grants permits in priority order and within
+//! two limits:
 //!
 //! - **Slots.** At most `slots` jobs run at once, engine-wide, which is the number of job
-//!   threads, so a granted job always starts right away. Compactions may hold at most
-//!   `slots - 1` of them: one slot is always left for a flush, so a stream of long compactions
-//!   never delays a flush, and with it the write stall a flush releases.
-//! - **Maintenance memory.** A compaction's permit reserves the bytes its build holds (see the
-//!   compaction policy's `build_bytes`) from the engine-wide pool of
-//!   `maintenance_fraction * memory_limit`, and releases them when the permit is dropped. A
-//!   compaction that does not fit in the free part of the pool waits; one larger than the whole
-//!   pool is declined at once. A flush reserves what its build holds beyond the memtable (the
-//!   builder's copy of the rows and the index sections), but never waits for it and is never
-//!   declined: its reservation only makes compactions wait while it runs, so the pool stays
-//!   within its size whenever no flush runs.
+//!   threads, so a granted job always starts right away. There are `max(2, threads) + 1`: one
+//!   is always left for a flush, so a stream of long compactions never delays a flush, and
+//!   with it the write stall a flush releases; one is the index-build slot, so a graph build
+//!   (the longest job by far) never holds back a compaction; compactions may hold the rest.
+//! - **Maintenance memory.** A compaction's or an index build's permit reserves the bytes its
+//!   build holds (see the compaction policy's `build_bytes` and `index_build_bytes`) from the
+//!   engine-wide pool of `maintenance_fraction * memory_limit`, and releases them when the
+//!   permit is dropped. A job that does not fit in the free part of the pool waits; one larger
+//!   than the whole pool is declined at once. A flush reserves what its build holds beyond the
+//!   memtable (the builder's copy of the rows and its SQ8 and scalar index sections), but never
+//!   waits for it and is never declined: its reservation only makes the other jobs wait while
+//!   it runs, so the pool stays within its size whenever no flush runs.
 //!
-//! Waiting requests are granted flushes first, then compactions, each in request order. A
-//! waiting compaction that does not fit blocks the compactions behind it (so a large job is
-//! never starved by smaller ones), but never a flush.
+//! Waiting requests are granted flushes first, then compactions, then index builds, each in
+//! request order. A waiting compaction that does not fit blocks the compactions behind it (so a
+//! large job is never starved by smaller ones), but never a flush; index builds wait while any
+//! compaction does, so graph builds use what memory and time compactions leave, and a graph is
+//! built for the segments compaction settles on rather than for ones it is about to merge.
 //!
 //! The scheduler never calls into a collection while it holds its lock: a grant is delivered
 //! (by sending the permit to the collection's writer) after the lock is released, and a permit
@@ -41,6 +45,7 @@ fn priority(kind: JobKind) -> u8 {
     match kind {
         JobKind::Flush => 0,
         JobKind::Compact => 1,
+        JobKind::Index => 2,
     }
 }
 
@@ -55,7 +60,9 @@ struct Shared {
     slots: usize,
     /// Of those, compactions.
     compaction_slots: usize,
-    /// The maintenance-memory pool compactions reserve from.
+    /// Of those, index builds.
+    index_slots: usize,
+    /// The maintenance-memory pool compactions and index builds reserve from.
     pool_bytes: u64,
     state: Mutex<State>,
 }
@@ -75,7 +82,8 @@ struct State {
     next_request: u64,
     running_flushes: usize,
     running_compactions: usize,
-    /// Maintenance memory compaction permits reserve.
+    running_indexes: usize,
+    /// Maintenance memory compaction and index-build permits reserve.
     reserved: u64,
     /// Maintenance memory flush permits reserve (granted without checking the pool).
     flush_reserved: u64,
@@ -92,15 +100,18 @@ pub struct SchedulerStats {
     pub flushes_granted: u64,
     /// Compaction permits granted.
     pub compactions_granted: u64,
-    /// Compaction requests declined because they need more than the whole pool.
+    /// Index-build permits granted.
+    pub index_builds_granted: u64,
+    /// Compaction and index-build requests declined because they need more than the whole
+    /// pool.
     pub declined: u64,
     /// Requests waiting now.
     pub waiting: usize,
     /// Jobs holding a permit now.
     pub running: usize,
-    /// Maintenance memory compactions reserve now.
+    /// Maintenance memory compactions and index builds reserve now.
     pub reserved_bytes: u64,
-    /// The most maintenance memory compactions ever reserved at once.
+    /// The most maintenance memory compactions and index builds ever reserved at once.
     pub peak_reserved_bytes: u64,
     /// Maintenance memory running flushes reserve now.
     pub flush_reserved_bytes: u64,
@@ -147,6 +158,10 @@ impl Drop for Permit {
                     state.running_compactions -= 1;
                     state.reserved -= self.bytes;
                 }
+                JobKind::Index => {
+                    state.running_indexes -= 1;
+                    state.reserved -= self.bytes;
+                }
             }
         }
         MaintenanceScheduler::pump(&self.shared);
@@ -159,14 +174,15 @@ impl Drop for Permit {
 pub(crate) struct RequestId(u8, u64);
 
 impl MaintenanceScheduler {
-    /// A scheduler for `threads` job threads (at least two: one is kept for flushes) and a
-    /// maintenance-memory pool of `pool_bytes`.
+    /// A scheduler for `threads` maintenance threads (at least two: one is kept for flushes),
+    /// plus one slot for index builds, and a maintenance-memory pool of `pool_bytes`.
     pub(crate) fn new(threads: usize, pool_bytes: u64) -> Self {
         let slots = threads.max(2);
         Self {
             shared: Arc::new(Shared {
-                slots,
+                slots: slots + 1,
                 compaction_slots: slots - 1,
+                index_slots: 1,
                 pool_bytes,
                 state: Mutex::new(State::default()),
             }),
@@ -186,8 +202,8 @@ impl MaintenanceScheduler {
 
     /// Ask for a permit of `kind` reserving `bytes` of maintenance memory; `deliver` receives
     /// it once granted, on whatever thread released the resources (never under the scheduler's
-    /// lock). Fails at once when a compaction needs more than the whole pool; a flush is granted
-    /// whatever it reserves.
+    /// lock). Fails at once when a compaction or an index build needs more than the whole pool;
+    /// a flush is granted whatever it reserves.
     pub(crate) fn request(
         &self,
         kind: JobKind,
@@ -196,10 +212,14 @@ impl MaintenanceScheduler {
     ) -> Result<RequestId> {
         let id = {
             let mut state = self.shared.lock();
-            if kind == JobKind::Compact && bytes > self.shared.pool_bytes {
+            if kind != JobKind::Flush && bytes > self.shared.pool_bytes {
                 state.stats.declined += 1;
                 return Err(LogPoseError::TooLarge {
-                    what: "compaction build memory".to_owned(),
+                    what: match kind {
+                        JobKind::Index => "index build memory",
+                        _ => "compaction build memory",
+                    }
+                    .to_owned(),
                     size: Some(bytes),
                     limit: self.shared.pool_bytes,
                 });
@@ -256,7 +276,7 @@ impl MaintenanceScheduler {
         let state = self.shared.lock();
         SchedulerStats {
             waiting: state.queue.len(),
-            running: state.running_flushes + state.running_compactions,
+            running: state.running_flushes + state.running_compactions + state.running_indexes,
             reserved_bytes: state.reserved,
             flush_reserved_bytes: state.flush_reserved,
             pool_bytes: self.shared.pool_bytes,
@@ -277,12 +297,14 @@ impl MaintenanceScheduler {
         if state.paused && state.steps == 0 {
             return None;
         }
-        let running = state.running_flushes + state.running_compactions;
+        let running = state.running_flushes + state.running_compactions + state.running_indexes;
         if running >= shared.slots {
             return None;
         }
+        let fits = |bytes: u64| state.reserved + state.flush_reserved + bytes <= shared.pool_bytes;
         let mut chosen = None;
         let mut compaction_seen = false;
+        let mut index_seen = false;
         for (key, waiting) in &state.queue {
             match waiting.kind {
                 JobKind::Flush => {
@@ -296,10 +318,20 @@ impl MaintenanceScheduler {
                         continue;
                     }
                     compaction_seen = true;
-                    if state.running_compactions < shared.compaction_slots
-                        && state.reserved + state.flush_reserved + waiting.bytes
-                            <= shared.pool_bytes
+                    if state.running_compactions < shared.compaction_slots && fits(waiting.bytes)
                     {
+                        chosen = Some(*key);
+                        break;
+                    }
+                }
+                JobKind::Index => {
+                    // Index builds wait for every waiting compaction, and only the first
+                    // waiting one is a candidate, like compactions.
+                    if compaction_seen || index_seen {
+                        break;
+                    }
+                    index_seen = true;
+                    if state.running_indexes < shared.index_slots && fits(waiting.bytes) {
                         chosen = Some(*key);
                         break;
                     }
@@ -319,6 +351,13 @@ impl MaintenanceScheduler {
             JobKind::Compact => {
                 state.running_compactions += 1;
                 state.stats.compactions_granted += 1;
+                state.reserved += waiting.bytes;
+                state.stats.peak_reserved_bytes =
+                    state.stats.peak_reserved_bytes.max(state.reserved);
+            }
+            JobKind::Index => {
+                state.running_indexes += 1;
+                state.stats.index_builds_granted += 1;
                 state.reserved += waiting.bytes;
                 state.stats.peak_reserved_bytes =
                     state.stats.peak_reserved_bytes.max(state.reserved);

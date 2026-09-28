@@ -29,6 +29,10 @@ pub const SEGMENT_MAGIC: [u8; 8] = *b"LPSEG\x00\x02\x00";
 pub const FOOTER_MAGIC: [u8; 8] = *b"LPSEGEND";
 /// Format version in the header. Bump it with any change to the golden file.
 pub const FORMAT_VERSION: u32 = 2;
+/// Header flag of an index sidecar: a file in the segment format that holds only the
+/// `SchemaSnapshot` of the segment it indexes and index sections built after the segment was
+/// written (vector graphs). It carries the indexed segment's header otherwise.
+pub const HEADER_FLAG_INDEX_SIDECAR: u32 = 1;
 /// Length of the file header.
 pub const HEADER_LEN: usize = 128;
 /// Length of one section table entry.
@@ -168,15 +172,23 @@ pub struct SegmentHeader {
     pub min_seq_no: SeqNo,
     /// Largest row sequence number, or 0 for an empty segment.
     pub max_seq_no: SeqNo,
+    /// Header flags: 0 for a segment, [`HEADER_FLAG_INDEX_SIDECAR`] for an index sidecar.
+    pub flags: u32,
 }
 
 impl SegmentHeader {
+    /// Whether the file is an index sidecar rather than a segment.
+    #[must_use]
+    pub fn is_index_sidecar(&self) -> bool {
+        self.flags & HEADER_FLAG_INDEX_SIDECAR != 0
+    }
+
     /// Encode with its CRC. Returns the bytes and the CRC.
     pub(crate) fn encode(&self) -> ([u8; HEADER_LEN], u32) {
         let mut out = Vec::with_capacity(HEADER_LEN);
         out.extend_from_slice(&SEGMENT_MAGIC);
         put_u32(&mut out, FORMAT_VERSION);
-        put_u32(&mut out, 0);
+        put_u32(&mut out, self.flags);
         out.extend_from_slice(self.collection_id.0.as_bytes());
         put_u32(&mut out, self.unit_id);
         put_u32(&mut out, self.row_count);
@@ -214,7 +226,8 @@ impl SegmentHeader {
         if version != FORMAT_VERSION {
             return Err(SegmentError::UnsupportedVersion { version });
         }
-        if cursor.u32().map_err(malformed)? != 0 {
+        let flags = cursor.u32().map_err(malformed)?;
+        if flags != 0 && flags != HEADER_FLAG_INDEX_SIDECAR {
             return Err(SegmentError::corrupt(region, "unknown header flags"));
         }
         let mut uuid = [0_u8; 16];
@@ -227,6 +240,7 @@ impl SegmentHeader {
             schema_hash: cursor.u64().map_err(malformed)?,
             min_seq_no: cursor.u64().map_err(malformed)?,
             max_seq_no: cursor.u64().map_err(malformed)?,
+            flags,
         };
         cursor
             .zeros(HEADER_CRC_AT - cursor.position())

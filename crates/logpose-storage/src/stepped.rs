@@ -22,7 +22,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 pub use crate::writer::JobKind;
 
-/// A flush or compaction whose phases the caller runs one at a time.
+/// A flush, compaction, or index build whose phases the caller runs one at a time.
 ///
 /// Test support, hidden from the documented API: a stepped job bypasses the scheduler's
 /// permits and maintenance-memory reservation, so only deterministic-interleaving tests (the
@@ -40,6 +40,8 @@ pub struct SteppedJob {
     start: Option<JobStart>,
     /// What the build produced.
     built: Option<JobCommit>,
+    /// A compaction took the segment of this index build: it builds and commits nothing.
+    cancelled: bool,
     ticket: Option<JobTicket>,
     core: CoreRef,
 }
@@ -60,7 +62,8 @@ impl Engine {
     /// Begin a maintenance job of `kind` on `handle` without a scheduler permit, drained and
     /// captured by the writer exactly as a background job's begin is. A flush takes the oldest
     /// frozen memtable (freezing the active one if none is frozen) and waits for a flush already
-    /// running; a compaction takes every unreserved segment. Blocking.
+    /// running; a compaction takes what one job of an explicit compaction would; an index build
+    /// takes the largest segment with SQ8 codes and no index sidecar. Blocking.
     ///
     /// Test support, hidden from the documented API: see [`SteppedJob`].
     ///
@@ -76,6 +79,7 @@ impl Engine {
             handle: Arc::clone(handle),
             start: Some(start),
             built: None,
+            cancelled: false,
             ticket: Some(ticket),
             core,
         })
@@ -109,8 +113,9 @@ impl SteppedJob {
         self.kind
     }
 
-    /// Whether the begin found anything to do: a flush with no frozen operation, or a
-    /// compaction of fewer than two segments, has nothing to build and commits as a no-op.
+    /// Whether the begin found anything to do: a flush with no frozen operation, a compaction
+    /// of fewer than two segments, or an index build with no segment that needs one, has
+    /// nothing to build and commits as a no-op.
     #[must_use]
     pub fn has_work(&self) -> bool {
         self.built.is_some()
@@ -133,14 +138,16 @@ impl SteppedJob {
     }
 
     /// Build and write the job's files (the segment and DV files of a flush; the output segment
-    /// of a compaction) on the calling thread, then release what the begin captured. Does
-    /// nothing for a job without work, or when called twice. Blocking.
+    /// of a compaction; the index sidecar of an index build) on the calling thread, then
+    /// release what the begin captured. Does nothing for a job without work, or when called
+    /// twice. An index build that a compaction cancelled (by taking its segment) builds
+    /// nothing, and its commit ends it without a change, as a background build ends. Blocking.
     ///
     /// # Errors
     ///
     /// The build's I/O and corruption errors. The job is then over: it can only be dropped.
     pub fn build(&mut self) -> Result<()> {
-        if self.built.is_some() {
+        if self.built.is_some() || self.cancelled {
             return Ok(());
         }
         let Some(start) = self.start.take() else {
@@ -164,6 +171,17 @@ impl SteppedJob {
                 self.core
                     .build_compaction(&self.handle, &start.version, start.unit, work, ticket)
             }
+            JobWork::Index(work) => {
+                let built =
+                    self.core
+                        .build_index(&self.handle, &start.version, start.unit, work, ticket);
+                if work.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Whatever it built is of no use: the commit ends the job without it.
+                    self.cancelled = true;
+                    return Ok(());
+                }
+                built
+            }
         };
         // A background build drops its captured inputs before it hands its result over, so the
         // last holder of a retired segment removes its file once the commit publishes.
@@ -186,6 +204,15 @@ impl SteppedJob {
         };
         match self.built.take() {
             Some(commit) => ticket.commit(commit),
+            // A cancelled build ends like an abandoned one, removing what it wrote.
+            None if self.cancelled => {
+                drop(ticket);
+                let version = self.handle.current();
+                Ok(Snapshot {
+                    manifest_generation: version.manifest_generation,
+                    visible_seq_no: version.visible_seq_no,
+                })
+            }
             None => {
                 drop(ticket);
                 let version = self.handle.current();

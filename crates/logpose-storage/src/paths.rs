@@ -3,8 +3,9 @@
 //!
 //! A collection directory holds `descriptor.json`, `placement.json`,
 //! `CURRENT`, `manifests/<generation:020>.mf`, `wal/<first seq no:020>.wal`, and
-//! `segments/`: one segment v2 file per segment unit, `<unit:08x>.seg`, and its deletion-vector
-//! files, `<unit:08x>.dv.<generation:016x>`. Unit ids and DV generations are never reused, so no
+//! `segments/`: one segment v2 file per segment unit, `<unit:08x>.seg`, its deletion-vector
+//! files, `<unit:08x>.dv.<generation:016x>`, and its index sidecar,
+//! `<unit:08x>.idx.<sidecar unit:08x>`. Unit ids and DV generations are never reused, so no
 //! file name is ever issued twice.
 
 use crate::engine::EngineCore;
@@ -29,6 +30,35 @@ pub(crate) fn segment_path(dir: &Path, unit: UnitId) -> PathBuf {
 pub(crate) fn parse_segment_file_name(name: &str) -> Option<UnitId> {
     let (digits, rest) = name.split_at_checked(8)?;
     if rest != SEGMENT_EXTENSION
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok().map(UnitId)
+}
+
+/// Infix of an index sidecar's name.
+const INDEX_INFIX: &str = ".idx.";
+
+/// `segments/<segment:08x>.idx.<unit:08x>`: the index sidecar of `segment` that the index-build
+/// job allocated `unit` wrote.
+pub(crate) fn index_path(dir: &Path, segment: UnitId, unit: UnitId) -> PathBuf {
+    dir.join(SEGMENTS_DIR)
+        .join(format!("{segment}{INDEX_INFIX}{unit}"))
+}
+
+/// The segment and the sidecar unit of an index sidecar's file name.
+pub(crate) fn parse_index_file_name(name: &str) -> Option<(UnitId, UnitId)> {
+    let (segment, rest) = name.split_at_checked(8)?;
+    let unit = rest.strip_prefix(INDEX_INFIX)?;
+    Some((parse_unit_hex(segment)?, parse_unit_hex(unit)?))
+}
+
+/// Eight lowercase hex digits as a unit id.
+fn parse_unit_hex(digits: &str) -> Option<UnitId> {
+    if digits.len() != 8
         || !digits
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
