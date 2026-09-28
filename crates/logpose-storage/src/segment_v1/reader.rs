@@ -2,19 +2,19 @@
 
 use super::{SegmentEntry, SegmentEntryKind, SegmentFooter, SegmentHeader};
 use crate::segment_v1::SegmentRecord;
-use crate::{durable_fs::read_file, error::json_message};
+use crate::{durable_fs::read_file, error::json_corrupt};
 use crc32fast::hash;
-use logpose_types::{LogPoseError, PutRecord, RecordId, Result, WriteOperation};
+use logpose_types::{CorruptionKind, LogPoseError, PutRecord, RecordId, Result, WriteOperation};
 use logpose_vfs::Vfs;
 use std::path::Path;
 
 pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<SegmentRecord>> {
     let bytes = read_file(vfs, path, "failed to read segment file")?;
     if bytes.len() < 4 || &bytes[..4] != b"LPS1" {
-        return Err(LogPoseError::Message(format!(
-            "invalid segment magic in '{}'",
-            path.display()
-        )));
+        return Err(LogPoseError::corrupt(
+            CorruptionKind::Segment,
+            format!("invalid segment magic in '{}'", path.display()),
+        ));
     }
 
     let mut offset = 4usize;
@@ -37,7 +37,7 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
 
     let header: SegmentHeader =
         serde_json::from_slice(checked_slice(&bytes, offset, header_len, "segment header")?)
-            .map_err(json_message)?;
+            .map_err(|error| json_corrupt(CorruptionKind::Segment, path, &error))?;
     offset += header_len;
     let entries: Vec<SegmentEntry> = serde_json::from_slice(checked_slice(
         &bytes,
@@ -45,7 +45,7 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
         entry_len,
         "segment entry table",
     )?)
-    .map_err(json_message)?;
+    .map_err(|error| json_corrupt(CorruptionKind::Segment, path, &error))?;
     offset += entry_len;
 
     let ids = checked_slice(&bytes, offset, ids_len, "segment id section")?;
@@ -56,16 +56,19 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
     offset += metadata_len;
     let footer: SegmentFooter =
         serde_json::from_slice(checked_slice(&bytes, offset, footer_len, "segment footer")?)
-            .map_err(json_message)?;
+            .map_err(|error| json_corrupt(CorruptionKind::Segment, path, &error))?;
 
     let actual_checksum = hash(&[ids, vectors, metadata].concat());
     if actual_checksum != footer.payload_checksum {
-        return Err(LogPoseError::Message(format!(
-            "checksum mismatch while reading segment '{}': expected {}, got {}",
-            path.display(),
-            footer.payload_checksum,
-            actual_checksum
-        )));
+        return Err(LogPoseError::corrupt(
+            CorruptionKind::Segment,
+            format!(
+                "checksum mismatch while reading segment '{}': expected {}, got {}",
+                path.display(),
+                footer.payload_checksum,
+                actual_checksum
+            ),
+        ));
     }
 
     let mut records = Vec::with_capacity(header.entry_count);
@@ -77,7 +80,10 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
             "segment record id",
         )?;
         let id = RecordId::new(std::str::from_utf8(id_slice).map_err(|error| {
-            LogPoseError::Message(format!("failed to decode record id from segment: {error}"))
+            LogPoseError::corrupt(
+                CorruptionKind::Segment,
+                format!("failed to decode record id from segment: {error}"),
+            )
         })?);
 
         let op = match entry.kind {
@@ -105,7 +111,7 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
                     metadata_end.saturating_sub(metadata_start),
                     "segment metadata payload",
                 )?)
-                .map_err(json_message)?;
+                .map_err(|error| json_corrupt(CorruptionKind::Segment, path, &error))?;
                 WriteOperation::Put(PutRecord {
                     id,
                     vector,
@@ -124,14 +130,20 @@ pub(crate) fn read_segment_file(vfs: &dyn Vfs, path: &Path) -> Result<Vec<Segmen
 }
 
 fn checked_slice<'a>(bytes: &'a [u8], start: usize, len: usize, label: &str) -> Result<&'a [u8]> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| LogPoseError::Message(format!("overflow while reading {label}")))?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        LogPoseError::corrupt(
+            CorruptionKind::Segment,
+            format!("overflow while reading {label}"),
+        )
+    })?;
     if end > bytes.len() {
-        return Err(LogPoseError::Message(format!(
-            "truncated segment while reading {label}: need {end} bytes but file has {}",
-            bytes.len()
-        )));
+        return Err(LogPoseError::corrupt(
+            CorruptionKind::Segment,
+            format!(
+                "truncated segment while reading {label}: need {end} bytes but file has {}",
+                bytes.len()
+            ),
+        ));
     }
     Ok(&bytes[start..end])
 }

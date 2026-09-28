@@ -882,7 +882,7 @@ impl StorageEngine for PlannerStorage {
         &self,
         _request: CreateCollectionRequest,
     ) -> logpose_types::Result<CollectionDescriptor> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "create_collection is not used by planner tests".to_owned(),
         ))
     }
@@ -896,7 +896,7 @@ impl StorageEngine for PlannerStorage {
         _collection_name: &str,
         _operations: Vec<WriteOperation>,
     ) -> logpose_types::Result<CommitAck> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "write is not used by planner tests".to_owned(),
         ))
     }
@@ -940,13 +940,13 @@ impl StorageEngine for PlannerStorage {
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "flush is not used by planner tests".to_owned(),
         ))
     }
 
     async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "compact is not used by planner tests".to_owned(),
         ))
     }
@@ -968,7 +968,7 @@ impl StorageEngine for PlannerStorage {
         _collection_name: &str,
         _target: InspectTarget,
     ) -> logpose_types::Result<InspectReport> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "inspect is not used by planner tests".to_owned(),
         ))
     }
@@ -984,7 +984,7 @@ impl StorageEngine for DeleteAwarePlannerStorage {
         &self,
         _request: CreateCollectionRequest,
     ) -> logpose_types::Result<CollectionDescriptor> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "create_collection is not used by planner tests".to_owned(),
         ))
     }
@@ -998,7 +998,7 @@ impl StorageEngine for DeleteAwarePlannerStorage {
         _collection_name: &str,
         _operations: Vec<WriteOperation>,
     ) -> logpose_types::Result<CommitAck> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "write is not used by planner tests".to_owned(),
         ))
     }
@@ -1039,13 +1039,13 @@ impl StorageEngine for DeleteAwarePlannerStorage {
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "flush is not used by planner tests".to_owned(),
         ))
     }
 
     async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "compact is not used by planner tests".to_owned(),
         ))
     }
@@ -1067,7 +1067,7 @@ impl StorageEngine for DeleteAwarePlannerStorage {
         _collection_name: &str,
         _target: InspectTarget,
     ) -> logpose_types::Result<InspectReport> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "inspect is not used by planner tests".to_owned(),
         ))
     }
@@ -1083,7 +1083,7 @@ impl StorageEngine for ShadowingPlannerStorage {
         &self,
         _request: CreateCollectionRequest,
     ) -> logpose_types::Result<CollectionDescriptor> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "create_collection is not used by planner tests".to_owned(),
         ))
     }
@@ -1097,7 +1097,7 @@ impl StorageEngine for ShadowingPlannerStorage {
         _collection_name: &str,
         _operations: Vec<WriteOperation>,
     ) -> logpose_types::Result<CommitAck> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "write is not used by planner tests".to_owned(),
         ))
     }
@@ -1147,13 +1147,13 @@ impl StorageEngine for ShadowingPlannerStorage {
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "flush is not used by planner tests".to_owned(),
         ))
     }
 
     async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "compact is not used by planner tests".to_owned(),
         ))
     }
@@ -1175,7 +1175,7 @@ impl StorageEngine for ShadowingPlannerStorage {
         _collection_name: &str,
         _target: InspectTarget,
     ) -> logpose_types::Result<InspectReport> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "inspect is not used by planner tests".to_owned(),
         ))
     }
@@ -1191,7 +1191,7 @@ impl StorageEngine for MixedImmutableIndexPlannerStorage {
         &self,
         _request: CreateCollectionRequest,
     ) -> logpose_types::Result<CollectionDescriptor> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "create_collection is not used by planner tests".to_owned(),
         ))
     }
@@ -1205,7 +1205,7 @@ impl StorageEngine for MixedImmutableIndexPlannerStorage {
         _collection_name: &str,
         _operations: Vec<WriteOperation>,
     ) -> logpose_types::Result<CommitAck> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "write is not used by planner tests".to_owned(),
         ))
     }
@@ -1253,7 +1253,7 @@ impl StorageEngine for MixedImmutableIndexPlannerStorage {
         _request: logpose_types::AnnSearchRequest,
         _filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
     ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "ann_search_selected should not run without full ann coverage".to_owned(),
         ))
     }
@@ -1266,19 +1266,19 @@ impl StorageEngine for MixedImmutableIndexPlannerStorage {
         _include_mutable: bool,
         _immutable_unit_ids: Vec<String>,
     ) -> logpose_types::Result<Vec<VisibleRecord>> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "latest_visible_selected is not used by this planner test".to_owned(),
         ))
     }
 
     async fn flush(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "flush is not used by planner tests".to_owned(),
         ))
     }
 
     async fn compact(&self, _collection_name: &str) -> logpose_types::Result<Snapshot> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "compact is not used by planner tests".to_owned(),
         ))
     }
@@ -1300,7 +1300,7 @@ impl StorageEngine for MixedImmutableIndexPlannerStorage {
         _collection_name: &str,
         _target: InspectTarget,
     ) -> logpose_types::Result<InspectReport> {
-        Err(logpose_types::LogPoseError::Message(
+        Err(logpose_types::LogPoseError::internal(
             "inspect is not used by planner tests".to_owned(),
         ))
     }

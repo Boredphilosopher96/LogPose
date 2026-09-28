@@ -44,7 +44,7 @@ pub(crate) enum RecoveredCollection {
         reference: CollectionRef,
         /// The descriptor, when it is valid.
         descriptor: Option<Box<CollectionDescriptor>>,
-        error: String,
+        error: LogPoseError,
     },
     /// The descriptor cannot be parsed, so the collection is not even known by name.
     Unreadable { error: String },
@@ -84,7 +84,13 @@ impl CoreRef {
             return RecoveredCollection::Failed {
                 reference,
                 descriptor: None,
-                error: error.to_string(),
+                error: LogPoseError::corrupt(
+                    CorruptionKind::Descriptor,
+                    format!(
+                        "collection descriptor in '{}' is invalid: {error}",
+                        dir.display()
+                    ),
+                ),
             };
         }
         match self.open_collection(descriptor.clone()) {
@@ -92,7 +98,7 @@ impl CoreRef {
             Err(error) => RecoveredCollection::Failed {
                 reference,
                 descriptor: Some(Box::new(descriptor)),
-                error: error.to_string(),
+                error,
             },
         }
     }

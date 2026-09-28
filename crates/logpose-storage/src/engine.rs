@@ -17,7 +17,9 @@ use crate::{
     writer::{ControlMsg, GroupCommitConfig},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionAssignment, CollectionRef, LogPoseError, Result};
+use logpose_types::{
+    CollectionAssignment, CollectionRef, CorruptionKind, LogPoseError, ResourceKind, Result,
+};
 use logpose_vfs::{Vfs, VfsLock};
 use logpose_wal::{BootId, DEFAULT_WAL_FILE_BYTES, WalConfig};
 use std::{
@@ -196,7 +198,7 @@ enum CollectionSlot {
 pub(crate) struct FailedCollection {
     /// The descriptor, when it was readable and valid.
     pub(crate) descriptor: Option<CollectionDescriptor>,
-    pub(crate) error: String,
+    pub(crate) error: LogPoseError,
 }
 
 /// A collection directory whose descriptor could not be parsed.
@@ -554,9 +556,7 @@ impl EngineCore {
     pub(crate) fn collection(&self, reference: &CollectionRef) -> Result<Arc<CollectionHandle>> {
         match self.read_collections().get(reference) {
             Some(CollectionSlot::Open(handle)) => Ok(Arc::clone(handle)),
-            Some(CollectionSlot::Failed(failed)) => {
-                Err(LogPoseError::Message(failed.error.clone()))
-            }
+            Some(CollectionSlot::Failed(failed)) => Err(failed.error.clone()),
             Some(CollectionSlot::Creating | CollectionSlot::Dropping) | None => {
                 Err(not_found(reference))
             }
@@ -577,11 +577,15 @@ impl EngineCore {
     /// listing would silently omit it.
     pub(crate) fn list_descriptors(&self) -> Result<Vec<CollectionDescriptor>> {
         if let Some(unreadable) = self.unreadable.get().and_then(|list| list.first()) {
-            return Err(LogPoseError::Message(format!(
-                "collection directory '{}' is unreadable: {}",
-                unreadable.dir.display(),
-                unreadable.error
-            )));
+            return Err(LogPoseError::Corrupt {
+                kind: CorruptionKind::Descriptor,
+                location: Some(unreadable.dir.display().to_string()),
+                message: format!(
+                    "collection directory '{}' is unreadable: {}",
+                    unreadable.dir.display(),
+                    unreadable.error
+                ),
+            });
         }
         let mut descriptors = Vec::new();
         for slot in self.read_collections().values() {
@@ -589,7 +593,7 @@ impl EngineCore {
                 CollectionSlot::Open(handle) => descriptors.push(handle.descriptor().clone()),
                 CollectionSlot::Failed(failed) => match &failed.descriptor {
                     Some(descriptor) => descriptors.push(descriptor.clone()),
-                    None => return Err(LogPoseError::Message(failed.error.clone())),
+                    None => return Err(failed.error.clone()),
                 },
                 CollectionSlot::Creating | CollectionSlot::Dropping => {}
             }
@@ -612,7 +616,7 @@ impl EngineCore {
                     committed: false,
                 })
             }
-            Some(CollectionSlot::Dropping) => Err(LogPoseError::Message(format!(
+            Some(CollectionSlot::Dropping) => Err(LogPoseError::failed_precondition(format!(
                 "collection '{}/{}' is being dropped",
                 reference.database_name, reference.collection_name
             ))),
@@ -765,7 +769,7 @@ impl CoreRef {
             match collections.get(reference) {
                 Some(CollectionSlot::Open(_) | CollectionSlot::Failed(_)) => {}
                 Some(CollectionSlot::Creating) => {
-                    return Err(LogPoseError::Message(format!(
+                    return Err(LogPoseError::failed_precondition(format!(
                         "collection '{}/{}' is being created",
                         reference.database_name, reference.collection_name
                     )));
@@ -780,7 +784,7 @@ impl CoreRef {
                 Some(descriptor) => self
                     .retire_collection_dir(&descriptor.root_path)
                     .map_err(|failure| failure.error),
-                None => Err(LogPoseError::Message(format!(
+                None => Err(LogPoseError::failed_precondition(format!(
                     "collection '{}/{}' has an unreadable descriptor and cannot be dropped: {}",
                     reference.database_name, reference.collection_name, failed.error
                 ))),
@@ -1006,17 +1010,17 @@ impl Drop for TaskGuard {
 }
 
 pub(crate) fn not_found(reference: &CollectionRef) -> LogPoseError {
-    LogPoseError::Message(format!(
-        "collection '{}/{}' does not exist",
-        reference.database_name, reference.collection_name
-    ))
+    LogPoseError::not_found(
+        ResourceKind::Collection,
+        format!("{}/{}", reference.database_name, reference.collection_name),
+    )
 }
 
 pub(crate) fn already_exists(reference: &CollectionRef) -> LogPoseError {
-    LogPoseError::Message(format!(
-        "collection '{}/{}' already exists",
-        reference.database_name, reference.collection_name
-    ))
+    LogPoseError::already_exists(
+        ResourceKind::Collection,
+        format!("{}/{}", reference.database_name, reference.collection_name),
+    )
 }
 
 #[cfg(test)]

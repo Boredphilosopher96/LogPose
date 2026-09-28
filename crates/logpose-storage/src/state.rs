@@ -105,14 +105,17 @@ impl EngineCore {
                 if snapshot.visible_seq_no > current.visible_seq_no
                     || snapshot.manifest_generation > current.manifest_generation
                 {
-                    return Err(LogPoseError::Message(format!(
-                        "invalid snapshot: manifest generation {}, visible sequence {} is ahead \
-                         of the collection (generation {}, sequence {})",
-                        snapshot.manifest_generation,
-                        snapshot.visible_seq_no,
-                        current.manifest_generation,
-                        current.visible_seq_no
-                    )));
+                    return Err(LogPoseError::invalid_field(
+                        "snapshot",
+                        format!(
+                            "invalid snapshot: manifest generation {}, visible sequence {} is \
+                             ahead of the collection (generation {}, sequence {})",
+                            snapshot.manifest_generation,
+                            snapshot.visible_seq_no,
+                            current.manifest_generation,
+                            current.visible_seq_no
+                        ),
+                    ));
                 }
                 handle.pinned_version_for(snapshot).ok_or_else(|| {
                     LogPoseError::SnapshotExpired {
@@ -143,24 +146,35 @@ pub(crate) fn resolve_snapshot(
     });
 
     if snapshot.manifest_generation != state.manifest.generation {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: manifest generation {} is unavailable",
-            snapshot.manifest_generation
-        )));
+        return Err(LogPoseError::invalid_field(
+            "snapshot",
+            format!(
+                "invalid snapshot: manifest generation {} is unavailable",
+                snapshot.manifest_generation
+            ),
+        ));
     }
 
     let max_visible = state.visible_seq_no();
     if snapshot.visible_seq_no > max_visible {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: visible sequence {} exceeds maximum {} for manifest generation {}",
-            snapshot.visible_seq_no, max_visible, snapshot.manifest_generation
-        )));
+        return Err(LogPoseError::invalid_field(
+            "snapshot",
+            format!(
+                "invalid snapshot: visible sequence {} exceeds maximum {} for manifest generation {}",
+                snapshot.visible_seq_no, max_visible, snapshot.manifest_generation
+            ),
+        ));
     }
     if snapshot.visible_seq_no < state.manifest.checkpoint_seq_no {
-        return Err(LogPoseError::Message(format!(
-            "invalid snapshot: visible sequence {} is below checkpoint {} for manifest generation {}",
-            snapshot.visible_seq_no, state.manifest.checkpoint_seq_no, snapshot.manifest_generation
-        )));
+        return Err(LogPoseError::invalid_field(
+            "snapshot",
+            format!(
+                "invalid snapshot: visible sequence {} is below checkpoint {} for manifest generation {}",
+                snapshot.visible_seq_no,
+                state.manifest.checkpoint_seq_no,
+                snapshot.manifest_generation
+            ),
+        ));
     }
 
     Ok(snapshot)

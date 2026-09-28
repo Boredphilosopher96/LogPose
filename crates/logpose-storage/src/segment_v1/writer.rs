@@ -375,7 +375,16 @@ fn publish_segment_artifacts(
 }
 
 fn prefixed(context: &str, error: logpose_types::LogPoseError) -> logpose_types::LogPoseError {
-    logpose_types::LogPoseError::Message(format!("{context}: {error}"))
+    match error {
+        logpose_types::LogPoseError::Io {
+            context: inner,
+            source,
+        } => logpose_types::LogPoseError::Io {
+            context: format!("{context}: {inner}"),
+            source,
+        },
+        other => other,
+    }
 }
 
 fn visible_hnsw_entries(

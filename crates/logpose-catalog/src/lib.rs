@@ -49,10 +49,13 @@ impl DatabaseDescriptor {
         validate_namespace_segment("database name", &self.name)?;
         let expected_is_default = self.name == DEFAULT_DATABASE_NAME;
         if self.is_default != expected_is_default {
-            return Err(LogPoseError::Message(format!(
-                "database descriptor is_default must be {expected_is_default} for database '{}'",
-                self.name
-            )));
+            return Err(LogPoseError::invalid_field(
+                "is_default",
+                format!(
+                    "database descriptor is_default must be {expected_is_default} for database '{}'",
+                    self.name
+                ),
+            ));
         }
         Ok(())
     }
@@ -182,10 +185,10 @@ impl CollectionDescriptor {
     /// changes land, the schema moves to the manifest, not this descriptor.
     pub fn schema(&self) -> logpose_types::Result<CollectionSchema> {
         legacy::legacy_schema(self.dimensions, self.metric).map_err(|error| {
-            LogPoseError::Message(format!(
-                "collection '{}' has an invalid schema: {error}",
-                self.name
-            ))
+            LogPoseError::invalid_field(
+                "dimensions",
+                format!("collection '{}' has an invalid schema: {error}", self.name),
+            )
         })
     }
 
@@ -198,23 +201,27 @@ impl CollectionDescriptor {
     fn validated_schema(&self) -> logpose_types::Result<CollectionSchema> {
         self.collection_ref().validate()?;
         if self.dimensions == 0 {
-            return Err(LogPoseError::Message(
-                "dimensions must be greater than 0".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "dimensions",
+                "dimensions must be greater than 0",
             ));
         }
         if self.flush_threshold_ops == 0 {
-            return Err(LogPoseError::Message(
-                "flush_threshold_ops must be greater than 0".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "flush_threshold_ops",
+                "flush_threshold_ops must be greater than 0",
             ));
         }
         if self.flush_threshold_bytes == 0 {
-            return Err(LogPoseError::Message(
-                "flush_threshold_bytes must be greater than 0".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "flush_threshold_bytes",
+                "flush_threshold_bytes must be greater than 0",
             ));
         }
         if self.compaction_threshold_segments <= 1 {
-            return Err(LogPoseError::Message(
-                "compaction_threshold_segments must be greater than 1".to_owned(),
+            return Err(LogPoseError::invalid_field(
+                "compaction_threshold_segments",
+                "compaction_threshold_segments must be greater than 1",
             ));
         }
         self.schema()
@@ -234,8 +241,25 @@ impl CollectionDescriptor {
         legacy::validate_write(&schema, operation.clone())
             .map(|_| ())
             .map_err(|error| {
-                LogPoseError::Message(format!("record '{}' is invalid: {error}", operation.id()))
+                let message = format!("record '{}' is invalid: {error}", operation.id());
+                match legacy_error_field(&error) {
+                    Some(field) => LogPoseError::invalid_field(field, message),
+                    None => LogPoseError::invalid_argument(message),
+                }
             })
+    }
+}
+
+/// The v1 request field a legacy validation error is about: `id`, `vector`, or
+/// `metadata` (with the dynamic key, as `metadata.<key>`).
+fn legacy_error_field(error: &legacy::LegacyError) -> Option<String> {
+    match error {
+        legacy::LegacyError::MetadataNotObject { .. } => Some("metadata".to_owned()),
+        legacy::LegacyError::Record(error) => error.field_name().map(|field| match field {
+            legacy::LEGACY_PRIMARY_KEY_FIELD | legacy::LEGACY_VECTOR_FIELD => field.to_owned(),
+            key => format!("metadata.{key}"),
+        }),
+        legacy::LegacyError::NotLegacyShaped { .. } => None,
     }
 }
 
@@ -246,17 +270,22 @@ fn default_database_name() -> String {
 fn validate_namespace_segment(label: &str, value: &str) -> logpose_types::Result<()> {
     let trimmed = value.trim();
     if value.trim().is_empty() {
-        return Err(LogPoseError::Message(format!("{label} must not be empty")));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not be empty"),
+        ));
     }
     if value.contains('/') {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not contain '/'"
-        )));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not contain '/'"),
+        ));
     }
     if matches!(trimmed, "." | "..") {
-        return Err(LogPoseError::Message(format!(
-            "{label} must not be a relative path component"
-        )));
+        return Err(LogPoseError::invalid_field(
+            label.replace(' ', "_"),
+            format!("{label} must not be a relative path component"),
+        ));
     }
     Ok(())
 }

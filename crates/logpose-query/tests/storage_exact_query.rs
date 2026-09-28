@@ -422,8 +422,7 @@ async fn surfaces_unknown_collection_errors_from_storage() {
 
     assert!(matches!(
         result,
-        Err(QueryError::Storage(LogPoseError::Message(message)))
-            if message.contains("does not exist")
+        Err(QueryError::Storage(LogPoseError::NotFound { .. }))
     ));
 }
 

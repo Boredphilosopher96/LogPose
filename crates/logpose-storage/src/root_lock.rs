@@ -31,7 +31,7 @@ pub(crate) fn lock_root_exclusively(vfs: &dyn Vfs, root: &Path) -> Result<Box<dy
                 holder_pid,
             })
         }
-        Err(error) => Err(LogPoseError::Message(format!(
+        Err(error) => Err(LogPoseError::failed_precondition(format!(
             "failed to take the exclusive lock on '{}': {error}; storage_root must be on a \
              filesystem that supports advisory file locks (flock), such as a local disk, so \
              that two engines cannot serve '{}' at once; move storage_root to such a \

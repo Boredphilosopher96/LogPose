@@ -587,12 +587,10 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
     let ClientError::Status(status) = error else {
         return;
     };
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status
-            .message()
-            .contains("data-only nodes cannot accept control-plane collection lifecycle mutations")
-    );
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains(
+        "is running as 'data' and cannot accept control-plane collection lifecycle mutations"
+    ));
 
     server.abort();
     let _ = server.await;
@@ -769,6 +767,7 @@ fn test_config_with_role(
         storage_root: root.join("data"),
         metadata: Default::default(),
         auth: Default::default(),
+        limits: Default::default(),
     }
 }
 

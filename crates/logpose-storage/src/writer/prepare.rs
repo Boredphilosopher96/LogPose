@@ -57,7 +57,7 @@ pub(crate) fn prepare(
                         let last_seq_no = frame.last_seq_no();
                         if let Err(error) = apply(state, next_seq_no, change) {
                             // Unreachable: the batch was validated against this schema.
-                            let _ = ack.send(Err(LogPoseError::Message(error.to_string())));
+                            let _ = ack.send(Err(LogPoseError::internal(error.to_string())));
                             continue;
                         }
                         prepared.frames.push(frame);
@@ -78,7 +78,7 @@ pub(crate) fn prepare(
                 match schema_frame(&state.schema, next_seq_no, &change) {
                     Ok((frame, schema)) => {
                         if let Err(error) = apply(state, next_seq_no, Change::Schema(schema)) {
-                            let _ = ack.send(Err(LogPoseError::Message(error.to_string())));
+                            let _ = ack.send(Err(LogPoseError::internal(error.to_string())));
                             continue;
                         }
                         prepared.frames.push(frame);
@@ -106,20 +106,22 @@ fn batch_frame(
     ops: Vec<ClientOp>,
 ) -> Result<(WalFrame, Change)> {
     if ops.is_empty() {
-        return Err(LogPoseError::Message(
-            "write batch must include at least one operation".to_owned(),
+        return Err(LogPoseError::invalid_field(
+            "operations",
+            "write batch must include at least one operation",
         ));
     }
     let mut seen = HashSet::with_capacity(ops.len());
     let mut row_ops = Vec::with_capacity(ops.len());
-    for op in ops {
+    for (index, op) in ops.into_iter().enumerate() {
         let pk = op.pk().clone();
         if !seen.insert(WirePk::from(pk.clone())) {
-            return Err(LogPoseError::Message(format!(
-                "write batch includes duplicate record id '{pk}'"
-            )));
+            return Err(LogPoseError::invalid_field(
+                format!("operations[{index}].id"),
+                format!("write batch includes duplicate record id '{pk}'"),
+            ));
         }
-        row_ops.push(row_op(schema, op).map_err(|error| invalid_record(&pk, error))?);
+        row_ops.push(row_op(schema, op).map_err(|error| invalid_record(index, &pk, error))?);
     }
     let count = row_ops.len() as SeqNo;
     let payload = WalPayload::WriteBatch(WriteBatchPayload {
@@ -128,9 +130,7 @@ fn batch_frame(
     });
     let bytes = encode(&payload)?;
     let WalPayload::WriteBatch(batch) = payload else {
-        return Err(LogPoseError::Message(
-            "write batch payload changed kind".to_owned(),
-        ));
+        return Err(LogPoseError::internal("write batch payload changed kind"));
     };
     let frame = WalFrame::write_batch(first_seq_no, first_seq_no + count - 1, bytes)?;
     Ok((
@@ -163,8 +163,11 @@ fn row_op(schema: &CollectionSchema, op: ClientOp) -> std::result::Result<RowOp,
     }
 }
 
-fn invalid_record(pk: &PrimaryKey, error: String) -> LogPoseError {
-    LogPoseError::Message(format!("record '{pk}' is invalid: {error}"))
+fn invalid_record(index: usize, pk: &PrimaryKey, error: String) -> LogPoseError {
+    LogPoseError::invalid_field(
+        format!("operations[{index}]"),
+        format!("record '{pk}' is invalid: {error}"),
+    )
 }
 
 /// Validate a schema change and build its frame. Returns the new schema, not yet applied.
@@ -175,14 +178,12 @@ fn schema_frame(
 ) -> Result<(WalFrame, CollectionSchema)> {
     let mut next = schema.clone();
     change.apply_to(&mut next).map_err(|error| {
-        LogPoseError::Message(format!("invalid schema change {change:?}: {error}"))
+        LogPoseError::invalid_argument(format!("invalid schema change {change:?}: {error}"))
     })?;
     let payload = WalPayload::SchemaChange(SchemaChangePayload { schema: next });
     let bytes = encode(&payload)?;
     let WalPayload::SchemaChange(SchemaChangePayload { schema: next }) = payload else {
-        return Err(LogPoseError::Message(
-            "schema change payload changed kind".to_owned(),
-        ));
+        return Err(LogPoseError::internal("schema change payload changed kind"));
     };
     Ok((WalFrame::schema_change(seq_no, bytes)?, next))
 }

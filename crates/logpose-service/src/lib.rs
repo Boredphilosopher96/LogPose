@@ -21,6 +21,8 @@ use serde as _;
 #[cfg(test)]
 use serde_json as _;
 #[cfg(test)]
+use thiserror as _;
+#[cfg(test)]
 use tokio as _;
 #[cfg(test)]
 use tonic as _;
@@ -30,7 +32,7 @@ use tower as _;
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
-use logpose_query::{QueryError, QueryRequest, QueryResponse, query_exact};
+use logpose_query::{QueryRequest, QueryResponse, query_exact};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
@@ -41,8 +43,8 @@ use logpose_storage_etcd::{
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
-    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus, Snapshot,
-    WriteOperation,
+    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus,
+    ResourceKind, Snapshot, WriteOperation,
 };
 use std::{
     fmt,
@@ -53,44 +55,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use thiserror::Error;
 use tokio::{
     runtime::Handle,
     time::{Duration, Instant, interval, sleep},
 };
 
-/// Service-local result type.
-pub type Result<T> = std::result::Result<T, ServiceError>;
-
-/// Shared service errors mapped from storage and query layers.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum ServiceError {
-    /// The requested resource already exists.
-    #[error("{0}")]
-    AlreadyExists(String),
-    /// The requested resource does not exist.
-    #[error("{0}")]
-    NotFound(String),
-    /// The caller supplied an invalid request.
-    #[error("{0}")]
-    InvalidArgument(String),
-    /// The request is well-formed but cannot be satisfied by the current node state yet.
-    #[error("{0}")]
-    FailedPrecondition(String),
-    /// A per-collection or engine-wide limit is reached; retry after releasing resources or
-    /// waiting.
-    #[error("{0}")]
-    ResourceExhausted(String),
-    /// The caller failed authentication.
-    #[error("{0}")]
-    Unauthenticated(String),
-    /// The caller lacks permission for this operation.
-    #[error("{0}")]
-    PermissionDenied(String),
-    /// The system failed while processing the request.
-    #[error("{0}")]
-    Internal(String),
-}
+/// Service-local result type. Every layer reports the one typed [`LogPoseError`].
+pub type Result<T> = std::result::Result<T, LogPoseError>;
 
 #[derive(Clone)]
 enum CoordinationRuntime {
@@ -472,10 +443,7 @@ impl LogPoseDataService {
         &self,
         request: CreateCollectionRequest,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        self.storage
-            .create_collection(request)
-            .await
-            .map_err(Into::into)
+        self.storage.create_collection(request).await
     }
 
     /// Create a collection with an explicit persisted placement assignment.
@@ -488,7 +456,6 @@ impl LogPoseDataService {
         self.storage
             .create_collection_with_assignment(request, assignment, leader_fence)
             .await
-            .map_err(Into::into)
     }
 
     /// Fetch collection metadata by name.
@@ -501,7 +468,7 @@ impl LogPoseDataService {
 
     /// List all known collections.
     pub async fn list_collections(&self) -> Result<Vec<logpose_catalog::CollectionDescriptor>> {
-        self.storage.list_collections().await.map_err(Into::into)
+        self.storage.list_collections().await
     }
 
     /// Load the persisted placement assignment for a descriptor.
@@ -512,7 +479,6 @@ impl LogPoseDataService {
         self.storage
             .collection_assignment_descriptor(descriptor)
             .await
-            .map_err(Into::into)
     }
 
     /// Return the underlying engine identifier.
@@ -522,15 +488,12 @@ impl LogPoseDataService {
 
     /// Verify whether the backing metadata authority is currently reachable.
     pub async fn metadata_status(&self) -> Result<()> {
-        self.storage.metadata_status().await.map_err(Into::into)
+        self.storage.metadata_status().await
     }
 
     /// Return whether the collection's local on-disk state exists on this node.
     pub async fn has_local_collection(&self, collection_name: &str) -> Result<bool> {
-        self.storage
-            .has_local_collection(collection_name)
-            .await
-            .map_err(Into::into)
+        self.storage.has_local_collection(collection_name).await
     }
 
     /// Return whether the local on-disk descriptor matches the authoritative descriptor.
@@ -541,7 +504,6 @@ impl LogPoseDataService {
         self.storage
             .local_collection_matches_descriptor(descriptor)
             .await
-            .map_err(Into::into)
     }
 
     /// Persist a write batch.
@@ -554,7 +516,6 @@ impl LogPoseDataService {
         self.storage
             .write(&descriptor.lookup_name(), operations)
             .await
-            .map_err(Into::into)
     }
 
     /// Execute a filtered exact query.
@@ -567,10 +528,7 @@ impl LogPoseDataService {
     /// Capture the current read snapshot.
     pub async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .snapshot(&descriptor.lookup_name())
-            .await
-            .map_err(Into::into)
+        self.storage.snapshot(&descriptor.lookup_name()).await
     }
 
     /// Return collection-level stats.
@@ -609,10 +567,7 @@ impl LogPoseDataService {
         descriptor: &logpose_catalog::CollectionDescriptor,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
-        self.storage
-            .stats_descriptor(descriptor, snapshot)
-            .await
-            .map_err(ServiceError::from)
+        self.storage.stats_descriptor(descriptor, snapshot).await
     }
 
     /// Load persisted maintenance state without reconstructing full stats.
@@ -620,10 +575,7 @@ impl LogPoseDataService {
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
-        self.storage
-            .maintenance_status_descriptor(descriptor)
-            .await
-            .map_err(Into::into)
+        self.storage.maintenance_status_descriptor(descriptor).await
     }
 
     /// Resume persisted maintenance for a descriptor when the current runtime can serve it.
@@ -634,25 +586,18 @@ impl LogPoseDataService {
         self.storage
             .recover_maintenance_descriptor(descriptor)
             .await
-            .map_err(Into::into)
     }
 
     /// Flush the mutable delta to a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .flush(&descriptor.lookup_name())
-            .await
-            .map_err(Into::into)
+        self.storage.flush(&descriptor.lookup_name()).await
     }
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .compact(&descriptor.lookup_name())
-            .await
-            .map_err(Into::into)
+        self.storage.compact(&descriptor.lookup_name()).await
     }
 
     /// Inspect arbitrary operator-visible storage state.
@@ -665,7 +610,6 @@ impl LogPoseDataService {
         self.storage
             .inspect(&descriptor.lookup_name(), target)
             .await
-            .map_err(Into::into)
     }
 
     /// Inspect the current manifest.
@@ -692,15 +636,13 @@ impl LogPoseDataService {
         &self,
         collection_name: &str,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        let reference = parse_collection_reference(collection_name).map_err(ServiceError::from)?;
+        let reference = CollectionRef::parse(collection_name)?;
         let descriptor = self
             .storage
             .open_collection(collection_name)
             .await
-            .map_err(|error| qualify_collection_error(error, collection_name))
-            .map_err(ServiceError::from)?;
-        ensure_collection_reference_matches_descriptor(&reference, &descriptor, collection_name)
-            .map_err(ServiceError::from)?;
+            .map_err(|error| qualify_collection_error(error, collection_name))?;
+        ensure_collection_reference_matches_descriptor(&reference, &descriptor, collection_name)?;
         Ok(descriptor)
     }
 
@@ -711,8 +653,9 @@ impl LogPoseDataService {
         read_barrier: Option<Snapshot>,
     ) -> Result<Option<Snapshot>> {
         match (snapshot, read_barrier) {
-            (Some(_), Some(_)) => Err(ServiceError::InvalidArgument(
-                "snapshot and read_barrier cannot be provided together".to_owned(),
+            (Some(_), Some(_)) => Err(LogPoseError::invalid_field(
+                "read_barrier",
+                "snapshot and read_barrier cannot be provided together",
             )),
             (Some(snapshot), None) => Ok(Some(snapshot)),
             (None, None) => Ok(None),
@@ -721,13 +664,13 @@ impl LogPoseDataService {
                 if current.satisfies_read_barrier(&read_barrier) {
                     Ok(Some(current))
                 } else {
-                    Err(ServiceError::FailedPrecondition(format!(
-                        "read barrier generation {}, seq {} is not yet visible; current snapshot is generation {}, seq {}",
-                        read_barrier.manifest_generation,
-                        read_barrier.visible_seq_no,
-                        current.manifest_generation,
-                        current.visible_seq_no
-                    )))
+                    Err(LogPoseError::ReadBarrierNotSatisfied {
+                        collection: collection_name.to_owned(),
+                        required_manifest_generation: read_barrier.manifest_generation,
+                        required_seq_no: read_barrier.visible_seq_no,
+                        visible_manifest_generation: current.manifest_generation,
+                        visible_seq_no: current.visible_seq_no,
+                    })
                 }
             }
         }
@@ -812,17 +755,12 @@ impl LogPoseControlService {
         request: CreateCollectionRequest,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
         match self.config.node_role {
-            NodeRole::Data => {
-                return Err(ServiceError::InvalidArgument(
-                    "data-only nodes cannot accept control-plane collection lifecycle mutations"
-                        .to_owned(),
-                ));
-            }
-            NodeRole::Control => {
-                return Err(ServiceError::InvalidArgument(
-                    "control-only nodes cannot accept control-plane collection lifecycle mutations without a local data plane"
-                        .to_owned(),
-                ));
+            NodeRole::Data | NodeRole::Control => {
+                return Err(LogPoseError::WrongNodeRole {
+                    node: self.config.node_name.clone(),
+                    role: self.config.node_role,
+                    operation: "control-plane collection lifecycle mutations".to_owned(),
+                });
             }
             NodeRole::Combined => {}
         }
@@ -832,7 +770,7 @@ impl LogPoseControlService {
             && let Some(leader_fence) = leader_fence.as_ref()
             && assignment.assigned_node != leader_fence.node_id
         {
-            return Err(ServiceError::InvalidArgument(format!(
+            return Err(LogPoseError::internal(format!(
                 "etcd-backed collection creation requires the active control-plane leader '{}' to own the initial assignment; got '{}'",
                 leader_fence.node_id, assignment.assigned_node
             )));
@@ -849,41 +787,42 @@ impl LogPoseControlService {
     ) -> Result<DatabaseAccessPolicy> {
         match self.config.node_role {
             NodeRole::Data => {
-                return Err(ServiceError::InvalidArgument(
-                    "data-only nodes cannot accept control-plane database policy mutations"
-                        .to_owned(),
-                ));
+                return Err(LogPoseError::WrongNodeRole {
+                    node: self.config.node_name.clone(),
+                    role: self.config.node_role,
+                    operation: "control-plane database policy mutations".to_owned(),
+                });
             }
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog
-            .put_database_access_policy(policy)
-            .map_err(Into::into)
+        self.catalog.put_database_access_policy(policy)
     }
 
     /// Create or replace one database descriptor.
     pub async fn put_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
         match self.config.node_role {
             NodeRole::Data => {
-                return Err(ServiceError::InvalidArgument(
-                    "data-only nodes cannot accept control-plane database mutations".to_owned(),
-                ));
+                return Err(LogPoseError::WrongNodeRole {
+                    node: self.config.node_name.clone(),
+                    role: self.config.node_role,
+                    operation: "control-plane database mutations".to_owned(),
+                });
             }
             NodeRole::Control | NodeRole::Combined => {}
         }
         self.require_local_control_plane_leader().await?;
-        self.catalog.put_database(descriptor).map_err(Into::into)
+        self.catalog.put_database(descriptor)
     }
 
     /// Read one database descriptor.
     pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
-        self.catalog.get_database(database_name).map_err(Into::into)
+        self.catalog.get_database(database_name)
     }
 
     /// List every database descriptor.
     pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
-        self.catalog.list_databases().map_err(Into::into)
+        self.catalog.list_databases()
     }
 
     /// Read one database-scoped access policy.
@@ -891,16 +830,12 @@ impl LogPoseControlService {
         &self,
         database_name: &str,
     ) -> Result<DatabaseAccessPolicy> {
-        self.catalog
-            .get_database_access_policy(database_name)
-            .map_err(Into::into)
+        self.catalog.get_database_access_policy(database_name)
     }
 
     /// Read one persisted principal descriptor.
     pub async fn principal(&self, principal_name: &str) -> Result<Principal> {
-        self.catalog
-            .get_principal(principal_name)
-            .map_err(Into::into)
+        self.catalog.get_principal(principal_name)
     }
 
     /// Return the placement summary for one collection.
@@ -1014,12 +949,10 @@ impl LogPoseControlService {
         for token in &self.config.auth.bootstrap_tokens {
             match self.catalog.get_principal(&token.principal.name) {
                 Ok(_) => {}
-                Err(error) if error.to_string().contains("does not exist") => {
-                    self.catalog
-                        .put_principal(token.principal.clone())
-                        .map_err(ServiceError::from)?;
+                Err(LogPoseError::NotFound { .. }) => {
+                    self.catalog.put_principal(token.principal.clone())?;
                 }
-                Err(error) => return Err(ServiceError::from(error)),
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -1235,16 +1168,16 @@ impl LogPoseControlService {
                 "0",
             )
             .await
-            .map_err(Into::into)
     }
 
     /// Require this runtime to own the active write path for one collection.
     pub async fn require_local_write_ownership(&self, collection_name: &str) -> Result<()> {
         if !matches!(self.config.node_role, NodeRole::Combined | NodeRole::Data) {
-            return Err(ServiceError::InvalidArgument(format!(
-                "node '{}' is running as '{}' and cannot accept data-plane operations",
-                self.config.node_name, self.config.node_role
-            )));
+            return Err(LogPoseError::WrongNodeRole {
+                node: self.config.node_name.clone(),
+                role: self.config.node_role,
+                operation: "data-plane operations".to_owned(),
+            });
         }
         let descriptor = self.data.get_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
@@ -1255,10 +1188,13 @@ impl LogPoseControlService {
             .await?;
         let coordination = self.coordination.snapshot().await;
         if self.coordination_client.is_some() && ownership.is_none() {
-            return Err(ServiceError::InvalidArgument(format!(
-                "collection '{}/{}' has no authoritative shard ownership metadata and cannot accept writes until reconciliation completes",
-                descriptor.database_name, descriptor.name
-            )));
+            return Err(LogPoseError::Unavailable {
+                message: format!(
+                    "collection '{}/{}' has no authoritative shard ownership metadata and cannot accept writes until reconciliation completes",
+                    descriptor.database_name, descriptor.name
+                ),
+                retry_after: Some(logpose_types::error::ROUTING_RETRY_AFTER),
+            });
         }
         let placement = self.local_placement(
             &descriptor,
@@ -1276,14 +1212,11 @@ impl LogPoseControlService {
             .owner_node
             .clone()
             .unwrap_or_else(|| placement.assigned_node.clone());
-        Err(ServiceError::InvalidArgument(format!(
-            "collection '{}/{}' is assigned to node '{}' with role '{}' and is not locally served by node '{}'",
-            descriptor.database_name,
-            descriptor.name,
-            routed_node,
-            placement.assigned_role,
-            self.config.node_name
-        )))
+        Err(LogPoseError::NotOwner {
+            collection: format!("{}/{}", descriptor.database_name, descriptor.name),
+            node: self.config.node_name.clone(),
+            owner_node: Some(routed_node),
+        })
     }
 
     fn role_can_serve_assignment(&self, assigned_role: NodeRole) -> bool {
@@ -1314,7 +1247,7 @@ impl LogPoseControlService {
             };
             if coordination.is_local_leader {
                 let lease_id = coordination.leadership_lease_id.ok_or_else(|| {
-                    ServiceError::Internal(format!(
+                    LogPoseError::internal(format!(
                         "node '{}' reported local leadership without a lease id",
                         self.config.node_name
                     ))
@@ -1325,99 +1258,14 @@ impl LogPoseControlService {
                 }));
             }
             if coordination.leader_node.is_some() || Instant::now() >= deadline {
-                let leader = coordination
-                    .leader_node
-                    .unwrap_or_else(|| "none".to_owned());
-                return Err(ServiceError::InvalidArgument(format!(
-                    "node '{}' is not the active control-plane leader; current leader is '{}'",
-                    self.config.node_name, leader
-                )));
+                return Err(LogPoseError::NotLeader {
+                    node: self.config.node_name.clone(),
+                    leader_node: coordination.leader_node,
+                });
             }
             sleep(Duration::from_millis(25)).await;
         }
     }
-}
-
-impl From<LogPoseError> for ServiceError {
-    fn from(error: LogPoseError) -> Self {
-        match error {
-            LogPoseError::Message(message) => classify_message(message),
-            error @ (LogPoseError::StorageRootLocked { .. }
-            | LogPoseError::CollectionPoisoned { .. }
-            | LogPoseError::SnapshotExpired { .. }) => {
-                ServiceError::FailedPrecondition(error.to_string())
-            }
-            error @ LogPoseError::TooManySnapshots { .. } => {
-                ServiceError::ResourceExhausted(error.to_string())
-            }
-            error @ LogPoseError::TooLarge { .. } => {
-                ServiceError::InvalidArgument(error.to_string())
-            }
-            error @ (LogPoseError::Corrupt { .. }
-            | LogPoseError::WalWriteFailed { .. }
-            | LogPoseError::Io { .. }
-            | LogPoseError::Internal { .. }) => ServiceError::Internal(error.to_string()),
-        }
-    }
-}
-
-impl From<QueryError> for ServiceError {
-    fn from(error: QueryError) -> Self {
-        match error {
-            QueryError::RequestVectorDimensionMismatch { .. }
-            | QueryError::VectorDimensionMismatch { .. }
-            | QueryError::InvalidPredicate(_) => Self::InvalidArgument(error.to_string()),
-            QueryError::StoredVectorDimensionMismatch { .. } => Self::Internal(error.to_string()),
-            QueryError::Storage(error) => error.into(),
-        }
-    }
-}
-
-fn classify_message(message: String) -> ServiceError {
-    if message.contains("already exists") {
-        ServiceError::AlreadyExists(message)
-    } else if message.contains("does not exist") {
-        ServiceError::NotFound(message)
-    } else if message.contains("unsupported")
-        || message.contains("duplicate record id")
-        || message.contains("must include at least one operation")
-        || message.contains("must not be empty")
-        || message.contains("must not contain '/'")
-        || message.contains("must not be a relative path component")
-        || message.contains("must be greater than 0")
-        || message.contains("role binding database_name must match policy database_name")
-        || message.contains("authentication_mode")
-        || message.contains("is_default")
-        || message.contains("invalid snapshot")
-        || message.contains("not the active control-plane leader")
-        || message.contains("already has metadata assignment in etcd")
-        || message.contains("snapshot and read_barrier cannot be provided together")
-        || message.contains("manual reconciliation is required")
-        || message.contains("reconciliation is required")
-        || is_dimension_validation_error(&message)
-        || is_schema_validation_error(&message)
-    {
-        ServiceError::InvalidArgument(message)
-    } else if message.contains("read barrier") {
-        ServiceError::FailedPrecondition(message)
-    } else {
-        ServiceError::Internal(message)
-    }
-}
-
-fn is_dimension_validation_error(message: &str) -> bool {
-    message.contains("record '")
-        && message.contains(" dimensions")
-        && message.contains(" expected ")
-        && message.contains(" found ")
-}
-
-/// Errors from `CollectionDescriptor::validate_operation` ("record '<id>' is
-/// invalid: ...") and from deriving a collection's schema ("collection
-/// '<name>' has an invalid schema: ...") are caused by the request.
-fn is_schema_validation_error(message: &str) -> bool {
-    (message.starts_with("record '") && message.contains("' is invalid: "))
-        || (message.starts_with("collection '") && message.contains("' has an invalid schema: "))
 }
 
 fn http_endpoint(host: &str, port: u16) -> String {
@@ -1428,25 +1276,6 @@ fn http_endpoint(host: &str, port: u16) -> String {
     format!("http://{authority}:{port}")
 }
 
-fn parse_collection_reference(collection_name: &str) -> logpose_types::Result<CollectionRef> {
-    let reference = match collection_name
-        .trim()
-        .split('/')
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [collection_name] => CollectionRef::new_default(*collection_name),
-        [database_name, collection_name] => CollectionRef::new(*database_name, *collection_name),
-        _ => {
-            return Err(LogPoseError::Message(format!(
-                "unsupported collection reference '{collection_name}': expected 'collection' or 'database/collection'"
-            )));
-        }
-    };
-    reference.validate()?;
-    Ok(reference)
-}
-
 fn ensure_collection_reference_matches_descriptor(
     reference: &CollectionRef,
     descriptor: &logpose_catalog::CollectionDescriptor,
@@ -1455,17 +1284,20 @@ fn ensure_collection_reference_matches_descriptor(
     if reference.database_name != descriptor.database_name
         || reference.collection_name != descriptor.name
     {
-        return Err(LogPoseError::Message(format!(
-            "collection '{original_name}' does not exist"
-        )));
+        return Err(LogPoseError::not_found(
+            ResourceKind::Collection,
+            original_name,
+        ));
     }
     Ok(())
 }
 
+/// Report any missing resource on the way to a collection (its database, say) as the
+/// collection the caller named.
 fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPoseError {
     match error {
-        LogPoseError::Message(message) if message.contains("does not exist") => {
-            LogPoseError::Message(format!("collection '{collection_name}' does not exist"))
+        LogPoseError::NotFound { .. } => {
+            LogPoseError::not_found(ResourceKind::Collection, collection_name)
         }
         other => other,
     }
@@ -1490,48 +1322,8 @@ mod tests {
     };
 
     #[test]
-    fn snapshot_token_errors_map_to_failed_precondition_and_resource_exhausted() {
-        let expired = ServiceError::from(LogPoseError::SnapshotExpired {
-            collection: "default/docs".to_owned(),
-            reason: "the token expired".to_owned(),
-        });
-        assert!(
-            matches!(expired, ServiceError::FailedPrecondition(ref message) if message.contains("the token expired")),
-            "{expired:?}"
-        );
-        let exhausted = ServiceError::from(LogPoseError::TooManySnapshots {
-            collection: "default/docs".to_owned(),
-            reason: "64 pins".to_owned(),
-        });
-        assert!(
-            matches!(exhausted, ServiceError::ResourceExhausted(ref message) if message.contains("64 pins")),
-            "{exhausted:?}"
-        );
-    }
-
-    #[test]
-    fn preserves_checksum_style_expected_messages_as_internal_errors() {
-        let error = ServiceError::from(LogPoseError::Message(
-            "checksum mismatch while reading segment 'abc': expected 10, got 11".to_owned(),
-        ));
-
-        assert!(
-            matches!(error, ServiceError::Internal(message) if message.contains("checksum mismatch"))
-        );
-    }
-
-    #[test]
-    fn classifies_reconciliation_failures_as_invalid_argument() {
-        let error = ServiceError::from(LogPoseError::Message(
-            "collection 'default/documents' has authoritative metadata in etcd but local state finalization is still pending; manual reconciliation is required before serving it".to_owned(),
-        ));
-
-        assert!(matches!(error, ServiceError::InvalidArgument(_)));
-    }
-
-    #[test]
     fn parse_collection_reference_accepts_database_collection() {
-        let reference = parse_collection_reference("analytics/documents")
+        let reference = CollectionRef::parse("analytics/documents")
             .expect("database-qualified collection name should parse");
 
         assert_eq!(reference.database_name, "analytics");
@@ -1657,9 +1449,7 @@ mod tests {
                 &self,
                 name: &str,
             ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(ResourceKind::Collection, name))
             }
 
             async fn write(
@@ -1667,15 +1457,17 @@ mod tests {
                 collection_name: &str,
                 _operations: Vec<WriteOperation>,
             ) -> logpose_types::Result<CommitAck> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn scan_exact(
@@ -1683,9 +1475,10 @@ mod tests {
                 collection_name: &str,
                 _snapshot: Option<Snapshot>,
             ) -> logpose_types::Result<Vec<VisibleRecord>> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn ann_search_selected(
@@ -1696,27 +1489,31 @@ mod tests {
                 _request: AnnSearchRequest,
                 _filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
             ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn inspect(
@@ -1771,8 +1568,8 @@ mod tests {
             }
 
             async fn metadata_status(&self) -> logpose_types::Result<()> {
-                Err(LogPoseError::Message(
-                    "etcd metadata operation failed: connection refused".to_owned(),
+                Err(LogPoseError::unavailable(
+                    "etcd metadata operation failed: connection refused",
                 ))
             }
 
@@ -1780,22 +1577,20 @@ mod tests {
                 &self,
                 _request: CreateCollectionRequest,
             ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::Message("unsupported".to_owned()))
+                Err(LogPoseError::internal("unsupported".to_owned()))
             }
 
             async fn open_collection(
                 &self,
                 name: &str,
             ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(ResourceKind::Collection, name))
             }
 
             async fn list_collections(
                 &self,
             ) -> logpose_types::Result<Vec<logpose_catalog::CollectionDescriptor>> {
-                Err(LogPoseError::Message(
+                Err(LogPoseError::internal(
                     "list_collections should not run when metadata is unavailable".to_owned(),
                 ))
             }
@@ -1805,15 +1600,17 @@ mod tests {
                 collection_name: &str,
                 _operations: Vec<WriteOperation>,
             ) -> logpose_types::Result<CommitAck> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn scan_exact(
@@ -1821,9 +1618,10 @@ mod tests {
                 collection_name: &str,
                 _snapshot: Option<Snapshot>,
             ) -> logpose_types::Result<Vec<VisibleRecord>> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn ann_search_selected(
@@ -1834,27 +1632,31 @@ mod tests {
                 _request: AnnSearchRequest,
                 _filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
             ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                Err(LogPoseError::Message(format!(
-                    "collection '{collection_name}' does not exist"
-                )))
+                Err(LogPoseError::not_found(
+                    ResourceKind::Collection,
+                    collection_name,
+                ))
             }
 
             async fn inspect(

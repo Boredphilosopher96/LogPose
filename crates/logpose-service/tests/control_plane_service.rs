@@ -372,7 +372,11 @@ async fn control_only_nodes_reject_control_plane_collection_creation() {
         .expect_err("control-only nodes should reject collection creation");
 
     assert!(
-        error.to_string().contains("without a local data plane"),
+        matches!(
+            &error,
+            logpose_types::LogPoseError::WrongNodeRole { role: logpose_types::NodeRole::Control, operation, .. }
+                if operation == "control-plane collection lifecycle mutations"
+        ),
         "unexpected error: {error}"
     );
 }
@@ -1068,9 +1072,11 @@ async fn data_only_nodes_reject_database_policy_mutation_while_control_only_node
         .expect_err("data-only node should reject policy mutation");
 
     assert!(
-        data_error
-            .to_string()
-            .contains("data-only nodes cannot accept control-plane database policy mutations"),
+        matches!(
+            &data_error,
+            logpose_types::LogPoseError::WrongNodeRole { role: logpose_types::NodeRole::Data, operation, .. }
+                if operation == "control-plane database policy mutations"
+        ),
         "unexpected error: {data_error}"
     );
 

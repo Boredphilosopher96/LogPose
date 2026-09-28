@@ -226,7 +226,7 @@ async fn a_failed_fsync_poisons_the_collection_and_fails_the_group_as_not_applie
     assert!(
         refused
             .to_string()
-            .contains("read-only until it is reopened"),
+            .contains("read-only until the engine is reopened"),
         "{refused}"
     );
     assert_eq!(
@@ -411,44 +411,46 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
     vfs.fail_next_syncs(1);
     let failed = spawn_write(&handle, "n".to_owned());
     assert!(vfs.wait_for_held_sync(Duration::from_secs(10)));
-    let altered = {
-        let handle = Arc::clone(&handle);
-        tokio::spawn(async move {
-            handle
-                .alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
-                    "price",
-                    FieldType::Int64,
-                )))
-                .await
-        })
-    };
-    let large = {
+    // The large batch reaches the idle writer first and is prepared on the query pool behind
+    // the held group; the schema change joins it or queues behind it.
+    let (sending, sent) = tokio::sync::oneshot::channel();
+    let behind = {
         let handle = Arc::clone(&handle);
         tokio::spawn(async move {
             let rows = (0..2 * INLINE_PREPARE_ROWS)
                 .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
                 .collect();
-            handle.write(ops(&handle, rows)).await
+            let large = handle.write(ops(&handle, rows));
+            let altered = handle.alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
+                "price",
+                FieldType::Int64,
+            )));
+            let _ = sending.send(());
+            tokio::join!(large, altered)
         })
     };
+    sent.await.expect("the requests are being sent");
     tokio::time::sleep(Duration::from_millis(300)).await;
     vfs.release_syncs();
 
+    let (large, altered) = behind.await.expect("task should join");
     let results = [
-        ("n", failed.await.expect("task should join")),
-        ("alter", altered.await.expect("task should join")),
-        ("large", large.await.expect("task should join")),
+        ("n", failed.await.expect("task should join"), false),
+        ("large", large, false),
+        ("alter", altered, true),
     ];
-    for (name, result) in results {
+    for (name, result, may_follow_the_poison) in results {
         let error = result.expect_err("nothing in or behind the failed group is acknowledged");
+        let not_applied = matches!(
+            error,
+            LogPoseError::WalWriteFailed {
+                outcome: WriteOutcome::NotApplied,
+                ..
+            }
+        );
+        let refused = matches!(error, LogPoseError::CollectionPoisoned { .. });
         assert!(
-            matches!(
-                error,
-                LogPoseError::WalWriteFailed {
-                    outcome: WriteOutcome::NotApplied,
-                    ..
-                }
-            ),
+            not_applied || (may_follow_the_poison && refused),
             "{name}: {error}"
         );
     }
@@ -556,6 +558,62 @@ async fn a_group_prepared_during_a_drop_that_does_not_commit_is_forgotten() {
         .expect("collection should reopen");
     assert_eq!(handle.visible_seq_no(), 3);
     assert_eq!(visible(&handle).keys().collect::<Vec<_>>(), expected);
+}
+
+/// Shutdown while writers wait: one group is in flight, one is prepared behind it, one request
+/// is queued and another waits for room in the full request queue. The engine's drop finishes
+/// the group in flight (acknowledged), fails everything else with an error, and returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_answers_every_waiting_writer_and_returns() {
+    let fault = FaultVfs::new(15);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let engine = Engine::open(
+        vfs.clone(),
+        ROOT,
+        EngineConfig {
+            group: GroupCommitConfig {
+                request_queue_depth: 1,
+                ..GroupCommitConfig::default()
+            },
+            ..config("boot")
+        },
+    )
+    .expect("engine should open");
+    let handle = create(&engine, "stopping");
+
+    vfs.hold_syncs();
+    let in_flight = spawn_write(&handle, "in-flight".to_owned());
+    assert!(vfs.wait_for_held_sync(Duration::from_secs(10)));
+    let mut waiting = Vec::new();
+    for index in 0..3 {
+        waiting.push(spawn_write(&handle, format!("waiting-{index}")));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (done, dropped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(engine);
+        let _ = done.send(());
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    vfs.release_syncs();
+    let returned =
+        tokio::task::spawn_blocking(move || dropped.recv_timeout(Duration::from_secs(60)).is_ok())
+            .await
+            .expect("waiter should join");
+    assert!(returned, "the engine drop hung");
+
+    in_flight
+        .await
+        .expect("task should join")
+        .expect("the group in flight commits");
+    for task in waiting {
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("every waiting writer is answered")
+            .expect("task should join")
+            .expect_err("nothing after the shutdown is acknowledged");
+    }
 }
 
 /// The WAL rotation a flush begins with appends and syncs a checkpoint group to the new file.
@@ -889,6 +947,13 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     for round in 0..3 {
+        // A flush of an empty delta publishes nothing, and the job is fast enough that the
+        // writers may not have published a group since the previous flush's commit.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while handle.current().delta_len() == 0 {
+            assert!(Instant::now() < deadline, "the writers stopped writing");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let flushed = tokio::time::timeout(Duration::from_secs(20), {
             let handle = Arc::clone(&handle);
             engine.job(move |core| core.flush_collection(&handle))

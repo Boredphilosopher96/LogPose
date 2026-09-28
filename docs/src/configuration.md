@@ -24,4 +24,26 @@ When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is 
 
 `storage_root` belongs to one server process at a time. On startup the server takes an exclusive lock on `storage_root/LOCK` and holds it until exit; a second server pointed at the same directory exits with an error naming the directory and the pid holding it. The lock is released automatically when the owning process exits, so a stale `LOCK` file needs no cleanup. The lock is an advisory `flock`, so `storage_root` must live on a filesystem that supports it: startup fails with an error naming `LOCK` on filesystems that reject file locks, and network mounts that only lock locally (for example NFS mounted with `nolock`) cannot keep servers on different hosts apart.
 
+## Request Size Limits
+
+The optional `[limits]` table caps request sizes on both API listeners:
+
+```toml
+[limits]
+max_rest_body_bytes = 16777216     # 16 MiB, the default
+max_grpc_message_bytes = 16777216  # 16 MiB, the default
+```
+
+- `max_rest_body_bytes` caps a REST request body. A larger body gets HTTP
+  `413` with code `RESOURCE_EXHAUSTED` and reason `TOO_LARGE`; the error's
+  metadata reports `limit_bytes` and, when the request declared a
+  `Content-Length`, `size_bytes`.
+- `max_grpc_message_bytes` caps one decoded gRPC request message. A larger
+  message gets `RESOURCE_EXHAUSTED` with reason `TOO_LARGE`. Each message of a
+  `BulkWriteCollection` stream is one batch and is checked on its own, so
+  bulk ingest is bounded per batch, not per stream.
+
+Both values must be greater than 0. Either key may be omitted to keep its
+default.
+
 `node_name` must not be `local`. That token is reserved for anonymous local placement metadata created by raw storage-engine workflows.

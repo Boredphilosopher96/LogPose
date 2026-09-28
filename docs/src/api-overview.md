@@ -53,15 +53,109 @@ REST  :  http://127.0.0.1:8080/v1/...
 gRPC  :  logpose.v1.LogPoseService
 ```
 
-## Common Response Schemas
+## Errors
 
-Every error from the REST surface returns the same envelope:
+Errors are typed from storage to the wire. Every error has a canonical code,
+a stable machine-readable `reason`, and structured details, and both
+transports report the same values. Nothing is classified by message text.
+
+REST returns the code's HTTP status and this body:
 
 ```json
 {
-  "error": "human-readable description of the failure"
+  "code": "UNAVAILABLE",
+  "message": "collection 'default/embeddings' is not locally served by node 'node-a'; it is served by node 'node-b'",
+  "details": {
+    "reason": "NOT_OWNER",
+    "metadata": {
+      "collection": "default/embeddings",
+      "node": "node-a",
+      "owner_node": "node-b"
+    },
+    "field_violations": [],
+    "retry_after_ms": 1000
+  }
 }
 ```
+
+- `code` is one of the codes below, named like the gRPC status code.
+- `details.reason` is stable and more specific than `code`.
+- `details.metadata` holds the error's structured fields as strings.
+- `details.field_violations` names the offending request fields, such as
+  `operations[2].vector`, for `INVALID_ARGUMENT` errors that know them.
+- `details.retry_after_ms` is present when retrying is expected to help. REST
+  also sends it as a `Retry-After` header in whole seconds, rounded up.
+
+gRPC returns the same code as the status code and the message as the status
+message. The `grpc-status-details-bin` trailer holds a `google.rpc.Status`
+with a `google.rpc.ErrorInfo` (the `reason`, domain `logpose`, and the
+`metadata`), a `google.rpc.BadRequest` with the field violations, and a
+`google.rpc.RetryInfo` with the retry hint. The retry hint is also sent as the
+ASCII trailer `retry-after-ms` for clients that do not decode rich details.
+
+| Code                  | HTTP  | gRPC                  | Meaning                                                          |
+|-----------------------|-------|-----------------------|------------------------------------------------------------------|
+| `INVALID_ARGUMENT`    | `400` | `INVALID_ARGUMENT`    | The request is malformed or fails validation                     |
+| `NOT_FOUND`           | `404` | `NOT_FOUND`           | A named resource, or a route (path and method), does not exist   |
+| `ALREADY_EXISTS`      | `409` | `ALREADY_EXISTS`      | A resource the request creates already exists                    |
+| `FAILED_PRECONDITION` | `409` | `FAILED_PRECONDITION` | The node or collection is not in the state the request needs     |
+| `UNAUTHENTICATED`     | `401` | `UNAUTHENTICATED`     | Missing or invalid bearer token                                  |
+| `PERMISSION_DENIED`   | `403` | `PERMISSION_DENIED`   | The principal may not do this                                    |
+| `RESOURCE_EXHAUSTED`  | `413` | `RESOURCE_EXHAUSTED`  | The request exceeds a size limit (`429` for other exhaustion)    |
+| `UNAVAILABLE`         | `503` | `UNAVAILABLE`         | This node cannot serve the request now; retry, maybe elsewhere   |
+| `DATA_LOSS`           | `500` | `DATA_LOSS`           | Stored data is corrupt                                           |
+| `INTERNAL`            | `500` | `INTERNAL`            | An unexpected server failure                                     |
+
+<!-- markdownlint-disable MD060 -->
+| Reason                       | Code                  | Metadata                                                        | Retry hint |
+|------------------------------|-----------------------|-----------------------------------------------------------------|------------|
+| `INVALID_ARGUMENT`           | `INVALID_ARGUMENT`    | field violation when the field is known                         | no         |
+| `DIMENSION_MISMATCH`         | `INVALID_ARGUMENT`    | `expected_dimensions`, `actual_dimensions`, `record_id`         | no         |
+| `INVALID_CONFIG`             | `INVALID_ARGUMENT`    |                                                                 | no         |
+| `TOO_LARGE`                  | `RESOURCE_EXHAUSTED`  | `what`, `limit_bytes`, `size_bytes` when known                  | no         |
+| `RESOURCE_NOT_FOUND`         | `NOT_FOUND`           | `resource_type`, `resource_name`                                | no         |
+| `RESOURCE_ALREADY_EXISTS`    | `ALREADY_EXISTS`      | `resource_type`, `resource_name`                                | no         |
+| `FAILED_PRECONDITION`        | `FAILED_PRECONDITION` |                                                                 | no         |
+| `WRONG_NODE_ROLE`            | `FAILED_PRECONDITION` | `node`, `node_role`                                             | no         |
+| `RECONCILIATION_REQUIRED`    | `FAILED_PRECONDITION` | `collection`                                                    | no         |
+| `STORAGE_ROOT_LOCKED`        | `FAILED_PRECONDITION` | `storage_root`, `holder_pid`                                    | no         |
+| `SNAPSHOT_EXPIRED`           | `FAILED_PRECONDITION` | `collection`                                                    | no         |
+| `TOO_MANY_SNAPSHOTS`         | `RESOURCE_EXHAUSTED`  | `collection`                                                    | no         |
+| `UNAUTHENTICATED`            | `UNAUTHENTICATED`     |                                                                 | no         |
+| `PERMISSION_DENIED`          | `PERMISSION_DENIED`   |                                                                 | no         |
+| `NOT_OWNER`                  | `UNAVAILABLE`         | `collection`, `node`, `owner_node` when known                   | 1 s        |
+| `NOT_LEADER`                 | `UNAVAILABLE`         | `node`, `leader_node` when known                                | 1 s        |
+| `READ_BARRIER_NOT_SATISFIED` | `FAILED_PRECONDITION` | `collection`, `required_manifest_generation`, `required_seq_no`, `visible_manifest_generation`, `visible_seq_no` | no |
+| `UNAVAILABLE`                | `UNAVAILABLE`         |                                                                 | sometimes  |
+| `COLLECTION_POISONED`        | `FAILED_PRECONDITION` | `collection`                                                    | no         |
+| `WAL_WRITE_FAILED`           | `UNAVAILABLE` (`not_applied`) or `INTERNAL` (`unknown_*`) | `collection`, `outcome` (`not_applied`, `unknown_fenced`, `unknown_unfenced`) | no |
+| `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
+| `IO_ERROR`                   | `INTERNAL`            | `io_error_kind`                                                 | no         |
+| `INTERNAL`                   | `INTERNAL`            |                                                                 | no         |
+<!-- markdownlint-enable MD060 -->
+
+`NOT_OWNER` and `NOT_LEADER` mean the request reached the wrong node: send it
+to `owner_node` or `leader_node` when the error names one, or retry after the
+hint. `COLLECTION_POISONED` means a storage failure made the collection
+read-only until an operator reopens the engine; reads keep working. Do not
+retry it automatically. `WAL_WRITE_FAILED` is the error of the writes whose WAL
+group could not be made durable, which also poisons the collection: with
+`outcome` `not_applied` the write is definitely absent (`UNAVAILABLE`); with
+`unknown_fenced` or `unknown_unfenced` it may still appear after recovery, so
+treat it like a timeout (`INTERNAL`).
+
+## Request Size Limits
+
+| Setting                         | Default | Over the limit                                                |
+| `limits.max_rest_body_bytes`    | 16 MiB  | HTTP `413`, `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`          |
+| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                 |
+| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                  |
+
+The gRPC limit applies to each request message, so each batch of a
+`BulkWriteCollection` stream is checked on its own. See
+[Configuration](configuration.md).
+
+## Common Response Schemas
 
 Snapshot references are used across writes, queries, flushes, and compactions:
 
@@ -74,13 +168,14 @@ Snapshot references are used across writes, queries, flushes, and compactions:
 
 An exact snapshot stays readable only while its manifest generation is current.
 Every flush and compaction publishes a new generation; after that, a read of a
-snapshot from an older generation fails with `FAILED_PRECONDITION` (the storage
-error is `SnapshotExpired`) unless a snapshot token pins that state. Tokens
+snapshot from an older generation fails with `FAILED_PRECONDITION` (reason
+`SNAPSHOT_EXPIRED`) unless a snapshot token pins that state. Tokens
 are an engine interface for now (`LocalStorageEngine::pin_snapshot`); the API
 exposes them with the new read path. Queries without an explicit snapshot
 restart on their own when a flush lands between their storage reads. Pinning
 more snapshots than a collection allows, or more retired memory than the
-engine allows, fails with `RESOURCE_EXHAUSTED` (HTTP 429).
+engine allows, fails with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`,
+HTTP 429).
 
 Collection-scoped write/query/flush/compact/inspect responses flatten
 `database_name` and `collection_name` into the top-level JSON
@@ -260,8 +355,9 @@ curl -X POST http://127.0.0.1:8080/v1/collections \
 | Status | Meaning                                       |
 |--------|-----------------------------------------------|
 | `201`  | Collection created                            |
-| `400`  | Invalid request or wrong node role            |
-| `409`  | Collection already exists                     |
+| `400`  | Invalid request                               |
+| `409`  | Collection already exists, or wrong node role |
+| `413`  | Request body too large                        |
 
 gRPC equivalent:
 
@@ -290,8 +386,9 @@ curl http://127.0.0.1:8080/v1/collections/embeddings
 | Status | Meaning                            |
 |--------|------------------------------------|
 | `200`  | Collection descriptor              |
-| `400`  | Reconciliation or namespace error  |
+| `400`  | Invalid namespace                  |
 | `404`  | Collection not found               |
+| `409`  | Reconciliation required            |
 
 ### Get Collection Placement
 
@@ -381,17 +478,53 @@ anything is written, and one invalid operation rejects the whole batch:
   fields, so they cannot be named `id` or `vector`, the collection's
   declared key and vector fields, or `$extra`, which is reserved.
 
-| Status | Meaning                                     |
-|--------|---------------------------------------------|
-| `200`  | Write committed                             |
-| `400`  | Invalid request or collection not servable  |
-| `404`  | Collection not found                        |
+| Status | Meaning                                                                                       |
+|--------|-----------------------------------------------------------------------------------------------|
+| `200`  | Write committed                                                                               |
+| `400`  | Invalid request; see `field_violations`                                                       |
+| `404`  | Collection not found                                                                          |
+| `409`  | Wrong node role, or collection read-only until the engine is reopened (`COLLECTION_POISONED`) |
+| `413`  | Request body too large                                                                        |
+| `503`  | Not the owner (`NOT_OWNER`)                                                                   |
 
 gRPC equivalent:
 
 ```protobuf
 rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
 ```
+
+### Bulk Write (gRPC only)
+
+`BulkWriteCollection` is a client-streaming RPC for bulk ingest. REST has no
+equivalent; REST clients send batches to `POST /v1/collections/{name}/writes`.
+
+```protobuf
+rpc BulkWriteCollection(stream BulkWriteCollectionRequest) returns (BulkWriteCollectionReply);
+```
+
+- The first message names the collection (`collection_name`, and
+  `database_name` for non-default databases). Later messages may leave both
+  empty, or must repeat the same values.
+- Each message is one batch, validated and committed atomically exactly like
+  one `WriteCollection` call.
+- Batches commit in stream order, one at a time. The server reads the next
+  message only after the previous batch commits, so HTTP/2 flow control
+  pushes back on a client that sends faster than the collection commits.
+- Each message must fit `limits.max_grpc_message_bytes`.
+- When every batch commits, the reply reports `committed_batches`,
+  `applied_ops`, the `last_seq_no` of the last batch, and a `snapshot` that
+  includes every batch.
+- The first failing batch fails the RPC with that batch's error code and
+  reason, and the server stops reading. Every earlier batch is committed; the
+  failed batch and everything after it are not. The error's `ErrorInfo`
+  metadata reports `failed_batch_index` (zero-based), `committed_batches`,
+  `committed_operations`, and `last_committed_seq_no` when a batch was
+  committed, so a client can resume from `failed_batch_index`.
+- If the client cancels or disconnects, a batch that is being committed still
+  commits or fails as a whole, and once the server sees the cancellation it
+  starts no further batch, even one the client sent before cancelling. Resume
+  after checking what is visible.
+- An empty stream is `INVALID_ARGUMENT`.
 
 ### Query Collection
 
@@ -468,9 +601,11 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | Status | Meaning                                  |
 |--------|------------------------------------------|
 | `200`  | Query returned                           |
-| `400`  | Invalid request or collection not servable |
+| `400`  | Invalid request                          |
 | `404`  | Collection not found                     |
-| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+| `409`  | Wrong node role, read barrier not visible (`READ_BARRIER_NOT_SATISFIED`), or read barriers rejected after ownership promotion until freshness metadata exists |
+| `413`  | Request body too large                   |
+| `503`  | Not the owner (`NOT_OWNER`)              |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
@@ -581,9 +716,10 @@ curl http://127.0.0.1:8080/v1/collections/embeddings/stats
 | Status | Meaning                                  |
 |--------|------------------------------------------|
 | `200`  | Collection stats returned                |
-| `400`  | Invalid request or collection not locally servable |
+| `400`  | Invalid request                          |
 | `404`  | Collection not found                     |
-| `412`  | Read barrier not yet visible on this node, or rejected after ownership promotion until freshness metadata exists |
+| `409`  | Wrong node role, read barrier not visible (`READ_BARRIER_NOT_SATISFIED`), or read barriers rejected after ownership promotion until freshness metadata exists |
+| `503`  | Not the owner (`NOT_OWNER`)              |
 <!-- markdownlint-enable MD060 -->
 
 gRPC equivalent:
@@ -694,17 +830,30 @@ The full gRPC contract is defined in `proto/logpose/v1/logpose.proto`:
 service LogPoseService {
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataReply);
   rpc GetRuntimeStatus(GetRuntimeStatusRequest) returns (GetRuntimeStatusReply);
+  rpc PutDatabase(PutDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc GetDatabase(GetDatabaseRequest) returns (DatabaseDescriptorReply);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesReply);
   rpc CreateCollection(CreateCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollection(GetCollectionRequest) returns (CollectionDescriptorReply);
   rpc GetCollectionPlacement(GetCollectionPlacementRequest) returns (CollectionPlacementReply);
   rpc WriteCollection(WriteCollectionRequest) returns (CommitAckReply);
+  rpc BulkWriteCollection(stream BulkWriteCollectionRequest) returns (BulkWriteCollectionReply);
   rpc QueryCollection(QueryCollectionRequest) returns (QueryCollectionReply);
   rpc GetCollectionStats(GetCollectionStatsRequest) returns (CollectionStatsReply);
   rpc FlushCollection(FlushCollectionRequest) returns (SnapshotReply);
   rpc CompactCollection(CompactCollectionRequest) returns (SnapshotReply);
   rpc InspectCollection(InspectCollectionRequest) returns (InspectCollectionReply);
+  rpc PutDatabasePolicy(PutDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
+  rpc GetDatabasePolicy(GetDatabasePolicyRequest) returns (DatabaseAccessPolicyReply);
 }
 ```
+
+Every RPC has a REST operation whose `operationId` is the RPC name in
+lower camel case, except `BulkWriteCollection` (gRPC only). `GET /health` is
+REST only; gRPC serves the standard `grpc.health.v1.Health` service. The
+`api_contract` test in `crates/logpose-api-rest/tests` enforces this, checks
+that the router serves exactly the documented routes and methods, and
+validates the OpenAPI document.
 
 ## Distance Metrics
 
@@ -720,6 +869,7 @@ service LogPoseService {
 |---------|-------------------------------------|
 | REST    | `openapi/logpose.v1.yaml`           |
 | gRPC    | `proto/logpose/v1/logpose.proto`    |
+| Errors  | `crates/logpose-types/src/error.rs` |
 
 ## Current Limits
 

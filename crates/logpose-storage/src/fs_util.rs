@@ -2,9 +2,9 @@
 
 use crate::{
     durable_fs::{create_dir_all_synced, read_file, sync_parent_dir, write_file_synced},
-    error::{io_message, json_message},
+    error::{io_message, json_corrupt},
 };
-use logpose_types::{LogPoseError, Result};
+use logpose_types::{CorruptionKind, LogPoseError, Result};
 use logpose_vfs::{CrashPoint, Vfs};
 use serde::Deserialize;
 use std::{
@@ -17,7 +17,8 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let bytes = read_file(vfs, path, "failed to read JSON file")?;
-    serde_json::from_slice(&bytes).map_err(json_message)
+    serde_json::from_slice(&bytes)
+        .map_err(|error| json_corrupt(CorruptionKind::Descriptor, path, &error))
 }
 
 /// Durably replace `path` with `bytes`: write a temp file, fsync it, rename it into place, and
@@ -66,7 +67,7 @@ fn replace_atomically(vfs: &dyn Vfs, path: &Path, bytes: Vec<u8>) -> Result<()> 
 pub(crate) fn crash_point(vfs: &dyn Vfs, point: Option<CrashPoint>) -> Result<()> {
     match point {
         Some(point) => vfs.crash_point(point).map_err(|error| {
-            LogPoseError::Message(format!("interrupted at crash point {point:?}: {error}"))
+            LogPoseError::io(format!("interrupted at crash point {point:?}"), error)
         }),
         None => Ok(()),
     }

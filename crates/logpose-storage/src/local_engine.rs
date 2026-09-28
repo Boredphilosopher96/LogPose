@@ -28,8 +28,9 @@ use logpose_index::{
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus,
-    NodeRole, RecordId, Result, SeqNo, Snapshot, VisibleRecord, WriteOperation,
+    CollectionStats, CommitAck, CorruptionKind, DistanceMetric, LeadershipFence, LogPoseError,
+    MaintenanceStatus, NodeRole, RecordId, ResourceKind, Result, SeqNo, Snapshot, VisibleRecord,
+    WriteOperation,
 };
 use logpose_vfs::{Vfs, std_vfs};
 use serde_json::{Value, json};
@@ -329,7 +330,7 @@ impl StorageEngine for LocalStorageEngine {
             .assignment
             .clone()
             .ok_or_else(|| {
-                LogPoseError::Message(format!(
+                LogPoseError::internal(format!(
                     "collection '{}' is missing placement metadata",
                     descriptor.name
                 ))
@@ -556,10 +557,13 @@ impl EngineCore {
         {
             let hnsw_path = descriptor.root_path.join("indexes").join(
                 segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                    LogPoseError::Message(format!(
-                        "segment '{}' is missing hnsw artifact metadata",
-                        segment.segment_id
-                    ))
+                    LogPoseError::corrupt(
+                        CorruptionKind::Manifest,
+                        format!(
+                            "segment '{}' is missing hnsw artifact metadata",
+                            segment.segment_id
+                        ),
+                    )
                 })?,
             );
             let segment_candidates = match self.read_current_hnsw_sidecar(&hnsw_path)? {
@@ -683,7 +687,7 @@ impl EngineCore {
                     .legacy_segments()
                     .find(|segment| segment.segment_id == segment_id)
                     .ok_or_else(|| {
-                        LogPoseError::Message(format!("segment '{segment_id}' does not exist"))
+                        LogPoseError::not_found(ResourceKind::Segment, segment_id.clone())
                     })?;
                 let records = read_segment_file(
                     self.vfs.as_ref(),
@@ -694,18 +698,24 @@ impl EngineCore {
                 )?;
                 let index = self.read_flat_sidecar(&descriptor.root_path.join("indexes").join(
                     segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
-                        LogPoseError::Message(format!(
-                            "segment '{}' is missing flat artifact metadata",
-                            segment.segment_id
-                        ))
+                        LogPoseError::corrupt(
+                            CorruptionKind::Manifest,
+                            format!(
+                                "segment '{}' is missing flat artifact metadata",
+                                segment.segment_id
+                            ),
+                        )
                     })?,
                 ))?;
                 let hnsw = self.read_hnsw_sidecar(&descriptor.root_path.join("indexes").join(
                     segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                        LogPoseError::Message(format!(
-                            "segment '{}' is missing hnsw artifact metadata",
-                            segment.segment_id
-                        ))
+                        LogPoseError::corrupt(
+                            CorruptionKind::Manifest,
+                            format!(
+                                "segment '{}' is missing hnsw artifact metadata",
+                                segment.segment_id
+                            ),
+                        )
                     })?,
                 ))?;
                 Ok(InspectReport {

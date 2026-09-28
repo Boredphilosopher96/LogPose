@@ -1,22 +1,29 @@
 //! gRPC API surface for LogPose.
 
+mod bulk;
+mod error;
+#[cfg(test)]
+mod test_support;
+
+pub use error::{ERROR_DOMAIN, RETRY_AFTER_METADATA_KEY, grpc_code, status_from_error};
+
+use error::{MessageLimitLayer, respond, unauthenticated};
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};
 use logpose_core::{AppState, RequestAuth};
 use logpose_query::{
     ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryDiagnostics,
     QueryPlanKind, QueryRequest, QueryStageTimings, ScalarMetadataValue,
 };
-use logpose_service::ServiceError;
 use logpose_storage::CreateCollectionRequest as StorageCreateCollectionRequest;
 use logpose_types::{
     CollectionPlacement, CoordinationStatus, DEFAULT_DATABASE_NAME, DeleteRecord, DistanceMetric,
-    MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord, QueryUnitStats,
-    RecordId, ScalarFieldStats, Snapshot, WriteOperation,
+    LogPoseError, MaintenanceBacklog, MaintenanceStatus, NodeRole, NodeRuntimeStatus, PutRecord,
+    QueryUnitStats, RecordId, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use serde_json::{Number, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{Request, Response, Status, Streaming, transport::Server};
 use tonic_health::server::health_reporter;
 use tracing::info;
 
@@ -27,6 +34,7 @@ pub mod proto {
 }
 
 use proto::log_pose_service_server::{LogPoseService, LogPoseServiceServer};
+use proto::{BulkWriteCollectionReply, BulkWriteCollectionRequest};
 use proto::{
     CollectionDescriptorReply, CollectionPlacementReply, CollectionStatsReply, CommitAckReply,
     CompactCollectionRequest, CoordinationStatusReply, CreateCollectionRequest,
@@ -52,6 +60,9 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Serve the gRPC API over an existing listener.
+///
+/// Request messages above `limits.max_grpc_message_bytes` are rejected with
+/// `RESOURCE_EXHAUSTED` and a typed `TOO_LARGE` error.
 pub async fn serve_with_listener(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
@@ -64,9 +75,14 @@ pub async fn serve_with_listener(
 
     info!(%address, "starting gRPC listener");
 
+    let message_limit = state.config.limits.max_grpc_message_bytes;
     Server::builder()
+        .layer(MessageLimitLayer::new(message_limit))
         .add_service(health_service)
-        .add_service(LogPoseServiceServer::new(GrpcLogPoseService::new(state)))
+        .add_service(
+            LogPoseServiceServer::new(GrpcLogPoseService::new(state))
+                .max_decoding_message_size(message_limit),
+        )
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
 
@@ -91,80 +107,186 @@ impl GrpcLogPoseService {
 impl LogPoseService for GrpcLogPoseService {
     async fn get_metadata(
         &self,
-        _request: Request<GetMetadataRequest>,
+        request: Request<GetMetadataRequest>,
     ) -> Result<Response<GetMetadataReply>, Status> {
-        Ok(Response::new(metadata_reply_from_domain(
-            self.state.metadata(),
-        )))
+        respond(self.get_metadata_inner(request).await)
     }
 
     async fn get_runtime_status(
         &self,
         request: Request<GetRuntimeStatusRequest>,
     ) -> Result<Response<GetRuntimeStatusReply>, Status> {
-        let auth = request_auth_from_metadata(&request)?;
-        let status = self
-            .state
-            .runtime_status_with_auth(&auth)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(runtime_status_reply_from_domain(status)))
+        respond(self.get_runtime_status_inner(request).await)
     }
 
     async fn put_database(
         &self,
         request: Request<PutDatabaseRequest>,
     ) -> Result<Response<DatabaseDescriptorReply>, Status> {
-        let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let descriptor = request
-            .descriptor
-            .ok_or_else(|| Status::invalid_argument("database descriptor payload is required"))?;
-        let stored = self
-            .state
-            .put_database_with_auth(&auth, database_descriptor_from_proto(descriptor)?)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(database_descriptor_to_proto(stored)))
+        respond(self.put_database_inner(request).await)
     }
 
     async fn get_database(
         &self,
         request: Request<GetDatabaseRequest>,
     ) -> Result<Response<DatabaseDescriptorReply>, Status> {
-        let auth = request_auth_from_metadata(&request)?;
-        let request = request.into_inner();
-        let database_name = normalize_database_name(&request.database_name);
-        let descriptor = self
-            .state
-            .database_with_auth(&auth, &database_name)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(database_descriptor_to_proto(descriptor)))
+        respond(self.get_database_inner(request).await)
     }
 
     async fn list_databases(
         &self,
         request: Request<ListDatabasesRequest>,
     ) -> Result<Response<ListDatabasesReply>, Status> {
-        let auth = request_auth_from_metadata(&request)?;
-        let descriptors = self
-            .state
-            .databases_with_auth(&auth)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(ListDatabasesReply {
-            databases: descriptors
-                .into_iter()
-                .map(database_descriptor_to_proto)
-                .collect(),
-        }))
+        respond(self.list_databases_inner(request).await)
     }
 
     async fn create_collection(
         &self,
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CollectionDescriptorReply>, Status> {
+        respond(self.create_collection_inner(request).await)
+    }
+
+    async fn get_collection_placement(
+        &self,
+        request: Request<GetCollectionPlacementRequest>,
+    ) -> Result<Response<CollectionPlacementReply>, Status> {
+        respond(self.get_collection_placement_inner(request).await)
+    }
+
+    async fn get_collection(
+        &self,
+        request: Request<GetCollectionRequest>,
+    ) -> Result<Response<CollectionDescriptorReply>, Status> {
+        respond(self.get_collection_inner(request).await)
+    }
+
+    async fn write_collection(
+        &self,
+        request: Request<WriteCollectionRequest>,
+    ) -> Result<Response<CommitAckReply>, Status> {
+        respond(self.write_collection_inner(request).await)
+    }
+
+    async fn bulk_write_collection(
+        &self,
+        request: Request<Streaming<BulkWriteCollectionRequest>>,
+    ) -> Result<Response<BulkWriteCollectionReply>, Status> {
+        respond(bulk::bulk_write_collection(Arc::clone(&self.state), request).await)
+    }
+
+    async fn query_collection(
+        &self,
+        request: Request<QueryCollectionRequest>,
+    ) -> Result<Response<QueryCollectionReply>, Status> {
+        respond(self.query_collection_inner(request).await)
+    }
+
+    async fn get_collection_stats(
+        &self,
+        request: Request<GetCollectionStatsRequest>,
+    ) -> Result<Response<CollectionStatsReply>, Status> {
+        respond(self.get_collection_stats_inner(request).await)
+    }
+
+    async fn flush_collection(
+        &self,
+        request: Request<FlushCollectionRequest>,
+    ) -> Result<Response<SnapshotReply>, Status> {
+        respond(self.flush_collection_inner(request).await)
+    }
+
+    async fn compact_collection(
+        &self,
+        request: Request<CompactCollectionRequest>,
+    ) -> Result<Response<SnapshotReply>, Status> {
+        respond(self.compact_collection_inner(request).await)
+    }
+
+    async fn inspect_collection(
+        &self,
+        request: Request<InspectCollectionRequest>,
+    ) -> Result<Response<InspectCollectionReply>, Status> {
+        respond(self.inspect_collection_inner(request).await)
+    }
+
+    async fn put_database_policy(
+        &self,
+        request: Request<PutDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        respond(self.put_database_policy_inner(request).await)
+    }
+
+    async fn get_database_policy(
+        &self,
+        request: Request<GetDatabasePolicyRequest>,
+    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+        respond(self.get_database_policy_inner(request).await)
+    }
+}
+
+impl GrpcLogPoseService {
+    async fn get_metadata_inner(
+        &self,
+        _request: Request<GetMetadataRequest>,
+    ) -> Result<GetMetadataReply, LogPoseError> {
+        Ok(metadata_reply_from_domain(self.state.metadata()))
+    }
+
+    async fn get_runtime_status_inner(
+        &self,
+        request: Request<GetRuntimeStatusRequest>,
+    ) -> Result<GetRuntimeStatusReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let status = self.state.runtime_status_with_auth(&auth).await?;
+        Ok(runtime_status_reply_from_domain(status))
+    }
+
+    async fn put_database_inner(
+        &self,
+        request: Request<PutDatabaseRequest>,
+    ) -> Result<DatabaseDescriptorReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let descriptor = request.descriptor.ok_or_else(|| {
+            LogPoseError::invalid_argument("database descriptor payload is required")
+        })?;
+        let stored = self
+            .state
+            .put_database_with_auth(&auth, database_descriptor_from_proto(descriptor)?)
+            .await?;
+        Ok(database_descriptor_to_proto(stored))
+    }
+
+    async fn get_database_inner(
+        &self,
+        request: Request<GetDatabaseRequest>,
+    ) -> Result<DatabaseDescriptorReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let request = request.into_inner();
+        let database_name = normalize_database_name(&request.database_name);
+        let descriptor = self.state.database_with_auth(&auth, &database_name).await?;
+        Ok(database_descriptor_to_proto(descriptor))
+    }
+
+    async fn list_databases_inner(
+        &self,
+        request: Request<ListDatabasesRequest>,
+    ) -> Result<ListDatabasesReply, LogPoseError> {
+        let auth = request_auth_from_metadata(&request)?;
+        let descriptors = self.state.databases_with_auth(&auth).await?;
+        Ok(ListDatabasesReply {
+            databases: descriptors
+                .into_iter()
+                .map(database_descriptor_to_proto)
+                .collect(),
+        })
+    }
+
+    async fn create_collection_inner(
+        &self,
+        request: Request<CreateCollectionRequest>,
+    ) -> Result<CollectionDescriptorReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let descriptor = self
@@ -178,15 +300,14 @@ impl LogPoseService for GrpcLogPoseService {
                     metric_from_proto(request.metric)?,
                 ),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(collection_descriptor_reply(descriptor)))
+            .await?;
+        Ok(collection_descriptor_reply(descriptor))
     }
 
-    async fn get_collection_placement(
+    async fn get_collection_placement_inner(
         &self,
         request: Request<GetCollectionPlacementRequest>,
-    ) -> Result<Response<CollectionPlacementReply>, Status> {
+    ) -> Result<CollectionPlacementReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let placement = self
@@ -195,17 +316,14 @@ impl LogPoseService for GrpcLogPoseService {
                 &auth,
                 &collection_lookup_key(&request.database_name, &request.collection_name),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(collection_placement_reply_from_domain(
-            placement,
-        )))
+            .await?;
+        Ok(collection_placement_reply_from_domain(placement))
     }
 
-    async fn get_collection(
+    async fn get_collection_inner(
         &self,
         request: Request<GetCollectionRequest>,
-    ) -> Result<Response<CollectionDescriptorReply>, Status> {
+    ) -> Result<CollectionDescriptorReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let descriptor = self
@@ -214,23 +332,18 @@ impl LogPoseService for GrpcLogPoseService {
                 &auth,
                 &collection_lookup_key(&request.database_name, &request.collection_name),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(collection_descriptor_reply(descriptor)))
+            .await?;
+        Ok(collection_descriptor_reply(descriptor))
     }
 
-    async fn write_collection(
+    async fn write_collection_inner(
         &self,
         request: Request<WriteCollectionRequest>,
-    ) -> Result<Response<CommitAckReply>, Status> {
+    ) -> Result<CommitAckReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
-        let operations = request
-            .operations
-            .into_iter()
-            .map(write_operation_from_proto)
-            .collect::<Result<Vec<_>, _>>()?;
+        let operations = write_operations_from_proto(request.operations)?;
         let ack = self
             .state
             .write_with_auth(
@@ -238,26 +351,28 @@ impl LogPoseService for GrpcLogPoseService {
                 &collection_lookup_key(&database_name, &request.collection_name),
                 operations,
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(CommitAckReply {
+            .await?;
+        Ok(CommitAckReply {
             last_seq_no: ack.last_seq_no,
             applied_ops: ack.applied_ops as u64,
             database_name,
             collection_name: request.collection_name,
             snapshot: Some(snapshot_message_from_domain(ack.snapshot)),
-        }))
+        })
     }
 
-    async fn query_collection(
+    async fn query_collection_inner(
         &self,
         request: Request<QueryCollectionRequest>,
-    ) -> Result<Response<QueryCollectionReply>, Status> {
+    ) -> Result<QueryCollectionReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
         if request.top_k == 0 {
-            return Err(Status::invalid_argument("top_k must be greater than 0"));
+            return Err(LogPoseError::invalid_field(
+                "top_k",
+                "top_k must be greater than 0",
+            ));
         }
         let filters = request
             .filters
@@ -283,9 +398,8 @@ impl LogPoseService for GrpcLogPoseService {
                     explain: explain_mode_from_proto(request.explain)?,
                 },
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(QueryCollectionReply {
+            .await?;
+        Ok(QueryCollectionReply {
             metric: proto_metric(response.metric) as i32,
             top_k: response.top_k as u64,
             returned: response.returned as u64,
@@ -296,7 +410,7 @@ impl LogPoseService for GrpcLogPoseService {
                 .map(|candidate| {
                     let metadata_json =
                         serde_json::to_string(&candidate.metadata).map_err(|error| {
-                            Status::internal(format!(
+                            LogPoseError::internal(format!(
                                 "failed to serialize query match metadata: {error}"
                             ))
                         })?;
@@ -306,20 +420,20 @@ impl LogPoseService for GrpcLogPoseService {
                         metadata_json,
                     })
                 })
-                .collect::<Result<Vec<_>, Status>>()?,
+                .collect::<Result<Vec<_>, LogPoseError>>()?,
             diagnostics: response
                 .diagnostics
                 .map(query_diagnostics_to_proto)
                 .transpose()?,
             database_name,
             collection_name: request.collection_name,
-        }))
+        })
     }
 
-    async fn get_collection_stats(
+    async fn get_collection_stats_inner(
         &self,
         request: Request<GetCollectionStatsRequest>,
-    ) -> Result<Response<CollectionStatsReply>, Status> {
+    ) -> Result<CollectionStatsReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
@@ -331,15 +445,14 @@ impl LogPoseService for GrpcLogPoseService {
                 request.snapshot.map(snapshot_from_proto),
                 request.read_barrier.map(snapshot_from_proto),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(collection_stats_reply_from_domain(stats)?))
+            .await?;
+        collection_stats_reply_from_domain(stats)
     }
 
-    async fn flush_collection(
+    async fn flush_collection_inner(
         &self,
         request: Request<FlushCollectionRequest>,
-    ) -> Result<Response<SnapshotReply>, Status> {
+    ) -> Result<SnapshotReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
@@ -349,19 +462,18 @@ impl LogPoseService for GrpcLogPoseService {
                 &auth,
                 &collection_lookup_key(&database_name, &request.collection_name),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(snapshot_reply_from_domain(
+            .await?;
+        Ok(snapshot_reply_from_domain(
             snapshot,
             database_name,
             request.collection_name,
-        )))
+        ))
     }
 
-    async fn compact_collection(
+    async fn compact_collection_inner(
         &self,
         request: Request<CompactCollectionRequest>,
-    ) -> Result<Response<SnapshotReply>, Status> {
+    ) -> Result<SnapshotReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
@@ -371,19 +483,18 @@ impl LogPoseService for GrpcLogPoseService {
                 &auth,
                 &collection_lookup_key(&database_name, &request.collection_name),
             )
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(snapshot_reply_from_domain(
+            .await?;
+        Ok(snapshot_reply_from_domain(
             snapshot,
             database_name,
             request.collection_name,
-        )))
+        ))
     }
 
-    async fn inspect_collection(
+    async fn inspect_collection_inner(
         &self,
         request: Request<InspectCollectionRequest>,
-    ) -> Result<Response<InspectCollectionReply>, Status> {
+    ) -> Result<InspectCollectionReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
@@ -395,61 +506,59 @@ impl LogPoseService for GrpcLogPoseService {
                 &collection_lookup_key(&database_name, &request.collection_name),
                 target,
             )
-            .await
-            .map_err(status_from_service_error)?;
+            .await?;
         let payload_json = serde_json::to_string(&report.payload).map_err(|error| {
-            Status::internal(format!("failed to serialize inspect payload: {error}"))
+            LogPoseError::internal(format!("failed to serialize inspect payload: {error}"))
         })?;
-        Ok(Response::new(InspectCollectionReply {
+        Ok(InspectCollectionReply {
             target: report.target,
             payload_json,
             database_name,
             collection_name: request.collection_name,
-        }))
+        })
     }
 
-    async fn put_database_policy(
+    async fn put_database_policy_inner(
         &self,
         request: Request<PutDatabasePolicyRequest>,
-    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let policy = request
             .policy
-            .ok_or_else(|| Status::invalid_argument("database policy payload is required"))?;
+            .ok_or_else(|| LogPoseError::invalid_argument("database policy payload is required"))?;
         let policy = database_access_policy_from_proto(policy)?;
         let stored = self
             .state
             .set_database_access_policy_with_auth(&auth, policy)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(stored)))
+            .await?;
+        Ok(database_access_policy_to_proto(stored))
     }
 
-    async fn get_database_policy(
+    async fn get_database_policy_inner(
         &self,
         request: Request<GetDatabasePolicyRequest>,
-    ) -> Result<Response<DatabaseAccessPolicyReply>, Status> {
+    ) -> Result<DatabaseAccessPolicyReply, LogPoseError> {
         let auth = request_auth_from_metadata(&request)?;
         let request = request.into_inner();
         let database_name = normalize_database_name(&request.database_name);
         let policy = self
             .state
             .database_access_policy_with_auth(&auth, &database_name)
-            .await
-            .map_err(status_from_service_error)?;
-        Ok(Response::new(database_access_policy_to_proto(policy)))
+            .await?;
+        Ok(database_access_policy_to_proto(policy))
     }
 }
 
-fn metric_from_proto(metric: i32) -> Result<DistanceMetric, Status> {
+fn metric_from_proto(metric: i32) -> Result<DistanceMetric, LogPoseError> {
     match proto::DistanceMetric::try_from(metric).unwrap_or(proto::DistanceMetric::Unspecified) {
         proto::DistanceMetric::Cosine => Ok(DistanceMetric::Cosine),
         proto::DistanceMetric::Dot => Ok(DistanceMetric::Dot),
         proto::DistanceMetric::L2 => Ok(DistanceMetric::L2),
-        proto::DistanceMetric::Unspecified => {
-            Err(Status::invalid_argument("distance metric must be set"))
-        }
+        proto::DistanceMetric::Unspecified => Err(LogPoseError::invalid_field(
+            "metric",
+            "distance metric must be set",
+        )),
     }
 }
 
@@ -461,16 +570,36 @@ fn proto_metric(metric: DistanceMetric) -> proto::DistanceMetric {
     }
 }
 
-fn write_operation_from_proto(operation: proto::WriteOperation) -> Result<WriteOperation, Status> {
+/// Convert a batch of proto operations, naming a bad one by its index (`operations[2].put.id`).
+fn write_operations_from_proto(
+    operations: Vec<proto::WriteOperation>,
+) -> Result<Vec<WriteOperation>, LogPoseError> {
+    operations
+        .into_iter()
+        .enumerate()
+        .map(|(index, operation)| {
+            write_operation_from_proto(operation)
+                .map_err(|error| error.with_field_prefix(&format!("operations[{index}]")))
+        })
+        .collect()
+}
+
+fn write_operation_from_proto(
+    operation: proto::WriteOperation,
+) -> Result<WriteOperation, LogPoseError> {
     match operation.operation {
         Some(proto::write_operation::Operation::Put(put)) => {
             if put.id.is_empty() {
-                return Err(Status::invalid_argument(
+                return Err(LogPoseError::invalid_field(
+                    "put.id",
                     "put operation record id must not be empty",
                 ));
             }
             let metadata = serde_json::from_str::<Value>(&put.metadata_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid metadata_json: {error}"))
+                LogPoseError::invalid_field(
+                    "put.metadata_json",
+                    format!("invalid metadata_json: {error}"),
+                )
             })?;
             Ok(WriteOperation::Put(PutRecord {
                 id: RecordId::new(put.id),
@@ -480,7 +609,8 @@ fn write_operation_from_proto(operation: proto::WriteOperation) -> Result<WriteO
         }
         Some(proto::write_operation::Operation::Delete(delete)) => {
             if delete.id.is_empty() {
-                return Err(Status::invalid_argument(
+                return Err(LogPoseError::invalid_field(
+                    "delete.id",
                     "delete operation record id must not be empty",
                 ));
             }
@@ -488,26 +618,28 @@ fn write_operation_from_proto(operation: proto::WriteOperation) -> Result<WriteO
                 id: RecordId::new(delete.id),
             }))
         }
-        None => Err(Status::invalid_argument(
+        None => Err(LogPoseError::invalid_argument(
             "write operation must include put or delete",
         )),
     }
 }
 
-fn metadata_filter_from_proto(filter: proto::MetadataFilter) -> Result<MetadataFilter, Status> {
+fn metadata_filter_from_proto(
+    filter: proto::MetadataFilter,
+) -> Result<MetadataFilter, LogPoseError> {
     let value = filter
         .value
-        .ok_or_else(|| Status::invalid_argument("metadata filter value is required"))?;
+        .ok_or_else(|| LogPoseError::invalid_argument("metadata filter value is required"))?;
     Ok(MetadataFilter {
         field: filter.field,
         value: scalar_value_from_proto(value)?,
     })
 }
 
-fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, Status> {
+fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, LogPoseError> {
     match predicate
         .node
-        .ok_or_else(|| Status::invalid_argument("predicate node is required"))?
+        .ok_or_else(|| LogPoseError::invalid_argument("predicate node is required"))?
     {
         proto::predicate::Node::And(list) => Ok(FilterExpr::And {
             children: list
@@ -525,7 +657,7 @@ fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, Statu
         }),
         proto::predicate::Node::Not(node) => Ok(FilterExpr::Not {
             child: Box::new(predicate_from_proto(*node.child.ok_or_else(|| {
-                Status::invalid_argument("not predicate child is required")
+                LogPoseError::invalid_argument("not predicate child is required")
             })?)?),
         }),
         proto::predicate::Node::Comparison(comparison) => Ok(FilterExpr::Comparison(
@@ -536,7 +668,7 @@ fn predicate_from_proto(predicate: proto::Predicate) -> Result<FilterExpr, Statu
 
 fn predicate_comparison_from_proto(
     comparison: proto::PredicateComparison,
-) -> Result<FilterComparison, Status> {
+) -> Result<FilterComparison, LogPoseError> {
     Ok(FilterComparison {
         field: comparison.field,
         operator: predicate_operator_from_proto(comparison.operator)?,
@@ -544,7 +676,7 @@ fn predicate_comparison_from_proto(
     })
 }
 
-fn predicate_operator_from_proto(operator: i32) -> Result<FilterOperator, Status> {
+fn predicate_operator_from_proto(operator: i32) -> Result<FilterOperator, LogPoseError> {
     match proto::PredicateOperator::try_from(operator)
         .unwrap_or(proto::PredicateOperator::Unspecified)
     {
@@ -556,15 +688,15 @@ fn predicate_operator_from_proto(operator: i32) -> Result<FilterOperator, Status
         proto::PredicateOperator::Gte => Ok(FilterOperator::Gte),
         proto::PredicateOperator::Exists => Ok(FilterOperator::Exists),
         proto::PredicateOperator::IsNull => Ok(FilterOperator::IsNull),
-        proto::PredicateOperator::Unspecified => Err(Status::invalid_argument(
+        proto::PredicateOperator::Unspecified => Err(LogPoseError::invalid_argument(
             "predicate comparison operator must be set",
         )),
     }
 }
 
-fn explain_mode_from_proto(mode: i32) -> Result<ExplainMode, Status> {
+fn explain_mode_from_proto(mode: i32) -> Result<ExplainMode, LogPoseError> {
     match proto::ExplainMode::try_from(mode)
-        .map_err(|_| Status::invalid_argument("explain mode must be a valid enum value"))?
+        .map_err(|_| LogPoseError::invalid_argument("explain mode must be a valid enum value"))?
     {
         proto::ExplainMode::None => Ok(ExplainMode::None),
         proto::ExplainMode::Plan => Ok(ExplainMode::Plan),
@@ -572,7 +704,7 @@ fn explain_mode_from_proto(mode: i32) -> Result<ExplainMode, Status> {
     }
 }
 
-fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue, Status> {
+fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue, LogPoseError> {
     match value.kind {
         Some(proto::scalar_value::Kind::StringValue(value)) => {
             Ok(ScalarMetadataValue::String(value))
@@ -585,14 +717,16 @@ fn scalar_value_from_proto(value: ScalarValue) -> Result<ScalarMetadataValue, St
         }
         Some(proto::scalar_value::Kind::DoubleValue(value)) => Number::from_f64(value)
             .map(ScalarMetadataValue::Number)
-            .ok_or_else(|| Status::invalid_argument("double scalar value must be finite")),
+            .ok_or_else(|| LogPoseError::invalid_argument("double scalar value must be finite")),
         Some(proto::scalar_value::Kind::BoolValue(value)) => Ok(ScalarMetadataValue::Bool(value)),
         Some(proto::scalar_value::Kind::NullValue(_)) => Ok(ScalarMetadataValue::Null),
-        None => Err(Status::invalid_argument("scalar value kind is required")),
+        None => Err(LogPoseError::invalid_argument(
+            "scalar value kind is required",
+        )),
     }
 }
 
-fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue, Status> {
+fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue, LogPoseError> {
     let kind = match value {
         ScalarMetadataValue::String(value) => proto::scalar_value::Kind::StringValue(value),
         ScalarMetadataValue::Number(value) => {
@@ -603,7 +737,9 @@ fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue, Stat
             } else if let Some(value) = value.as_f64() {
                 proto::scalar_value::Kind::DoubleValue(value)
             } else {
-                return Err(Status::internal("numeric scalar value must be finite"));
+                return Err(LogPoseError::internal(
+                    "numeric scalar value must be finite",
+                ));
             }
         }
         ScalarMetadataValue::Bool(value) => proto::scalar_value::Kind::BoolValue(value),
@@ -615,15 +751,16 @@ fn scalar_value_to_proto(value: ScalarMetadataValue) -> Result<ScalarValue, Stat
 fn inspect_target_from_proto(
     target: i32,
     segment_id: String,
-) -> Result<logpose_storage::InspectTarget, Status> {
-    match InspectTarget::try_from(target)
-        .map_err(|_| Status::invalid_argument(format!("unsupported inspect target '{target}'")))?
-    {
+) -> Result<logpose_storage::InspectTarget, LogPoseError> {
+    match InspectTarget::try_from(target).map_err(|_| {
+        LogPoseError::invalid_argument(format!("unsupported inspect target '{target}'"))
+    })? {
         InspectTarget::Manifest => Ok(logpose_storage::InspectTarget::Manifest),
         InspectTarget::Wal => Ok(logpose_storage::InspectTarget::Wal),
         InspectTarget::Segment => {
             if segment_id.is_empty() {
-                Err(Status::invalid_argument(
+                Err(LogPoseError::invalid_field(
+                    "segment_id",
                     "segment_id is required when inspect target is SEGMENT",
                 ))
             } else {
@@ -663,7 +800,7 @@ fn snapshot_reply_from_domain(
 
 fn query_diagnostics_to_proto(
     diagnostics: QueryDiagnostics,
-) -> Result<proto::QueryDiagnostics, Status> {
+) -> Result<proto::QueryDiagnostics, LogPoseError> {
     Ok(proto::QueryDiagnostics {
         chosen_plan: query_plan_kind_to_proto(diagnostics.chosen_plan) as i32,
         planner_reason: diagnostics.planner_reason,
@@ -733,11 +870,11 @@ fn database_descriptor_to_proto(
 
 fn database_descriptor_from_proto(
     descriptor: DatabaseDescriptorReply,
-) -> Result<logpose_catalog::DatabaseDescriptor, Status> {
+) -> Result<logpose_catalog::DatabaseDescriptor, LogPoseError> {
     Ok(logpose_catalog::DatabaseDescriptor {
         database_id: descriptor.database_id.parse().map_err(
             |error: logpose_types::LogPoseError| {
-                Status::invalid_argument(format!("invalid database_id: {error}"))
+                LogPoseError::invalid_argument(format!("invalid database_id: {error}"))
             },
         )?,
         name: descriptor.name,
@@ -826,7 +963,7 @@ fn coordination_status_to_proto(status: CoordinationStatus) -> CoordinationStatu
 
 fn collection_stats_reply_from_domain(
     stats: logpose_types::CollectionStats,
-) -> Result<CollectionStatsReply, Status> {
+) -> Result<CollectionStatsReply, LogPoseError> {
     Ok(CollectionStatsReply {
         collection_id: stats.collection_id.to_string(),
         collection_name: stats.collection_name,
@@ -860,7 +997,7 @@ fn database_access_policy_to_proto(policy: DatabaseAccessPolicy) -> DatabaseAcce
 
 fn database_access_policy_from_proto(
     policy: DatabaseAccessPolicyReply,
-) -> Result<DatabaseAccessPolicy, Status> {
+) -> Result<DatabaseAccessPolicy, LogPoseError> {
     Ok(DatabaseAccessPolicy {
         database_name: normalize_database_name(&policy.database_name),
         authentication_mode: authentication_mode_from_proto(policy.authentication_mode)?,
@@ -882,7 +1019,7 @@ fn database_role_binding_to_proto(binding: DatabaseRoleBinding) -> DatabaseRoleB
 
 fn database_role_binding_from_proto(
     binding: DatabaseRoleBindingReply,
-) -> Result<DatabaseRoleBinding, Status> {
+) -> Result<DatabaseRoleBinding, LogPoseError> {
     Ok(DatabaseRoleBinding {
         database_name: normalize_database_name(&binding.database_name),
         principal_name: binding.principal_name,
@@ -932,17 +1069,17 @@ fn authentication_mode_to_proto(mode: AuthenticationMode) -> proto::Authenticati
     }
 }
 
-fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, Status> {
+fn authentication_mode_from_proto(mode: i32) -> Result<AuthenticationMode, LogPoseError> {
     match proto::AuthenticationMode::try_from(mode).map_err(|_| {
-        Status::invalid_argument(format!("unsupported authentication mode '{mode}'"))
+        LogPoseError::invalid_argument(format!("unsupported authentication mode '{mode}'"))
     })? {
         proto::AuthenticationMode::Disabled => Ok(AuthenticationMode::Disabled),
         proto::AuthenticationMode::Password => Ok(AuthenticationMode::Password),
         proto::AuthenticationMode::MutualTls => Ok(AuthenticationMode::MutualTls),
         proto::AuthenticationMode::ExternalToken => Ok(AuthenticationMode::ExternalToken),
-        proto::AuthenticationMode::Unspecified => {
-            Err(Status::invalid_argument("authentication mode is required"))
-        }
+        proto::AuthenticationMode::Unspecified => Err(LogPoseError::invalid_argument(
+            "authentication mode is required",
+        )),
     }
 }
 
@@ -954,20 +1091,20 @@ fn database_role_to_proto(role: DatabaseRole) -> proto::DatabaseRole {
     }
 }
 
-fn database_role_from_proto(role: i32) -> Result<DatabaseRole, Status> {
-    match proto::DatabaseRole::try_from(role)
-        .map_err(|_| Status::invalid_argument(format!("unsupported database role '{role}'")))?
-    {
+fn database_role_from_proto(role: i32) -> Result<DatabaseRole, LogPoseError> {
+    match proto::DatabaseRole::try_from(role).map_err(|_| {
+        LogPoseError::invalid_argument(format!("unsupported database role '{role}'"))
+    })? {
         proto::DatabaseRole::Owner => Ok(DatabaseRole::Owner),
         proto::DatabaseRole::ReadWrite => Ok(DatabaseRole::ReadWrite),
         proto::DatabaseRole::ReadOnly => Ok(DatabaseRole::ReadOnly),
         proto::DatabaseRole::Unspecified => {
-            Err(Status::invalid_argument("database role is required"))
+            Err(LogPoseError::invalid_argument("database role is required"))
         }
     }
 }
 
-fn query_unit_stats_to_proto(stats: QueryUnitStats) -> Result<proto::QueryUnitStats, Status> {
+fn query_unit_stats_to_proto(stats: QueryUnitStats) -> Result<proto::QueryUnitStats, LogPoseError> {
     Ok(proto::QueryUnitStats {
         unit_id: stats.unit_id,
         tier: stats.tier,
@@ -999,7 +1136,9 @@ fn query_unit_stats_to_proto(stats: QueryUnitStats) -> Result<proto::QueryUnitSt
     })
 }
 
-fn scalar_field_stats_to_proto(stats: ScalarFieldStats) -> Result<proto::ScalarFieldStats, Status> {
+fn scalar_field_stats_to_proto(
+    stats: ScalarFieldStats,
+) -> Result<proto::ScalarFieldStats, LogPoseError> {
     Ok(proto::ScalarFieldStats {
         present_count: stats.present_count as u64,
         null_count: stats.null_count as u64,
@@ -1014,36 +1153,23 @@ fn scalar_field_stats_to_proto(stats: ScalarFieldStats) -> Result<proto::ScalarF
     })
 }
 
-fn request_auth_from_metadata<T>(request: &Request<T>) -> Result<RequestAuth, Status> {
+fn request_auth_from_metadata<T>(request: &Request<T>) -> Result<RequestAuth, LogPoseError> {
     let value = match request.metadata().get("authorization") {
         Some(value) => value,
         None => return Ok(RequestAuth::default()),
     };
     let value = value
         .to_str()
-        .map_err(|_| Status::unauthenticated("authorization metadata must be valid ASCII"))?;
-    let (scheme, token) = value.split_once(' ').ok_or_else(|| {
-        Status::unauthenticated("authorization metadata must use the Bearer scheme")
-    })?;
+        .map_err(|_| unauthenticated("authorization metadata must be valid ASCII"))?;
+    let (scheme, token) = value
+        .split_once(' ')
+        .ok_or_else(|| unauthenticated("authorization metadata must use the Bearer scheme"))?;
     if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
-        return Err(Status::unauthenticated(
+        return Err(unauthenticated(
             "authorization metadata must use the Bearer scheme",
         ));
     }
     Ok(RequestAuth::bearer_token(token.trim()))
-}
-
-fn status_from_service_error(error: ServiceError) -> Status {
-    match error {
-        ServiceError::AlreadyExists(message) => Status::already_exists(message),
-        ServiceError::NotFound(message) => Status::not_found(message),
-        ServiceError::InvalidArgument(message) => Status::invalid_argument(message),
-        ServiceError::FailedPrecondition(message) => Status::failed_precondition(message),
-        ServiceError::ResourceExhausted(message) => Status::resource_exhausted(message),
-        ServiceError::Unauthenticated(message) => Status::unauthenticated(message),
-        ServiceError::PermissionDenied(message) => Status::permission_denied(message),
-        ServiceError::Internal(message) => Status::internal(message),
-    }
 }
 
 #[cfg(test)]
@@ -1063,17 +1189,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     use tonic::metadata::MetadataValue;
-
-    #[test]
-    fn resource_exhausted_maps_to_the_grpc_resource_exhausted_code() {
-        let status =
-            status_from_service_error(ServiceError::ResourceExhausted("too many pins".to_owned()));
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(status.message(), "too many pins");
-        let status =
-            status_from_service_error(ServiceError::FailedPrecondition("expired".to_owned()));
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
+    use tonic_types::StatusExt;
 
     #[test]
     fn query_diagnostics_to_proto_preserves_ann_fields() {
@@ -1343,6 +1459,14 @@ mod tests {
             .await
             .expect_err("unsatisfied read barrier should fail");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.get_details_retry_info().is_none());
+        assert_eq!(
+            error
+                .get_details_error_info()
+                .map(|info| info.reason)
+                .as_deref(),
+            Some("READ_BARRIER_NOT_SATISFIED")
+        );
     }
 
     #[tokio::test]
@@ -1612,11 +1736,11 @@ mod tests {
             .await
             .expect_err("data-only node should reject policy mutation");
 
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(
             error
                 .message()
-                .contains("data-only nodes cannot accept control-plane database mutations")
+                .contains("cannot accept control-plane database mutations")
         );
     }
 
@@ -1805,9 +1929,9 @@ mod tests {
             .await
             .expect_err("data-only node should reject collection creation");
 
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains(
-            "data-only nodes cannot accept control-plane collection lifecycle mutations"
+            "is running as 'data' and cannot accept control-plane collection lifecycle mutations"
         ));
     }
 
@@ -1827,8 +1951,10 @@ mod tests {
             .await
             .expect_err("control-only node should reject collection creation");
 
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("without a local data plane"));
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains(
+            "is running as 'control' and cannot accept control-plane collection lifecycle mutations"
+        ));
     }
 
     #[tokio::test]
@@ -1924,7 +2050,7 @@ mod tests {
         for (operation, error) in errors {
             assert_eq!(
                 error.code(),
-                tonic::Code::InvalidArgument,
+                tonic::Code::FailedPrecondition,
                 "{operation} should be rejected on control-only nodes"
             );
             assert!(
@@ -2027,8 +2153,16 @@ mod tests {
         for (operation, error) in errors {
             assert_eq!(
                 error.code(),
-                tonic::Code::InvalidArgument,
+                tonic::Code::Unavailable,
                 "{operation} should be rejected for recorded remote assignments"
+            );
+            assert_eq!(
+                error
+                    .get_details_error_info()
+                    .map(|info| info.reason)
+                    .as_deref(),
+                Some("NOT_OWNER"),
+                "{operation} should carry the NOT_OWNER reason"
             );
             assert!(
                 error.message().contains("not locally served"),
