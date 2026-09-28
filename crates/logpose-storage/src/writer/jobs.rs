@@ -1362,15 +1362,49 @@ impl Writer {
     }
 
     /// Fail everything still queued and stop.
-    pub(super) fn stop(&mut self) {
+    ///
+    /// Both channels are closed and then drained with `recv`, which after a close also waits
+    /// for a send that already passed the channel's open check but has not queued its message
+    /// yet. Dropping a receiver, or draining it with `try_recv`, misses such a message: it then
+    /// sits in the channel with its reply sender alive, and its caller (a client write, an
+    /// explicit flush or compaction, a job a test steps by hand, a quiescing drop) waits
+    /// forever, which hangs engine shutdown. Jobs waiting for a permit are withdrawn first, so
+    /// no grant is delivered to the closed channel; a permit already queued is dropped with its
+    /// message, which releases it.
+    pub(super) async fn stop(&mut self) {
         self.requests.close();
+        self.control.close();
+        self.cancel_waiting_jobs();
         if let Some(held) = self.held.take() {
             let _ = held.request.ack().send(Err(shutting_down()));
         }
-        while let Ok(queued) = self.requests.try_recv() {
+        while let Some(queued) = self.requests.recv().await {
             let _ = queued.request.ack().send(Err(shutting_down()));
         }
-        self.cancel_waiting_jobs();
+        while let Some(message) = self.control.recv().await {
+            match message {
+                ControlMsg::JobDone { reply, .. } => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(shutting_down()));
+                    }
+                }
+                ControlMsg::Flush { reply } => {
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(shutting_down()));
+                    }
+                }
+                ControlMsg::Compact { reply } => {
+                    let _ = reply.send(Err(shutting_down()));
+                }
+                ControlMsg::BeginJob { reply, .. } => {
+                    let _ = reply.send(Err(shutting_down()));
+                }
+                ControlMsg::Quiesce { reply } => self.quiesce_waiters.push(reply),
+                ControlMsg::PermitGranted { .. }
+                | ControlMsg::EndJob { .. }
+                | ControlMsg::Shutdown => {}
+            }
+        }
         for job in self.jobs.values_mut() {
             self.compact_waiters.append(&mut job.waiters);
         }

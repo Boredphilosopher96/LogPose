@@ -45,6 +45,8 @@ mod compaction_tests;
 #[cfg(test)]
 mod dv_tests;
 mod jobs;
+#[cfg(test)]
+mod model_tests;
 mod pk_index;
 mod prepare;
 #[cfg(test)]
@@ -646,7 +648,7 @@ impl Writer {
         if let Some(io) = inflight.take() {
             self.finish(io).await;
         }
-        self.stop();
+        self.stop().await;
     }
 
     /// Why the writer refuses new work, if it does.

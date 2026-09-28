@@ -201,7 +201,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .iter()
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be present");
-    assert_eq!(immutable.index_kind, "hnsw");
+    assert_eq!(immutable.index_kind, "exact");
     assert!(
         immutable
             .artifact_stats

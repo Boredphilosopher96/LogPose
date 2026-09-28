@@ -921,7 +921,9 @@ fn select_query_units(stats: &CollectionStats, predicate: Option<&FilterExpr>) -
             selection
                 .exact_immutable_unit_ids
                 .push(unit.unit_id.clone());
-            if unit.index_kind == "hnsw" {
+            // `exact` segments serve ANN candidates by an exact scan until their vector index
+            // sections land.
+            if matches!(unit.index_kind.as_str(), "hnsw" | "exact") {
                 selection.ann_immutable_unit_ids.push(unit.unit_id.clone());
             }
         } else {
