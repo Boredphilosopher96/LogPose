@@ -661,6 +661,23 @@ mod tests {
         assert_eq!(forced.reason, "ACORN walk forced");
     }
 
+    /// ACORN never wins on the calibration workload's shape (128 dimensions, `M = 16`,
+    /// `ef = 64`) but does where a scanned row costs more next to a hop: at 768 dimensions over
+    /// a million rows, a 5 percent filter walks ACORN-1 style.
+    #[test]
+    fn acorn_wins_at_higher_dimensions_but_not_at_the_calibration_shape() {
+        let model = CostModel::default();
+        let choice_at = |dims: usize, matched: u64| {
+            let mut shape = shape(1_000_000, matched);
+            shape.dims = dims;
+            model.decide(&shape, Force::Auto).chosen.choice
+        };
+        for matched in (1..=100).map(|percent| percent * 10_000) {
+            assert_ne!(choice_at(128, matched), Choice::GraphAcorn, "{matched} rows");
+        }
+        assert_eq!(choice_at(768, 50_000), Choice::GraphAcorn);
+    }
+
     #[test]
     fn a_walk_needs_more_matches_than_candidates() {
         let decision = CostModel::default().decide(&shape(1_000_000, 40), Force::Walk);
