@@ -1810,7 +1810,8 @@ fn a_segment_answers_the_same_before_and_after_its_graph_lands() {
     use logpose_storage::{EngineConfig, IndexPolicy, JobKind};
 
     const DIM: usize = 16;
-    const ROWS: u32 = 3_000;
+    // Enough rows that the planner prices a walk below an exact scan of the codes.
+    const ROWS: u32 = 20_000;
     let root_dir = support::unique_temp_dir("storage-graph-lands");
     let engine = Engine::open_local(
         root_dir.path(),

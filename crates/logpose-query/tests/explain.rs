@@ -221,6 +221,8 @@ async fn graph_plans_show_the_walk_its_estimate_and_its_reason() {
         .collect();
     fixture.upsert(records).await;
     fixture.flush().await;
+    // A flushed segment gets its graph from an index build, which the compaction runs.
+    fixture.compact().await;
     let view = fixture.view().await;
     for (force, filter) in [
         (Force::Admit, None),

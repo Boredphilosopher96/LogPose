@@ -296,6 +296,8 @@ async fn graph_searches_over_ties_agree_in_parallel_and_in_sequence() {
     )
     .await;
     scenario.populate().await;
+    // Flushed segments get their graphs from an index build, which the compaction runs.
+    scenario.fixture.compact().await;
     scenario
         .check(
             &[
