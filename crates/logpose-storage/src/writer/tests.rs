@@ -6,8 +6,8 @@ use crate::{
     CreateCollectionRequest, Engine, EngineConfig,
     legacy_view::{legacy_ops, legacy_put},
     test_support::{ControlledVfs, put},
-    version::DeltaOp,
 };
+use logpose_types::record::PrimaryKey;
 use logpose_types::{
     CollectionRef, DistanceMetric, WriteOperation,
     record::Record,
@@ -15,7 +15,7 @@ use logpose_types::{
     value::Value,
 };
 use logpose_vfs::{FaultPlan, FaultVfs, TearMode};
-use logpose_wal::{BootId, codec::WirePk};
+use logpose_wal::BootId;
 use serde_json::json;
 use std::{
     collections::BTreeMap,
@@ -61,25 +61,13 @@ fn ops(handle: &CollectionHandle, operations: Vec<WriteOperation>) -> Vec<Client
 fn visible(handle: &CollectionHandle) -> BTreeMap<String, (SeqNo, serde_json::Value)> {
     let version = handle.current();
     version.check_invariants().expect("invariants hold");
-    let mut latest = BTreeMap::new();
-    for record in version.delta.iter() {
-        match &record.op {
-            DeltaOp::Put(image) => {
-                let put = legacy_put(&version.schema, image).expect("row should read");
-                latest.insert(
-                    put.id.as_str().to_owned(),
-                    Some((record.seq_no, put.metadata)),
-                );
-            }
-            DeltaOp::Delete(pk) => {
-                latest.insert(crate::legacy_view::legacy_id(pk).as_str().to_owned(), None);
-            }
-            DeltaOp::SchemaChange { .. } => {}
-        }
-    }
-    latest
+    version
+        .live_images()
         .into_iter()
-        .filter_map(|(id, value)| value.map(|value| (id, value)))
+        .map(|(seq_no, image)| {
+            let put = legacy_put(&version.schema, &image).expect("row should read");
+            (put.id.as_str().to_owned(), (seq_no, put.metadata))
+        })
         .collect()
 }
 
@@ -162,7 +150,7 @@ async fn an_acknowledged_write_is_immediately_readable_from_another_thread() {
                     let reader = Arc::clone(&handle);
                     let seen = std::thread::spawn(move || {
                         let version = reader.current();
-                        let image = version.delta_image(&WirePk::String(id.clone()));
+                        let image = version.get(&PrimaryKey::from(id.clone()));
                         (version.visible_seq_no, image.map(|(seq_no, _)| seq_no))
                     })
                     .join()
@@ -402,7 +390,7 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
             while !done.load(Ordering::Acquire) {
                 let version = handle.current();
                 seen.fetch_max(version.visible_seq_no, Ordering::AcqRel);
-                seen.fetch_max(version.delta.len() as u64, Ordering::AcqRel);
+                seen.fetch_max(version.counters.total_rows, Ordering::AcqRel);
             }
         })
     };
@@ -792,10 +780,14 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
         .write_blocking(vec![record("a", None, json!({"price": 1, "color": "red"}))])
         .expect("write a");
     // A typed value for an undeclared field is refused... unless it can be dynamic: it moves to
-    // `$extra`, which is the v1 behavior for undeclared keys.
+    // `$extra`, which is the v1 behavior for undeclared keys. The flush freezes the memtable
+    // that holds `a`.
     let (mut ticket, start) = handle.begin_job(JobKind::Flush).expect("flush begins");
-    let frozen = start.version;
-    assert_eq!(frozen.visible_seq_no, 1);
+    let JobWork::Flush(work) = start.work else {
+        unreachable!("the memtable has an operation to flush");
+    };
+    assert_eq!(start.version.visible_seq_no, 1);
+    assert_eq!(start.version.frozen.len(), 1);
 
     // Seq 2..=4, above the flush checkpoint: add `price`, write `b` with a typed price, drop it.
     let added = handle
@@ -842,35 +834,12 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
         "{invalid}"
     );
 
-    // Commit the flush now: the manifest records schema version 4 with checkpoint 1.
-    let segment = core
-        .write_segment_file(
-            handle.descriptor(),
-            &frozen
-                .delta
-                .iter()
-                .filter_map(|record| {
-                    crate::legacy_view::legacy_record(&frozen.schema, record).expect("legacy")
-                })
-                .collect::<Vec<_>>(),
-            crate::segment_v1::SegmentBuild {
-                unit: start.unit,
-                purpose: crate::segment_v1::SegmentPurpose::Flush,
-                origin: crate::manifest::SegmentOrigin::Flush {
-                    first_seq_no: 1,
-                    last_seq_no: 1,
-                },
-                schema_version: frozen.schema.schema_version(),
-            },
-        )
-        .expect("segment should write");
-    ticket.writing_files();
-    ticket
-        .commit(JobCommit::Flush {
-            checkpoint_seq_no: 1,
-            segment: Some(segment),
-        })
-        .expect("flush should commit");
+    // Commit the flush now: the segment has the schema captured at the begin (version 1), and
+    // the manifest records schema version 4 with checkpoint 1.
+    let commit = core
+        .build_flush(&handle, &start.version, start.unit, &work, &mut ticket)
+        .expect("the flush builds");
+    ticket.commit(commit).expect("flush should commit");
     let before = handle.current();
     assert_eq!(before.schema.schema_version(), 4);
     assert_eq!(before.checkpoint_seq_no, 1);
@@ -879,7 +848,7 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
     assert_eq!(before_rows["b"].1, json!({}), "b's price was dropped");
     assert_eq!(before_rows["c"].1, json!({"cost": 9}));
 
-    drop((ticket_guard(), before, handle, core));
+    drop((before, handle, core));
     drop(engine);
     fault.crash();
     let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should reopen");
@@ -893,19 +862,15 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
     // Replay skipped the schema changes the manifest already reflects and read `b` (written
     // under version 2) with version 4: the dropped field's value is gone from the row itself.
     let b = after
-        .delta_image(&WirePk::String("b".to_owned()))
-        .expect("b is in the delta");
+        .get(&PrimaryKey::from("b"))
+        .expect("b is in the memtable");
     assert!(b.1.scalars.is_empty(), "{:?}", b.1);
-    let kinds = after
-        .delta
-        .iter()
-        .map(|record| match record.op {
-            DeltaOp::Put(_) => "put",
-            DeltaOp::Delete(_) => "delete",
-            DeltaOp::SchemaChange { .. } => "schema",
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(kinds, ["schema", "put", "schema", "schema", "put"]);
+    assert_eq!(
+        after.active.op_count(),
+        5,
+        "replay applied the three schema changes and the two writes above the checkpoint"
+    );
+    assert_eq!(after.active.slot_count(), 2);
     handle
         .write_blocking(vec![ClientOp::Upsert(
             Record::new("d")
@@ -914,8 +879,6 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
         )])
         .expect("writes continue with the recovered schema");
 }
-
-fn ticket_guard() {}
 
 /// A continuous stream of writes must not starve maintenance: flushes, a compaction, and a
 /// drop all finish promptly while several clients keep writing.
@@ -936,8 +899,8 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
                         break;
                     }
                     index += 1;
-                    // Keep the delta small enough that a debug-build v1 flush (which builds an
-                    // HNSW sidecar) stays fast; the writer still never goes idle for long.
+                    // Pace the writers so that flushes stay small; the writer still never goes
+                    // idle for long.
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
                 index
@@ -947,10 +910,10 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     for round in 0..3 {
-        // A flush of an empty delta publishes nothing, and the job is fast enough that the
+        // A flush of an empty memtable publishes nothing, and the job is fast enough that the
         // writers may not have published a group since the previous flush's commit.
         let deadline = Instant::now() + Duration::from_secs(20);
-        while handle.current().delta_len() == 0 {
+        while !handle.current().active.has_ops() {
             assert!(Instant::now() < deadline, "the writers stopped writing");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -1165,8 +1128,9 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
         handle.current().manifest_generation > 0
     });
     assert_eq!(
-        visible(&handle).len(),
-        0,
+        handle.current().checkpoint_seq_no,
+        3,
         "the flush checkpointed every write"
     );
+    assert_eq!(visible(&handle).len(), 3, "every write is still visible");
 }

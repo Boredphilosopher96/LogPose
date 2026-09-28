@@ -13,7 +13,7 @@ arc-swap = "1.7"
 async-trait.workspace = true
 bytemuck = "1.25"
 crc32c = "0.6"
-crc32fast = "1.4"
+imbl = "7.0"
 logpose-auth = { path = "../logpose-auth" }
 logpose-catalog = { path = "../logpose-catalog" }
 logpose-index = { path = "../logpose-index" }

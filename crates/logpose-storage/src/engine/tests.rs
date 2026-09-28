@@ -235,7 +235,7 @@ fn a_dropped_collection_refuses_calls_but_pinned_versions_keep_their_data() {
     assert!(engine.collection(&reference("documents")).is_err());
     assert_eq!(pinned.visible_seq_no, 1);
     assert_eq!(
-        pinned.delta.len(),
+        pinned.active.slot_count(),
         1,
         "a pinned version keeps its resident state"
     );
@@ -429,7 +429,8 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
                         version.id,
                         version.visible_seq_no,
                         version.manifest_generation,
-                        version.delta.iter().count(),
+                        version.counters,
+                        version.active.slot_count(),
                     );
                     pinned.push((version, summary));
                     if pinned.len() > 64 {
@@ -442,7 +443,8 @@ fn readers_pin_a_version_while_writes_and_flushes_publish() {
                         version.id,
                         version.visible_seq_no,
                         version.manifest_generation,
-                        version.delta.iter().count(),
+                        version.counters,
+                        version.active.slot_count(),
                     );
                     assert_eq!(now, summary);
                     version.check_invariants().expect("still consistent");

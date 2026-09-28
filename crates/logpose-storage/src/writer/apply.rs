@@ -1,14 +1,30 @@
-//! The one `apply` function shared by the live writer and WAL replay.
+//! The one `apply` function shared by the live writer and WAL replay, and the writer's private
+//! state it advances.
 //!
 //! Both paths feed it the same thing: the decoded content of one WAL data frame and the frame's
 //! first sequence number. The writer calls it while preparing a group (before the group's fsync;
-//! nothing it produces is published until the fsync returns), and recovery and historical reads
-//! call it for every replayed frame. Because the live path and replay run the same code over the
-//! same frames, the recovered state is the state the writer published.
+//! nothing it produces is published until the fsync returns), and recovery calls it for every
+//! replayed frame on top of the segments, their DV files, and the primary-key index rebuilt
+//! from them. Because the live path and replay run the same code over the same frames, the
+//! recovered state is the state the writer published.
+//!
+//! For each row operation with sequence number `seq`:
+//!
+//! 1. `old = pk_index.resolve(pk)`, following forwarding tables.
+//! 2. If there is an `old` row, set its bit in its unit's deletion vector.
+//! 3. A `Put` appends a slot to the active memtable and points the key at it; a `Delete`
+//!    forgets the key (a delete of a missing key changes nothing but still consumes `seq`).
+//!
+//! So an upsert of an existing key never rewrites a slot: it appends one and deletes the old
+//! row, in the same `apply` call, so no `Version` shows zero or two live rows for the key (I5).
 
-use crate::version::{DeltaLog, DeltaOp, DeltaRecord};
+use super::pk_index::PkIndex;
+use crate::{
+    dv::DeletionMap, memtable::MemtableData, segment::SegmentHandle, version::VersionCounters,
+};
 use logpose_types::{
-    CorruptionKind, LogPoseError, Result, SeqNo,
+    CorruptionKind, LogPoseError, Result, RowAddr, SeqNo,
+    record::PrimaryKey,
     schema::{CollectionSchema, FieldRef},
 };
 use logpose_wal::{
@@ -17,12 +33,112 @@ use logpose_wal::{
 };
 use std::sync::Arc;
 
-/// The logical state `apply` advances: the schema as of the last applied operation and the
-/// delta above the manifest checkpoint.
-#[derive(Clone, Debug)]
+/// The writer's private state: the schema, the units, their deletion vectors, the counters, and
+/// the primary-key index. The persistent parts are O(fields) to clone; the index is not cloned
+/// but journaled, so a group that is never appended can be taken back.
 pub(crate) struct LogicalState {
     pub(crate) schema: Arc<CollectionSchema>,
-    pub(crate) delta: DeltaLog,
+    /// The memtable new rows go to.
+    pub(crate) active: MemtableData,
+    /// Memtables frozen for a flush, oldest first.
+    pub(crate) frozen: Vec<Arc<MemtableData>>,
+    /// Segments of the durable manifest, ascending by unit.
+    pub(crate) segments: Arc<[Arc<SegmentHandle>]>,
+    pub(crate) deletes: DeletionMap,
+    pub(crate) counters: VersionCounters,
+    pub(crate) pk: PkIndex,
+    /// Whether an invariant violation fails the write (tests) instead of being counted.
+    pub(crate) strict: bool,
+}
+
+/// The persistent part of a [`LogicalState`], taken before a group is prepared.
+pub(crate) struct Savepoint {
+    schema: Arc<CollectionSchema>,
+    active: MemtableData,
+    frozen: Vec<Arc<MemtableData>>,
+    segments: Arc<[Arc<SegmentHandle>]>,
+    deletes: DeletionMap,
+    counters: VersionCounters,
+}
+
+impl LogicalState {
+    /// The last sequence number applied.
+    pub(crate) fn visible_seq_no(&self) -> SeqNo {
+        self.active.last_seq_no
+    }
+
+    /// Remember the state before a group is prepared and start journaling the key index.
+    pub(crate) fn savepoint(&mut self) -> Savepoint {
+        self.pk.begin_group();
+        Savepoint {
+            schema: Arc::clone(&self.schema),
+            active: self.active.clone(),
+            frozen: self.frozen.clone(),
+            segments: Arc::clone(&self.segments),
+            deletes: self.deletes.clone(),
+            counters: self.counters,
+        }
+    }
+
+    /// Take back everything since `savepoint`: the group was never appended.
+    pub(crate) fn restore(&mut self, savepoint: Savepoint) {
+        self.pk.rollback_group();
+        self.schema = savepoint.schema;
+        self.active = savepoint.active;
+        self.frozen = savepoint.frozen;
+        self.segments = savepoint.segments;
+        self.deletes = savepoint.deletes;
+        self.counters = savepoint.counters;
+    }
+
+    /// The group since the last savepoint was handed to the WAL: it can no longer be taken back.
+    pub(crate) fn release_savepoint(&mut self) {
+        self.pk.end_group();
+    }
+
+    /// The memtable `unit` names, if it is the active or a frozen one.
+    pub(crate) fn memtable(&self, unit: logpose_types::UnitId) -> Option<&MemtableData> {
+        if self.active.unit == unit {
+            return Some(&self.active);
+        }
+        self.frozen
+            .iter()
+            .find(|memtable| memtable.unit == unit)
+            .map(AsRef::as_ref)
+    }
+
+    /// Resolve `pk` to its live row. A forwarding violation (an index entry for a row that was
+    /// already deleted when its unit was retired) fails in strict mode and is otherwise counted
+    /// and treated as absent.
+    pub(crate) fn resolve(
+        &mut self,
+        pk: &PrimaryKey,
+    ) -> std::result::Result<Option<RowAddr>, ApplyError> {
+        match self.pk.resolve(pk) {
+            Ok(addr) => Ok(addr),
+            Err(violation) if self.strict => Err(ApplyError::Invariant(format!(
+                "the primary-key index points key {pk} at {}, a row its job had already \
+                 dropped",
+                violation.addr
+            ))),
+            Err(violation) => {
+                self.pk.violations += 1;
+                tracing::error!(
+                    %pk,
+                    addr = %violation.addr,
+                    "pk forwarding violation: an index entry pointed at a dropped row"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Set `addr`'s deletion bit.
+    fn mark(&mut self, addr: RowAddr) {
+        if self.deletes.mark(addr) {
+            self.counters.deleted_rows += 1;
+        }
+    }
 }
 
 /// The content of one WAL data frame.
@@ -38,13 +154,18 @@ pub(crate) enum Change {
 }
 
 /// Why a frame cannot be applied to the state. Replay reports these as WAL corruption; the live
-/// writer never produces them.
+/// writer never produces the first three.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ApplyError {
     /// A batch validated against a schema newer than the one the log reached.
     BatchFromTheFuture { batch: u64, current: u64 },
     /// A schema change that skips a version.
     SchemaGap { change: u64, current: u64 },
+    /// A row that does not fit the memtable (a key of the wrong type, a value that does not
+    /// decode as its field's type).
+    BadRow(String),
+    /// An engine invariant was violated (strict mode only).
+    Invariant(String),
 }
 
 impl std::fmt::Display for ApplyError {
@@ -59,19 +180,22 @@ impl std::fmt::Display for ApplyError {
                 formatter,
                 "schema change to version {change} does not follow schema version {current}"
             ),
+            Self::BadRow(reason) => write!(formatter, "a row does not fit the schema: {reason}"),
+            Self::Invariant(reason) => write!(formatter, "invariant violated: {reason}"),
         }
     }
 }
 
 /// Apply one WAL data frame, whose first sequence number is `first_seq_no`, to `state`.
 ///
-/// - A batch becomes one delta batch, one sequence number per operation. A batch validated
+/// - A batch applies its row operations in order, one sequence number each. A batch validated
 ///   against an older schema is applied normally, except that values of fields the current
 ///   schema no longer declares are discarded: a later drop hid them, exactly as it did live.
 ///   A batch from a newer schema than the state's is an error.
-/// - A schema change to `current + 1` becomes the state's schema. One at or below the current
-///   version is already reflected (recovery starts from a manifest whose schema may be newer
-///   than its checkpoint) and only consumes its sequence number. Any other version is an error.
+/// - A schema change to `current + 1` becomes the state's schema and the active memtable's. One
+///   at or below the current version is already reflected (recovery starts from a manifest whose
+///   schema may be newer than its checkpoint) and only consumes its sequence number. Any other
+///   version is an error.
 pub(crate) fn apply(
     state: &mut LogicalState,
     first_seq_no: SeqNo,
@@ -89,23 +213,44 @@ pub(crate) fn apply(
                     current,
                 });
             }
-            let records = ops
-                .into_iter()
-                .zip(first_seq_no..)
-                .map(|(op, seq_no)| DeltaRecord {
-                    seq_no,
-                    op: match op {
-                        RowOp::Put(mut image) => {
-                            if schema_version < current {
-                                retain_declared(&state.schema, &mut image);
-                            }
-                            DeltaOp::Put(image)
+            let bytes_before = state.active.bytes().total();
+            for (op, seq_no) in ops.into_iter().zip(first_seq_no..) {
+                match op {
+                    RowOp::Put(mut image) => {
+                        if schema_version < current {
+                            retain_declared(&state.schema, &mut image);
                         }
-                        RowOp::Delete(pk) => DeltaOp::Delete(pk),
-                    },
-                })
-                .collect();
-            state.delta.append(records);
+                        let pk = PrimaryKey::from(image.pk.clone());
+                        let old = state.resolve(&pk)?;
+                        let slot = state
+                            .active
+                            .push(seq_no, &image)
+                            .map_err(ApplyError::BadRow)?;
+                        if let Some(old) = old {
+                            state.mark(old);
+                        }
+                        state.pk.insert(
+                            pk,
+                            RowAddr {
+                                unit: state.active.unit,
+                                row: slot,
+                            },
+                        );
+                        state.counters.total_rows += 1;
+                        state.counters.memtable_rows += 1;
+                    }
+                    RowOp::Delete(pk) => {
+                        let pk = PrimaryKey::from(pk);
+                        if let Some(old) = state.resolve(&pk)? {
+                            state.mark(old);
+                            state.pk.remove(&pk);
+                        }
+                        state.active.note_op(seq_no);
+                    }
+                }
+            }
+            let bytes_after = state.active.bytes().total();
+            state.counters.memtable_bytes += bytes_after.saturating_sub(bytes_before);
         }
         Change::Schema(schema) => {
             let version = schema.schema_version();
@@ -116,14 +261,11 @@ pub(crate) fn apply(
                 });
             }
             if version == current + 1 {
-                state.schema = Arc::new(schema);
+                let schema = Arc::new(schema);
+                state.schema = Arc::clone(&schema);
+                state.active.apply_schema(schema);
             }
-            state.delta.append(vec![DeltaRecord {
-                seq_no: first_seq_no,
-                op: DeltaOp::SchemaChange {
-                    schema_version: version,
-                },
-            }]);
+            state.active.note_op(first_seq_no);
         }
     }
     Ok(())
@@ -191,141 +333,11 @@ pub(crate) fn replay_frame(
         WalPayload::SchemaChange(change) => Change::Schema(change.schema),
     };
     debug_assert_ne!(frame.header.kind, PayloadKind::Checkpoint);
-    apply(state, frame.header.first_seq_no, change).map_err(|error| corrupt(error.to_string()))
+    apply(state, frame.header.first_seq_no, change).map_err(|error| match error {
+        ApplyError::Invariant(reason) => LogPoseError::internal(reason),
+        other => corrupt(other.to_string()),
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use logpose_types::{
-        DistanceMetric,
-        legacy::legacy_schema,
-        record::Record,
-        schema::{FieldType, ScalarFieldSpec},
-        value::Value,
-    };
-    use logpose_wal::codec::WirePk;
-
-    fn base() -> CollectionSchema {
-        legacy_schema(2, DistanceMetric::Dot).expect("schema")
-    }
-
-    fn put(schema: &CollectionSchema, id: &str, price: Option<i64>) -> RowOp {
-        let mut record = Record::new(id).with_vector("vector", vec![1.0, 0.0]);
-        if let Some(price) = price {
-            record = record.with_field("price", Value::Int64(price));
-        }
-        RowOp::Put(RowImage::from_record(schema, record).expect("image"))
-    }
-
-    #[test]
-    fn batches_from_an_older_schema_lose_fields_a_later_drop_hid() {
-        let mut v2 = base();
-        v2.add_field(ScalarFieldSpec::new("price", FieldType::Int64))
-            .expect("add");
-        let mut v3 = v2.clone();
-        v3.drop_field("price").expect("drop");
-
-        // Replay from a manifest whose schema already is v3: the add (seq 1) and the drop
-        // (seq 3) are skipped, and the batch written under v2 loses its price.
-        let mut state = LogicalState {
-            schema: Arc::new(v3.clone()),
-            delta: DeltaLog::default(),
-        };
-        apply(&mut state, 1, Change::Schema(v2.clone())).expect("skip v2");
-        apply(
-            &mut state,
-            2,
-            Change::Batch {
-                schema_version: 2,
-                ops: vec![put(&v2, "a", Some(5))],
-            },
-        )
-        .expect("batch");
-        apply(&mut state, 3, Change::Schema(v3.clone())).expect("skip v3");
-        assert_eq!(state.schema.schema_version(), 3);
-        let records = state.delta.iter().collect::<Vec<_>>();
-        assert_eq!(records.len(), 3);
-        let image = match &records[1].op {
-            DeltaOp::Put(image) => Some(image),
-            _ => None,
-        }
-        .expect("the batch's put is in the delta");
-        assert!(
-            image.scalars.is_empty(),
-            "the dropped field's value is gone"
-        );
-        assert_eq!(image.pk, WirePk::String("a".to_owned()));
-    }
-
-    #[test]
-    fn replay_from_an_older_schema_applies_changes_in_order() {
-        let mut v2 = base();
-        v2.add_field(ScalarFieldSpec::new("price", FieldType::Int64))
-            .expect("add");
-        let mut state = LogicalState {
-            schema: Arc::new(base()),
-            delta: DeltaLog::default(),
-        };
-        apply(&mut state, 1, Change::Schema(v2.clone())).expect("v2");
-        apply(
-            &mut state,
-            2,
-            Change::Batch {
-                schema_version: 2,
-                ops: vec![
-                    put(&v2, "a", Some(5)),
-                    RowOp::Delete(WirePk::String("b".into())),
-                ],
-            },
-        )
-        .expect("batch");
-        assert_eq!(state.schema.as_ref(), &v2);
-        let image = match &state.delta.iter().nth(1).expect("put").op {
-            DeltaOp::Put(image) => Some(image),
-            _ => None,
-        }
-        .expect("the batch's put is in the delta");
-        assert_eq!(
-            image.scalars.len(),
-            1,
-            "the field is declared, so its value stays"
-        );
-        assert_eq!(state.delta.last_seq_no(), Some(3));
-    }
-
-    #[test]
-    fn frames_that_skip_schema_versions_are_rejected() {
-        let mut v2 = base();
-        v2.add_field(ScalarFieldSpec::new("price", FieldType::Int64))
-            .expect("add");
-        let mut v3 = v2.clone();
-        v3.drop_field("price").expect("drop");
-        let mut state = LogicalState {
-            schema: Arc::new(base()),
-            delta: DeltaLog::default(),
-        };
-        assert_eq!(
-            apply(&mut state, 1, Change::Schema(v3)),
-            Err(ApplyError::SchemaGap {
-                change: 3,
-                current: 1
-            })
-        );
-        assert_eq!(
-            apply(
-                &mut state,
-                1,
-                Change::Batch {
-                    schema_version: 2,
-                    ops: vec![put(&v2, "a", None)],
-                },
-            ),
-            Err(ApplyError::BatchFromTheFuture {
-                batch: 2,
-                current: 1
-            })
-        );
-        assert!(state.delta.is_empty(), "a rejected frame changes nothing");
-    }
-}
+mod tests;

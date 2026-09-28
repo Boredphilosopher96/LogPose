@@ -1420,13 +1420,20 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
         .await
         .expect("wal inspect should succeed");
     assert_eq!(wal.target, "wal");
-    assert_eq!(
+    // The delete after the flush only set the segment row's deletion bit: the memtable holds
+    // no record, but one operation sits above the checkpoint.
+    assert!(
         wal.payload
             .get("records")
             .and_then(Value::as_array)
             .expect("wal records should be an array")
-            .len(),
-        1
+            .is_empty()
+    );
+    assert_eq!(
+        wal.payload["visible_seq_no"].as_u64(),
+        wal.payload["checkpoint_seq_no"]
+            .as_u64()
+            .map(|seq_no| seq_no + 1)
     );
 
     let segment = service

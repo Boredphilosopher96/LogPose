@@ -660,12 +660,16 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert!(
         immutable_unit["artifact_stats"]
             .as_array()
-            .is_some_and(|artifacts| artifacts.len() >= 2)
+            .is_some_and(
+                |artifacts| artifacts.iter().any(|artifact| artifact["file_name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with(".seg")))
+            )
     );
     assert!(
-        immutable_unit["component_bytes"]["ann_graph"]
+        immutable_unit["component_bytes"]["segment"]
             .as_u64()
-            .is_some()
+            .is_some_and(|bytes| bytes > 0)
     );
 
     let manifest = fixture.run_cli_json(&["inspect", "manifest", "colors"]);
@@ -697,18 +701,16 @@ fn data_commands_run_against_the_server_over_grpc() {
             .len(),
         3
     );
-    assert_eq!(segment_response["payload"]["segment"]["index_kind"], "hnsw");
     assert_eq!(
-        segment_response["payload"]["artifacts"]
-            .as_array()
-            .expect("segment artifacts should be an array")
-            .len(),
-        2
+        segment_response["payload"]["segment"]["file_name"],
+        format!("{segment_id}.seg")
     );
     assert!(
-        segment_response["payload"]["hnsw_index"]["node_count"]
-            .as_u64()
-            .is_some_and(|count| count >= 3)
+        segment_response["payload"]["sections"]
+            .as_array()
+            .is_some_and(|sections| sections
+                .iter()
+                .any(|section| section["kind"] == "VectorF32"))
     );
 
     let ann_profiled_query = fixture.run_cli_json(&[

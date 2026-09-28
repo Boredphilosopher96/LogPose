@@ -13,7 +13,7 @@ use arc_swap as _;
 use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
-use crc32fast as _;
+use imbl as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -72,8 +72,9 @@ fn delete(id: &str) -> WriteOperation {
     })
 }
 
-/// Two flushes (the second rolls a WAL file with data), a compaction of the two segments, and
-/// writes before, between and after them.
+/// Two flushes (the second rolls a WAL file with data and writes a DV file for the first
+/// segment, whose `b` and `c` rows the writes between them supersede), a compaction of the two
+/// segments, and writes before, between and after them.
 fn scenario() -> Vec<Step> {
     vec![
         Step::Write(vec![put("a", 1.0), put("b", 2.0)]),
@@ -270,13 +271,18 @@ async fn assert_recovered(
         .await
         .unwrap_or_else(|error| panic!("{context}: stats failed: {error}"));
     assert_eq!(stats.live_record_count, recovered.len(), "{context}");
+    let current = Snapshot {
+        manifest_generation: stats.manifest_generation,
+        visible_seq_no: stats.visible_seq_no,
+    };
 
-    // A snapshot handed out before the crash reads exactly the state it named while its
-    // manifest generation is the recovered one; any other is expired (tokens, which could pin
-    // it, do not survive a restart). It never reads a different state.
+    // A snapshot handed out before the crash reads exactly the state it named when that state
+    // is the recovered one; any other is expired (recovery retains only its first version, and
+    // tokens, which could pin another, do not survive a restart). It never reads a different
+    // state.
     for (snapshot, acked) in &outcome.snapshots {
         let read = engine.scan_exact(COLLECTION, Some(snapshot.clone())).await;
-        if snapshot.manifest_generation == stats.manifest_generation {
+        if *snapshot == current {
             let read = read.unwrap_or_else(|error| {
                 panic!("{context}: snapshot {snapshot:?} is unreadable after recovery: {error}")
             });
@@ -286,7 +292,7 @@ async fn assert_recovered(
                 "{context}: snapshot {snapshot:?} changed across the crash"
             );
         } else {
-            let error = read.expect_err("a snapshot of another generation is not retained");
+            let error = read.expect_err("a snapshot of another state is not retained");
             assert!(
                 matches!(error, LogPoseError::SnapshotExpired { .. }),
                 "{context}: snapshot {snapshot:?}: {error}"
@@ -695,6 +701,21 @@ async fn named_crash_points_have_the_documented_outcome() {
         assert_engine_keeps_working(&mut harness, kept, &context).await;
     }
 
+    // The second flush writes a DV file for the first segment; until its manifest is published
+    // the file is an orphan and recovery replays the deletions from the WAL.
+    let second_flush = scenario
+        .iter()
+        .enumerate()
+        .skip(first_flush + 1)
+        .find(|(_, step)| matches!(step, Step::Flush))
+        .map(|(index, _)| index)
+        .expect("scenario has a second flush");
+    let (mut harness, outcome) = run_to_crash_point(CrashPoint::FlushAfterDvSync, 35).await;
+    assert_eq!(outcome.failed_step, Some(second_flush));
+    assert_eq!(manifest_generation(&harness).await, 1);
+    let kept = assert_recovered(&harness, &outcome, "FlushAfterDvSync").await;
+    assert_engine_keeps_working(&mut harness, kept, "FlushAfterDvSync").await;
+
     // A compaction whose output is synced but whose manifest is not published changes nothing.
     let (mut harness, outcome) =
         run_to_crash_point(CrashPoint::CompactionAfterOutputSync, 40).await;
@@ -884,9 +905,10 @@ async fn crash_after_wal_tail_repair_keeps_the_repair() {
     assert_engine_keeps_working(&mut harness, kept, "RecoveryAfterTailRepair").await;
 }
 
-/// Every crash point the legacy engine implements is reached by a clean run, so the named tests
-/// above cannot silently stop testing anything. The points for deletion vectors, GC and orphan
-/// cleanup belong to engine code that does not exist yet.
+/// Every crash point a sequential run can reach is reached by a clean run, so the named tests
+/// above cannot silently stop testing anything. `CompactionAfterDvSync` needs a deletion that
+/// lands while a compaction runs (the storage unit tests step it); the GC, recovery, and
+/// rollback points have tests of their own.
 #[tokio::test]
 async fn clean_run_reaches_every_implemented_crash_point() {
     let harness = Harness::new(70).await;
@@ -898,6 +920,7 @@ async fn clean_run_reaches_every_implemented_crash_point() {
         CrashPoint::WalAfterSync,
         CrashPoint::WalAfterRotateCreate,
         CrashPoint::FlushAfterSegmentSync,
+        CrashPoint::FlushAfterDvSync,
         CrashPoint::FlushAfterSegmentsDirSync,
         CrashPoint::ManifestAfterFileSync,
         CrashPoint::ManifestAfterDirSync,

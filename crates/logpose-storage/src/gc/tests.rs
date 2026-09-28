@@ -4,8 +4,9 @@
 use super::*;
 use crate::{
     CollectionHandle, CreateCollectionRequest, Engine, EngineConfig,
-    manifest::{Manifest, manifest_path, publish_manifest},
-    paths::UnitFiles,
+    dv::dv_path,
+    manifest::{DvRef, Manifest, manifest_path, publish_manifest},
+    paths::segment_path,
     test_support::{ControlledVfs, put},
 };
 use logpose_types::{CollectionId, CollectionRef, DistanceMetric, legacy::legacy_schema};
@@ -52,14 +53,14 @@ fn manifest(generation: u64, units: &[u32]) -> Manifest {
             dv: None,
             vectors: Vec::new(),
             zones: Vec::new(),
-            legacy: None,
         })
         .collect();
     manifest
 }
 
-/// A collection directory holding the live unit 1, orphans of units 2 and 9, staged files,
-/// and manifest generations 1, 3, 4 (current) and 6.
+/// A collection directory holding the live unit 1 with its DV generation 2, orphan segments
+/// of units 2 and 9, orphan DV files (an older generation of unit 1, and one of unit 9), staged
+/// files, and manifest generations 1, 3, 4 (current) and 6.
 fn populated(vfs: &dyn Vfs) -> (Manifest, Vec<PathBuf>, Vec<PathBuf>) {
     let dir = Path::new(DIR);
     vfs.create_dir_all(&manifests_dir(dir)).expect("manifests");
@@ -68,18 +69,25 @@ fn populated(vfs: &dyn Vfs) -> (Manifest, Vec<PathBuf>, Vec<PathBuf>) {
     for generation in [1, 3, 6] {
         publish_manifest(vfs, dir, &manifest(generation, &[1])).expect("publish");
     }
-    let current = manifest(4, &[1]);
+    let mut current = manifest(4, &[1]);
+    current.segments[0].dv = Some(DvRef {
+        generation: 2,
+        cardinality: 1,
+        covered_seq_no: 1,
+    });
+    current.next_dv_gen = 3;
     publish_manifest(vfs, dir, &current).expect("publish current");
-    let live = UnitFiles::new(dir, UnitId(1)).published();
-    let mut orphans = UnitFiles::new(dir, UnitId(2)).published();
-    orphans.extend(UnitFiles::new(dir, UnitId(9)).all());
-    orphans.extend([
-        dir.join(SEGMENTS_DIR).join("00000001.lps.tmp"),
-        dir.join(TMP_DIR).join("anything"),
+    let live = vec![segment_path(dir, UnitId(1)), dv_path(dir, UnitId(1), 2)];
+    let orphans = vec![
+        segment_path(dir, UnitId(2)),
+        segment_path(dir, UnitId(9)),
+        dv_path(dir, UnitId(1), 1),
+        dv_path(dir, UnitId(9), 5),
+        dir.join(SEGMENTS_DIR).join("00000001.seg.tmp"),
         dir.join(CURRENT_TEMP_FILE),
         manifest_path(dir, 1),
         manifest_path(dir, 6),
-    ]);
+    ];
     for path in live.iter().chain(&orphans) {
         if !exists_at(vfs, path) {
             touch(vfs, path);
@@ -109,6 +117,10 @@ fn orphan_cleanup_removes_exactly_the_files_the_manifest_does_not_reference() {
         "above generation 6 that was on disk"
     );
     assert_eq!(cleanup.next_unit_id, 10, "above unit 9 that was on disk");
+    assert_eq!(
+        cleanup.next_dv_gen, 6,
+        "above DV generation 5 that was on disk"
+    );
     assert!(
         vfs.crash_points_hit()
             .contains(&CrashPoint::RecoveryAfterOrphanCleanup)
@@ -243,13 +255,7 @@ fn write(engine: &Engine, handle: &Arc<CollectionHandle>, id: &str) {
 }
 
 fn unit_files_exist(vfs: &dyn Vfs, handle: &CollectionHandle, unit: UnitId) -> bool {
-    let files = UnitFiles::new(&handle.meta().dir, unit).published();
-    let present = files.iter().filter(|path| exists_at(vfs, path)).count();
-    assert!(
-        present == 0 || present == files.len(),
-        "a segment is whole or gone"
-    );
-    present == files.len()
+    exists_at(vfs, &segment_path(&handle.meta().dir, unit))
 }
 
 fn wal_files(vfs: &dyn Vfs, handle: &CollectionHandle) -> Vec<String> {
@@ -311,7 +317,7 @@ fn a_segment_is_removed_only_after_the_last_version_and_token_holding_it_are_rel
         assert!(!unit_files_exist(vfs.as_ref(), &handle, *unit), "released");
     }
     assert!(unit_files_exist(vfs.as_ref(), &handle, output[0]));
-    assert!(engine.gc_removed_files() >= 6);
+    assert!(engine.gc_removed_files() >= 2);
     drop((handle, core));
     drop(engine);
 
@@ -360,6 +366,7 @@ fn wal_files_and_old_manifests_are_removed_only_after_a_durable_checkpoint() {
     );
     assert!(rotated.contains(&before[0]));
 
+    // The retry flushes the memtable the failed flush froze, then the one "b" went to.
     write(&engine, &handle, "b");
     core.flush_collection(&handle).expect("flush");
     let after = wal_files(vfs.as_ref(), &handle);
@@ -375,21 +382,23 @@ fn wal_files_and_old_manifests_are_removed_only_after_a_durable_checkpoint() {
         "{after:?}"
     );
 
-    // Generations: 0, 1 (burned), 2 (durable). The next flush supersedes 2 and removes 0.
+    // Generations: 0, 1 (burned), 2 (checkpoint 1), 3 (checkpoint 2). Committing 3 removed 0;
+    // the previous generation stays for inspection.
     let dir = handle.meta().dir.clone();
-    assert_eq!(handle.current().manifest_generation, 2);
+    assert_eq!(handle.current().manifest_generation, 3);
     engine.wait_for_gc();
     assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 1)), "burned");
-    assert!(exists_at(vfs.as_ref(), &manifest_path(&dir, 0)));
+    assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 0)));
+    assert!(exists_at(vfs.as_ref(), &manifest_path(&dir, 2)));
     write(&engine, &handle, "c");
     core.flush_collection(&handle).expect("flush");
     engine.wait_for_gc();
-    assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 0)));
+    assert!(!exists_at(vfs.as_ref(), &manifest_path(&dir, 2)));
     assert!(
-        exists_at(vfs.as_ref(), &manifest_path(&dir, 2)),
+        exists_at(vfs.as_ref(), &manifest_path(&dir, 3)),
         "previous is kept"
     );
-    assert!(exists_at(vfs.as_ref(), &manifest_path(&dir, 3)));
+    assert!(exists_at(vfs.as_ref(), &manifest_path(&dir, 4)));
 }
 
 /// A job that fails before it commits has its files removed right away: no durable manifest
@@ -407,18 +416,24 @@ fn an_abandoned_job_leaves_no_files_behind() {
         .expect_err("the manifest file sync fails");
     engine.wait_for_gc();
     let vfs = fault.process();
-    assert!(!unit_files_exist(vfs.as_ref(), &handle, UnitId(0)));
-    for child in [SEGMENTS_DIR, INDEXES_DIR, TMP_DIR] {
-        let dir = handle.meta().dir.join(child);
-        let names = vfs.list(&dir).expect("list");
-        assert!(names.is_empty(), "{child}: {names:?}");
-    }
+    // The job's output was unit 1 (unit 0 is the memtable it froze, unit 2 the new active one).
+    assert!(!unit_files_exist(vfs.as_ref(), &handle, UnitId(1)));
+    let names = vfs
+        .list(&handle.meta().dir.join(SEGMENTS_DIR))
+        .expect("list");
+    assert!(names.is_empty(), "{names:?}");
+    assert_eq!(
+        handle.current().frozen.len(),
+        1,
+        "the memtable stays frozen"
+    );
     core.flush_collection(&handle).expect("retry");
     assert_eq!(
         handle.current().manifest.units().collect::<Vec<_>>(),
-        [UnitId(1)],
+        [UnitId(3)],
         "the retry got a fresh unit"
     );
+    assert!(handle.current().frozen.is_empty());
 }
 
 /// Dropping the last reference to a file handle removes its files only when the writer marked
@@ -430,9 +445,9 @@ fn only_the_last_reference_to_an_obsolete_handle_removes_its_files() {
     let engine = Engine::open(fault.process(), ROOT, config()).expect("engine should open");
     let vfs = fault.process();
     let dir = Path::new(ROOT).join("handles");
-    let live = UnitFiles::new(&dir, UnitId(1)).published();
-    let obsolete = UnitFiles::new(&dir, UnitId(2)).published();
-    for path in live.iter().chain(&obsolete) {
+    let live = segment_path(&dir, UnitId(1));
+    let obsolete = segment_path(&dir, UnitId(2));
+    for path in [&live, &obsolete] {
         touch(vfs.as_ref(), path);
     }
     let gc = engine.core().gc.clone();
@@ -443,16 +458,16 @@ fn only_the_last_reference_to_an_obsolete_handle_removes_its_files() {
     drop(obsolete_handle);
     engine.wait_for_gc();
     assert!(
-        obsolete.iter().all(|path| exists_at(vfs.as_ref(), path)),
+        exists_at(vfs.as_ref(), &obsolete),
         "a reader still holds the obsolete handle"
     );
     drop(reader);
     drop(live_handle);
     engine.wait_for_gc();
-    assert!(obsolete.iter().all(|path| !exists_at(vfs.as_ref(), path)));
+    assert!(!exists_at(vfs.as_ref(), &obsolete));
     assert!(
-        live.iter().all(|path| exists_at(vfs.as_ref(), path)),
-        "a handle that was never marked obsolete leaves its files"
+        exists_at(vfs.as_ref(), &live),
+        "a handle that was never marked obsolete leaves its file"
     );
 }
 
@@ -664,15 +679,14 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                         let Ok(version) = resolved else {
                             continue;
                         };
-                        for file in version.files.iter() {
-                            for path in UnitFiles::new(&handle.meta().dir, file.unit()).published()
-                            {
-                                assert!(
-                                    exists_at(vfs.as_ref(), &path),
-                                    "{} is gone while a version holds it",
-                                    path.display()
-                                );
-                            }
+                        // Deletion vectors live in the version, so only its segment files must
+                        // stay on disk while it is held.
+                        for segment in version.segments.iter() {
+                            assert!(
+                                exists_at(vfs.as_ref(), segment.path()),
+                                "{} is gone while a version holds it",
+                                segment.path().display()
+                            );
                         }
                         // The reaper may expire the token between two uses.
                         let records = core.scan_exact_internal(&handle, token.clone(), true, None);
@@ -735,8 +749,17 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
     let current = handle.current();
     let mut expected = current
         .manifest
-        .units()
-        .flat_map(|unit| UnitFiles::new(&dir, unit).published())
+        .segments
+        .iter()
+        .flat_map(|segment| {
+            [
+                Some(segment_path(&dir, segment.unit)),
+                segment
+                    .dv
+                    .map(|dv| dv_path(&dir, segment.unit, dv.generation)),
+            ]
+        })
+        .flatten()
         .collect::<BTreeSet<_>>();
     let generation = current.manifest_generation;
     drop(current);
@@ -746,7 +769,7 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
         expected.insert(manifest_path(&dir, previous));
     }
     let mut found = BTreeSet::new();
-    for child in [SEGMENTS_DIR, INDEXES_DIR, TMP_DIR, MANIFESTS_DIR] {
+    for child in [SEGMENTS_DIR, MANIFESTS_DIR] {
         for name in files_in(vfs.as_ref(), &dir.join(child)).expect("list") {
             found.insert(dir.join(child).join(name));
         }

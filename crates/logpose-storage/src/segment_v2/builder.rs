@@ -28,9 +28,11 @@ pub(crate) const SCHEMA_ENCODING_POSTCARD: u16 = 1;
 pub(crate) const ROW_META_U64: u16 = 1;
 pub(crate) const ROW_META_U32_DELTA: u16 = 2;
 
-/// Largest number of rows in one segment. `u32::MAX` is reserved as a
-/// "no row" sentinel by the engine's forwarding tables.
-pub const MAX_SEGMENT_ROWS: u32 = u32::MAX - 1;
+/// Largest number of rows in one segment: `2^31`. `u32::MAX` is reserved as
+/// a "no row" sentinel by the engine's forwarding tables, and the key
+/// filter's fingerprint array (about 1.13 slots per key) must stay below
+/// `u32::MAX` entries, which bounds a segment near 3.8 billion keys.
+pub const MAX_SEGMENT_ROWS: u32 = 1 << 31;
 
 /// Which segment a builder writes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,7 +229,7 @@ impl SegmentBuilder {
         }
         if self.row_count() >= MAX_SEGMENT_ROWS {
             return Err(SegmentError::TooLarge {
-                what: "more than u32::MAX - 1 rows",
+                what: "more than 2^31 rows",
             });
         }
         match (&mut self.pk, pk) {

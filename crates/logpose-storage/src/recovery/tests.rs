@@ -4,8 +4,9 @@
 
 use crate::{
     CollectionHandle, CreateCollectionRequest, Engine, EngineConfig,
+    dv::{dv_path, parse_dv_file_name},
     manifest::{CURRENT_FILE, manifest_path},
-    paths::UnitFiles,
+    paths::{parse_segment_file_name, segment_path},
     test_support::{ControlledVfs, put},
 };
 use logpose_types::{CollectionRef, DistanceMetric, LogPoseError, UnitId, VisibleRecord};
@@ -70,26 +71,30 @@ fn exists(vfs: &dyn Vfs, path: &Path) -> bool {
     logpose_vfs::exists(vfs, path).expect("exists")
 }
 
-/// Every segment, sidecar, and staged file in the collection belongs to a unit of the current
-/// manifest, and every manifest file is the current generation or the one kept below it.
+/// Every segment and DV file in the collection is one the current manifest names, and every
+/// manifest file is the current generation or the one kept below it.
 fn assert_no_orphans(vfs: &dyn Vfs, handle: &CollectionHandle, context: &str) {
     let version = handle.current();
     let live = version.manifest.units().collect::<Vec<_>>();
+    let dvs = version
+        .manifest
+        .segments
+        .iter()
+        .filter_map(|segment| segment.dv.map(|dv| (segment.unit, dv.generation)))
+        .collect::<Vec<_>>();
     let dir = &handle.meta().dir;
     for unit in &live {
-        for path in UnitFiles::new(dir, *unit).published() {
-            assert!(exists(vfs, &path), "{context}: live {}", path.display());
-        }
+        let path = segment_path(dir, *unit);
+        assert!(exists(vfs, &path), "{context}: live {}", path.display());
     }
-    for child in ["segments", "indexes", "tmp"] {
-        for entry in vfs.list(&dir.join(child)).expect("list") {
-            let owner = u32::from_str_radix(&entry.name[..8.min(entry.name.len())], 16).ok();
-            assert!(
-                child != "tmp" && owner.is_some_and(|unit| live.contains(&UnitId(unit))),
-                "{context}: orphan {child}/{}",
-                entry.name
-            );
-        }
+    for (unit, generation) in &dvs {
+        let path = dv_path(dir, *unit, *generation);
+        assert!(exists(vfs, &path), "{context}: live {}", path.display());
+    }
+    for entry in vfs.list(&dir.join("segments")).expect("list") {
+        let named = parse_segment_file_name(&entry.name).is_some_and(|unit| live.contains(&unit))
+            || parse_dv_file_name(&entry.name).is_some_and(|dv| dvs.contains(&dv));
+        assert!(named, "{context}: orphan segments/{}", entry.name);
     }
     let generations = vfs
         .list(&dir.join("manifests"))
@@ -235,7 +240,7 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     engine
         .core()
         .flush_collection(&handle)
-        .expect("flush: generation 1, unit 0");
+        .expect("flush: generation 1, unit 1");
     write(&engine, &handle, "b", 2.0);
 
     controlled.fail_renames_to(CURRENT_FILE, 1);
@@ -258,15 +263,13 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
         exists(vfs.as_ref(), &manifest_path(&dir, 2)),
         "the failed attempt wrote generation 2"
     );
-    assert!(exists(
-        vfs.as_ref(),
-        &UnitFiles::new(&dir, UnitId(1)).segment
-    ));
+    // The failed flush's output was unit 3 (unit 2 was the memtable it froze).
+    assert!(exists(vfs.as_ref(), &segment_path(&dir, UnitId(3))));
     let seen = rows(&engine);
     drop(handle);
     drop(engine);
 
-    // In-process reopen: CURRENT still names generation 1, and generation 2 and unit 1 are
+    // In-process reopen: CURRENT still names generation 1, and generation 2 and unit 3 are
     // orphans.
     let engine = open(controlled.clone());
     let first = rows(&engine);
@@ -274,17 +277,14 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     let handle = open_handle(&engine);
     assert_eq!(handle.current().manifest_generation, 1);
     assert!(!exists(vfs.as_ref(), &manifest_path(&dir, 2)));
-    assert!(!exists(
-        vfs.as_ref(),
-        &UnitFiles::new(&dir, UnitId(1)).segment
-    ));
+    assert!(!exists(vfs.as_ref(), &segment_path(&dir, UnitId(3))));
     engine.core().flush_collection(&handle).expect("retry");
     let retried = handle.current();
     assert_eq!(retried.manifest_generation, 3, "generation 2 is burned");
     assert_eq!(
         retried.manifest.units().collect::<Vec<_>>(),
-        [UnitId(0), UnitId(2)],
-        "unit 1 is burned"
+        [UnitId(1), UnitId(5)],
+        "unit 3 is burned; the recovered memtable took unit 4"
     );
     let after_retry = rows(&engine);
     drop((handle, retried));
@@ -359,9 +359,9 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
 
     let vfs = fault.process();
     let planted = [
-        UnitFiles::new(&dir, UnitId(7)).segment,
-        UnitFiles::new(&dir, UnitId(7)).hnsw,
-        UnitFiles::new(&dir, UnitId(8)).segment_temp,
+        segment_path(&dir, UnitId(7)),
+        dv_path(&dir, UnitId(7), 4),
+        dir.join("segments").join("00000008.seg.tmp"),
         manifest_path(&dir, 9),
         dir.join("CURRENT.tmp"),
     ];
@@ -377,12 +377,14 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
         assert!(!exists(vfs.as_ref(), path), "{}", path.display());
     }
     assert_no_orphans(vfs.as_ref(), &handle, "planted");
-    // Unit 8 and generation 9 were seen, so they are never issued.
+    // Unit 8, DV generation 4, and manifest generation 9 were seen, so they are never issued:
+    // the recovered memtable took unit 9, the flush output unit 10.
     write(&engine, &handle, "b", 2.0);
     engine.core().flush_collection(&handle).expect("flush");
     let version = handle.current();
     assert_eq!(version.manifest_generation, 10);
-    assert_eq!(version.manifest.units().last(), Some(UnitId(9)));
+    assert_eq!(version.manifest.units().last(), Some(UnitId(10)));
+    assert!(version.manifest.next_dv_gen >= 5);
 }
 
 /// A leftover whose name uses the last manifest generation leaves no generation to issue after

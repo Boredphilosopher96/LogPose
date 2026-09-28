@@ -4,7 +4,7 @@ use arc_swap as _;
 use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
-use crc32fast as _;
+use imbl as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -589,23 +589,20 @@ async fn flush_persists_visible_records_for_reopen() {
         .iter()
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be reported");
-    assert_eq!(immutable.index_kind, "hnsw");
-    assert!(
-        immutable
-            .artifact_stats
-            .iter()
-            .any(|artifact| artifact.file_name.ends_with(".flat.json"))
+    assert_eq!(
+        immutable.index_kind, "hnsw",
+        "a segment serves ANN candidates (by exact scan until index sections land)"
     );
     assert!(
         immutable
             .artifact_stats
             .iter()
-            .any(|artifact| artifact.file_name.ends_with(".hnsw.bin"))
+            .any(|artifact| artifact.file_name == format!("{}.seg", immutable.unit_id))
     );
     assert!(
         immutable
             .component_bytes
-            .get("ann_graph")
+            .get("segment")
             .copied()
             .unwrap_or_default()
             > 0
@@ -973,7 +970,10 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
         .await
         .expect("stats should succeed");
     assert_eq!(before.live_record_count, 2);
-    assert_eq!(before.deleted_record_count, 0);
+    assert_eq!(
+        before.deleted_record_count, 1,
+        "the first segment's alpha row is deleted by the upsert"
+    );
     assert_eq!(before.segment_count, 2);
 
     engine
@@ -986,7 +986,10 @@ async fn compact_merges_segments_and_preserves_latest_versions() {
         .await
         .expect("stats should succeed");
     assert_eq!(after.live_record_count, 2);
-    assert_eq!(after.deleted_record_count, 0);
+    assert_eq!(
+        after.deleted_record_count, 0,
+        "compaction drops the deleted row"
+    );
     assert_eq!(after.segment_count, 1);
 
     let visible = engine
@@ -1076,7 +1079,15 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
         .get("records")
         .and_then(Value::as_array)
         .expect("wal records should be an array");
-    assert_eq!(wal_records.len(), 1);
+    assert!(
+        wal_records.is_empty(),
+        "the memtable holds no row: the delete only set a deletion bit"
+    );
+    assert_eq!(
+        wal.payload["visible_seq_no"].as_u64(),
+        wal.payload["checkpoint_seq_no"].as_u64().map(|seq| seq + 1),
+        "one operation above the checkpoint"
+    );
 
     let segment = engine
         .inspect("documents", InspectTarget::Segment(segment_id.clone()))
@@ -1093,36 +1104,38 @@ async fn inspect_reports_manifest_wal_and_segment_targets() {
         Some(segment_id.as_str())
     );
     assert_eq!(
-        segment
-            .payload
-            .get("segment")
-            .and_then(Value::as_object)
-            .and_then(|segment| segment.get("index_kind"))
-            .and_then(Value::as_str),
-        Some("hnsw")
+        segment.payload["segment"]["file_name"].as_str(),
+        Some(format!("{segment_id}.seg").as_str())
     );
+    assert_eq!(segment.payload["segment"]["deleted_rows"], 1);
+    assert_eq!(segment.payload["segment"]["live_rows"], 1);
+    let kinds = segment.payload["sections"]
+        .as_array()
+        .expect("segment sections should be an array")
+        .iter()
+        .filter_map(|section| section["kind"].as_str())
+        .collect::<Vec<_>>();
+    for kind in [
+        "SchemaSnapshot",
+        "RowMeta",
+        "PkColumn",
+        "VectorF32",
+        "Stats",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} in {kinds:?}");
+    }
+    let records = segment
+        .payload
+        .get("records")
+        .and_then(Value::as_array)
+        .expect("segment records should be an array");
+    assert_eq!(records.len(), 2);
     assert_eq!(
-        segment
-            .payload
-            .get("artifacts")
-            .and_then(Value::as_array)
-            .expect("segment artifacts should be an array")
+        records
             .iter()
-            .filter_map(|artifact| artifact.get("file_name").and_then(Value::as_str))
+            .map(|record| (record["id"].as_str(), record["deleted"].as_bool()))
             .collect::<Vec<_>>(),
-        vec![
-            format!("{segment_id}.flat.json"),
-            format!("{segment_id}.hnsw.bin"),
-        ]
-    );
-    assert_eq!(
-        segment
-            .payload
-            .get("records")
-            .and_then(Value::as_array)
-            .expect("segment records should be an array")
-            .len(),
-        2
+        [(Some("alpha"), Some(true)), (Some("beta"), Some(false))]
     );
 
     let maintenance = engine
@@ -1265,11 +1278,13 @@ async fn background_maintenance_preserves_namespace_for_duplicate_collection_nam
     assert_eq!(analytics_stats.live_record_count, 1);
 }
 
+/// A byte flipped inside a segment's vector data leaves the segment openable (its header,
+/// footer, and section table are intact) but fails every read of that data with typed segment
+/// corruption, never a wrong answer or a panic.
 #[tokio::test]
-async fn ann_queries_surface_corrupted_hnsw_sidecars() {
-    let root = support::unique_temp_dir("storage-hnsw-corruption");
+async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
+    let root = support::unique_temp_dir("storage-segment-corruption");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
     let descriptor = engine
         .create_collection(CreateCollectionRequest::new(
             "documents",
@@ -1278,7 +1293,6 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
         ))
         .await
         .expect("collection should be created");
-
     engine
         .write(
             "documents",
@@ -1301,28 +1315,40 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
         .flush("documents")
         .await
         .expect("flush should succeed");
-
-    let manifest = engine
+    let segment_id = engine
         .inspect("documents", InspectTarget::Manifest)
         .await
-        .expect("manifest inspect should succeed");
-    let segment_id = manifest
-        .payload
-        .get("segments")
-        .and_then(Value::as_array)
-        .and_then(|segments| segments.first())
-        .and_then(|segment| segment.get("segment_id"))
-        .and_then(Value::as_str)
-        .expect("segment id should exist");
-    fs::write(
-        descriptor
-            .root_path
-            .join("indexes")
-            .join(format!("{segment_id}.hnsw.bin")),
-        b"LPH1",
-    )
-    .expect("corrupted sidecar should be written");
+        .expect("manifest inspect should succeed")
+        .payload["segments"][0]["segment_id"]
+        .as_str()
+        .expect("segment id should exist")
+        .to_owned();
+    drop(engine);
 
+    let path = descriptor
+        .root_path
+        .join("segments")
+        .join(format!("{segment_id}.seg"));
+    let (offset, length) = {
+        let reader = logpose_storage::segment_v2::SegmentReader::open(
+            logpose_storage::segment_v2::FileSource::open(&path).expect("segment opens"),
+        )
+        .expect("segment reads");
+        let vectors = reader
+            .sections()
+            .iter()
+            .find(|section| {
+                section.section_kind() == Some(logpose_storage::segment_v2::SectionKind::VectorF32)
+            })
+            .expect("a vector section");
+        (vectors.offset, vectors.length)
+    };
+    let mut bytes = fs::read(&path).expect("segment should read");
+    let last = usize::try_from(offset + length - 1).expect("offset fits");
+    bytes[last] ^= 0x40;
+    fs::write(&path, &bytes).expect("corrupted segment should be written");
+
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should reopen");
     let error = logpose_query::query_exact(
         &engine,
         logpose_query::QueryRequest {
@@ -1337,19 +1363,40 @@ async fn ann_queries_surface_corrupted_hnsw_sidecars() {
         },
     )
     .await
-    .expect_err("corrupted hnsw sidecar should fail");
+    .expect_err("a corrupted vector section fails the query");
     assert!(
-        error.to_string().contains("failed to read hnsw sidecar"),
-        "unexpected error: {error}"
+        matches!(
+            error,
+            logpose_query::QueryError::Storage(LogPoseError::Corrupt {
+                kind: CorruptionKind::Segment,
+                ..
+            })
+        ),
+        "unexpected error: {error:?}"
+    );
+    let error = engine
+        .scan_exact("documents", None)
+        .await
+        .expect_err("a scan reads the vector section too");
+    assert!(
+        matches!(
+            error,
+            LogPoseError::Corrupt {
+                kind: CorruptionKind::Segment,
+                ..
+            }
+        ),
+        "{error:?}"
     );
 }
 
+/// ANN candidates over a segment come from an exact scan of its live rows: rows an upsert or a
+/// delete superseded never appear, and filters apply before the budget.
 #[tokio::test]
-async fn ann_queries_score_segments_with_outdated_hnsw_sidecars_exactly() {
-    let root = support::unique_temp_dir("storage-hnsw-outdated");
+async fn ann_queries_over_segments_see_only_live_rows() {
+    let root = support::unique_temp_dir("storage-ann-live-rows");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    let descriptor = engine
+    engine
         .create_collection(CreateCollectionRequest::new(
             "documents",
             2,
@@ -1375,6 +1422,10 @@ async fn ann_queries_score_segments_with_outdated_hnsw_sidecars_exactly() {
         .await
         .expect("write should succeed");
     engine
+        .flush("documents")
+        .await
+        .expect("flush should succeed");
+    engine
         .write(
             "documents",
             vec![
@@ -1390,10 +1441,6 @@ async fn ann_queries_score_segments_with_outdated_hnsw_sidecars_exactly() {
         )
         .await
         .expect("write should succeed");
-    engine
-        .flush("documents")
-        .await
-        .expect("flush should succeed");
 
     let query = |filters: Vec<logpose_query::MetadataFilter>| logpose_query::QueryRequest {
         collection_name: "documents".to_owned(),
@@ -1418,48 +1465,21 @@ async fn ann_queries_score_segments_with_outdated_hnsw_sidecars_exactly() {
             .map(|matched| matched.id.as_str().to_owned())
             .collect::<Vec<_>>()
     };
-    let unfiltered = ids(logpose_query::query_exact(&engine, query(Vec::new()))
-        .await
-        .expect("query should succeed"));
-    let filtered = ids(logpose_query::query_exact(&engine, query(keep()))
-        .await
-        .expect("filtered query should succeed"));
-    assert_eq!(unfiltered, ["doc-10", "doc-09"]);
-    assert_eq!(filtered, ["doc-10", "doc-08"]);
-
-    // Rewrite the sidecar header as a version 1 graph, which this build no longer reads.
-    let segment_id = engine
-        .inspect("documents", InspectTarget::Manifest)
-        .await
-        .expect("manifest inspect should succeed")
-        .payload
-        .get("segments")
-        .and_then(Value::as_array)
-        .and_then(|segments| segments.first())
-        .and_then(|segment| segment.get("segment_id"))
-        .and_then(Value::as_str)
-        .expect("segment id should exist")
-        .to_owned();
-    let sidecar_path = descriptor
-        .root_path
-        .join("indexes")
-        .join(format!("{segment_id}.hnsw.bin"));
-    let mut sidecar = fs::read(&sidecar_path).expect("sidecar should read");
-    sidecar[4..6].copy_from_slice(&1u16.to_le_bytes());
-    fs::write(&sidecar_path, &sidecar).expect("outdated sidecar should be written");
-
-    assert_eq!(
-        ids(logpose_query::query_exact(&engine, query(Vec::new()))
+    for round in 0..2 {
+        let unfiltered = ids(logpose_query::query_exact(&engine, query(Vec::new()))
             .await
-            .expect("query over an outdated sidecar should fall back to an exact scan")),
-        unfiltered
-    );
-    assert_eq!(
-        ids(logpose_query::query_exact(&engine, query(keep()))
+            .expect("query should succeed"));
+        let filtered = ids(logpose_query::query_exact(&engine, query(keep()))
             .await
-            .expect("filtered query over an outdated sidecar should succeed")),
-        filtered
-    );
+            .expect("filtered query should succeed"));
+        assert_eq!(unfiltered, ["doc-10", "doc-09"], "round {round}");
+        assert_eq!(filtered, ["doc-10", "doc-08"], "round {round}");
+        // The same answers once the upsert and the delete are flushed too.
+        engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+    }
 }
 
 #[tokio::test]

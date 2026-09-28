@@ -6,19 +6,19 @@
 //! `Arc<Version>` once and holds that `Arc` until it finishes, so expiry never pulls files out
 //! from under a running read; the pin only keeps the `Version` alive between requests.
 //!
-//! Pins hold obsolete segment files on disk and retired memtables (for now, the delta batches
-//! a flush checkpointed) in memory. The first is bounded by `max_per_collection`; the second by
-//! the engine-wide `memory_limit`: new pins are refused with [`LogPoseError::TooManySnapshots`]
+//! Pins hold obsolete segment files on disk and retired memtables (memtables a flush turned
+//! into a segment) in memory. The first is bounded by `max_per_collection`; the second by the
+//! engine-wide `memory_limit`: new pins are refused with [`LogPoseError::TooManySnapshots`]
 //! while pinned retired bytes exceed it, and the reaper expires pins oldest-first until they no
-//! longer do.
+//! longer do. Pinned retired bytes also count against the engine-wide memtable budget.
 //!
 //! The registry mutex is held only for a map operation. Versions leave the map under the lock
 //! but are dropped after it is released, because dropping one may enqueue file removals.
 
 use crate::version::{Version, VersionId};
-use logpose_types::{CollectionId, LogPoseError, Result, SeqNo, Snapshot};
+use logpose_types::{CollectionId, LogPoseError, Result, Snapshot, UnitId};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     str::FromStr,
     sync::{
@@ -37,8 +37,9 @@ pub struct TokenConfig {
     /// Most pinned snapshots per collection. Default 64.
     pub max_per_collection: usize,
     /// Engine-wide bytes of retired memtables that only pinned snapshots still hold, above which
-    /// new pins are refused and the reaper expires pins oldest-first. Default 256 MiB.
-    pub memory_limit: u64,
+    /// new pins are refused and the reaper expires pins oldest-first. `None` (the default) is a
+    /// quarter of the engine's memtable budget.
+    pub memory_limit: Option<u64>,
     /// How often the reaper runs. Default 1 second.
     pub reaper_interval: Duration,
 }
@@ -48,7 +49,7 @@ impl Default for TokenConfig {
         Self {
             ttl: Duration::from_secs(5 * 60),
             max_per_collection: 64,
-            memory_limit: 256 * 1024 * 1024,
+            memory_limit: None,
             reaper_interval: Duration::from_secs(1),
         }
     }
@@ -237,7 +238,7 @@ impl TokenRegistry {
         if memory_exceeded {
             return Err(refused(format!(
                 "pinned snapshots already hold more than the {}-byte pinned-memory limit",
-                config.memory_limit
+                config.memory_limit.unwrap_or(0)
             )));
         }
         let token = SnapshotToken {
@@ -300,8 +301,8 @@ impl TokenRegistry {
         }
     }
 
-    /// The pinned version an exact `snapshot` names: same manifest generation, and a visible
-    /// sequence number range that contains the snapshot's. Extends the pin's expiry.
+    /// The pinned version an exact `snapshot` names: the same manifest generation and visible
+    /// sequence number. Extends the pin's expiry.
     pub(crate) fn find(
         &self,
         snapshot: &Snapshot,
@@ -309,15 +310,11 @@ impl TokenRegistry {
         ttl: Duration,
     ) -> Option<Arc<Version>> {
         let mut pins = self.lock();
-        let pin = pins
-            .values_mut()
-            .filter(|pin| {
-                pin.expires_at > now
-                    && pin.version.manifest_generation == snapshot.manifest_generation
-                    && pin.version.checkpoint_seq_no <= snapshot.visible_seq_no
-                    && snapshot.visible_seq_no <= pin.version.visible_seq_no
-            })
-            .min_by_key(|pin| pin.version.visible_seq_no)?;
+        let pin = pins.values_mut().find(|pin| {
+            pin.expires_at > now
+                && pin.version.manifest_generation == snapshot.manifest_generation
+                && pin.version.visible_seq_no == snapshot.visible_seq_no
+        })?;
         pin.expires_at = now.saturating_add(ttl);
         Some(Arc::clone(&pin.version))
     }
@@ -342,24 +339,27 @@ impl TokenRegistry {
         self.lock().len()
     }
 
-    /// Bytes of retired delta batches (at or below `checkpoint`, the current checkpoint) that
-    /// only pinned versions still hold. Each batch is counted once even when several pins share
-    /// it.
-    pub(crate) fn retired_bytes(&self, checkpoint: SeqNo) -> u64 {
+    /// Bytes of retired memtables (memtables `current` no longer contains) that only pinned
+    /// versions still hold. A memtable several pins share is counted once, at the largest size
+    /// any of them holds.
+    pub(crate) fn retired_bytes(&self, current: &Version) -> u64 {
         let versions = self
             .lock()
             .values()
             .map(|pin| Arc::clone(&pin.version))
             .collect::<Vec<_>>();
-        retired_bytes(&versions, checkpoint)
+        retired_bytes(&versions, current)
     }
 
-    /// The oldest pin that holds retired bytes, with its creation order.
-    pub(crate) fn oldest_retired(&self, checkpoint: SeqNo) -> Option<(u64, SnapshotToken)> {
+    /// The oldest pin that holds a retired memtable, with its creation order.
+    pub(crate) fn oldest_retired(&self, current: &Version) -> Option<(u64, SnapshotToken)> {
+        let live = live_memtables(current);
         self.lock()
             .iter()
             .filter(|(_, pin)| {
-                pin.version.checkpoint_seq_no < checkpoint && !pin.version.delta.is_empty()
+                pin.version
+                    .memtables()
+                    .any(|memtable| !live.contains(&memtable.unit))
             })
             .min_by_key(|(_, pin)| pin.order)
             .map(|((version_id, nonce), pin)| {
@@ -394,33 +394,26 @@ fn take_expired(pins: &mut HashMap<PinKey, Pin>, now: Duration) -> Vec<Arc<Versi
         .collect()
 }
 
-/// Bytes of the delta batches at or below `checkpoint` held by `versions`, each counted once.
-///
-/// Versions over the same manifest checkpoint have deltas that are prefixes of one another,
-/// and versions over different checkpoints share the batches their ranges overlap in, so the
-/// retired part is the union of the ranges `(base, min(visible, checkpoint)]`, each piece
-/// measured in a delta that covers it.
-fn retired_bytes(versions: &[Arc<Version>], checkpoint: SeqNo) -> u64 {
-    let mut longest = HashMap::<SeqNo, &Arc<Version>>::new();
+/// The memtables `current` contains.
+fn live_memtables(current: &Version) -> HashSet<UnitId> {
+    current.memtables().map(|memtable| memtable.unit).collect()
+}
+
+/// Bytes of the memtables `versions` hold that `current` does not, each counted once at the
+/// largest size a version holds it at (versions of one memtable hold prefixes of it).
+fn retired_bytes(versions: &[Arc<Version>], current: &Version) -> u64 {
+    let live = live_memtables(current);
+    let mut retired = HashMap::<UnitId, u64>::new();
     for version in versions {
-        let entry = longest.entry(version.checkpoint_seq_no).or_insert(version);
-        if version.visible_seq_no > entry.visible_seq_no {
-            *entry = version;
+        for memtable in version.memtables() {
+            if live.contains(&memtable.unit) {
+                continue;
+            }
+            let bytes = retired.entry(memtable.unit).or_default();
+            *bytes = (*bytes).max(memtable.bytes().total());
         }
     }
-    let mut groups = longest.into_iter().collect::<Vec<_>>();
-    groups.sort_by_key(|(base, _)| *base);
-    let mut covered = 0;
-    let mut total = 0;
-    for (base, version) in groups {
-        let end = version.visible_seq_no.min(checkpoint);
-        let start = base.max(covered);
-        if end > start {
-            total += version.delta.bytes_in(start, end);
-            covered = end;
-        }
-    }
-    total
+    retired.values().sum()
 }
 
 #[cfg(test)]

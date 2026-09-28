@@ -4,7 +4,7 @@ use arc_swap as _;
 use async_trait as _;
 use bytemuck as _;
 use crc32c as _;
-use crc32fast as _;
+use imbl as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_index as _;

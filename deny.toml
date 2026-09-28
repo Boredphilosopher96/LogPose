@@ -4,6 +4,18 @@ all-features = true
 [licenses]
 allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
 
+# imbl (the persistent maps and vectors behind memtables and deletion maps) and
+# its chunk crate are MPL-2.0: a weak, file-level copyleft that applies only to
+# modified copies of their own source files. LogPose uses them unmodified as
+# ordinary dependencies, which MPL-2.0 permits in an MIT-licensed product.
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "imbl"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "imbl-sized-chunks"
+
 [advisories]
 version = 2
 ignore = [

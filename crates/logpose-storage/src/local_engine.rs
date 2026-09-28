@@ -8,40 +8,23 @@
 use crate::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
     collections::collection_ref_from_lookup,
-    durable_fs::{path_exists, read_file},
-    engine::{CoreRef, Engine, EngineConfig, EngineCore, not_found},
-    error::{io_message, json_message},
+    durable_fs::path_exists,
+    engine::{CoreRef, Engine, EngineConfig, not_found},
     handle::CollectionHandle,
-    legacy_view::{legacy_ops, legacy_record},
+    legacy::MetadataFilter,
+    legacy_view::legacy_ops,
     maintenance::MaintenanceOperation,
-    manifest::{SegmentMeta, segment_artifact_file_name},
-    metric::{storage_metric_compare, storage_metric_value},
-    resolve::{ResolvedState, resolve_latest_state_for_ids_selected},
-    segment_v1::read_segment_file,
     tokens::SnapshotToken,
 };
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
-use logpose_index::{
-    FlatIndexSidecar, HnswIndexSidecar, decode_flat_index, decode_hnsw_index,
-    is_unsupported_hnsw_version,
-};
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef,
-    CollectionStats, CommitAck, CorruptionKind, DistanceMetric, LeadershipFence, LogPoseError,
-    MaintenanceStatus, NodeRole, RecordId, ResourceKind, Result, SeqNo, Snapshot, VisibleRecord,
-    WriteOperation,
+    CollectionStats, CommitAck, LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole,
+    RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
 };
 use logpose_vfs::{Vfs, std_vfs};
-use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
-};
-
-/// A metadata filter over record metadata, as the query layer passes it down.
-type MetadataFilter = Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>;
+use std::{path::Path, sync::Arc};
 
 /// Local filesystem-backed storage engine: the [`StorageEngine`] trait over an [`Engine`].
 ///
@@ -505,290 +488,10 @@ impl CoreRef {
     }
 }
 
-impl EngineCore {
+impl crate::engine::EngineCore {
     pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
         path_exists(self.vfs.as_ref(), path)
     }
-
-    fn read_hnsw_sidecar(&self, path: &Path) -> Result<HnswIndexSidecar> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
-        decode_hnsw_index(bytes, path)
-            .map_err(|error| io_message("failed to read hnsw sidecar", error))
-    }
-
-    /// Read an HNSW sidecar the ANN path can traverse. `Ok(None)` means the sidecar has a graph
-    /// layout this build does not read; the segment's records are still readable, so the caller
-    /// scores them exactly instead of failing the query.
-    fn read_current_hnsw_sidecar(&self, path: &Path) -> Result<Option<HnswIndexSidecar>> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read hnsw sidecar")?;
-        match decode_hnsw_index(bytes, path) {
-            Ok(hnsw) => Ok(Some(hnsw)),
-            Err(error) if is_unsupported_hnsw_version(&error) => Ok(None),
-            Err(error) => Err(io_message("failed to read hnsw sidecar", error)),
-        }
-    }
-
-    fn read_flat_sidecar(&self, path: &Path) -> Result<FlatIndexSidecar> {
-        let bytes = read_file(self.vfs.as_ref(), path, "failed to read flat index sidecar")?;
-        decode_flat_index(&bytes)
-            .map_err(|error| io_message("failed to read flat index sidecar", error))
-    }
-
-    fn ann_search_selected(
-        &self,
-        handle: &CollectionHandle,
-        at: impl Into<crate::state::ReadAt>,
-        immutable_unit_ids: Vec<String>,
-        request: &AnnSearchRequest,
-        filter: Option<MetadataFilter>,
-    ) -> Result<Vec<AnnCandidate>> {
-        let (state, snapshot) = self.read_state(handle, at)?;
-        let descriptor = handle.descriptor();
-        let metric = descriptor.metric;
-        let selected = immutable_unit_ids.into_iter().collect::<BTreeSet<_>>();
-        let mut candidates_by_record_id = BTreeMap::<RecordId, AnnCandidate>::new();
-        let request_budget = request.candidate_budget.max(request.top_k);
-
-        for segment in state
-            .manifest
-            .legacy_segments()
-            .rev()
-            .filter(|segment| selected.contains(&segment.segment_id))
-        {
-            let hnsw_path = descriptor.root_path.join("indexes").join(
-                segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                    LogPoseError::corrupt(
-                        CorruptionKind::Manifest,
-                        format!(
-                            "segment '{}' is missing hnsw artifact metadata",
-                            segment.segment_id
-                        ),
-                    )
-                })?,
-            );
-            let segment_candidates = match self.read_current_hnsw_sidecar(&hnsw_path)? {
-                Some(hnsw) => logpose_index::search_hnsw(
-                    &hnsw,
-                    &request.vector,
-                    request_budget,
-                    filter.as_deref(),
-                )
-                .map_err(|error| io_message("failed to search hnsw sidecar", error))?
-                .candidates
-                .into_iter()
-                .filter(|candidate| candidate.seq_no <= snapshot.visible_seq_no)
-                .map(|candidate| AnnCandidate {
-                    unit_id: segment.segment_id.clone(),
-                    record_id: candidate.record_id,
-                    seq_no: candidate.seq_no,
-                    value: candidate.value,
-                })
-                .collect::<Vec<_>>(),
-                // A sidecar from an older graph layout cannot be traversed, but the segment's
-                // records are still readable: score them exactly rather than fail the query.
-                // A compaction that merges the segment writes a current sidecar.
-                None => exact_segment_candidates(
-                    self.vfs.as_ref(),
-                    &descriptor.root_path,
-                    segment,
-                    metric,
-                    &request.vector,
-                    snapshot.visible_seq_no,
-                    request_budget,
-                    filter.as_deref(),
-                )?,
-            };
-            for candidate in segment_candidates {
-                match candidates_by_record_id.entry(candidate.record_id.clone()) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(candidate);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        if candidate.seq_no > entry.get().seq_no {
-                            entry.insert(candidate);
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut candidates = candidates_by_record_id.into_values().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            storage_metric_compare(metric, right.value, left.value)
-                .then(right.seq_no.cmp(&left.seq_no))
-                .then(left.record_id.cmp(&right.record_id))
-                .then(left.unit_id.cmp(&right.unit_id))
-        });
-        candidates.truncate(request_budget);
-
-        Ok(candidates)
-    }
-
-    fn latest_visible_selected(
-        &self,
-        handle: &CollectionHandle,
-        at: impl Into<crate::state::ReadAt>,
-        record_ids: Vec<RecordId>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let (state, snapshot) = self.read_state(handle, at)?;
-        let resolved = resolve_latest_state_for_ids_selected(
-            self.vfs.as_ref(),
-            handle.descriptor(),
-            &state,
-            snapshot.visible_seq_no,
-            &record_ids.into_iter().collect(),
-            include_mutable,
-            Some(immutable_unit_ids.into_iter().collect()),
-        )?;
-        let mut records = resolved
-            .into_values()
-            .filter_map(|state| match state {
-                ResolvedState::Visible(record) => Some(record),
-                ResolvedState::Deleted { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(records)
-    }
-
-    fn inspect(&self, handle: &CollectionHandle, target: InspectTarget) -> Result<InspectReport> {
-        handle.ensure_open()?;
-        let version = handle.current();
-        let descriptor = handle.descriptor();
-        match target {
-            InspectTarget::Manifest => Ok(InspectReport {
-                target: "manifest".to_owned(),
-                payload: version.manifest.inspect_json(),
-            }),
-            InspectTarget::Wal => {
-                let mut records = Vec::with_capacity(version.delta.len());
-                for record in version.delta.iter() {
-                    records.extend(legacy_record(&version.schema, record)?);
-                }
-                Ok(InspectReport {
-                    target: "wal".to_owned(),
-                    payload: json!({
-                        "checkpoint_seq_no": version.checkpoint_seq_no,
-                        "schema_version": version.schema.schema_version(),
-                        "records": records,
-                    }),
-                })
-            }
-            InspectTarget::Maintenance => Ok(InspectReport {
-                target: "maintenance".to_owned(),
-                payload: serde_json::to_value(self.maintenance_status(handle))
-                    .map_err(json_message)?,
-            }),
-            InspectTarget::Segment(segment_id) => {
-                let segment = version
-                    .manifest
-                    .legacy_segments()
-                    .find(|segment| segment.segment_id == segment_id)
-                    .ok_or_else(|| {
-                        LogPoseError::not_found(ResourceKind::Segment, segment_id.clone())
-                    })?;
-                let records = read_segment_file(
-                    self.vfs.as_ref(),
-                    &descriptor
-                        .root_path
-                        .join("segments")
-                        .join(&segment.file_name),
-                )?;
-                let index = self.read_flat_sidecar(&descriptor.root_path.join("indexes").join(
-                    segment_artifact_file_name(segment, "flat_exact").ok_or_else(|| {
-                        LogPoseError::corrupt(
-                            CorruptionKind::Manifest,
-                            format!(
-                                "segment '{}' is missing flat artifact metadata",
-                                segment.segment_id
-                            ),
-                        )
-                    })?,
-                ))?;
-                let hnsw = self.read_hnsw_sidecar(&descriptor.root_path.join("indexes").join(
-                    segment_artifact_file_name(segment, "hnsw").ok_or_else(|| {
-                        LogPoseError::corrupt(
-                            CorruptionKind::Manifest,
-                            format!(
-                                "segment '{}' is missing hnsw artifact metadata",
-                                segment.segment_id
-                            ),
-                        )
-                    })?,
-                ))?;
-                Ok(InspectReport {
-                    target: format!("segment:{segment_id}"),
-                    payload: json!({
-                        "segment": segment,
-                        "artifacts": segment.artifacts,
-                        "flat_index": index,
-                        "hnsw_index": {
-                            "index_kind": hnsw.index_kind.as_str(),
-                            "dimensions": hnsw.dimensions,
-                            "entry_point": hnsw.entry_point,
-                            "max_level": hnsw.max_level,
-                            "node_count": hnsw.nodes.len(),
-                            "params": {
-                                "max_neighbors": hnsw.params.max_neighbors,
-                                "max_neighbors_layer0": hnsw.params.max_neighbors_for_layer(0),
-                                "ef_construction": hnsw.params.ef_construction,
-                                "ef_search": hnsw.params.ef_search,
-                            },
-                        },
-                        "records": records,
-                    }),
-                })
-            }
-        }
-    }
-}
-
-/// Score a segment's records exactly, standing in for its HNSW sidecar when that cannot be read.
-///
-/// The candidates match what the sidecar would hold: the latest record per id in the segment,
-/// when it is a put visible at `visible_seq_no` and admitted by `filter`, best `budget` first.
-#[allow(clippy::too_many_arguments)]
-fn exact_segment_candidates(
-    vfs: &dyn Vfs,
-    collection_root: &Path,
-    segment: &SegmentMeta,
-    metric: DistanceMetric,
-    query: &[f32],
-    visible_seq_no: SeqNo,
-    budget: usize,
-    filter: Option<&(dyn for<'a> Fn(&'a Value) -> bool + Send + Sync)>,
-) -> Result<Vec<AnnCandidate>> {
-    let records = read_segment_file(
-        vfs,
-        &collection_root.join("segments").join(&segment.file_name),
-    )?;
-    let mut seen = BTreeSet::new();
-    let mut candidates = Vec::new();
-    for record in records.iter().rev() {
-        if !seen.insert(record.op.id()) {
-            continue;
-        }
-        let WriteOperation::Put(put) = &record.op else {
-            continue;
-        };
-        if record.seq_no > visible_seq_no || filter.is_some_and(|filter| !filter(&put.metadata)) {
-            continue;
-        }
-        candidates.push(AnnCandidate {
-            unit_id: segment.segment_id.clone(),
-            record_id: put.id.clone(),
-            seq_no: record.seq_no,
-            value: storage_metric_value(metric, query, &put.vector)?,
-        });
-    }
-    candidates.sort_by(|left, right| {
-        storage_metric_compare(metric, right.value, left.value)
-            .then(left.record_id.cmp(&right.record_id))
-    });
-    candidates.truncate(budget);
-    Ok(candidates)
 }
 
 #[cfg(test)]

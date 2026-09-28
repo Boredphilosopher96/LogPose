@@ -1561,12 +1561,19 @@ mod tests {
             .payload_json
             .parse::<Value>()
             .expect("wal payload should be valid json");
-        assert_eq!(
+        // The delete after the flush only set a deletion bit on the segment's row, so the
+        // memtable holds no record, but one operation sits above the checkpoint.
+        assert!(
             wal_payload["records"]
                 .as_array()
                 .expect("wal records should be an array")
-                .len(),
-            1
+                .is_empty()
+        );
+        assert_eq!(
+            wal_payload["visible_seq_no"].as_u64(),
+            wal_payload["checkpoint_seq_no"]
+                .as_u64()
+                .map(|seq_no| seq_no + 1)
         );
 
         let segment = service

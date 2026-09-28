@@ -18,30 +18,11 @@ fn collection_id() -> CollectionId {
     CollectionId(Uuid::from_u128(0x1234))
 }
 
-fn legacy(unit: UnitId) -> SegmentMeta {
-    SegmentMeta {
-        segment_id: unit.to_string(),
-        file_name: format!("{unit}.lps"),
-        min_seq_no: 1,
-        max_seq_no: 9,
-        put_count: 3,
-        delete_count: 1,
-        dimensions: 2,
-        checksum: 77,
-        approx_bytes: 4096,
-        index_kind: "hnsw".to_owned(),
-        scalar_fields: BTreeMap::new(),
-        artifacts: Vec::new(),
-        component_bytes: BTreeMap::from([("segment".to_owned(), 100)]),
-        remote: None,
-    }
-}
-
 fn segment(unit: u32) -> ManifestSegment {
     ManifestSegment {
         unit: UnitId(unit),
         file_len: 100 + u64::from(unit),
-        footer_crc: 0,
+        footer_crc: 0xdead_beef,
         row_count: 4,
         schema_version: 3,
         min_seq_no: 1,
@@ -68,7 +49,6 @@ fn segment(unit: u32) -> ManifestSegment {
             null_count: 1,
             distinct_estimate: 3,
         }],
-        legacy: Some(legacy(UnitId(unit))),
     }
 }
 
@@ -105,7 +85,10 @@ fn a_manifest_round_trips_through_its_file_format() {
     assert_eq!(le_u64(&bytes[16..24]) as usize, bytes.len() - 32);
     let decoded = Manifest::decode(&bytes, Path::new("/m")).expect("decode");
     assert_eq!(decoded, manifest);
-    assert_eq!(decoded.legacy_segments().count(), 2);
+    let inspected = decoded.inspect_json();
+    assert_eq!(inspected["segments"][1]["segment_id"], "00000005");
+    assert_eq!(inspected["segments"][0]["deleted_rows"], 1);
+    assert_eq!(inspected["totals"]["rows"], 8);
     assert_eq!(decoded.units().collect::<Vec<_>>(), [UnitId(2), UnitId(5)]);
 }
 

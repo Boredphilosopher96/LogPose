@@ -138,6 +138,18 @@ struct ExpectedGenerationState {
     segment_count: usize,
 }
 
+/// One row the engine stores: a put, in a memtable until a flush moves it into a segment, and
+/// gone once a flush (for a memtable row) or a compaction (for a segment row) that ran after it
+/// was superseded dropped it.
+#[derive(Clone, Debug)]
+struct PhysicalRow {
+    id: RecordId,
+    seq_no: SeqNo,
+    in_segment: bool,
+    /// The manifest generation whose flush or compaction dropped the row.
+    dropped_at: Option<u64>,
+}
+
 #[derive(Debug)]
 struct ExpectedModel {
     collection_id: Option<CollectionId>,
@@ -148,6 +160,7 @@ struct ExpectedModel {
     segment_count: usize,
     generation_states: BTreeMap<u64, ExpectedGenerationState>,
     history: Vec<(SeqNo, WriteOperation)>,
+    rows: Vec<PhysicalRow>,
 }
 
 impl ExpectedModel {
@@ -169,7 +182,26 @@ impl ExpectedModel {
             segment_count: 0,
             generation_states,
             history: Vec::new(),
+            rows: Vec::new(),
         }
+    }
+
+    /// Whether an operation on `row`'s key after the row, at or below `visible_seq_no`,
+    /// superseded it.
+    fn superseded(&self, row: &PhysicalRow, visible_seq_no: SeqNo) -> bool {
+        self.history.iter().any(|(seq_no, operation)| {
+            *seq_no > row.seq_no && *seq_no <= visible_seq_no && operation.id() == &row.id
+        })
+    }
+
+    /// Puts above the checkpoint: the memtable's slots.
+    fn memtable_put_count(&self) -> usize {
+        self.history
+            .iter()
+            .filter(|(seq_no, operation)| {
+                *seq_no > self.checkpoint_seq_no && matches!(operation, WriteOperation::Put(_))
+            })
+            .count()
     }
 
     fn register_collection(&mut self, collection_id: CollectionId, metric: DistanceMetric) {
@@ -187,6 +219,14 @@ impl ExpectedModel {
                 && let WriteOperation::Put(put) = &mut operation
             {
                 normalize(&mut put.vector);
+            }
+            if let WriteOperation::Put(put) = &operation {
+                self.rows.push(PhysicalRow {
+                    id: put.id.clone(),
+                    seq_no: self.next_seq_no,
+                    in_segment: false,
+                    dropped_at: None,
+                });
             }
             self.history.push((self.next_seq_no, operation));
         }
@@ -209,7 +249,24 @@ impl ExpectedModel {
         );
         self.manifest_generation = generation;
         self.checkpoint_seq_no = self.next_seq_no;
-        self.segment_count += 1;
+        // The memtable's dead slots are dropped; its live ones become a segment, if any.
+        let now = self.next_seq_no;
+        let mut live = false;
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            if row.in_segment || row.dropped_at.is_some() {
+                continue;
+            }
+            if self.superseded(row, now) {
+                self.rows[index].dropped_at = Some(generation);
+            } else {
+                self.rows[index].in_segment = true;
+                live = true;
+            }
+        }
+        if live {
+            self.segment_count += 1;
+        }
         self.generation_states.insert(
             self.manifest_generation,
             ExpectedGenerationState {
@@ -231,7 +288,21 @@ impl ExpectedModel {
             self.manifest_generation
         );
         self.manifest_generation = generation;
-        self.segment_count = 1;
+        // The segments' deleted rows are dropped; the live ones become one segment, if any.
+        let now = self.next_seq_no;
+        let mut live = false;
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            if !row.in_segment || row.dropped_at.is_some() {
+                continue;
+            }
+            if self.superseded(row, now) {
+                self.rows[index].dropped_at = Some(generation);
+            } else {
+                live = true;
+            }
+        }
+        self.segment_count = usize::from(live);
         self.generation_states.insert(
             self.manifest_generation,
             ExpectedGenerationState {
@@ -269,9 +340,18 @@ impl ExpectedModel {
             .values()
             .filter(|state| matches!(state, ExpectedState::Visible(_)))
             .count();
-        let deleted_record_count = resolved
-            .values()
-            .filter(|state| matches!(state, ExpectedState::Deleted))
+        // Rows the engine still stores at that state (not yet dropped by a flush or
+        // compaction of a later generation) that an operation up to it superseded.
+        let deleted_record_count = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.seq_no <= snapshot.visible_seq_no
+                    && row
+                        .dropped_at
+                        .is_none_or(|generation| generation > snapshot.manifest_generation)
+                    && self.superseded(row, snapshot.visible_seq_no)
+            })
             .count();
         let mutable_op_count = self
             .history
@@ -622,9 +702,10 @@ struct PinnedSnapshot {
 /// Most snapshots the harness keeps pinned at once.
 const MAX_PINNED: usize = 16;
 
-/// A snapshot reads exactly the state it named while its generation is current or a pinned
-/// version of its generation covers it (its own token, or a later pin taken before the next
-/// flush or compaction); any other is expired.
+/// A snapshot reads exactly the state it named while that state is retained: it is the current
+/// one, or a live token pins exactly it. Otherwise the engine may still retain it among the
+/// latest versions of the current generation (then the read must be exact) or report it
+/// expired; it never reads a different state.
 async fn assert_snapshot_reads(
     engine: &LocalStorageEngine,
     model: &ExpectedModel,
@@ -635,11 +716,9 @@ async fn assert_snapshot_reads(
 ) {
     let entry = &snapshots[index];
     let snapshot = &entry.snapshot;
-    let covered = snapshots.iter().any(|other| {
-        other.token.is_some()
-            && other.snapshot.manifest_generation == snapshot.manifest_generation
-            && other.snapshot.visible_seq_no >= snapshot.visible_seq_no
-    });
+    let pinned = snapshots
+        .iter()
+        .any(|other| other.token.is_some() && other.snapshot == *snapshot);
     if let Some(token) = &entry.token {
         let actual = engine
             .scan_exact_at_token(COLLECTION_NAME, token.clone())
@@ -650,7 +729,7 @@ async fn assert_snapshot_reads(
         let expected = model.expected_visible(snapshot.visible_seq_no);
         assert_eq_with_context(seed, trace, "token scan mismatch", &expected, &actual);
     }
-    if covered || snapshot.manifest_generation == model.manifest_generation {
+    if pinned || *snapshot == model.current_snapshot() {
         assert_scan_matches_snapshot(engine, model, snapshot, seed, trace).await;
         assert_exact_queries_match_snapshot(engine, model, snapshot, seed, trace).await;
         assert_stats_match(engine, model, Some(snapshot.clone()), seed, trace).await;
@@ -662,19 +741,44 @@ async fn assert_snapshot_reads(
     let stats = engine
         .stats_snapshot(COLLECTION_NAME, Some(snapshot.clone()))
         .await;
-    for (what, error) in [("scan", scan.err()), ("stats", stats.err())] {
-        match error {
-            Some(LogPoseError::SnapshotExpired { .. }) => {}
-            other => panic_with_context(
+    match scan {
+        Ok(actual) => {
+            let recent = snapshot.manifest_generation == model.manifest_generation;
+            assert!(
+                recent,
+                "seed={seed}: only versions of the current generation are retained unpinned"
+            );
+            let expected = model.expected_visible(snapshot.visible_seq_no);
+            assert_eq_with_context(seed, trace, "recent snapshot scan", &expected, &actual);
+        }
+        Err(LogPoseError::SnapshotExpired { .. }) => {}
+        Err(other) => panic_with_context(
+            seed,
+            trace,
+            format!(
+                "scan of unpinned snapshot {snapshot:?} (current generation {}) must read \
+                 exactly or expire, got {other:?}",
+                model.manifest_generation
+            ),
+        ),
+    }
+    match stats {
+        Ok(actual) => {
+            let expected = model.expected_stats(snapshot.clone());
+            assert_eq_with_context(
                 seed,
                 trace,
-                format!(
-                    "{what} of unpinned snapshot {snapshot:?} (current generation {}) must \
-                     expire, got {other:?}",
-                    model.manifest_generation
-                ),
-            ),
+                "recent snapshot stats",
+                &(expected.visible_seq_no, expected.live_record_count),
+                &(actual.visible_seq_no, actual.live_record_count),
+            );
         }
+        Err(LogPoseError::SnapshotExpired { .. }) => {}
+        Err(other) => panic_with_context(
+            seed,
+            trace,
+            format!("stats of unpinned snapshot {snapshot:?} must be exact or expire: {other:?}"),
+        ),
     }
 }
 
@@ -1191,18 +1295,11 @@ async fn assert_stats_match(
             immutable
                 .artifact_stats
                 .iter()
-                .any(|artifact| artifact.file_name.ends_with(".flat.json")),
+                .any(|artifact| artifact.file_name.ends_with(".seg")),
             "seed={seed} trace={trace:?} immutable={immutable:?}"
         );
         assert!(
-            immutable
-                .artifact_stats
-                .iter()
-                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
-            "seed={seed} trace={trace:?} immutable={immutable:?}"
-        );
-        assert!(
-            immutable.component_bytes.contains_key("ann_graph"),
+            immutable.component_bytes.contains_key("segment"),
             "seed={seed} trace={trace:?} immutable={immutable:?}"
         );
     }
@@ -1247,7 +1344,12 @@ async fn assert_wal_inspect_matches(
         .get("records")
         .and_then(Value::as_array)
         .expect("wal records should be an array");
-    assert_eq!(records.len(), model.mutable_op_count());
+    assert_eq!(records.len(), model.memtable_put_count());
+    let operations = report.payload["visible_seq_no"]
+        .as_u64()
+        .zip(report.payload["checkpoint_seq_no"].as_u64())
+        .map(|(visible, checkpoint)| visible - checkpoint);
+    assert_eq!(operations, Some(model.mutable_op_count() as u64));
 }
 
 async fn assert_segment_inspect_matches(

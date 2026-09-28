@@ -1,21 +1,17 @@
 //! The v1 view of v2 rows, for the legacy `StorageEngine` read paths.
 //!
-//! The mutable delta holds `FieldId`-keyed row images. The legacy read paths (exact scan,
-//! latest-visible lookups, statistics, v1 segment flushes) still speak `PutRecord { id, vector,
-//! metadata }`. A row is read with the reading `Version`'s schema ([`RowImage::to_record`]:
+//! Memtables and segments hold `FieldId`-keyed rows. The legacy read paths (exact scan,
+//! latest-visible lookups, ANN candidates, statistics, inspect) still speak `PutRecord { id,
+//! vector, metadata }`. A row is read with the reading `Version`'s schema ([`RowImage::to_record`]:
 //! dropped fields skipped, dynamic keys shadowed), then flattened: the key becomes the id, the
 //! collection's vector field the vector, and the visible dynamic keys plus the typed scalar
 //! fields (under their current names) the metadata object. Deleted with the legacy trait
 //! (PR 14).
 
-use crate::{
-    segment_v1::SegmentRecord,
-    version::{DeltaOp, DeltaRecord},
-};
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    DeleteRecord, LogPoseError, PutRecord, RecordId, Result, WriteOperation,
-    legacy::client_op_from_write, record::ClientOp, schema::CollectionSchema,
+    LogPoseError, PutRecord, RecordId, Result, WriteOperation, legacy::client_op_from_write,
+    record::ClientOp, schema::CollectionSchema,
 };
 use logpose_wal::codec::{RowImage, WirePk};
 use serde_json::Value as JsonValue;
@@ -80,31 +76,6 @@ pub(crate) fn legacy_put(schema: &CollectionSchema, image: &RowImage) -> Result<
         vector,
         metadata: JsonValue::Object(metadata),
     })
-}
-
-/// The v1 record of one delta operation, or `None` for a schema change, which changes no row.
-pub(crate) fn legacy_record(
-    schema: &CollectionSchema,
-    record: &DeltaRecord,
-) -> Result<Option<SegmentRecord>> {
-    let op = match &record.op {
-        DeltaOp::Put(image) => WriteOperation::Put(legacy_put(schema, image)?),
-        DeltaOp::Delete(pk) => WriteOperation::Delete(DeleteRecord { id: legacy_id(pk) }),
-        DeltaOp::SchemaChange { .. } => return Ok(None),
-    };
-    Ok(Some(SegmentRecord {
-        seq_no: record.seq_no,
-        op,
-    }))
-}
-
-/// The key a delta operation writes, if it writes one.
-pub(crate) fn delta_key(op: &DeltaOp) -> Option<&WirePk> {
-    match op {
-        DeltaOp::Put(image) => Some(&image.pk),
-        DeltaOp::Delete(pk) => Some(pk),
-        DeltaOp::SchemaChange { .. } => None,
-    }
 }
 
 #[cfg(test)]

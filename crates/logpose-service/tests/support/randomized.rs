@@ -84,6 +84,18 @@ struct ExpectedGenerationState {
     segment_count: usize,
 }
 
+/// One row the engine stores: a put, in a memtable until a flush moves it into a segment, and
+/// gone once a flush (for a memtable row) or a compaction (for a segment row) that ran after it
+/// was superseded dropped it.
+#[derive(Clone, Debug)]
+struct PhysicalRow {
+    id: RecordId,
+    seq_no: SeqNo,
+    in_segment: bool,
+    /// The manifest generation whose flush or compaction dropped the row.
+    dropped_at: Option<u64>,
+}
+
 #[derive(Debug)]
 struct ExpectedModel {
     collection_id: Option<String>,
@@ -94,6 +106,7 @@ struct ExpectedModel {
     segment_count: usize,
     generation_states: BTreeMap<u64, ExpectedGenerationState>,
     history: Vec<(SeqNo, WriteOperation)>,
+    rows: Vec<PhysicalRow>,
 }
 
 impl ExpectedModel {
@@ -115,7 +128,26 @@ impl ExpectedModel {
             segment_count: 0,
             generation_states,
             history: Vec::new(),
+            rows: Vec::new(),
         }
+    }
+
+    /// Whether an operation on `row`'s key after the row, at or below `visible_seq_no`,
+    /// superseded it.
+    fn superseded(&self, row: &PhysicalRow, visible_seq_no: SeqNo) -> bool {
+        self.history.iter().any(|(seq_no, operation)| {
+            *seq_no > row.seq_no && *seq_no <= visible_seq_no && operation.id() == &row.id
+        })
+    }
+
+    /// Puts above the checkpoint: the memtable's slots.
+    fn memtable_put_count(&self) -> usize {
+        self.history
+            .iter()
+            .filter(|(seq_no, operation)| {
+                *seq_no > self.checkpoint_seq_no && matches!(operation, WriteOperation::Put(_))
+            })
+            .count()
     }
 
     fn register_collection(&mut self, collection_id: String, metric: DistanceMetric) {
@@ -133,6 +165,14 @@ impl ExpectedModel {
             {
                 normalize(&mut put.vector);
             }
+            if let WriteOperation::Put(put) = &operation {
+                self.rows.push(PhysicalRow {
+                    id: put.id.clone(),
+                    seq_no: self.next_seq_no,
+                    in_segment: false,
+                    dropped_at: None,
+                });
+            }
             self.history.push((self.next_seq_no, operation));
         }
     }
@@ -143,7 +183,25 @@ impl ExpectedModel {
         }
         self.manifest_generation += 1;
         self.checkpoint_seq_no = self.next_seq_no;
-        self.segment_count += 1;
+        // The memtable's dead slots are dropped; its live ones become a segment, if any.
+        let generation = self.manifest_generation;
+        let now = self.next_seq_no;
+        let mut live = false;
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            if row.in_segment || row.dropped_at.is_some() {
+                continue;
+            }
+            if self.superseded(row, now) {
+                self.rows[index].dropped_at = Some(generation);
+            } else {
+                self.rows[index].in_segment = true;
+                live = true;
+            }
+        }
+        if live {
+            self.segment_count += 1;
+        }
         self.generation_states.insert(
             self.manifest_generation,
             ExpectedGenerationState {
@@ -158,7 +216,22 @@ impl ExpectedModel {
             return;
         }
         self.manifest_generation += 1;
-        self.segment_count = 1;
+        // The segments' deleted rows are dropped; the live ones become one segment, if any.
+        let generation = self.manifest_generation;
+        let now = self.next_seq_no;
+        let mut live = false;
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            if !row.in_segment || row.dropped_at.is_some() {
+                continue;
+            }
+            if self.superseded(row, now) {
+                self.rows[index].dropped_at = Some(generation);
+            } else {
+                live = true;
+            }
+        }
+        self.segment_count = usize::from(live);
         self.generation_states.insert(
             self.manifest_generation,
             ExpectedGenerationState {
@@ -196,9 +269,18 @@ impl ExpectedModel {
             .values()
             .filter(|state| matches!(state, ExpectedState::Visible(_)))
             .count();
-        let deleted_record_count = resolved
-            .values()
-            .filter(|state| matches!(state, ExpectedState::Deleted))
+        // Rows the engine still stores at that state (not yet dropped by a flush or
+        // compaction of a later generation) that an operation up to it superseded.
+        let deleted_record_count = self
+            .rows
+            .iter()
+            .filter(|row| {
+                row.seq_no <= snapshot.visible_seq_no
+                    && row
+                        .dropped_at
+                        .is_none_or(|generation| generation > snapshot.manifest_generation)
+                    && self.superseded(row, snapshot.visible_seq_no)
+            })
             .count();
         let mutable_op_count = self
             .history
@@ -486,9 +568,17 @@ async fn run_seeded_service_scenario(seed: u64, steps: usize) {
                         format!("missing snapshot index {snapshot_index}"),
                     )
                 });
-                // The service pins nothing, so a snapshot stays exact only while its manifest
-                // generation is current.
-                if snapshot.manifest_generation == model.manifest_generation {
+                // The service pins nothing, so a snapshot is exact while it names the current
+                // state. One of an earlier state of the current generation may still be
+                // retained (then it reads exactly) or not (then it is expired everywhere); one of
+                // an older generation is always expired.
+                let retained = snapshot == model.current_snapshot()
+                    || (snapshot.manifest_generation == model.manifest_generation
+                        && state
+                            .stats_at_snapshot(COLLECTION_NAME, Some(snapshot.clone()))
+                            .await
+                            .is_ok());
+                if retained {
                     assert_query_parity(
                         &state,
                         &rest,
@@ -1236,18 +1326,11 @@ async fn assert_stats_parity(
             immutable
                 .artifact_stats
                 .iter()
-                .any(|artifact| artifact.file_name.ends_with(".flat.json")),
+                .any(|artifact| artifact.file_name.ends_with(".seg")),
             "seed={seed} trace={trace:?} immutable={immutable:?}"
         );
         assert!(
-            immutable
-                .artifact_stats
-                .iter()
-                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
-            "seed={seed} trace={trace:?} immutable={immutable:?}"
-        );
-        assert!(
-            immutable.component_bytes.contains_key("ann_graph"),
+            immutable.component_bytes.contains_key("segment"),
             "seed={seed} trace={trace:?} immutable={immutable:?}"
         );
         let rest_units = rest_body["query_units"]
@@ -1266,11 +1349,11 @@ async fn assert_stats_parity(
         assert!(
             rest_immutable["artifact_stats"]
                 .as_array()
-                .is_some_and(|artifacts| artifacts.len() >= 2),
+                .is_some_and(|artifacts| !artifacts.is_empty()),
             "seed={seed} trace={trace:?} immutable={rest_immutable:#?}"
         );
         assert!(
-            rest_immutable["component_bytes"]["ann_graph"]
+            rest_immutable["component_bytes"]["segment"]
                 .as_u64()
                 .is_some(),
             "seed={seed} trace={trace:?} immutable={rest_immutable:#?}"
@@ -1290,11 +1373,11 @@ async fn assert_stats_parity(
             grpc_immutable
                 .artifact_stats
                 .iter()
-                .any(|artifact| artifact.file_name.ends_with(".hnsw.bin")),
+                .any(|artifact| artifact.file_name.ends_with(".seg")),
             "seed={seed} trace={trace:?} immutable={grpc_immutable:?}"
         );
         assert!(
-            grpc_immutable.component_bytes.contains_key("ann_graph"),
+            grpc_immutable.component_bytes.contains_key("segment"),
             "seed={seed} trace={trace:?} immutable={grpc_immutable:?}"
         );
     }
@@ -1344,7 +1427,7 @@ async fn assert_inspect_parity(
                 .as_array()
                 .expect("wal records should be an array")
                 .len(),
-            model.mutable_op_count()
+            model.memtable_put_count()
         ),
         _ => {}
     }
@@ -1389,7 +1472,7 @@ async fn assert_inspect_parity(
                 .as_array()
                 .expect("wal records should be an array")
                 .len(),
-            model.mutable_op_count()
+            model.memtable_put_count()
         ),
         _ => {}
     }
