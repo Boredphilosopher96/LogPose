@@ -227,14 +227,20 @@ impl ExpectedModel {
         );
     }
 
+    /// A compaction merges two or more segments, or rewrites a lone segment that has deleted
+    /// rows.
     fn record_compact(&mut self) {
-        if self.segment_count <= 1 {
+        let now = self.next_seq_no;
+        let reclaims = self
+            .rows
+            .iter()
+            .any(|row| row.in_segment && row.dropped_at.is_none() && self.superseded(row, now));
+        if self.segment_count == 0 || (self.segment_count == 1 && !reclaims) {
             return;
         }
         self.manifest_generation += 1;
         // The segments' deleted rows are dropped; the live ones become one segment, if any.
         let generation = self.manifest_generation;
-        let now = self.next_seq_no;
         let mut live = false;
         for index in 0..self.rows.len() {
             let row = &self.rows[index];

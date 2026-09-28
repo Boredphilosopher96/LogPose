@@ -2135,7 +2135,12 @@ mod tests {
             |pending: &[&str], in_progress: Option<&str>, error: Option<&str>| MaintenanceStatus {
                 pending: pending.iter().map(|label| (*label).to_owned()).collect(),
                 in_progress: in_progress.map(str::to_owned),
-                last_error: error.map(str::to_owned),
+                last_error: error.map(|message| logpose_types::MaintenanceError {
+                    job: "flush".to_owned(),
+                    message: message.to_owned(),
+                    failed_at_unix_ms: 0,
+                    consecutive_failures: 1,
+                }),
                 completed_runs: 0,
             };
         let storage = Arc::new(FixedMaintenance {

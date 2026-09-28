@@ -275,9 +275,15 @@ impl ExpectedModel {
         );
     }
 
-    /// A compaction that the engine published as `generation`.
+    /// A compaction that the engine published as `generation`. It merges two or more segments,
+    /// or rewrites a lone segment that has deleted rows.
     fn record_compact(&mut self, generation: u64) {
-        if self.segment_count <= 1 {
+        let now = self.next_seq_no;
+        let reclaims = self
+            .rows
+            .iter()
+            .any(|row| row.in_segment && row.dropped_at.is_none() && self.superseded(row, now));
+        if self.segment_count == 0 || (self.segment_count == 1 && !reclaims) {
             assert_eq!(generation, self.manifest_generation, "nothing to compact");
             return;
         }
@@ -288,7 +294,6 @@ impl ExpectedModel {
         );
         self.manifest_generation = generation;
         // The segments' deleted rows are dropped; the live ones become one segment, if any.
-        let now = self.next_seq_no;
         let mut live = false;
         for index in 0..self.rows.len() {
             let row = &self.rows[index];

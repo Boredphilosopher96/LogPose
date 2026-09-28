@@ -44,6 +44,8 @@ mod apply;
 mod compaction_tests;
 #[cfg(test)]
 mod dv_tests;
+#[cfg(test)]
+mod failure_tests;
 mod jobs;
 #[cfg(test)]
 mod model_tests;
@@ -451,7 +453,8 @@ pub(crate) fn spawn(
         quiesce_waiters: Vec::new(),
         freeze_pending: false,
         held: None,
-        retry_at: None,
+        flush_retry: jobs::Backoff::flush(),
+        compaction_retry: jobs::Backoff::compaction(),
         policy,
     };
     runtime.spawn(writer.run());
@@ -528,8 +531,11 @@ struct Writer {
     /// writes stall, so its age can be checked, or a filter request met while collecting a
     /// group, which starts a group of its own.
     held: Option<Queued>,
-    /// After a failed job, no background job is requested before this engine-clock time.
-    retry_at: Option<Duration>,
+    /// When background freezes and flushes may run again after failed ones.
+    flush_retry: jobs::Backoff,
+    /// When background compactions may be planned again after failed ones; independent of
+    /// `flush_retry`, so a failing compaction never holds back a flush.
+    compaction_retry: jobs::Backoff,
     policy: Policy,
 }
 
