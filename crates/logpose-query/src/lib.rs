@@ -6,12 +6,12 @@
 //!
 //! - [`compile`]: filters to per-unit bitmaps, through scalar indexes where a unit has one and
 //!   column or `$extra` scans otherwise.
-//! - [`search`]: staged vector search: per-unit strategy from the exact filter cardinality
+//! - [`search`](mod@search): staged vector search: per-unit strategy from the exact filter cardinality
 //!   (exact scan, ACORN-1 style walk, or admit-only walk over SQ8 codes), a resumable cursor
 //!   that widens `ef` for short or anti-correlated results, an exact f32 rerank, and a global
 //!   top-k merge.
 //! - [`ops`]: get, count, scroll by key, and order by a field.
-//! - [`resolver`]: the [`RowSetResolver`](logpose_storage::RowSetResolver) the engine uses for
+//! - [`resolver`](mod@resolver): the [`RowSetResolver`](logpose_storage::RowSetResolver) the engine uses for
 //!   delete-by-filter and update-by-filter.
 //!
 //! [`query`] serves the API's single-vector query shape ([`QueryRequest`]) on top of them.

@@ -216,7 +216,7 @@ impl SegmentUnit {
 
 impl SegmentUnit {
     /// [`load`](Self::load), then, for a whole index section, decode it and
-    /// attach the decoded form (see [`attach_decoded`]) so the cache charges
+    /// attach the decoded form (`index::attach_decoded`) so the cache charges
     /// it and every hit reuses it. A payload that verifies but does not
     /// decode is [`SegmentError::Corrupt`] in the section.
     ///

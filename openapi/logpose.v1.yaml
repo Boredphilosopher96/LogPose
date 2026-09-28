@@ -1191,7 +1191,7 @@ components:
             - type: string
         unit_scan_mix:
           type: object
-          description: Units per strategy: `memtable_scan`, `exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`, `pruned` (zone maps excluded the filter), and `empty` (no live row matched).
+          description: "Units per strategy: `memtable_scan`, `exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`, `pruned` (zone maps excluded the filter), and `empty` (no live row matched)."
           additionalProperties:
             type: integer
         stage_timings:
