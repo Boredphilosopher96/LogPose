@@ -266,6 +266,8 @@ pub struct Runner {
     pub pending: Option<Model>,
     /// The collection refused further writes after a failure.
     pub poisoned: bool,
+    /// A failure was injected since the last restart.
+    faulted: bool,
     jobs: Vec<SteppedJob>,
     tokens: Vec<Pinned>,
     scrolls: Vec<Scroll>,
@@ -298,6 +300,7 @@ impl Runner {
             model,
             pending: None,
             poisoned: false,
+            faulted: false,
             jobs: Vec::new(),
             tokens: Vec::new(),
             scrolls: Vec::new(),
@@ -325,6 +328,14 @@ impl Runner {
         self.tokens.iter().map(|pinned| pinned.id).collect()
     }
 
+    /// The model token `id` reads.
+    pub fn token_model(&self, id: u64) -> Option<&Model> {
+        self.tokens
+            .iter()
+            .find(|pinned| pinned.id == id)
+            .map(|pinned| &pinned.model)
+    }
+
     pub fn open_scrolls(&self) -> Vec<u64> {
         self.scrolls.iter().map(|scroll| scroll.id).collect()
     }
@@ -332,6 +343,18 @@ impl Runner {
     /// Run one action and check its outcome and the state it leaves.
     pub fn execute(&mut self, action: &Action) -> Check {
         self.stats.actions += 1;
+        if let Action::Read(Read::Search { .. }) | Action::ReadAt(_, Read::Search { .. }) = action {
+            self.stats.searches += 1;
+        }
+        if !self.poisoned && self.session.handle().is_poisoned() {
+            // Only an injected failure may poison the collection, and possibly after the
+            // action that injected it returned (a background job that ran into it).
+            if !self.faulted {
+                return fail("the collection was poisoned without an injected failure");
+            }
+            self.poisoned = true;
+            self.stats.poisoned += 1;
+        }
         match action {
             Action::Crash {
                 during,
@@ -351,6 +374,23 @@ impl Runner {
     fn attempt(&mut self, action: &Action, armed: bool) -> Check {
         match action {
             Action::Write(ops) => self.write(ops, armed),
+            // Replayed filter requests over fields the schema no longer declares do nothing:
+            // the model does not evaluate `$extra` filters.
+            Action::DeleteByFilter(filter) | Action::UpdateByFilter(filter, _)
+                if !filter_declared(&self.model, filter) =>
+            {
+                Ok(())
+            }
+            Action::ScrollStart { by, filter, .. }
+                if filter
+                    .as_ref()
+                    .is_some_and(|filter| !filter_declared(&self.model, filter))
+                    || by
+                        .as_ref()
+                        .is_some_and(|(field, _)| self.model.schema.scalar_field(field).is_none()) =>
+            {
+                Ok(())
+            }
             Action::DeleteByFilter(filter) => self.delete_by_filter(filter, armed),
             Action::UpdateByFilter(filter, patch) => self.update_by_filter(filter, patch, armed),
             Action::Alter(change) => self.alter(change, armed),
@@ -869,6 +909,7 @@ impl Runner {
             plan.fail_sync = Some(fault.file_syncs() + nth);
         }
         fault.set_plan(plan);
+        self.faulted = true;
         let outcome = self.attempt(during, true);
         // Background jobs may still be running into the failure.
         self.session.wait_for_jobs()?;
@@ -967,6 +1008,7 @@ impl Runner {
         }
         self.pending = None;
         self.poisoned = false;
+        self.faulted = false;
         for pinned in &mut self.tokens {
             pinned.dead = true;
         }
@@ -1027,6 +1069,11 @@ impl Runner {
 
     /// Check a read of `view` against `model`.
     pub fn check_read(&self, view: &ReadView, model: &Model, read: &Read) -> Check {
+        if !declared(model, read) {
+            // A replayed read whose fields the schema no longer declares (the model does not
+            // evaluate `$extra` filters).
+            return Ok(());
+        }
         match read {
             Read::Get(keys) => self.check_get(view, model, keys),
             Read::Count(filter) => {
@@ -1228,6 +1275,34 @@ impl Runner {
         }
         Ok(())
     }
+}
+
+/// Whether every field `filter` compares is a declared scalar field of `model`.
+fn filter_declared(model: &Model, filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::And { children } | FilterExpr::Or { children } => {
+            children.iter().all(|child| filter_declared(model, child))
+        }
+        FilterExpr::Not { child } => filter_declared(model, child),
+        FilterExpr::Comparison(comparison) => {
+            model.schema.scalar_field(&comparison.field).is_some()
+        }
+    }
+}
+
+/// Whether every field `read` filters or orders on is a declared scalar field of `model`.
+fn declared(model: &Model, read: &Read) -> bool {
+    let filter = match read {
+        Read::Get(_) | Read::Scan { .. } => None,
+        Read::Count(filter) | Read::Search { filter, .. } => filter.as_ref(),
+        Read::OrderBy { field, filter, .. } => {
+            if model.schema.scalar_field(field).is_none() {
+                return false;
+            }
+            filter.as_ref()
+        }
+    };
+    filter.is_none_or(|filter| filter_declared(model, filter))
 }
 
 /// Run a future to completion on a runtime of its own (on a thread outside every runtime).

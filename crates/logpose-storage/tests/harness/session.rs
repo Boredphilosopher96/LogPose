@@ -291,6 +291,7 @@ impl Session {
         });
         let started = Instant::now();
         let paused = self.setup.maintenance == Maintenance::Paused;
+        let mut nudges = 0_u32;
         loop {
             match finished.recv_timeout(Duration::from_millis(1)) {
                 Ok(value) => return Ok(value),
@@ -302,12 +303,22 @@ impl Session {
             if started.elapsed() > CALL_DEADLINE {
                 return Err(format!("{what} did not return within {CALL_DEADLINE:?}"));
             }
-            if paused && started.elapsed() > Duration::from_millis(5) {
-                let scheduler = self.engine().scheduler();
-                let stats = scheduler.stats();
-                if stats.waiting > 0 && stats.running == 0 {
-                    scheduler.step(1);
-                }
+            let scheduler = self.engine().scheduler();
+            let stats = scheduler.stats();
+            if paused
+                && started.elapsed() > Duration::from_millis(5)
+                && stats.waiting > 0
+                && stats.running == 0
+            {
+                scheduler.step(1);
+            }
+            // Time passes on the manual clock only when the harness says so. A call held up by
+            // a job's retry backoff (a write stalled behind flushes that failed) waits for it,
+            // so let a second pass whenever the call has been idle for a while.
+            let idle = started.elapsed().saturating_sub(Duration::from_millis(200));
+            if stats.running == 0 && idle > Duration::from_millis(100) * nudges {
+                self.clock.advance(Duration::from_secs(1));
+                nudges += 1;
             }
         }
     }

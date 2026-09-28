@@ -190,7 +190,10 @@ impl Generator {
             }
             Kind::Read => Action::Read(self.read(model)),
             Kind::ReadAt => match self.token(runner) {
-                Some(id) => Action::ReadAt(id, self.read(model)),
+                Some(id) => {
+                    let pinned = runner.token_model(id).unwrap_or(model);
+                    Action::ReadAt(id, self.read(pinned))
+                }
                 None => Action::Pin,
             },
             Kind::ScrollStart => self.scroll_start(runner),
