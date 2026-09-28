@@ -226,7 +226,10 @@ impl Session {
             tokens: TokenConfig {
                 ttl: TTL,
                 memory_limit: Some(u64::MAX),
-                // Hand-stepped runs reap expired pins when they settle instead.
+                // Hand-stepped runs reap expired pins when they settle instead. The same pass
+                // refreshes the cache budget and runs the global memtable-budget trigger, which
+                // they therefore skip: neither changes what a read returns, and the harness's
+                // memtables never come near the budget (a fraction of the default 4 GiB).
                 reaper_interval: if self.setup.background() {
                     TokenConfig::default().reaper_interval
                 } else {
