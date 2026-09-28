@@ -4,7 +4,7 @@
 //! # Checks
 //!
 //! [`CompiledFilter::compile`] resolves every field path with
-//! [`resolve_field`](logpose_types::filter::resolve_field) and checks every operand against the
+//! [`resolve_field`] and checks every operand against the
 //! field it compares, and reports the first problem as `InvalidArgument` at the node's path
 //! below `filter` (the same paths [`FilterExpr::from_json`] uses, such as
 //! `filter.and[1].range.price.gte`):

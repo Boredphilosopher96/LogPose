@@ -2714,7 +2714,6 @@ mod tests {
                             proto::Value {
                                 kind: Some(proto::value::Kind::ArrayValue(proto::ValueArray {
                                     values: vec![string_value("c")],
-                                    ..Default::default()
                                 })),
                             },
                         ),
