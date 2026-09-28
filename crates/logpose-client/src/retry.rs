@@ -12,9 +12,12 @@
 //!
 //! # Idempotency
 //!
-//! The server attaches a retry hint only to errors that refused the request, and a lost reply
-//! (a transport failure) carries no hint, so a retried write is normally applied once. Write
-//! retries are opt-in all the same, so a caller that cannot tolerate a repeat never gets one
+//! A lost reply (a transport failure) carries no hint, so it is never retried. Most hinted
+//! errors refuse the request before it changes anything: `NOT_OWNER`, `NOT_LEADER`, and a
+//! collection write without ownership metadata. A metadata store (etcd) failure is the
+//! exception: it carries a hint too, and during `set_database`, `set_database_policy` or
+//! `create_collection` the change may have committed before the reply was lost. Write retries
+//! are opt-in for that reason, so a caller that cannot tolerate a repeat never gets one
 //! silently. The client's writes are safe to repeat:
 //!
 //! - `write`: puts and deletes address records by id, so a repeated batch leaves the same
@@ -144,6 +147,12 @@ impl Default for RetryPolicy {
 }
 
 /// Maps a node id, as named by `owner_node` or `leader_node`, to its gRPC endpoint.
+///
+/// The node id comes from the server; the endpoint comes only from the resolver. The client
+/// sends its bearer token to every endpoint the resolver returns and keeps one connection per
+/// distinct endpoint for its lifetime, so return only endpoints of known nodes. A resolver that
+/// builds an endpoint from any id (such as `format!("http://{node}:50051")`) lets the server
+/// choose where the token goes and how many connections the client keeps.
 pub trait NodeResolver: Send + Sync + 'static {
     /// The gRPC endpoint URL of `node`, or `None` when it is unknown.
     fn endpoint(&self, node: &str) -> Option<String>;
@@ -220,7 +229,7 @@ impl fmt::Debug for RedirectPolicy {
 mod tests {
     use super::*;
     use logpose_api_grpc::status_from_error;
-    use logpose_types::LogPoseError;
+    use logpose_types::{LogPoseError, WriteOutcome};
 
     fn unavailable(retry_after: Option<Duration>) -> ServerError {
         ServerError::from_status(status_from_error(&LogPoseError::Unavailable {
@@ -327,13 +336,32 @@ mod tests {
                 reason: "fsync".to_owned(),
             },
             LogPoseError::internal("boom"),
+            // A WAL failure is never retried: `not_applied` carries no hint, and `unknown_*`
+            // (INTERNAL) may still be replayed, so a repeat could apply the batch twice.
+            LogPoseError::WalWriteFailed {
+                collection: "default/docs".to_owned(),
+                outcome: WriteOutcome::NotApplied,
+                reason: "fsync".to_owned(),
+            },
+            LogPoseError::WalWriteFailed {
+                collection: "default/docs".to_owned(),
+                outcome: WriteOutcome::Unknown { fenced: true },
+                reason: "fsync".to_owned(),
+            },
+            LogPoseError::WalWriteFailed {
+                collection: "default/docs".to_owned(),
+                outcome: WriteOutcome::Unknown { fenced: false },
+                reason: "fsync".to_owned(),
+            },
         ] {
             let decoded = ServerError::from_status(status_from_error(&error));
-            assert_eq!(
-                policy.delay_before_retry(Operation::Read, 1, &decoded),
-                None,
-                "{error}"
-            );
+            for operation in [Operation::Read, Operation::Write] {
+                assert_eq!(
+                    policy.delay_before_retry(operation, 1, &decoded),
+                    None,
+                    "{error}"
+                );
+            }
         }
     }
 
