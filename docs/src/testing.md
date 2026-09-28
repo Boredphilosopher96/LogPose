@@ -184,7 +184,9 @@ Two subcommands run VectorDBBench-style workloads against a running server over 
 LOGPOSE_BENCH_DATA=$HOME/.cache/logpose-bench scripts/bench-milvus.sh cohere-100k openai-50k
 ```
 
-It needs Docker for Milvus (`SKIP_MILVUS=1` runs LogPose alone) and Python 3 with `venv`; it creates a venv with `pymilvus` (pinned to 3.0.2) and `numpy` under `LOGPOSE_BENCH_DATA`.
+It runs on Linux and needs `flock` from util-linux, Docker for Milvus (`SKIP_MILVUS=1` runs LogPose alone), and Python 3 with `venv`; it creates a venv with `pymilvus` (pinned to 3.0.2) and `numpy` under `LOGPOSE_BENCH_DATA`.
+
+Each run keeps its server data, Milvus volume, binaries, raw reports, and logs in `LOGPOSE_BENCH_DATA/runs/<run id>` and holds a lock on that directory while it runs. It refuses to start when the lock is taken or a port it needs is already in use, and after starting `logpose-server` it checks that the server is alive and owns both listening ports. `LOGPOSE_BENCH_RUN_ID` (default `default`), `LOGPOSE_BENCH_GRPC_PORT` (15051), `LOGPOSE_BENCH_REST_PORT` (18080), `LOGPOSE_BENCH_MILVUS_PORT` (19530), and `LOGPOSE_BENCH_MILVUS_HEALTH_PORT` (9091) select the run and its ports, and the Milvus container is `logpose-bench-milvus-<run id>`. A run stops the `logpose-server` and Milvus container that a killed (SIGKILL) earlier run with the same run id left behind. To run two benchmarks on one host at the same time, for example the base and the change of an A/B comparison, give each a distinct run id, distinct ports, and its own `OUTPUT_DIR`; `benches/baselines/README.md` has the recipe.
 
 ## Non-Negotiable Harness Rules
 
