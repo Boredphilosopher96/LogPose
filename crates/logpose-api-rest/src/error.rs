@@ -169,7 +169,7 @@ mod tests {
     use serde_json::Value;
 
     /// The documented HTTP status of every variant (see `docs/src/api-overview.md`).
-    const EXPECTED: [(&str, StatusCode); 24] = [
+    const EXPECTED: [(&str, StatusCode); 25] = [
         ("InvalidArgument", StatusCode::BAD_REQUEST),
         ("DimensionMismatch", StatusCode::BAD_REQUEST),
         ("TooLarge", StatusCode::PAYLOAD_TOO_LARGE),
@@ -182,6 +182,7 @@ mod tests {
         ("StorageRootLocked", StatusCode::CONFLICT),
         ("SnapshotExpired", StatusCode::CONFLICT),
         ("TooManySnapshots", StatusCode::TOO_MANY_REQUESTS),
+        ("WriteStalled", StatusCode::SERVICE_UNAVAILABLE),
         ("Unauthenticated", StatusCode::UNAUTHORIZED),
         ("PermissionDenied", StatusCode::FORBIDDEN),
         ("NotOwner", StatusCode::SERVICE_UNAVAILABLE),
