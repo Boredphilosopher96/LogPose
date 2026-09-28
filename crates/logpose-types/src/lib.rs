@@ -582,10 +582,23 @@ pub struct MaintenanceStatus {
     pub pending: Vec<String>,
     /// Operation currently executing, if any.
     pub in_progress: Option<String>,
-    /// Most recent maintenance failure.
-    pub last_error: Option<String>,
+    /// The last failed job, until a job of the same kind completes.
+    pub last_error: Option<MaintenanceError>,
     /// Number of successfully completed maintenance operations.
     pub completed_runs: usize,
+}
+
+/// A failed maintenance job, as a collection's [`MaintenanceStatus`] reports it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceError {
+    /// The job that failed: `flush` or `compact`.
+    pub job: String,
+    /// What failed.
+    pub message: String,
+    /// When it failed, in milliseconds since the Unix epoch.
+    pub failed_at_unix_ms: u64,
+    /// Jobs of this kind that failed in a row, this one included.
+    pub consecutive_failures: u32,
 }
 
 /// One physical artifact that backs a queryable unit.

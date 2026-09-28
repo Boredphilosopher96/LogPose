@@ -38,8 +38,8 @@ pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget}
 use logpose_types::{
     CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
     CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, MaintenanceBacklog,
-    MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
-    RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
+    MaintenanceError, MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats,
+    RecordId, RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
 use retry::Operation;
 use serde::{Deserialize, Serialize};
@@ -1247,7 +1247,12 @@ fn maintenance_status_from_proto(status: proto::MaintenanceStatus) -> Result<Mai
     Ok(MaintenanceStatus {
         pending: status.pending,
         in_progress: status.in_progress,
-        last_error: status.last_error,
+        last_error: status.last_error.map(|error| MaintenanceError {
+            job: error.job,
+            message: error.message,
+            failed_at_unix_ms: error.failed_at_unix_ms,
+            consecutive_failures: error.consecutive_failures,
+        }),
         completed_runs: status.completed_runs as usize,
     })
 }

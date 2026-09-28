@@ -154,7 +154,11 @@ impl LocalEngineTarget {
             let stats = self.runtime.block_on(self.engine.stats(collection))?;
             let maintenance = &stats.maintenance;
             if let Some(error) = maintenance.last_error.as_ref() {
-                return Err(anyhow!("background maintenance failed: {error}"));
+                return Err(anyhow!(
+                    "background maintenance failed: {} failed: {}",
+                    error.job,
+                    error.message
+                ));
             }
             if maintenance.pending.is_empty() && maintenance.in_progress.is_none() {
                 if idle_after_runs == Some(maintenance.completed_runs) {

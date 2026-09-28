@@ -68,6 +68,11 @@ pub struct MemtableConfig {
     /// How long a write may wait through a write stall before it fails with
     /// `WriteStalled`. Default 30 seconds.
     pub write_stall_timeout: Duration,
+    /// Flushes of a collection that may fail in a row before it is poisoned: it then refuses
+    /// writes with `CollectionPoisoned` until the engine is reopened, instead of stalling them
+    /// against a device that cannot take a flush. A flush that fails because the device is
+    /// full or read-only, or on corrupt data, poisons at once. Default 5.
+    pub max_flush_failures: u32,
 }
 
 impl Default for MemtableConfig {
@@ -79,6 +84,7 @@ impl Default for MemtableConfig {
             global_fraction: 0.125,
             max_frozen: 2,
             write_stall_timeout: Duration::from_secs(30),
+            max_flush_failures: 5,
         }
     }
 }
