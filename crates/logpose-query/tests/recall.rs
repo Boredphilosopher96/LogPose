@@ -343,78 +343,62 @@ async fn qps_100k_top10_ef64() {
     let (fixture, rows, centers) = build(100_000, 5, IndexPolicy::default()).await;
     let view = fixture.view().await;
     let queries = queries(&centers, 1_000, 3);
-    let case = &cases()[0];
-    let warm = measure(
-        &view,
-        &rows,
-        &queries[..50],
-        case,
-        SearchTuning::default(),
-        Some(64),
-    )
-    .await;
-    let started = Instant::now();
-    let mut stages = [0_u64; 4];
-    for query in &queries {
-        let request = SearchRequest {
-            ef: Some(64),
-            ..SearchRequest::new(query.clone(), K)
-        };
-        let outcome = search(&view, &request)
-            .await
-            .expect("search should succeed");
-        for (total, micros) in stages.iter_mut().zip(outcome.micros) {
-            *total += micros;
+    let all = cases();
+    // Unfiltered, uniform 10%, uniform 1%, anti-correlated 10%.
+    let measured = [
+        (&all[0], 1_000),
+        (&all[2], 500),
+        (&all[1], 500),
+        (&all[5], 500),
+    ];
+    for (case, count) in measured {
+        let warm = measure(
+            &view,
+            &rows,
+            &queries[..50],
+            case,
+            SearchTuning::default(),
+            Some(64),
+        )
+        .await;
+        let started = Instant::now();
+        let mut stages = [0_u64; 4];
+        for query in &queries[..count] {
+            let request = SearchRequest {
+                ef: Some(64),
+                filter: case.filter.clone(),
+                ..SearchRequest::new(query.clone(), K)
+            };
+            let outcome = search(&view, &request)
+                .await
+                .expect("search should succeed");
+            for (total, micros) in stages.iter_mut().zip(outcome.micros) {
+                *total += micros;
+            }
         }
+        let seconds = started.elapsed().as_secs_f64();
+        let per_query = stages.map(|total| total / count as u64);
+        let recall = measure(
+            &view,
+            &rows,
+            &queries[..200],
+            case,
+            SearchTuning::default(),
+            Some(64),
+        )
+        .await;
+        println!(
+            "100k x 128, top-10, ef=64, {:<20}: {:>6.0} QPS single-client, recall@10 {:.3} \
+             (warm-up {:.3}); mean stage micros: plan+fetch {}, compute {}, fetch+rerank {}, \
+             project {}",
+            case.name,
+            count as f64 / seconds,
+            recall.recall,
+            warm.recall,
+            per_query[0],
+            per_query[1],
+            per_query[2],
+            per_query[3]
+        );
     }
-    let seconds = started.elapsed().as_secs_f64();
-    let per_query = stages.map(|total| total / queries.len() as u64);
-    println!(
-        "mean stage micros: plan+fetch {}, walk {}, fetch+rerank {}, project {}",
-        per_query[0], per_query[1], per_query[2], per_query[3]
-    );
-    let recall = measure(
-        &view,
-        &rows,
-        &queries[..200],
-        case,
-        SearchTuning::default(),
-        Some(64),
-    )
-    .await;
-    println!(
-        "100k x 128, top-10, ef=64: {:.0} QPS single-client ({} queries in {seconds:.2}s), \
-         recall@10 {:.3} (warm-up recall {:.3})",
-        queries.len() as f64 / seconds,
-        queries.len(),
-        recall.recall,
-        warm.recall
-    );
-    let filtered = &cases()[2];
-    let started = Instant::now();
-    for query in &queries[..500] {
-        let request = SearchRequest {
-            ef: Some(64),
-            filter: filtered.filter.clone(),
-            ..SearchRequest::new(query.clone(), K)
-        };
-        search(&view, &request)
-            .await
-            .expect("search should succeed");
-    }
-    let seconds = started.elapsed().as_secs_f64();
-    let recall = measure(
-        &view,
-        &rows,
-        &queries[..200],
-        filtered,
-        SearchTuning::default(),
-        Some(64),
-    )
-    .await;
-    println!(
-        "100k x 128, top-10, ef=64, uniform 10% filter: {:.0} QPS, recall@10 {:.3}",
-        500.0 / seconds,
-        recall.recall
-    );
 }
