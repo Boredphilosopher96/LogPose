@@ -3,12 +3,14 @@
 use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
+use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryError, QueryRequest,
-    query_exact,
+    ExplainMode, FilterComparison, FilterExpr, FilterOperator, QueryError, QueryRequest, query,
 };
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{DistanceMetric, LogPoseError, PutRecord, RecordId, Snapshot, WriteOperation};
+use rayon as _;
+use roaring as _;
 use serde as _;
 use serde_json::json;
 use std::{
@@ -56,7 +58,7 @@ async fn queries_storage_records_and_honors_snapshots() {
         .await
         .expect("write should succeed");
 
-    let current = query_exact(
+    let current = query(
         &engine,
         QueryRequest {
             collection_name: "documents".to_owned(),
@@ -67,6 +69,8 @@ async fn queries_storage_records_and_honors_snapshots() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -103,7 +107,7 @@ async fn queries_storage_records_and_honors_snapshots() {
         .await
         .expect("write should succeed");
 
-    let historical = query_exact(
+    let historical = query(
         &engine,
         QueryRequest {
             collection_name: "documents".to_owned(),
@@ -114,6 +118,8 @@ async fn queries_storage_records_and_honors_snapshots() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -144,7 +150,7 @@ async fn returns_empty_matches_for_empty_collection() {
         .await
         .expect("collection should be created");
 
-    let response = query_exact(
+    let response = query(
         &engine,
         QueryRequest {
             collection_name: "empty".to_owned(),
@@ -155,6 +161,8 @@ async fn returns_empty_matches_for_empty_collection() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -187,7 +195,7 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
         .await
         .expect("collection should be created");
 
-    let result = query_exact(
+    let result = query(
         &engine,
         QueryRequest {
             collection_name: "embeddings".to_owned(),
@@ -198,6 +206,8 @@ async fn rejects_query_vector_with_wrong_collection_dimensions() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await;
@@ -270,8 +280,10 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         filters: Vec::new(),
         predicate: None,
         explain: logpose_query::ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     };
-    let historical = query_exact(&engine, historical_request.clone())
+    let historical = query(&engine, historical_request.clone())
         .await
         .expect("a pinned historical query should succeed");
     assert_eq!(
@@ -286,7 +298,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
     // Pins end with the process: after a reopen the old generation is gone.
     drop(engine);
     let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    let expired = query_exact(&reopened, historical_request)
+    let expired = query(&reopened, historical_request)
         .await
         .expect_err("an unpinned historical snapshot expires");
     assert!(
@@ -317,7 +329,7 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
         .await
         .expect("compaction should succeed");
 
-    let current = query_exact(
+    let current = query(
         &reopened,
         QueryRequest {
             collection_name: "profiles".to_owned(),
@@ -328,6 +340,8 @@ async fn preserves_visibility_through_delete_flush_reopen_and_compaction() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -373,7 +387,7 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
         .await
         .expect("flush should succeed");
 
-    let response = query_exact(
+    let response = query(
         &engine,
         QueryRequest {
             collection_name: "documents".to_owned(),
@@ -388,6 +402,8 @@ async fn exists_predicates_match_non_scalar_fields_after_flush() {
                 value: None,
             })),
             explain: ExplainMode::Plan,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -405,7 +421,7 @@ async fn surfaces_unknown_collection_errors_from_storage() {
     let root = unique_temp_dir("query-missing-collection");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
-    let result = query_exact(
+    let result = query(
         &engine,
         QueryRequest {
             collection_name: "missing".to_owned(),
@@ -416,6 +432,8 @@ async fn surfaces_unknown_collection_errors_from_storage() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await;

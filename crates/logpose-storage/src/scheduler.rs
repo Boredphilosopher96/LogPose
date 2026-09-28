@@ -12,8 +12,10 @@
 //!   compaction policy's `build_bytes`) from the engine-wide pool of
 //!   `maintenance_fraction * memory_limit`, and releases them when the permit is dropped. A
 //!   compaction that does not fit in the free part of the pool waits; one larger than the whole
-//!   pool is declined at once. A flush reserves nothing here: the memtable it writes is already
-//!   charged to the memtable reservation.
+//!   pool is declined at once. A flush reserves what its build holds beyond the memtable (the
+//!   builder's copy of the rows and the index sections), but never waits for it and is never
+//!   declined: its reservation only makes compactions wait while it runs, so the pool stays
+//!   within its size whenever no flush runs.
 //!
 //! Waiting requests are granted flushes first, then compactions, each in request order. A
 //! waiting compaction that does not fit blocks the compactions behind it (so a large job is
@@ -73,7 +75,10 @@ struct State {
     next_request: u64,
     running_flushes: usize,
     running_compactions: usize,
+    /// Maintenance memory compaction permits reserve.
     reserved: u64,
+    /// Maintenance memory flush permits reserve (granted without checking the pool).
+    flush_reserved: u64,
     /// While paused, only [`MaintenanceScheduler::step`] grants, one request per step.
     paused: bool,
     steps: usize,
@@ -93,10 +98,12 @@ pub struct SchedulerStats {
     pub waiting: usize,
     /// Jobs holding a permit now.
     pub running: usize,
-    /// Maintenance memory reserved now.
+    /// Maintenance memory compactions reserve now.
     pub reserved_bytes: u64,
-    /// The most maintenance memory ever reserved at once.
+    /// The most maintenance memory compactions ever reserved at once.
     pub peak_reserved_bytes: u64,
+    /// Maintenance memory running flushes reserve now.
+    pub flush_reserved_bytes: u64,
     /// The size of the maintenance-memory pool.
     pub pool_bytes: u64,
 }
@@ -132,10 +139,15 @@ impl Drop for Permit {
         {
             let mut state = self.shared.lock();
             match self.kind {
-                JobKind::Flush => state.running_flushes -= 1,
-                JobKind::Compact => state.running_compactions -= 1,
+                JobKind::Flush => {
+                    state.running_flushes -= 1;
+                    state.flush_reserved -= self.bytes;
+                }
+                JobKind::Compact => {
+                    state.running_compactions -= 1;
+                    state.reserved -= self.bytes;
+                }
             }
-            state.reserved -= self.bytes;
         }
         MaintenanceScheduler::pump(&self.shared);
     }
@@ -174,20 +186,17 @@ impl MaintenanceScheduler {
 
     /// Ask for a permit of `kind` reserving `bytes` of maintenance memory; `deliver` receives
     /// it once granted, on whatever thread released the resources (never under the scheduler's
-    /// lock). Fails at once when a compaction needs more than the whole pool.
+    /// lock). Fails at once when a compaction needs more than the whole pool; a flush is granted
+    /// whatever it reserves.
     pub(crate) fn request(
         &self,
         kind: JobKind,
         bytes: u64,
         deliver: impl FnOnce(Permit) + Send + 'static,
     ) -> Result<RequestId> {
-        let bytes = match kind {
-            JobKind::Flush => 0,
-            JobKind::Compact => bytes,
-        };
         let id = {
             let mut state = self.shared.lock();
-            if bytes > self.shared.pool_bytes {
+            if kind == JobKind::Compact && bytes > self.shared.pool_bytes {
                 state.stats.declined += 1;
                 return Err(LogPoseError::TooLarge {
                     what: "compaction build memory".to_owned(),
@@ -249,6 +258,7 @@ impl MaintenanceScheduler {
             waiting: state.queue.len(),
             running: state.running_flushes + state.running_compactions,
             reserved_bytes: state.reserved,
+            flush_reserved_bytes: state.flush_reserved,
             pool_bytes: self.shared.pool_bytes,
             ..state.stats
         }
@@ -287,7 +297,8 @@ impl MaintenanceScheduler {
                     }
                     compaction_seen = true;
                     if state.running_compactions < shared.compaction_slots
-                        && state.reserved + waiting.bytes <= shared.pool_bytes
+                        && state.reserved + state.flush_reserved + waiting.bytes
+                            <= shared.pool_bytes
                     {
                         chosen = Some(*key);
                         break;
@@ -303,14 +314,16 @@ impl MaintenanceScheduler {
             JobKind::Flush => {
                 state.running_flushes += 1;
                 state.stats.flushes_granted += 1;
+                state.flush_reserved += waiting.bytes;
             }
             JobKind::Compact => {
                 state.running_compactions += 1;
                 state.stats.compactions_granted += 1;
+                state.reserved += waiting.bytes;
+                state.stats.peak_reserved_bytes =
+                    state.stats.peak_reserved_bytes.max(state.reserved);
             }
         }
-        state.reserved += waiting.bytes;
-        state.stats.peak_reserved_bytes = state.stats.peak_reserved_bytes.max(state.reserved);
         Some((
             waiting.deliver,
             Permit {

@@ -1,6 +1,11 @@
 //! [`AlignedBytes`]: the 8-byte-aligned buffers the cache holds.
 
-use std::{fmt, ops::Deref};
+use std::{
+    any::Any,
+    fmt,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 /// An immutable-once-cached byte buffer whose start is 8-byte aligned.
 ///
@@ -9,11 +14,34 @@ use std::{fmt, ops::Deref};
 /// buffer that starts 8-byte aligned admits zero-copy typed views
 /// (`bytemuck::try_cast_slice`) of every `u16`, `u32`, `u64`, `i64`, `f32`,
 /// and `f64` array it holds.
-#[derive(Clone, Default, Eq, PartialEq)]
+///
+/// A buffer can carry one decoded form of itself (a graph, a scalar index,
+/// parsed SQ8 params), attached once with [`AlignedBytes::attach`] or
+/// [`AlignedBytes::decoded`]. It lives exactly as long as the buffer, so a
+/// cached unit decodes once per cache load instead of once per access. The
+/// cache charges an attachment's heap size when it is attached before the
+/// insert (loaders do that).
+#[derive(Clone, Default)]
 pub struct AlignedBytes {
     words: Box<[u64]>,
     len: usize,
+    decoded: OnceLock<Decoded>,
 }
+
+/// A decoded form of a buffer and the heap bytes it holds.
+#[derive(Clone)]
+struct Decoded {
+    value: Arc<dyn Any + Send + Sync>,
+    heap_bytes: u64,
+}
+
+impl PartialEq for AlignedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for AlignedBytes {}
 
 impl AlignedBytes {
     /// A zero-filled buffer of `len` bytes.
@@ -22,6 +50,7 @@ impl AlignedBytes {
         Self {
             words: vec![0_u64; len.div_ceil(8)].into_boxed_slice(),
             len,
+            decoded: OnceLock::new(),
         }
     }
 
@@ -65,6 +94,60 @@ impl AlignedBytes {
     pub fn allocated(&self) -> u64 {
         self.words.len() as u64 * 8
     }
+
+    /// Attach `value`, a decoded form of these bytes holding `heap_bytes` of
+    /// heap memory. Returns `false` (and drops `value`) if a decoded form is
+    /// already attached.
+    pub fn attach<T: Any + Send + Sync>(&self, value: T, heap_bytes: u64) -> bool {
+        self.decoded
+            .set(Decoded {
+                value: Arc::new(value),
+                heap_bytes,
+            })
+            .is_ok()
+    }
+
+    /// The attached decoded form of type `T`, if one is attached.
+    #[must_use]
+    pub fn attached<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let decoded = self.decoded.get()?;
+        Arc::clone(&decoded.value).downcast::<T>().ok()
+    }
+
+    /// The decoded form of type `T`: the attached one, or `decode(bytes)`,
+    /// which is attached for later callers (the first attach wins a race).
+    /// A buffer that carries a decoded form of another type decodes on every
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// `decode`'s error; nothing is attached then.
+    pub fn decoded<T, E>(
+        &self,
+        decode: impl FnOnce(&[u8]) -> Result<(T, u64), E>,
+    ) -> Result<Arc<T>, E>
+    where
+        T: Any + Send + Sync,
+    {
+        if let Some(value) = self.attached::<T>() {
+            return Ok(value);
+        }
+        let (value, heap_bytes) = decode(self.as_bytes())?;
+        let value = Arc::new(value);
+        if self.decoded.get().is_none() {
+            let _ = self.decoded.set(Decoded {
+                value: Arc::clone(&value) as Arc<dyn Any + Send + Sync>,
+                heap_bytes,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Heap bytes of the attached decoded form; 0 without one.
+    #[must_use]
+    pub fn decoded_heap_bytes(&self) -> u64 {
+        self.decoded.get().map_or(0, |decoded| decoded.heap_bytes)
+    }
 }
 
 impl Deref for AlignedBytes {
@@ -92,6 +175,7 @@ impl fmt::Debug for AlignedBytes {
         formatter
             .debug_struct("AlignedBytes")
             .field("len", &self.len)
+            .field("decoded", &self.decoded.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -119,5 +203,25 @@ mod tests {
         let words: &[u64] = bytemuck::try_cast_slice(&bytes).expect("aligned and sized");
         assert_eq!(words.len(), 3);
         assert_eq!(words[0].to_ne_bytes(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn decoded_forms_are_attached_once_and_typed() {
+        let bytes = AlignedBytes::copy_from(&[1, 2, 3]);
+        assert_eq!(bytes.decoded_heap_bytes(), 0);
+        let mut calls = 0;
+        let mut decode = |raw: &[u8]| -> Result<(usize, u64), ()> {
+            calls += 1;
+            Ok((raw.len(), 16))
+        };
+        assert_eq!(*bytes.decoded(&mut decode).expect("decodes"), 3);
+        assert_eq!(*bytes.decoded(&mut decode).expect("decodes"), 3);
+        assert_eq!(calls, 1);
+        assert_eq!(bytes.decoded_heap_bytes(), 16);
+        assert!(bytes.attached::<String>().is_none());
+        assert!(!bytes.attach(7_usize, 8));
+        let failed: Result<std::sync::Arc<u8>, &str> = bytes.decoded(|_| Err("bad"));
+        assert!(failed.is_err());
+        assert_eq!(bytes, AlignedBytes::copy_from(&[1, 2, 3]));
     }
 }

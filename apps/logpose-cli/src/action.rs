@@ -641,6 +641,8 @@ pub fn query_request_from_action(action: &QueryAction) -> anyhow::Result<QueryRe
         filters,
         predicate,
         explain,
+        snapshot_token: None,
+        pin: false,
     })
 }
 

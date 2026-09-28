@@ -441,6 +441,36 @@ fn async_fetches_pin_units_for_the_compute_stage() {
     assert!(matches!(fetched, Fetched::Loaded { .. }));
 }
 
+/// A read view fetches the key sections decoded: the loader attaches the decoded column,
+/// order, and filter before the insert, so the cache charges them with the bytes and every
+/// hit reuses them (decoding on first use attached them after the charge).
+#[test]
+fn key_sections_fetched_decoded_are_charged_with_their_decoded_form() {
+    let cache = cache();
+    let reader = SegmentReader::open(MemorySource::new(fixture::golden_bytes()))
+        .expect("opens")
+        .with_cache(&cache);
+    let mut charged = 0;
+    for kind in [
+        SectionKind::PkColumn,
+        SectionKind::PkSorted,
+        SectionKind::PkFilter,
+    ] {
+        let index = reader.find_section(kind, None).expect("present");
+        let unit = reader.section_unit(index).expect("unit");
+        let (bytes, _) = block_on(reader.fetch_decoded(&unit, &InlineExecutor)).expect("loads");
+        let decoded = match kind {
+            SectionKind::PkColumn => bytes.attached::<crate::segment_v2::PkColumn>().is_some(),
+            SectionKind::PkSorted => bytes.attached::<crate::segment_v2::PkSorted>().is_some(),
+            _ => bytes.attached::<crate::segment_v2::PkFilter>().is_some(),
+        };
+        assert!(decoded, "{kind:?} carries its decoded form");
+        let length = usize::try_from(reader.sections()[index].length).expect("fits");
+        charged += charge_for(length) + bytes.len() as u64;
+    }
+    assert_eq!(cache.stats().used_by(ArtifactClass::PkIndex), charged);
+}
+
 #[test]
 fn warm_up_loads_the_hot_sections_of_a_segment() {
     let bytes = fixture::golden_bytes();

@@ -342,6 +342,13 @@ message QueryCollectionRequest {
   Predicate predicate = 6;
   ExplainMode explain = 7;
   string database_name = 8;
+  // Read exactly the state this snapshot token pins, and extend its expiry. Empty reads the
+  // current state (or `snapshot`). An expired, released, or unknown token fails with
+  // `FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`); a malformed one with `INVALID_ARGUMENT`.
+  string snapshot_token = 10;
+  // Pin the state the query reads under a snapshot token, returned in the reply, for repeatable
+  // reads. Fails with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`) past the pin limits.
+  bool pin = 11;
 }
 
 message QueryMatch {
@@ -396,6 +403,8 @@ message QueryCollectionReply {
   QueryDiagnostics diagnostics = 6;
   string database_name = 7;
   string collection_name = 8;
+  // The token pinning the state read: set when the request pinned or named a token.
+  string snapshot_token = 9;
 }
 
 message GetCollectionStatsRequest {

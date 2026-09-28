@@ -214,16 +214,23 @@ Snapshot references are used across writes, queries, flushes, and compactions:
 }
 ```
 
-An exact snapshot stays readable only while its manifest generation is current.
-Every flush and compaction publishes a new generation; after that, a read of a
-snapshot from an older generation fails with `FAILED_PRECONDITION` (reason
-`SNAPSHOT_EXPIRED`) unless a snapshot token pins that state. Tokens
-are an engine interface for now (`LocalStorageEngine::pin_snapshot`); the API
-exposes them with the new read path. Queries without an explicit snapshot
-restart on their own when a flush lands between their storage reads. Pinning
-more snapshots than a collection allows, or more retired memory than the
-engine allows, fails with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`,
-HTTP 429).
+An exact snapshot is readable only while it is the current state, one of the
+latest states of the current manifest generation, or a state a snapshot token
+pins. Every flush and compaction publishes a new generation; after that, a read
+of an unpinned snapshot from an older generation fails with
+`FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`, HTTP 409).
+
+For repeatable reads, pin the state: a query with `"pin": true` returns a
+`snapshot_token` (an opaque 48-character string), and later queries that pass
+it as `snapshot_token` read exactly that state, whatever was written, flushed,
+or compacted since. Each use extends the token's expiry (five minutes by
+default); an expired, released, or unknown token fails with
+`SNAPSHOT_EXPIRED`. Tokens do not survive a restart. Pinning more snapshots
+than a collection allows, or more retired memory than the engine allows, fails
+with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`, HTTP 429).
+
+A query that names no snapshot reads one consistent state from its first stage
+to its last: a flush or compaction that publishes while it runs never fails it.
 
 Collection-scoped write/query/flush/compact/inspect responses flatten
 `database_name` and `collection_name` into the top-level JSON
@@ -599,6 +606,8 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
 | `vector`        | float[] | yes      | Query vector                                                                   |
 | `top_k`         | integer | yes      | Maximum results to return (>= 1)                                               |
 | `snapshot`      | object  | no       | Read one exact snapshot; see snapshot retention above                          |
+| `snapshot_token` | string | no       | Read exactly the state this token pins; cannot be combined with `snapshot`     |
+| `pin`           | boolean | no       | Pin the state read and return its `snapshot_token`                             |
 | `read_barrier`  | object  | no       | Require a lower-bound previously observed snapshot on the current owner; cannot be combined with `snapshot` |
 | `filters`       | object  | no       | Legacy AND-only equality filters over scalar metadata                          |
 | `predicate`     | object  | no       | Structured predicate tree (see below)                                          |
@@ -621,25 +630,24 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
   ],
   "diagnostics": {
     "chosen_plan": "hybrid_exact_ann_merge",
-    "planner_reason": "mutable exact candidates and immutable ann candidates must be merged before rerank",
+    "planner_reason": "unit 00000003 graph_admit: 48000 matching rows exceed the exact-scan limit 2048; selectivity 1.000; unit 00000007 memtable_scan: memtables are scanned exactly",
     "estimated_selectivity": 1.0,
     "units_considered": 2,
     "units_pruned": 0,
     "units_scanned": 2,
-    "candidates_before_filter": 50,
-    "candidates_after_filter": 50,
-    "candidates_reranked": 5,
-    "candidates_merged": 2,
-    "rerank_count": 5,
-    "fallback_reason": null,
-    "unit_scan_mix": { "mutable": 1, "immutable": 1 },
+    "candidates_before_filter": 48050,
+    "candidates_after_filter": 48050,
+    "candidates_reranked": 20,
+    "candidates_merged": 40,
+    "rerank_count": 1,
+    "unit_scan_mix": { "graph_admit": 1, "memtable_scan": 1 },
     "stage_timings": {
-      "planning_micros": 12,
+      "planning_micros": 90,
       "prefilter_micros": 0,
       "candidate_generation_micros": 340,
-      "postfilter_micros": 0,
+      "postfilter_micros": 35,
       "rerank_micros": 45,
-      "merge_micros": 8
+      "merge_micros": 0
     }
   }
 }
@@ -694,18 +702,34 @@ Available operators: `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `exists`, `is_null`.
 
 #### Query Plan Kinds
 
-The planner selects an execution strategy based on collection state and
-filter selectivity:
+The planner chooses a strategy per unit from the exact number of live rows
+the filter matches there (`n`) and the unit's live rows (`N`). Memtables are
+scanned exactly. A segment without a graph, or whose `n` is at most 2,048 (or
+the candidate budget, four candidates per result), is scanned exactly over its
+filter bitmap: over SQ8 codes when it has them, then reranked in f32. Otherwise
+it walks its HNSW graph over SQ8 codes: ACORN-1 style when `n / N` is below
+0.3, else a walk that admits only matching rows; a walk that comes back short,
+or whose visited rows match the filter far less often than `n / N` predicts,
+widens its beam and continues. Every unit's candidates are reranked in f32 and
+merged into one top-k. `unit_scan_mix` counts units per strategy
+(`memtable_scan`, `exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`,
+`pruned`, `empty`); `chosen_plan` summarizes them:
 
 | Plan Kind                          | Description                                             |
 |------------------------------------|---------------------------------------------------------|
-| `unfiltered_exact_scan`            | Full exact scan, no filters applied                     |
-| `predicate_first_exact`            | Filter first, then exact distance on survivors          |
-| `vector_first_exact`               | Exact scan first, then post-filter                      |
-| `tiny_population_exact_fallback`   | Population too small for ANN, falls back to exact       |
-| `vector_first_ann`                 | ANN index scan, then post-filter                        |
-| `cooperative_filtered_ann`         | Cooperative ANN with inline predicate evaluation        |
-| `hybrid_exact_ann_merge`           | Merge exact (mutable) and ANN (immutable) results       |
+| `unfiltered_exact_scan`            | Every unit scanned exactly, no filter                   |
+| `predicate_first_exact`            | Every unit scanned exactly over its filter bitmap       |
+| `vector_first_ann`                 | Segment graph walks, no filter, no memtable rows        |
+| `cooperative_filtered_ann`         | Filtered segment graph walks (ACORN-1 or admit-only)    |
+| `hybrid_exact_ann_merge`           | Segment graph walks merged with memtable scans          |
+| `vector_first_exact`               | No longer produced                                      |
+| `tiny_population_exact_fallback`   | No longer produced                                      |
+
+Filter semantics: a declared field compares by its type (integers and
+timestamps as integers, floats as floats, strings bytewise, arrays by
+element); `ne` matches only rows that have a value, while `not` also matches
+rows where the field is null. Undeclared names filter `$extra` keys with JSON
+semantics, as before.
 
 ### Collection Stats
 

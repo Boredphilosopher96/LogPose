@@ -609,6 +609,158 @@ fn l2_block<S: Simd>(
     }
 }
 
+/// Magic of an SQ8 codes section ([`write_codes_section`]).
+const SECTION_MAGIC: [u8; 8] = *b"LPS8CODE";
+/// Format version of an SQ8 codes section.
+const SECTION_VERSION: u32 = 1;
+/// Fixed header of an SQ8 codes section.
+const SECTION_HEADER_LEN: usize = 32;
+
+/// Serializes one segment's SQ8 section: the trained `params` and the codes
+/// of `rows` rows, `rows * params.dims()` bytes in row order (rows without a
+/// vector hold zero codes).
+///
+/// ```text
+/// offset size field
+///      0    8 magic "LPS8CODE"
+///      8    4 version (1)
+///     12    4 dims
+///     16    8 rows
+///     24    4 params_len
+///     28    4 reserved, zero
+///     32    n params (Sq8Params::to_bytes), zero padding to 8
+///      .    . codes, rows * dims bytes
+/// ```
+///
+/// Integers are little-endian. The params carry their own CRC; the codes
+/// are covered by the storage section's CRC.
+///
+/// # Errors
+///
+/// [`Sq8Error::Corrupt`] when `codes` is not `rows * dims` bytes.
+pub fn write_codes_section(
+    params: &Sq8Params,
+    rows: u64,
+    codes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), Sq8Error> {
+    let dims = params.dims();
+    let expected = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(dims));
+    if expected != Some(codes.len()) {
+        return Err(Sq8Error::Corrupt("codes length does not match rows * dims"));
+    }
+    let params_bytes = params.to_bytes();
+    out.extend_from_slice(&SECTION_MAGIC);
+    out.extend_from_slice(&SECTION_VERSION.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(dims).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(&rows.to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(params_bytes.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&params_bytes);
+    out.resize(out.len() + padding_to_8(params_bytes.len()), 0);
+    out.extend_from_slice(codes);
+    Ok(())
+}
+
+/// A parsed SQ8 codes section: its params and where the codes start.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sq8Section {
+    params: Sq8Params,
+    rows: usize,
+    codes_offset: usize,
+}
+
+impl Sq8Section {
+    /// Parses and validates a section written by [`write_codes_section`]:
+    /// the header, the params (with their CRC), and that the codes fill the
+    /// rest of `bytes` exactly. The codes stay in `bytes`; read them with
+    /// [`Self::codes`].
+    ///
+    /// # Errors
+    ///
+    /// [`Sq8Error::Corrupt`] or a params error for malformed input.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Sq8Error> {
+        let header = bytes
+            .get(..SECTION_HEADER_LEN)
+            .ok_or(Sq8Error::Corrupt("truncated codes header"))?;
+        if header[..8] != SECTION_MAGIC {
+            return Err(Sq8Error::Corrupt("bad codes magic"));
+        }
+        let word = |at: usize| {
+            u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+        };
+        let version = word(8);
+        if version != SECTION_VERSION {
+            return Err(Sq8Error::UnsupportedVersion(
+                u16::try_from(version).unwrap_or(u16::MAX),
+            ));
+        }
+        let dims = word(12) as usize;
+        let mut rows_bytes = [0; 8];
+        rows_bytes.copy_from_slice(&header[16..24]);
+        let rows = usize::try_from(u64::from_le_bytes(rows_bytes))
+            .map_err(|_| Sq8Error::Corrupt("row count does not fit in memory"))?;
+        let params_len = word(24) as usize;
+        if word(28) != 0 {
+            return Err(Sq8Error::Corrupt("reserved codes header bits are set"));
+        }
+        let params_end = SECTION_HEADER_LEN
+            .checked_add(params_len)
+            .ok_or(Sq8Error::Corrupt("params length overflows"))?;
+        let params = Sq8Params::from_bytes(
+            bytes
+                .get(SECTION_HEADER_LEN..params_end)
+                .ok_or(Sq8Error::Corrupt("truncated params"))?,
+        )?;
+        if params.dims() != dims {
+            return Err(Sq8Error::Corrupt(
+                "params dimensions differ from the header",
+            ));
+        }
+        let codes_offset = params_end + padding_to_8(params_len);
+        let codes_len = rows
+            .checked_mul(dims)
+            .ok_or(Sq8Error::Corrupt("codes length overflows"))?;
+        if codes_offset.checked_add(codes_len) != Some(bytes.len()) {
+            return Err(Sq8Error::Corrupt("codes do not fill the section"));
+        }
+        Ok(Self {
+            params,
+            rows,
+            codes_offset,
+        })
+    }
+
+    /// The trained params.
+    #[must_use]
+    pub fn params(&self) -> &Sq8Params {
+        &self.params
+    }
+
+    /// Number of rows with a code.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The codes, `rows * dims` bytes, from the same `bytes` [`Self::parse`]
+    /// validated. Empty if `bytes` is shorter than that.
+    #[must_use]
+    pub fn codes<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        bytes.get(self.codes_offset..).unwrap_or(&[])
+    }
+}
+
+fn padding_to_8(len: usize) -> usize {
+    (8 - len % 8) % 8
+}
+
 fn check_finite(values: &[f32]) -> Result<(), Sq8Error> {
     match values.iter().position(|value| !value.is_finite()) {
         Some(index) => Err(Sq8Error::NonFinite { index }),
@@ -1050,6 +1202,37 @@ mod tests {
             Sq8Params::from_bytes(&future),
             Err(Sq8Error::UnsupportedVersion(2))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn codes_section_round_trips_and_rejects_damage() -> Result<(), Sq8Error> {
+        let rows = [0.0_f32, 1.0, -1.0, 0.5, 2.0, -2.0];
+        let params = Sq8Params::train(&rows, 2)?;
+        let mut codes = Vec::new();
+        for row in rows.chunks_exact(2) {
+            codes.extend(params.encode(row)?);
+        }
+        let mut bytes = Vec::new();
+        write_codes_section(&params, 3, &codes, &mut bytes)?;
+        assert_eq!(
+            (bytes.len() - codes.len()) % 8,
+            0,
+            "codes start 8-byte aligned"
+        );
+        let section = Sq8Section::parse(&bytes)?;
+        assert_eq!(section.rows(), 3);
+        assert_eq!(section.params(), &params);
+        assert_eq!(section.codes(&bytes), codes.as_slice());
+
+        assert!(write_codes_section(&params, 4, &codes, &mut Vec::new()).is_err());
+        assert!(Sq8Section::parse(&bytes[..bytes.len() - 1]).is_err());
+        let mut bad = bytes.clone();
+        bad[0] ^= 1;
+        assert!(Sq8Section::parse(&bad).is_err());
+        let mut bad = bytes;
+        bad[40] ^= 1;
+        assert!(Sq8Section::parse(&bad).is_err());
         Ok(())
     }
 }

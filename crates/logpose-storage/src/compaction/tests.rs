@@ -175,15 +175,22 @@ fn a_job_is_capped_at_half_the_memory_pool() {
 }
 
 #[test]
-fn build_bytes_count_stored_rows_and_the_graph_per_vector_field() {
+fn build_bytes_count_stored_rows_and_the_index_builds() {
     let shape = RowShape {
         vector_fields: 2,
         vector_dims: 96,
+        indexed_scalar_fields: 3,
     };
     let inputs = [segment(1, 10, 5), segment(2, 20, 0)];
-    // 5 + 20 live rows at (100 stored + 2 * 141 graph) bytes each, plus the larger input's
-    // 2,000-byte file.
-    assert_eq!(build_bytes(&inputs, shape), 25 * (100 + 2 * 141) + 2_000);
+    // Per row: an f32 copy and an SQ8 code of every dimension (5 * 96), the graph build and its
+    // encoding per vector field (2 * (3 * 141 + 64)), and the scalar indexes (3 * 32).
+    let index = 5 * 96 + 2 * (3 * 141 + 64) + 3 * 32;
+    assert_eq!(shape.index_bytes_per_row(), index);
+    // 5 + 20 live rows at (100 stored + index) bytes each, plus the larger input's 2,000-byte
+    // file.
+    assert_eq!(build_bytes(&inputs, shape), 25 * (100 + index) + 2_000);
+    // A flush holds the builder's copy of the memtable's payload and the same index build.
+    assert_eq!(flush_build_bytes(25, 7_000, shape), 7_000 + 25 * index);
 }
 
 /// The build reads each input whole, deleted rows included, so a rewrite of a mostly deleted
@@ -240,6 +247,7 @@ fn outputs_stay_within_max_output_rows_and_vector_bytes() {
     let shape = RowShape {
         vector_fields: 1,
         vector_dims: 4,
+        indexed_scalar_fields: 0,
     };
     let plans = Policy::new(bytes, 4, u64::MAX, shape).plan(&segments, &BTreeSet::new(), 1);
     assert_eq!(units(&plans[0]), [1, 2, 3], "30 rows of 16 vector bytes");

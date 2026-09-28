@@ -7,7 +7,7 @@ expression: snapshot
     "collection_name": "colors",
     "database_name": "default",
     "diagnostics": {
-      "chosen_plan": "vector_first_exact",
+      "chosen_plan": "predicate_first_exact",
       "units_considered": 1,
       "units_pruned": 0,
       "units_scanned": 1
@@ -54,7 +54,7 @@ expression: snapshot
     "collection_name": "colors",
     "database_name": "default",
     "diagnostics": {
-      "chosen_plan": "vector_first_ann",
+      "chosen_plan": "predicate_first_exact",
       "stage_timings": {
         "candidate_generation_micros": "[timing]",
         "merge_micros": "[timing]",

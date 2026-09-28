@@ -939,6 +939,13 @@ mod concurrent {
                 max_jobs_per_collection: 3,
                 ..CompactionConfig::default()
             },
+            // Every flush and compaction builds SQ8 codes and a graph, so jobs build graphs
+            // concurrently and crashes land in index builds.
+            index: crate::IndexPolicy {
+                graph_min_rows: 4,
+                sq8_min_rows: 2,
+                ..crate::IndexPolicy::default()
+            },
             ..config()
         }
     }
