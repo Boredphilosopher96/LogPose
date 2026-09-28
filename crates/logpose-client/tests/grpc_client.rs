@@ -1183,6 +1183,7 @@ fn test_config_with_role(
         limits: Default::default(),
         snapshots: Default::default(),
         index: Default::default(),
+        drain_timeout_ms: logpose_config::DEFAULT_DRAIN_TIMEOUT_MS,
     }
 }
 

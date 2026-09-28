@@ -446,6 +446,7 @@ pub struct InteractiveArgs {
     #[arg(
         long,
         value_name = "RECORD_ID",
+        allow_negative_numbers = true,
         help = "Prefill record id. Example: alpha"
     )]
     pub id: Option<String>,
@@ -455,6 +456,7 @@ pub struct InteractiveArgs {
         long,
         value_parser = parse_query_vector,
         value_name = "VECTOR",
+        allow_hyphen_values = true,
         help = "Prefill query vector. Example: 0.12,-0.44,0.90"
     )]
     pub vector: Option<QueryVector>,
@@ -800,6 +802,7 @@ pub struct RecordGetArgs {
     #[arg(
         value_name = "KEY",
         required = true,
+        allow_negative_numbers = true,
         help = "Primary keys to read, typed by the schema. Example: alpha"
     )]
     pub keys: Vec<String>,
@@ -889,6 +892,7 @@ pub struct RecordDeleteArgs {
     #[arg(
         value_name = "RECORD_ID",
         required_unless_present_any = ["filters", "where_clauses", "filter_json"],
+        allow_negative_numbers = true,
         help = "Primary key of the record to delete, typed by the schema. Example: alpha"
     )]
     pub id: Option<String>,
@@ -1002,7 +1006,8 @@ pub struct QueryArgs {
         long,
         value_parser = parse_query_vector,
         value_name = "VECTOR",
-        help = "Comma-separated query vector. Without one the query is a filtered scan. Example: 0.12,-0.44,0.90"
+        allow_hyphen_values = true,
+        help = "Comma-separated query vector. Without one the query is a filtered scan. Example: -0.12,0.44,0.90"
     )]
     pub vector: Option<QueryVector>,
     #[arg(
@@ -1190,6 +1195,82 @@ mod tests {
         };
         assert_eq!(query.collection.database_name, "analytics");
         assert_eq!(query.collection.collection_name, "colors");
+    }
+
+    #[test]
+    fn query_vectors_and_keys_may_start_with_a_minus_sign() {
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "query",
+            "colors",
+            "--vector",
+            "-0.5,0.25",
+            "--top-k",
+            "1",
+        ])
+        .expect("a vector whose first component is negative should parse");
+        let CommandRequest::Direct {
+            action: Action::Query(query),
+            ..
+        } = cli.into_request()
+        else {
+            unreachable!("expected a direct query");
+        };
+        assert_eq!(query.vector, Some(QueryVector(vec![-0.5, 0.25])));
+
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "interactive",
+            "--workflow",
+            "query",
+            "--vector",
+            "-1,0",
+            "--id",
+            "-7",
+        ])
+        .expect("an interactive prefill vector and id may start with a minus sign");
+        let CommandRequest::Interactive { args, .. } = cli.into_request() else {
+            unreachable!("expected an interactive request");
+        };
+        assert_eq!(args.vector, Some(QueryVector(vec![-1.0, 0.0])));
+        assert_eq!(args.id.as_deref(), Some("-7"));
+
+        // A flag after `--vector` is not taken for a missing vector silently.
+        let error = Cli::try_parse_from(["logpose", "query", "colors", "--vector", "--top-k", "1"])
+            .expect_err("a flag is not a vector");
+        assert!(error.to_string().contains("--top-k"), "{error}");
+
+        let cli = Cli::try_parse_from([
+            "logpose",
+            "record",
+            "get",
+            "products",
+            "-7",
+            "8",
+            "--output-field",
+            "price",
+        ])
+        .expect("negative int64 keys should parse");
+        let CommandRequest::Direct {
+            action: Action::RecordGet(get),
+            ..
+        } = cli.into_request()
+        else {
+            unreachable!("expected a direct record get");
+        };
+        assert_eq!(get.keys, ["-7", "8"]);
+        assert_eq!(get.output_fields, ["price"]);
+
+        let cli = Cli::try_parse_from(["logpose", "record", "delete", "products", "-7"])
+            .expect("a negative int64 key should parse for delete");
+        let CommandRequest::Direct {
+            action: Action::RecordDelete(delete),
+            ..
+        } = cli.into_request()
+        else {
+            unreachable!("expected a direct record delete");
+        };
+        assert_eq!(delete.id.as_deref(), Some("-7"));
     }
 
     #[test]
