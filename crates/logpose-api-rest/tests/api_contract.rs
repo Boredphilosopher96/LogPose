@@ -27,13 +27,13 @@ use serde as _;
 use tokio as _;
 use tower_http as _;
 
-const OPENAPI: &str = include_str!("../../../openapi/logpose.v1.yaml");
-const PROTO: &str = include_str!("../../../proto/logpose/v1/logpose.proto");
+const OPENAPI: &str = include_str!("../../../openapi/logpose.v2.yaml");
+const PROTO: &str = include_str!("../../../proto/logpose/v2/logpose.proto");
 
 /// gRPC RPCs without a REST operation, and why.
 const GRPC_ONLY: &[(&str, &str)] = &[(
-    "BulkWriteCollection",
-    "client-streaming ingest has no REST form; REST clients send batches to writeCollection",
+    "BulkUpsertRecords",
+    "client-streaming ingest has no REST form; REST clients send batches to upsertRecords",
 )];
 
 /// REST operations without a gRPC RPC, and why.
@@ -153,7 +153,8 @@ fn openapi_document_is_a_structurally_valid_openapi_3_1_document() {
     );
     let mut problems = Vec::new();
     walk(&document, String::new(), &mut |pointer, map| {
-        if map.contains_key("nullable") {
+        // A property named `nullable` (a scalar field declares one) is not the keyword.
+        if map.contains_key("nullable") && !pointer.ends_with("/properties") {
             problems.push(format!(
                 "{pointer}: `nullable` is not OpenAPI 3.1; use `type: [T, \"null\"]`"
             ));
@@ -394,10 +395,7 @@ async fn rest_router_serves_exactly_the_documented_routes_and_methods() {
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let routed_paths = route_paths()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    let routed_paths = route_paths().into_iter().collect::<BTreeSet<_>>();
     assert_eq!(routed_paths, documented_paths);
 
     let root = unique_temp_dir("routes");
@@ -408,7 +406,9 @@ async fn rest_router_serves_exactly_the_documented_routes_and_methods() {
     })));
     let mut problems = Vec::new();
     for path in &documented_paths {
-        let concrete = path.replace("{name}", "contract");
+        let concrete = path
+            .replace("{database}", "contract")
+            .replace("{collection}", "contract");
         for method in HTTP_METHODS {
             let documented = document["paths"][path].get(method).is_some();
             let response = app

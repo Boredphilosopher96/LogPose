@@ -21,6 +21,8 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, CollectionStats, CommitAck,
     LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole, Result, Snapshot, WriteOperation,
+    record::ClientOp,
+    schema::{CollectionSchema, SchemaChange},
 };
 use logpose_vfs::{Vfs, std_vfs};
 use std::{path::Path, sync::Arc};
@@ -285,7 +287,7 @@ impl StorageEngine for LocalStorageEngine {
     }
 
     async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        self.handle(name).map(|handle| handle.descriptor().clone())
+        self.handle(name).map(|handle| handle.describe())
     }
 
     async fn has_local_collection(&self, name: &str) -> Result<bool> {
@@ -323,14 +325,44 @@ impl StorageEngine for LocalStorageEngine {
             })
     }
 
+    async fn drop_collection(
+        &self,
+        collection_name: &str,
+        _leader_fence: Option<LeadershipFence>,
+    ) -> Result<()> {
+        let reference = collection_ref_from_lookup(collection_name);
+        self.engine
+            .io(move |core| core.drop_collection(&reference))
+            .await
+    }
+
+    async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
+        let handle = self.handle(collection_name)?;
+        handle.ensure_open()?;
+        Ok(Arc::clone(&handle.current().schema))
+    }
+
+    async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
+        let handle = self.handle(collection_name)?;
+        handle.alter_schema(change).await
+    }
+
+    async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
+        let handle = self.handle(collection_name)?;
+        handle.write(ops).await
+    }
+
     async fn write(
         &self,
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
         let handle = self.handle(collection_name)?;
-        let ops = legacy_ops(handle.descriptor(), operations)?;
-        handle.write(ops).await
+        let ops = legacy_ops(operations)?;
+        handle
+            .write(ops)
+            .await
+            .map_err(|error| error.with_field_prefix("operations"))
     }
 
     async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
@@ -392,8 +424,10 @@ impl CoreRef {
         handle: &Arc<CollectionHandle>,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
-        let ops = legacy_ops(handle.descriptor(), operations)?;
-        handle.write_blocking(ops)
+        let ops = legacy_ops(operations)?;
+        handle
+            .write_blocking(ops)
+            .map_err(|error| error.with_field_prefix("operations"))
     }
 }
 

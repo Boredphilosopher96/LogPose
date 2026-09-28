@@ -68,8 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("node-b leadership attempt: {second_leader:#?}");
 
     let collection = CollectionRef::new_default("chaos");
-    let descriptor = CollectionDescriptor::new("chaos", 2, DistanceMetric::Dot, Path::new("/tmp"))
-        .without_root_path();
+    let descriptor = CollectionDescriptor::new(
+        "chaos",
+        logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
+        Path::new("/tmp"),
+    )
+    .without_root_path();
     let assignment = CollectionAssignment {
         assigned_node: "node-a".to_owned(),
         assigned_role: logpose_types::NodeRole::Combined,

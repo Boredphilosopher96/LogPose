@@ -40,7 +40,7 @@ max_grpc_message_bytes = 16777216  # 16 MiB, the default
   `Content-Length`, `size_bytes`.
 - `max_grpc_message_bytes` caps one decoded gRPC request message. A larger
   message gets `RESOURCE_EXHAUSTED` with reason `TOO_LARGE`. Each message of a
-  `BulkWriteCollection` stream is one batch and is checked on its own, so
+  `BulkUpsertRecords` stream is one batch and is checked on its own, so
   bulk ingest is bounded per batch, not per stream.
 
 Both values must be greater than 0. Either key may be omitted to keep its

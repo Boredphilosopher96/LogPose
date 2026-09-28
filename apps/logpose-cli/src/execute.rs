@@ -1,19 +1,18 @@
 use crate::{
     action::{
-        Action, CLI_PUT_BATCH_BYTES, database_descriptor, query_request_from_action,
-        read_database_policy_input, read_jsonl_put_batches, stats_read_barrier_from_action,
-        stats_snapshot_from_action,
+        Action, CLI_PUT_BATCH_BYTES, primary_key_from_text, query_request_from_action,
+        read_collection_spec, read_database_policy_input, read_jsonl_put_batches,
+        records_from_documents, stats_read_barrier_from_action, stats_snapshot_from_action,
     },
     feedback::{ProgressHandle, Reporter},
     render::ActionOutput,
 };
 use anyhow::Context;
-use logpose_client::{ClientConfig, LogPoseClient};
+use logpose_client::{ClientConfig, CreateCollectionRequest, LogPoseClient};
 use logpose_config::LogPoseConfig;
-use logpose_types::{DeleteRecord, RecordId, WriteOperation};
 
 /// What `record put` tells the operator about the batch whose write failed. Each batch is one
-/// `WriteCollection` call and commits atomically, so it never lands in part.
+/// `UpsertRecords` call and commits atomically, so it never lands in part.
 const FAILED_BATCH_ADVICE: &str = "each batch commits atomically, so the failing batch was \
      applied in full or not at all; verify collection state before retrying it";
 
@@ -64,7 +63,7 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Updating database...");
             let client = connect_client(config, auth_token).await?;
             let database = client
-                .set_database(database_descriptor(&action.database_name))
+                .put_database(&action.database_name)
                 .await
                 .context("failed to update database")?;
             progress.finish_success("Database updated");
@@ -102,12 +101,67 @@ pub async fn execute_action<R: Reporter>(
             progress.finish_success("Collection created");
             Ok(ActionOutput::CollectionCreated(descriptor))
         }
+        Action::DatabaseDrop { database_name } => {
+            let progress = ProgressHandle::start(reporter.clone(), "Dropping database...");
+            let client = connect_client(config, auth_token).await?;
+            client
+                .drop_database(database_name)
+                .await
+                .context("failed to drop database")?;
+            progress.finish_success("Database dropped");
+            Ok(ActionOutput::DatabaseDropped(database_name.clone()))
+        }
+        Action::CollectionCreateFromSchema(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Reading schema...");
+            let spec = read_collection_spec(&action.schema, &action.collection.collection_name)?;
+            progress.set_message("Creating collection...");
+            let client = connect_client(config, auth_token).await?;
+            let descriptor = client
+                .create_collection(CreateCollectionRequest::from_spec(
+                    action.collection.database_name.clone(),
+                    spec,
+                ))
+                .await
+                .context("failed to create collection")?;
+            progress.finish_success("Collection created");
+            Ok(ActionOutput::CollectionCreated(descriptor))
+        }
+        Action::CollectionList { database_name } => {
+            let progress = ProgressHandle::start(reporter.clone(), "Listing collections...");
+            let client = connect_client(config, auth_token).await?;
+            let collections = client
+                .collections(database_name)
+                .await
+                .context("failed to list collections")?;
+            progress.finish_success("Collection list ready");
+            Ok(ActionOutput::CollectionsListed(collections))
+        }
+        Action::CollectionAlter(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Changing schema...");
+            let client = connect_client(config, auth_token).await?;
+            let descriptor = client
+                .alter_collection(&action.collection, action.change.clone())
+                .await
+                .context("failed to change the collection schema")?;
+            progress.finish_success("Schema changed");
+            Ok(ActionOutput::CollectionAltered(descriptor))
+        }
+        Action::CollectionDrop(collection) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Dropping collection...");
+            let client = connect_client(config, auth_token).await?;
+            client
+                .drop_collection(collection)
+                .await
+                .context("failed to drop collection")?;
+            progress.finish_success("Collection dropped");
+            Ok(ActionOutput::CollectionDropped(collection.clone()))
+        }
         Action::CollectionShow(collection) => {
             let progress =
                 ProgressHandle::start(reporter.clone(), "Fetching collection metadata...");
             let client = connect_client(config, auth_token).await?;
             let descriptor = client
-                .get_collection_in_database(&collection.database_name, &collection.collection_name)
+                .collection(collection)
                 .await
                 .context("failed to fetch collection")?;
             progress.finish_success("Collection metadata ready");
@@ -117,9 +171,8 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Fetching collection stats...");
             let client = connect_client(config, auth_token).await?;
             let stats = client
-                .stats_in_database_for_read(
-                    &action.collection.database_name,
-                    &action.collection.collection_name,
+                .stats(
+                    &action.collection,
                     stats_snapshot_from_action(action)?,
                     stats_read_barrier_from_action(action)?,
                 )
@@ -133,10 +186,7 @@ pub async fn execute_action<R: Reporter>(
                 ProgressHandle::start(reporter.clone(), "Fetching collection placement...");
             let client = connect_client(config, auth_token).await?;
             let placement = client
-                .collection_placement_in_database(
-                    &collection.database_name,
-                    &collection.collection_name,
-                )
+                .collection_placement(collection)
                 .await
                 .context("failed to fetch collection placement")?;
             progress.finish_success("Collection placement ready");
@@ -146,7 +196,7 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Flushing collection...");
             let client = connect_client(config, auth_token).await?;
             let snapshot = client
-                .flush_in_database(&collection.database_name, &collection.collection_name)
+                .flush(collection)
                 .await
                 .context("failed to flush collection")?;
             progress.finish_success("Flush completed");
@@ -156,7 +206,7 @@ pub async fn execute_action<R: Reporter>(
             let progress = ProgressHandle::start(reporter.clone(), "Compacting collection...");
             let client = connect_client(config, auth_token).await?;
             let snapshot = client
-                .compact_in_database(&collection.database_name, &collection.collection_name)
+                .compact(collection)
                 .await
                 .context("failed to compact collection")?;
             progress.finish_success("Compaction completed");
@@ -167,18 +217,17 @@ pub async fn execute_action<R: Reporter>(
             let batches = read_jsonl_put_batches(&action.input, CLI_PUT_BATCH_BYTES)?;
             progress.set_message("Writing records...");
             let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
             let mut last_seq_no = 0;
             let mut applied_ops = 0;
             let mut acknowledged_snapshot = None;
-            for operations in batches {
-                let ack = match client
-                    .write_in_database(
-                        &action.collection.database_name,
-                        &action.collection.collection_name,
-                        operations,
-                    )
-                    .await
-                {
+            for documents in batches {
+                let records = records_from_documents(&schema, documents)?;
+                let ack = match client.upsert(&action.collection, records).await {
                     Ok(ack) => ack,
                     Err(error) if applied_ops > 0 => {
                         return Err(error).context(format!(
@@ -211,14 +260,14 @@ pub async fn execute_action<R: Reporter>(
         Action::RecordDelete(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Deleting record...");
             let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
+            let key = primary_key_from_text(&schema, &action.id)?;
             let ack = client
-                .write_in_database(
-                    &action.collection.database_name,
-                    &action.collection.collection_name,
-                    vec![WriteOperation::Delete(DeleteRecord {
-                        id: RecordId::new(action.id.clone()),
-                    })],
-                )
+                .delete(&action.collection, vec![key])
                 .await
                 .context(
                     "failed to delete record; the delete may have been durably recorded before the error was returned, so verify collection state before retrying",
@@ -226,12 +275,32 @@ pub async fn execute_action<R: Reporter>(
             progress.finish_success("Delete completed");
             Ok(ActionOutput::RecordDeleted(ack))
         }
+        Action::RecordGet(action) => {
+            let progress = ProgressHandle::start(reporter.clone(), "Reading records...");
+            let client = connect_client(config, auth_token).await?;
+            let schema = client
+                .collection(&action.collection)
+                .await
+                .context("failed to fetch the collection schema")?
+                .schema;
+            let keys = action
+                .keys
+                .iter()
+                .map(|key| primary_key_from_text(&schema, key))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let response = client
+                .get(&action.collection, keys, action.output_fields.clone())
+                .await
+                .context("failed to read records")?;
+            progress.finish_success("Records ready");
+            Ok(ActionOutput::RecordsFetched { schema, response })
+        }
         Action::Query(action) => {
             let progress = ProgressHandle::start(reporter.clone(), "Running query...");
             let request = query_request_from_action(action)?;
             let client = connect_client(config, auth_token).await?;
             let response = client
-                .query_in_database(&action.collection.database_name, request)
+                .query(request)
                 .await
                 .context("failed to query collection")?;
             progress.finish_success("Query completed");
@@ -242,11 +311,7 @@ pub async fn execute_action<R: Reporter>(
                 ProgressHandle::start(reporter.clone(), "Inspecting collection storage...");
             let client = connect_client(config, auth_token).await?;
             let report = client
-                .inspect_in_database(
-                    &collection.database_name,
-                    &collection.collection_name,
-                    target.clone(),
-                )
+                .inspect(collection, target.clone())
                 .await
                 .context("failed to inspect collection")?;
             progress.finish_success("Inspection ready");

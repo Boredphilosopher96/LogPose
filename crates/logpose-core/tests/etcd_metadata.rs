@@ -21,7 +21,9 @@ use logpose_storage_etcd::{
 };
 use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, DistanceMetric, EtcdMetadataConfig,
-    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId, WriteOperation,
+    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId,
+    legacy::record_from_put,
+    schema::{FieldType, ScalarFieldSpec, SchemaChange},
 };
 use serde as _;
 use serde_json::json;
@@ -57,6 +59,9 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         &key_prefix,
         cluster_name,
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     let descriptor = state_a
         .control
         .create_collection(CreateCollectionRequest::new(
@@ -75,13 +80,17 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         cluster_name,
     )));
     state_a
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("authoritative owner should serve local writes");
@@ -103,11 +112,8 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         .collection_placement("documents")
         .await
         .expect("remote node should resolve recorded placement");
-    let runtime = state_b
-        .control
-        .runtime_status()
-        .await
-        .expect("runtime status should list authoritative metadata");
+    // Node B serves data only once its background coordination has registered it.
+    let runtime = wait_for_runtime_status(&state_b, |status| status.data_plane_ready).await;
     let stats_error = state_b
         .stats("documents")
         .await
@@ -132,6 +138,132 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
     assert_eq!(runtime.collections[0].ownership_epoch, Some(1));
     assert_eq!(runtime.collections[0].route_kind, "recorded");
     assert!(matches!(stats_error, LogPoseError::NotOwner { .. }));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_schema_changes_reach_the_catalog_other_nodes_describe").await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("alter-catalog");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-alter-catalog";
+    let state_a = Arc::new(AppState::new(test_config(
+        "alter-node-a",
+        unique_temp_dir("etcd-alter-node-a"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
+    state_a
+        .control
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            2,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created through authoritative metadata");
+    let altered = state_a
+        .alter_collection_with_auth(
+            &RequestAuth::default(),
+            "documents",
+            SchemaChange::AddField(ScalarFieldSpec::new("color", FieldType::String)),
+        )
+        .await
+        .expect("the owner should apply the schema change");
+    assert!(altered.schema.scalar_field("color").is_some());
+
+    let state_b = Arc::new(AppState::new(test_config(
+        "alter-node-b",
+        unique_temp_dir("etcd-alter-node-b"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let remote = state_b
+        .get_collection("documents")
+        .await
+        .expect("another node should describe the collection from the catalog");
+    assert_eq!(
+        remote.schema, altered.schema,
+        "a node that does not own the collection describes its live schema"
+    );
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
+async fn etcd_drop_database_refuses_while_any_collection_metadata_remains() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_drop_database_refuses_while_any_collection_metadata_remains")
+            .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("drop-database");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-drop-database";
+    let state = Arc::new(AppState::new(test_config(
+        "drop-db-node",
+        unique_temp_dir("etcd-drop-db-node"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state).await;
+    let auth = RequestAuth::default();
+    state
+        .put_database_with_auth(&auth, logpose_catalog::DatabaseDescriptor::new("analytics"))
+        .await
+        .expect("database should be created");
+    // A collection whose creation has written only its first metadata key, as a create racing
+    // the drop has.
+    let orphan =
+        format!("{key_prefix}/clusters/{cluster_name}/collections/analytics/late/assignment");
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd should be reachable");
+    client
+        .put(orphan.clone(), "{}", Some(PutOptions::new()))
+        .await
+        .expect("raw metadata key should be written");
+
+    let error = state
+        .drop_database_with_auth(&auth, "analytics")
+        .await
+        .expect_err("a database with collection metadata must not be dropped");
+    assert!(
+        matches!(error, LogPoseError::FailedPrecondition { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("late"), "{error}");
+    state
+        .database_with_auth(&auth, "analytics")
+        .await
+        .expect("the refused drop keeps the database");
+
+    client
+        .delete(orphan, None)
+        .await
+        .expect("raw metadata key should be removed");
+    state
+        .drop_database_with_auth(&auth, "analytics")
+        .await
+        .expect("an empty database is dropped");
+    assert!(matches!(
+        state.database_with_auth(&auth, "analytics").await,
+        Err(LogPoseError::NotFound { .. })
+    ));
 
     cleanup_prefix(&endpoints, &key_prefix).await;
 }
@@ -175,6 +307,9 @@ async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
         cluster_name,
         bootstrap_tokens.clone(),
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     state_a
         .put_database_with_auth(
             &RequestAuth::bearer_token("operator-token"),
@@ -394,6 +529,9 @@ async fn etcd_collection_creation_seeds_shared_database_metadata() {
         cluster_name,
         bootstrap_tokens.clone(),
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     state_a
         .create_collection_with_auth(
             &RequestAuth::bearer_token("operator-token"),
@@ -457,6 +595,9 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
     );
     combined_config.node_role = logpose_types::NodeRole::Combined;
     let combined = Arc::new(AppState::new(combined_config));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&combined).await;
     combined
         .put_database_with_auth(
             &RequestAuth::bearer_token("operator-token"),
@@ -1147,13 +1288,17 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .expect("collection should be created by the owner");
 
     owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1225,24 +1370,32 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .await
         .expect("follower runtime status should load");
     let owner_error = owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect_err("promoted old owner must reject writes");
     let follower_ack = follower
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("gamma"),
-                vector: vec![0.5, 0.5],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("gamma"),
+                    vector: vec![0.5, 0.5],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("promoted owner with local state should accept writes");
@@ -1346,13 +1499,17 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         .expect("collection should be created by the owner");
 
     let pre_promotion_ack = owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1382,13 +1539,17 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
     assert!(matches!(promoted, PromotionResult::Applied(_)));
 
     let post_promotion_ack = follower
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("promoted owner with mirrored local state should accept writes");
@@ -1515,13 +1676,17 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
         .await
         .expect("collection should be created by the owner");
     owner
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("owner should serve writes before owner metadata is removed");
@@ -1576,8 +1741,7 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         "documents",
-        2,
-        DistanceMetric::Dot,
+        logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
         unique_temp_dir("etcd-owner-promotion-pending").as_path(),
     )
     .without_root_path();

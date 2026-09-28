@@ -12,7 +12,7 @@ use logpose_api_rest as _;
 use logpose_auth as _;
 use logpose_catalog as _;
 use logpose_config as _;
-use logpose_core as _;
+use logpose_core::RequestAuth;
 use logpose_query::{
     ExplainMode, FilterComparison, FilterExpr, FilterOperator, MetadataFilter, QueryPlanKind,
     QueryRequest, ScalarMetadataValue,
@@ -21,7 +21,9 @@ use logpose_service::LogPoseDataService;
 use logpose_storage::{CreateCollectionRequest, InspectTarget};
 use logpose_storage_etcd as _;
 use logpose_types::{
-    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, Snapshot, WriteOperation,
+    DistanceMetric, LogPoseError, PutRecord, RecordId, ResourceKind, Snapshot,
+    legacy::record_from_put,
+    record::{PrimaryKey, Record},
 };
 use rand as _;
 use serde as _;
@@ -44,12 +46,12 @@ async fn service_runs_filtered_query_and_storage_workflow() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     let descriptor = service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
     assert_eq!(descriptor.name, "documents");
@@ -62,24 +64,27 @@ async fn service_runs_filtered_query_and_storage_workflow() {
     assert_eq!(placement.assigned_role, logpose_types::NodeRole::Data);
 
     service
-        .write(
+        .upsert(
             "documents",
             vec![
-                WriteOperation::Put(PutRecord {
+                record_from_put(PutRecord {
                     id: RecordId::new("alpha"),
                     vector: vec![1.0, 0.0],
                     metadata: json!({"color":"red","kind":"keep"}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("beta"),
                     vector: vec![3.0, 0.0],
                     metadata: json!({"color":"blue","kind":"drop"}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("gamma"),
                     vector: vec![2.0, 0.0],
                     metadata: json!({"color":"red","kind":"keep"}),
-                }),
+                })
+                .expect("record"),
             ],
         )
         .await
@@ -149,23 +154,26 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     let first_ack = service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("first write should succeed");
@@ -175,13 +183,16 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
     assert_eq!(first_ack.snapshot.visible_seq_no, 1);
 
     let second_ack = service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![0.0, 1.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("second write should succeed");
@@ -237,34 +248,40 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     let ack = service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
     service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("beta"),
-                vector: vec![2.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("beta"),
+                    vector: vec![2.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -341,23 +358,26 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     let ack = service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -400,23 +420,26 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -452,12 +475,12 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
@@ -496,23 +519,26 @@ async fn service_stats_read_barrier_advances_to_latest_snapshot() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     let ack = service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -538,23 +564,26 @@ async fn service_rejects_unsatisfied_stats_read_barrier() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -583,23 +612,26 @@ async fn service_rejects_impossible_snapshots() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -636,23 +668,26 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     service
-        .write(
+        .upsert(
             "documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("write should succeed");
@@ -696,23 +731,27 @@ async fn app_state_accepts_database_qualified_collection_references() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "default/documents",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("alpha"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
+            vec![
+                record_from_put(PutRecord {
+                    id: RecordId::new("alpha"),
+                    vector: vec![1.0, 0.0],
+                    metadata: json!({"kind":"keep"}),
+                })
+                .expect("record"),
+            ],
         )
         .await
         .expect("qualified write should succeed");
@@ -772,34 +811,38 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     state
-        .write(
+        .upsert_records_with_auth(
+            &RequestAuth::default(),
             "documents",
             vec![
-                WriteOperation::Put(PutRecord {
+                record_from_put(PutRecord {
                     id: RecordId::new("alpha"),
                     vector: vec![1.0, 0.0],
                     metadata: json!({"kind":"keep","version":1}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("beta"),
                     vector: vec![2.0, 0.0],
                     metadata: json!({"kind":"drop","version":2}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("gamma"),
                     vector: vec![5.0, 0.0],
                     metadata: json!({"kind":"keep","version":3}),
-                }),
+                })
+                .expect("record"),
             ],
         )
         .await
@@ -837,7 +880,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/collections/documents/query")
+                .uri("/v2/databases/default/collections/documents/query")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -887,7 +930,7 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
                 )),
             }),
             explain: proto::ExplainMode::Profile as i32,
-            database_name: String::new(),
+            database_name: "default".to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -1012,27 +1055,28 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
 
     state
         .control
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
-    let operations = (0..12)
+    let records = (0..12)
         .map(|index| {
             let kind = if index % 4 == 0 { "keep" } else { "drop" };
-            WriteOperation::Put(PutRecord {
+            record_from_put(PutRecord {
                 id: RecordId::new(format!("doc-{index}")),
                 vector: vec![index as f32 + 1.0, 0.0],
                 metadata: json!({"kind":kind,"version":index}),
             })
+            .expect("record")
         })
         .collect::<Vec<_>>();
     state
-        .write("documents", operations)
+        .upsert_records_with_auth(&RequestAuth::default(), "documents", records)
         .await
         .expect("write should succeed");
     state
@@ -1066,7 +1110,7 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/collections/documents/query")
+                .uri("/v2/databases/default/collections/documents/query")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -1115,7 +1159,7 @@ async fn service_rest_and_grpc_surface_filtered_segment_scans() {
                 )),
             }),
             explain: proto::ExplainMode::Profile as i32,
-            database_name: String::new(),
+            database_name: "default".to_owned(),
             snapshot_token: String::new(),
             pin: false,
         }))
@@ -1324,29 +1368,31 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
     service
-        .write(
+        .upsert(
             "documents",
             vec![
-                WriteOperation::Put(PutRecord {
+                record_from_put(PutRecord {
                     id: RecordId::new("alpha"),
                     vector: vec![1.0, 0.0],
                     metadata: json!({"version":1}),
-                }),
-                WriteOperation::Put(PutRecord {
+                })
+                .expect("record"),
+                record_from_put(PutRecord {
                     id: RecordId::new("beta"),
                     vector: vec![0.0, 1.0],
                     metadata: json!({"version":1}),
-                }),
+                })
+                .expect("record"),
             ],
         )
         .await
@@ -1356,12 +1402,7 @@ async fn service_reports_stats_and_inspect_targets_for_maintenance_workflows() {
         .await
         .expect("flush should succeed");
     service
-        .write(
-            "documents",
-            vec![WriteOperation::Delete(logpose_types::DeleteRecord {
-                id: RecordId::new("alpha"),
-            })],
-        )
+        .delete("documents", vec![PrimaryKey::from("alpha")])
         .await
         .expect("delete should succeed");
 
@@ -1459,33 +1500,54 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
     let service = LogPoseDataService::local(&root).expect("data service should open");
 
     service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "documents".to_owned(),
-            dimensions: 2,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect("collection should be created");
 
-    let put = |id: String, vector: Vec<f32>, metadata: Value| {
-        WriteOperation::Put(PutRecord {
-            id: RecordId::new(id),
-            vector,
-            metadata,
-        })
+    let record = |id: String, vector: Vec<f32>, extra: Value| {
+        let mut record = Record::new(id).with_vector("vector", vector);
+        if let Value::Object(extra) = extra {
+            record.extra = extra;
+        }
+        record
     };
-    for operation in [
-        put("a".to_owned(), vec![1.0, 0.0], json!("text")),
-        put("a".to_owned(), vec![1.0, 0.0], json!({"id": "x"})),
-        put("a".to_owned(), vec![1.0, 0.0], json!({"vector": 1})),
-        put("a".to_owned(), vec![1.0, 0.0], json!({"$extra": 1})),
-        put("a".to_owned(), vec![f32::INFINITY, 0.0], Value::Null),
-        put("a".repeat(1_025), vec![1.0, 0.0], Value::Null),
-        put(String::new(), vec![1.0, 0.0], Value::Null),
+    for (record, field) in [
+        (
+            record("a".to_owned(), vec![1.0, 0.0], json!({"id": "x"})),
+            "records[0].id",
+        ),
+        (
+            record("a".to_owned(), vec![1.0, 0.0], json!({"vector": 1})),
+            "records[0].vector",
+        ),
+        (
+            record("a".to_owned(), vec![1.0, 0.0], json!({"$extra": 1})),
+            "records[0].$extra",
+        ),
+        (
+            record("a".to_owned(), vec![f32::INFINITY, 0.0], Value::Null),
+            "records[0].vector",
+        ),
+        (
+            record("a".repeat(1_025), vec![1.0, 0.0], Value::Null),
+            "records[0].id",
+        ),
+        (
+            record(String::new(), vec![1.0, 0.0], Value::Null),
+            "records[0].id",
+        ),
+        (
+            record("a".to_owned(), vec![1.0], Value::Null),
+            "records[0].vector",
+        ),
     ] {
         let error = service
-            .write("documents", vec![operation.clone()])
+            .upsert("documents", vec![record.clone()])
             .await
             .expect_err("invalid record should be rejected");
         assert!(
@@ -1493,17 +1555,22 @@ async fn service_rejects_invalid_records_and_schemas_as_invalid_argument() {
                 error,
                 LogPoseError::InvalidArgument { .. } | LogPoseError::DimensionMismatch { .. }
             ),
-            "{operation:?} should be an invalid argument, got {error:?}"
+            "{record:?} should be an invalid argument, got {error:?}"
+        );
+        assert_eq!(
+            error.details().field_violations[0].field,
+            field,
+            "{error:?}"
         );
     }
 
     let error = service
-        .create_collection(CreateCollectionRequest {
-            database_name: "default".to_owned(),
-            name: "huge".to_owned(),
-            dimensions: 65_537,
-            metric: DistanceMetric::Dot,
-        })
+        .create_collection(CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "huge".to_owned(),
+            65_537,
+            DistanceMetric::Dot,
+        ))
         .await
         .expect_err("too many dimensions should be rejected");
     assert!(

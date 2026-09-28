@@ -53,8 +53,8 @@ fn create(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
         .expect("collection should be created")
 }
 
-fn ops(handle: &CollectionHandle, operations: Vec<WriteOperation>) -> Vec<ClientOp> {
-    legacy_ops(handle.descriptor(), operations).expect("legacy ops should map")
+fn ops(operations: Vec<WriteOperation>) -> Vec<ClientOp> {
+    legacy_ops(operations).expect("legacy ops should map")
 }
 
 /// Every record the published version shows, as `id -> (seq_no, metadata)`.
@@ -72,9 +72,7 @@ fn visible(handle: &CollectionHandle) -> BTreeMap<String, (SeqNo, serde_json::Va
 }
 
 async fn write(handle: &Arc<CollectionHandle>, id: &str) -> Result<CommitAck> {
-    handle
-        .write(ops(handle, vec![put(id, vec![1.0, 0.0])]))
-        .await
+    handle.write(ops(vec![put(id, vec![1.0, 0.0])])).await
 }
 
 fn spawn_write(
@@ -408,7 +406,7 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
             let rows = (0..2 * super::prepare::INLINE_PREPARE_ROWS)
                 .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
                 .collect();
-            let large = handle.write(ops(&handle, rows));
+            let large = handle.write(ops(rows));
             let altered = handle.alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
                 "price",
                 FieldType::Int64,
@@ -829,9 +827,15 @@ fn schema_changes_replay_with_the_schema_of_each_record_across_a_crash() {
             name: "missing".to_owned(),
         })
         .expect_err("an invalid change fails");
-    assert!(
-        invalid.to_string().contains("invalid schema change"),
-        "{invalid}"
+    assert_eq!(invalid.to_string(), "field 'missing' does not exist");
+    assert_eq!(
+        invalid
+            .details()
+            .field_violations
+            .iter()
+            .map(|violation| violation.field.as_str())
+            .collect::<Vec<_>>(),
+        ["drop_field.name"]
     );
 
     // Commit the flush now: the segment has the schema captured at the begin (version 1), and
@@ -1024,16 +1028,7 @@ fn inline_preparation_is_bounded_by_rows_and_by_bytes() {
         .map(|index| put(&format!("wide-{index}"), vec![0.5; 32 * 1024]))
         .collect::<Vec<_>>();
     let request = WriteRequest::Batch {
-        ops: legacy_ops(
-            &logpose_catalog::CollectionDescriptor::new(
-                "wide",
-                32 * 1024,
-                DistanceMetric::Dot,
-                std::path::Path::new("/c"),
-            ),
-            rows,
-        )
-        .expect("rows map"),
+        ops: legacy_ops(rows).expect("rows map"),
         ack: tokio::sync::oneshot::channel().0,
     };
     assert!(!prepares_inline(

@@ -27,19 +27,18 @@ impl EngineCore {
         request: &CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
         let request = request.clone().with_defaults();
-        let collection = CollectionRef::new(request.database_name.clone(), request.name.clone());
-        if self.contains(&collection) {
-            return Err(already_exists(&collection));
-        }
-
+        let collection = request.collection_ref();
+        let schema = request.spec.build_schema()?;
         let descriptor = CollectionDescriptor::new_in_database(
             request.database_name,
-            request.name,
-            request.dimensions,
-            request.metric,
+            request.spec.name,
+            schema,
             self.collections_root(),
         );
         descriptor.validate()?;
+        if self.contains(&collection) {
+            return Err(already_exists(&collection));
+        }
         Ok(descriptor)
     }
 
@@ -90,7 +89,7 @@ impl EngineCore {
         if let Some(assignment) = assignment {
             self.persist_collection_assignment(descriptor, assignment)?;
         }
-        let manifest = Manifest::empty(descriptor.collection_id.clone(), descriptor.schema()?);
+        let manifest = Manifest::empty(descriptor.collection_id.clone(), descriptor.schema.clone());
         publish_manifest(self.vfs.as_ref(), &descriptor.root_path, &manifest)
             .map_err(|failure| failure.error)?;
         let wal = WalRecovery::open(

@@ -472,7 +472,10 @@ async fn run_seeded_storage_scenario(seed: u64, steps: usize, kind: BackendKind)
         create_collection_without_background_maintenance(&engine).unwrap_or_else(|error| {
             panic_with_context(seed, &trace, format!("create failed: {error}"))
         });
-    model.register_collection(descriptor.collection_id.clone(), descriptor.metric);
+    model.register_collection(
+        descriptor.collection_id.clone(),
+        descriptor.schema.vectors()[0].metric,
+    );
     assert_stats_match(&engine, &model, None, seed, &trace).await;
     assert_current_scan_matches(&engine, &model, seed, &trace).await;
     assert_current_exact_queries_match(&engine, &model, seed, &trace).await;

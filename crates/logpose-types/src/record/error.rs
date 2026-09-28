@@ -1,6 +1,7 @@
 //! Typed errors for record and partial-update validation.
 
-use crate::{schema::PrimaryKeyType, value::ValueError};
+use super::PrimaryKey;
+use crate::{LogPoseError, schema::PrimaryKeyType, value::ValueError};
 use thiserror::Error;
 
 /// Reasons a record or partial update does not fit a collection schema.
@@ -162,6 +163,47 @@ pub enum RecordError {
 }
 
 impl RecordError {
+    /// This error as the wire error of the record at request path `path`, such as
+    /// `records[2]`, whose key is `pk` when known.
+    ///
+    /// A vector of the wrong length is [`LogPoseError::DimensionMismatch`]; everything else is
+    /// [`LogPoseError::InvalidArgument`]. Either names the offending field below `path`, such
+    /// as `records[2].price`, or `records[2].tags[3]` for a bad array element.
+    #[must_use]
+    pub fn to_error(&self, path: &str, pk: Option<&PrimaryKey>) -> LogPoseError {
+        let field = match self.field_name() {
+            Some(name) => {
+                let element = match self {
+                    Self::InvalidField {
+                        source:
+                            ValueError::ArrayElement { index, .. }
+                            | ValueError::NullArrayElement { index },
+                        ..
+                    } => format!("[{index}]"),
+                    _ => String::new(),
+                };
+                format!("{path}.{name}{element}")
+            }
+            None => path.to_owned(),
+        };
+        if let Self::VectorDimensionMismatch {
+            expected, actual, ..
+        } = self
+        {
+            return LogPoseError::DimensionMismatch {
+                field,
+                record_id: pk.map(PrimaryKey::label),
+                expected: *expected as usize,
+                actual: *actual,
+            };
+        }
+        let message = match pk {
+            Some(pk) => format!("record {pk} is invalid: {self}"),
+            None => self.to_string(),
+        };
+        LogPoseError::invalid_field(field, message)
+    }
+
     /// The record field or key the error is about, when it names one.
     #[must_use]
     pub fn field_name(&self) -> Option<&str> {
