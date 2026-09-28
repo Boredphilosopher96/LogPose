@@ -76,10 +76,10 @@ impl Shape {
 
     /// Generator parameters for this shape.
     ///
-    /// The latent structure (32 latent dimensions, 256 clusters) was chosen so
-    /// that an HNSW index with `M = 16` and `ef_construction = 200` needs an
-    /// `ef` of roughly 32 to 64 for recall@10 of 0.95, which is where public
-    /// embedding datasets land.
+    /// The latent structure (32 latent dimensions, 256 clusters) gives well-defined
+    /// nearest neighbors, unlike an isotropic Gaussian. At 50K and 100K rows an
+    /// HNSW index with `M = 16` and `ef_construction = 200` reaches recall@10 of
+    /// 0.95 at an `ef` of 16 to 24, so the data may be easier than real embeddings.
     #[must_use]
     pub fn generator(self, seed: u64) -> EmbeddingLikeSpec {
         let (n, dims, queries) = match self {

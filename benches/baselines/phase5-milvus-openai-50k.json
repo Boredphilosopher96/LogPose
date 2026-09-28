@@ -167,7 +167,7 @@
           "matching_rows": 50000,
           "sweep": [
             {
-              "ef": 16,
+              "ef": 40,
               "recall": 0.9879999999999984,
               "min_recall": 0.7,
               "queries": 1000,
@@ -183,7 +183,7 @@
               }
             }
           ],
-          "chosen_ef": 16,
+          "chosen_ef": 40,
           "chosen_recall": 0.9879999999999984,
           "met_target": true,
           "plan": {
@@ -251,7 +251,7 @@
           "matching_rows": 500,
           "sweep": [
             {
-              "ef": 16,
+              "ef": 40,
               "recall": 1.0,
               "min_recall": 1.0,
               "queries": 1000,
@@ -267,7 +267,7 @@
               }
             }
           ],
-          "chosen_ef": 16,
+          "chosen_ef": 40,
           "chosen_recall": 1.0,
           "met_target": true,
           "plan": {
@@ -335,7 +335,7 @@
           "matching_rows": 49500,
           "sweep": [
             {
-              "ef": 16,
+              "ef": 40,
               "recall": 0.9878999999999983,
               "min_recall": 0.7,
               "queries": 1000,
@@ -351,7 +351,7 @@
               }
             }
           ],
-          "chosen_ef": 16,
+          "chosen_ef": 40,
           "chosen_recall": 0.9878999999999983,
           "met_target": true,
           "plan": {
@@ -811,5 +811,15 @@
         "the dataset is synthetic (embedding-like, see dataset.generator); it mirrors only the shape of the public dataset named in dataset.mirrors"
       ]
     }
-  }
+  },
+  "corrections": [
+    "Corrected after the run: the LogPose driver recorded the requested `ef` (16), but LogPose raises every `ef` to its floor of 4 * k = 40 candidates, so every LogPose row ran at 40. The LogPose `ef` values in the JSON file now say 40; no measurement changed. `vdb-run` now records the `ef` that ran.",
+    "Recorded after the run: Milvus searches used consistency level Bounded, the level `pymilvus` 3.0.2 gives a new collection when none is named (the driver now sets it explicitly). Every row was flushed and indexed before the first search, so every search saw all rows.",
+    "Provenance: the LogPose binaries were built from commit `eb8dbbf` plus the insert-retry change later committed as `855bee0`. The `git_commit` in each report names whatever `HEAD` was checked out when it was written, and the tree was dirty."
+  ],
+  "caveats": [
+    "These results do not show that the Phase 5 exit criterion is met. That needs Cohere 1M, OpenAI 500K, and a 10M case on the public datasets, on a quiet machine.",
+    "LogPose ran its pre-v2 query planner. Rerun after planner v2 lands.",
+    "LogPose's compaction stopped short of one segment (see `server_stats`), and segments under 20,000 rows have no graph and are scanned exactly. Every query searches every segment and merges."
+  ]
 }

@@ -96,7 +96,9 @@ pub struct CaseResult {
 /// One serial pass over every query at one `ef`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SweepPoint {
-    /// Requested beam width.
+    /// Beam width the search ran with. For LogPose this is the requested `ef` raised
+    /// to the server's floor of `4 * k` candidates; filtered walks that come up
+    /// short may widen it further.
     pub ef: u32,
     /// Mean recall@k.
     pub recall: f64,
