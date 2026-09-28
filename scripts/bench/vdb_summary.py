@@ -108,13 +108,13 @@ def markdown(comparison: dict) -> str:
 
     add("## Load")
     add("")
-    add("| System | Rows | Insert s | Optimize s | Total s | Insert rows/s |")
-    add("| --- | --- | --- | --- | --- | --- |")
+    add("| System | Rows | Insert s | Optimize s | Total s | Insert rows/s | Stalled inserts retried |")
+    add("| --- | --- | --- | --- | --- | --- | --- |")
     for name in names:
         load = systems[name]["load"]
         add(
             f"| {SYSTEM_LABELS[name]} | {load['rows']:,} | {fmt(load['insert_seconds'])} | {fmt(load['optimize_seconds'])} | "
-            f"{fmt(load['total_seconds'])} | {fmt(load['insert_rows_per_sec'], 0)} |"
+            f"{fmt(load['total_seconds'])} | {fmt(load['insert_rows_per_sec'], 0)} | {load.get('write_retries', 0)} |"
         )
     add("")
     add("Optimize is everything after the last insert until the data is fully indexed and searchable: flush, compaction, and index build (and for Milvus, reloading the collection).")

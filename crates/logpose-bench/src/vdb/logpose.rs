@@ -3,8 +3,9 @@
 //!
 //! Every search goes over the network through the generated gRPC client, so the
 //! numbers include serialization and transport, as they do for the Milvus
-//! driver. Inserts use one `BulkUpsertRecords` stream; each concurrent search
-//! client opens its own connection.
+//! driver. Inserts are sequential `UpsertRecords` batches that ride out write
+//! stalls by retrying after the server's hint; each concurrent search client
+//! opens its own connection.
 
 use super::{
     files::{CaseSpec, Prepared},
@@ -13,10 +14,10 @@ use super::{
 use crate::metrics::{LatencySummary, recall_at_k};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use logpose_api_grpc::proto::{
-    self, BulkUpsertRecordsRequest, CompactCollectionRequest, CreateCollectionRequest,
-    DropCollectionRequest, FieldRange, Filter, FlushCollectionRequest, GetCollectionRequest,
-    GetCollectionStatsRequest, GetDatabaseRequest, GetMetadataRequest, PrimaryKey, PrimaryKeySpec,
-    PutDatabaseRequest, QueryCollectionRequest, Record, ScalarFieldSpec, Value, Vector,
+    self, CompactCollectionRequest, CreateCollectionRequest, DropCollectionRequest, FieldRange,
+    Filter, FlushCollectionRequest, GetCollectionRequest, GetCollectionStatsRequest,
+    GetDatabaseRequest, GetMetadataRequest, PrimaryKey, PrimaryKeySpec, PutDatabaseRequest,
+    QueryCollectionRequest, Record, ScalarFieldSpec, UpsertRecordsRequest, Value, Vector,
     VectorFieldSpec, VectorQuery, log_pose_service_client::LogPoseServiceClient,
 };
 use serde_json::json;
@@ -33,6 +34,8 @@ const VECTOR_FIELD: &str = "embedding";
 const PK_FIELD: &str = "id";
 /// How long to wait for background maintenance to settle after a load.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1_800);
+/// Most write stalls one load rides out before giving up.
+const MAX_WRITE_RETRIES: usize = 600;
 /// Largest reply the driver accepts.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -194,29 +197,44 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
     let n = prepared.dataset.len();
     let batch_size = config.batch_size;
     log(format!("inserting {n} rows in batches of {batch_size}"));
-    let first = Arc::clone(&prepared);
-    let (database, collection) = (config.database.clone(), config.collection.clone());
-    let batches = (0..n).step_by(batch_size).map(move |start| {
-        let end = (start + batch_size).min(n);
-        BulkUpsertRecordsRequest {
-            database_name: database.clone(),
-            collection_name: collection.clone(),
-            records: (start..end).map(|row| record(&first, row)).collect(),
-        }
-    });
     let insert_started = Instant::now();
-    let reply = client
-        .inner
-        .bulk_upsert_records(tokio_stream::iter(batches))
-        .await
-        .map_err(|status| anyhow!("bulk upsert failed: {status}"))?
-        .into_inner();
+    let mut write_retries = 0;
+    for start in (0..n).step_by(batch_size) {
+        let end = (start + batch_size).min(n);
+        let request = UpsertRecordsRequest {
+            database_name: config.database.clone(),
+            collection_name: config.collection.clone(),
+            records: (start..end).map(|row| record(&prepared, row)).collect(),
+        };
+        loop {
+            match client.inner.upsert_records(request.clone()).await {
+                Ok(reply) => {
+                    let applied = reply.into_inner().applied_ops;
+                    ensure!(
+                        applied == (end - start) as u64,
+                        "server applied {applied} of rows {start}..{end}"
+                    );
+                    break;
+                }
+                // A write stall (memtables waiting for flushes) is backpressure: the batch
+                // was not applied, and upserts by key are idempotent anyway, so retry it.
+                Err(status) if status.code() == Code::Unavailable => {
+                    write_retries += 1;
+                    ensure!(
+                        write_retries <= MAX_WRITE_RETRIES,
+                        "rows {start}..{end} still refused after {MAX_WRITE_RETRIES} retries: {status}"
+                    );
+                    log(format!(
+                        "rows {start}..{end} refused, retrying: {}",
+                        status.message()
+                    ));
+                    tokio::time::sleep(retry_delay(&status)).await;
+                }
+                Err(status) => bail!("upserting rows {start}..{end}: {status}"),
+            }
+        }
+    }
     let insert_seconds = insert_started.elapsed().as_secs_f64();
-    ensure!(
-        reply.applied_ops == n as u64,
-        "server applied {} of {n} rows",
-        reply.applied_ops
-    );
 
     log("flushing, compacting, and waiting for maintenance");
     let optimize_started = Instant::now();
@@ -253,7 +271,18 @@ pub async fn load(config: &DriverConfig, prepared: Arc<Prepared>) -> Result<Load
         optimize_seconds,
         total_seconds: insert_seconds + optimize_seconds,
         insert_rows_per_sec: n as f64 / insert_seconds.max(f64::MIN_POSITIVE),
+        write_retries,
     })
+}
+
+/// The server's retry hint (the `retry-after-ms` trailer), or one second.
+fn retry_delay(status: &tonic::Status) -> Duration {
+    status
+        .metadata()
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::from_secs(1), Duration::from_millis)
 }
 
 fn record(prepared: &Prepared, row: usize) -> Record {

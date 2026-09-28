@@ -63,6 +63,9 @@ pub struct LoadReport {
     pub total_seconds: f64,
     /// Rows per second over `insert_seconds`.
     pub insert_rows_per_sec: f64,
+    /// Insert requests the server refused with backpressure (a write stall) and the
+    /// driver retried; the waits count toward `insert_seconds`.
+    pub write_retries: usize,
 }
 
 /// Results of one case.

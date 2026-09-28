@@ -218,6 +218,7 @@ def load(client: MilvusClient, args: argparse.Namespace, dataset: Dataset) -> di
         "optimize_seconds": optimize_seconds,
         "total_seconds": insert_seconds + optimize_seconds,
         "insert_rows_per_sec": n / max(insert_seconds, 1e-9),
+        "write_retries": 0,
     }
 
 
@@ -391,7 +392,7 @@ def main(argv: list[str]) -> int:
     version = client.get_server_version()
     log(f"connected to Milvus {version}")
     load_report = (
-        {"rows": 0, "batch_size": args.batch_size, "insert_seconds": 0.0, "optimize_seconds": 0.0, "total_seconds": 0.0, "insert_rows_per_sec": 0.0}
+        {"rows": 0, "batch_size": args.batch_size, "insert_seconds": 0.0, "optimize_seconds": 0.0, "total_seconds": 0.0, "insert_rows_per_sec": 0.0, "write_retries": 0}
         if args.skip_load
         else load(client, args, dataset)
     )
