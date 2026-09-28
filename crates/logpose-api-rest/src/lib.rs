@@ -638,7 +638,7 @@ fn bounded_json<T: Serialize>(
     let limit = state.config.limits.max_rest_body_bytes;
     if bytes.len() > limit {
         return Err(ApiError(LogPoseError::TooLarge {
-            what: format!("{what}; ask for fewer results or output fields"),
+            what: what.to_owned(),
             size: u64::try_from(bytes.len()).ok(),
             limit: u64::try_from(limit).unwrap_or(u64::MAX),
         }));
@@ -3474,7 +3474,20 @@ mod tests {
             let (status, error) = call(&app, "POST", &format!("{ITEMS}/{path}"), Some(body)).await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {error}");
             assert_eq!(error["details"]["reason"], "TOO_LARGE", "{path}: {error}");
-            assert_eq!(error["details"]["metadata"]["limit_bytes"], "4096");
+            let metadata = &error["details"]["metadata"];
+            assert_eq!(metadata["limit_bytes"], "4096");
+            let what = match path {
+                "query" => "query response",
+                "records/scroll" => "scroll response",
+                _ => "get records response",
+            };
+            assert_eq!(metadata["what"], what, "{path}: {error}");
+            let size = metadata["size_bytes"].as_str().expect("size_bytes");
+            assert_eq!(
+                error["message"],
+                format!("{what} of {size} bytes exceeds the 4096-byte limit"),
+                "{path}: {error}"
+            );
         }
         // A small enough answer is served.
         let (status, body) = call(

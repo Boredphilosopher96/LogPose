@@ -127,7 +127,7 @@ impl GrpcLogPoseService {
         let size = reply.encoded_len();
         if size > limit {
             return Err(LogPoseError::TooLarge {
-                what: format!("{what}; ask for fewer results or output fields"),
+                what: what.to_owned(),
                 size: u64::try_from(size).ok(),
                 limit: u64::try_from(limit).unwrap_or(u64::MAX),
             });
@@ -4286,6 +4286,13 @@ mod tests {
             .expect_err("a reply above the limit should fail");
         assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{error:?}");
         assert_eq!(reason(&error).as_deref(), Some("TOO_LARGE"));
+        let info = error.get_details_error_info().expect("error info");
+        assert_eq!(info.metadata["what"], "QueryCollection reply");
+        let size = &info.metadata["size_bytes"];
+        assert_eq!(
+            error.message(),
+            format!("QueryCollection reply of {size} bytes exceeds the 2048-byte limit")
+        );
         let error = service
             .scroll_records(Request::new(items_scroll(None, 40)))
             .await
