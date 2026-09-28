@@ -524,6 +524,124 @@ async fn a_scroll_that_fits_in_one_page_pins_nothing() {
     );
 }
 
+/// A view keeps its state but not the engine: once the engine is dropped, a search that needs
+/// segment sections fails with `Unavailable` (it never hangs or panics), and what the view
+/// holds itself (its counters) still answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_view_that_outlives_its_engine_fails_fetches_without_hanging() {
+    let fixture = Fixture::new(
+        "outlives",
+        8,
+        DistanceMetric::L2,
+        IndexPolicy {
+            graph_min_rows: 64,
+            sq8_min_rows: 32,
+            ..IndexPolicy::default()
+        },
+        &[("group", FieldType::Int64)],
+    )
+    .await;
+    let mut rng = Rng::new(17);
+    rows(&fixture, &mut rng, 0, 100).await;
+    fixture.flush().await;
+    rows(&fixture, &mut rng, 100, 10).await;
+    let view = fixture.view().await;
+    let probe = rng.vector(8);
+    let Fixture {
+        engine,
+        handle,
+        root,
+        ..
+    } = fixture;
+    drop(handle);
+    drop(engine);
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        search(&view, &SearchRequest::new(probe, 5)),
+    )
+    .await
+    .expect("a search on a view whose engine is gone never hangs");
+    assert!(
+        matches!(
+            outcome,
+            Err(logpose_query::QueryError::Storage(
+                LogPoseError::Unavailable { .. }
+            ))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        logpose_query::count_view(&view, None)
+            .await
+            .expect("counters"),
+        110
+    );
+    drop(view);
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A filter update whose key set is too large for one WAL frame fails with `TooLarge` before
+/// anything is logged: no row changes, no sequence number is taken, and the collection stays
+/// writable.
+#[tokio::test]
+async fn a_filter_write_too_large_for_one_frame_fails_and_changes_nothing() {
+    // 2,048 dimensions: an update's row image carries its 8 KiB vector, so about 8,200
+    // matching rows exceed a 64 MiB frame.
+    let dims = 2048;
+    let fixture = Fixture::new(
+        "too-large",
+        dims,
+        DistanceMetric::L2,
+        IndexPolicy::default(),
+        &[("group", FieldType::Int64)],
+    )
+    .await;
+    let mut rng = Rng::new(3);
+    for batch in 0..9 {
+        let records = (batch * 1000..(batch + 1) * 1000)
+            .map(|index| {
+                record(
+                    &format!("r{index:05}"),
+                    rng.vector(dims),
+                    &[("group", Value::Int64(1))],
+                )
+            })
+            .collect();
+        fixture.upsert(records).await;
+        if batch == 4 {
+            fixture.flush().await;
+        }
+    }
+    let before = fixture.handle.current().snapshot();
+    let mut patch = PartialUpdate::new("ignored");
+    patch.fields.insert("group".to_owned(), Value::Int64(2));
+    let error = fixture
+        .handle
+        .update_by_filter(eq("group", 1), patch)
+        .await
+        .expect_err("9,000 updated rows exceed one frame");
+    assert!(matches!(error, LogPoseError::TooLarge { .. }), "{error:?}");
+    assert_eq!(fixture.handle.current().snapshot(), before);
+    assert_eq!(
+        count(
+            &fixture.engine,
+            &fixture.reference,
+            Some(&eq("group", 1)),
+            ReadOptions::default()
+        )
+        .await
+        .expect("count"),
+        9000
+    );
+    let ack = fixture
+        .handle
+        .delete_by_filter(eq("group", 1))
+        .await
+        .expect("a delete of the same rows fits");
+    assert_eq!(ack.applied_ops, 9000);
+    assert_eq!(ack.last_seq_no, before.visible_seq_no + 9000);
+}
+
 /// A read barrier holds for the state a request reads: a token that pins a state before the
 /// barrier fails with `ReadBarrierNotSatisfied` instead of passing because the current state
 /// satisfies it and then reading the older, pinned one.

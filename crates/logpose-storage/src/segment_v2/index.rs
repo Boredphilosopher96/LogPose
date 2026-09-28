@@ -700,6 +700,45 @@ mod tests {
             .sections
     }
 
+    /// A damaged graph section never panics or allocates beyond its bytes: every truncation
+    /// and every single-byte flip of a mapped section (duplicate vectors) decodes to an error,
+    /// or to a graph whose node map stays within the segment.
+    #[test]
+    fn damaged_graph_sections_decode_to_errors_never_panics() {
+        // 12 distinct vectors, each on two rows, plus 6 null rows: 30 rows.
+        let rows = 30_u32;
+        let data = (0..12_u16)
+            .flat_map(|node| [f32::from(node), f32::from(node % 5)])
+            .collect::<Vec<_>>();
+        let source = F32Vectors::new(2, data, F32Metric::L2Squared).expect("vectors");
+        let graph = HnswGraph::build_parallel(&source, HnswParams::default()).expect("graph");
+        let node_rows = (0..12_u32)
+            .map(|node| vec![node * 2, node * 2 + 1])
+            .collect::<Vec<_>>();
+        let bytes = encode_graph_section(rows, &node_rows, false, &graph).expect("encodes");
+        let decoded = SegmentGraph::decode(&bytes, rows).expect("decodes");
+        assert_eq!(decoded.nodes.rows(3).collect::<Vec<_>>(), [6, 7]);
+        assert!(SegmentGraph::decode(&bytes, rows + 1).is_err(), "row count");
+
+        let check = |damaged: &[u8]| {
+            if let Ok(graph) = SegmentGraph::decode(damaged, rows) {
+                for node in 0..u32::try_from(graph.graph.len()).expect("fits") {
+                    assert!(graph.nodes.rows(node).all(|row| row < rows));
+                }
+            }
+        };
+        for len in 0..bytes.len() {
+            check(&bytes[..len]);
+        }
+        for at in 0..bytes.len() {
+            for flip in [0x01_u8, 0x80, 0xff] {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= flip;
+                check(&damaged);
+            }
+        }
+    }
+
     /// A vector field whose range is too wide for SQ8 gets neither codes nor a graph: walks
     /// traverse codes, so its segments are scanned exactly in f32.
     #[test]
