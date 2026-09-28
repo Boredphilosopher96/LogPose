@@ -158,6 +158,7 @@ async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
     assert_eq!(diagnostics.unit_scan_mix.get("graph_admit"), Some(&1));
     assert_eq!(diagnostics.rerank_count, 1);
     assert!(diagnostics.stage_timings.is_some());
+    assert_eq!(diagnostics.fallback_reason, None, "the graph was walked");
 }
 
 #[tokio::test]
@@ -171,6 +172,15 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
         .flush()
         .await
         .expect("flush should succeed");
+    // Before its index build the segment has no graph: the fallback says so.
+    let before = query(&engine, request("documents", 5, None))
+        .await
+        .expect("query should succeed");
+    let reason = before
+        .diagnostics
+        .and_then(|diagnostics| diagnostics.fallback_reason)
+        .expect("a fallback reason");
+    assert!(reason.contains("no graph yet"), "{reason}");
     // A flushed segment gets its graph from an index build, which the compaction runs.
     handle(&engine, "documents")
         .compact()
@@ -204,6 +214,12 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
             .is_some_and(|reason| reason.contains("cheapest")),
         "{:?}",
         scan.reason
+    );
+    // The segment has a graph: the fallback names the price, not a missing graph.
+    let reason = diagnostics.fallback_reason.expect("a fallback reason");
+    assert_eq!(
+        reason,
+        "an exact scan was cheaper than a walk at the filter's selectivity"
     );
 
     // 15,000 rows that are not `keep`: an admit-only walk (selectivity 0.75).

@@ -28,7 +28,7 @@
 use crate::{
     QueryError, Result,
     compile::CompiledFilter,
-    cost::{Choice, CostModel, Decision, Force, SegmentShape, Work},
+    cost::{Choice, CostModel, Decision, ExactCause, Force, SegmentShape, Work},
     explain::{Operator, OperatorStats, PlanNode},
 };
 use logpose_index::{
@@ -216,6 +216,9 @@ pub struct UnitReport {
     pub walk_abandoned: bool,
     /// Why the strategy was chosen.
     pub reason: String,
+    /// Why the unit was scanned exactly rather than walked; `None` for a walk, or a unit with
+    /// nothing to search.
+    pub exact_cause: Option<ExactCause>,
 }
 
 impl UnitReport {
@@ -235,6 +238,7 @@ impl UnitReport {
             two_hops: 0,
             walk_abandoned: false,
             reason: reason.to_owned(),
+            exact_cause: None,
         }
     }
 }
@@ -1296,6 +1300,7 @@ fn unit_candidates(
     let Some(sq8) = index.sq8.as_ref() else {
         // Scanned in f32 in the rerank stage, once the rows' pages are fetched.
         let mut report = UnitReport::new(unit, UnitStrategy::ExactF32, matched, &decision.reason);
+        report.exact_cause = decision.exact_cause.or(Some(ExactCause::NoGraph));
         report.candidates = usize::try_from(matched).unwrap_or(usize::MAX);
         return Ok(UnitResult {
             unit: unit.id(),
@@ -1318,6 +1323,7 @@ fn unit_candidates(
     };
 
     let mut report = UnitReport::new(unit, UnitStrategy::ExactSq8, matched, &decision.reason);
+    report.exact_cause = decision.exact_cause;
     let (candidates, scan_node) = match (decision.chosen.choice, usable_graph) {
         (Choice::GraphAdmit | Choice::GraphAcorn, Some(graph)) => {
             let started = Instant::now();
@@ -1370,6 +1376,7 @@ fn unit_candidates(
                     // The walk spent the exact scan's price: scan exactly instead.
                     report.strategy = UnitStrategy::ExactSq8;
                     report.walk_abandoned = true;
+                    report.exact_cause = Some(ExactCause::WalkAbandoned);
                     report.reason = format!("{}; {why}", decision.reason);
                     let started = Instant::now();
                     let morsels = scan_morsels(context, decision.exact.micros);
@@ -1457,6 +1464,7 @@ fn memtable_scan(
         matched,
         "memtables are scanned exactly",
     );
+    report.exact_cause = Some(ExactCause::Memtable);
     report.candidates = scored.len();
     report.distances = matched;
     let work = Work {

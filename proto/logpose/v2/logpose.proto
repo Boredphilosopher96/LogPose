@@ -902,6 +902,8 @@ message QueryDiagnostics {
   uint64 candidates_reranked = 9;
   uint64 candidates_merged = 10;
   uint64 rerank_count = 11;
+  // Why no segment walked a graph (unset when one did): each cause of the units' exact scans,
+  // such as a segment without a graph yet or an exact scan priced below a walk.
   optional string fallback_reason = 12;
   map<string, uint64> unit_scan_mix = 13;
   QueryStageTimings stage_timings = 14;

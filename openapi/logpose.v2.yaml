@@ -2018,6 +2018,7 @@ components:
         rerank_count:
           type: integer
         fallback_reason:
+          description: "Why no segment walked a graph (null when one did): each cause of the units' exact scans, such as a segment without a graph yet, matching rows that fit the candidate budget, or an exact scan priced below a walk."
           oneOf:
             - type: "null"
             - type: string

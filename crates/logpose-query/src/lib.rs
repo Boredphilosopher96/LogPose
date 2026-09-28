@@ -32,7 +32,7 @@ pub mod search;
 mod tests;
 
 pub use compile::CompiledFilter;
-pub use cost::{CostModel, Force};
+pub use cost::{CostModel, ExactCause, Force};
 pub use explain::{Operator, OperatorStats, PlanNode};
 pub use logpose_storage::read::Direction;
 pub use logpose_types::filter::{FilterExpr, RangeBounds};
@@ -864,6 +864,39 @@ fn clear_times(node: &mut PlanNode) {
     }
 }
 
+/// Why no unit walked a graph, from the causes of the units' exact scans.
+fn fallback_reason(units: &[search::UnitReport], filtered: bool) -> String {
+    let mut causes = units
+        .iter()
+        .filter_map(|unit| unit.exact_cause)
+        .collect::<Vec<_>>();
+    causes.sort_unstable_by_key(|cause| *cause as u8);
+    causes.dedup();
+    if causes.is_empty() {
+        return "no unit had live rows matching the filter".to_owned();
+    }
+    causes
+        .into_iter()
+        .map(|cause| match cause {
+            ExactCause::Memtable => "memtable rows are scanned exactly",
+            ExactCause::NoGraph => {
+                "a segment has no graph yet (its index build has not run, or it is too small \
+                 for one)"
+            }
+            ExactCause::FitsBudget => "a segment's matching rows fit the candidates it contributes",
+            ExactCause::Cheaper if filtered => {
+                "an exact scan was cheaper than a walk at the filter's selectivity"
+            }
+            ExactCause::Cheaper => "an exact scan was cheaper than a walk for the segment's size",
+            ExactCause::WalkAbandoned => {
+                "a walk reached the exact scan's price and the segment was scanned exactly"
+            }
+            ExactCause::Forced => "exact scans were forced",
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn diagnostics(outcome: &SearchOutcome, filtered: bool, explain: ExplainMode) -> QueryDiagnostics {
     let mut mix = BTreeMap::new();
     let mut graph = false;
@@ -920,7 +953,7 @@ fn diagnostics(outcome: &SearchOutcome, filtered: bool, explain: ExplainMode) ->
         candidates_reranked: outcome.reranked,
         candidates_merged: merged,
         rerank_count: usize::from(outcome.reranked > 0),
-        fallback_reason: (!graph).then(|| "no segment has a graph large enough to walk".to_owned()),
+        fallback_reason: (!graph).then(|| fallback_reason(&outcome.units, filtered)),
         unit_scan_mix: mix,
         stage_timings: (explain == ExplainMode::Profile).then_some(QueryStageTimings {
             planning_micros: outcome.timings.planning,

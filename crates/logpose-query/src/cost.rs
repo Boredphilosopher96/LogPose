@@ -253,6 +253,25 @@ pub struct Priced {
     pub micros: f64,
 }
 
+/// Why a unit was scanned exactly rather than walked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactCause {
+    /// A memtable, which is always scanned exactly.
+    Memtable,
+    /// The segment has no graph to walk (none built yet, or too few rows for one) or no SQ8
+    /// codes.
+    NoGraph,
+    /// Its matching rows fit the candidates it contributes, so a walk could not visit fewer.
+    FitsBudget,
+    /// The cost model priced the exact scan below every walk.
+    Cheaper,
+    /// A walk reached the exact scan's price and the unit was scanned exactly instead.
+    WalkAbandoned,
+    /// Exact scans were forced.
+    Forced,
+}
+
 /// The planner's decision for one segment.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decision {
@@ -264,6 +283,8 @@ pub struct Decision {
     pub alternatives: Vec<Priced>,
     /// Why, in words.
     pub reason: String,
+    /// Why the exact scan was chosen, when it was.
+    pub exact_cause: Option<ExactCause>,
 }
 
 /// Restricts the planner to one family of strategies (for tests and benchmarks).
@@ -448,12 +469,20 @@ impl CostModel {
                 "ACORN walk forced",
             )),
         };
+        let mut exact_cause = None;
         let (chosen, reason) = match forced {
-            Some((Some(chosen), why)) => (chosen, why.to_owned()),
+            Some((Some(chosen), why)) => {
+                if chosen.choice == Choice::ExactScan {
+                    exact_cause = Some(ExactCause::Forced);
+                }
+                (chosen, why.to_owned())
+            }
             _ if !walkable => {
                 let why = if shape.graph_nodes.is_none() || !shape.sq8 {
+                    exact_cause = Some(ExactCause::NoGraph);
                     "no graph".to_owned()
                 } else {
+                    exact_cause = Some(ExactCause::FitsBudget);
                     format!(
                         "{} matching rows fit the {} candidates",
                         shape.matched, shape.budget
@@ -463,6 +492,9 @@ impl CostModel {
             }
             _ => {
                 let chosen = alternatives.first().copied().unwrap_or(exact);
+                if chosen.choice == Choice::ExactScan {
+                    exact_cause = Some(ExactCause::Cheaper);
+                }
                 let others = alternatives
                     .iter()
                     .skip(1)
@@ -485,6 +517,7 @@ impl CostModel {
             exact,
             alternatives,
             reason,
+            exact_cause,
         }
     }
 
