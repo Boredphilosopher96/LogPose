@@ -805,6 +805,104 @@ fn data_commands_run_against_the_server_over_grpc() {
 }
 
 #[test]
+fn count_scroll_scan_and_delete_by_filter_run_against_the_server() {
+    let fixture = TestServerFixture::spawn("cli-server-count-scroll");
+    let input = fixture.temp_root.join("records.jsonl");
+    fs::write(
+        &input,
+        [
+            r#"{"id":"alpha","vector":[1.0,0.0],"kind":"keep","rank":3}"#,
+            r#"{"id":"beta","vector":[0.9,0.0],"kind":"drop","rank":1}"#,
+            r#"{"id":"gamma","vector":[0.8,0.0],"kind":"keep","rank":2}"#,
+            r#"{"id":"delta","vector":[0.7,0.0],"kind":"drop","rank":5}"#,
+            r#"{"id":"epsilon","vector":[0.6,0.0],"kind":"keep","rank":4}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("jsonl input should be written");
+    fixture.run_cli([
+        "collection",
+        "create",
+        "colors",
+        "--dimensions",
+        "2",
+        "--metric",
+        "dot",
+    ]);
+    fixture.run_cli([
+        "record",
+        "put",
+        "colors",
+        "--input",
+        input.to_str().expect("input path should be utf8"),
+    ]);
+    let json = |args: &[&str]| -> Value {
+        let output = fixture.run_cli_json(args);
+        serde_json::from_slice(&output.stdout).expect("output should be valid json")
+    };
+    let ids = |body: &Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .expect("an array of records")
+            .iter()
+            .map(|item| {
+                let record = item.get("record").unwrap_or(item);
+                record["id"].as_str().unwrap_or_default().to_owned()
+            })
+            .collect()
+    };
+
+    let counted = json(&["count", "colors", "--filter", "kind=keep"]);
+    assert_eq!(scoped_response_body(&counted)["count"], 3);
+
+    let first = json(&[
+        "scroll",
+        "colors",
+        "--where",
+        "kind:eq:keep",
+        "--page-size",
+        "2",
+    ]);
+    assert_eq!(ids(&first, "records"), vec!["alpha", "epsilon"]);
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a first page of two has a cursor")
+        .to_owned();
+    let second = json(&[
+        "scroll",
+        "colors",
+        "--where",
+        "kind:eq:keep",
+        "--page-size",
+        "2",
+        "--cursor",
+        &cursor,
+    ]);
+    assert_eq!(ids(&second, "records"), vec!["gamma"]);
+    assert!(second["next_cursor"].is_null(), "{second}");
+
+    // A query without a vector is a filtered scan, in primary key order by default.
+    let scanned = json(&[
+        "query",
+        "colors",
+        "--top-k",
+        "2",
+        "--where",
+        "rank:gte:json:2",
+    ]);
+    assert_eq!(
+        ids(query_response_body(&scanned), "hits"),
+        vec!["alpha", "delta"]
+    );
+    assert!(scanned["hits"][0].get("score").is_none(), "{scanned}");
+
+    let deleted = json(&["record", "delete", "colors", "--filter", "kind=drop"]);
+    assert_eq!(scoped_response_body(&deleted)["applied_ops"], 2);
+    let counted = json(&["count", "colors"]);
+    assert_eq!(counted["count"], 3);
+}
+
+#[test]
 fn query_and_stats_support_read_barrier_flags_against_server() {
     let fixture = TestServerFixture::spawn("cli-server-read-barrier");
     let first_input = fixture.temp_root.join("records-first.jsonl");

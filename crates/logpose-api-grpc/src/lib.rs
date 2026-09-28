@@ -1120,7 +1120,12 @@ mod tests {
     };
     use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
     use logpose_query::{QueryDiagnostics, QueryPlanKind, QueryStageTimings};
-    use logpose_types::{DEFAULT_DATABASE_NAME, DistanceMetric};
+    use logpose_types::{
+        DEFAULT_DATABASE_NAME, DistanceMetric,
+        filter::RangeBounds,
+        record::{Record, RecordPatch},
+        value::Value as TypedValue,
+    };
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -3622,5 +3627,727 @@ mod tests {
         let path = std::env::temp_dir().join(format!("logpose-api-grpc-{label}-{suffix}"));
         fs::create_dir_all(&path).expect("temp dir should be created");
         path
+    }
+
+    // ----- Search, count, scroll, and filter writes -----
+
+    const ITEMS: &str = "items";
+
+    /// The `items` collection: an int64 key `sku`, the vector fields `embedding` (dot, three
+    /// dimensions) and `thumb` (L2, two), typed scalar fields, and dynamic fields.
+    fn items_request() -> CreateCollectionRequest {
+        let field = |name: &str, field_type: proto::FieldType| proto::ScalarFieldSpec {
+            name: name.to_owned(),
+            r#type: field_type as i32,
+            index: proto::FieldIndex::Auto as i32,
+            nullable: None,
+        };
+        let vector =
+            |name: &str, dimensions: u32, metric: proto::DistanceMetric| proto::VectorFieldSpec {
+                name: name.to_owned(),
+                dimensions,
+                metric: metric as i32,
+            };
+        CreateCollectionRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            primary_key: Some(proto::PrimaryKeySpec {
+                name: "sku".to_owned(),
+                r#type: proto::PrimaryKeyType::Int64 as i32,
+            }),
+            vectors: vec![
+                vector("embedding", 3, proto::DistanceMetric::Dot),
+                vector("thumb", 2, proto::DistanceMetric::L2),
+            ],
+            fields: vec![
+                field("tenant", proto::FieldType::String),
+                field("price", proto::FieldType::Float64),
+                field("stock", proto::FieldType::Int64),
+                field("tags", proto::FieldType::ArrayString),
+            ],
+            dynamic_fields: Some(true),
+        }
+    }
+
+    /// Item `sku`: even skus belong to `acme` and odd ones to `globex`, the price is
+    /// `1.5 * sku`, the stock `sku % 7` (none for multiples of 5), the tag `t{sku % 3}`, the
+    /// `$extra` color red for multiples of 4 and blue otherwise, and the embedding's dot product
+    /// with `[1, 0, 0]` is `sku`.
+    fn item(sku: i64) -> proto::Record {
+        let tenant = if sku % 2 == 0 { "acme" } else { "globex" };
+        let mut record = Record::new(sku)
+            .with_vector("embedding", vec![sku as f32, 1.0, 0.0])
+            .with_vector("thumb", vec![0.0, sku as f32])
+            .with_field("tenant", TypedValue::from(tenant))
+            .with_field("price", TypedValue::Float64(sku as f64 * 1.5))
+            .with_field(
+                "tags",
+                TypedValue::Array(vec![TypedValue::String(format!("t{}", sku % 3))]),
+            );
+        if sku % 5 != 0 {
+            record = record.with_field("stock", TypedValue::Int64(sku % 7));
+        }
+        let color = if sku % 4 == 0 { "red" } else { "blue" };
+        record.extra.insert("color".to_owned(), json!(color));
+        convert::record_to_proto(record)
+    }
+
+    /// A service over `config` holding the `items` collection with `skus`.
+    async fn items_service(
+        config: LogPoseConfig,
+        skus: std::ops::RangeInclusive<i64>,
+    ) -> GrpcLogPoseService {
+        let service = GrpcLogPoseService::new(Arc::new(AppState::new(config)));
+        service
+            .create_collection(Request::new(items_request()))
+            .await
+            .expect("create should succeed");
+        upsert_items(&service, skus).await;
+        service
+    }
+
+    async fn upsert_items(service: &GrpcLogPoseService, skus: std::ops::RangeInclusive<i64>) {
+        service
+            .upsert_records(Request::new(upsert_request(
+                ITEMS,
+                skus.map(item).collect(),
+            )))
+            .await
+            .expect("upsert should succeed");
+    }
+
+    async fn run_items_step(service: &GrpcLogPoseService, step: &str) {
+        match step {
+            "flush" => {
+                service
+                    .flush_collection(Request::new(flush_collection_request(ITEMS)))
+                    .await
+                    .expect("flush should succeed");
+            }
+            _ => {
+                service
+                    .compact_collection(Request::new(compact_collection_request(ITEMS)))
+                    .await
+                    .expect("compact should succeed");
+            }
+        }
+    }
+
+    fn items_query(vector: Option<(&str, Vec<f32>)>, top_k: u64) -> QueryCollectionRequest {
+        QueryCollectionRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            vector: vector.map(|(field, values)| proto::VectorQuery {
+                field: field.to_owned(),
+                values,
+            }),
+            top_k,
+            ..QueryCollectionRequest::default()
+        }
+    }
+
+    fn items_count(filter: Option<FilterExpr>) -> proto::CountRecordsRequest {
+        proto::CountRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            filter: filter.map(convert::filter_to_proto),
+            ..proto::CountRecordsRequest::default()
+        }
+    }
+
+    fn items_scroll(filter: Option<FilterExpr>, page_size: u32) -> proto::ScrollRecordsRequest {
+        proto::ScrollRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            filter: filter.map(convert::filter_to_proto),
+            page_size,
+            ..proto::ScrollRecordsRequest::default()
+        }
+    }
+
+    fn items_delete(filter: FilterExpr) -> DeleteRecordsRequest {
+        DeleteRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            keys: Vec::new(),
+            filter: Some(convert::filter_to_proto(filter)),
+        }
+    }
+
+    fn items_update(filter: FilterExpr, patch: RecordPatch) -> proto::UpdateRecordsRequest {
+        proto::UpdateRecordsRequest {
+            database_name: default_database_name(),
+            collection_name: ITEMS.to_owned(),
+            records: Vec::new(),
+            filter: Some(convert::filter_to_proto(filter)),
+            patch: Some(convert::patch_to_proto(patch)),
+        }
+    }
+
+    fn sku_of(record: &proto::Record) -> i64 {
+        record
+            .pk
+            .as_ref()
+            .and_then(|pk| match pk.kind {
+                Some(proto::primary_key::Kind::Int64Value(sku)) => Some(sku),
+                _ => None,
+            })
+            .expect("records should carry an int64 sku")
+    }
+
+    fn hit_skus(reply: &QueryCollectionReply) -> Vec<i64> {
+        reply
+            .hits
+            .iter()
+            .map(|hit| sku_of(hit.record.as_ref().expect("hits carry a record")))
+            .collect()
+    }
+
+    async fn count_items(service: &GrpcLogPoseService, request: proto::CountRecordsRequest) -> u64 {
+        service
+            .count_records(Request::new(request))
+            .await
+            .expect("count should succeed")
+            .into_inner()
+            .count
+    }
+
+    /// Every page of a scroll from `first`, and the skus it returned.
+    async fn scroll_all(
+        service: &GrpcLogPoseService,
+        first: proto::ScrollRecordsRequest,
+    ) -> (Vec<ScrollRecordsReply>, Vec<i64>) {
+        let mut pages = Vec::new();
+        let mut skus = Vec::new();
+        let mut request = first;
+        loop {
+            let page = service
+                .scroll_records(Request::new(request.clone()))
+                .await
+                .expect("scroll page should succeed")
+                .into_inner();
+            skus.extend(page.records.iter().map(sku_of));
+            let next = page.next_cursor.clone();
+            pages.push(page);
+            if next.is_empty() {
+                break;
+            }
+            request.cursor = next;
+            request.snapshot_token.clear();
+        }
+        (pages, skus)
+    }
+
+    fn acme() -> FilterExpr {
+        FilterExpr::eq("tenant", "acme")
+    }
+
+    #[tokio::test]
+    async fn grpc_queries_search_a_named_vector_field_with_typed_filters_orders_and_projections() {
+        let service = items_service(test_config("grpc-p6c-query"), 1..=40).await;
+
+        // A vector search: acme items with 15 <= price < 45 are skus 10 to 28, best first.
+        let mut request = items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 3);
+        request.filter = Some(convert::filter_to_proto(FilterExpr::and(vec![
+            acme(),
+            FilterExpr::range(
+                "price",
+                RangeBounds {
+                    gte: Some(TypedValue::Int64(15)),
+                    lt: Some(TypedValue::Int64(45)),
+                    ..RangeBounds::default()
+                },
+            ),
+        ])));
+        request.output_fields = vec!["price".to_owned()];
+        let reply = service
+            .query_collection(Request::new(request))
+            .await
+            .expect("query should succeed")
+            .into_inner();
+        assert_eq!(reply.vector_field, "embedding");
+        assert_eq!(reply.metric, proto::DistanceMetric::Dot as i32);
+        assert_eq!(hit_skus(&reply), vec![28, 26, 24]);
+        assert_eq!(
+            reply.hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+            vec![Some(28.0), Some(26.0), Some(24.0)]
+        );
+        let first = reply.hits[0].record.clone().expect("hit record");
+        assert!(first.vectors.is_empty());
+        assert_eq!(first.fields.keys().collect::<Vec<_>>(), vec!["price"]);
+        assert_eq!(
+            first
+                .fields
+                .get("price")
+                .cloned()
+                .and_then(|value| convert::value_from_proto(value, "value").ok()),
+            Some(TypedValue::Float64(42.0))
+        );
+
+        // The other vector field, by name: L2 distance to [0, 3] is smallest for sku 3.
+        let reply = service
+            .query_collection(Request::new(items_query(
+                Some(("thumb", vec![0.0, 3.0])),
+                2,
+            )))
+            .await
+            .expect("thumb query should succeed")
+            .into_inner();
+        assert_eq!(reply.metric, proto::DistanceMetric::L2 as i32);
+        assert_eq!(hit_skus(&reply)[0], 3);
+
+        // No vector: a filtered scan in `order_by` order, without scores.
+        let mut request = items_query(None, 4);
+        request.filter = Some(convert::filter_to_proto(FilterExpr::contains("tags", "t0")));
+        request.order_by = vec![proto::OrderBy {
+            field: "price".to_owned(),
+            direction: proto::SortDirection::Desc as i32,
+        }];
+        request.explain = proto::ExplainMode::Plan as i32;
+        let reply = service
+            .query_collection(Request::new(request))
+            .await
+            .expect("scan should succeed")
+            .into_inner();
+        assert_eq!(hit_skus(&reply), vec![39, 36, 33, 30]);
+        assert!(reply.hits.iter().all(|hit| hit.score.is_none()));
+        assert!(reply.vector_field.is_empty());
+        assert_eq!(
+            reply.diagnostics.map(|diagnostics| diagnostics.chosen_plan),
+            Some(proto::QueryPlanKind::OrderedScan as i32)
+        );
+
+        // `$extra` keys filter by path, and `in` and `not_in` take lists.
+        let mut request = items_query(None, 100);
+        request.filter = Some(convert::filter_to_proto(FilterExpr::and(vec![
+            FilterExpr::eq("$extra.color", "red"),
+            FilterExpr::not_in("sku", vec![TypedValue::Int64(4), TypedValue::Int64(8)]),
+            FilterExpr::in_values("tenant", vec!["acme".into(), "initech".into()]),
+        ])));
+        let reply = service
+            .query_collection(Request::new(request))
+            .await
+            .expect("extra query should succeed")
+            .into_inner();
+        assert_eq!(hit_skus(&reply), vec![12, 16, 20, 24, 28, 32, 36, 40]);
+
+        // A pinned query returns the token of the state it read.
+        let mut request = items_query(None, 1);
+        request.pin = true;
+        let reply = service
+            .query_collection(Request::new(request))
+            .await
+            .expect("pinned query should succeed")
+            .into_inner();
+        assert!(!reply.snapshot_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grpc_scroll_cursors_read_the_pinned_state_through_writes_flushes_and_compactions() {
+        let service = items_service(test_config("grpc-p6c-pinned"), 1..=40).await;
+        run_items_step(&service, "flush").await;
+
+        let mut pin = items_count(Some(acme()));
+        pin.pin = true;
+        let counted = service
+            .count_records(Request::new(pin))
+            .await
+            .expect("pinned count should succeed")
+            .into_inner();
+        assert_eq!(counted.count, 20);
+        let token = counted.snapshot_token.clone();
+        assert!(!token.is_empty());
+
+        let mut first = items_scroll(Some(acme()), 7);
+        first.snapshot_token = token.clone();
+        first.output_fields = vec!["price".to_owned()];
+        let page = service
+            .scroll_records(Request::new(first.clone()))
+            .await
+            .expect("first page should succeed")
+            .into_inner();
+        assert_eq!(
+            page.records.iter().map(sku_of).collect::<Vec<_>>(),
+            vec![2, 4, 6, 8, 10, 12, 14]
+        );
+        assert_eq!(page.snapshot, counted.snapshot);
+        let cursor = page.next_cursor.clone();
+        assert!(!cursor.is_empty());
+
+        // Change what the pinned state holds: deletes, updates, new rows, a flush, a compaction.
+        let ack = service
+            .delete_records(Request::new(items_delete(FilterExpr::range(
+                "sku",
+                RangeBounds {
+                    gte: Some(TypedValue::Int64(16)),
+                    lte: Some(TypedValue::Int64(24)),
+                    ..RangeBounds::default()
+                },
+            ))))
+            .await
+            .expect("delete by filter should succeed")
+            .into_inner();
+        assert_eq!(ack.applied_ops, 9);
+        let patch = RecordPatch {
+            fields: [("price".to_owned(), TypedValue::Float64(0.5))]
+                .into_iter()
+                .collect(),
+            ..RecordPatch::default()
+        };
+        service
+            .update_records(Request::new(items_update(acme(), patch)))
+            .await
+            .expect("update by filter should succeed");
+        upsert_items(&service, 41..=60).await;
+        run_items_step(&service, "flush").await;
+        run_items_step(&service, "compact").await;
+
+        // A cursor with another filter, or with a token, is refused.
+        let mut other = items_scroll(Some(FilterExpr::eq("tenant", "globex")), 7);
+        other.cursor = cursor.clone();
+        let error = service
+            .scroll_records(Request::new(other))
+            .await
+            .expect_err("a cursor of another filter should be refused");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(violation_fields(&error), vec!["cursor"]);
+        let mut both = items_scroll(Some(acme()), 7);
+        both.cursor = cursor.clone();
+        both.snapshot_token = token.clone();
+        let error = service
+            .scroll_records(Request::new(both))
+            .await
+            .expect_err("a cursor with a token should be refused");
+        assert_eq!(violation_fields(&error), vec!["snapshot_token"]);
+
+        // The rest of the pages read exactly the pinned state.
+        let mut rest = items_scroll(Some(acme()), 7);
+        rest.cursor = cursor;
+        rest.output_fields = vec!["price".to_owned()];
+        let (pages, skus) = scroll_all(&service, rest).await;
+        let mut scrolled = page.records.iter().map(sku_of).collect::<Vec<_>>();
+        scrolled.extend(skus);
+        assert_eq!(scrolled, (2..=40).step_by(2).collect::<Vec<_>>());
+        assert_eq!(scrolled.len() as u64, counted.count);
+        assert!(pages.iter().all(|next| next.snapshot == counted.snapshot));
+        assert_eq!(
+            pages[0].records[0]
+                .fields
+                .get("price")
+                .cloned()
+                .and_then(|value| convert::value_from_proto(value, "value").ok()),
+            Some(TypedValue::Float64(24.0))
+        );
+
+        // The current state shows the changes; the token still reads the pinned one.
+        assert_eq!(count_items(&service, items_count(Some(acme()))).await, 25);
+        let mut through_token = items_count(Some(acme()));
+        through_token.snapshot_token = token;
+        assert_eq!(count_items(&service, through_token).await, 20);
+
+        // Count agrees with the scroll total of the current state.
+        let globex = FilterExpr::eq("tenant", "globex");
+        let (_, skus) = scroll_all(&service, items_scroll(Some(globex.clone()), 9)).await;
+        assert_eq!(
+            skus.len() as u64,
+            count_items(&service, items_count(Some(globex))).await
+        );
+        assert_eq!(skus.len(), 26);
+    }
+
+    #[tokio::test]
+    async fn grpc_expired_scroll_cursors_and_tokens_fail_with_snapshot_expired() {
+        let mut config = test_config("grpc-p6c-expiry");
+        config.snapshots.token_ttl_ms = 200;
+        let service = items_service(config, 1..=10).await;
+        let page = service
+            .scroll_records(Request::new(items_scroll(None, 3)))
+            .await
+            .expect("first page should succeed")
+            .into_inner();
+        assert!(!page.next_cursor.is_empty());
+        let mut pin = items_count(None);
+        pin.pin = true;
+        let counted = service
+            .count_records(Request::new(pin))
+            .await
+            .expect("pinned count should succeed")
+            .into_inner();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        let mut next = items_scroll(None, 3);
+        next.cursor = page.next_cursor;
+        let error = service
+            .scroll_records(Request::new(next))
+            .await
+            .expect_err("an expired cursor should fail");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(reason(&error).as_deref(), Some("SNAPSHOT_EXPIRED"));
+        let mut through_token = items_count(None);
+        through_token.snapshot_token = counted.snapshot_token;
+        let error = service
+            .count_records(Request::new(through_token))
+            .await
+            .expect_err("an expired token should fail");
+        assert_eq!(reason(&error).as_deref(), Some("SNAPSHOT_EXPIRED"));
+    }
+
+    #[tokio::test]
+    async fn grpc_deletes_and_updates_by_filter_commit_every_match_as_one_batch() {
+        let service = items_service(test_config("grpc-p6c-filter-writes"), 1..=40).await;
+        let mut pin = items_count(None);
+        pin.pin = true;
+        let before = service
+            .count_records(Request::new(pin))
+            .await
+            .expect("pinned count should succeed")
+            .into_inner();
+
+        let ack = service
+            .delete_records(Request::new(items_delete(FilterExpr::lt("price", 15))))
+            .await
+            .expect("delete by filter should succeed")
+            .into_inner();
+        assert_eq!(ack.applied_ops, 9);
+        // One batch: the nine deletes take consecutive sequence numbers and become visible
+        // together.
+        let visible_before = before
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.visible_seq_no);
+        assert_eq!(Some(ack.last_seq_no), visible_before.map(|seq| seq + 9));
+        assert_eq!(
+            ack.snapshot.map(|snapshot| snapshot.visible_seq_no),
+            Some(ack.last_seq_no)
+        );
+        let fetched = service
+            .get_records(Request::new(GetRecordsRequest {
+                database_name: default_database_name(),
+                collection_name: ITEMS.to_owned(),
+                keys: (1..=10).map(int_key).collect(),
+                output_fields: vec!["sku".to_owned()],
+            }))
+            .await
+            .expect("get should succeed")
+            .into_inner();
+        assert_eq!(
+            fetched.missing_keys,
+            (1..=9).map(int_key).collect::<Vec<_>>()
+        );
+        assert_eq!(count_items(&service, items_count(None)).await, 31);
+        let mut then = items_count(None);
+        then.snapshot_token = before.snapshot_token;
+        assert_eq!(count_items(&service, then).await, 40);
+
+        let mut patch = RecordPatch {
+            fields: [("stock".to_owned(), TypedValue::Int64(100))]
+                .into_iter()
+                .collect(),
+            ..RecordPatch::default()
+        };
+        patch.extra.insert("color".to_owned(), json!("green"));
+        let ack = service
+            .update_records(Request::new(items_update(acme(), patch)))
+            .await
+            .expect("update by filter should succeed")
+            .into_inner();
+        assert_eq!(ack.applied_ops, 16);
+        for filter in [
+            FilterExpr::eq("stock", 100),
+            FilterExpr::eq("$extra.color", "green"),
+        ] {
+            assert_eq!(
+                count_items(&service, items_count(Some(filter.clone()))).await,
+                16,
+                "{filter:?}"
+            );
+        }
+
+        // An invalid patch changes nothing, and a filter without a match commits nothing.
+        let patch = RecordPatch {
+            fields: [("price".to_owned(), TypedValue::from("free"))]
+                .into_iter()
+                .collect(),
+            ..RecordPatch::default()
+        };
+        let error = service
+            .update_records(Request::new(items_update(acme(), patch)))
+            .await
+            .expect_err("a patch of the wrong type should fail");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(violation_fields(&error), vec!["patch.price"]);
+        let ack = service
+            .delete_records(Request::new(items_delete(FilterExpr::eq(
+                "tenant", "initech",
+            ))))
+            .await
+            .expect("an empty delete should succeed")
+            .into_inner();
+        assert_eq!(ack.applied_ops, 0);
+        assert_eq!(count_items(&service, items_count(None)).await, 31);
+    }
+
+    #[tokio::test]
+    async fn grpc_search_count_scroll_and_filter_write_errors_name_the_request_field() {
+        let service = items_service(test_config("grpc-p6c-errors"), 1..=5).await;
+        let embedding = || items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 3);
+        let with_filter = |filter: proto::Filter| {
+            let mut request = embedding();
+            request.filter = Some(filter);
+            request
+        };
+        let filter = convert::filter_to_proto;
+        let node = |node: proto::filter::Node| proto::Filter { node: Some(node) };
+        let order = |field: &str, direction: i32| proto::OrderBy {
+            field: field.to_owned(),
+            direction,
+        };
+
+        let mut queries = vec![
+            (
+                items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 0),
+                "top_k",
+            ),
+            (
+                items_query(Some(("embedding", vec![1.0, 0.0, 0.0])), 10_001),
+                "top_k",
+            ),
+            (
+                items_query(Some(("", vec![1.0, 0.0, 0.0])), 1),
+                "vector.field",
+            ),
+            (items_query(Some(("tenant", vec![1.0])), 1), "vector.field"),
+            (
+                items_query(Some(("embedding", vec![1.0])), 1),
+                "vector.values",
+            ),
+            (
+                with_filter(filter(FilterExpr::eq("price", "cheap"))),
+                "filter.eq.price",
+            ),
+            (
+                with_filter(filter(FilterExpr::and(Vec::new()))),
+                "filter.and",
+            ),
+            (
+                with_filter(filter(FilterExpr::or(vec![FilterExpr::in_values(
+                    "tags",
+                    vec!["a".into(), TypedValue::Int64(3)],
+                )]))),
+                "filter.or[0].in.tags[1]",
+            ),
+            (
+                with_filter(filter(FilterExpr::contains("tenant", "acme"))),
+                "filter.contains.tenant",
+            ),
+            (
+                with_filter(filter(FilterExpr::negate(FilterExpr::exists("embedding")))),
+                "filter.not.exists",
+            ),
+            (
+                with_filter(filter(FilterExpr::eq("$extra.tenant", "acme"))),
+                "filter.eq.$extra.tenant",
+            ),
+            (with_filter(proto::Filter { node: None }), "filter"),
+            (
+                with_filter(node(proto::filter::Node::Eq(proto::FieldValue {
+                    field: "tenant".to_owned(),
+                    value: None,
+                }))),
+                "filter.eq.tenant",
+            ),
+        ];
+        let mut ef = items_query(None, 1);
+        ef.ef = 16;
+        queries.push((ef, "ef"));
+        let mut ordered = embedding();
+        ordered.order_by = vec![order("tags", 0)];
+        queries.push((ordered, "order_by[0].field"));
+        let mut ordered = embedding();
+        ordered.order_by = vec![order("price", 0), order("stock", 0)];
+        queries.push((ordered, "order_by[1]"));
+        let mut ordered = embedding();
+        ordered.order_by = vec![order("price", 7)];
+        queries.push((ordered, "order_by[0].direction"));
+        for (request, field) in queries {
+            let error = service
+                .query_collection(Request::new(request.clone()))
+                .await
+                .expect_err("an invalid query should fail");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{request:?}");
+            assert_eq!(violation_fields(&error), vec![field], "{request:?}");
+        }
+
+        let mut bad_token = items_count(None);
+        bad_token.snapshot_token = "not-a-token".to_owned();
+        let mut bad_bound = items_count(None);
+        bad_bound.filter = Some(node(proto::filter::Node::Range(proto::FieldRange {
+            field: "price".to_owned(),
+            ..proto::FieldRange::default()
+        })));
+        for (request, field) in [
+            (bad_token, "snapshot_token"),
+            (bad_bound, "filter.range.price"),
+        ] {
+            let error = service
+                .count_records(Request::new(request))
+                .await
+                .expect_err("an invalid count should fail");
+            assert_eq!(violation_fields(&error), vec![field]);
+        }
+
+        let mut bad_cursor = items_scroll(None, 3);
+        bad_cursor.cursor = "not-a-cursor".to_owned();
+        let mut too_big = items_scroll(None, 10_001);
+        too_big.output_fields = vec!["sku".to_owned()];
+        let mut by_vector = items_scroll(None, 3);
+        by_vector.order_by = vec![order("embedding", 0)];
+        for (request, field) in [
+            (bad_cursor, "cursor"),
+            (too_big, "page_size"),
+            (by_vector, "order_by[0].field"),
+        ] {
+            let error = service
+                .scroll_records(Request::new(request))
+                .await
+                .expect_err("an invalid scroll should fail");
+            assert_eq!(violation_fields(&error), vec![field]);
+        }
+
+        let mut both = items_delete(FilterExpr::eq("sku", 1));
+        both.keys = vec![int_key(1)];
+        let mut neither = items_delete(FilterExpr::eq("sku", 1));
+        neither.filter = None;
+        for (request, field) in [
+            (both, "keys"),
+            (neither, "keys"),
+            (items_delete(FilterExpr::eq("sku", "one")), "filter.eq.sku"),
+        ] {
+            let error = service
+                .delete_records(Request::new(request))
+                .await
+                .expect_err("an invalid delete should fail");
+            assert_eq!(violation_fields(&error), vec![field]);
+        }
+
+        let mut no_patch = items_update(FilterExpr::eq("sku", 1), RecordPatch::default());
+        no_patch.patch = None;
+        let vector_patch = RecordPatch {
+            vectors: [("embedding".to_owned(), vec![1.0])].into_iter().collect(),
+            ..RecordPatch::default()
+        };
+        for (request, field) in [
+            (no_patch, "patch"),
+            (
+                items_update(FilterExpr::eq("sku", 1), vector_patch),
+                "patch.embedding",
+            ),
+        ] {
+            let error = service
+                .update_records(Request::new(request))
+                .await
+                .expect_err("an invalid update should fail");
+            assert_eq!(violation_fields(&error), vec![field]);
+        }
     }
 }

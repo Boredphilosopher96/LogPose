@@ -446,6 +446,12 @@ pub fn order_field(schema: &CollectionSchema, name: &str, path: &str) -> Result<
         {
             Ok(field.id)
         }
+        Some(FieldRef::PrimaryKey(_)) => Err(QueryError::Storage(LogPoseError::invalid_field(
+            path,
+            format!(
+                "'{name}' is the primary key; primary key order is the default, so leave order_by out"
+            ),
+        ))),
         _ => Err(QueryError::Storage(LogPoseError::invalid_field(
             path,
             format!("'{name}' is not a scalar field that can be ordered (arrays and json cannot)"),

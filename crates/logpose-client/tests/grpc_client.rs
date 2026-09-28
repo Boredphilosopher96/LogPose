@@ -6,9 +6,10 @@ use logpose_auth::{
 };
 use logpose_catalog as _;
 use logpose_client::{
-    ClientError, CollectionRef, CreateCollectionRequest, DatabaseAccessPolicy, DatabaseRoleBinding,
-    ErrorCode, ErrorReason, LogPoseClient, PartialUpdate, PrimaryKey, Record, SchemaChange,
-    ServerError,
+    ClientError, CollectionRef, CountRecordsRequest, CreateCollectionRequest, DatabaseAccessPolicy,
+    DatabaseRoleBinding, ErrorCode, ErrorReason, LogPoseClient, OrderBy, PartialUpdate, PrimaryKey,
+    ReadConsistency, Record, RecordPatch, SchemaChange, ScrollRecordsRequest, ServerError,
+    SortDirection,
 };
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::AppState;
@@ -902,6 +903,168 @@ async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
         .expect("profile mode should include timings");
     assert_eq!(timings.prefilter_micros, 0);
     assert_eq!(timings.merge_micros, 0);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn grpc_client_counts_scrolls_scans_and_writes_by_filter() {
+    let temp_root = unique_temp_dir("client-grpc-scroll");
+    let grpc_addr = reserve_local_addr();
+    let rest_addr = reserve_local_addr();
+    let state = Arc::new(AppState::new(test_config(&temp_root, rest_addr, grpc_addr)));
+    let server = tokio::spawn(logpose_api_grpc::serve(state));
+    wait_for_port(grpc_addr).await;
+    let client = LogPoseClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("client should connect");
+
+    let created = client
+        .create_collection(CreateCollectionRequest::from_spec(
+            "default",
+            CreateCollectionSpec {
+                name: "items".to_owned(),
+                primary_key: PrimaryKeySpec {
+                    name: "sku".to_owned(),
+                    key_type: PrimaryKeyType::Int64,
+                },
+                vectors: vec![VectorFieldSpec {
+                    name: "embedding".to_owned(),
+                    dimensions: 2,
+                    metric: DistanceMetric::Dot,
+                }],
+                fields: vec![ScalarFieldSpec {
+                    name: "rank".to_owned(),
+                    field_type: FieldType::Int64,
+                    index: FieldIndex::Auto,
+                    nullable: true,
+                }],
+                dynamic_fields: false,
+            },
+        ))
+        .await
+        .expect("collection should be created");
+    let collection = created.collection_ref();
+    let records = (1..=12_i64)
+        .map(|sku| {
+            Record::new(sku)
+                .with_vector("embedding", vec![sku as f32, 0.0])
+                .with_field("rank", RecordValue::Int64(sku % 4))
+        })
+        .collect();
+    client
+        .upsert(&collection, records)
+        .await
+        .expect("records should be written");
+
+    let low_rank = FilterExpr::lt("rank", 2);
+    let counted = client
+        .count(
+            &collection,
+            CountRecordsRequest {
+                filter: Some(low_rank.clone()),
+                read: ReadConsistency {
+                    pin: true,
+                    ..ReadConsistency::default()
+                },
+            },
+        )
+        .await
+        .expect("count should succeed")
+        .response;
+    assert_eq!(counted.count, 6);
+    let token = counted
+        .snapshot_token
+        .expect("a pinned count returns a token");
+
+    // Scroll the pinned state in pages of four, deleting matches between pages.
+    let mut request = ScrollRecordsRequest {
+        filter: Some(low_rank),
+        page_size: Some(4),
+        output_fields: vec!["rank".to_owned()],
+        snapshot_token: Some(token),
+        ..ScrollRecordsRequest::default()
+    };
+    let mut skus = Vec::new();
+    loop {
+        let page = client
+            .scroll(&collection, request.clone())
+            .await
+            .expect("scroll page should succeed")
+            .response;
+        skus.extend(page.records.iter().map(|record| record.pk.clone()));
+        assert!(page.records.iter().all(|record| record.vectors.is_empty()));
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if skus.len() == 4 {
+            let ack = client
+                .delete_by_filter(&collection, FilterExpr::eq("rank", 0))
+                .await
+                .expect("delete by filter should succeed")
+                .response;
+            assert_eq!(ack.applied_ops, 3);
+        }
+        request.cursor = Some(cursor);
+        request.snapshot_token = None;
+    }
+    assert_eq!(skus, [1_i64, 4, 5, 8, 9, 12].map(PrimaryKey::Int64));
+
+    let patch = RecordPatch {
+        fields: [("rank".to_owned(), RecordValue::Int64(9))].into(),
+        ..RecordPatch::default()
+    };
+    let ack = client
+        .update_by_filter(&collection, FilterExpr::eq("rank", 1), patch)
+        .await
+        .expect("update by filter should succeed")
+        .response;
+    assert_eq!(ack.applied_ops, 3);
+
+    // A scan without a vector, ordered by rank descending.
+    let scanned = client
+        .query(
+            &collection,
+            QueryRequest {
+                order_by: vec![OrderBy {
+                    field: "rank".to_owned(),
+                    direction: SortDirection::Desc,
+                }],
+                top_k: 3,
+                output_fields: vec!["sku".to_owned()],
+                ..QueryRequest::default()
+            },
+        )
+        .await
+        .expect("scan should succeed")
+        .response;
+    assert_eq!(
+        scanned
+            .hits
+            .iter()
+            .map(|hit| hit.record.pk.clone())
+            .collect::<Vec<_>>(),
+        [1_i64, 5, 9].map(PrimaryKey::Int64)
+    );
+    assert!(scanned.hits.iter().all(|hit| hit.score.is_none()));
+
+    let error = client
+        .delete_by_filter(&collection, FilterExpr::contains("rank", 1))
+        .await
+        .expect_err("contains on a scalar field should fail");
+    let ClientError::Server(error) = error else {
+        unreachable!("expected a typed server error, got {error:?}");
+    };
+    assert_eq!(error.reason(), Some(ErrorReason::InvalidArgument));
+    assert_eq!(
+        error
+            .field_violations()
+            .iter()
+            .map(|violation| violation.field.as_str())
+            .collect::<Vec<_>>(),
+        vec!["filter.contains.rank"]
+    );
 
     server.abort();
     let _ = server.await;

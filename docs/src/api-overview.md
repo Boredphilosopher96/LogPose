@@ -828,7 +828,9 @@ nothing.
   last page. A page after that fails with `FAILED_PRECONDITION` (reason
   `SNAPSHOT_EXPIRED`, HTTP 409): start the scroll again.
 - Ordering by a field puts records without a value last in both directions and
-  breaks ties by primary key.
+  breaks ties by primary key. `order_by` takes a declared scalar field that is
+  not an array or JSON; primary key order (ascending) is what an empty
+  `order_by` gives, and naming the primary key is `INVALID_ARGUMENT`.
 - Each open scroll holds one of the collection's snapshot pins, so a client
   that abandons many scrolls can exhaust them until they expire
   (`TOO_MANY_SNAPSHOTS`).
