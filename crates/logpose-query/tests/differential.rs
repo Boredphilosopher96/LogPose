@@ -14,8 +14,8 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, SearchRequest,
-    SearchTuning, UnitStrategy, count_view, metric_value, search,
+    FilterComparison, FilterExpr, FilterOperator, ScalarMetadataValue, SearchRequest, SearchTuning,
+    UnitStrategy, count_view, metric_value, search,
 };
 use logpose_storage::{IndexPolicy, Projection};
 use logpose_types::{
@@ -61,7 +61,11 @@ fn record(key: &str, row: &Row) -> Record {
     record
 }
 
-fn comparison(field: &str, operator: FilterOperator, value: Option<ScalarMetadataValue>) -> FilterExpr {
+fn comparison(
+    field: &str,
+    operator: FilterOperator,
+    value: Option<ScalarMetadataValue>,
+) -> FilterExpr {
     FilterExpr::Comparison(FilterComparison {
         field: field.to_owned(),
         operator,
@@ -89,7 +93,9 @@ fn random_comparison(rng: &mut Rng) -> FilterExpr {
         _ => comparison(
             "n",
             operators[rng.below(4) as usize],
-            Some(ScalarMetadataValue::Number((rng.below(12) as i64 - 1).into())),
+            Some(ScalarMetadataValue::Number(
+                (rng.below(12) as i64 - 1).into(),
+            )),
         ),
     }
 }
@@ -349,7 +355,10 @@ impl Scenario {
         let filter = random_filter(&mut self.rng);
         assert_eq!(
             count_view(&view, Some(&filter)).await.expect("count"),
-            self.model.values().filter(|row| matches(&filter, row)).count() as u64,
+            self.model
+                .values()
+                .filter(|row| matches(&filter, row))
+                .count() as u64,
             "count {filter:?}"
         );
         for _ in 0..6 {
@@ -417,11 +426,15 @@ impl Scenario {
             let PrimaryKey::String(name) = &hit.row.record.pk else {
                 unreachable!()
             };
-            assert!(seen.insert(name.clone()), "{name} returned twice: {context}");
-            let row = self
-                .model
-                .get(name)
-                .unwrap_or_else(|| panic!("{name} is deleted but was returned: {context}"));
+            assert!(
+                seen.insert(name.clone()),
+                "{name} returned twice: {context}"
+            );
+            assert!(
+                self.model.contains_key(name),
+                "{name} is deleted but was returned: {context}"
+            );
+            let row = &self.model[name];
             if let Some(filter) = &filter {
                 assert!(
                     matches(filter, row),
@@ -488,7 +501,11 @@ impl Scenario {
                 self.recall.1 += wanted;
             }
         } else {
-            assert_eq!(outcome.hits.len(), wanted, "exact search is short: {context}");
+            assert_eq!(
+                outcome.hits.len(),
+                wanted,
+                "exact search is short: {context}"
+            );
             for (hit, value) in outcome.hits.iter().zip(&expected) {
                 assert!(
                     close(hit.value, *value),
@@ -515,7 +532,11 @@ async fn run(seed: u64, metric: DistanceMetric, indexed: bool, steps: usize) -> 
 
 #[tokio::test]
 async fn exact_search_matches_the_model_for_every_metric() {
-    for metric in [DistanceMetric::L2, DistanceMetric::Cosine, DistanceMetric::Dot] {
+    for metric in [
+        DistanceMetric::L2,
+        DistanceMetric::Cosine,
+        DistanceMetric::Dot,
+    ] {
         for seed in [1, 2] {
             let scenario = run(seed, metric, false, 220).await;
             assert!(scenario.searches > 0);
@@ -526,7 +547,11 @@ async fn exact_search_matches_the_model_for_every_metric() {
 #[tokio::test]
 async fn indexed_search_returns_only_live_matching_rows_for_every_metric() {
     let mut strategies = BTreeSet::new();
-    for metric in [DistanceMetric::L2, DistanceMetric::Cosine, DistanceMetric::Dot] {
+    for metric in [
+        DistanceMetric::L2,
+        DistanceMetric::Cosine,
+        DistanceMetric::Dot,
+    ] {
         let mut found = 0;
         let mut wanted = 0;
         for seed in [21, 22, 23] {
@@ -542,7 +567,10 @@ async fn indexed_search_returns_only_live_matching_rows_for_every_metric() {
     }
     println!("strategies: {strategies:?}");
     for strategy in ["exact_sq8", "graph_admit", "graph_acorn", "memtable_scan"] {
-        assert!(strategies.contains(strategy), "{strategy} never ran: {strategies:?}");
+        assert!(
+            strategies.contains(strategy),
+            "{strategy} never ran: {strategies:?}"
+        );
     }
 }
 
