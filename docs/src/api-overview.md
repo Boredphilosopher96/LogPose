@@ -178,7 +178,7 @@ The CLI prints a typed error with its reason and message, followed by its code,
 field violations, metadata, and where or when to retry:
 
 ```text
-[error] failed to write records; the failing batch may have partially committed, so verify collection state before retrying
+[error] failed to write records; each batch commits atomically, so the failing batch was applied in full or not at all; verify collection state before retrying it
   [cause] DIMENSION_MISMATCH: record 'alpha' expected 2 dimensions but found 3
     code: INVALID_ARGUMENT
     field operations[0].vector: record 'alpha' expected 2 dimensions but found 3

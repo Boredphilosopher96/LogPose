@@ -387,6 +387,15 @@ fn server_validation_errors_print_their_reason_and_field_violations() {
         stderr.contains("metadata: actual_dimensions=3, expected_dimensions=2, record_id=alpha"),
         "{stderr}"
     );
+    // A batch commits atomically: the advice must not suggest a partial commit.
+    assert!(
+        stderr.contains(
+            "failed to write records; each batch commits atomically, so the failing batch was \
+             applied in full or not at all; verify collection state before retrying it"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("partially"), "{stderr}");
 }
 
 #[test]
