@@ -210,12 +210,22 @@ pub struct SearchOutcome {
     pub micros: [u64; 4],
 }
 
-/// A candidate: its unit, row, and distance (lower is closer).
-#[derive(Clone, Copy, Debug)]
+/// A candidate: its unit, row, distance (lower is closer), and key, when the unit's keys are
+/// at hand.
+///
+/// Results with equal values are ordered by key, so every cut over exact distances orders
+/// rows tied in distance by key too: the kept set is then the one a global sort by
+/// `(distance, key)` would keep, however many rows tie, and it never grows past the cut's
+/// limit. Keys are read for memtables and for segments scanned exactly in f32 (whose key
+/// sections fetch 2 loads), and only for rows a cut may keep. Candidates of SQ8 and graph
+/// stages, whose order is approximate anyway, carry no key and order after keyed ones at an
+/// equal distance, then by unit and row.
+#[derive(Clone, Debug)]
 struct Candidate {
     unit: UnitId,
     row: RowId,
     distance: f32,
+    key: Option<PrimaryKey>,
 }
 
 impl PartialEq for Candidate {
@@ -236,12 +246,18 @@ impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
         self.distance
             .total_cmp(&other.distance)
+            .then_with(|| match (&self.key, &other.key) {
+                (Some(left), Some(right)) => compare_keys(left, right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
             .then(self.unit.cmp(&other.unit))
             .then(self.row.cmp(&other.row))
     }
 }
 
-/// Keeps the `limit` closest candidates.
+/// Keeps the `limit` smallest candidates in [`Candidate`] order.
 struct TopK {
     limit: usize,
     heap: BinaryHeap<Candidate>,
@@ -253,6 +269,34 @@ impl TopK {
             limit,
             heap: BinaryHeap::with_capacity(limit + 1),
         }
+    }
+
+    /// Offer `row` of `unit` at `distance`. `key` is called only when the row may be kept, so
+    /// a scan reads the keys of the rows that enter the heap, not of every row it scores.
+    fn offer(
+        &mut self,
+        unit: UnitId,
+        row: RowId,
+        distance: f32,
+        key: impl FnOnce(RowId) -> Option<PrimaryKey>,
+    ) {
+        if self.limit == 0 || !distance.is_finite() {
+            return;
+        }
+        if self.heap.len() >= self.limit
+            && self
+                .heap
+                .peek()
+                .is_some_and(|worst| distance.total_cmp(&worst.distance).is_gt())
+        {
+            return;
+        }
+        self.push(Candidate {
+            unit,
+            row,
+            distance,
+            key: key(row),
+        });
     }
 
     fn push(&mut self, candidate: Candidate) {
@@ -520,6 +564,8 @@ pub async fn search(view: &ReadView, request: &SearchRequest) -> Result<SearchOu
             }
             UnitOutput::Scan(rows) => {
                 plan.push(unit, SectionNeed::VectorRows(context.field, rows.clone()));
+                // Keys order the rows an exact cut keeps at its boundary.
+                plan.push(unit, SectionNeed::Pk);
             }
             UnitOutput::Exact(_) | UnitOutput::None => {}
         }
@@ -667,14 +713,16 @@ fn unit_first_stage(
     }
     if unit.is_memtable() {
         let vectors = unit.vector_rows(context.field, pins)?;
+        let pks = unit.pks(pins)?;
         let mut top = TopK::new(context.budget);
         for row in &allowed {
             if let Some(vector) = vectors.get(row)? {
-                top.push(Candidate {
-                    unit: unit.id(),
+                top.offer(
+                    unit.id(),
                     row,
-                    distance: context.metric.distance(&context.query, &vector),
-                });
+                    context.metric.distance(&context.query, &vector),
+                    |row| pks.pk_at(row),
+                );
             }
         }
         let candidates = top.into_sorted();
@@ -773,20 +821,17 @@ fn unit_first_stage(
                         probing = false;
                     }
                 }
-                let neighbors = cursor.top_k(context.budget);
-                let mut candidates = Vec::with_capacity(neighbors.len());
-                for neighbor in neighbors {
+                // A node stands for every row with its vector; the cut bounds the candidates
+                // when very many rows share one.
+                let mut top = TopK::new(context.budget);
+                for neighbor in cursor.top_k(context.budget) {
                     for row in graph.nodes.rows(neighbor.row) {
                         if allowed.contains(row) {
-                            candidates.push(Candidate {
-                                unit: unit.id(),
-                                row,
-                                distance: neighbor.distance,
-                            });
+                            top.offer(unit.id(), row, neighbor.distance, |_| None);
                         }
                     }
                 }
-                (candidates, ef, cursor.stats().visited, escalations)
+                (top.into_sorted(), ef, cursor.stats().visited, escalations)
             });
             report.candidates = candidates.len();
             report.ef = ef;
@@ -797,11 +842,7 @@ fn unit_first_stage(
         _ => {
             let mut top = TopK::new(context.budget);
             for row in &allowed {
-                top.push(Candidate {
-                    unit: unit.id(),
-                    row,
-                    distance: estimate(row),
-                });
+                top.offer(unit.id(), row, estimate(row), |_| None);
             }
             let candidates = top.into_sorted();
             report.strategy = UnitStrategy::ExactSq8;
@@ -860,32 +901,28 @@ fn exact_stage(
         rows_to_score.len()
     };
     let vectors = unit.vector_rows(context.field, pins)?;
+    // A memtable's keys are always at hand, a segment's when fetch 2 loaded them (exact f32
+    // scans); SQ8 and graph candidates rerank without them.
+    let pks = unit.pks(pins).ok();
     let mut top = TopK::new(context.budget);
-    let mut values = HashMap::with_capacity(rows_to_score.len().min(context.budget * 2));
     for row in rows_to_score {
         let Some(vector) = vectors.get(row)? else {
             continue;
         };
         let distance = context.metric.distance(&context.query, &vector);
-        let candidate = Candidate {
-            unit: unit.id(),
-            row,
-            distance,
-        };
-        top.push(candidate);
-        values.insert(
-            row,
-            metric_value(context.metric.metric, &context.raw_query, &vector),
-        );
+        top.offer(unit.id(), row, distance, |row| {
+            pks.as_ref().and_then(|pks| pks.pk_at(row))
+        });
     }
-    let candidates = top
-        .into_sorted()
-        .into_iter()
-        .map(|candidate| {
-            let value = values.get(&candidate.row).copied().unwrap_or_default();
-            (candidate, value)
-        })
-        .collect();
+    // The reported values of the kept rows only.
+    let kept = top.into_sorted();
+    let mut candidates = Vec::with_capacity(kept.len());
+    for candidate in kept {
+        let value = vectors.get(candidate.row)?.map_or(0.0, |vector| {
+            metric_value(context.metric.metric, &context.raw_query, &vector)
+        });
+        candidates.push((candidate, value));
+    }
     Ok((candidates, reranked))
 }
 
@@ -923,5 +960,63 @@ impl<F: Fn(RowId) -> f32> QueryDistance for NodeDistance<'_, F> {
         self.nodes
             .first_row(node)
             .map_or(f32::MAX, |row| (self.estimate)(row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keyed(row: RowId) -> Option<PrimaryKey> {
+        Some(PrimaryKey::from(format!("k{:05}", 99_999 - row).as_str()))
+    }
+
+    #[test]
+    fn a_cut_over_tied_rows_keeps_its_limit_by_key() {
+        let mut top = TopK::new(3);
+        for row in 0..10_000 {
+            top.offer(UnitId(1), row, 1.0, keyed);
+        }
+        let keys = top
+            .into_sorted()
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![keyed(9_999), keyed(9_998), keyed(9_997)]);
+    }
+
+    #[test]
+    fn a_cut_reads_keys_only_of_rows_it_may_keep() {
+        let mut top = TopK::new(2);
+        let mut reads = 0;
+        for row in 0..1_000 {
+            // Rows get farther, so after the first two none can enter the heap.
+            top.offer(UnitId(1), row, row as f32, |row| {
+                reads += 1;
+                keyed(row)
+            });
+        }
+        assert_eq!(reads, 2);
+        let rows = top
+            .into_sorted()
+            .iter()
+            .map(|candidate| candidate.row)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn keyed_candidates_order_before_unkeyed_ones_at_an_equal_distance() {
+        let mut top = TopK::new(2);
+        top.offer(UnitId(1), 0, 1.0, |_| None);
+        top.offer(UnitId(2), 5, 1.0, keyed);
+        top.offer(UnitId(0), 9, 1.0, |_| None);
+        top.offer(UnitId(3), 1, 0.5, |_| None);
+        let kept = top
+            .into_sorted()
+            .iter()
+            .map(|candidate| (candidate.unit, candidate.row))
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![(UnitId(3), 1), (UnitId(2), 5)]);
     }
 }

@@ -5,10 +5,28 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  schedule:
+    # Nightly: the same harness with a longer time bound.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
   randomized-storage:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Harness v2 (crates/logpose-storage/tests/harness): each randomized test runs its fixed
+      # seeds, then keeps drawing new ones until this many seconds passed. Seeds start from the
+      # run number times a million (a nightly run draws a few thousand), so every run explores
+      # new ones; a failure prints its seed and a replay command.
+      LOGPOSE_HARNESS_SEEDS: "24"
+      LOGPOSE_HARNESS_FIRST_SEED: "${{ github.run_number }}000000"
+      LOGPOSE_HARNESS_SECS: ${{ github.event_name == 'schedule' && '1500' || '90' }}
+      LOGPOSE_STRESS_SECS: ${{ github.event_name == 'schedule' && '900' || '60' }}
+      # Recovery idempotence against a clean recovery at every crash state, in every tear mode,
+      # nightly; every third crash state and one tear mode otherwise.
+      LOGPOSE_CRASH_I11_STRIDE: ${{ github.event_name == 'schedule' && '1' || '3' }}
+      LOGPOSE_CRASH_I11_TEARS: ${{ github.event_name == 'schedule' && 'all' || 'one' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -21,5 +39,5 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run randomized storage harness
-        run: cargo test -p logpose-storage --test randomized_storage
+      - name: Run storage harness v2
+        run: cargo test -p logpose-storage --locked --test harness -- --nocapture

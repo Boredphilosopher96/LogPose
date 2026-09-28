@@ -2,3 +2,6 @@
 
 # Committed binary test fixtures.
 *.seg binary
+
+# Golden storage files: byte-exact engine output.
+crates/logpose-storage/tests/golden/** binary

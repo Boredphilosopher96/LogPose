@@ -612,3 +612,116 @@ async fn rerank_orders_candidates_sq8_cannot_tell_apart() {
     let expected = metric_value(DistanceMetric::L2, &query, &nearest);
     assert!(close(hit.value, expected), "{} vs {expected}", hit.value);
 }
+
+/// Results with equal values are ordered by key, however many rows tie: every cut over exact
+/// distances (a memtable's scan, an exact segment scan, the global finalists) orders the rows
+/// tied at its boundary by key. Here twelve rows share one vector, in three segments and the memtable,
+/// written in descending key order so that the smallest keys land last in every unit; a cut
+/// that broke ties by unit and row returned `t01` (found by the harness v2 model check,
+/// seed 1072).
+#[tokio::test]
+async fn rows_tied_beyond_every_candidate_cut_are_ordered_by_key() {
+    let fixture = Fixture::new(
+        "ties",
+        4,
+        DistanceMetric::Dot,
+        IndexPolicy {
+            graph_min_rows: u32::MAX,
+            sq8_min_rows: u32::MAX,
+            ..IndexPolicy::default()
+        },
+        &[],
+    )
+    .await;
+    let tied = vec![1.0, 2.0, 0.0, 0.0];
+    let far = vec![-1.0, -1.0, 0.0, 0.0];
+    for unit in 0..4 {
+        let mut records = Vec::new();
+        for index in (0..5).rev() {
+            let key = format!("t{:02}", unit * 5 + index);
+            records.push(Record::new(key).with_vector("vector", tied.clone()));
+            records.push(
+                Record::new(format!("u{:02}", unit * 5 + index)).with_vector("vector", far.clone()),
+            );
+        }
+        fixture.upsert(records).await;
+        if unit < 3 {
+            fixture.flush().await;
+        }
+    }
+    let view = fixture.view().await;
+    for top_k in [1, 2, 3, 7] {
+        let outcome = search(&view, &SearchRequest::new(vec![1.0, 1.0, 0.0, 0.0], top_k))
+            .await
+            .expect("search");
+        let keys = outcome
+            .hits
+            .iter()
+            .map(|hit| hit.row.record.pk.clone())
+            .collect::<Vec<_>>();
+        let wanted = (0..top_k)
+            .map(|index| PrimaryKey::from(format!("t{index:02}").as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, wanted, "top {top_k}");
+        assert!(outcome.hits.iter().all(|hit| hit.value == 3.0));
+    }
+}
+
+/// Very many rows sharing one vector: every exact cut still keeps at most its limit, by key, so
+/// the memtable contributes at most `top_k * rerank_factor` candidates, and the results are the
+/// rows with the smallest keys.
+#[tokio::test]
+async fn many_rows_sharing_one_vector_keep_every_cut_bounded() {
+    let fixture = Fixture::new(
+        "shared",
+        4,
+        DistanceMetric::L2,
+        IndexPolicy {
+            graph_min_rows: u32::MAX,
+            sq8_min_rows: u32::MAX,
+            ..IndexPolicy::default()
+        },
+        &[],
+    )
+    .await;
+    let shared = vec![0.5, 0.5, 0.0, 0.0];
+    for unit in 0..3_u32 {
+        let records = (0..400_u32)
+            .rev()
+            .map(|index| {
+                Record::new(format!("s{:04}", index * 3 + unit))
+                    .with_vector("vector", shared.clone())
+            })
+            .collect::<Vec<_>>();
+        fixture.upsert(records).await;
+        if unit < 2 {
+            fixture.flush().await;
+        }
+    }
+    let view = fixture.view().await;
+    let factor = SearchTuning::default().rerank_factor;
+    for top_k in [1, 4, 9] {
+        let outcome = search(&view, &SearchRequest::new(vec![0.0; 4], top_k))
+            .await
+            .expect("search");
+        let keys = outcome
+            .hits
+            .iter()
+            .map(|hit| hit.row.record.pk.clone())
+            .collect::<Vec<_>>();
+        let wanted = (0..top_k)
+            .map(|index| PrimaryKey::from(format!("s{index:04}").as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, wanted, "top {top_k}");
+        let memtable = outcome
+            .units
+            .iter()
+            .find(|unit| unit.memtable)
+            .expect("the memtable is searched");
+        assert!(
+            memtable.candidates <= top_k * factor,
+            "the memtable kept {} candidates for top {top_k}",
+            memtable.candidates
+        );
+    }
+}

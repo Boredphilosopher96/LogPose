@@ -215,6 +215,13 @@ impl FaultVfs {
         self.lock().file_syncs
     }
 
+    /// Number of directory syncs attempted since the last reboot; the index the next one has for
+    /// [`FaultPlan::fail_sync_dir`].
+    #[must_use]
+    pub fn dir_syncs(&self) -> u64 {
+        self.lock().dir_syncs
+    }
+
     /// Crash points reached since the last reboot, in order.
     #[must_use]
     pub fn crash_points_hit(&self) -> Vec<CrashPoint> {
@@ -225,6 +232,23 @@ impl FaultVfs {
     #[must_use]
     pub fn boot(&self) -> u64 {
         self.lock().boot
+    }
+
+    /// An independent copy of the whole filesystem as it is now: every file's live and durable
+    /// content, every directory's live and durable entry set, the pending unsynced changes, the
+    /// fault plan, the counters, and the random generator's state. The copy has no locks and
+    /// shares nothing with `self`, so identical operations on the two produce identical states.
+    ///
+    /// Tests fork a post-crash state to run recovery on it more than once (recovery
+    /// idempotence against a clean recovery) without replaying the scenario that produced it.
+    #[must_use]
+    pub fn fork(&self) -> Arc<Self> {
+        let mut world = self.lock().clone();
+        world.locks.clear();
+        Arc::new(Self {
+            world: Arc::new(Mutex::new(world)),
+            pinned_boot: None,
+        })
     }
 
     /// Overwrite bytes of a file in place, in both its live and its durable content, extending
@@ -655,7 +679,7 @@ enum Node {
     Dir(u64),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Inode {
     /// Content visible to readers now.
     current: Vec<u8>,
@@ -730,6 +754,7 @@ impl Inode {
     }
 }
 
+#[derive(Clone)]
 struct World {
     rng: SplitMix64,
     plan: FaultPlan,
@@ -976,6 +1001,7 @@ fn not_found(path: &Path) -> io::Error {
 
 /// SplitMix64: a tiny, well-distributed, seedable generator. Deterministic across platforms and
 /// dependency upgrades, which keeps recorded failing seeds reproducible.
+#[derive(Clone)]
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -1103,6 +1129,41 @@ mod tests {
         let report = vfs.crash();
         assert_eq!(report.files.len(), 1);
         assert_eq!(read_file(vfs.as_ref(), path).expect("read"), b"synced");
+    }
+
+    #[test]
+    fn a_fork_is_an_independent_copy_that_crashes_identically() {
+        let vfs = FaultVfs::new(3);
+        vfs.create_dir_all(Path::new("/db")).expect("mkdir");
+        vfs.sync_dir(Path::new("/")).expect("sync root");
+        write_synced(vfs.as_ref(), Path::new("/db/a"), b"synced");
+        let file = vfs
+            .open(Path::new("/db/a"), OpenMode::Append)
+            .expect("open");
+        file.append(&[io::IoSlice::new(&[7; 9000])])
+            .expect("append");
+        vfs.set_plan(FaultPlan {
+            tear: TearMode::ReorderedPages,
+            ..FaultPlan::default()
+        });
+
+        let fork = vfs.fork();
+        assert_eq!(fork.mutating_ops(), vfs.mutating_ops());
+        assert_eq!(fork.plan(), vfs.plan());
+        // The same crash on both copies tears the same bytes.
+        vfs.crash();
+        fork.crash();
+        assert_eq!(
+            read_file(vfs.as_ref(), Path::new("/db/a")).expect("read"),
+            read_file(fork.as_ref(), Path::new("/db/a")).expect("read")
+        );
+        assert_eq!(names(vfs.as_ref(), "/db"), names(fork.as_ref(), "/db"));
+
+        // Changes to one never reach the other.
+        write_synced(fork.as_ref(), Path::new("/db/b"), b"fork only");
+        vfs.remove_file(Path::new("/db/a")).expect("remove");
+        assert!(!exists(vfs.as_ref(), Path::new("/db/b")).expect("exists"));
+        assert!(exists(fork.as_ref(), Path::new("/db/a")).expect("exists"));
     }
 
     #[test]
