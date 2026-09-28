@@ -446,6 +446,7 @@ pub struct InteractiveArgs {
     #[arg(
         long,
         value_name = "RECORD_ID",
+        allow_negative_numbers = true,
         help = "Prefill record id. Example: alpha"
     )]
     pub id: Option<String>,
@@ -1224,12 +1225,20 @@ mod tests {
             "query",
             "--vector",
             "-1,0",
+            "--id",
+            "-7",
         ])
-        .expect("an interactive prefill vector may start with a minus sign");
+        .expect("an interactive prefill vector and id may start with a minus sign");
         let CommandRequest::Interactive { args, .. } = cli.into_request() else {
             unreachable!("expected an interactive request");
         };
         assert_eq!(args.vector, Some(QueryVector(vec![-1.0, 0.0])));
+        assert_eq!(args.id.as_deref(), Some("-7"));
+
+        // A flag after `--vector` is not taken for a missing vector silently.
+        let error = Cli::try_parse_from(["logpose", "query", "colors", "--vector", "--top-k", "1"])
+            .expect_err("a flag is not a vector");
+        assert!(error.to_string().contains("--top-k"), "{error}");
 
         let cli = Cli::try_parse_from([
             "logpose",
