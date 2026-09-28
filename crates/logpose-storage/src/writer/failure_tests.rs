@@ -6,7 +6,8 @@
 use super::*;
 use crate::{
     CompactionConfig, CreateCollectionRequest, Engine, EngineConfig, ManualClock, MemtableConfig,
-    RuntimeConfig, legacy_view::legacy_put, test_support::ControlledVfs,
+    RuntimeConfig,
+    test_support::{ControlledVfs, flat_row, scan},
 };
 use jobs::FLUSH_RETRY_BACKOFF;
 use logpose_types::{
@@ -51,7 +52,7 @@ fn create(engine: &Engine, flush_ops: usize, min_merge: usize) -> Arc<Collection
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = min_merge;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
@@ -83,10 +84,7 @@ fn live(handle: &CollectionHandle) -> Vec<String> {
     let mut ids = version
         .live_images()
         .into_iter()
-        .map(|(_, image)| {
-            let put = legacy_put(&version.schema, &image).expect("row should read");
-            put.id.as_str().to_owned()
-        })
+        .map(|(_, image)| flat_row(&version.schema, &image).0)
         .collect::<Vec<_>>();
     ids.sort();
     ids
@@ -226,17 +224,11 @@ fn flushes_that_keep_failing_poison_the_collection_so_writes_fail_fast() {
 
     // Reads keep serving every acknowledged row.
     assert_eq!(live(&handle), ["a", "b", "c", "d"]);
-    let records = engine
-        .core()
-        .scan_exact_internal(&handle, None::<Snapshot>, true, None)
-        .expect("reads keep working");
+    let records = scan(&handle, None::<Snapshot>).expect("reads keep working");
     assert_eq!(records.len(), 4);
 
     // The stats report the failure that poisoned the collection.
-    let stats = engine
-        .core()
-        .collection_stats(&handle, None::<Snapshot>)
-        .expect("stats keep working");
+    let stats = handle.stats(None).expect("stats keep working");
     let error = stats.maintenance.last_error.expect("the last failure");
     assert_eq!(error.job, "flush");
     assert_eq!(error.consecutive_failures, 3);

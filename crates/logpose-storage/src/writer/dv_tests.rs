@@ -4,10 +4,8 @@
 
 use super::*;
 use crate::{
-    CreateCollectionRequest, Engine, EngineConfig,
-    dv::dv_path,
-    legacy_view::{legacy_id, legacy_put},
-    paths::segment_path,
+    CreateCollectionRequest, Engine, EngineConfig, dv::dv_path, paths::segment_path,
+    test_support::flat_row,
 };
 use logpose_types::{
     CollectionRef, DistanceMetric, ResourceKind,
@@ -42,7 +40,7 @@ fn create(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
@@ -83,8 +81,8 @@ fn live(handle: &CollectionHandle) -> BTreeMap<String, (Vec<f32>, serde_json::Va
         .live_images()
         .into_iter()
         .map(|(_, image)| {
-            let put = legacy_put(&version.schema, &image).expect("row should read");
-            (put.id.as_str().to_owned(), (put.vector, put.metadata))
+            let (id, vector, fields) = flat_row(&version.schema, &image);
+            (id, (vector, fields))
         })
         .collect()
 }
@@ -126,7 +124,7 @@ fn an_upsert_of_a_flushed_key_marks_its_segment_row_until_the_next_flush_persist
             upsert("b", 2.0, json!({"v": 1})),
         ],
     );
-    core.flush_collection(&handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     let [segment] = segment_units(&handle)[..] else {
         unreachable!("one segment");
     };
@@ -147,7 +145,7 @@ fn an_upsert_of_a_flushed_key_marks_its_segment_row_until_the_next_flush_persist
     drop(version);
     assert_eq!(row(&handle, "a"), Some((vec![3.0, 1.0], json!({"v": 2}))));
 
-    core.flush_collection(&handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     let version = handle.current();
     let entry = version
         .manifest
@@ -190,7 +188,7 @@ fn a_partial_update_merges_into_the_live_row_wherever_it_lives() {
         &handle,
         vec![upsert("a", 1.0, json!({"color": "red", "size": 1}))],
     );
-    core.flush_collection(&handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     let [segment] = segment_units(&handle)[..] else {
         unreachable!("one segment");
     };
@@ -330,10 +328,7 @@ fn deletions_that_land_while_a_flush_builds_reach_the_new_segment() {
         [1, 2],
         "replayed from the WAL"
     );
-    engine
-        .core()
-        .flush_collection(&handle)
-        .expect("the next flush");
+    handle.flush_blocking().expect("the next flush");
     let dv = handle
         .current()
         .manifest
@@ -347,8 +342,7 @@ fn deletions_that_land_while_a_flush_builds_reach_the_new_segment() {
 
 /// Build two segments, `s1 = {a, b, c, d}` with `d` deleted and `s2 = {e, d}`, and return their
 /// units.
-fn two_segments(engine: &Engine, handle: &Arc<CollectionHandle>) -> (UnitId, UnitId) {
-    let core = engine.core();
+fn two_segments(handle: &Arc<CollectionHandle>) -> (UnitId, UnitId) {
     write(
         handle,
         ["a", "b", "c", "d"]
@@ -357,12 +351,12 @@ fn two_segments(engine: &Engine, handle: &Arc<CollectionHandle>) -> (UnitId, Uni
             .map(|(id, x)| upsert(id, x as f32, json!({})))
             .collect(),
     );
-    core.flush_collection(handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     write(
         handle,
         vec![upsert("e", 5.0, json!({})), upsert("d", 40.0, json!({}))],
     );
-    core.flush_collection(handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     let [s1, s2] = segment_units(handle)[..] else {
         unreachable!("two segments");
     };
@@ -381,7 +375,7 @@ fn deletions_that_land_while_a_compaction_builds_are_reconciled_onto_its_output(
     let engine = open(&fault);
     let handle = create(&engine, "compacted");
     let core = engine.core();
-    let (s1, s2) = two_segments(&engine, &handle);
+    let (s1, s2) = two_segments(&handle);
 
     let (mut ticket, start) = handle
         .begin_job(JobKind::Compact)
@@ -440,8 +434,8 @@ fn deletions_that_land_while_a_compaction_builds_are_reconciled_onto_its_output(
     assert_eq!(deleted_rows(&handle, output), [0, 1, 2, 3]);
 
     // Compact again: d's row moves a second time, and the index follows it.
-    core.flush_collection(&handle).expect("flush");
-    core.compact_collection(&handle).expect("compact");
+    handle.flush_blocking().expect("flush");
+    handle.compact_blocking().expect("compact");
     let [second] = segment_units(&handle)[..] else {
         unreachable!("one segment");
     };
@@ -483,7 +477,7 @@ fn a_crash_after_the_compaction_dv_sync_keeps_the_inputs() {
     let engine = open(&fault);
     let handle = create(&engine, "crashed");
     let core = engine.core();
-    let (s1, s2) = two_segments(&engine, &handle);
+    let (s1, s2) = two_segments(&handle);
     let (mut ticket, start) = handle
         .begin_job(JobKind::Compact)
         .expect("compaction begins");
@@ -555,7 +549,7 @@ fn the_last_vector_field_cannot_be_dropped_and_a_renamed_one_keeps_flushing() {
     let handle = create(&engine, "renamed");
     let core = engine.core();
     write(&handle, vec![upsert("a", 1.0, json!({"k": 1}))]);
-    core.flush_collection(&handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     write(&handle, vec![upsert("b", 2.0, json!({"k": 2}))]);
     let error = handle
         .alter_schema_blocking(SchemaChange::DropField {
@@ -575,8 +569,8 @@ fn the_last_vector_field_cannot_be_dropped_and_a_renamed_one_keeps_flushing() {
             Record::new("c").with_vector("embedding", vec![3.0, 1.0]),
         )],
     );
-    core.flush_collection(&handle).expect("flush");
-    core.compact_collection(&handle).expect("compact");
+    handle.flush_blocking().expect("flush");
+    handle.compact_blocking().expect("compact");
     let vectors = |handle: &CollectionHandle| {
         let version = handle.current();
         version.check_invariants().expect("invariants hold");
@@ -586,7 +580,7 @@ fn the_last_vector_field_cannot_be_dropped_and_a_renamed_one_keeps_flushing() {
             .map(|(_, image)| {
                 let record = image.to_record(&version.schema).expect("row reads");
                 (
-                    legacy_id(&image.pk).as_str().to_owned(),
+                    PrimaryKey::from(image.pk.clone()).label(),
                     record.vectors.get("embedding").cloned(),
                 )
             })

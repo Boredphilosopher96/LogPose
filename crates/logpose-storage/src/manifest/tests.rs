@@ -2,16 +2,15 @@
 
 use super::*;
 use crate::test_support::ControlledVfs;
-use logpose_types::{
-    CollectionId, DistanceMetric, legacy::legacy_schema, schema::CollectionSchema,
-};
+use crate::test_support::vector_schema;
+use logpose_types::{CollectionId, DistanceMetric, schema::CollectionSchema};
 use logpose_vfs::{FaultPlan, FaultVfs, TearMode};
 use uuid::Uuid;
 
 const DIR: &str = "/c";
 
 fn schema() -> CollectionSchema {
-    legacy_schema(2, DistanceMetric::Dot).expect("schema should build")
+    vector_schema(2, DistanceMetric::Dot)
 }
 
 fn collection_id() -> CollectionId {

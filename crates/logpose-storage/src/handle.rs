@@ -3,7 +3,7 @@
 
 use crate::{
     clock::Clock,
-    engine::EngineCore,
+    engine::{CoreRef, EngineCore},
     tokens::{SnapshotToken, TokenConfig, TokenRegistry},
     version::Version,
     writer::{
@@ -213,6 +213,49 @@ impl CollectionHandle {
     #[must_use]
     pub fn current(&self) -> Arc<Version> {
         self.current.load_full()
+    }
+
+    /// The live schema: the schema of the current `Version`.
+    ///
+    /// # Errors
+    ///
+    /// The collection is dropped.
+    pub fn schema(&self) -> Result<Arc<CollectionSchema>> {
+        self.ensure_open()?;
+        Ok(Arc::clone(&self.current().schema))
+    }
+
+    /// The snapshot naming the current `Version`: its manifest generation and visible
+    /// sequence number.
+    ///
+    /// # Errors
+    ///
+    /// The collection is dropped.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        self.ensure_open()?;
+        Ok(self.current().snapshot())
+    }
+
+    /// Run blocking `f` on the engine's I/O pool, as an engine task.
+    pub(crate) async fn run_io<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let core = self
+            .token_context
+            .core
+            .upgrade()
+            .map(|core| CoreRef::new(&core))
+            .ok_or_else(|| LogPoseError::unavailable("the storage engine is shut down"))?;
+        let future = {
+            // Not held across the await: only tracked engine tasks may outlive the engine.
+            let engine = Arc::clone(core.arc());
+            engine.runtime().io.run(move || {
+                let _task = core;
+                f()
+            })
+        };
+        future.await?
     }
 
     /// The latest published `visible_seq_no`, without pinning a version.
@@ -814,7 +857,7 @@ mod tests {
             ))
             .expect("descriptor should plan");
         let handle = engine
-            .create_collection(descriptor, None)
+            .create_collection_blocking(descriptor, None)
             .expect("collection should be created");
 
         let error = handle
@@ -824,13 +867,10 @@ mod tests {
         assert!(error.to_string().contains("read barrier"), "{error}");
 
         let writer = {
-            let engine = engine.clone();
             let handle = Arc::clone(&handle);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                engine
-                    .io(move |core| core.write(&handle, vec![put("alpha", vec![1.0, 0.0])]))
-                    .await
+                handle.write(vec![put("alpha", vec![1.0, 0.0])]).await
             })
         };
         let version = handle
@@ -864,7 +904,7 @@ mod tests {
             ))
             .expect("descriptor should plan");
         let handle = engine
-            .create_collection(descriptor, None)
+            .create_collection_blocking(descriptor, None)
             .expect("collection should be created");
         let done = Arc::new(AtomicBool::new(false));
         let readers = (0..4)
@@ -887,9 +927,9 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let core = engine.core();
         for index in 0..1000 {
-            core.write(&handle, vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
+            handle
+                .write_blocking(vec![put(&format!("id-{index}"), vec![1.0, 0.0])])
                 .expect("write should succeed");
         }
         done.store(true, Ordering::Release);

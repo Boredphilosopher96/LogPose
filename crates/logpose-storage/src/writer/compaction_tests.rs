@@ -9,7 +9,7 @@
 use super::*;
 use crate::{
     CompactionConfig, CreateCollectionRequest, Engine, EngineConfig, ManualClock, MemtableConfig,
-    RuntimeConfig, legacy_view::legacy_put,
+    RuntimeConfig, test_support::flat_row,
 };
 use logpose_types::{
     CollectionRef, DistanceMetric,
@@ -69,7 +69,7 @@ fn create(engine: &Engine, flush_ops: usize, min_merge: usize) -> Arc<Collection
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = min_merge;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
@@ -101,8 +101,8 @@ fn live(handle: &CollectionHandle) -> BTreeMap<String, f32> {
         .live_images()
         .into_iter()
         .map(|(_, image)| {
-            let put = legacy_put(&version.schema, &image).expect("row should read");
-            (put.id.as_str().to_owned(), put.vector[0])
+            let (id, vector, _) = flat_row(&version.schema, &image);
+            (id, vector[0])
         })
         .collect()
 }
@@ -380,7 +380,7 @@ fn compactions_never_reserve_more_than_the_maintenance_memory_pool() {
             descriptor.flush_threshold_bytes = usize::MAX;
             descriptor.compaction_threshold_segments = 2;
             engine
-                .create_collection(descriptor, None)
+                .create_collection_blocking(descriptor, None)
                 .expect("collection should be created")
         })
         .collect::<Vec<_>>();
@@ -651,7 +651,7 @@ fn a_dropped_collection_releases_its_permits_and_maintenance_memory() {
     assert_eq!(scheduler.stats().compactions_granted, 1);
 
     engine
-        .drop_collection(&CollectionRef::new_default(NAME))
+        .drop_collection_blocking(&CollectionRef::new_default(NAME))
         .expect("drop");
     assert!(
         flushed.join().expect("flush thread").is_err(),
@@ -811,8 +811,8 @@ mod concurrent {
             .live_images()
             .into_iter()
             .map(|(_, image)| {
-                let put = legacy_put(&version.schema, &image).expect("row should read");
-                (put.id.as_str().to_owned(), put.vector[0])
+                let (id, vector, _) = flat_row(&version.schema, &image);
+                (id, vector[0])
             })
             .filter(|(id, _)| id.starts_with(&prefix))
             .collect()

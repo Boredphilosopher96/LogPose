@@ -31,22 +31,3 @@ pub(crate) fn should_flush(
         || active.slot_count() >= config.max_rows
         || now.saturating_sub(active.created_at) >= config.max_age
 }
-
-#[cfg(test)]
-impl crate::engine::CoreRef {
-    /// Flush every operation `handle` had when the call began. Blocking.
-    pub(crate) fn flush_collection(
-        &self,
-        handle: &crate::handle::CollectionHandle,
-    ) -> logpose_types::Result<logpose_types::Snapshot> {
-        handle.flush_blocking()
-    }
-
-    /// Compact `handle`'s segments into one, as far as one job can hold. Blocking.
-    pub(crate) fn compact_collection(
-        &self,
-        handle: &crate::handle::CollectionHandle,
-    ) -> logpose_types::Result<logpose_types::Snapshot> {
-        handle.compact_blocking()
-    }
-}

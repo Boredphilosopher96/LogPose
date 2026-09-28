@@ -1,8 +1,7 @@
-//! Collection descriptors on disk: planning, durable creation, placement assignment, and the
-//! descriptor-directory listing the catalog uses.
+//! Collection create requests, and collection descriptors on disk: planning, durable creation,
+//! placement assignment, and the descriptor-directory listing the catalog uses.
 
 use crate::{
-    CreateCollectionRequest,
     durable_fs::{create_dir_all_synced, sync_dir},
     engine::{CoreRef, EngineCore, already_exists},
     error::{io_message, json_message},
@@ -13,12 +12,103 @@ use crate::{
     writer::{PkIndex, checkpoint_frame},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionAssignment, CollectionRef, Result, UnitId};
+use logpose_types::{
+    CollectionAssignment, CollectionRef, DEFAULT_DATABASE_NAME, DistanceMetric, Result, UnitId,
+    schema::{CreateCollectionSpec, PrimaryKeySpec, PrimaryKeyType, VectorFieldSpec},
+};
 use logpose_wal::{WalRecovery, WalWriter};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+/// Request payload for creating a collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateCollectionRequest {
+    /// Database containing the collection. Blank values default to `default`.
+    pub database_name: String,
+    /// The collection's name and schema, as the create request carries them (engine plan
+    /// decision D4). Validated when the collection is planned, so errors name spec fields
+    /// such as `vectors[0].dimensions`.
+    pub spec: CreateCollectionSpec,
+}
+
+impl CreateCollectionRequest {
+    /// Create a collection from a schema-based spec in an explicit database namespace.
+    #[must_use]
+    pub fn from_spec(database_name: impl Into<String>, spec: CreateCollectionSpec) -> Self {
+        Self {
+            database_name: database_name.into(),
+            spec,
+        }
+    }
+
+    /// A request in the default database for the single-vector shape: string primary key
+    /// `id`, one vector field `vector` with `dimensions` and `metric`, and dynamic fields on.
+    #[must_use]
+    pub fn new(name: impl Into<String>, dimensions: usize, metric: DistanceMetric) -> Self {
+        Self::in_database(DEFAULT_DATABASE_NAME, name, dimensions, metric)
+    }
+
+    /// [`CreateCollectionRequest::new`] in an explicit database namespace.
+    #[must_use]
+    pub fn in_database(
+        database_name: impl Into<String>,
+        name: impl Into<String>,
+        dimensions: usize,
+        metric: DistanceMetric,
+    ) -> Self {
+        Self::from_spec(
+            database_name,
+            CreateCollectionSpec {
+                name: name.into(),
+                primary_key: PrimaryKeySpec {
+                    name: "id".to_owned(),
+                    key_type: PrimaryKeyType::String,
+                },
+                vectors: vec![VectorFieldSpec {
+                    name: "vector".to_owned(),
+                    // Out-of-range dimensions fail validation when the collection is planned.
+                    dimensions: u32::try_from(dimensions).unwrap_or(u32::MAX),
+                    metric,
+                }],
+                fields: Vec::new(),
+                dynamic_fields: true,
+            },
+        )
+    }
+
+    /// The collection name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    /// Return the canonical database/collection reference for this request.
+    #[must_use]
+    pub fn collection_ref(&self) -> CollectionRef {
+        let request = self.clone().with_defaults();
+        CollectionRef::new(request.database_name, request.spec.name)
+    }
+
+    /// Return the canonical database/collection lookup key for this request.
+    #[must_use]
+    pub fn lookup_name(&self) -> String {
+        self.collection_ref().lookup_name()
+    }
+
+    pub(crate) fn with_defaults(self) -> Self {
+        let database_name = if self.database_name.trim().is_empty() {
+            DEFAULT_DATABASE_NAME.to_owned()
+        } else {
+            self.database_name
+        };
+        Self {
+            database_name,
+            spec: self.spec,
+        }
+    }
+}
 
 impl EngineCore {
     /// Build the descriptor that would be persisted for one collection request.
@@ -176,15 +266,5 @@ impl CoreRef {
         )?;
         reservation.commit(Arc::clone(&handle));
         Ok(handle)
-    }
-}
-
-/// Parse a `database/collection` lookup name; a bare name is in the default database.
-pub(crate) fn collection_ref_from_lookup(name: &str) -> CollectionRef {
-    let parts = name.split('/').collect::<Vec<_>>();
-    if parts.len() == 2 && parts.iter().all(|part| !part.trim().is_empty()) {
-        CollectionRef::new(parts[0], parts[1])
-    } else {
-        CollectionRef::new_default(name)
     }
 }

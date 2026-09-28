@@ -1644,8 +1644,7 @@ impl EngineCore {
         let (version, token) = match &options.token {
             Some(token) => (handle.snapshot_version(token)?, Some(token.clone())),
             None => {
-                let (version, _) =
-                    self.read_state(handle, ReadAt::Snapshot(options.snapshot.clone()))?;
+                let (version, _) = handle.read_state(ReadAt::Snapshot(options.snapshot.clone()))?;
                 (version, None)
             }
         };
@@ -1673,7 +1672,8 @@ impl EngineCore {
 }
 
 impl Engine {
-    /// A view of the collection `reference` names; see [`CollectionReader`].
+    /// A view of the collection `reference` names; see [`CollectionReader`]. The first read
+    /// of a recovered collection lets its background maintenance run.
     ///
     /// # Errors
     ///
@@ -1686,17 +1686,8 @@ impl Engine {
         options: &ReadOptions,
     ) -> Result<ReadView> {
         let handle = self.collection(reference)?;
-        self.core().read_view_of(&handle, options)
-    }
-}
-
-impl CoreRef {
-    pub(crate) fn read_view_of(
-        &self,
-        handle: &CollectionHandle,
-        options: &ReadOptions,
-    ) -> Result<ReadView> {
-        self.arc().read_view(handle, options)
+        handle.arm_maintenance();
+        self.core().arc().read_view(&handle, options)
     }
 }
 

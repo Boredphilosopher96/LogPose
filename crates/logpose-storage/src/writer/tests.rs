@@ -4,12 +4,11 @@
 use super::*;
 use crate::{
     CreateCollectionRequest, Engine, EngineConfig,
-    legacy_view::{legacy_ops, legacy_put},
     test_support::{ControlledVfs, put},
 };
 use logpose_types::record::PrimaryKey;
 use logpose_types::{
-    CollectionRef, DistanceMetric, WriteOperation,
+    CollectionRef, DistanceMetric,
     record::Record,
     schema::{FieldType, ScalarFieldSpec},
     value::Value,
@@ -49,15 +48,12 @@ fn create(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
-fn ops(operations: Vec<WriteOperation>) -> Vec<ClientOp> {
-    legacy_ops(operations).expect("legacy ops should map")
-}
-
-/// Every record the published version shows, as `id -> (seq_no, metadata)`.
+/// Every record the published version shows, as `key -> (seq_no, fields)`, where the fields
+/// are the visible `$extra` keys and the typed scalar fields as one JSON object.
 fn visible(handle: &CollectionHandle) -> BTreeMap<String, (SeqNo, serde_json::Value)> {
     let version = handle.current();
     version.check_invariants().expect("invariants hold");
@@ -65,14 +61,21 @@ fn visible(handle: &CollectionHandle) -> BTreeMap<String, (SeqNo, serde_json::Va
         .live_images()
         .into_iter()
         .map(|(seq_no, image)| {
-            let put = legacy_put(&version.schema, &image).expect("row should read");
-            (put.id.as_str().to_owned(), (seq_no, put.metadata))
+            let record = image.to_record(&version.schema).expect("row should read");
+            let mut fields = record.extra;
+            for (name, value) in record.fields {
+                fields.insert(name, value.into_json());
+            }
+            (
+                record.pk.label(),
+                (seq_no, serde_json::Value::Object(fields)),
+            )
         })
         .collect()
 }
 
 async fn write(handle: &Arc<CollectionHandle>, id: &str) -> Result<CommitAck> {
-    handle.write(ops(vec![put(id, vec![1.0, 0.0])])).await
+    handle.write(vec![put(id, vec![1.0, 0.0])]).await
 }
 
 fn spawn_write(
@@ -406,7 +409,7 @@ async fn a_failed_group_and_the_one_prepared_behind_it_never_become_visible() {
             let rows = (0..2 * super::prepare::INLINE_PREPARE_ROWS)
                 .map(|index| put(&format!("big-{index}"), vec![0.0, 1.0]))
                 .collect();
-            let large = handle.write(ops(rows));
+            let large = handle.write(rows);
             let altered = handle.alter_schema(SchemaChange::AddField(ScalarFieldSpec::new(
                 "price",
                 FieldType::Int64,
@@ -498,7 +501,9 @@ async fn a_group_prepared_during_a_drop_that_does_not_commit_is_forgotten() {
     vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
     let dropped = {
         let engine = engine.clone();
-        tokio::task::spawn_blocking(move || engine.drop_collection(&reference("undropped")))
+        tokio::task::spawn_blocking(move || {
+            engine.drop_collection_blocking(&reference("undropped"))
+        })
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !handle.is_dropped() {
@@ -936,7 +941,7 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     let started = Instant::now();
     let dropped = tokio::time::timeout(Duration::from_secs(20), {
         let engine = engine.clone();
-        tokio::task::spawn_blocking(move || engine.drop_collection(&reference("busy")))
+        tokio::task::spawn_blocking(move || engine.drop_collection_blocking(&reference("busy")))
     })
     .await;
     dropped
@@ -962,11 +967,13 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should open");
     let handle = create(&engine, "rewound");
     let core = engine.core();
-    core.write(&handle, vec![put("a", vec![1.0, 0.0])])
+    handle
+        .write_blocking(vec![put("a", vec![1.0, 0.0])])
         .expect("write a");
-    core.flush_collection(&handle).expect("flush");
+    handle.flush_blocking().expect("flush");
     // The flush's checkpoint frame rides along with the next group.
-    core.write(&handle, vec![put("b", vec![1.0, 0.0])])
+    handle
+        .write_blocking(vec![put("b", vec![1.0, 0.0])])
         .expect("write b");
     let current = handle.meta().dir.join(crate::manifest::CURRENT_FILE);
     drop((handle, core));
@@ -1028,7 +1035,7 @@ fn inline_preparation_is_bounded_by_rows_and_by_bytes() {
         .map(|index| put(&format!("wide-{index}"), vec![0.5; 32 * 1024]))
         .collect::<Vec<_>>();
     let request = WriteRequest::Batch {
-        ops: legacy_ops(rows).expect("rows map"),
+        ops: rows,
         ack: tokio::sync::oneshot::channel().0,
     };
     assert!(!prepares_inline(
@@ -1057,9 +1064,8 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     let handle = engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created");
-    let core = engine.core();
     let status = || handle.maintenance_status();
     let wait_for = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1072,7 +1078,8 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
     // Hold every permit, so the flush the threshold plans waits for one.
     engine.scheduler().pause();
     for id in ["a", "b"] {
-        core.write(&handle, vec![put(id, vec![1.0, 0.0])])
+        handle
+            .write_blocking(vec![put(id, vec![1.0, 0.0])])
             .expect("write");
     }
     wait_for("the flush to wait for its permit", &|| {
@@ -1087,7 +1094,7 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
     // A drop that fails its rename voids the waiting flush.
     vfs.fail_renames_to(crate::engine::DROPPED_DIR_SUFFIX, u32::MAX);
     engine
-        .drop_collection(&reference("requests"))
+        .drop_collection_blocking(&reference("requests"))
         .expect_err("the rename fails");
     vfs.stop_failing_renames();
     assert!(!handle.is_dropped());
