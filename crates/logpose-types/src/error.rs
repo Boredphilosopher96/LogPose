@@ -231,6 +231,8 @@ pub enum ResourceKind {
     DatabasePolicy,
     /// A segment of a collection.
     Segment,
+    /// A record of a collection, addressed by primary key.
+    Record,
     /// A REST route.
     Route,
 }
@@ -246,6 +248,7 @@ impl ResourceKind {
             Self::Principal => "principal",
             Self::DatabasePolicy => "database_policy",
             Self::Segment => "segment",
+            Self::Record => "record",
             Self::Route => "route",
         }
     }
@@ -258,6 +261,7 @@ impl ResourceKind {
             Self::Principal => "principal",
             Self::DatabasePolicy => "database access policy",
             Self::Segment => "segment",
+            Self::Record => "record",
             Self::Route => "route",
         }
     }
@@ -276,9 +280,11 @@ pub enum CorruptionKind {
     Wal,
     /// A segment file.
     Segment,
+    /// A deletion-vector file of a segment.
+    DeletionVector,
     /// A manifest or the `CURRENT` pointer.
     Manifest,
-    /// An index sidecar file.
+    /// A vector or scalar index structure.
     Index,
     /// A descriptor file: collection, database, principal, or policy.
     Descriptor,
@@ -293,6 +299,7 @@ impl CorruptionKind {
         match self {
             Self::Wal => "wal",
             Self::Segment => "segment",
+            Self::DeletionVector => "deletion_vector",
             Self::Manifest => "manifest",
             Self::Index => "index",
             Self::Descriptor => "descriptor",
