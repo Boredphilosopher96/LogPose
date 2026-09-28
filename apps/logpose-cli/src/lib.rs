@@ -26,6 +26,7 @@ use walkdir as _;
 pub mod action;
 pub mod cli;
 pub mod direct;
+pub mod error_report;
 pub mod execute;
 pub mod feedback;
 pub mod interactive;

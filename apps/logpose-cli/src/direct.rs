@@ -1,4 +1,7 @@
-use crate::feedback::{ProgressEvent, Reporter};
+use crate::{
+    error_report::{server_error, server_error_details},
+    feedback::{ProgressEvent, Reporter},
+};
 use anyhow::{Context, bail};
 use std::{
     io::{self, IsTerminal, Write},
@@ -47,10 +50,17 @@ impl TerminalUi {
         self.stdin_is_terminal && self.stdout_is_terminal && self.stderr_is_terminal
     }
 
+    /// Print `error`, each cause, and the reason, field violations, metadata, and retry advice
+    /// of a typed server error.
     pub fn error_report(&self, error: &anyhow::Error) {
         self.error(&error.to_string());
         for cause in error.chain().skip(1) {
             eprintln!("  {} {cause}", self.decorate("[cause]", MessageTone::Warn));
+            if let Some(server) = server_error(cause) {
+                for line in server_error_details(server) {
+                    eprintln!("    {line}");
+                }
+            }
         }
     }
 

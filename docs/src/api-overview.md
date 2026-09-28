@@ -142,12 +142,59 @@ group could not be made durable, which also poisons the collection: with
 `unknown_fenced` or `unknown_unfenced` it may still appear after recovery, so
 treat it like a timeout (`INTERNAL`).
 
+### Rust Client Errors, Retries, and Redirects
+
+The `logpose-client` crate decodes every error status into
+`ClientError::Server(ServerError)`. A `ServerError` carries the `ErrorReason`,
+the `ErrorCode`, the message, the metadata, the field violations, and the retry
+hint (from `RetryInfo`, or the `retry-after-ms` trailer), and keeps the raw
+`tonic::Status`. A status the client cannot classify (a reason from a newer
+server, another `ErrorInfo` domain, or no `ErrorInfo`, as from a proxy or the
+transport) decodes to the generic `ServerErrorKind::Unknown` with its gRPC
+code, raw reason, and message.
+
+By default the client sends each request once and returns the typed error. Two
+opt-in policies change that:
+
+- `RetryPolicy` retries on the same node only errors the server marks
+  retryable: `UNAVAILABLE` or `RESOURCE_EXHAUSTED` with a retry hint. It never
+  retries `INVALID_ARGUMENT`, `FAILED_PRECONDITION` (including
+  `COLLECTION_POISONED` and `READ_BARRIER_NOT_SATISFIED`), or any error without
+  a hint. It waits the larger of the hint and its own exponential backoff, and
+  returns the error instead when the hint is longer than `max_backoff`. Reads
+  are retried; writes only with `retry_writes`. A lost reply carries no hint
+  and is never retried, but an etcd failure during a database, policy, or
+  collection create is hinted and may have committed. Upserts and deletes by id
+  and the database and policy puts are idempotent; a repeated collection create
+  can report `RESOURCE_ALREADY_EXISTS`. Bulk streams (`BulkWriteCollection`) are
+  never retried automatically; resume from `failed_batch_index`.
+- `RedirectPolicy` follows `NOT_OWNER` to `owner_node` and `NOT_LEADER` to
+  `leader_node` immediately, through a `NodeResolver` that maps node ids to
+  gRPC endpoints, up to `max_redirects` times per request (2 by default). Both
+  errors refuse the request before applying it, so redirects apply to writes
+  too. Without a resolver, or when it does not know the node, the typed error is
+  returned (or retried after its hint by a `RetryPolicy`). Each request starts
+  at the configured endpoint again. The server names only a node id; the
+  endpoint, and so where the client sends its bearer token, comes from the
+  resolver, so it should map only known node ids.
+
+The CLI prints a typed error with its reason and message, followed by its code,
+field violations, metadata, and where or when to retry:
+
+```text
+[error] failed to write records; each batch commits atomically, so the failing batch was applied in full or not at all; verify collection state before retrying it
+  [cause] DIMENSION_MISMATCH: record 'alpha' expected 2 dimensions but found 3
+    code: INVALID_ARGUMENT
+    field operations[0].vector: record 'alpha' expected 2 dimensions but found 3
+    metadata: actual_dimensions=3, expected_dimensions=2, record_id=alpha
+```
+
 ## Request Size Limits
 
-| Setting                         | Default | Over the limit                                                |
-| `limits.max_rest_body_bytes`    | 16 MiB  | HTTP `413`, `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`          |
-| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                 |
-| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`                  |
+| Setting                         | Default | Over the limit                                       |
+|---------------------------------|---------|------------------------------------------------------|
+| `limits.max_rest_body_bytes`    | 16 MiB  | HTTP `413`, `RESOURCE_EXHAUSTED`, reason `TOO_LARGE` |
+| `limits.max_grpc_message_bytes` | 16 MiB  | gRPC `RESOURCE_EXHAUSTED`, reason `TOO_LARGE`        |
 
 The gRPC limit applies to each request message, so each batch of a
 `BulkWriteCollection` stream is checked on its own. See

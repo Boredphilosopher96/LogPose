@@ -1,4 +1,18 @@
 //! gRPC-backed client helpers for LogPose operator workflows.
+//!
+//! Server errors arrive as [`ClientError::Server`] with a decoded [`ServerError`]: the
+//! [`ErrorReason`], code, metadata, field violations, and retry hint the server sent. Requests
+//! are sent once unless the client is given a [`RetryPolicy`] or a [`RedirectPolicy`]; see
+//! [`retry`] for what each retries and when.
+
+mod error;
+pub mod retry;
+#[cfg(test)]
+mod test_support;
+
+pub use error::{ClientError, Result, ServerError, ServerErrorKind, grpc_code_name};
+pub use logpose_types::{ErrorCode, ErrorReason, FieldViolation};
+pub use retry::{NodeResolver, RedirectPolicy, RetryPolicy};
 
 use logpose_api_grpc::proto::{
     self, CollectionDescriptorReply, CollectionPlacementReply, CompactCollectionRequest,
@@ -23,17 +37,20 @@ use logpose_query::{
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
     CollectionId, CollectionPlacement, CollectionRef, CollectionStats, CommitAck,
-    CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, LogPoseError, MaintenanceBacklog,
+    CoordinationStatus, DEFAULT_DATABASE_NAME, DistanceMetric, MaintenanceBacklog,
     MaintenanceStatus, NodeMetadata, NodeRole, NodeRuntimeStatus, QueryUnitStats, RecordId,
     RemoteBlobConfig, ScalarFieldStats, Snapshot, WriteOperation,
 };
+use retry::Operation;
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
-use thiserror::Error;
-#[cfg(test)]
-use tokio as _;
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    ops::Deref,
+    sync::{Arc, Mutex, PoisonError},
+};
 use tonic::{
-    Request,
+    Request, Response, Status,
     codegen::InterceptedService,
     metadata::{Ascii, MetadataValue},
     service::Interceptor,
@@ -87,32 +104,6 @@ impl<T> Deref for ScopedCollectionResponse<T> {
     }
 }
 
-/// Client-scoped result type.
-pub type Result<T> = std::result::Result<T, ClientError>;
-
-/// Errors returned by the gRPC-backed client.
-#[derive(Debug, Error)]
-pub enum ClientError {
-    /// gRPC transport bootstrap failed.
-    #[error(transparent)]
-    Transport(#[from] tonic::transport::Error),
-    /// The server returned a gRPC status error.
-    #[error(transparent)]
-    Status(#[from] tonic::Status),
-    /// The caller supplied an invalid client-side request.
-    #[error("{0}")]
-    InvalidRequest(String),
-    /// The server returned an invalid or incomplete payload.
-    #[error("{0}")]
-    InvalidResponse(String),
-    /// The caller supplied an invalid bearer token for client transport metadata.
-    #[error("{0}")]
-    InvalidAuthToken(String),
-    /// The server returned malformed JSON payloads.
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-}
-
 #[derive(Clone, Debug, Default)]
 struct AuthInterceptor {
     authorization: Option<MetadataValue<Ascii>>,
@@ -139,10 +130,19 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
+type ServiceClient = LogPoseServiceClient<InterceptedService<Channel, AuthInterceptor>>;
+
 /// Thin gRPC client over the shared LogPose server contract.
+///
+/// Cloning is cheap: clones share the connection and the redirect connections.
 #[derive(Clone)]
 pub struct LogPoseClient {
-    inner: LogPoseServiceClient<InterceptedService<Channel, AuthInterceptor>>,
+    inner: ServiceClient,
+    interceptor: AuthInterceptor,
+    retry: RetryPolicy,
+    redirects: Option<RedirectPolicy>,
+    /// Lazily connected clients for redirect endpoints, by endpoint URL.
+    peers: Arc<Mutex<BTreeMap<String, ServiceClient>>>,
 }
 
 impl LogPoseClient {
@@ -157,9 +157,14 @@ impl LogPoseClient {
         auth_token: Option<&str>,
     ) -> Result<Self> {
         let channel = Endpoint::new(endpoint.into())?.connect().await?;
-        let inner =
-            LogPoseServiceClient::with_interceptor(channel, AuthInterceptor::new(auth_token)?);
-        Ok(Self { inner })
+        let interceptor = AuthInterceptor::new(auth_token)?;
+        Ok(Self {
+            inner: LogPoseServiceClient::with_interceptor(channel, interceptor.clone()),
+            interceptor,
+            retry: RetryPolicy::disabled(),
+            redirects: None,
+            peers: Arc::default(),
+        })
     }
 
     /// Connect using a shared client configuration.
@@ -167,14 +172,90 @@ impl LogPoseClient {
         Self::connect_with_auth(config.grpc_endpoint.clone(), config.auth_token.as_deref()).await
     }
 
+    /// Retry retryable server errors with `policy`. Without one, every request is sent once.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// Follow `NOT_OWNER` and `NOT_LEADER` errors to the node they name with `policy`.
+    /// Without one, those errors are returned.
+    #[must_use]
+    pub fn with_redirects(mut self, policy: RedirectPolicy) -> Self {
+        self.redirects = Some(policy);
+        self
+    }
+
+    /// The retry policy in effect.
+    #[must_use]
+    pub fn retry_policy(&self) -> &RetryPolicy {
+        &self.retry
+    }
+
+    /// Send one unary request, following redirects and retrying as the policies allow.
+    async fn call<Req, Reply, Fut>(
+        &self,
+        operation: Operation,
+        request: Req,
+        rpc: impl Fn(ServiceClient, Request<Req>) -> Fut,
+    ) -> Result<Reply>
+    where
+        Req: Clone,
+        Fut: Future<Output = std::result::Result<Response<Reply>, Status>>,
+    {
+        if !self.retry.applies_to(operation) && self.redirects.is_none() {
+            return Ok(rpc(self.inner.clone(), Request::new(request))
+                .await?
+                .into_inner());
+        }
+        let mut target = self.inner.clone();
+        let mut attempt = 1;
+        let mut redirects = 0;
+        loop {
+            let status = match rpc(target.clone(), Request::new(request.clone())).await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(status) => status,
+            };
+            let error = ServerError::from_status(status);
+            if let Some(endpoint) = self
+                .redirects
+                .as_ref()
+                .and_then(|policy| policy.target(redirects, &error))
+            {
+                target = self.peer(&endpoint)?;
+                redirects += 1;
+                continue;
+            }
+            let Some(delay) = self.retry.delay_before_retry(operation, attempt, &error) else {
+                return Err(error.into());
+            };
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
+    /// The client for a redirect endpoint, connected lazily on first use.
+    fn peer(&self, endpoint: &str) -> Result<ServiceClient> {
+        let mut peers = self.peers.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = peers.get(endpoint) {
+            return Ok(client.clone());
+        }
+        let channel = Endpoint::new(endpoint.to_owned())?.connect_lazy();
+        let client = LogPoseServiceClient::with_interceptor(channel, self.interceptor.clone());
+        peers.insert(endpoint.to_owned(), client.clone());
+        Ok(client)
+    }
+
     /// Fetch canonical node metadata from the server.
     pub async fn metadata(&self) -> Result<NodeMetadata> {
         let response = self
-            .inner
-            .clone()
-            .get_metadata(Request::new(GetMetadataRequest {}))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetMetadataRequest {},
+                |mut client, request| async move { client.get_metadata(request).await },
+            )
+            .await?;
         Ok(NodeMetadata {
             product: response.product,
             node_name: response.node_name,
@@ -187,48 +268,52 @@ impl LogPoseClient {
     /// Fetch runtime and maintenance status from the control plane.
     pub async fn runtime_status(&self) -> Result<NodeRuntimeStatus> {
         let response = self
-            .inner
-            .clone()
-            .get_runtime_status(Request::new(GetRuntimeStatusRequest {}))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetRuntimeStatusRequest {},
+                |mut client, request| async move { client.get_runtime_status(request).await },
+            )
+            .await?;
         runtime_status_from_proto(response)
     }
 
     /// Create or replace one database descriptor.
     pub async fn set_database(&self, descriptor: DatabaseDescriptor) -> Result<DatabaseDescriptor> {
         let response = self
-            .inner
-            .clone()
-            .put_database(Request::new(PutDatabaseRequest {
-                descriptor: Some(database_descriptor_to_proto(descriptor)),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                PutDatabaseRequest {
+                    descriptor: Some(database_descriptor_to_proto(descriptor)),
+                },
+                |mut client, request| async move { client.put_database(request).await },
+            )
+            .await?;
         database_descriptor_from_proto(response)
     }
 
     /// Read one database descriptor.
     pub async fn database(&self, database_name: &str) -> Result<DatabaseDescriptor> {
         let response = self
-            .inner
-            .clone()
-            .get_database(Request::new(GetDatabaseRequest {
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetDatabaseRequest {
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.get_database(request).await },
+            )
+            .await?;
         database_descriptor_from_proto(response)
     }
 
     /// List every database descriptor.
     pub async fn databases(&self) -> Result<Vec<DatabaseDescriptor>> {
         let response = self
-            .inner
-            .clone()
-            .list_databases(Request::new(ListDatabasesRequest {}))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                ListDatabasesRequest {},
+                |mut client, request| async move { client.list_databases(request).await },
+            )
+            .await?;
         response
             .databases
             .into_iter()
@@ -242,16 +327,17 @@ impl LogPoseClient {
         request: CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
         let response = self
-            .inner
-            .clone()
-            .create_collection(Request::new(ProtoCreateCollectionRequest {
-                name: request.name,
-                dimensions: request.dimensions as u64,
-                metric: proto_metric(request.metric) as i32,
-                database_name: request.database_name,
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                ProtoCreateCollectionRequest {
+                    name: request.name,
+                    dimensions: request.dimensions as u64,
+                    metric: proto_metric(request.metric) as i32,
+                    database_name: request.database_name,
+                },
+                |mut client, request| async move { client.create_collection(request).await },
+            )
+            .await?;
         collection_descriptor_from_proto(response)
     }
 
@@ -269,14 +355,15 @@ impl LogPoseClient {
         collection_name: &str,
     ) -> Result<CollectionPlacement> {
         let response = self
-            .inner
-            .clone()
-            .get_collection_placement(Request::new(GetCollectionPlacementRequest {
-                collection_name: collection_name.to_owned(),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetCollectionPlacementRequest {
+                    collection_name: collection_name.to_owned(),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.get_collection_placement(request).await },
+            )
+            .await?;
         collection_placement_from_proto(response)
     }
 
@@ -294,14 +381,15 @@ impl LogPoseClient {
         collection_name: &str,
     ) -> Result<CollectionDescriptor> {
         let response = self
-            .inner
-            .clone()
-            .get_collection(Request::new(GetCollectionRequest {
-                collection_name: collection_name.to_owned(),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetCollectionRequest {
+                    collection_name: collection_name.to_owned(),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.get_collection(request).await },
+            )
+            .await?;
         collection_descriptor_from_proto(response)
     }
 
@@ -312,26 +400,28 @@ impl LogPoseClient {
     ) -> Result<DatabaseAccessPolicy> {
         let database_name = policy.database_name.clone();
         let response = self
-            .inner
-            .clone()
-            .put_database_policy(Request::new(PutDatabasePolicyRequest {
-                policy: Some(database_policy_to_proto(policy)),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                PutDatabasePolicyRequest {
+                    policy: Some(database_policy_to_proto(policy)),
+                },
+                |mut client, request| async move { client.put_database_policy(request).await },
+            )
+            .await?;
         database_policy_from_proto(response, &database_name)
     }
 
     /// Read one database access policy.
     pub async fn database_policy(&self, database_name: &str) -> Result<DatabaseAccessPolicy> {
         let response = self
-            .inner
-            .clone()
-            .get_database_policy(Request::new(GetDatabasePolicyRequest {
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetDatabasePolicyRequest {
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.get_database_policy(request).await },
+            )
+            .await?;
         database_policy_from_proto(response, database_name)
     }
 
@@ -356,18 +446,19 @@ impl LogPoseClient {
         operations: Vec<WriteOperation>,
     ) -> Result<ScopedCollectionResponse<CommitAck>> {
         let response = self
-            .inner
-            .clone()
-            .write_collection(Request::new(WriteCollectionRequest {
-                collection_name: collection_name.to_owned(),
-                operations: operations
-                    .into_iter()
-                    .map(write_operation_to_proto)
-                    .collect::<Vec<_>>(),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                WriteCollectionRequest {
+                    collection_name: collection_name.to_owned(),
+                    operations: operations
+                        .into_iter()
+                        .map(write_operation_to_proto)
+                        .collect::<Vec<_>>(),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.write_collection(request).await },
+            )
+            .await?;
         Ok(scoped_collection_response(
             response.database_name,
             response.collection_name,
@@ -404,25 +495,26 @@ impl LogPoseClient {
         validate_read_constraints(request.snapshot.as_ref(), request.read_barrier.as_ref())?;
         let collection_name = request.collection_name.clone();
         let response = self
-            .inner
-            .clone()
-            .query_collection(Request::new(QueryCollectionRequest {
-                collection_name: collection_name.clone(),
-                vector: request.vector,
-                top_k: request.top_k as u64,
-                snapshot: request.snapshot.map(snapshot_to_proto),
-                read_barrier: request.read_barrier.map(snapshot_to_proto),
-                filters: request
-                    .filters
-                    .into_iter()
-                    .map(metadata_filter_to_proto)
-                    .collect::<Result<Vec<_>>>()?,
-                predicate: request.predicate.map(predicate_to_proto).transpose()?,
-                explain: explain_mode_to_proto(request.explain) as i32,
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                QueryCollectionRequest {
+                    collection_name: collection_name.clone(),
+                    vector: request.vector,
+                    top_k: request.top_k as u64,
+                    snapshot: request.snapshot.map(snapshot_to_proto),
+                    read_barrier: request.read_barrier.map(snapshot_to_proto),
+                    filters: request
+                        .filters
+                        .into_iter()
+                        .map(metadata_filter_to_proto)
+                        .collect::<Result<Vec<_>>>()?,
+                    predicate: request.predicate.map(predicate_to_proto).transpose()?,
+                    explain: explain_mode_to_proto(request.explain) as i32,
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.query_collection(request).await },
+            )
+            .await?;
 
         Ok(scoped_collection_response(
             response.database_name,
@@ -487,16 +579,17 @@ impl LogPoseClient {
     ) -> Result<CollectionStats> {
         validate_read_constraints(snapshot.as_ref(), read_barrier.as_ref())?;
         let response = self
-            .inner
-            .clone()
-            .get_collection_stats(Request::new(GetCollectionStatsRequest {
-                collection_name: collection_name.to_owned(),
-                database_name: database_name.to_owned(),
-                snapshot: snapshot.map(snapshot_to_proto),
-                read_barrier: read_barrier.map(snapshot_to_proto),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                GetCollectionStatsRequest {
+                    collection_name: collection_name.to_owned(),
+                    database_name: database_name.to_owned(),
+                    snapshot: snapshot.map(snapshot_to_proto),
+                    read_barrier: read_barrier.map(snapshot_to_proto),
+                },
+                |mut client, request| async move { client.get_collection_stats(request).await },
+            )
+            .await?;
         Ok(CollectionStats {
             collection_id: parse_collection_id(&response.collection_id)?,
             database_name: response.database_name,
@@ -536,14 +629,15 @@ impl LogPoseClient {
         collection_name: &str,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
-            .inner
-            .clone()
-            .flush_collection(Request::new(FlushCollectionRequest {
-                collection_name: collection_name.to_owned(),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                FlushCollectionRequest {
+                    collection_name: collection_name.to_owned(),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.flush_collection(request).await },
+            )
+            .await?;
         let snapshot = snapshot_reply_from_proto(response.clone());
         Ok(scoped_collection_response(
             response.database_name,
@@ -570,14 +664,15 @@ impl LogPoseClient {
         collection_name: &str,
     ) -> Result<ScopedCollectionResponse<Snapshot>> {
         let response = self
-            .inner
-            .clone()
-            .compact_collection(Request::new(CompactCollectionRequest {
-                collection_name: collection_name.to_owned(),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Write,
+                CompactCollectionRequest {
+                    collection_name: collection_name.to_owned(),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.compact_collection(request).await },
+            )
+            .await?;
         let snapshot = snapshot_reply_from_proto(response.clone());
         Ok(scoped_collection_response(
             response.database_name,
@@ -609,16 +704,17 @@ impl LogPoseClient {
         target: InspectTarget,
     ) -> Result<ScopedCollectionResponse<InspectReport>> {
         let response = self
-            .inner
-            .clone()
-            .inspect_collection(Request::new(InspectCollectionRequest {
-                collection_name: collection_name.to_owned(),
-                target: inspect_target_to_proto(&target) as i32,
-                segment_id: inspect_segment_id(&target),
-                database_name: database_name.to_owned(),
-            }))
-            .await?
-            .into_inner();
+            .call(
+                Operation::Read,
+                InspectCollectionRequest {
+                    collection_name: collection_name.to_owned(),
+                    target: inspect_target_to_proto(&target) as i32,
+                    segment_id: inspect_segment_id(&target),
+                    database_name: database_name.to_owned(),
+                },
+                |mut client, request| async move { client.inspect_collection(request).await },
+            )
+            .await?;
         Ok(scoped_collection_response(
             response.database_name,
             response.collection_name,
@@ -1221,12 +1317,6 @@ fn inspect_segment_id(target: &InspectTarget) -> String {
     match target {
         InspectTarget::Segment(segment_id) => segment_id.clone(),
         InspectTarget::Manifest | InspectTarget::Wal | InspectTarget::Maintenance => String::new(),
-    }
-}
-
-impl From<LogPoseError> for ClientError {
-    fn from(error: LogPoseError) -> Self {
-        Self::InvalidResponse(error.to_string())
     }
 }
 
