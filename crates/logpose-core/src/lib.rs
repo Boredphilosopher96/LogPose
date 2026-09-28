@@ -1030,6 +1030,21 @@ mod tests {
     };
 
     #[test]
+    fn default_index_config_keeps_the_engine_default_index_policy() {
+        assert_eq!(
+            index_policy(&IndexConfig::default()),
+            IndexPolicy::default()
+        );
+        let tuned = index_policy(&IndexConfig {
+            hnsw_m: 24,
+            hnsw_ef_construction: 200,
+        });
+        assert_eq!(tuned.hnsw.m, 24);
+        assert_eq!(tuned.hnsw.ef_construction, 200);
+        assert_eq!(tuned.graph_min_rows, IndexPolicy::default().graph_min_rows);
+    }
+
+    #[test]
     fn rejects_reserved_anonymous_local_node_name_at_runtime_bootstrap() {
         let result = std::panic::catch_unwind(|| {
             AppState::new(LogPoseConfig {
