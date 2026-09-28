@@ -129,7 +129,7 @@ ASCII trailer `retry-after-ms` for clients that do not decode rich details.
 | `UNAVAILABLE`                | `UNAVAILABLE`         |                                                                 | sometimes  |
 | `COLLECTION_POISONED`        | `FAILED_PRECONDITION` | `collection`                                                    | no         |
 | `WAL_WRITE_FAILED`           | `UNAVAILABLE` (`not_applied`) or `INTERNAL` (`unknown_*`) | `collection`, `outcome` (`not_applied`, `unknown_fenced`, `unknown_unfenced`) | no |
-| `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
+| `DATA_CORRUPTION`            | `DATA_LOSS`           | `corruption_kind` (`wal`, `segment`, `deletion_vector`, `manifest`, `index`, `descriptor`, `metadata`), `location` | no |
 | `IO_ERROR`                   | `INTERNAL`            | `io_error_kind`                                                 | no         |
 | `INTERNAL`                   | `INTERNAL`            |                                                                 | no         |
 <!-- markdownlint-enable MD060 -->
@@ -620,7 +620,7 @@ curl -X POST http://127.0.0.1:8080/v1/collections/embeddings/query \
   ],
   "diagnostics": {
     "chosen_plan": "hybrid_exact_ann_merge",
-    "planner_reason": "mutable delta present alongside HNSW sidecar",
+    "planner_reason": "mutable exact candidates and immutable ann candidates must be merged before rerank",
     "estimated_selectivity": 1.0,
     "units_considered": 2,
     "units_pruned": 0,

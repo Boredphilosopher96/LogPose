@@ -14,9 +14,9 @@ LogPose is a Rust retrieval database prototype shaped more like a storage engine
 ## What It Is Today
 
 - one local process with role-aware control-plane and data-plane boundaries
-- local filesystem durability with WAL, manifests, immutable segments, and index sidecars
+- local filesystem durability with WAL, manifests, immutable segments, and deletion vectors
 - persisted database descriptors, bootstrap bearer authentication, and database-scoped access policies for read, write, and owner control
-- immutable HNSW sidecars for ANN, with exact execution still covering mutable state and acting as the correctness oracle
+- ANN plans over immutable segments (served by an exact scan of their live rows until segments carry vector index sections), with exact execution still covering mutable state and acting as the correctness oracle
 - layered integration, randomized, process-boundary, and deterministic service-boundary tests
 
 ## What Is Not Here Yet
