@@ -69,6 +69,12 @@ pub const MAX_EF_MULTIPLIER: usize = 8;
 /// Rows of `B` per morsel of a parallel exact scan: a scan of more than two morsels splits
 /// into morsels scanned in parallel on the query pool.
 pub const SCAN_MORSEL_ROWS: u32 = 8_192;
+/// Units run their candidates stage in parallel when more than one has more live rows than
+/// this; smaller units run inline, where a hand-off to another worker would cost more than
+/// they do.
+pub const PARALLEL_UNIT_ROWS: u32 = 4_096;
+/// Units rerank in parallel when they have more candidates than this in all.
+pub const PARALLEL_RERANK_CANDIDATES: usize = 2_048;
 
 /// How a search chooses and runs its strategies.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -378,12 +384,16 @@ impl TopK {
     }
 }
 
-/// An exactly scored row: its rank (the metric value oriented so lower is better), key, and
-/// reported value. Ordered by rank, then key, then address.
+/// An exactly scored row: its rank (the metric value oriented so lower is better), its key
+/// when read, and its reported value. Ordered by rank, then key (keyed rows first), then
+/// address.
+///
+/// Keys only break ties, and reading one costs a cache miss or two, so a row's key is read
+/// only when its rank ties another's at the final cut ([`Execution::resolve_ties`]).
 #[derive(Clone, Debug)]
 struct Scored {
     rank: f32,
-    key: PrimaryKey,
+    key: Option<PrimaryKey>,
     addr: RowAddr,
     value: f32,
 }
@@ -406,27 +416,45 @@ impl Ord for Scored {
     fn cmp(&self, other: &Self) -> Ordering {
         self.rank
             .total_cmp(&other.rank)
-            .then_with(|| compare_keys(&self.key, &other.key))
+            .then_with(|| match (&self.key, &other.key) {
+                (Some(left), Some(right)) => compare_keys(left, right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
             .then(self.addr.unit.cmp(&other.addr.unit))
             .then(self.addr.row.cmp(&other.addr.row))
     }
 }
 
-/// The best `k` of `scored`, sorted.
+/// The best `k` of `scored`, sorted, plus every row whose rank ties the `k`th: which of the tied
+/// rows are best depends on keys not read yet.
 fn best_k(scored: impl IntoIterator<Item = Scored>, k: usize) -> Vec<Scored> {
-    let mut heap: BinaryHeap<Scored> = BinaryHeap::with_capacity(k + 1);
-    for item in scored {
-        if heap.len() < k {
-            heap.push(item);
-        } else if heap.peek().is_some_and(|worst| item < *worst) {
-            heap.pop();
-            heap.push(item);
-        }
-    }
-    heap.into_sorted_vec()
+    let mut scored = scored.into_iter().collect::<Vec<_>>();
+    scored.sort_unstable();
+    cut_with_ties(&mut scored, k);
+    scored
 }
 
-/// A k-way heap merge of sorted lists to their first `k` items.
+/// Truncate sorted `items` to `k`, keeping every item whose rank ties the `k`th.
+fn cut_with_ties(items: &mut Vec<Scored>, k: usize) {
+    if k == 0 {
+        items.clear();
+        return;
+    }
+    let Some(kth) = items.get(k - 1).map(|item| item.rank) else {
+        return;
+    };
+    let end = items
+        .iter()
+        .skip(k)
+        .position(|item| item.rank.total_cmp(&kth).is_ne())
+        .map_or(items.len(), |extra| k + extra);
+    items.truncate(end);
+}
+
+/// A k-way heap merge of sorted lists to their first `k` items, plus every item whose rank ties
+/// the `k`th.
 fn merge_sorted(lists: Vec<Vec<Scored>>, k: usize) -> Vec<Scored> {
     let mut iters = lists
         .into_iter()
@@ -438,11 +466,18 @@ fn merge_sorted(lists: Vec<Vec<Scored>>, k: usize) -> Vec<Scored> {
             heap.push(Reverse((first, index)));
         }
     }
-    let mut out = Vec::with_capacity(k);
-    while out.len() < k {
+    let mut out: Vec<Scored> = Vec::with_capacity(k);
+    loop {
         let Some(Reverse((item, index))) = heap.pop() else {
             break;
         };
+        if out.len() >= k
+            && out
+                .last()
+                .is_none_or(|last| last.rank.total_cmp(&item.rank).is_ne())
+        {
+            break;
+        }
         if let Some(next) = iters[index].next() {
             heap.push(Reverse((next, index)));
         }
@@ -787,7 +822,17 @@ impl Execution {
                     let context = &self.context;
                     let pins = &self.pins;
                     let units = view.units();
-                    let results = if context.tuning.parallel {
+                    // Units run in parallel only when more than one has real work: handing a
+                    // task to another worker and joining it costs tens of microseconds, more
+                    // than a small unit (an empty memtable, a pruned segment) takes.
+                    let heavy = units
+                        .iter()
+                        .filter(|unit| {
+                            unit.live_count() > PARALLEL_UNIT_ROWS
+                                && !context.pruned.contains(&unit.id())
+                        })
+                        .count();
+                    let results = if context.tuning.parallel && heavy > 1 {
                         units
                             .into_par_iter()
                             .map(|unit| unit_candidates(&unit, pins, context))
@@ -823,7 +868,8 @@ impl Execution {
                     let merge_started = Instant::now();
                     let merged_from = lists.iter().map(Vec::len).sum::<usize>();
                     let unit_count = lists.len();
-                    let finalists = merge_sorted(lists, self.context.top_k);
+                    let mut finalists = merge_sorted(lists, self.context.top_k);
+                    self.resolve_ties(view, &mut finalists)?;
                     let merge_micros = micros_since(merge_started);
                     self.timings.merge = elapsed(merge_started);
                     let merge = PlanNode::new(
@@ -984,7 +1030,17 @@ impl Execution {
                 }
                 Ok((result, scored, count))
             };
-        let reranked = if context.tuning.parallel {
+        // A unit reranks at most its `k * rerank_factor` candidates, microseconds of work, so
+        // units rerank in parallel only when there are many candidates in all.
+        let candidates = units
+            .iter()
+            .map(|unit| match &unit.output {
+                Output::Approx(candidates) => candidates.len(),
+                Output::ScanF32(rows) => usize::try_from(rows.len()).unwrap_or(usize::MAX),
+                Output::Exact(_) | Output::None => 0,
+            })
+            .sum::<usize>();
+        let reranked = if context.tuning.parallel && candidates > PARALLEL_RERANK_CANDIDATES {
             units.into_par_iter().map(rerank_one).collect::<Vec<_>>()
         } else {
             units.into_iter().map(rerank_one).collect::<Vec<_>>()
@@ -998,6 +1054,50 @@ impl Execution {
             lists.push(scored);
         }
         Ok((out_units, lists))
+    }
+
+    /// Read the keys of finalists whose ranks tie, order them by (rank, key), and cut to `k`:
+    /// results with equal values are ordered by key, however many rows tie.
+    fn resolve_ties(
+        &self,
+        view: &ReadView,
+        finalists: &mut Vec<Scored>,
+    ) -> logpose_types::Result<()> {
+        let tied = |index: usize| {
+            let rank = finalists[index].rank;
+            let equal = |other: Option<&Scored>| {
+                other.is_some_and(|other| other.rank.total_cmp(&rank).is_eq())
+            };
+            equal(
+                index
+                    .checked_sub(1)
+                    .and_then(|before| finalists.get(before)),
+            ) || equal(finalists.get(index + 1))
+        };
+        let missing = (0..finalists.len())
+            .filter(|index| finalists[*index].key.is_none() && tied(*index))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let units: HashMap<UnitId, UnitView<'_>> = view
+                .units()
+                .into_iter()
+                .map(|unit| (unit.id(), unit))
+                .collect();
+            for index in missing {
+                let addr = finalists[index].addr;
+                let unit = units.get(&addr.unit).ok_or_else(|| {
+                    LogPoseError::internal(format!("unit {} left the view", addr.unit))
+                })?;
+                let key = unit
+                    .pks(&self.pins)?
+                    .pk_at(addr.row)
+                    .ok_or_else(|| missing_key(unit, addr.row))?;
+                finalists[index].key = Some(key);
+            }
+            finalists.sort_unstable();
+        }
+        finalists.truncate(self.context.top_k);
+        Ok(())
     }
 
     fn finish(
@@ -1456,15 +1556,9 @@ fn scan_f32(
             continue;
         };
         let value = metric_value(context.metric.metric, &context.raw_query, &vector);
-        let key = match candidate.key {
-            Some(key) => key,
-            None => pks
-                .pk_at(candidate.row)
-                .ok_or_else(|| missing_key(unit, candidate.row))?,
-        };
         scored.push(Scored {
             rank: context.metric.rank(value),
-            key,
+            key: candidate.key,
             addr: RowAddr {
                 unit: unit.id(),
                 row: candidate.row,
@@ -1487,7 +1581,6 @@ fn rerank_candidates(
     context: &Context,
 ) -> logpose_types::Result<Vec<Scored>> {
     let vectors = unit.vector_rows(context.field, pins)?;
-    let pks = unit.pks(pins)?;
     let mut scored = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let Some(vector) = vectors.get(candidate.row)? else {
@@ -1499,9 +1592,7 @@ fn rerank_candidates(
         }
         scored.push(Scored {
             rank: context.metric.rank(value),
-            key: pks
-                .pk_at(candidate.row)
-                .ok_or_else(|| missing_key(unit, candidate.row))?,
+            key: None,
             addr: RowAddr {
                 unit: unit.id(),
                 row: candidate.row,
@@ -1764,7 +1855,7 @@ mod tests {
     fn scored(rank: f32, key: i64, unit: u32) -> Scored {
         Scored {
             rank,
-            key: PrimaryKey::Int64(key),
+            key: Some(PrimaryKey::Int64(key)),
             addr: RowAddr {
                 unit: UnitId(unit),
                 row: 0,
@@ -1804,7 +1895,7 @@ mod tests {
             let k = usize::try_from(next() % 15).unwrap_or_default();
             let mut expected = all;
             expected.sort();
-            expected.truncate(k);
+            cut_with_ties(&mut expected, k);
             let merged = merge_sorted(lists, k);
             let keys = |items: &[Scored]| {
                 items
@@ -1817,17 +1908,28 @@ mod tests {
     }
 
     #[test]
-    fn best_k_breaks_value_ties_by_key() {
-        let items = (0..50).rev().map(|key| scored(1.0, key, 0));
+    fn best_k_keeps_every_row_tied_with_the_kth() {
+        let items = (0..50)
+            .rev()
+            .map(|key| scored(1.0, key, 0))
+            .chain([scored(0.5, 99, 0)]);
         let best = best_k(items, 3);
-        let keys = best.iter().map(|item| item.key.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            best.len(),
+            51,
+            "one better row and all fifty tied at the third"
+        );
+        let keys = best
+            .iter()
+            .take(3)
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             keys,
-            vec![
-                PrimaryKey::Int64(0),
-                PrimaryKey::Int64(1),
-                PrimaryKey::Int64(2)
-            ]
+            [99, 0, 1].map(|key| Some(PrimaryKey::Int64(key))).to_vec()
         );
+        let distinct = best_k((0..10).map(|key| scored(key as f32, key, 0)), 3);
+        assert_eq!(distinct.len(), 3);
+        assert!(best_k((0..10).map(|key| scored(1.0, key, 0)), 0).is_empty());
     }
 }
