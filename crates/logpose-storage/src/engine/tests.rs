@@ -629,11 +629,7 @@ async fn a_busy_collection_does_not_starve_other_collections_of_job_threads() {
     // Let the busy collection's job loop start.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let flushed = tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.job(move |core| core.flush_collection(&quiet)),
-    )
-    .await;
+    let flushed = tokio::time::timeout(Duration::from_secs(5), quiet.flush()).await;
     done.store(true, Ordering::Release);
     writer.join().expect("writer should join");
     flushed

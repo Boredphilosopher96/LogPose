@@ -22,6 +22,9 @@ use thiserror::Error;
 /// [`LogPoseError::NotLeader`]) and with transient metadata unavailability.
 pub const ROUTING_RETRY_AFTER: Duration = Duration::from_secs(1);
 
+/// Retry hint returned with [`LogPoseError::WriteStalled`]: about one flush's time.
+pub const WRITE_STALL_RETRY_AFTER: Duration = Duration::from_secs(1);
+
 /// Canonical, transport-neutral error class.
 ///
 /// The names and meanings follow the gRPC status codes of the same name. LogPose never uses
@@ -121,6 +124,8 @@ pub enum ErrorReason {
     SnapshotExpired,
     /// `TOO_MANY_SNAPSHOTS`: see [`LogPoseError::TooManySnapshots`].
     TooManySnapshots,
+    /// `WRITE_STALLED`: see [`LogPoseError::WriteStalled`].
+    WriteStalled,
     /// `UNAUTHENTICATED`: see [`LogPoseError::Unauthenticated`].
     Unauthenticated,
     /// `PERMISSION_DENIED`: see [`LogPoseError::PermissionDenied`].
@@ -147,7 +152,7 @@ pub enum ErrorReason {
 
 impl ErrorReason {
     /// Every reason, in declaration order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::InvalidArgument,
         Self::DimensionMismatch,
         Self::TooLarge,
@@ -160,6 +165,7 @@ impl ErrorReason {
         Self::StorageRootLocked,
         Self::SnapshotExpired,
         Self::TooManySnapshots,
+        Self::WriteStalled,
         Self::Unauthenticated,
         Self::PermissionDenied,
         Self::NotOwner,
@@ -189,6 +195,7 @@ impl ErrorReason {
             Self::StorageRootLocked => "STORAGE_ROOT_LOCKED",
             Self::SnapshotExpired => "SNAPSHOT_EXPIRED",
             Self::TooManySnapshots => "TOO_MANY_SNAPSHOTS",
+            Self::WriteStalled => "WRITE_STALLED",
             Self::Unauthenticated => "UNAUTHENTICATED",
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::NotOwner => "NOT_OWNER",
@@ -515,6 +522,18 @@ pub enum LogPoseError {
         /// Which limit was reached.
         reason: String,
     },
+    /// A write waited through a write stall for longer than the stall timeout: the collection
+    /// already had as many memtables waiting to be flushed as it allows, and its active
+    /// memtable was full. The write was not applied.
+    ///
+    /// This is `UNAVAILABLE` with a retry hint: the stall ends when a flush commits.
+    #[error("writes to collection '{collection}' are stalled: {reason}")]
+    WriteStalled {
+        /// The collection, as `database/collection`.
+        collection: String,
+        /// Why writes stall, and how long the write waited.
+        reason: String,
+    },
 
     // ----- Authentication and authorization. -----
     /// The request carries no valid credentials.
@@ -801,6 +820,7 @@ impl LogPoseError {
             Self::NotOwner { .. }
             | Self::NotLeader { .. }
             | Self::Unavailable { .. }
+            | Self::WriteStalled { .. }
             | Self::WalWriteFailed {
                 outcome: WriteOutcome::NotApplied,
                 ..
@@ -832,6 +852,7 @@ impl LogPoseError {
             Self::StorageRootLocked { .. } => ErrorReason::StorageRootLocked,
             Self::SnapshotExpired { .. } => ErrorReason::SnapshotExpired,
             Self::TooManySnapshots { .. } => ErrorReason::TooManySnapshots,
+            Self::WriteStalled { .. } => ErrorReason::WriteStalled,
             Self::Unauthenticated { .. } => ErrorReason::Unauthenticated,
             Self::PermissionDenied { .. } => ErrorReason::PermissionDenied,
             Self::NotOwner { .. } => ErrorReason::NotOwner,
@@ -858,6 +879,7 @@ impl LogPoseError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::NotOwner { .. } | Self::NotLeader { .. } => Some(ROUTING_RETRY_AFTER),
+            Self::WriteStalled { .. } => Some(WRITE_STALL_RETRY_AFTER),
             Self::Unavailable { retry_after, .. } => *retry_after,
             Self::BulkBatchFailed { source, .. } => source.retry_after(),
             _ => None,
@@ -931,7 +953,8 @@ impl LogPoseError {
             Self::ReconciliationRequired { collection, .. }
             | Self::CollectionPoisoned { collection, .. }
             | Self::SnapshotExpired { collection, .. }
-            | Self::TooManySnapshots { collection, .. } => {
+            | Self::TooManySnapshots { collection, .. }
+            | Self::WriteStalled { collection, .. } => {
                 put("collection", collection.clone());
             }
             Self::StorageRootLocked {
@@ -1087,6 +1110,10 @@ pub mod fixtures {
                 collection: "default/docs".to_owned(),
                 reason: "it already holds 64 pinned snapshots".to_owned(),
             },
+            LogPoseError::WriteStalled {
+                collection: "default/docs".to_owned(),
+                reason: "2 memtables are waiting to be flushed".to_owned(),
+            },
             LogPoseError::Unauthenticated {
                 message: "missing bearer token".to_owned(),
             },
@@ -1180,9 +1207,10 @@ mod tests {
             LogPoseError::WalWriteFailed { .. } => 21,
             LogPoseError::SnapshotExpired { .. } => 22,
             LogPoseError::TooManySnapshots { .. } => 23,
+            LogPoseError::WriteStalled { .. } => 24,
         }
     }
-    const VARIANT_COUNT: usize = 24;
+    const VARIANT_COUNT: usize = 25;
 
     #[test]
     fn every_variant_is_listed() {
@@ -1259,6 +1287,7 @@ mod tests {
                 ErrorCode::ResourceExhausted,
                 "TOO_MANY_SNAPSHOTS",
             ),
+            ("WriteStalled", ErrorCode::Unavailable, "WRITE_STALLED"),
             (
                 "Unauthenticated",
                 ErrorCode::Unauthenticated,
@@ -1346,6 +1375,21 @@ mod tests {
         assert_eq!(exhausted.reason(), "TOO_MANY_SNAPSHOTS");
         assert_eq!(exhausted.details().metadata["collection"], "default/docs");
         assert!(exhausted.to_string().contains("64 pinned"), "{exhausted}");
+    }
+
+    #[test]
+    fn a_stalled_write_is_unavailable_with_a_retry_hint() {
+        let stalled = LogPoseError::WriteStalled {
+            collection: "default/docs".to_owned(),
+            reason: "2 memtables are waiting to be flushed".to_owned(),
+        };
+        assert_eq!(stalled.code(), ErrorCode::Unavailable);
+        assert_eq!(stalled.reason(), "WRITE_STALLED");
+        assert_eq!(stalled.retry_after(), Some(WRITE_STALL_RETRY_AFTER));
+        let details = stalled.details();
+        assert_eq!(details.metadata["collection"], "default/docs");
+        assert_eq!(details.retry_after_ms, Some(1000));
+        assert!(stalled.to_string().contains("stalled"), "{stalled}");
     }
 
     #[test]

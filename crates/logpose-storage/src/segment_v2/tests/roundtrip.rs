@@ -385,6 +385,45 @@ fn file_source_reads_what_the_builder_wrote() {
     std::fs::remove_dir_all(dir).expect("temp dir removed");
 }
 
+/// `for_each_row` visits exactly the rows it is asked for, in row order, each equal to what
+/// `read_rows` returns for it, and hands back the first error the visitor returns.
+#[test]
+fn for_each_row_visits_the_wanted_rows_in_order_and_stops_at_a_visit_error() {
+    let (_, _, _, bytes) = random_segment(17, 120);
+    let reader = open_verified(&bytes);
+    let all = reader.read_rows().expect("rows");
+    let mut visited = Vec::new();
+    reader
+        .for_each_row(
+            |row| row % 3 != 0,
+            |row, stored| {
+                visited.push((row, stored));
+                Ok::<_, SegmentError>(())
+            },
+        )
+        .expect("visit");
+    let expected = (0_u32..)
+        .zip(all)
+        .filter(|(row, _)| row % 3 != 0)
+        .collect::<Vec<_>>();
+    assert_eq!(visited, expected);
+
+    let mut seen = 0;
+    let stopped = reader.for_each_row(
+        |_| true,
+        |row, _| {
+            seen += 1;
+            if row == 4 {
+                Err(SegmentError::Encode("stop".to_owned()))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(stopped, Err(SegmentError::Encode(message)) if message == "stop"));
+    assert_eq!(seen, 5, "nothing is visited after the error");
+}
+
 #[test]
 fn every_section_is_64_byte_aligned_and_sections_are_ordered() {
     let bytes = fixture::golden_bytes();

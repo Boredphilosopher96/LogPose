@@ -97,7 +97,8 @@ pub struct CollectionDescriptor {
     pub flush_threshold_ops: usize,
     /// Mutable byte threshold before a flush should occur.
     pub flush_threshold_bytes: usize,
-    /// Immutable segment threshold before compaction is recommended.
+    /// Segments of one size tier that start a background compaction merging them (the
+    /// size-tiered policy's `min_merge`). `usize::MAX` turns background compaction off.
     pub compaction_threshold_segments: usize,
 }
 

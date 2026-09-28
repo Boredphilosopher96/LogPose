@@ -1101,13 +1101,41 @@ impl<S: SectionSource> SegmentReader<S> {
         ))
     }
 
-    /// Read every row back as a WAL row image. Used by compaction-style
-    /// full scans and by tests; it loads every section.
+    /// Read every row back as a WAL row image. Used by full scans and by
+    /// tests; it loads every section and holds every row.
     ///
     /// # Errors
     ///
     /// I/O or corruption errors.
     pub fn read_rows(&self) -> Result<Vec<SegmentRow>, SegmentError> {
+        // Not sized from the header up front: a corrupt row count must fail as corruption, not
+        // as an allocation.
+        let mut out = Vec::new();
+        self.for_each_row(
+            |_| true,
+            |_, row| {
+                out.push(row);
+                Ok::<_, SegmentError>(())
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// Visit the rows `wanted` accepts, in row order, each as a WAL row
+    /// image. Every section is loaded whole (around the cache), but a row is
+    /// decoded only when it is visited and is the visitor's to keep or drop,
+    /// so a scan that copies rows elsewhere (compaction) holds the sections
+    /// and one row, never a second copy of every row; rows `wanted` rejects
+    /// are never decoded.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors, or the first error `visit` returns.
+    pub fn for_each_row<E: From<SegmentError>>(
+        &self,
+        mut wanted: impl FnMut(u32) -> bool,
+        mut visit: impl FnMut(u32, SegmentRow) -> Result<(), E>,
+    ) -> Result<(), E> {
         let via = Via::Bypass;
         let rows = usize_from(self.header.row_count);
         let seqs = self.row_meta_via(via)?;
@@ -1137,9 +1165,11 @@ impl<S: SectionSource> SegmentReader<S> {
             None => Vec::new(),
         };
 
-        let mut out = Vec::with_capacity(rows);
         for row in 0..rows {
             let row_u32 = u32::try_from(row).unwrap_or(u32::MAX);
+            if !wanted(row_u32) {
+                continue;
+            }
             let pk = pks.get(row).ok_or_else(|| {
                 SegmentError::corrupt(Region::File, format!("pk of row {row} is missing"))
             })?;
@@ -1174,12 +1204,15 @@ impl<S: SectionSource> SegmentReader<S> {
             if let Some(raw) = dynamic.get(block).and_then(|block| block.raw(row_u32)) {
                 image.dynamic = Some(ValueBytes::from_encoded(raw.to_vec()));
             }
-            out.push(SegmentRow {
-                seq_no: seqs.get(row).copied().unwrap_or(0),
-                image,
-            });
+            visit(
+                row_u32,
+                SegmentRow {
+                    seq_no: seqs.get(row).copied().unwrap_or(0),
+                    image,
+                },
+            )?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Verify the whole file: every CRC, every padding byte, and every

@@ -243,7 +243,7 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     engine
         .core()
         .flush_collection(&handle)
-        .expect("flush: generation 1, unit 1");
+        .expect("flush: generation 1, unit 2");
     write(&engine, &handle, "b", 2.0);
 
     controlled.fail_renames_to(CURRENT_FILE, 1);
@@ -266,13 +266,13 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
         exists(vfs.as_ref(), &manifest_path(&dir, 2)),
         "the failed attempt wrote generation 2"
     );
-    // The failed flush's output was unit 3 (unit 2 was the memtable it froze).
-    assert!(exists(vfs.as_ref(), &segment_path(&dir, UnitId(3))));
+    // The failed flush's output was unit 4 (the freeze gave the new memtable unit 3).
+    assert!(exists(vfs.as_ref(), &segment_path(&dir, UnitId(4))));
     let seen = rows(&engine);
     drop(handle);
     drop(engine);
 
-    // In-process reopen: CURRENT still names generation 1, and generation 2 and unit 3 are
+    // In-process reopen: CURRENT still names generation 1, and generation 2 and unit 4 are
     // orphans.
     let engine = open(controlled.clone());
     let first = rows(&engine);
@@ -280,14 +280,14 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     let handle = open_handle(&engine);
     assert_eq!(handle.current().manifest_generation, 1);
     assert!(!exists(vfs.as_ref(), &manifest_path(&dir, 2)));
-    assert!(!exists(vfs.as_ref(), &segment_path(&dir, UnitId(3))));
+    assert!(!exists(vfs.as_ref(), &segment_path(&dir, UnitId(4))));
     engine.core().flush_collection(&handle).expect("retry");
     let retried = handle.current();
     assert_eq!(retried.manifest_generation, 3, "generation 2 is burned");
     assert_eq!(
         retried.manifest.units().collect::<Vec<_>>(),
-        [UnitId(1), UnitId(5)],
-        "unit 3 is burned; the recovered memtable took unit 4"
+        [UnitId(2), UnitId(7)],
+        "unit 4 is burned; the recovered memtable took unit 5, the next one unit 6"
     );
     let after_retry = rows(&engine);
     drop((handle, retried));
@@ -381,12 +381,13 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
     }
     assert_no_orphans(vfs.as_ref(), &handle, "planted");
     // Unit 8, DV generation 4, and manifest generation 9 were seen, so they are never issued:
-    // the recovered memtable took unit 9, the flush output unit 10.
+    // the recovered memtable took unit 9, the one the flush froze it for unit 10, and the
+    // flush output unit 11.
     write(&engine, &handle, "b", 2.0);
     engine.core().flush_collection(&handle).expect("flush");
     let version = handle.current();
     assert_eq!(version.manifest_generation, 10);
-    assert_eq!(version.manifest.units().last(), Some(UnitId(10)));
+    assert_eq!(version.manifest.units().last(), Some(UnitId(11)));
     assert!(version.manifest.next_dv_gen >= 5);
 }
 
@@ -614,6 +615,163 @@ fn a_crash_at_every_op_of_a_flush_that_writes_a_dv_file_recovers_the_same_state(
             drop(handle);
             assert_index_resolves_every_key(&engine, &context);
         }
+    }
+}
+
+/// Three segments `{a, b}`, `{c, d}`, `{e, f}`, and a compaction of all three that the test
+/// steps by hand: begun, then, while it builds, an upsert of `a`, a delete of `c`, and a new
+/// `g`, so the commit reconciles two deletions onto the output and writes its DV file.
+fn compaction_in_progress(
+    fault: &Arc<FaultVfs>,
+) -> (
+    Engine,
+    Arc<CollectionHandle>,
+    crate::handle::JobTicket,
+    crate::writer::JobStart,
+) {
+    let engine = open(fault.process());
+    let handle = create(&engine);
+    for pair in [["a", "b"], ["c", "d"], ["e", "f"]] {
+        for id in pair {
+            write(&engine, &handle, id, 1.0);
+        }
+        engine.core().flush_collection(&handle).expect("flush");
+    }
+    let (ticket, start) = handle
+        .begin_job(crate::writer::JobKind::Compact)
+        .expect("the compaction begins");
+    write(&engine, &handle, "a", 10.0);
+    engine
+        .core()
+        .write(
+            &handle,
+            vec![WriteOperation::Delete(DeleteRecord {
+                id: RecordId::new("c"),
+            })],
+        )
+        .expect("delete");
+    write(&engine, &handle, "g", 7.0);
+    (engine, handle, ticket, start)
+}
+
+/// Build and commit the compaction [`compaction_in_progress`] began. Returns whether it
+/// committed.
+fn finish_compaction(
+    engine: &Engine,
+    handle: &Arc<CollectionHandle>,
+    mut ticket: crate::handle::JobTicket,
+    start: crate::writer::JobStart,
+) -> bool {
+    let crate::writer::JobWork::Compact(work) = &start.work else {
+        unreachable!("three segments to compact");
+    };
+    let built =
+        engine
+            .core()
+            .build_compaction(handle, &start.version, start.unit, work, &mut ticket);
+    drop(start);
+    match built {
+        Ok(commit) => ticket.commit(commit).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Compaction crash analysis, exhaustively: a crash at every mutating operation of a
+/// compaction whose commit reconciles deletions onto its output (the output segment, its sync
+/// and directory sync, the output's DV file, the manifest publish, and the removal of the
+/// inputs), under every tear mode, recovers the same rows from either the old or the new
+/// manifest, with no orphan, the reconciled deletions in force, and a primary-key index that
+/// resolves every key.
+#[test]
+fn a_crash_at_every_op_of_a_compaction_recovers_the_same_state() {
+    let clean = FaultVfs::new(90);
+    let (engine, handle, ticket, start) = compaction_in_progress(&clean);
+    let expected = rows(&engine);
+    let before = clean.mutating_ops();
+    assert!(finish_compaction(&engine, &handle, ticket, start));
+    engine.wait_for_gc();
+    let ops = clean.mutating_ops() - before;
+    assert_eq!(rows(&engine), expected);
+    let version = handle.current();
+    assert_eq!(version.manifest_generation, 4);
+    assert_eq!(version.manifest.segments.len(), 1);
+    assert_eq!(
+        version.manifest.segments[0].dv.map(|dv| dv.cardinality),
+        Some(2),
+        "a's and c's copies are deleted in the output's DV file"
+    );
+    drop((version, handle));
+    drop(engine);
+
+    for tear in TearMode::ALL {
+        for k in 0..=ops {
+            let context = format!("{tear:?}, crash after {k} of {ops} compaction ops");
+            let fault = FaultVfs::new(3000 + k);
+            let (engine, handle, ticket, start) = compaction_in_progress(&fault);
+            fault.set_plan(FaultPlan {
+                crash_after_ops: Some(fault.mutating_ops() + k),
+                tear,
+                ..FaultPlan::default()
+            });
+            let committed = finish_compaction(&engine, &handle, ticket, start);
+            engine.wait_for_gc();
+            drop(handle);
+            drop(engine);
+            fault.crash();
+            fault.set_plan(FaultPlan::default());
+
+            let engine = open(fault.process());
+            assert_eq!(rows(&engine), expected, "{context}");
+            let handle = open_handle(&engine);
+            let version = handle.current();
+            assert!(version.manifest_generation <= 4, "{context}");
+            if committed {
+                assert_eq!(version.manifest_generation, 4, "{context}: durable");
+            }
+            match version.manifest_generation {
+                4 => assert_eq!(version.segments.len(), 1, "{context}"),
+                _ => assert_eq!(version.segments.len(), 3, "{context}"),
+            }
+            drop(version);
+            assert_no_orphans(fault.process().as_ref(), &handle, &context);
+            drop(handle);
+            assert_index_resolves_every_key(&engine, &context);
+        }
+    }
+}
+
+/// The named compaction crash points: after the output's sync nothing is published, so the
+/// output is an orphan; after the output DV file's sync the same holds for both files. Either
+/// way recovery keeps the inputs and replays the deletions that landed during the job.
+#[test]
+fn named_compaction_crash_points_leave_the_inputs_in_force() {
+    for (seed, point) in [
+        (91, CrashPoint::CompactionAfterOutputSync),
+        (92, CrashPoint::CompactionAfterDvSync),
+    ] {
+        let fault = FaultVfs::new(seed);
+        let (engine, handle, ticket, start) = compaction_in_progress(&fault);
+        let expected = rows(&engine);
+        fault.set_plan(FaultPlan {
+            crash_at: Some(point),
+            ..FaultPlan::default()
+        });
+        assert!(
+            !finish_compaction(&engine, &handle, ticket, start),
+            "{point:?}"
+        );
+        drop(handle);
+        drop(engine);
+        fault.crash();
+        fault.set_plan(FaultPlan::default());
+        let engine = open(fault.process());
+        assert_eq!(rows(&engine), expected, "{point:?}");
+        let handle = open_handle(&engine);
+        assert_eq!(handle.current().manifest_generation, 3, "{point:?}");
+        assert_eq!(handle.current().segments.len(), 3, "{point:?}");
+        assert_no_orphans(fault.process().as_ref(), &handle, &format!("{point:?}"));
+        drop(handle);
+        assert_index_resolves_every_key(&engine, &format!("{point:?}"));
     }
 }
 

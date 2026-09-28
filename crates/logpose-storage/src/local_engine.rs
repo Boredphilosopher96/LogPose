@@ -1,9 +1,10 @@
 //! `LocalStorageEngine`: the `StorageEngine` implementation over an [`Engine`].
 //!
 //! Every trait method resolves its collection with a map lookup and runs its blocking work on
-//! the engine's I/O pool (reads) or maintenance job threads (flush and compaction), never on a
-//! tokio worker. Writes go to the collection's writer task, which does its own I/O on the I/O
-//! pool. Reads of the current state use the published `Version` and read no metadata files.
+//! the engine's I/O pool (reads), never on a tokio worker. Writes, flushes, and compactions go
+//! to the collection's writer task, which does its own I/O on the I/O pool and runs job builds
+//! on the job threads. Reads of the current state use the published `Version` and read no
+//! metadata files.
 
 use crate::{
     BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget,
@@ -14,7 +15,6 @@ use crate::{
     handle::CollectionHandle,
     legacy::MetadataFilter,
     legacy_view::legacy_ops,
-    maintenance::MaintenanceOperation,
     tokens::SnapshotToken,
 };
 use async_trait::async_trait;
@@ -190,36 +190,15 @@ impl LocalStorageEngine {
         self.engine.collection(&collection_ref_from_lookup(name))
     }
 
-    /// The handle of `name` for a write. The first write to a recovered collection resumes its
-    /// persisted maintenance, as a v1 state load did.
-    fn writable_handle(&self, name: &str) -> Result<Arc<CollectionHandle>> {
-        let handle = self.handle(name)?;
-        if handle.take_maintenance_resume() {
-            let core = self.engine.core();
-            let resumed = Arc::clone(&handle);
-            // Resuming persists the maintenance status: blocking I/O, so not on this worker.
-            let _ = self
-                .engine
-                .runtime()
-                .io
-                .execute(move || core.resume_maintenance(&resumed));
-        }
-        Ok(handle)
-    }
-
     /// Run data-plane work for `handle` on the I/O pool. The first data-plane access of a
-    /// recovered collection resumes its persisted maintenance, as a v1 state load did.
+    /// recovered collection lets its background maintenance run.
     async fn data_io<T: Send + 'static>(
         &self,
         handle: Arc<CollectionHandle>,
         f: impl FnOnce(&CoreRef, &Arc<CollectionHandle>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.engine
-            .io(move |core| {
-                core.resume_armed_maintenance(&handle);
-                f(core, &handle)
-            })
-            .await
+        handle.arm_maintenance();
+        self.engine.io(move |core| f(core, &handle)).await
     }
 
     /// The handle serving `descriptor`, which must name the same collection (same id).
@@ -242,20 +221,6 @@ impl LocalStorageEngine {
                 let descriptor = core.plan_collection_descriptor(&request)?;
                 core.create_collection(descriptor, Some(&assignment))
                     .map(|handle| handle.descriptor().clone())
-            })
-            .await
-    }
-
-    async fn maintain(
-        &self,
-        collection_name: &str,
-        operation: MaintenanceOperation,
-    ) -> Result<Snapshot> {
-        let handle = self.handle(collection_name)?;
-        self.engine
-            .job(move |core| {
-                core.resume_armed_maintenance(&handle);
-                core.perform_maintenance(&handle, operation)
             })
             .await
     }
@@ -358,12 +323,12 @@ impl StorageEngine for LocalStorageEngine {
     }
 
     async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
-        let handle = self.writable_handle(collection_name)?;
+        let handle = self.handle(collection_name)?;
         handle.alter_schema(change).await
     }
 
     async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
-        let handle = self.writable_handle(collection_name)?;
+        let handle = self.handle(collection_name)?;
         handle.write(ops).await
     }
 
@@ -386,7 +351,7 @@ impl StorageEngine for LocalStorageEngine {
         collection_name: &str,
         operations: Vec<WriteOperation>,
     ) -> Result<CommitAck> {
-        let handle = self.writable_handle(collection_name)?;
+        let handle = self.handle(collection_name)?;
         let ops = legacy_ops(operations)?;
         handle
             .write(ops)
@@ -468,13 +433,11 @@ impl StorageEngine for LocalStorageEngine {
     }
 
     async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        self.maintain(collection_name, MaintenanceOperation::Flush)
-            .await
+        self.handle(collection_name)?.flush().await
     }
 
     async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        self.maintain(collection_name, MaintenanceOperation::Compact)
-            .await
+        self.handle(collection_name)?.compact().await
     }
 
     async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
@@ -494,22 +457,7 @@ impl StorageEngine for LocalStorageEngine {
         &self,
         descriptor: &CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
-        let handle = self.handle_for(descriptor)?;
-        Ok(self.engine.core().maintenance_status(&handle))
-    }
-
-    async fn recover_maintenance_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<()> {
-        let handle = self.handle_for(descriptor)?;
-        self.engine
-            .io(move |core| {
-                handle.take_maintenance_resume();
-                core.resume_maintenance(&handle);
-                Ok(())
-            })
-            .await
+        Ok(self.handle_for(descriptor)?.maintenance_status())
     }
 
     async fn stats_snapshot(

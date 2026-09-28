@@ -486,7 +486,14 @@ pub async fn run_background_maintenance_stays_off() {
         .stats(COLLECTION_NAME)
         .await
         .expect("stats should succeed");
-    assert_eq!(stats.maintenance, MaintenanceStatus::default());
+    // The explicit flushes are the only jobs that ran.
+    assert_eq!(
+        stats.maintenance,
+        MaintenanceStatus {
+            completed_runs: usize::try_from(segments).expect("fits"),
+            ..MaintenanceStatus::default()
+        }
+    );
     assert_eq!(stats.manifest_generation, segments);
     assert_eq!(stats.segment_count as u64, segments);
 }

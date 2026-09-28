@@ -4,18 +4,17 @@
 use crate::{
     clock::Clock,
     engine::EngineCore,
-    maintenance::MaintenanceState,
     tokens::{SnapshotToken, TokenConfig, TokenRegistry},
     version::Version,
     writer::{
-        ControlMsg, JobCommit, JobKind, JobStart, SchemaChange, WriteRequest, WriterChannels,
+        ControlMsg, JobCommit, JobId, JobKind, Queued, SchemaChange, WriteRequest, WriterChannels,
     },
 };
 use arc_swap::ArcSwap;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, ResourceKind,
-    Result, SeqNo, Snapshot, record::ClientOp, schema::CollectionSchema,
+    CollectionAssignment, CollectionId, CollectionRef, CommitAck, LogPoseError, MaintenanceStatus,
+    ResourceKind, Result, SeqNo, Snapshot, record::ClientOp, schema::CollectionSchema,
 };
 use std::{
     collections::VecDeque,
@@ -140,14 +139,15 @@ pub struct CollectionHandle {
     /// First fatal error; once set, the collection refuses writes and maintenance and serves
     /// reads of its last published version.
     poison: OnceLock<Poison>,
-    /// Set when recovery found persisted pending maintenance that has not been resumed yet.
-    resume_maintenance: AtomicBool,
+    /// Whether background maintenance may run. A recovered collection runs none until its
+    /// first data-plane access, so a node that only reports status for a collection never
+    /// runs its jobs.
+    armed: AtomicBool,
     writer: WriterChannels,
-    /// Background maintenance queue and its status.
-    pub(crate) jobs: Mutex<MaintenanceState>,
-    /// Serializes writes of `maintenance.json` and holds the status version last written, so
-    /// the jobs lock is never held across the file's fsync.
-    pub(crate) status_file: Mutex<u64>,
+    /// Maintenance status, runtime state the writer keeps current.
+    status: Mutex<MaintenanceStatus>,
+    /// Rows and bytes flushes and compactions wrote, for write amplification.
+    written: [AtomicU64; 4],
     /// Pinned snapshots.
     tokens: TokenRegistry,
     token_context: Arc<TokenContext>,
@@ -163,7 +163,7 @@ impl CollectionHandle {
     pub(crate) fn new(
         version: Version,
         writer: WriterChannels,
-        jobs: MaintenanceState,
+        armed: bool,
         token_context: Arc<TokenContext>,
     ) -> Self {
         let meta = Arc::clone(&version.meta);
@@ -177,10 +177,10 @@ impl CollectionHandle {
             visible,
             state: AtomicU8::new(STATE_OPEN),
             poison: OnceLock::new(),
-            resume_maintenance: AtomicBool::new(false),
+            armed: AtomicBool::new(armed),
             writer,
-            jobs: Mutex::new(jobs),
-            status_file: Mutex::new(0),
+            status: Mutex::new(MaintenanceStatus::default()),
+            written: Default::default(),
             pk_index_bytes: AtomicU64::new(0),
             recent: Mutex::new(VecDeque::new()),
         }
@@ -355,15 +355,29 @@ impl CollectionHandle {
         self.submit_blocking(|ack| WriteRequest::AlterSchema { change, ack })
     }
 
+    /// A request stamped with the engine-clock time it is submitted at: a request that waits
+    /// through a write stall for longer than `write_stall_timeout` fails with `WriteStalled`.
+    fn queued(
+        &self,
+        request: impl FnOnce(oneshot::Sender<Result<CommitAck>>) -> WriteRequest,
+    ) -> (Queued, oneshot::Receiver<Result<CommitAck>>) {
+        let (ack, acked) = oneshot::channel();
+        let queued = Queued {
+            request: request(ack),
+            enqueued_at: self.token_context.clock.now(),
+        };
+        (queued, acked)
+    }
+
     async fn submit(
         &self,
         request: impl FnOnce(oneshot::Sender<Result<CommitAck>>) -> WriteRequest,
     ) -> Result<CommitAck> {
         self.ensure_writable()?;
-        let (ack, acked) = oneshot::channel();
+        let (queued, acked) = self.queued(request);
         self.writer
             .requests
-            .send(request(ack))
+            .send(queued)
             .await
             .map_err(|_| self.unavailable())?;
         acked.await.map_err(|_| self.writer_stopped())?
@@ -374,12 +388,107 @@ impl CollectionHandle {
         request: impl FnOnce(oneshot::Sender<Result<CommitAck>>) -> WriteRequest,
     ) -> Result<CommitAck> {
         self.ensure_writable()?;
-        let (ack, acked) = oneshot::channel();
+        let (queued, acked) = self.queued(request);
         self.writer
             .requests
-            .blocking_send(request(ack))
+            .blocking_send(queued)
             .map_err(|_| self.unavailable())?;
         acked.blocking_recv().map_err(|_| self.writer_stopped())?
+    }
+
+    /// Flush every operation visible now: freeze the active memtable and flush the frozen
+    /// memtables until the checkpoint covers it. Returns the snapshot after the last flush.
+    pub async fn flush(&self) -> Result<Snapshot> {
+        let replied = self.control_request(|reply| ControlMsg::Flush { reply: Some(reply) })?;
+        replied.await.map_err(|_| self.writer_stopped())?
+    }
+
+    /// [`CollectionHandle::flush`] for threads outside any async runtime.
+    pub fn flush_blocking(&self) -> Result<Snapshot> {
+        let replied = self.control_request(|reply| ControlMsg::Flush { reply: Some(reply) })?;
+        replied.blocking_recv().map_err(|_| self.writer_stopped())?
+    }
+
+    /// Compact the collection's segments into one, as far as one job's maintenance-memory
+    /// reservation allows, once no background compaction runs. Fails with
+    /// [`LogPoseError::TooLarge`] when even two segments need more than the whole pool.
+    pub async fn compact(&self) -> Result<Snapshot> {
+        let replied = self.control_request(|reply| ControlMsg::Compact { reply })?;
+        replied.await.map_err(|_| self.writer_stopped())?
+    }
+
+    /// [`CollectionHandle::compact`] for threads outside any async runtime.
+    pub fn compact_blocking(&self) -> Result<Snapshot> {
+        let replied = self.control_request(|reply| ControlMsg::Compact { reply })?;
+        replied.blocking_recv().map_err(|_| self.writer_stopped())?
+    }
+
+    /// Ask the writer to flush what is visible now, without waiting (the engine's memtable
+    /// budget trigger).
+    pub(crate) fn request_flush(&self) {
+        let _ = self.writer.control.send(ControlMsg::Flush { reply: None });
+    }
+
+    fn control_request(
+        &self,
+        message: impl FnOnce(oneshot::Sender<Result<Snapshot>>) -> ControlMsg,
+    ) -> Result<oneshot::Receiver<Result<Snapshot>>> {
+        self.ensure_writable()?;
+        let (reply, replied) = oneshot::channel();
+        self.writer
+            .control
+            .send(message(reply))
+            .map_err(|_| self.unavailable())?;
+        Ok(replied)
+    }
+
+    /// The collection's maintenance status: jobs waiting for a permit, the job running, the
+    /// last failure, and the jobs completed since the engine opened. Runtime state only.
+    #[must_use]
+    pub fn maintenance_status(&self) -> MaintenanceStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Change the maintenance status; only the writer calls this.
+    pub(crate) fn update_maintenance_status(&self, change: impl FnOnce(&mut MaintenanceStatus)) {
+        change(&mut self.status.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+
+    /// Rows and bytes that flushes and compactions wrote since the engine opened.
+    #[must_use]
+    pub fn maintenance_written(&self) -> MaintenanceWritten {
+        let load = |index: usize| self.written[index].load(Ordering::Relaxed);
+        MaintenanceWritten {
+            flush_rows: load(0),
+            flush_bytes: load(1),
+            compaction_rows: load(2),
+            compaction_bytes: load(3),
+        }
+    }
+
+    /// Count what a committed job wrote; only the writer calls this.
+    pub(crate) fn record_written(&self, kind: JobKind, rows: u64, bytes: u64) {
+        let base = match kind {
+            JobKind::Flush => 0,
+            JobKind::Compact => 2,
+        };
+        self.written[base].fetch_add(rows, Ordering::Relaxed);
+        self.written[base + 1].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Let background maintenance run: the collection had a data-plane access.
+    pub(crate) fn arm_maintenance(&self) {
+        if !self.armed.load(Ordering::Relaxed) {
+            self.armed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether background maintenance may run.
+    pub(crate) fn maintenance_armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
     }
 
     /// The error for a request the writer dropped without answering: it stopped part-way.
@@ -394,10 +503,15 @@ impl CollectionHandle {
         ))
     }
 
-    /// Start a maintenance job, waiting for any other job of this collection to end first.
+    /// Begin a maintenance job without a scheduler permit, for a test to build and commit by
+    /// hand (a flush waits for a running flush; a compaction takes every unreserved segment).
     /// Returns the published state the job works from and a ticket that ends the job when it
-    /// is committed or dropped. Blocking; for job threads only.
-    pub(crate) fn begin_job(&self, kind: JobKind) -> Result<(JobTicket<'_>, JobStart)> {
+    /// is committed or dropped. Blocking.
+    #[cfg(test)]
+    pub(crate) fn begin_job(
+        self: &Arc<Self>,
+        kind: JobKind,
+    ) -> Result<(JobTicket, crate::writer::JobStart)> {
         self.ensure_writable()?;
         let (reply, replied) = oneshot::channel();
         self.writer
@@ -405,14 +519,7 @@ impl CollectionHandle {
             .send(ControlMsg::BeginJob { kind, reply })
             .map_err(|_| self.unavailable())?;
         let start = replied.blocking_recv().map_err(|_| self.unavailable())??;
-        Ok((
-            JobTicket {
-                handle: self,
-                open: true,
-                wrote_files: false,
-            },
-            start,
-        ))
+        Ok((JobTicket::new(Arc::clone(self), start.job), start))
     }
 
     /// Wait until the writer has drained its pipeline and no maintenance job is active. Used by
@@ -533,17 +640,6 @@ impl CollectionHandle {
         self.poison.get().is_some()
     }
 
-    /// Resume the persisted maintenance on the next data-plane access.
-    pub(crate) fn arm_maintenance_resume(&self) {
-        self.resume_maintenance.store(true, Ordering::Release);
-    }
-
-    /// Whether persisted maintenance is waiting to resume; clears the flag.
-    pub(crate) fn take_maintenance_resume(&self) -> bool {
-        self.resume_maintenance.load(Ordering::Acquire)
-            && self.resume_maintenance.swap(false, Ordering::AcqRel)
-    }
-
     pub(crate) fn mark_dropped(&self) {
         self.state.store(STATE_DROPPED, Ordering::Release);
     }
@@ -560,32 +656,70 @@ impl CollectionHandle {
     }
 }
 
-/// An active maintenance job. Committing it publishes its manifest; dropping it ends the job
-/// without a change, so the next job can start.
-pub(crate) struct JobTicket<'a> {
-    handle: &'a CollectionHandle,
+/// Rows and bytes flushes and compactions wrote, for write amplification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceWritten {
+    /// Rows flushes wrote into segments.
+    pub flush_rows: u64,
+    /// Segment bytes flushes wrote.
+    pub flush_bytes: u64,
+    /// Rows compactions rewrote.
+    pub compaction_rows: u64,
+    /// Segment bytes compactions wrote.
+    pub compaction_bytes: u64,
+}
+
+/// A running maintenance job's build. Handing it the build's result sends it to the writer to
+/// commit; dropping it ends the job without a change.
+pub(crate) struct JobTicket {
+    handle: Arc<CollectionHandle>,
+    job: JobId,
     open: bool,
     /// Whether the job may have created files for its unit.
     wrote_files: bool,
 }
 
-impl JobTicket<'_> {
+impl JobTicket {
+    pub(crate) fn new(handle: Arc<CollectionHandle>, job: JobId) -> Self {
+        Self {
+            handle,
+            job,
+            open: true,
+            wrote_files: false,
+        }
+    }
+
     /// Record that the job is about to create files for its unit, so that they are removed
     /// if it ends without committing.
     pub(crate) fn writing_files(&mut self) {
         self.wrote_files = true;
     }
 
-    /// Publish what the job built. Blocking.
+    /// Hand the build's result to the writer, which commits it (or ends the job on an error).
+    pub(crate) fn done(mut self, result: Result<JobCommit>) {
+        self.open = false;
+        let _ = self.handle.writer.control.send(ControlMsg::JobDone {
+            job: self.job,
+            result,
+            wrote_files: self.wrote_files,
+            reply: None,
+        });
+    }
+
+    /// Publish what the job built and wait for the outcome. Blocking; for tests that step a
+    /// job by hand.
+    #[cfg(test)]
     pub(crate) fn commit(mut self, commit: JobCommit) -> Result<Snapshot> {
         self.open = false;
         let (reply, replied) = oneshot::channel();
         self.handle
             .writer
             .control
-            .send(ControlMsg::CommitJob {
-                commit: Box::new(commit),
-                reply,
+            .send(ControlMsg::JobDone {
+                job: self.job,
+                result: Ok(commit),
+                wrote_files: self.wrote_files,
+                reply: Some(reply),
             })
             .map_err(|_| self.handle.unavailable())?;
         replied
@@ -594,10 +728,11 @@ impl JobTicket<'_> {
     }
 }
 
-impl Drop for JobTicket<'_> {
+impl Drop for JobTicket {
     fn drop(&mut self) {
         if self.open {
             let _ = self.handle.writer.control.send(ControlMsg::EndJob {
+                job: self.job,
                 wrote_files: self.wrote_files,
             });
         }

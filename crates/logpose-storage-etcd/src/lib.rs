@@ -739,13 +739,6 @@ impl StorageEngine for EtcdBackedStorageEngine {
         self.local.maintenance_status_descriptor(descriptor).await
     }
 
-    async fn recover_maintenance_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<()> {
-        self.local.recover_maintenance_descriptor(descriptor).await
-    }
-
     async fn stats_snapshot(
         &self,
         collection_name: &str,
