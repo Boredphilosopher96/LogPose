@@ -59,6 +59,9 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         &key_prefix,
         cluster_name,
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     let descriptor = state_a
         .control
         .create_collection(CreateCollectionRequest::new(
@@ -109,11 +112,8 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         .collection_placement("documents")
         .await
         .expect("remote node should resolve recorded placement");
-    let runtime = state_b
-        .control
-        .runtime_status()
-        .await
-        .expect("runtime status should list authoritative metadata");
+    // Node B serves data only once its background coordination has registered it.
+    let runtime = wait_for_runtime_status(&state_b, |status| status.data_plane_ready).await;
     let stats_error = state_b
         .stats("documents")
         .await
@@ -159,6 +159,9 @@ async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
         &key_prefix,
         cluster_name,
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     state_a
         .control
         .create_collection(CreateCollectionRequest::new(
@@ -215,6 +218,9 @@ async fn etcd_drop_database_refuses_while_any_collection_metadata_remains() {
         &key_prefix,
         cluster_name,
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state).await;
     let auth = RequestAuth::default();
     state
         .put_database_with_auth(&auth, logpose_catalog::DatabaseDescriptor::new("analytics"))
@@ -301,6 +307,9 @@ async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
         cluster_name,
         bootstrap_tokens.clone(),
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     state_a
         .put_database_with_auth(
             &RequestAuth::bearer_token("operator-token"),
@@ -520,6 +529,9 @@ async fn etcd_collection_creation_seeds_shared_database_metadata() {
         cluster_name,
         bootstrap_tokens.clone(),
     )));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&state_a).await;
     state_a
         .create_collection_with_auth(
             &RequestAuth::bearer_token("operator-token"),
@@ -583,6 +595,9 @@ async fn etcd_data_only_nodes_reject_catalog_mutations() {
     );
     combined_config.node_role = logpose_types::NodeRole::Combined;
     let combined = Arc::new(AppState::new(combined_config));
+    // Control-plane writes need the leadership this node campaigns for in the
+    // background; do not race its first election.
+    wait_for_local_leadership(&combined).await;
     combined
         .put_database_with_auth(
             &RequestAuth::bearer_token("operator-token"),
