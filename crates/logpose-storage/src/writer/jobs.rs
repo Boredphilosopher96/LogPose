@@ -1386,6 +1386,10 @@ impl Writer {
             Outcome::Failed(error) => self.job_failed(entry.kind, error),
             Outcome::Abandoned => {}
         }
+        // The status stops reporting the job before anyone waiting for it hears back, so a
+        // caller that reads the status right after its flush or compaction returns never sees
+        // that job still running.
+        self.update_status();
         match entry.kind {
             JobKind::Flush => self.settle_flush_waiters(&outcome),
             JobKind::Compact => {
