@@ -255,7 +255,10 @@ impl BenchTarget for LocalEngineTarget {
         let handle = self.handle()?;
         loop {
             match self.runtime.block_on(handle.write(operations.clone())) {
-                Err(LogPoseError::WriteStalled { .. }) => continue,
+                // Back off briefly so the retry does not spin while flushes catch up.
+                Err(LogPoseError::WriteStalled { .. }) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 result => {
                     result.context("writing batch")?;
                     return Ok(());
