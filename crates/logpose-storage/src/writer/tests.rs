@@ -958,29 +958,52 @@ async fn maintenance_and_drops_make_progress_under_continuous_writes() {
     assert!(engine.collection(&reference("busy")).is_err());
 }
 
-/// Recovery refuses a log that `CURRENT` went backwards on: the WAL files below the newer
-/// checkpoint are gone once its manifest is durable, and a checkpoint frame ahead of the
-/// manifest would fail the replay's cross-check if they were not.
-#[test]
-fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
-    let fault = FaultVfs::new(9);
+/// Write `a`, flush it (checkpoint 1, manifest generation 1), and write `b`, whose group
+/// carries the flush's checkpoint frame. Then point `CURRENT` back at generation 0, whose
+/// checkpoint is 0, as if `CURRENT` went backwards. Returns the WAL file that held `a` and its
+/// bytes from before the flush's GC removed it.
+fn rewind_current_past_a_flush(fault: &Arc<FaultVfs>) -> (PathBuf, Vec<u8>) {
     let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should open");
     let handle = create(&engine, "rewound");
-    let core = engine.core();
     handle
         .write_blocking(vec![put("a", vec![1.0, 0.0])])
         .expect("write a");
+    let wal_dir = crate::engine::EngineCore::wal_dir(handle.descriptor());
+    let vfs = fault.process();
+    let wal_files = |vfs: &dyn logpose_vfs::Vfs| {
+        let mut names = vfs
+            .list(&wal_dir)
+            .expect("list the WAL directory")
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|name| name.ends_with(".wal"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = wal_files(vfs.as_ref());
+    assert_eq!(before.len(), 1, "one WAL file before the flush: {before:?}");
+    let first = wal_dir.join(&before[0]);
+    let file = vfs
+        .open(&first, logpose_vfs::OpenMode::Read)
+        .expect("open the WAL");
+    let mut bytes = vec![0; usize::try_from(file.len().expect("WAL length")).expect("fits")];
+    file.read_exact_at(&mut bytes, 0).expect("read the WAL");
+    drop(file);
+
     handle.flush_blocking().expect("flush");
     // The flush's checkpoint frame rides along with the next group.
     handle
         .write_blocking(vec![put("b", vec![1.0, 0.0])])
         .expect("write b");
+    assert!(
+        !wal_files(vfs.as_ref()).contains(&before[0]),
+        "the flush's GC removed the checkpointed WAL file"
+    );
     let current = handle.meta().dir.join(crate::manifest::CURRENT_FILE);
-    drop((handle, core));
+    drop(handle);
     drop(engine);
 
-    // Point CURRENT back at generation 0, whose checkpoint is 0.
-    let vfs = fault.process();
     vfs.remove_file(&current).expect("remove CURRENT");
     let file = vfs
         .open(&current, logpose_vfs::OpenMode::CreateNew)
@@ -988,12 +1011,68 @@ fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
     file.append(&[std::io::IoSlice::new(b"00000000000000000000\n")])
         .expect("write CURRENT");
     file.sync_all().expect("sync CURRENT");
+    (first, bytes)
+}
+
+/// Recovery refuses a log that `CURRENT` went backwards on. Once the newer manifest is
+/// durable, the WAL files below its checkpoint are gone, so replaying from the older
+/// checkpoint finds operations missing.
+#[test]
+fn a_rewound_current_without_the_checkpointed_wal_fails_recovery() {
+    let fault = FaultVfs::new(9);
+    rewind_current_past_a_flush(&fault);
 
     let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should open");
     let error = engine
         .collection(&reference("rewound"))
         .expect_err("recovery must refuse");
-    assert!(error.to_string().contains("checkpoint"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("operations in between are missing"),
+        "{error}"
+    );
+}
+
+/// With the checkpointed WAL file still there (restored here), replay reaches the flush's
+/// checkpoint frame, whose checkpoint is above the manifest's: the cross-check in
+/// `replay_frame` must refuse it, since a checkpoint frame is appended only after its manifest
+/// is durable. Without the cross-check the rewound state would open, replaying `a` and `b`
+/// over a manifest that no longer references the flushed segment.
+#[test]
+fn a_checkpoint_frame_above_the_manifest_checkpoint_fails_recovery() {
+    let fault = FaultVfs::new(11);
+    let (first, bytes) = rewind_current_past_a_flush(&fault);
+    let vfs = fault.process();
+    let file = vfs
+        .open(&first, logpose_vfs::OpenMode::CreateNew)
+        .expect("restore the checkpointed WAL file");
+    file.append(&[std::io::IoSlice::new(&bytes)])
+        .expect("write the WAL");
+    file.sync_all().expect("sync the WAL");
+    vfs.sync_dir(logpose_vfs::parent_dir(&first))
+        .expect("sync the WAL directory");
+
+    let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should open");
+    let error = engine
+        .collection(&reference("rewound"))
+        .expect_err("recovery must refuse");
+    assert!(
+        matches!(
+            error,
+            LogPoseError::Corrupt {
+                kind: logpose_types::CorruptionKind::Wal,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint frame names checkpoint 1 of manifest generation 1"),
+        "{error}"
+    );
 }
 
 /// A directory with the version 1 WAL is rejected with a typed format error.

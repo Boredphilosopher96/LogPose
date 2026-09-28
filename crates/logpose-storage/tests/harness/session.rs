@@ -129,7 +129,7 @@ impl Session {
             descriptor.compaction_threshold_segments = usize::MAX;
         }
         let handle = engine
-            .create_collection(descriptor, None)
+            .create_collection_blocking(descriptor, None)
             .map_err(|error| error.to_string())?;
         for (name, field_type) in [("n", FieldType::Int64), ("s", FieldType::String)] {
             handle
