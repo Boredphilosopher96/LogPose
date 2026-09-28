@@ -12,18 +12,18 @@ use etcd_client::{
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_storage::{
-    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
+    BoxFuture, CollectionReader, CreateCollectionRequest, InspectReport, InspectTarget,
+    LocalStorageEngine, ReadOptions, ReadView, StorageEngine,
 };
 use logpose_types::{
-    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
-    CommitAck, CorruptionKind, DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence,
-    LogPoseError, MaintenanceStatus, RecordId, ResourceKind, Result, Snapshot, VisibleRecord,
-    WriteOperation, error::ROUTING_RETRY_AFTER,
+    CollectionAssignment, CollectionRef, CollectionStats, CommitAck, CorruptionKind,
+    DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError, MaintenanceStatus,
+    ResourceKind, Result, Snapshot, WriteOperation, error::ROUTING_RETRY_AFTER,
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
 use protoc_bin_vendored as _;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 // The metadata configuration types (`MetadataBackend`, `EtcdMetadataConfig`,
@@ -343,6 +343,16 @@ impl EtcdCatalogStore {
     }
 }
 
+impl CollectionReader for EtcdBackedStorageEngine {
+    fn read_view<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        options: ReadOptions,
+    ) -> BoxFuture<'a, Result<ReadView>> {
+        self.local.read_view(collection, options)
+    }
+}
+
 #[async_trait]
 impl StorageEngine for EtcdBackedStorageEngine {
     async fn engine_name(&self) -> &'static str {
@@ -519,69 +529,6 @@ impl StorageEngine for EtcdBackedStorageEngine {
 
     async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
         self.local.snapshot(collection_name).await
-    }
-
-    async fn scan_exact(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<Vec<VisibleRecord>> {
-        self.local.scan_exact(collection_name, snapshot).await
-    }
-
-    async fn scan_exact_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        self.local
-            .scan_exact_selected(
-                collection_name,
-                snapshot,
-                include_mutable,
-                immutable_unit_ids,
-            )
-            .await
-    }
-
-    async fn ann_search_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        immutable_unit_ids: Vec<String>,
-        request: AnnSearchRequest,
-        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
-    ) -> Result<Vec<AnnCandidate>> {
-        self.local
-            .ann_search_selected(
-                collection_name,
-                snapshot,
-                immutable_unit_ids,
-                request,
-                filter,
-            )
-            .await
-    }
-
-    async fn latest_visible_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        record_ids: Vec<RecordId>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        self.local
-            .latest_visible_selected(
-                collection_name,
-                snapshot,
-                record_ids,
-                include_mutable,
-                immutable_unit_ids,
-            )
-            .await
     }
 
     async fn flush(&self, collection_name: &str) -> Result<Snapshot> {

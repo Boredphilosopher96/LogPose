@@ -95,7 +95,8 @@ impl AppState {
         })?;
         let build = BuildInfo::current();
         // One engine owns the storage root; the data plane and the catalog share it.
-        let local = LocalStorageEngine::new(&config.storage_root)?;
+        let local =
+            LocalStorageEngine::with_resolver(&config.storage_root, logpose_query::resolver())?;
         let storage: Arc<dyn logpose_storage::StorageEngine> = match config.metadata.backend {
             MetadataBackend::Local => Arc::new(local.clone()),
             MetadataBackend::Etcd => Arc::new(EtcdBackedStorageEngine::with_local(

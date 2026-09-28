@@ -32,7 +32,7 @@ use tower as _;
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
-use logpose_query::{QueryRequest, QueryResponse, query_exact};
+use logpose_query::{QueryRequest, QueryResponse};
 use logpose_storage::{
     CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, StorageEngine,
 };
@@ -435,7 +435,10 @@ impl LogPoseDataService {
     ///
     /// Fails if another process holds the storage root.
     pub fn local(root: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self::new(Arc::new(LocalStorageEngine::new(root)?)))
+        Ok(Self::new(Arc::new(LocalStorageEngine::with_resolver(
+            root,
+            logpose_query::resolver(),
+        )?)))
     }
 
     /// Create a collection.
@@ -520,7 +523,7 @@ impl LogPoseDataService {
 
     /// Execute a filtered exact query.
     pub async fn query(&self, request: QueryRequest) -> Result<QueryResponse> {
-        query_exact(self.storage.as_ref(), request)
+        logpose_query::query(self.storage.as_ref(), request)
             .await
             .map_err(Into::into)
     }
@@ -1311,9 +1314,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
-    use logpose_types::{
-        AnnSearchRequest, CollectionStats, CommitAck, DistanceMetric, Snapshot, VisibleRecord,
-    };
+    use logpose_types::{CollectionStats, CommitAck, DistanceMetric, Snapshot};
     use serde_json::json;
     use std::{
         path::PathBuf,
@@ -1429,6 +1430,22 @@ mod tests {
             next_id: AtomicU64,
         }
 
+        impl logpose_storage::CollectionReader for CreateOnlyStorageEngine {
+            fn read_view<'a>(
+                &'a self,
+                collection: &'a CollectionRef,
+                _options: logpose_storage::ReadOptions,
+            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
+            {
+                Box::pin(async move {
+                    Err(LogPoseError::not_found(
+                        ResourceKind::Collection,
+                        collection.lookup_name(),
+                    ))
+                })
+            }
+        }
+
         #[async_trait]
         impl StorageEngine for CreateOnlyStorageEngine {
             async fn engine_name(&self) -> &'static str {
@@ -1467,31 +1484,6 @@ mod tests {
             }
 
             async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn scan_exact(
-                &self,
-                collection_name: &str,
-                _snapshot: Option<Snapshot>,
-            ) -> logpose_types::Result<Vec<VisibleRecord>> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn ann_search_selected(
-                &self,
-                collection_name: &str,
-                _snapshot: Option<Snapshot>,
-                _immutable_unit_ids: Vec<String>,
-                _request: AnnSearchRequest,
-                _filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
-            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
                 Err(LogPoseError::not_found(
                     ResourceKind::Collection,
                     collection_name,
@@ -1564,6 +1556,22 @@ mod tests {
         #[derive(Debug)]
         struct MetadataUnavailableStorageEngine;
 
+        impl logpose_storage::CollectionReader for MetadataUnavailableStorageEngine {
+            fn read_view<'a>(
+                &'a self,
+                collection: &'a CollectionRef,
+                _options: logpose_storage::ReadOptions,
+            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
+            {
+                Box::pin(async move {
+                    Err(LogPoseError::unavailable(format!(
+                        "metadata for '{}' is unavailable",
+                        collection.lookup_name()
+                    )))
+                })
+            }
+        }
+
         #[async_trait]
         impl StorageEngine for MetadataUnavailableStorageEngine {
             async fn engine_name(&self) -> &'static str {
@@ -1610,31 +1618,6 @@ mod tests {
             }
 
             async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn scan_exact(
-                &self,
-                collection_name: &str,
-                _snapshot: Option<Snapshot>,
-            ) -> logpose_types::Result<Vec<VisibleRecord>> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn ann_search_selected(
-                &self,
-                collection_name: &str,
-                _snapshot: Option<Snapshot>,
-                _immutable_unit_ids: Vec<String>,
-                _request: AnnSearchRequest,
-                _filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
-            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
                 Err(LogPoseError::not_found(
                     ResourceKind::Collection,
                     collection_name,
@@ -1721,6 +1704,17 @@ mod tests {
             armed: std::sync::atomic::AtomicBool,
         }
 
+        impl logpose_storage::CollectionReader for FlushAfterSnapshot {
+            fn read_view<'a>(
+                &'a self,
+                collection: &'a CollectionRef,
+                options: logpose_storage::ReadOptions,
+            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
+            {
+                self.inner.read_view(collection, options)
+            }
+        }
+
         #[async_trait]
         impl StorageEngine for FlushAfterSnapshot {
             async fn engine_name(&self) -> &'static str {
@@ -1761,33 +1755,6 @@ mod tests {
                     self.inner.flush(collection_name).await?;
                 }
                 Ok(snapshot)
-            }
-
-            async fn scan_exact(
-                &self,
-                collection_name: &str,
-                snapshot: Option<Snapshot>,
-            ) -> logpose_types::Result<Vec<VisibleRecord>> {
-                self.inner.scan_exact(collection_name, snapshot).await
-            }
-
-            async fn ann_search_selected(
-                &self,
-                collection_name: &str,
-                snapshot: Option<Snapshot>,
-                immutable_unit_ids: Vec<String>,
-                request: AnnSearchRequest,
-                filter: Option<Arc<dyn for<'a> Fn(&'a serde_json::Value) -> bool + Send + Sync>>,
-            ) -> logpose_types::Result<Vec<logpose_types::AnnCandidate>> {
-                self.inner
-                    .ann_search_selected(
-                        collection_name,
-                        snapshot,
-                        immutable_unit_ids,
-                        request,
-                        filter,
-                    )
-                    .await
             }
 
             async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {

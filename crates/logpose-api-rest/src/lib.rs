@@ -304,6 +304,8 @@ async fn query_collection(
                 filters,
                 predicate: request.predicate,
                 explain: request.explain,
+                snapshot_token: request.snapshot_token,
+                pin: request.pin,
             },
         )
         .await?;
@@ -499,6 +501,10 @@ struct QueryCollectionBody {
     predicate: Option<FilterExpr>,
     #[serde(default)]
     explain: ExplainMode,
+    #[serde(default)]
+    snapshot_token: Option<String>,
+    #[serde(default)]
+    pin: bool,
 }
 
 impl QueryCollectionBody {
@@ -723,6 +729,7 @@ mod tests {
                     merge_micros: 66,
                 }),
             }),
+            snapshot_token: None,
         })
         .expect("query response should serialize");
 

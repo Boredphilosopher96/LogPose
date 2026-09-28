@@ -105,6 +105,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query should succeed");
@@ -226,6 +228,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("hybrid query should succeed");
@@ -660,6 +664,8 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query should succeed");

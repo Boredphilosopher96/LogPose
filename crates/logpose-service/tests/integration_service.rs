@@ -103,6 +103,8 @@ async fn service_runs_filtered_query_and_storage_workflow() {
             }],
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query should succeed");
@@ -198,6 +200,8 @@ async fn service_write_ack_returns_immediate_read_snapshot() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query at write ack snapshot should succeed");
@@ -274,6 +278,8 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
         filters: Vec::new(),
         predicate: None,
         explain: ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     };
     let response = service
         .query(request.clone())
@@ -321,6 +327,8 @@ async fn write_ack_snapshot_is_exact_until_a_flush_supersedes_its_generation() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("the barrier is satisfied");
@@ -369,6 +377,8 @@ async fn service_query_read_barrier_advances_to_latest_snapshot() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("read barrier should advance to the latest visible snapshot");
@@ -424,6 +434,8 @@ async fn service_rejects_unsatisfied_query_read_barrier() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("barrier above the current snapshot should fail");
@@ -465,6 +477,8 @@ async fn service_rejects_query_snapshot_and_read_barrier_conflicts() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("snapshot and read barrier should conflict");
@@ -603,6 +617,8 @@ async fn service_rejects_impossible_snapshots() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("invalid snapshot should error");
@@ -659,6 +675,8 @@ async fn service_rejects_snapshots_below_manifest_checkpoint() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("below-checkpoint snapshot should error");
@@ -726,6 +744,8 @@ async fn app_state_accepts_database_qualified_collection_references() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("qualified query should succeed");
@@ -806,6 +826,8 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             filters: Vec::new(),
             predicate: Some(predicate.clone()),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("service query should succeed");
@@ -866,6 +888,8 @@ async fn service_rest_and_grpc_queries_share_profile_diagnostics() {
             }),
             explain: proto::ExplainMode::Profile as i32,
             database_name: String::new(),
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .expect("grpc query should succeed")
@@ -1031,6 +1055,8 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
             filters: Vec::new(),
             predicate: Some(predicate.clone()),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("service query should succeed");
@@ -1089,6 +1115,8 @@ async fn service_rest_and_grpc_surface_cooperative_filtered_ann() {
             }),
             explain: proto::ExplainMode::Profile as i32,
             database_name: String::new(),
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .expect("grpc query should succeed")

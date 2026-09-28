@@ -816,6 +816,8 @@ async fn assert_data_matches(
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .unwrap_or_else(|error| {
@@ -837,6 +839,8 @@ async fn assert_data_matches(
             predicate: None,
             explain: proto::ExplainMode::None as i32,
             database_name,
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .unwrap_or_else(|error| panic_with_context(trace, format!("grpc query failed: {error}")))
