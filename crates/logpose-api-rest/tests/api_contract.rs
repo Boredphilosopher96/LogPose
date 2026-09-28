@@ -8,7 +8,7 @@ use http_body_util::BodyExt;
 use logpose_api_rest::{ErrorBody, http_status, route_paths, router};
 use logpose_config::LogPoseConfig;
 use logpose_core::AppState;
-use logpose_types::{ErrorCode, error::fixtures::one_of_each_variant};
+use logpose_types::{ErrorCode, ErrorReason, error::fixtures::one_of_each_variant};
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -250,10 +250,9 @@ fn openapi_error_schema_matches_the_error_taxonomy() {
         .collect::<BTreeSet<_>>();
     assert_eq!(enum_values(&document, "ErrorCode"), codes);
 
-    let errors = one_of_each_variant();
-    let reasons = errors
+    let reasons = ErrorReason::ALL
         .iter()
-        .map(|error| error.reason().to_owned())
+        .map(|reason| reason.as_str().to_owned())
         .collect::<BTreeSet<_>>();
     assert_eq!(enum_values(&document, "ErrorReason"), reasons);
 
@@ -281,7 +280,7 @@ fn openapi_error_schema_matches_the_error_taxonomy() {
         (500, "Internal"),
         (503, "Unavailable"),
     ]);
-    for error in &errors {
+    for error in &one_of_each_variant() {
         let body = serde_json::to_value(ErrorBody::from_error(error)).expect("body serializes");
         let keys = body
             .as_object()

@@ -90,6 +90,132 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// Stable machine-readable reason of a [`LogPoseError`], sent as `google.rpc.ErrorInfo.reason`
+/// over gRPC and as `details.reason` over REST.
+///
+/// A reason is more specific than its [`ErrorCode`]. Clients decode it with
+/// [`ErrorReason::parse`]; a reason a client does not know comes from a newer server.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ErrorReason {
+    /// `INVALID_ARGUMENT`: see [`LogPoseError::InvalidArgument`].
+    InvalidArgument,
+    /// `DIMENSION_MISMATCH`: see [`LogPoseError::DimensionMismatch`].
+    DimensionMismatch,
+    /// `TOO_LARGE`: see [`LogPoseError::TooLarge`].
+    TooLarge,
+    /// `INVALID_CONFIG`: see [`LogPoseError::InvalidConfig`].
+    InvalidConfig,
+    /// `RESOURCE_NOT_FOUND`: see [`LogPoseError::NotFound`].
+    ResourceNotFound,
+    /// `RESOURCE_ALREADY_EXISTS`: see [`LogPoseError::AlreadyExists`].
+    ResourceAlreadyExists,
+    /// `FAILED_PRECONDITION`: see [`LogPoseError::FailedPrecondition`].
+    FailedPrecondition,
+    /// `WRONG_NODE_ROLE`: see [`LogPoseError::WrongNodeRole`].
+    WrongNodeRole,
+    /// `RECONCILIATION_REQUIRED`: see [`LogPoseError::ReconciliationRequired`].
+    ReconciliationRequired,
+    /// `STORAGE_ROOT_LOCKED`: see [`LogPoseError::StorageRootLocked`].
+    StorageRootLocked,
+    /// `SNAPSHOT_EXPIRED`: see [`LogPoseError::SnapshotExpired`].
+    SnapshotExpired,
+    /// `TOO_MANY_SNAPSHOTS`: see [`LogPoseError::TooManySnapshots`].
+    TooManySnapshots,
+    /// `UNAUTHENTICATED`: see [`LogPoseError::Unauthenticated`].
+    Unauthenticated,
+    /// `PERMISSION_DENIED`: see [`LogPoseError::PermissionDenied`].
+    PermissionDenied,
+    /// `NOT_OWNER`: see [`LogPoseError::NotOwner`].
+    NotOwner,
+    /// `NOT_LEADER`: see [`LogPoseError::NotLeader`].
+    NotLeader,
+    /// `READ_BARRIER_NOT_SATISFIED`: see [`LogPoseError::ReadBarrierNotSatisfied`].
+    ReadBarrierNotSatisfied,
+    /// `UNAVAILABLE`: see [`LogPoseError::Unavailable`].
+    Unavailable,
+    /// `DATA_CORRUPTION`: see [`LogPoseError::Corrupt`].
+    DataCorruption,
+    /// `COLLECTION_POISONED`: see [`LogPoseError::CollectionPoisoned`].
+    CollectionPoisoned,
+    /// `WAL_WRITE_FAILED`: see [`LogPoseError::WalWriteFailed`].
+    WalWriteFailed,
+    /// `IO_ERROR`: see [`LogPoseError::Io`].
+    IoError,
+    /// `INTERNAL`: see [`LogPoseError::Internal`].
+    Internal,
+}
+
+impl ErrorReason {
+    /// Every reason, in declaration order.
+    pub const ALL: [Self; 23] = [
+        Self::InvalidArgument,
+        Self::DimensionMismatch,
+        Self::TooLarge,
+        Self::InvalidConfig,
+        Self::ResourceNotFound,
+        Self::ResourceAlreadyExists,
+        Self::FailedPrecondition,
+        Self::WrongNodeRole,
+        Self::ReconciliationRequired,
+        Self::StorageRootLocked,
+        Self::SnapshotExpired,
+        Self::TooManySnapshots,
+        Self::Unauthenticated,
+        Self::PermissionDenied,
+        Self::NotOwner,
+        Self::NotLeader,
+        Self::ReadBarrierNotSatisfied,
+        Self::Unavailable,
+        Self::DataCorruption,
+        Self::CollectionPoisoned,
+        Self::WalWriteFailed,
+        Self::IoError,
+        Self::Internal,
+    ];
+
+    /// The wire name, such as `NOT_OWNER`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::DimensionMismatch => "DIMENSION_MISMATCH",
+            Self::TooLarge => "TOO_LARGE",
+            Self::InvalidConfig => "INVALID_CONFIG",
+            Self::ResourceNotFound => "RESOURCE_NOT_FOUND",
+            Self::ResourceAlreadyExists => "RESOURCE_ALREADY_EXISTS",
+            Self::FailedPrecondition => "FAILED_PRECONDITION",
+            Self::WrongNodeRole => "WRONG_NODE_ROLE",
+            Self::ReconciliationRequired => "RECONCILIATION_REQUIRED",
+            Self::StorageRootLocked => "STORAGE_ROOT_LOCKED",
+            Self::SnapshotExpired => "SNAPSHOT_EXPIRED",
+            Self::TooManySnapshots => "TOO_MANY_SNAPSHOTS",
+            Self::Unauthenticated => "UNAUTHENTICATED",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::NotOwner => "NOT_OWNER",
+            Self::NotLeader => "NOT_LEADER",
+            Self::ReadBarrierNotSatisfied => "READ_BARRIER_NOT_SATISFIED",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::DataCorruption => "DATA_CORRUPTION",
+            Self::CollectionPoisoned => "COLLECTION_POISONED",
+            Self::WalWriteFailed => "WAL_WRITE_FAILED",
+            Self::IoError => "IO_ERROR",
+            Self::Internal => "INTERNAL",
+        }
+    }
+
+    /// The reason named `wire`, or `None` for a reason this build does not know.
+    #[must_use]
+    pub fn parse(wire: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == wire)
+    }
+}
+
+impl fmt::Display for ErrorReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The kind of resource a [`LogPoseError::NotFound`] or [`LogPoseError::AlreadyExists`] names.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ResourceKind {
@@ -685,33 +811,39 @@ impl LogPoseError {
     /// Stable machine-readable reason. A [`BulkBatchFailed`](Self::BulkBatchFailed) error
     /// reports the reason of the batch's failure.
     #[must_use]
-    pub fn reason(&self) -> &'static str {
+    pub fn error_reason(&self) -> ErrorReason {
         match self {
-            Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
-            Self::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
-            Self::TooLarge { .. } => "TOO_LARGE",
-            Self::InvalidConfig { .. } => "INVALID_CONFIG",
-            Self::NotFound { .. } => "RESOURCE_NOT_FOUND",
-            Self::AlreadyExists { .. } => "RESOURCE_ALREADY_EXISTS",
-            Self::FailedPrecondition { .. } => "FAILED_PRECONDITION",
-            Self::WrongNodeRole { .. } => "WRONG_NODE_ROLE",
-            Self::ReconciliationRequired { .. } => "RECONCILIATION_REQUIRED",
-            Self::StorageRootLocked { .. } => "STORAGE_ROOT_LOCKED",
-            Self::SnapshotExpired { .. } => "SNAPSHOT_EXPIRED",
-            Self::TooManySnapshots { .. } => "TOO_MANY_SNAPSHOTS",
-            Self::Unauthenticated { .. } => "UNAUTHENTICATED",
-            Self::PermissionDenied { .. } => "PERMISSION_DENIED",
-            Self::NotOwner { .. } => "NOT_OWNER",
-            Self::NotLeader { .. } => "NOT_LEADER",
-            Self::ReadBarrierNotSatisfied { .. } => "READ_BARRIER_NOT_SATISFIED",
-            Self::Unavailable { .. } => "UNAVAILABLE",
-            Self::Corrupt { .. } => "DATA_CORRUPTION",
-            Self::CollectionPoisoned { .. } => "COLLECTION_POISONED",
-            Self::WalWriteFailed { .. } => "WAL_WRITE_FAILED",
-            Self::Io { .. } => "IO_ERROR",
-            Self::Internal { .. } => "INTERNAL",
-            Self::BulkBatchFailed { source, .. } => source.reason(),
+            Self::InvalidArgument { .. } => ErrorReason::InvalidArgument,
+            Self::DimensionMismatch { .. } => ErrorReason::DimensionMismatch,
+            Self::TooLarge { .. } => ErrorReason::TooLarge,
+            Self::InvalidConfig { .. } => ErrorReason::InvalidConfig,
+            Self::NotFound { .. } => ErrorReason::ResourceNotFound,
+            Self::AlreadyExists { .. } => ErrorReason::ResourceAlreadyExists,
+            Self::FailedPrecondition { .. } => ErrorReason::FailedPrecondition,
+            Self::WrongNodeRole { .. } => ErrorReason::WrongNodeRole,
+            Self::ReconciliationRequired { .. } => ErrorReason::ReconciliationRequired,
+            Self::StorageRootLocked { .. } => ErrorReason::StorageRootLocked,
+            Self::SnapshotExpired { .. } => ErrorReason::SnapshotExpired,
+            Self::TooManySnapshots { .. } => ErrorReason::TooManySnapshots,
+            Self::Unauthenticated { .. } => ErrorReason::Unauthenticated,
+            Self::PermissionDenied { .. } => ErrorReason::PermissionDenied,
+            Self::NotOwner { .. } => ErrorReason::NotOwner,
+            Self::NotLeader { .. } => ErrorReason::NotLeader,
+            Self::ReadBarrierNotSatisfied { .. } => ErrorReason::ReadBarrierNotSatisfied,
+            Self::Unavailable { .. } => ErrorReason::Unavailable,
+            Self::Corrupt { .. } => ErrorReason::DataCorruption,
+            Self::CollectionPoisoned { .. } => ErrorReason::CollectionPoisoned,
+            Self::WalWriteFailed { .. } => ErrorReason::WalWriteFailed,
+            Self::Io { .. } => ErrorReason::IoError,
+            Self::Internal { .. } => ErrorReason::Internal,
+            Self::BulkBatchFailed { source, .. } => source.error_reason(),
         }
+    }
+
+    /// The wire name of [`error_reason`](Self::error_reason), such as `NOT_OWNER`.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        self.error_reason().as_str()
     }
 
     /// How long a client should wait before retrying, when a retry is expected to help.
@@ -1346,6 +1478,30 @@ mod tests {
                 .is_some_and(Vec::is_empty)
         );
         assert!(json.get("retry_after_ms").is_none());
+    }
+
+    #[test]
+    fn every_reason_parses_from_its_wire_name_and_unknown_names_do_not() {
+        let names = ErrorReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), ErrorReason::ALL.len());
+        for reason in ErrorReason::ALL {
+            assert_eq!(ErrorReason::parse(reason.as_str()), Some(reason));
+            assert_eq!(reason.to_string(), reason.as_str());
+        }
+        assert_eq!(ErrorReason::parse("SOME_FUTURE_REASON"), None);
+        assert_eq!(ErrorReason::parse("not_owner"), None);
+    }
+
+    #[test]
+    fn every_reason_is_produced_by_some_variant() {
+        let produced = one_of_each_variant()
+            .iter()
+            .map(LogPoseError::error_reason)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(produced, ErrorReason::ALL.into_iter().collect());
     }
 
     #[test]

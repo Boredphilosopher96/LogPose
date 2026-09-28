@@ -8,8 +8,8 @@ pub mod schema;
 pub mod value;
 
 pub use error::{
-    CorruptionKind, ErrorCode, ErrorDetails, FieldViolation, LogPoseError, ResourceKind,
-    WriteOutcome,
+    CorruptionKind, ErrorCode, ErrorDetails, ErrorReason, FieldViolation, LogPoseError,
+    ResourceKind, WriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};

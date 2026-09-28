@@ -5,7 +5,10 @@ mod error;
 #[cfg(test)]
 mod test_support;
 
-pub use error::{ERROR_DOMAIN, RETRY_AFTER_METADATA_KEY, grpc_code, status_from_error};
+pub use error::{
+    ERROR_DOMAIN, RETRY_AFTER_METADATA_KEY, code_from_grpc, code_to_grpc, grpc_code,
+    status_from_error,
+};
 
 use error::{MessageLimitLayer, respond, unauthenticated};
 use logpose_auth::{AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding};

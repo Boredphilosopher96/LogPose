@@ -9,6 +9,7 @@ use crate::{
     },
     cli::{InteractiveArgs, NamespaceArgs, OutputMode},
     direct::{DirectReporter, TerminalUi},
+    error_report::error_summary,
     execute::{connect_client, execute_action},
     feedback::{ProgressEvent, Reporter},
     render::{ActionOutput, command_preview},
@@ -1849,9 +1850,9 @@ impl InteractiveApp {
                     }
                     Err(error) => {
                         if let Some(form) = self.form.as_mut() {
-                            form.error = Some(error.to_string());
+                            form.error = Some(error_summary(&error));
                         }
-                        self.status_message = error.to_string();
+                        self.status_message = error_summary(&error);
                         self.running = None;
                         self.screen = Screen::Form;
                     }

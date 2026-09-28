@@ -12,6 +12,11 @@ use logpose_client::{ClientConfig, LogPoseClient};
 use logpose_config::LogPoseConfig;
 use logpose_types::{DeleteRecord, RecordId, WriteOperation};
 
+/// What `record put` tells the operator about the batch whose write failed. Each batch is one
+/// `WriteCollection` call and commits atomically, so it never lands in part.
+const FAILED_BATCH_ADVICE: &str = "each batch commits atomically, so the failing batch was \
+     applied in full or not at all; verify collection state before retrying it";
+
 pub async fn execute_action<R: Reporter>(
     config: &LogPoseConfig,
     auth_token: Option<&str>,
@@ -177,13 +182,12 @@ pub async fn execute_action<R: Reporter>(
                     Ok(ack) => ack,
                     Err(error) if applied_ops > 0 => {
                         return Err(error).context(format!(
-                            "failed to write records after {applied_ops} fully acknowledged operations; the failing batch may have partially committed, so verify collection state before retrying"
+                            "failed to write records after {applied_ops} acknowledged operations; {FAILED_BATCH_ADVICE}"
                         ));
                     }
                     Err(error) => {
-                        return Err(error).context(
-                            "failed to write records; the failing batch may have partially committed, so verify collection state before retrying",
-                        )
+                        return Err(error)
+                            .context(format!("failed to write records; {FAILED_BATCH_ADVICE}"));
                     }
                 };
                 last_seq_no = ack.last_seq_no;
