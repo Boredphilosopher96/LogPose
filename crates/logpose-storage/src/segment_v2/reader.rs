@@ -930,6 +930,42 @@ impl<S: SectionSource> SegmentReader<S> {
         self.dynamic_via(Via::Cache)
     }
 
+    /// The dynamic block index, decoded once per cache load.
+    fn dynamic_shared(&self) -> Result<Option<Arc<DynamicHandle>>, SegmentError> {
+        let Some(unit) = self.dynamic_index_unit() else {
+            return Ok(None);
+        };
+        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
+        bytes
+            .decoded(|raw| {
+                self.dynamic_handle(&unit, raw)
+                    .map(|handle| (handle, raw.len() as u64))
+            })
+            .map(Some)
+    }
+
+    /// Block `block` of the dynamic section, decoded once per cache load.
+    fn dynamic_block_shared(
+        &self,
+        handle: &DynamicHandle,
+        block: u32,
+    ) -> Result<Arc<DynamicBlock>, SegmentError> {
+        let region = Region::DynamicBlock {
+            index: handle.index,
+            block,
+        };
+        let (unit, rows) = handle
+            .block_unit(block)
+            .zip(handle.blocks.block_rows(block))
+            .ok_or_else(|| SegmentError::out_of_range(format!("{region}")))?;
+        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
+        bytes.decoded(|raw| {
+            DynamicBlock::decode(raw, rows)
+                .map(|block| (block, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
+    }
+
     fn dynamic_via(&self, via: Via) -> Result<Option<DynamicHandle>, SegmentError> {
         let Some(unit) = self.dynamic_index_unit() else {
             return Ok(None);
@@ -1123,7 +1159,7 @@ impl<S: SectionSource> SegmentReader<S> {
                 columns.push((field, column));
             }
         }
-        let dynamic = self.dynamic_via(via)?;
+        let dynamic = self.dynamic_shared()?;
         let mut blocks = std::collections::BTreeMap::new();
         let mut out = Vec::with_capacity(rows.len());
         for &row in rows {
@@ -1155,7 +1191,7 @@ impl<S: SectionSource> SegmentReader<S> {
                 let loaded = match blocks.entry(block) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(self.dynamic_block_via(handle, block, via)?)
+                        entry.insert(self.dynamic_block_shared(handle, block)?)
                     }
                 };
                 if let Some(raw) = loaded.raw(row) {
