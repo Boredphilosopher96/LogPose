@@ -12,15 +12,15 @@ use etcd_client::{
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
 use logpose_storage::{
-    BoxFuture, CollectionReader, CreateCollectionRequest, FetchedRecords, InspectReport,
-    InspectTarget, LocalStorageEngine, ReadOptions, ReadView, StorageEngine,
+    BoxFuture, CollectionReader, CreateCollectionRequest, InspectReport, InspectTarget,
+    LocalStorageEngine, ReadOptions, ReadView, StorageEngine,
 };
 use logpose_types::{
     CollectionAssignment, CollectionRef, CollectionStats, CommitAck, CorruptionKind,
     DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError, MaintenanceStatus,
     ResourceKind, Result, Snapshot, WriteOperation,
     error::ROUTING_RETRY_AFTER,
-    record::{ClientOp, PrimaryKey},
+    record::ClientOp,
     schema::{CollectionSchema, SchemaChange},
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
@@ -633,17 +633,6 @@ impl StorageEngine for EtcdBackedStorageEngine {
 
     async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
         self.local.write_batch(collection_name, ops).await
-    }
-
-    async fn get_records(
-        &self,
-        collection_name: &str,
-        keys: Vec<PrimaryKey>,
-        output_fields: Vec<String>,
-    ) -> Result<FetchedRecords> {
-        self.local
-            .get_records(collection_name, keys, output_fields)
-            .await
     }
 
     async fn write(

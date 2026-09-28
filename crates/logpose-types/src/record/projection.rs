@@ -94,6 +94,19 @@ impl Projection {
         self.selected.is_none()
     }
 
+    /// Whether this projection returns any vector field of `schema`, so a read must load
+    /// vectors.
+    #[must_use]
+    pub fn selects_vectors(&self, schema: &CollectionSchema) -> bool {
+        match &self.selected {
+            None => !schema.vectors().is_empty(),
+            Some(selected) => selected
+                .declared
+                .iter()
+                .any(|name| matches!(schema.field(name), Some(FieldRef::Vector(_)))),
+        }
+    }
+
     /// Keep only the projected fields of `record`.
     #[must_use]
     pub fn apply(&self, mut record: Record) -> Record {

@@ -2286,6 +2286,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_values_round_trip_exactly_through_segments() {
+        let app = router(Arc::new(AppState::new(test_config("rest-fidelity"))));
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v2/databases/default/collections",
+            Some(json!({
+                "name": "extremes",
+                "primary_key": {"name": "id", "type": "int64"},
+                "vectors": [{"name": "v", "dimensions": 2, "metric": "l2"}],
+                "fields": [
+                    {"name": "n", "type": "int64"},
+                    {"name": "f", "type": "float64"},
+                    {"name": "at", "type": "timestamp"},
+                    {"name": "ns", "type": "array<int64>"},
+                    {"name": "doc", "type": "json"}
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let extremes = "/v2/databases/default/collections/extremes";
+        let max = json!({
+            "id": i64::MAX,
+            "v": [0.1, -0.2],
+            "n": i64::MAX,
+            "f": f64::MAX,
+            "at": "9999-12-31T23:59:59.999999999Z",
+            "ns": [i64::MIN, 0, i64::MAX],
+            "doc": {"deep": {"list": [1, "two", null, {"k": u64::MAX}]}},
+            "\u{e9}t\u{e9} \u{1f600}": {"nested": [true, 1.5]}
+        });
+        let min = json!({
+            "id": i64::MIN,
+            "v": [0.0, 0.0],
+            "n": i64::MIN,
+            "f": -0.0,
+            "at": "0000-01-01T00:00:00-00:00",
+            "ns": [],
+            "doc": null
+        });
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/upsert"),
+            Some(json!({"records": [max, min]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let expected_max = json!({
+            "id": i64::MAX,
+            "v": [0.1, -0.2],
+            "n": i64::MAX,
+            "f": f64::MAX,
+            "at": "9999-12-31T23:59:59.999999Z",
+            "ns": [i64::MIN, 0, i64::MAX],
+            "doc": {"deep": {"list": [1, "two", null, {"k": u64::MAX}]}},
+            "\u{e9}t\u{e9} \u{1f600}": {"nested": [true, 1.5]}
+        });
+        let expected_min = json!({
+            "id": i64::MIN,
+            "v": [0.0, 0.0],
+            "n": i64::MIN,
+            "f": 0.0,
+            "at": "0000-01-01T00:00:00Z",
+            "ns": []
+        });
+        for stage in ["memtable", "flush", "compact"] {
+            if stage != "memtable" {
+                let (status, body) = call(&app, "POST", &format!("{extremes}/{stage}"), None).await;
+                assert_eq!(status, StatusCode::OK, "{stage}: {body}");
+            }
+            let (status, body) = call(
+                &app,
+                "POST",
+                &format!("{extremes}/records/get"),
+                Some(json!({"keys": [i64::MAX, i64::MIN, i64::MAX, 7]})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{stage}: {body}");
+            assert_eq!(
+                body["records"],
+                json!([expected_max, expected_min, expected_max]),
+                "{stage}: every type reads back exactly; a repeated key is returned each time"
+            );
+            assert_eq!(body["missing_keys"], json!([7]), "{stage}");
+        }
+
+        // A partial update merges with a row read back from a segment.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/update"),
+            Some(json!({"records": [{"id": i64::MIN, "n": 5, "ns": null}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/get"),
+            Some(json!({"keys": [i64::MIN], "output_fields": ["n", "ns", "v"]})),
+        )
+        .await;
+        assert_eq!(
+            body["records"],
+            json!([{"id": i64::MIN, "n": 5, "v": [0.0, 0.0]}])
+        );
+    }
+
+    #[tokio::test]
     async fn record_validation_errors_name_the_record_field() {
         let app = router(Arc::new(AppState::new(test_config("rest-record-errors"))));
         let (status, _) = call(

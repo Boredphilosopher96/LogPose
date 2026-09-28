@@ -91,7 +91,7 @@ pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use scheduler::{MaintenanceScheduler, SchedulerStats};
 pub use segment_v2::IndexPolicy;
 pub use storage_engine::{
-    BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, StorageEngine,
+    BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
 };
 pub use tokens::{InvalidSnapshotToken, SnapshotToken, TokenConfig};
 pub use version::{Version, VersionCounters, VersionId};

@@ -7,8 +7,7 @@
 //! metadata files.
 
 use crate::{
-    BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget,
-    StorageEngine, Version,
+    BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,
     collections::collection_ref_from_lookup,
     durable_fs::path_exists,
     engine::{CoreRef, Engine, EngineConfig, not_found},
@@ -22,7 +21,7 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, CollectionAssignment, CollectionRef, CollectionStats, CommitAck,
     LeadershipFence, LogPoseError, MaintenanceStatus, NodeRole, Result, Snapshot, WriteOperation,
-    record::{ClientOp, PrimaryKey, Projection},
+    record::ClientOp,
     schema::{CollectionSchema, SchemaChange},
 };
 use logpose_vfs::{Vfs, std_vfs};
@@ -353,20 +352,6 @@ impl StorageEngine for LocalStorageEngine {
         handle.write(ops).await
     }
 
-    async fn get_records(
-        &self,
-        collection_name: &str,
-        keys: Vec<PrimaryKey>,
-        output_fields: Vec<String>,
-    ) -> Result<FetchedRecords> {
-        let handle = self.handle(collection_name)?;
-        self.data_io(handle, move |_, handle| {
-            handle.ensure_open()?;
-            get_records(&handle.current(), &keys, &output_fields)
-        })
-        .await
-    }
-
     async fn write(
         &self,
         collection_name: &str,
@@ -428,40 +413,6 @@ impl StorageEngine for LocalStorageEngine {
         self.data_io(handle, move |core, handle| core.inspect(handle, target))
             .await
     }
-}
-
-/// Point lookups of `keys` in `version`, projected to `output_fields`. Blocking.
-///
-/// This is the engine's current point-lookup primitive over one published state; the read
-/// path's `CollectionReader::get` replaces it.
-fn get_records(
-    version: &Version,
-    keys: &[PrimaryKey],
-    output_fields: &[String],
-) -> Result<FetchedRecords> {
-    let schema = Arc::clone(&version.schema);
-    let projection = Projection::resolve(&schema, output_fields)?;
-    let mut records = Vec::with_capacity(keys.len());
-    for (index, key) in keys.iter().enumerate() {
-        schema.validate_primary_key(key).map_err(|error| {
-            LogPoseError::invalid_field(format!("keys[{index}]"), error.to_string())
-        })?;
-        let record = match version.lookup(key)? {
-            Some(image) => Some(projection.apply(image.to_record(&schema).map_err(|error| {
-                LogPoseError::internal(format!(
-                    "record {key} cannot be read with schema version {}: {error}",
-                    schema.schema_version()
-                ))
-            })?)),
-            None => None,
-        };
-        records.push(record);
-    }
-    Ok(FetchedRecords {
-        schema,
-        snapshot: version.snapshot(),
-        records,
-    })
 }
 
 impl CoreRef {

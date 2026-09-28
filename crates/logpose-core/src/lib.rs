@@ -6,10 +6,10 @@ use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
-use logpose_service::{LogPoseControlService, LogPoseDataService, Result as ServiceResult};
-use logpose_storage::{
-    CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, LocalStorageEngine,
+use logpose_service::{
+    FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
+use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine};
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
     BuildInfo, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME, LeadershipFence,

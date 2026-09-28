@@ -8,7 +8,7 @@ use logpose_types::{
     DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus, Result, Snapshot,
     WriteOperation,
     legacy::{LEGACY_PRIMARY_KEY_FIELD, LEGACY_VECTOR_FIELD},
-    record::{ClientOp, PrimaryKey, Record},
+    record::ClientOp,
     schema::{
         CollectionSchema, CreateCollectionSpec, PrimaryKeySpec, PrimaryKeyType, SchemaChange,
         VectorFieldSpec,
@@ -121,20 +121,6 @@ pub trait StorageEngine: CollectionReader + Send + Sync {
         let _ = collection_name;
         let _ = ops;
         Err(unsupported("typed writes"))
-    }
-
-    /// Point lookups of `keys` in the current state, each projected to `output_fields` (see
-    /// [`Projection::resolve`](logpose_types::record::Projection::resolve)).
-    async fn get_records(
-        &self,
-        collection_name: &str,
-        keys: Vec<PrimaryKey>,
-        output_fields: Vec<String>,
-    ) -> Result<FetchedRecords> {
-        let _ = collection_name;
-        let _ = keys;
-        let _ = output_fields;
-        Err(unsupported("point lookups"))
     }
 
     /// Load the persisted placement assignment for a collection descriptor.
@@ -288,18 +274,6 @@ impl CreateCollectionRequest {
             spec: self.spec,
         }
     }
-}
-
-/// The live records a point lookup found, read from one published state.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FetchedRecords {
-    /// The schema of that state, which the records follow.
-    pub schema: Arc<CollectionSchema>,
-    /// The state the lookup read.
-    pub snapshot: Snapshot,
-    /// One entry per requested key, in request order: the projected record, or `None` when
-    /// the key has no live record.
-    pub records: Vec<Option<Record>>,
 }
 
 fn unsupported(what: &str) -> LogPoseError {

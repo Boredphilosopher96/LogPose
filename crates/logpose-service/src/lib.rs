@@ -34,7 +34,7 @@ use logpose_catalog::{CatalogStore, DatabaseDescriptor};
 use logpose_config::LogPoseConfig;
 use logpose_query::{QueryRequest, QueryResponse};
 use logpose_storage::{
-    CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, LocalStorageEngine,
+    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, ReadOptions,
     StorageEngine,
 };
 use logpose_storage_etcd::{
@@ -46,7 +46,7 @@ use logpose_types::{
     CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
     MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus,
     ResourceKind, Snapshot,
-    record::{ClientOp, PartialUpdate, PrimaryKey, Record},
+    record::{ClientOp, PartialUpdate, PrimaryKey, Projection, Record},
     schema::{CollectionSchema, SchemaChange},
 };
 use std::{
@@ -62,6 +62,18 @@ use tokio::{
     runtime::Handle,
     time::{Duration, Instant, interval, sleep},
 };
+
+/// The live records a point lookup found, read from one published state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchedRecords {
+    /// The schema of that state, which the records follow.
+    pub schema: Arc<CollectionSchema>,
+    /// The state the lookup read.
+    pub snapshot: Snapshot,
+    /// One entry per requested key, in request order: the projected record, or `None` when
+    /// the key has no live record.
+    pub records: Vec<Option<Record>>,
+}
 
 /// Service-local result type. Every layer reports the one typed [`LogPoseError`].
 pub type Result<T> = std::result::Result<T, LogPoseError>;
@@ -603,9 +615,34 @@ impl LogPoseDataService {
         output_fields: Vec<String>,
     ) -> Result<FetchedRecords> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .get_records(&descriptor.lookup_name(), keys, output_fields)
-            .await
+        let view = self
+            .storage
+            .read_view(&descriptor.collection_ref(), ReadOptions::default())
+            .await?;
+        let schema = Arc::clone(view.schema());
+        let projection = Projection::resolve(&schema, &output_fields)?;
+        for (index, key) in keys.iter().enumerate() {
+            schema.validate_primary_key(key).map_err(|error| {
+                LogPoseError::invalid_field(format!("keys[{index}]"), error.to_string())
+            })?;
+        }
+        let rows = view
+            .get(
+                &keys,
+                logpose_storage::Projection {
+                    vectors: projection.selects_vectors(&schema),
+                    seq_no: false,
+                },
+            )
+            .await?;
+        Ok(FetchedRecords {
+            snapshot: view.snapshot(),
+            records: rows
+                .into_iter()
+                .map(|row| row.map(|row| projection.apply(row.record)))
+                .collect(),
+            schema,
+        })
     }
 
     async fn write_batch(
