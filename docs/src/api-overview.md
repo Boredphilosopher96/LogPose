@@ -229,6 +229,12 @@ The gRPC limit applies to each request message, so each batch of a
 `BulkUpsertRecords` stream is checked on its own. See
 [Configuration](configuration.md).
 
+The same limits bound the responses of reads that return records: a query,
+scroll page, or get whose response would be larger fails with the same
+`TOO_LARGE` error instead of sending it. Ask for fewer results (`top_k`,
+`page_size`, keys) or fewer `output_fields`. The Rust client accepts replies
+of any size, so the server's limit is the one that applies.
+
 ## Common Response Schemas
 
 Snapshot references are used across writes, queries, flushes, and compactions:

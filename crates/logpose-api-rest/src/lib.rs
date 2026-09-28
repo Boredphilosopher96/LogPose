@@ -13,8 +13,11 @@ use yaml_rust2 as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION},
-    response::IntoResponse,
+    http::{
+        HeaderMap, Method, StatusCode, Uri,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
+    response::{IntoResponse, Response},
     routing::{MethodRouter, get, post},
 };
 use error::{ApiError, ApiJson, ApiPath, ApiQuery};
@@ -466,7 +469,7 @@ async fn get_records(
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiJson(body): ApiJson<GetRecordsBody>,
-) -> Result<Json<CollectionScopedResponse<RecordsResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let keys = primary_keys_from_json(body.keys)?;
     let fetched = state
@@ -480,11 +483,15 @@ async fn get_records(
             None => missing_keys.push(key.to_json()),
         }
     }
-    Ok(Json(path.scoped(RecordsResponse {
-        records,
-        missing_keys,
-        snapshot: fetched.snapshot,
-    })))
+    bounded_json(
+        &state,
+        "get records response",
+        &path.scoped(RecordsResponse {
+            records,
+            missing_keys,
+            snapshot: fetched.snapshot,
+        }),
+    )
 }
 
 async fn count_records(
@@ -526,7 +533,7 @@ async fn scroll_records(
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiJson(body): ApiJson<ScrollBody>,
-) -> Result<Json<CollectionScopedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let filter = match body.filter {
         Some(filter) => {
@@ -551,7 +558,11 @@ async fn scroll_records(
             },
         )
         .await?;
-    Ok(Json(path.scoped(page.value.to_json(&page.schema))))
+    bounded_json(
+        &state,
+        "scroll response",
+        &path.scoped(page.value.to_json(&page.schema)),
+    )
 }
 
 async fn query_collection(
@@ -559,7 +570,7 @@ async fn query_collection(
     ApiPath(path): ApiPath<CollectionPath>,
     State(state): State<Arc<AppState>>,
     ApiJson(body): ApiJson<QueryCollectionBody>,
-) -> Result<Json<CollectionScopedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = request_auth_from_headers(&headers)?;
     let filter = match body.filter {
         Some(filter) => {
@@ -591,7 +602,32 @@ async fn query_collection(
             },
         )
         .await?;
-    Ok(Json(path.scoped(response.value.to_json(&response.schema))))
+    bounded_json(
+        &state,
+        "query response",
+        &path.scoped(response.value.to_json(&response.schema)),
+    )
+}
+
+/// `body` as a JSON response, unless it is larger than the configured REST body limit: a
+/// read response is bounded like a request, so a large `top_k`, page, or projection fails with
+/// a typed `TOO_LARGE` (HTTP 413).
+fn bounded_json<T: Serialize>(
+    state: &AppState,
+    what: &str,
+    body: &T,
+) -> Result<Response, ApiError> {
+    let bytes = serde_json::to_vec(body)
+        .map_err(|error| ApiError(LogPoseError::internal(format!("encode {what}: {error}"))))?;
+    let limit = state.config.limits.max_rest_body_bytes;
+    if bytes.len() > limit {
+        return Err(ApiError(LogPoseError::TooLarge {
+            what: format!("{what}; ask for fewer results or output fields"),
+            size: u64::try_from(bytes.len()).ok(),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        }));
+    }
+    Ok(([(CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
 async fn get_collection_stats(
@@ -3319,6 +3355,40 @@ mod tests {
             }
         }
         (pages, skus)
+    }
+
+    #[tokio::test]
+    async fn read_responses_above_the_body_limit_are_a_typed_413() {
+        let mut config = test_config("rest-p6c-response-limit");
+        config.limits.max_rest_body_bytes = 4096;
+        let app = router(Arc::new(AppState::new(config)));
+        create_items(&app, 1..=5).await;
+        for first in (6..=40).step_by(5) {
+            upsert_items(&app, first..=first + 4).await;
+        }
+        let vector = json!({"field": "embedding", "values": [1.0, 0.0, 0.0]});
+        let keys = (1..=40).collect::<Vec<i64>>();
+        for (path, body) in [
+            ("query", json!({"vector": vector, "top_k": 40})),
+            ("query", json!({"top_k": 40})),
+            ("records/scroll", json!({"page_size": 40})),
+            ("records/get", json!({"keys": keys})),
+        ] {
+            let (status, error) = call(&app, "POST", &format!("{ITEMS}/{path}"), Some(body)).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {error}");
+            assert_eq!(error["details"]["reason"], "TOO_LARGE", "{path}: {error}");
+            assert_eq!(error["details"]["metadata"]["limit_bytes"], "4096");
+        }
+        // A small enough answer is served.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{ITEMS}/query"),
+            Some(json!({"vector": vector, "top_k": 2})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(hit_skus(&body), vec![40, 39]);
     }
 
     #[tokio::test]

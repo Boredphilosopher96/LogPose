@@ -1087,7 +1087,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     PayloadTooLarge:
-      description: The request body exceeds `limits.max_rest_body_bytes` (`RESOURCE_EXHAUSTED`, reason `TOO_LARGE`).
+      description: The request body, or the response of a record read, exceeds `limits.max_rest_body_bytes` (`RESOURCE_EXHAUSTED`, reason `TOO_LARGE`).
       content:
         application/json:
           schema:

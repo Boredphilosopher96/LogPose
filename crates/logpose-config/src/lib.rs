@@ -92,16 +92,17 @@ pub const DEFAULT_MAX_REST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default for [`LimitsConfig::max_grpc_message_bytes`]: 16 MiB.
 pub const DEFAULT_MAX_GRPC_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Request size limits for the API listeners.
+/// Request and response size limits for the API listeners.
 ///
 /// A REST body above its limit is rejected with HTTP 413 and a gRPC message above its limit
-/// with `RESOURCE_EXHAUSTED`; both carry a `TOO_LARGE` error.
+/// with `RESOURCE_EXHAUSTED`; both carry a `TOO_LARGE` error. The same limits bound the
+/// responses of record reads (query, scroll, get), which fail the same way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
-    /// Largest REST request body accepted, in bytes.
+    /// Largest REST request body accepted, and largest record-read response sent, in bytes.
     pub max_rest_body_bytes: usize,
-    /// Largest decoded gRPC request message accepted, in bytes. Each message of a
+    /// Largest decoded gRPC request message accepted, and largest reply sent, in bytes. Each message of a
     /// `BulkWriteCollection` stream is one batch and is checked on its own.
     pub max_grpc_message_bytes: usize,
 }

@@ -26,7 +26,8 @@ When `node_role` is omitted it defaults to `combined`. When `LOGPOSE_CONFIG` is 
 
 ## Request Size Limits
 
-The optional `[limits]` table caps request sizes on both API listeners:
+The optional `[limits]` table caps request and response sizes on both API
+listeners:
 
 ```toml
 [limits]
@@ -42,6 +43,10 @@ max_grpc_message_bytes = 16777216  # 16 MiB, the default
   message gets `RESOURCE_EXHAUSTED` with reason `TOO_LARGE`. Each message of a
   `BulkUpsertRecords` stream is one batch and is checked on its own, so
   bulk ingest is bounded per batch, not per stream.
+
+The same limits bound the responses of record reads: a query, scroll page, or
+get whose REST response or gRPC reply would be larger fails with `TOO_LARGE`
+(HTTP `413` in REST) and is not sent.
 
 Both values must be greater than 0. Either key may be omitted to keep its
 default.

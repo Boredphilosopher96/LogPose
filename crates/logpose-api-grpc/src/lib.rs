@@ -91,7 +91,8 @@ pub async fn serve_with_listener(
         .add_service(health_service)
         .add_service(
             LogPoseServiceServer::new(GrpcLogPoseService::new(state))
-                .max_decoding_message_size(message_limit),
+                .max_decoding_message_size(message_limit)
+                .max_encoding_message_size(message_limit),
         )
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
@@ -106,6 +107,22 @@ pub struct GrpcLogPoseService {
 }
 
 impl GrpcLogPoseService {
+    /// `reply`, unless it encodes to more than the configured message limit: a read reply
+    /// is bounded like a request, so a large `top_k`, page, or projection fails with a typed
+    /// `TOO_LARGE` instead of a message the client cannot decode.
+    fn bounded<T: prost::Message>(&self, reply: T, what: &str) -> Result<T, LogPoseError> {
+        let limit = self.state.config.limits.max_grpc_message_bytes;
+        let size = reply.encoded_len();
+        if size > limit {
+            return Err(LogPoseError::TooLarge {
+                what: format!("{what}; ask for fewer results or output fields"),
+                size: u64::try_from(size).ok(),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(reply)
+    }
+
     /// Construct a gRPC service wrapper from shared application state.
     #[must_use]
     pub fn new(state: Arc<AppState>) -> Self {
@@ -238,7 +255,11 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<GetRecordsRequest>,
     ) -> Result<Response<GetRecordsReply>, Status> {
-        respond(self.get_records_inner(request).await)
+        respond(
+            self.get_records_inner(request)
+                .await
+                .and_then(|reply| self.bounded(reply, "GetRecords reply")),
+        )
     }
 
     async fn count_records(
@@ -252,14 +273,22 @@ impl LogPoseService for GrpcLogPoseService {
         &self,
         request: Request<proto::ScrollRecordsRequest>,
     ) -> Result<Response<ScrollRecordsReply>, Status> {
-        respond(self.scroll_records_inner(request).await)
+        respond(
+            self.scroll_records_inner(request)
+                .await
+                .and_then(|reply| self.bounded(reply, "ScrollRecords reply")),
+        )
     }
 
     async fn query_collection(
         &self,
         request: Request<QueryCollectionRequest>,
     ) -> Result<Response<QueryCollectionReply>, Status> {
-        respond(self.query_collection_inner(request).await)
+        respond(
+            self.query_collection_inner(request)
+                .await
+                .and_then(|reply| self.bounded(reply, "QueryCollection reply")),
+        )
     }
 
     async fn get_collection_stats(
@@ -4184,6 +4213,36 @@ mod tests {
             .into_inner();
         assert_eq!(ack.applied_ops, 0);
         assert_eq!(count_items(&service, items_count(None)).await, 31);
+    }
+
+    #[tokio::test]
+    async fn grpc_read_replies_above_the_message_limit_are_too_large() {
+        let mut config = test_config("grpc-p6c-reply-limit");
+        config.limits.max_grpc_message_bytes = 2048;
+        let service = items_service(config, 1..=40).await;
+        let error = service
+            .query_collection(Request::new(items_query(
+                Some(("embedding", vec![1.0, 0.0, 0.0])),
+                40,
+            )))
+            .await
+            .expect_err("a reply above the limit should fail");
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{error:?}");
+        assert_eq!(reason(&error).as_deref(), Some("TOO_LARGE"));
+        let error = service
+            .scroll_records(Request::new(items_scroll(None, 40)))
+            .await
+            .expect_err("a page above the limit should fail");
+        assert_eq!(reason(&error).as_deref(), Some("TOO_LARGE"));
+        let reply = service
+            .query_collection(Request::new(items_query(
+                Some(("embedding", vec![1.0, 0.0, 0.0])),
+                2,
+            )))
+            .await
+            .expect("a small reply is served")
+            .into_inner();
+        assert_eq!(reply.hits.len(), 2);
     }
 
     #[tokio::test]

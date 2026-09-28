@@ -158,6 +158,15 @@ impl Interceptor for AuthInterceptor {
 
 type ServiceClient = LogPoseServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
+/// A service client that decodes replies of any size: the server bounds its replies by its
+/// configured message limit (16 MiB by default) and reports larger ones as `TOO_LARGE`, so the
+/// client does not add a smaller limit of its own (tonic's default is 4 MiB).
+fn service_client(channel: Channel, interceptor: AuthInterceptor) -> ServiceClient {
+    LogPoseServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX)
+}
+
 /// Thin gRPC client over the shared LogPose server contract.
 ///
 /// Cloning is cheap: clones share the connection and the redirect connections.
@@ -185,7 +194,7 @@ impl LogPoseClient {
         let channel = Endpoint::new(endpoint.into())?.connect().await?;
         let interceptor = AuthInterceptor::new(auth_token)?;
         Ok(Self {
-            inner: LogPoseServiceClient::with_interceptor(channel, interceptor.clone()),
+            inner: service_client(channel, interceptor.clone()),
             interceptor,
             retry: RetryPolicy::disabled(),
             redirects: None,
@@ -268,7 +277,7 @@ impl LogPoseClient {
             return Ok(client.clone());
         }
         let channel = Endpoint::new(endpoint.to_owned())?.connect_lazy();
-        let client = LogPoseServiceClient::with_interceptor(channel, self.interceptor.clone());
+        let client = service_client(channel, self.interceptor.clone());
         peers.insert(endpoint.to_owned(), client.clone());
         Ok(client)
     }
