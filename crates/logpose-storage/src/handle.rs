@@ -555,6 +555,26 @@ impl CollectionHandle {
         Ok((JobTicket::new(Arc::clone(self), start.job), start))
     }
 
+    /// Run the writer's tick now and wait at most `timeout` for it; see
+    /// [`Engine::tick_writer`](crate::Engine::tick_writer). Blocking.
+    pub(crate) fn tick_writer(&self, timeout: Duration) -> Result<()> {
+        let (reply, replied) = std::sync::mpsc::sync_channel(1);
+        self.writer
+            .control
+            .send(ControlMsg::Tick { reply })
+            .map_err(|_| self.unavailable())?;
+        match replied.recv_timeout(timeout) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(self.writer_stopped()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(LogPoseError::internal(format!(
+                    "the writer of collection '{}' did not tick within {timeout:?}",
+                    self.meta.descriptor.lookup_name()
+                )))
+            }
+        }
+    }
+
     /// Wait until the writer has drained its pipeline and no maintenance job is active. Used by
     /// a drop after it marked the handle dropped. Blocking.
     pub(crate) fn quiesce(&self) {

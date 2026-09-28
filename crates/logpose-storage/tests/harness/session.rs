@@ -48,7 +48,10 @@ pub enum Maintenance {
     /// Background maintenance off: flushes and compactions run only when an action begins,
     /// builds, and commits a job by hand, or asks for one explicitly. The one exception is the
     /// engine's own: a frozen memtable that an abandoned or failed flush left behind is
-    /// flushed by a background job right away, as it must be.
+    /// flushed by a background job, right away after an abandoned flush and once the flush
+    /// backoff passed on the engine clock after a failed one, as it must be. The runner
+    /// [settles](Session::settle) such jobs after every action, so they land at the same
+    /// point of every replay, and the clock moves only when an action moves it.
     Stepped,
     /// Tiny flush and compaction thresholds with the scheduler paused: background jobs start
     /// only when an action grants a permit (or a blocked call needs one).
@@ -223,6 +226,15 @@ impl Session {
             tokens: TokenConfig {
                 ttl: TTL,
                 memory_limit: Some(u64::MAX),
+                // Hand-stepped runs reap expired pins when they settle instead. The same pass
+                // refreshes the cache budget and runs the global memtable-budget trigger, which
+                // they therefore skip: neither changes what a read returns, and the harness's
+                // memtables never come near the budget (a fraction of the default 4 GiB).
+                reaper_interval: if self.setup.background() {
+                    TokenConfig::default().reaper_interval
+                } else {
+                    Duration::from_secs(86_400 * 365)
+                },
                 ..TokenConfig::default()
             },
             clock: Some(self.clock.clone()),
@@ -351,7 +363,8 @@ impl Session {
     /// so a call that never returns fails the run with its seed instead of hanging the test.
     /// With the scheduler paused, grant a waiting permit whenever the call has waited a little
     /// and no job runs, so calls that wait for maintenance (a write held by the stall, an
-    /// explicit flush or compaction) finish.
+    /// explicit flush or compaction) finish. With background maintenance, advance the clock
+    /// while a call waits, for calls held up by a retry backoff.
     pub fn call<T: Send + 'static>(
         &self,
         what: &str,
@@ -386,9 +399,16 @@ impl Session {
             }
             // Time passes on the manual clock only when the harness says so. A call held up by
             // a job's retry backoff (a write stalled behind flushes that failed) waits for it,
-            // so let a second pass whenever the call has been idle for a while.
+            // so let a second pass whenever the call has been idle for a while. Hand-stepped
+            // runs never need this (no flush trigger fires, so no write stalls, and explicit
+            // requests ignore the backoffs), and a nudge there would move the clock by how
+            // slowly a call ran, which a replay does not repeat: it could let a failed flush's
+            // retry start, or a token expire, at a different action.
             let idle = started.elapsed().saturating_sub(Duration::from_millis(200));
-            if stats.running == 0 && idle > Duration::from_millis(100) * nudges {
+            if self.setup.background()
+                && stats.running == 0
+                && idle > Duration::from_millis(100) * nudges
+            {
                 self.clock.advance(Duration::from_secs(1));
                 nudges += 1;
             }
@@ -404,6 +424,67 @@ impl Session {
         scheduler.step(1);
         self.wait_for_jobs()?;
         Ok(true)
+    }
+
+    /// Hand-stepped runs: let everything the engine does in the background run to its end
+    /// now, so where it lands among the actions (and which operation a planned crash or an
+    /// injected sync failure hits) depends on the actions alone and not on timing.
+    ///
+    /// - The engine's own flush of a memtable that an abandoned or failed flush left frozen.
+    ///   The writer plans it when a job ends (after a dropped stepped job's `EndJob`, or after
+    ///   a stepped commit already answered) and at its tick once the flush backoff passed on
+    ///   the manual clock, and a real-time interval runs the tick. So: tick the writer
+    ///   ([`Engine::tick_writer`](logpose_storage::Engine::tick_writer)), which runs after
+    ///   every control message sent before it and has requested whatever it planned by the
+    ///   time it returns, then wait for the jobs holding permits, and repeat until a tick
+    ///   leaves none (a flush that ends may plan the next frozen memtable's). Hand-stepped
+    ///   jobs hold no permit and are not waited for.
+    /// - Snapshot pins that expired on the manual clock, which the token reaper drops (hand-
+    ///   stepped runs never run it on its real-time interval), and the file removals that
+    ///   dropped versions and committed jobs queued, which drain on the I/O pool.
+    ///
+    /// After a planned crash, jobs and removals only run into it, and closing the engine
+    /// waits for them.
+    ///
+    /// Timing still decides one thing: how the I/O pool batches the removals one action
+    /// queues (each batch syncs every directory it touched once), which can change that
+    /// action's count of directory syncs and mutating operations. A planned crash or a failed
+    /// directory sync landing among those removals then changes only which superseded files
+    /// were removed before it; orphan cleanup at the next open removes the rest, so the
+    /// recovered collection is the same.
+    pub fn settle(&self) -> Result<(), String> {
+        let deadline = Instant::now() + CALL_DEADLINE;
+        let crashed = || self.fault.as_ref().is_some_and(|fault| fault.is_crashed());
+        loop {
+            // On this thread, since a `call` per action made hand-stepped runs about a third
+            // slower: the tick bounds its own wait, so a writer that never answers still fails
+            // the run with its seed.
+            self.engine()
+                .tick_writer(self.handle(), CALL_DEADLINE)
+                .map_err(|error| format!("writer tick: {error}"))?;
+            if crashed() {
+                return Ok(());
+            }
+            let stats = self.engine().scheduler().stats();
+            if stats.running == 0 && stats.waiting == 0 {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "background jobs did not settle within {CALL_DEADLINE:?}: {} running, {} \
+                     waiting",
+                    stats.running, stats.waiting
+                ));
+            }
+            self.wait_for_jobs()?;
+            if stats.running == 0 {
+                // A request not granted yet.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.engine().reap_snapshots();
+        self.engine().wait_for_gc();
+        Ok(())
     }
 
     /// Wait until no maintenance job runs, or the planned crash has happened.
