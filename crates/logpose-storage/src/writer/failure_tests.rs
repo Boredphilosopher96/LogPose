@@ -363,6 +363,66 @@ fn a_reopen_after_poisoning_recovers_exactly_the_acknowledged_writes() {
     assert_eq!(live(&handle), ["b", "c", "d", "e"]);
 }
 
+/// A job that fails only because the collection is already poisoned does not replace the
+/// error that poisoned it: a compaction that ends after the poisoning is refused, and the stats
+/// keep reporting the flush failures.
+#[test]
+fn a_job_refused_by_a_poisoned_collection_keeps_the_error_that_poisoned_it() {
+    let fault = FaultVfs::new(8);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(
+        &vfs,
+        EngineConfig {
+            memtable: MemtableConfig {
+                max_flush_failures: 2,
+                ..MemtableConfig::default()
+            },
+            ..config(&clock)
+        },
+    );
+    let handle = create(&engine, 2, usize::MAX);
+    write(&handle, vec![upsert("a", 1.0), upsert("b", 2.0)]);
+    write(&handle, vec![upsert("c", 3.0), upsert("d", 4.0)]);
+    wait_idle(&engine, &handle);
+    assert_eq!(segment_rows(&handle), [2, 2]);
+
+    // A compaction, stepped by hand, builds before the device fails and commits after.
+    let (mut ticket, start) = handle
+        .begin_job(JobKind::Compact)
+        .expect("compaction begins");
+    let JobWork::Compact(work) = &start.work else {
+        unreachable!("two segments to compact");
+    };
+    let commit = engine
+        .core()
+        .build_compaction(&handle, &start.version, start.unit, work, &mut ticket)
+        .expect("the compaction builds");
+
+    vfs.fail_file_syncs_containing(".seg", u32::MAX);
+    write(&handle, vec![upsert("e", 5.0), upsert("f", 6.0)]);
+    wait_for("the first failed flush", || failures(&handle, "flush") == 1);
+    clock.advance(FLUSH_RETRY_BACKOFF);
+    wait_for("the collection to be poisoned", || handle.is_poisoned());
+
+    assert_poisoned(
+        &ticket
+            .commit(commit)
+            .expect_err("a poisoned collection refuses the commit"),
+    );
+    drop(start);
+    // The writer answers the commit before it ends the job.
+    wait_for("the compaction to end", || {
+        handle.maintenance_status().in_progress.is_none()
+    });
+    let error = handle
+        .maintenance_status()
+        .last_error
+        .expect("the flush failure");
+    assert_eq!(error.job, "flush");
+    assert_eq!(error.consecutive_failures, 2);
+}
+
 /// A compaction that keeps failing is retried after a backoff of its own, which doubles with
 /// each failure in a row and starts over after a success, and it never delays a flush: the
 /// clock stays inside the compaction's backoff while a flush runs.
@@ -381,6 +441,11 @@ fn a_failing_compaction_backs_off_on_its_own_and_never_delays_a_flush() {
                 min_merge: 2,
                 max_merge: 4,
                 ..CompactionConfig::default()
+            },
+            // Fewer than the compaction failures below: they must not count.
+            memtable: MemtableConfig {
+                max_flush_failures: 2,
+                ..MemtableConfig::default()
             },
             ..config(&clock)
         },
