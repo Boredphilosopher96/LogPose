@@ -39,6 +39,8 @@
 mod apply;
 #[cfg(test)]
 mod dv_tests;
+#[cfg(test)]
+mod model_tests;
 mod pk_index;
 mod prepare;
 #[cfg(test)]

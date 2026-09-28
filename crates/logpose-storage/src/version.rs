@@ -263,7 +263,10 @@ impl Version {
             }
         }
         for segment in self.segments.iter().rev() {
-            let row = segment.reader().find_row(pk).ok()??;
+            // A segment without the key says nothing about older ones.
+            let Some(row) = segment.reader().find_row(pk).ok()? else {
+                continue;
+            };
             if !self.is_deleted(RowAddr {
                 unit: segment.unit,
                 row,
