@@ -476,6 +476,11 @@ fn waiting_for_gc_covers_the_versions_the_reaper_releases_in_the_background() {
     unblocker.join().expect("unblocker should join");
 }
 
+/// Whether `result` failed only because the snapshot it read is no longer retained.
+fn expired<T>(result: &Result<T>) -> bool {
+    matches!(result, Err(LogPoseError::SnapshotExpired { .. }))
+}
+
 /// I7 under load: readers pin tokens and read through them (and through the exact snapshots
 /// they name) while a writer and a maintenance thread flush and compact without pause, the
 /// reaper expires idle pins, and the collector removes what they release. No read ever fails
@@ -571,17 +576,26 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                 while !done.load(AtomicOrdering::Acquire) {
                     round += 1;
                     let current = handle.current();
-                    match handle.pin_version(Arc::clone(&current)) {
-                        Ok(token) => held.push((token, current.snapshot(), None)),
-                        Err(LogPoseError::TooManySnapshots { .. }) => {}
-                        Err(error) => panic!("pin: {error}"),
+                    let pinned = handle.pin_version(Arc::clone(&current));
+                    assert!(
+                        pinned.is_ok()
+                            || matches!(pinned, Err(LogPoseError::TooManySnapshots { .. })),
+                        "pin: {:?}",
+                        pinned.as_ref().err()
+                    );
+                    if let Ok(token) = pinned {
+                        held.push((token, current.snapshot(), None));
                     }
                     drop(current);
                     for (token, snapshot, first) in &mut held {
-                        let version = match handle.snapshot_version(token) {
-                            Ok(version) => version,
-                            Err(LogPoseError::SnapshotExpired { .. }) => continue,
-                            Err(error) => panic!("resolve: {error}"),
+                        let resolved = handle.snapshot_version(token);
+                        assert!(
+                            resolved.is_ok() || expired(&resolved),
+                            "resolve: {:?}",
+                            resolved.as_ref().err()
+                        );
+                        let Ok(version) = resolved else {
+                            continue;
                         };
                         for file in version.files.iter() {
                             for path in UnitFiles::new(&handle.meta().dir, file.unit()).published()
@@ -593,32 +607,36 @@ fn readers_pinning_tokens_never_lose_a_file_while_flushes_compactions_and_gc_run
                                 );
                             }
                         }
-                        match core.scan_exact_internal(&handle, token.clone(), true, None) {
-                            Ok(records) => match first {
+                        // The reaper may expire the token between two uses.
+                        let records = core.scan_exact_internal(&handle, token.clone(), true, None);
+                        assert!(
+                            records.is_ok() || expired(&records),
+                            "read through a token: {:?}",
+                            records.as_ref().err()
+                        );
+                        if let Ok(records) = records {
+                            match first {
                                 Some(first) => {
                                     assert_eq!(*first, records, "reads through one token agree");
                                 }
                                 None => *first = Some(records),
-                            },
-                            // The reaper may expire the token between two uses.
-                            Err(LogPoseError::SnapshotExpired { .. }) => {}
-                            Err(error) => panic!("read through a token: {error}"),
+                            }
                         }
-                        match core.scan_exact_internal(&handle, Some(snapshot.clone()), true, None)
-                        {
-                            Ok(_) | Err(LogPoseError::SnapshotExpired { .. }) => {}
-                            Err(error) => panic!("read at an exact snapshot: {error}"),
-                        }
+                        let exact =
+                            core.scan_exact_internal(&handle, Some(snapshot.clone()), true, None);
+                        assert!(
+                            exact.is_ok() || expired(&exact),
+                            "read at an exact snapshot: {:?}",
+                            exact.as_ref().err()
+                        );
                         drop(version);
                         reads.fetch_add(1, AtomicOrdering::Relaxed);
                     }
                     core.scan_exact_internal(&handle, None, true, None)
                         .expect("a read of the current state never fails");
-                    if held.len() > 4 || round % 7 == reader {
-                        if !held.is_empty() {
-                            let (token, _, _) = held.remove(0);
-                            handle.release_snapshot(&token);
-                        }
+                    if (held.len() > 4 || round % 7 == reader) && !held.is_empty() {
+                        let (token, _, _) = held.remove(0);
+                        handle.release_snapshot(&token);
                     }
                 }
                 for (token, _, _) in held {
