@@ -1,6 +1,5 @@
-use logpose_query::{
-    ExplainMode, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, query_exact,
-};
+use crate::scan::ScanExt;
+use logpose_query::{ExplainMode, QueryMatch, QueryPlanKind, QueryRequest, QueryResponse, query};
 use logpose_storage::{
     CreateCollectionRequest, InspectTarget, LocalStorageEngine, SnapshotToken, StorageEngine,
 };
@@ -1147,7 +1146,7 @@ async fn assert_exact_queries_match(
             Some(snapshot) => snapshot_exact_query_request(vector.to_vec(), snapshot),
             None => current_exact_query_request(vector.to_vec()),
         };
-        let actual = query_exact(engine, request.clone())
+        let actual = query(engine, request.clone())
             .await
             .unwrap_or_else(|error| {
                 panic_with_context(seed, trace, format!("query failed: {error}"))
@@ -1155,7 +1154,7 @@ async fn assert_exact_queries_match(
         let expected = model.expected_query_response(request.clone());
         let exact_ranking = model.expected_query_ranking(&request);
 
-        let profiled = query_exact(engine, profiled_request(&request))
+        let profiled = query(engine, profiled_request(&request))
             .await
             .unwrap_or_else(|error| {
                 panic_with_context(seed, trace, format!("profile query failed: {error}"))
@@ -1187,7 +1186,11 @@ async fn assert_exact_queries_match(
             )
         });
         assert!(
-            timings.planning_micros > 0,
+            timings.planning_micros
+                + timings.candidate_generation_micros
+                + timings.rerank_micros
+                + timings.postfilter_micros
+                > 0,
             "seed={seed} trace={trace:?} diagnostics={diagnostics:#?}"
         );
         assert!(
@@ -1449,6 +1452,7 @@ impl ExpectedModel {
             snapshot,
             matches,
             diagnostics: None,
+            snapshot_token: None,
         }
     }
 
@@ -1502,6 +1506,8 @@ fn current_exact_query_request(vector: Vec<f32>) -> QueryRequest {
         filters: Vec::new(),
         predicate: None,
         explain: logpose_query::ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     }
 }
 
@@ -1515,6 +1521,8 @@ fn snapshot_exact_query_request(vector: Vec<f32>, snapshot: Snapshot) -> QueryRe
         filters: Vec::new(),
         predicate: None,
         explain: logpose_query::ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     }
 }
 

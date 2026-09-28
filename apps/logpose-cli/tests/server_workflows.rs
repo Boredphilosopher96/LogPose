@@ -586,12 +586,7 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert!(profiled_query_response["diagnostics"]["stage_timings"].is_object());
     assert_eq!(
         profiled_query_response["diagnostics"]["chosen_plan"],
-        "vector_first_exact"
-    );
-    assert!(
-        profiled_query_response["diagnostics"]["candidates_reranked"]
-            .as_u64()
-            .is_some_and(|count| count >= 1)
+        "predicate_first_exact"
     );
     assert!(
         profiled_query_response["diagnostics"]["candidates_merged"]
@@ -599,7 +594,7 @@ fn data_commands_run_against_the_server_over_grpc() {
             .is_some_and(|count| count >= 1)
     );
     assert!(
-        profiled_query_response["diagnostics"]["unit_scan_mix"]["mutable_exact"]
+        profiled_query_response["diagnostics"]["unit_scan_mix"]["memtable_scan"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
@@ -783,10 +778,10 @@ fn data_commands_run_against_the_server_over_grpc() {
     assert_eq!(ann_query_response["matches"][0]["id"], "alpha");
     assert_eq!(
         ann_query_response["diagnostics"]["chosen_plan"],
-        "vector_first_ann"
+        "predicate_first_exact"
     );
     assert!(
-        ann_query_response["diagnostics"]["unit_scan_mix"]["immutable_ann"]
+        ann_query_response["diagnostics"]["unit_scan_mix"]["exact_f32"]
             .as_u64()
             .is_some_and(|count| count >= 1)
     );
@@ -905,7 +900,7 @@ fn query_and_stats_support_read_barrier_flags_against_server() {
 }
 
 #[test]
-fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
+fn profiled_query_surfaces_filtered_scan_diagnostics() {
     let fixture = TestServerFixture::spawn("cli-cooperative-filtered-ann");
     let input_path = fixture.temp_root.join("cooperative-records.jsonl");
     let records = (0..12)
@@ -957,13 +952,16 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
     let profiled_query_response = query_response_body(&profiled_query_body);
     assert_eq!(profiled_query_response["matches"][0]["id"], "doc-8");
     assert_eq!(profiled_query_response["matches"][1]["id"], "doc-4");
+    // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
+    // three rows the filter matches.
     assert_eq!(
         profiled_query_response["diagnostics"]["chosen_plan"],
-        "cooperative_filtered_ann"
+        "predicate_first_exact"
     );
-    assert_eq!(
-        profiled_query_response["diagnostics"]["planner_reason"],
-        "filtered ann traversal is cheaper than exact scan for this selectivity"
+    assert!(
+        profiled_query_response["diagnostics"]["planner_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("exact_f32"))
     );
     assert_eq!(
         profiled_query_response["diagnostics"]["estimated_selectivity"],
@@ -985,10 +983,7 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
     assert!(candidates_before_filter >= 2);
     assert!(candidates_after_filter >= 2);
     assert!(candidates_after_filter <= candidates_before_filter);
-    assert_eq!(
-        profiled_query_response["diagnostics"]["fallback_reason"],
-        Value::Null
-    );
+    assert!(profiled_query_response["diagnostics"]["fallback_reason"].is_string());
     assert_eq!(profiled_query_response["diagnostics"]["rerank_count"], 1);
     assert!(
         profiled_query_response["diagnostics"]["candidates_reranked"]
@@ -1001,9 +996,9 @@ fn profiled_query_surfaces_cooperative_filtered_ann_diagnostics() {
             .is_some_and(|count| count == candidates_after_filter)
     );
     assert!(
-        profiled_query_response["diagnostics"]["unit_scan_mix"]["immutable_ann"]
+        profiled_query_response["diagnostics"]["unit_scan_mix"]["exact_f32"]
             .as_u64()
-            .is_some_and(|count| count >= 1)
+            .is_some_and(|count| count == 1)
     );
     assert_eq!(
         profiled_query_response["diagnostics"]["stage_timings"]["prefilter_micros"],

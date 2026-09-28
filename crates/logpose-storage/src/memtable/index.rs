@@ -1,7 +1,7 @@
 //! [`MemScalarIndex`]: a memtable's live postings over slots for one indexed scalar field.
 
 use crate::dv::CowBitmap;
-use logpose_index::scalar::ScalarKey;
+use logpose_index::scalar::{Direction, ScalarKey};
 use logpose_types::{RowId, schema::FieldIndex, value::Value};
 use roaring::RoaringBitmap;
 use std::ops::Bound;
@@ -34,10 +34,6 @@ impl IndexFlavor {
 /// of each key it touches, never a whole posting. Dead slots stay in their postings; readers
 /// always subtract the unit's deletion vector.
 #[derive(Clone)]
-#[allow(
-    dead_code,
-    reason = "the read path compiles filters over memtable postings"
-)]
 pub(crate) struct MemScalarIndex {
     flavor: IndexFlavor,
     /// The first slot the index covers; earlier slots (written before the field was added)
@@ -47,10 +43,6 @@ pub(crate) struct MemScalarIndex {
     nulls: CowBitmap,
 }
 
-#[allow(
-    dead_code,
-    reason = "the read path compiles filters over memtable postings"
-)]
 impl MemScalarIndex {
     pub(crate) fn new(flavor: IndexFlavor, first_slot: RowId) -> Self {
         Self {
@@ -123,9 +115,49 @@ impl MemScalarIndex {
         rows
     }
 
-    /// Number of distinct keys.
-    pub(crate) fn key_count(&self) -> usize {
-        self.keys.len()
+    /// Slots with at least one value.
+    pub(crate) fn values(&self) -> RoaringBitmap {
+        let mut rows = RoaringBitmap::new();
+        for posting in self.keys.values() {
+            posting.union_into(&mut rows);
+        }
+        rows
+    }
+
+    /// `(key, slot)` in key order from `start` in `direction`, slots of one key ascending for
+    /// ascending order and descending otherwise; `None` for an inverted index.
+    pub(crate) fn ordered(
+        &self,
+        start: Bound<&ScalarKey>,
+        direction: Direction,
+    ) -> Option<Box<dyn Iterator<Item = (ScalarKey, RowId)> + '_>> {
+        if self.flavor != IndexFlavor::Sorted {
+            return None;
+        }
+        let start = match start {
+            Bound::Included(key) => Bound::Included(key.clone()),
+            Bound::Excluded(key) => Bound::Excluded(key.clone()),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        Some(match direction {
+            Direction::Ascending => Box::new(
+                self.keys
+                    .range::<_, ScalarKey>((start, Bound::Unbounded))
+                    .flat_map(|(key, posting)| {
+                        let rows: Vec<RowId> = posting.iter().collect();
+                        rows.into_iter().map(move |row| (key.clone(), row))
+                    }),
+            ),
+            Direction::Descending => Box::new(
+                self.keys
+                    .range::<_, ScalarKey>((Bound::Unbounded, start))
+                    .rev()
+                    .flat_map(|(key, posting)| {
+                        let rows: Vec<RowId> = posting.iter().collect();
+                        rows.into_iter().rev().map(move |row| (key.clone(), row))
+                    }),
+            ),
+        })
     }
 }
 

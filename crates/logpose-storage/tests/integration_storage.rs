@@ -21,8 +21,12 @@ use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
+#[path = "support/scan.rs"]
+mod scan;
 #[path = "support/fs.rs"]
 mod support;
+
+use scan::ScanExt;
 
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
@@ -590,8 +594,8 @@ async fn flush_persists_visible_records_for_reopen() {
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be reported");
     assert_eq!(
-        immutable.index_kind, "exact",
-        "a segment serves ANN candidates by exact scan until index sections land"
+        immutable.index_kind, "flat",
+        "a one-row segment has no graph or SQ8 codes, so it is searched exactly"
     );
     assert!(
         immutable
@@ -607,7 +611,10 @@ async fn flush_persists_visible_records_for_reopen() {
             .unwrap_or_default()
             > 0
     );
-    assert_eq!(immutable.scalar_fields["topic"].present_count, 1);
+    assert!(
+        immutable.scalar_fields.is_empty(),
+        "`$extra` keys have no zone maps"
+    );
 }
 
 #[tokio::test]
@@ -1349,7 +1356,7 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
     fs::write(&path, &bytes).expect("corrupted segment should be written");
 
     let engine = LocalStorageEngine::new(&root).expect("storage engine should reopen");
-    let error = logpose_query::query_exact(
+    let error = logpose_query::query(
         &engine,
         logpose_query::QueryRequest {
             collection_name: "documents".to_owned(),
@@ -1360,6 +1367,8 @@ async fn queries_surface_a_corrupted_segment_section_as_typed_corruption() {
             filters: Vec::new(),
             predicate: None,
             explain: logpose_query::ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         },
     )
     .await
@@ -1451,6 +1460,8 @@ async fn ann_queries_over_segments_see_only_live_rows() {
         filters,
         predicate: None,
         explain: logpose_query::ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     };
     let keep = || {
         vec![logpose_query::MetadataFilter {
@@ -1466,10 +1477,10 @@ async fn ann_queries_over_segments_see_only_live_rows() {
             .collect::<Vec<_>>()
     };
     for round in 0..2 {
-        let unfiltered = ids(logpose_query::query_exact(&engine, query(Vec::new()))
+        let unfiltered = ids(logpose_query::query(&engine, query(Vec::new()))
             .await
             .expect("query should succeed"));
-        let filtered = ids(logpose_query::query_exact(&engine, query(keep()))
+        let filtered = ids(logpose_query::query(&engine, query(keep()))
             .await
             .expect("filtered query should succeed"));
         assert_eq!(unfiltered, ["doc-10", "doc-09"], "round {round}");
@@ -1480,96 +1491,6 @@ async fn ann_queries_over_segments_see_only_live_rows() {
             .await
             .expect("flush should succeed");
     }
-}
-
-#[tokio::test]
-async fn ann_search_selected_enforces_a_global_candidate_budget() {
-    let root = support::unique_temp_dir("storage-ann-budget");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "documents",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-
-    for batch in 0..3 {
-        engine
-            .write(
-                "documents",
-                vec![
-                    WriteOperation::Put(PutRecord {
-                        id: RecordId::new("shared-hot"),
-                        vector: vec![12.0 - batch as f32, 0.0],
-                        metadata: json!({"kind":"keep"}),
-                    }),
-                    WriteOperation::Put(PutRecord {
-                        id: RecordId::new(format!("doc-{batch}-unique")),
-                        vector: vec![9.0 - batch as f32, 0.0],
-                        metadata: json!({"kind":"keep"}),
-                    }),
-                ],
-            )
-            .await
-            .expect("write should succeed");
-        engine
-            .flush("documents")
-            .await
-            .expect("flush should succeed");
-    }
-
-    let immutable_units = engine
-        .stats("documents")
-        .await
-        .expect("stats should succeed")
-        .query_units
-        .into_iter()
-        .filter(|unit| unit.tier == "immutable")
-        .map(|unit| unit.unit_id)
-        .collect::<Vec<_>>();
-    let candidates = engine
-        .ann_search_selected(
-            "documents",
-            None,
-            immutable_units,
-            logpose_types::AnnSearchRequest {
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                candidate_budget: 2,
-            },
-            None,
-        )
-        .await
-        .expect("ann search should succeed");
-
-    assert!(candidates.len() <= 2);
-    let record_ids = candidates
-        .iter()
-        .map(|candidate| candidate.record_id.as_str().to_owned())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(record_ids.len(), candidates.len());
-    assert!(record_ids.contains("shared-hot"));
-    assert!(
-        record_ids
-            .iter()
-            .any(|record_id| record_id.ends_with("-unique")),
-        "expected a unique immutable candidate alongside the hot id, got {record_ids:?}"
-    );
-    let shared_hot = candidates
-        .iter()
-        .find(|candidate| candidate.record_id.as_str() == "shared-hot")
-        .expect("shared hot candidate should be present");
-    assert_eq!(shared_hot.seq_no, 5);
-    assert_eq!(shared_hot.value, 10.0);
-    assert!(
-        candidates
-            .windows(2)
-            .all(|pair| pair[0].value >= pair[1].value),
-        "candidates should be globally trimmed and sorted by score"
-    );
 }
 
 #[tokio::test]
@@ -1876,43 +1797,6 @@ async fn rejects_invalid_maintenance_thresholds_in_descriptor() {
         .await
         .expect_err("invalid thresholds should be rejected");
     assert!(error.to_string().contains("threshold"));
-}
-
-#[tokio::test]
-async fn scan_exact_selected_with_empty_immutable_selection_scans_none() {
-    let root = support::unique_temp_dir("storage-empty-immutable-selection");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-
-    engine
-        .create_collection(CreateCollectionRequest::new(
-            "events",
-            2,
-            DistanceMetric::Dot,
-        ))
-        .await
-        .expect("collection should be created");
-
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("evt-1"),
-                vector: vec![1.0, 0.0],
-                metadata: json!({"kind":"keep"}),
-            })],
-        )
-        .await
-        .expect("write should succeed");
-    engine.flush("events").await.expect("flush should succeed");
-
-    let visible = engine
-        .scan_exact_selected("events", None, false, Vec::new())
-        .await
-        .expect("selected scan should succeed");
-    assert!(
-        visible.is_empty(),
-        "empty immutable selection should scan no segments"
-    );
 }
 
 #[tokio::test]

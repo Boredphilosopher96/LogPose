@@ -15,8 +15,10 @@
 //!   postings over append-only slots).
 //! - `dv`: deletion vectors, their two-tier copy-on-write bitmaps, and DV files.
 //! - `segment`: the engine's handle on one segment v2 file, and writing one.
-//! - `legacy`, `legacy_view`: the v1 read paths (scans, lookups, ANN by exact scan, stats,
-//!   inspect) over v2 units, and the v1 record view of v2 rows.
+//! - `legacy_view`: the v1 record view of v2 rows and v1 batches, for the `StorageEngine`
+//!   adapter.
+//! - `inspect`: collection statistics (O(units), from counters and zone maps) and `inspect`
+//!   reports.
 //! - `storage_engine`: the trait and its public request, inspection and blob-store types.
 //! - `local_engine`: the trait implementation over `Engine`.
 //! - `collections`, `catalog`: collection, database and principal descriptor files.
@@ -24,6 +26,8 @@
 //! - `recovery`: the durability barrier, loading the manifest `CURRENT` names, orphan cleanup,
 //!   and replaying the WAL above its checkpoint.
 //! - `state`: resolving a read to the current or a token-pinned `Version`.
+//! - `read`: the read path's storage side: `CollectionReader`, `ReadView` (one pinned
+//!   `Version`), `UnitView`, the staged fetch of segment sections, and `RowSetResolver`.
 //! - `manifest`: manifest v2 and the `CURRENT` publish protocol.
 //! - `gc`: version-refcounted segment files, the file-removal queue, and orphan cleanup.
 //! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
@@ -31,7 +35,6 @@
 //! - `cache`: the buffer cache of segment section bytes that segment readers load through.
 //! - `flush`, `compaction`, `maintenance`, `scheduler`: maintenance jobs, the size-tiered
 //!   compaction policy, flush triggers, and the engine-wide scheduler of job permits.
-//! - `metric`: scoring.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
 
 #[cfg(test)]
@@ -52,14 +55,14 @@ mod flush;
 mod fs_util;
 mod gc;
 mod handle;
-mod legacy;
+mod inspect;
 mod legacy_view;
 mod local_engine;
 mod maintenance;
 mod manifest;
 mod memtable;
-mod metric;
 mod paths;
+pub mod read;
 mod recovery;
 mod root_lock;
 mod runtime;
@@ -80,8 +83,13 @@ pub use engine::{Engine, EngineConfig, FatalHandler};
 pub use handle::{CollectionHandle, CollectionMeta, MaintenanceWritten};
 pub use local_engine::LocalStorageEngine;
 pub use memtable::MemtableConfig;
+pub use read::{
+    BoxFuture, CollectionReader, FetchPlan, Projection, ReadOptions, ReadView, Residency, RowData,
+    RowSetResolver, SectionNeed, UnitView,
+};
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use scheduler::{MaintenanceScheduler, SchedulerStats};
+pub use segment_v2::IndexPolicy;
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, FetchedRecords, InspectReport, InspectTarget, StorageEngine,
 };

@@ -108,6 +108,12 @@ pub(crate) fn prepare(
                     }
                 }
             }
+            WriteRequest::DeleteByFilter { ack, .. } | WriteRequest::UpdateByFilter { ack, .. } => {
+                // The writer resolves filter requests into batches before preparing them.
+                let _ = ack.send(Err(LogPoseError::internal(
+                    "a filter request reached prepare unresolved",
+                )));
+            }
             WriteRequest::AlterSchema { change, ack } => {
                 match schema_frame(&state.schema, next_seq_no, &change) {
                     Ok((frame, schema)) => {

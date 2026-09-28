@@ -29,6 +29,10 @@ use tracing as _;
 use twox_hash as _;
 use uuid as _;
 
+#[path = "support/scan.rs"]
+mod scan;
+use scan::ScanExt;
+
 use logpose_storage::{
     CreateCollectionRequest, Engine, EngineConfig, GroupCommitConfig, LocalStorageEngine,
     StorageEngine,

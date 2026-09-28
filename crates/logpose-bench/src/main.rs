@@ -88,7 +88,7 @@ impl Preset {
 /// Systems the harness can drive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TargetKind {
-    /// The in-process `LocalStorageEngine` with the `query_exact` planner.
+    /// The in-process `LocalStorageEngine` with the staged `logpose_query` search.
     LocalEngine,
 }
 

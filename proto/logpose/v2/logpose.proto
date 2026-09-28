@@ -635,6 +635,13 @@ message QueryCollectionRequest {
   repeated MetadataFilter filters = 7;
   Predicate predicate = 8;
   ExplainMode explain = 9;
+  // Read exactly the state this snapshot token pins, and extend its expiry. Empty reads the
+  // current state (or `snapshot`). An expired, released, or unknown token fails with
+  // `FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`); a malformed one with `INVALID_ARGUMENT`.
+  string snapshot_token = 10;
+  // Pin the state the query reads under a snapshot token, returned in the reply, for repeatable
+  // reads. Fails with `RESOURCE_EXHAUSTED` (reason `TOO_MANY_SNAPSHOTS`) past the pin limits.
+  bool pin = 11;
 }
 
 // One search hit. `id` is the primary key as text, and `metadata` holds the record's
@@ -691,6 +698,8 @@ message QueryCollectionReply {
   Snapshot snapshot = 6;
   repeated QueryMatch matches = 7;
   QueryDiagnostics diagnostics = 8;
+  // The token pinning the state read: set when the request pinned or named a token.
+  string snapshot_token = 9;
 }
 
 // Statistics and maintenance

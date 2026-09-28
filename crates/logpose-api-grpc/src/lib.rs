@@ -614,6 +614,9 @@ impl GrpcLogPoseService {
                     filters,
                     predicate,
                     explain: explain_mode_from_proto(request.explain)?,
+                    snapshot_token: (!request.snapshot_token.is_empty())
+                        .then_some(request.snapshot_token),
+                    pin: request.pin,
                 },
             )
             .await?;
@@ -640,6 +643,7 @@ impl GrpcLogPoseService {
                 .diagnostics
                 .map(query_diagnostics_to_proto)
                 .transpose()?,
+            snapshot_token: response.snapshot_token.unwrap_or_default(),
         })
     }
 
@@ -3463,6 +3467,8 @@ mod tests {
             filters: Vec::new(),
             predicate: None,
             explain: proto::ExplainMode::None as i32,
+            snapshot_token: String::new(),
+            pin: false,
         }
     }
 

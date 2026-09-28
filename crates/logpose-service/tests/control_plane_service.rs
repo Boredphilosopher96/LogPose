@@ -713,6 +713,8 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
                 filters: Vec::new(),
                 predicate: None,
                 explain: ExplainMode::None,
+                snapshot_token: None,
+                pin: false,
             })
             .await
             .expect_err("query should be rejected")

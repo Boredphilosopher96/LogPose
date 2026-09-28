@@ -468,6 +468,8 @@ async fn query_collection(
                 filters,
                 predicate: request.predicate,
                 explain: request.explain,
+                snapshot_token: request.snapshot_token,
+                pin: request.pin,
             },
         )
         .await?;
@@ -655,6 +657,10 @@ struct QueryCollectionBody {
     predicate: Option<FilterExpr>,
     #[serde(default)]
     explain: ExplainMode,
+    #[serde(default)]
+    snapshot_token: Option<String>,
+    #[serde(default)]
+    pin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -831,6 +837,7 @@ mod tests {
                     merge_micros: 66,
                 }),
             }),
+            snapshot_token: None,
         })
         .expect("query response should serialize");
 
@@ -2587,7 +2594,12 @@ mod tests {
                 .is_some_and(|reason| !reason.is_empty())
         );
         assert!(
-            diagnostics["unit_scan_mix"]["mutable_exact"]
+            diagnostics["candidates_merged"]
+                .as_u64()
+                .is_some_and(|count| count >= 1)
+        );
+        assert!(
+            diagnostics["unit_scan_mix"]["memtable_scan"]
                 .as_u64()
                 .is_some_and(|count| count >= 1)
         );

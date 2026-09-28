@@ -626,6 +626,8 @@ impl LogPoseClient {
                         .collect::<Result<Vec<_>>>()?,
                     predicate: request.predicate.map(predicate_to_proto).transpose()?,
                     explain: explain_mode_to_proto(request.explain) as i32,
+                    snapshot_token: request.snapshot_token.unwrap_or_default(),
+                    pin: request.pin,
                 },
                 |mut client, request| async move { client.query_collection(request).await },
             )
@@ -650,6 +652,8 @@ impl LogPoseClient {
                     .diagnostics
                     .map(query_diagnostics_from_proto)
                     .transpose()?,
+                snapshot_token: (!response.snapshot_token.is_empty())
+                    .then_some(response.snapshot_token),
             },
         })
     }

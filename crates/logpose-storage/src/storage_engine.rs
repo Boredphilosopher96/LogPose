@@ -1,12 +1,12 @@
 //! The `StorageEngine` trait and the public request, inspection and blob-store types around it.
 
-use crate::metric::{storage_metric_compare, storage_metric_value};
+use crate::read::CollectionReader;
 use async_trait::async_trait;
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    AnnCandidate, AnnSearchRequest, CollectionAssignment, CollectionRef, CollectionStats,
-    CommitAck, DEFAULT_DATABASE_NAME, DistanceMetric, LeadershipFence, LogPoseError,
-    MaintenanceStatus, RecordId, Result, Snapshot, VisibleRecord, WriteOperation,
+    CollectionAssignment, CollectionRef, CollectionStats, CommitAck, DEFAULT_DATABASE_NAME,
+    DistanceMetric, LeadershipFence, LogPoseError, MaintenanceStatus, Result, Snapshot,
+    WriteOperation,
     legacy::{LEGACY_PRIMARY_KEY_FIELD, LEGACY_VECTOR_FIELD},
     record::{ClientOp, PrimaryKey, Record},
     schema::{
@@ -16,11 +16,14 @@ use logpose_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
-/// Durable storage surface for future engine implementations.
+/// Collection lifecycle, writes, maintenance, and statistics over one storage root.
+///
+/// Data reads go through the [`CollectionReader`] supertrait: a read resolves one
+/// [`ReadView`](crate::ReadView) and `logpose-query` executes over it.
 #[async_trait]
-pub trait StorageEngine: Send + Sync {
+pub trait StorageEngine: CollectionReader + Send + Sync {
     /// Return a short identifier for the engine implementation.
     async fn engine_name(&self) -> &'static str;
 
@@ -156,104 +159,6 @@ pub trait StorageEngine: Send + Sync {
 
     /// Capture the current manifest generation and visible sequence boundary.
     async fn snapshot(&self, collection_name: &str) -> Result<Snapshot>;
-
-    /// Resolve the currently visible records using exact scan semantics.
-    async fn scan_exact(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<Vec<VisibleRecord>>;
-
-    /// Resolve visible records for an explicit subset of mutable and immutable units.
-    async fn scan_exact_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let _ = include_mutable;
-        let _ = immutable_unit_ids;
-        self.scan_exact(collection_name, snapshot).await
-    }
-
-    /// Search immutable ANN-capable units for candidate ids before latest-visible resolution.
-    async fn ann_search_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        immutable_unit_ids: Vec<String>,
-        request: AnnSearchRequest,
-        filter: Option<Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + Sync>>,
-    ) -> Result<Vec<AnnCandidate>> {
-        let descriptor = self.open_collection(collection_name).await?;
-        let records = self
-            .scan_exact_selected(collection_name, snapshot, false, immutable_unit_ids)
-            .await?;
-        let filtered_records = if let Some(predicate) = filter.as_ref() {
-            let mut filtered_records = Vec::new();
-            for record in records {
-                if predicate.as_ref()(&record.metadata) {
-                    filtered_records.push(record);
-                }
-            }
-            filtered_records
-        } else {
-            records
-        };
-        // The legacy read paths search the first vector field.
-        let metric = descriptor
-            .schema
-            .vectors()
-            .first()
-            .map(|field| field.metric)
-            .ok_or_else(|| LogPoseError::internal("a collection schema has no vector field"))?;
-        let mut scored = filtered_records
-            .into_iter()
-            .map(|record| {
-                storage_metric_value(metric, &request.vector, &record.vector)
-                    .map(|value| (record, value))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        scored.sort_by(|(left_record, left_value), (right_record, right_value)| {
-            storage_metric_compare(metric, *right_value, *left_value)
-                .then(left_record.id.cmp(&right_record.id))
-        });
-        scored.truncate(request.candidate_budget.max(request.top_k));
-        Ok(scored
-            .into_iter()
-            .map(|(record, value)| AnnCandidate {
-                unit_id: "exact-fallback".to_owned(),
-                record_id: record.id,
-                seq_no: record.seq_no,
-                value,
-            })
-            .collect())
-    }
-
-    /// Resolve latest visible records for a focused set of ids across selected units.
-    async fn latest_visible_selected(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        record_ids: Vec<RecordId>,
-        include_mutable: bool,
-        immutable_unit_ids: Vec<String>,
-    ) -> Result<Vec<VisibleRecord>> {
-        let wanted = record_ids.into_iter().collect::<BTreeSet<_>>();
-        let records = self
-            .scan_exact_selected(
-                collection_name,
-                snapshot,
-                include_mutable,
-                immutable_unit_ids,
-            )
-            .await?;
-        Ok(records
-            .into_iter()
-            .filter(|record| wanted.contains(&record.id))
-            .collect())
-    }
 
     /// Flush the mutable delta into a new immutable segment.
     async fn flush(&self, collection_name: &str) -> Result<Snapshot>;

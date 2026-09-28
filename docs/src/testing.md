@@ -148,7 +148,7 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 ## Benchmark Harness
 
-`crates/logpose-bench` is the scoreboard for engine work. It drives a pluggable `BenchTarget` (today the in-process `LocalStorageEngine` with the `query_exact` planner) through bulk ingest, flush, unfiltered and filtered top-k search, and write-to-searchable probes, and it scores every answer against a brute-force oracle computed in the harness.
+`crates/logpose-bench` is the scoreboard for engine work. It drives a pluggable `BenchTarget` (today the in-process `LocalStorageEngine` with the staged `logpose_query::query` search) through bulk ingest, flush, unfiltered and filtered top-k search, and write-to-searchable probes, and it scores every answer against a brute-force oracle computed in the harness.
 
 - datasets: a seeded clustered Gaussian generator, or SIFT-format `.fvecs` files with optional `.ivecs` ground truth to validate the oracle
 - filters: exact selectivities (0.1, 1, 10, 50, and 99 percent by default), uncorrelated or anti-correlated with the queries, expressed with the `Predicate` AST as equality flags (default) or ranges
