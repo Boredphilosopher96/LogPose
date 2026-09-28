@@ -43,7 +43,7 @@ use logpose_index::{
     sq8::Sq8Section,
 };
 use logpose_types::{
-    CollectionRef, DistanceMetric, LogPoseError, Result, RowAddr, RowId, SeqNo, Snapshot, UnitId,
+    CollectionRef, LogPoseError, Result, RowAddr, RowId, SeqNo, Snapshot, UnitId,
     filter::FilterExpr,
     record::{PrimaryKey, Record},
     schema::{CollectionSchema, FieldId},
@@ -241,17 +241,6 @@ impl ReadView {
     #[must_use]
     pub fn collection(&self) -> &CollectionRef {
         &self.version.meta.reference
-    }
-
-    /// The metric of the first vector field of the view's schema: the vector the legacy read
-    /// paths search.
-    #[must_use]
-    pub fn metric(&self) -> DistanceMetric {
-        self.version
-            .schema
-            .vectors()
-            .first()
-            .map_or(DistanceMetric::Cosine, |field| field.metric)
     }
 
     /// Last sequence number the view includes.

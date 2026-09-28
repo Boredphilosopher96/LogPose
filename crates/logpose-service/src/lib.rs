@@ -37,18 +37,18 @@ use logpose_query::{
     ScrollRecordsResponse, WithSchema,
 };
 use logpose_storage::{
-    CreateCollectionRequest, InspectReport, InspectTarget, LocalStorageEngine, ReadOptions,
-    StorageEngine,
+    CollectionHandle, CollectionReader, CreateCollectionRequest, Engine, EngineConfig,
+    InspectReport, InspectTarget, ReadOptions,
 };
 use logpose_storage_etcd::{
-    EtcdCoordinationClient, LeadershipLease, LeadershipRecord, LeaseKeepAlive, MembershipRecord,
-    ShardOwnership,
+    EtcdCollectionCatalog, EtcdCoordinationClient, LeadershipLease, LeadershipRecord,
+    LeaseKeepAlive, MembershipRecord, ShardOwnership,
 };
 use logpose_types::{
     ANONYMOUS_LOCAL_NODE_NAME, BuildInfo, CollectionAssignment, CollectionPlacement, CollectionRef,
-    CollectionStats, CommitAck, CoordinationStatus, LeadershipFence, LogPoseError,
-    MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole, NodeRuntimeStatus,
-    ResourceKind, Snapshot,
+    CollectionStats, CommitAck, CoordinationStatus, EtcdMetadataConfig, LeadershipFence,
+    LogPoseError, MaintenanceBacklog, MaintenanceStatus, MetadataBackend, NodeRole,
+    NodeRuntimeStatus, ResourceKind, Snapshot,
     filter::FilterExpr,
     record::{ClientOp, PartialUpdate, PrimaryKey, Projection, Record, RecordPatch},
     schema::{CollectionSchema, SchemaChange},
@@ -428,56 +428,121 @@ fn coordination_write(
     }
 }
 
-/// Shared application orchestration over the current storage and query layers.
+/// Where collection metadata lives.
+#[derive(Clone)]
+enum CollectionCatalog {
+    /// The engine's own descriptors are authoritative (a single node).
+    Local,
+    /// Etcd is authoritative; the engine serves the collections this node owns.
+    Etcd(EtcdCollectionCatalog),
+}
+
+/// The data plane: collection lifecycle, writes, reads, and maintenance over the storage
+/// [`Engine`], with collection metadata from the engine itself or from etcd.
 #[derive(Clone)]
 pub struct LogPoseDataService {
-    storage: Arc<dyn StorageEngine>,
+    engine: Engine,
+    catalog: CollectionCatalog,
 }
 
 impl fmt::Debug for LogPoseDataService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LogPoseDataService")
-            .field("storage_engine", &"<dyn StorageEngine>")
+            .field("engine", &self.engine)
+            .field("catalog", &self.engine_name())
             .finish()
     }
 }
 
 impl LogPoseDataService {
-    /// Build a service over an arbitrary storage engine implementation.
+    /// Serve `engine` with its own descriptors as the collection metadata (a single node).
     #[must_use]
-    pub fn new(storage: Arc<dyn StorageEngine>) -> Self {
-        Self { storage }
+    pub fn new(engine: Engine) -> Self {
+        Self {
+            engine,
+            catalog: CollectionCatalog::Local,
+        }
     }
 
-    /// Build a service over the local filesystem-backed engine.
+    /// Serve `engine` with collection metadata in etcd.
     ///
-    /// Fails if another process holds the storage root.
-    pub fn local(root: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self::new(Arc::new(LocalStorageEngine::with_resolver(
-            root,
-            logpose_query::resolver(),
-        )?)))
+    /// # Errors
+    ///
+    /// An invalid etcd configuration.
+    pub fn with_etcd(engine: Engine, config: EtcdMetadataConfig) -> Result<Self> {
+        Ok(Self {
+            catalog: CollectionCatalog::Etcd(EtcdCollectionCatalog::new(engine.clone(), config)?),
+            engine,
+        })
     }
 
-    /// Create a collection.
+    /// Open an engine on the local filesystem at `root`, with `logpose-query`'s resolver for
+    /// filter writes, and serve it with local collection metadata.
+    ///
+    /// # Errors
+    ///
+    /// Another engine holds the storage root, or it cannot be opened.
+    pub fn local(root: impl AsRef<Path>) -> Result<Self> {
+        let engine = Engine::open_local(
+            root,
+            EngineConfig {
+                resolver: Some(logpose_query::resolver()),
+                ..EngineConfig::default()
+            },
+        )?;
+        Ok(Self::new(engine))
+    }
+
+    /// The storage engine this service serves.
+    #[must_use]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
+    /// Create a collection placed on this node as a data node.
     pub async fn create_collection(
         &self,
         request: CreateCollectionRequest,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        self.storage.create_collection(request).await
+        self.create_collection_with_assignment(
+            request,
+            CollectionAssignment {
+                assigned_node: ANONYMOUS_LOCAL_NODE_NAME.to_owned(),
+                assigned_role: NodeRole::Data,
+            },
+            None,
+        )
+        .await
     }
 
-    /// Create a collection with an explicit persisted placement assignment.
+    /// Create a collection with an explicit persisted placement assignment. With etcd
+    /// metadata the create is fenced by `leader_fence`, which it requires.
     pub async fn create_collection_with_assignment(
         &self,
         request: CreateCollectionRequest,
         assignment: CollectionAssignment,
         leader_fence: Option<LeadershipFence>,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
-        self.storage
-            .create_collection_with_assignment(request, assignment, leader_fence)
-            .await
+        match &self.catalog {
+            CollectionCatalog::Local => {
+                let descriptor = self.engine.plan_collection_descriptor(&request)?;
+                self.engine
+                    .create_collection(descriptor, Some(assignment))
+                    .await
+                    .map(|handle| handle.describe())
+            }
+            CollectionCatalog::Etcd(catalog) => {
+                let leader_fence = leader_fence.ok_or_else(|| {
+                    LogPoseError::internal(
+                        "etcd-backed collection creation requires a control-plane leadership fence",
+                    )
+                })?;
+                catalog
+                    .create_collection(request, assignment, leader_fence)
+                    .await
+            }
+        }
     }
 
     /// Fetch collection metadata by name.
@@ -490,7 +555,10 @@ impl LogPoseDataService {
 
     /// List all known collections.
     pub async fn list_collections(&self) -> Result<Vec<logpose_catalog::CollectionDescriptor>> {
-        self.storage.list_collections().await
+        match &self.catalog {
+            CollectionCatalog::Local => self.engine.list_collections(),
+            CollectionCatalog::Etcd(catalog) => catalog.list_collections().await,
+        }
     }
 
     /// Load the persisted placement assignment for a descriptor.
@@ -498,34 +566,58 @@ impl LogPoseDataService {
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<CollectionAssignment> {
-        self.storage
-            .collection_assignment_descriptor(descriptor)
-            .await
+        match &self.catalog {
+            CollectionCatalog::Local => self
+                .handle_for(descriptor)?
+                .meta()
+                .assignment
+                .clone()
+                .ok_or_else(|| {
+                    LogPoseError::internal(format!(
+                        "collection '{}' is missing placement metadata",
+                        descriptor.name
+                    ))
+                }),
+            CollectionCatalog::Etcd(catalog) => catalog.assignment(descriptor).await,
+        }
     }
 
-    /// Return the underlying engine identifier.
-    pub async fn engine_name(&self) -> &'static str {
-        self.storage.engine_name().await
+    /// Where collection metadata lives: `local`, or `local+etcd-metadata`.
+    #[must_use]
+    pub fn engine_name(&self) -> &'static str {
+        match &self.catalog {
+            CollectionCatalog::Local => "local",
+            CollectionCatalog::Etcd(_) => "local+etcd-metadata",
+        }
     }
 
     /// Verify whether the backing metadata authority is currently reachable.
     pub async fn metadata_status(&self) -> Result<()> {
-        self.storage.metadata_status().await
+        match &self.catalog {
+            CollectionCatalog::Local => Ok(()),
+            CollectionCatalog::Etcd(catalog) => catalog.metadata_status().await,
+        }
     }
 
-    /// Return whether the collection's local on-disk state exists on this node.
-    pub async fn has_local_collection(&self, collection_name: &str) -> Result<bool> {
-        self.storage.has_local_collection(collection_name).await
+    /// Return whether this node's engine serves the collection.
+    pub fn has_local_collection(&self, collection_name: &str) -> Result<bool> {
+        Ok(self
+            .engine
+            .collection(&CollectionRef::parse(collection_name)?)
+            .is_ok())
     }
 
-    /// Return whether the local on-disk descriptor matches the authoritative descriptor.
-    pub async fn local_collection_matches_descriptor(
+    /// Return whether this node's engine serves exactly the collection `descriptor` names (the
+    /// same collection id).
+    pub fn local_collection_matches_descriptor(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<bool> {
-        self.storage
-            .local_collection_matches_descriptor(descriptor)
-            .await
+        match self.engine.collection(&descriptor.collection_ref()) {
+            Ok(handle) => Ok(handle.descriptor().matches_serving_identity(descriptor)),
+            Err(LogPoseError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// List the collections of one database, each with its live schema.
@@ -533,39 +625,60 @@ impl LogPoseDataService {
         &self,
         database_name: &str,
     ) -> Result<Vec<logpose_catalog::CollectionDescriptor>> {
-        let mut descriptors = self.storage.list_collections().await?;
+        let mut descriptors = self.list_collections().await?;
         descriptors.retain(|descriptor| descriptor.database_name == database_name);
         Ok(descriptors)
     }
 
-    /// Drop a collection, fenced by `leader_fence` when metadata lives in a shared store.
+    /// Drop a collection. With etcd metadata the drop is fenced by `leader_fence`, which it
+    /// requires.
     pub async fn drop_collection(
         &self,
         collection_name: &str,
         leader_fence: Option<LeadershipFence>,
     ) -> Result<()> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .drop_collection(&descriptor.lookup_name(), leader_fence)
-            .await
+        match &self.catalog {
+            CollectionCatalog::Local => {
+                self.engine
+                    .drop_collection(&descriptor.collection_ref())
+                    .await
+            }
+            CollectionCatalog::Etcd(catalog) => {
+                let leader_fence = leader_fence.ok_or_else(|| {
+                    LogPoseError::internal(
+                        "etcd-backed collection drops require a control-plane leadership fence",
+                    )
+                })?;
+                catalog
+                    .drop_collection(&descriptor.lookup_name(), leader_fence)
+                    .await
+            }
+        }
     }
 
     /// Change a collection's schema online and return the collection with its new schema.
+    /// With etcd metadata the new schema is then published to the catalog, best effort: the
+    /// engine's schema is authoritative, and describing the collection heals a stale catalog.
     pub async fn alter_collection(
         &self,
         collection_name: &str,
         change: SchemaChange,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        let lookup_name = descriptor.lookup_name();
-        self.storage.alter_schema(&lookup_name, change).await?;
-        self.storage.open_collection(&lookup_name).await
+        let handle = self.handle_for(&descriptor)?;
+        handle.alter_schema(change).await?;
+        if let CollectionCatalog::Etcd(catalog) = &self.catalog {
+            let _ = catalog
+                .publish_schema(&descriptor.lookup_name(), &*handle.schema()?)
+                .await;
+        }
+        self.resolved_collection_descriptor(collection_name).await
     }
 
     /// The collection's live schema.
     pub async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage.schema(&descriptor.lookup_name()).await
+        self.handle(collection_name).await?.schema()
     }
 
     /// Commit upserts, partial updates, and deletes by key as one atomic batch. Validation
@@ -621,7 +734,7 @@ impl LogPoseDataService {
     ) -> Result<FetchedRecords> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
         let view = self
-            .storage
+            .engine
             .read_view(&descriptor.collection_ref(), ReadOptions::default())
             .await?;
         let schema = Arc::clone(view.schema());
@@ -656,9 +769,9 @@ impl LogPoseDataService {
         ops: Vec<ClientOp>,
         field: &str,
     ) -> Result<CommitAck> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .write_batch(&descriptor.lookup_name(), ops)
+        self.handle(collection_name)
+            .await?
+            .write(ops)
             .await
             .map_err(|error| error.with_field_prefix(field))
     }
@@ -672,9 +785,9 @@ impl LogPoseDataService {
         collection_name: &str,
         filter: FilterExpr,
     ) -> Result<CommitAck> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .delete_by_filter(&descriptor.lookup_name(), filter)
+        self.handle(collection_name)
+            .await?
+            .delete_by_filter(filter)
             .await
     }
 
@@ -689,9 +802,8 @@ impl LogPoseDataService {
         filter: FilterExpr,
         patch: RecordPatch,
     ) -> Result<CommitAck> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        let lookup_name = descriptor.lookup_name();
-        let schema = self.storage.schema(&lookup_name).await?;
+        let handle = self.handle(collection_name).await?;
+        let schema = handle.schema()?;
         let patch = patch
             .validate(&schema)
             .map_err(|error| error.to_error("patch", None))?;
@@ -699,8 +811,8 @@ impl LogPoseDataService {
             logpose_types::schema::PrimaryKeyType::Int64 => PrimaryKey::Int64(0),
             logpose_types::schema::PrimaryKeyType::String => PrimaryKey::String("_".to_owned()),
         };
-        self.storage
-            .update_by_filter(&lookup_name, filter, patch.into_update(placeholder))
+        handle
+            .update_by_filter(filter, patch.into_update(placeholder))
             .await
             .map_err(|error| match &error {
                 // Filter errors already name their node below `filter`.
@@ -718,7 +830,7 @@ impl LogPoseDataService {
         request: QueryRequest,
     ) -> Result<WithSchema<QueryResponse>> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::query(self.storage.as_ref(), &descriptor.collection_ref(), request)
+        logpose_query::query(&self.engine, &descriptor.collection_ref(), request)
             .await
             .map_err(Into::into)
     }
@@ -730,7 +842,7 @@ impl LogPoseDataService {
         request: CountRecordsRequest,
     ) -> Result<CountRecordsResponse> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::count_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
+        logpose_query::count_records(&self.engine, &descriptor.collection_ref(), request)
             .await
             .map_err(Into::into)
     }
@@ -742,15 +854,14 @@ impl LogPoseDataService {
         request: ScrollRecordsRequest,
     ) -> Result<WithSchema<ScrollRecordsResponse>> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        logpose_query::scroll_records(self.storage.as_ref(), &descriptor.collection_ref(), request)
+        logpose_query::scroll_records(&self.engine, &descriptor.collection_ref(), request)
             .await
             .map_err(Into::into)
     }
 
     /// Capture the current read snapshot.
     pub async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage.snapshot(&descriptor.lookup_name()).await
+        self.handle(collection_name).await?.snapshot()
     }
 
     /// Return collection-level stats.
@@ -769,7 +880,9 @@ impl LogPoseDataService {
             .await
     }
 
-    /// Return collection-level stats for one exact snapshot or lower-bound read barrier.
+    /// Return collection-level stats for one exact snapshot or lower-bound read barrier. With
+    /// a barrier the stats describe the current state, which must satisfy it: they are taken
+    /// from one published state, so a flush in between cannot move them past the check.
     pub async fn stats_for_read(
         &self,
         collection_name: &str,
@@ -777,10 +890,31 @@ impl LogPoseDataService {
         read_barrier: Option<Snapshot>,
     ) -> Result<CollectionStats> {
         let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        let snapshot = self
-            .resolve_read_snapshot(&descriptor.lookup_name(), snapshot, read_barrier)
-            .await?;
-        self.stats_descriptor(&descriptor, snapshot).await
+        match (snapshot, read_barrier) {
+            (Some(_), Some(_)) => Err(LogPoseError::invalid_field(
+                "read_barrier",
+                "snapshot and read_barrier cannot be provided together",
+            )),
+            (snapshot, None) => self.stats_descriptor(&descriptor, snapshot).await,
+            (None, Some(read_barrier)) => {
+                let stats = self.stats_descriptor(&descriptor, None).await?;
+                let read = Snapshot {
+                    manifest_generation: stats.manifest_generation,
+                    visible_seq_no: stats.visible_seq_no,
+                };
+                if read.satisfies_read_barrier(&read_barrier) {
+                    Ok(stats)
+                } else {
+                    Err(LogPoseError::ReadBarrierNotSatisfied {
+                        collection: descriptor.lookup_name(),
+                        required_manifest_generation: read_barrier.manifest_generation,
+                        required_seq_no: read_barrier.visible_seq_no,
+                        visible_manifest_generation: read.manifest_generation,
+                        visible_seq_no: read.visible_seq_no,
+                    })
+                }
+            }
+        }
     }
 
     /// Return collection-level stats using a previously loaded descriptor.
@@ -789,27 +923,25 @@ impl LogPoseDataService {
         descriptor: &logpose_catalog::CollectionDescriptor,
         snapshot: Option<Snapshot>,
     ) -> Result<CollectionStats> {
-        self.storage.stats_descriptor(descriptor, snapshot).await
+        self.handle_for(descriptor)?.stats(snapshot)
     }
 
     /// The collection's maintenance status (runtime state) without reconstructing full stats.
-    pub async fn maintenance_status_descriptor(
+    pub fn maintenance_status_descriptor(
         &self,
         descriptor: &logpose_catalog::CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
-        self.storage.maintenance_status_descriptor(descriptor).await
+        Ok(self.handle_for(descriptor)?.maintenance_status())
     }
 
     /// Flush the mutable delta to a new segment.
     pub async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage.flush(&descriptor.lookup_name()).await
+        self.handle(collection_name).await?.flush().await
     }
 
     /// Compact immutable segments.
     pub async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage.compact(&descriptor.lookup_name()).await
+        self.handle(collection_name).await?.compact().await
     }
 
     /// Inspect arbitrary operator-visible storage state.
@@ -818,10 +950,7 @@ impl LogPoseDataService {
         collection_name: &str,
         target: InspectTarget,
     ) -> Result<InspectReport> {
-        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
-        self.storage
-            .inspect(&descriptor.lookup_name(), target)
-            .await
+        self.handle(collection_name).await?.inspect(target).await
     }
 
     /// Inspect the current manifest.
@@ -844,60 +973,45 @@ impl LogPoseDataService {
             .await
     }
 
+    /// The local handle serving the collection `collection_name` names.
+    async fn handle(&self, collection_name: &str) -> Result<Arc<CollectionHandle>> {
+        let descriptor = self.resolved_collection_descriptor(collection_name).await?;
+        self.handle_for(&descriptor)
+    }
+
+    /// The local handle serving `descriptor`'s collection: the same collection id, not only
+    /// the same name.
+    fn handle_for(
+        &self,
+        descriptor: &logpose_catalog::CollectionDescriptor,
+    ) -> Result<Arc<CollectionHandle>> {
+        let reference = descriptor.collection_ref();
+        let handle = self.engine.collection(&reference)?;
+        if handle.meta().id != descriptor.collection_id {
+            return Err(LogPoseError::not_found(
+                ResourceKind::Collection,
+                format!("{}/{}", reference.database_name, reference.collection_name),
+            ));
+        }
+        Ok(handle)
+    }
+
     async fn resolved_collection_descriptor(
         &self,
         collection_name: &str,
     ) -> Result<logpose_catalog::CollectionDescriptor> {
         let reference = CollectionRef::parse(collection_name)?;
-        let descriptor = self
-            .storage
-            .open_collection(collection_name)
-            .await
-            .map_err(|error| qualify_collection_error(error, collection_name))?;
+        let descriptor = match &self.catalog {
+            CollectionCatalog::Local => self
+                .engine
+                .collection(&reference)
+                .map(|handle| handle.describe()),
+            CollectionCatalog::Etcd(catalog) => catalog.describe(collection_name).await,
+        }
+        .map_err(|error| qualify_collection_error(error, collection_name))?;
         ensure_collection_reference_matches_descriptor(&reference, &descriptor, collection_name)?;
         Ok(descriptor)
     }
-
-    async fn resolve_read_snapshot(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-        read_barrier: Option<Snapshot>,
-    ) -> Result<Option<Snapshot>> {
-        match (snapshot, read_barrier) {
-            (Some(_), Some(_)) => Err(LogPoseError::invalid_field(
-                "read_barrier",
-                "snapshot and read_barrier cannot be provided together",
-            )),
-            (Some(snapshot), None) => Ok(Some(snapshot)),
-            (None, None) => Ok(None),
-            (None, Some(read_barrier)) => {
-                let current = self.snapshot(collection_name).await?;
-                if current.satisfies_read_barrier(&read_barrier) {
-                    // Read the current state, not `current`: a state published since is newer,
-                    // so it satisfies the barrier too, while `current` stops being readable
-                    // once a flush or compaction supersedes its generation.
-                    Ok(None)
-                } else {
-                    Err(LogPoseError::ReadBarrierNotSatisfied {
-                        collection: collection_name.to_owned(),
-                        required_manifest_generation: read_barrier.manifest_generation,
-                        required_seq_no: read_barrier.visible_seq_no,
-                        visible_manifest_generation: current.manifest_generation,
-                        visible_seq_no: current.visible_seq_no,
-                    })
-                }
-            }
-        }
-    }
-}
-
-/// Build a filesystem-backed catalog store rooted under the runtime storage directory.
-///
-/// Opens its own engine, so it fails if another engine holds the storage root; a process that
-/// already serves the root shares that engine's catalog instead.
-pub fn local_catalog_store(root: impl AsRef<Path>) -> Result<Arc<dyn CatalogStore>> {
-    Ok(Arc::new(LocalStorageEngine::new(root)?))
 }
 
 /// Shared control-plane orchestration over local data-plane services.
@@ -1086,10 +1200,8 @@ impl LogPoseControlService {
         let descriptor = self.data.get_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
         let ownership = self.ownership_for_descriptor(&descriptor).await?;
-        let local_collection_available = self
-            .data
-            .local_collection_matches_descriptor(&descriptor)
-            .await?;
+        let local_collection_available =
+            self.data.local_collection_matches_descriptor(&descriptor)?;
         let coordination = self.coordination.snapshot().await;
         Ok(self.local_placement(
             &descriptor,
@@ -1114,10 +1226,8 @@ impl LogPoseControlService {
         for descriptor in &descriptors {
             let assignment = self.assignment_for_descriptor(descriptor).await?;
             let ownership = self.ownership_for_descriptor(descriptor).await?;
-            let local_collection_available = self
-                .data
-                .local_collection_matches_descriptor(descriptor)
-                .await?;
+            let local_collection_available =
+                self.data.local_collection_matches_descriptor(descriptor)?;
             let placement = self.local_placement(
                 descriptor,
                 &assignment,
@@ -1135,20 +1245,12 @@ impl LogPoseControlService {
                 .cmp(&(&right.database_name, &right.collection_name))
         });
 
-        let mut maintenance = MaintenanceBacklog::default();
-        for descriptor in local_descriptors {
-            let status = self.data.maintenance_status_descriptor(descriptor).await?;
-            if !status.pending.is_empty() {
-                maintenance.collections_with_pending += 1;
-                maintenance.pending_operations += status.pending.len();
-            }
-            if status.in_progress.is_some() {
-                maintenance.collections_in_progress += 1;
-            }
-            if status.last_error.is_some() {
-                maintenance.collections_with_errors += 1;
-            }
-        }
+        let maintenance = maintenance_backlog(
+            &local_descriptors
+                .into_iter()
+                .map(|descriptor| self.data.maintenance_status_descriptor(descriptor))
+                .collect::<Result<Vec<_>>>()?,
+        );
 
         let control_coordination_ready = coordination.as_ref().is_none_or(|status| {
             status.membership_registered
@@ -1167,7 +1269,7 @@ impl LogPoseControlService {
             role: self.config.node_role,
             rest_endpoint: http_endpoint(&self.config.rest_host, self.config.rest_port),
             grpc_endpoint: http_endpoint(&self.config.grpc_host, self.config.grpc_port),
-            storage_engine: self.data.engine_name().await.to_owned(),
+            storage_engine: self.data.engine_name().to_owned(),
             control_plane_ready: metadata_ready
                 && matches!(
                     self.config.node_role,
@@ -1425,10 +1527,8 @@ impl LogPoseControlService {
         let descriptor = self.data.get_collection(collection_name).await?;
         let assignment = self.assignment_for_descriptor(&descriptor).await?;
         let ownership = self.ownership_for_descriptor(&descriptor).await?;
-        let local_collection_available = self
-            .data
-            .local_collection_matches_descriptor(&descriptor)
-            .await?;
+        let local_collection_available =
+            self.data.local_collection_matches_descriptor(&descriptor)?;
         let coordination = self.coordination.snapshot().await;
         if self.coordination_client.is_some() && ownership.is_none() {
             return Err(LogPoseError::Unavailable {
@@ -1511,6 +1611,26 @@ impl LogPoseControlService {
     }
 }
 
+/// The maintenance backlog of a node's local collections, from each one's maintenance status:
+/// collections with jobs waiting and how many, collections with a job running, and collections
+/// whose last job failed.
+fn maintenance_backlog(statuses: &[MaintenanceStatus]) -> MaintenanceBacklog {
+    let mut backlog = MaintenanceBacklog::default();
+    for status in statuses {
+        if !status.pending.is_empty() {
+            backlog.collections_with_pending += 1;
+            backlog.pending_operations += status.pending.len();
+        }
+        if status.in_progress.is_some() {
+            backlog.collections_in_progress += 1;
+        }
+        if status.last_error.is_some() {
+            backlog.collections_with_errors += 1;
+        }
+    }
+    backlog
+}
+
 fn http_endpoint(host: &str, port: u16) -> String {
     let authority = match host.parse::<IpAddr>() {
         Ok(IpAddr::V6(_)) => format!("[{host}]"),
@@ -1549,21 +1669,22 @@ fn qualify_collection_error(error: LogPoseError, collection_name: &str) -> LogPo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
-    use logpose_types::{
-        CollectionStats, CommitAck, DistanceMetric, Snapshot, WriteOperation,
-        legacy::record_from_put,
-    };
-    use serde_json::json;
+    use logpose_types::DistanceMetric;
     use std::{
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "logpose-service-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn parse_collection_reference_accepts_database_collection() {
@@ -1662,259 +1783,27 @@ mod tests {
         assert_eq!(current.leadership_lease_id, None);
     }
 
-    #[tokio::test]
-    async fn create_collection_uses_plain_storage_create_when_assignments_are_unsupported() {
-        #[derive(Debug)]
-        struct CreateOnlyStorageEngine {
-            root: PathBuf,
-            next_id: AtomicU64,
-        }
-
-        impl logpose_storage::CollectionReader for CreateOnlyStorageEngine {
-            fn read_view<'a>(
-                &'a self,
-                collection: &'a CollectionRef,
-                _options: logpose_storage::ReadOptions,
-            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
-            {
-                Box::pin(async move {
-                    Err(LogPoseError::not_found(
-                        ResourceKind::Collection,
-                        collection.lookup_name(),
-                    ))
-                })
-            }
-        }
-
-        #[async_trait]
-        impl StorageEngine for CreateOnlyStorageEngine {
-            async fn engine_name(&self) -> &'static str {
-                "create-only"
-            }
-
-            async fn create_collection(
-                &self,
-                request: CreateCollectionRequest,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                let suffix = self.next_id.fetch_add(1, Ordering::Relaxed);
-                Ok(logpose_catalog::CollectionDescriptor::new(
-                    request.name().to_owned(),
-                    request.spec.build_schema()?,
-                    self.root.join(format!("collection-{suffix}")),
-                ))
-            }
-
-            async fn open_collection(
-                &self,
-                name: &str,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::not_found(ResourceKind::Collection, name))
-            }
-
-            async fn write(
-                &self,
-                collection_name: &str,
-                _operations: Vec<WriteOperation>,
-            ) -> logpose_types::Result<CommitAck> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn inspect(
-                &self,
-                collection_name: &str,
-                target: InspectTarget,
-            ) -> logpose_types::Result<InspectReport> {
-                let _ = collection_name;
-                Ok(InspectReport {
-                    target: match target {
-                        InspectTarget::Manifest => "manifest".to_owned(),
-                        InspectTarget::Wal => "wal".to_owned(),
-                        InspectTarget::Maintenance => "maintenance".to_owned(),
-                        InspectTarget::Segment(segment_id) => {
-                            format!("segment:{segment_id}")
-                        }
-                    },
-                    payload: json!({}),
-                })
-            }
-        }
-
-        let service = LogPoseDataService::new(Arc::new(CreateOnlyStorageEngine {
-            root: std::env::temp_dir().join("logpose-create-only-engine"),
-            next_id: AtomicU64::new(0),
-        }));
-
-        let descriptor = service
-            .create_collection(CreateCollectionRequest::in_database(
-                "default".to_owned(),
-                "documents".to_owned(),
-                2,
-                DistanceMetric::Dot,
-            ))
-            .await
-            .expect("plain storage create should still succeed");
-
-        assert_eq!(descriptor.name, "documents");
-        assert_eq!(descriptor.schema.vectors()[0].dimensions, 2);
-        assert_eq!(descriptor.schema.vectors()[0].metric, DistanceMetric::Dot);
-    }
-
+    /// With etcd metadata unreachable, the runtime status reports the node unready instead of
+    /// failing, and lists no collections.
     #[tokio::test]
     async fn runtime_status_surfaces_metadata_unready_without_failing() {
-        #[derive(Debug)]
-        struct MetadataUnavailableStorageEngine;
-
-        impl logpose_storage::CollectionReader for MetadataUnavailableStorageEngine {
-            fn read_view<'a>(
-                &'a self,
-                collection: &'a CollectionRef,
-                _options: logpose_storage::ReadOptions,
-            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
-            {
-                Box::pin(async move {
-                    Err(LogPoseError::unavailable(format!(
-                        "metadata for '{}' is unavailable",
-                        collection.lookup_name()
-                    )))
-                })
-            }
-        }
-
-        #[async_trait]
-        impl StorageEngine for MetadataUnavailableStorageEngine {
-            async fn engine_name(&self) -> &'static str {
-                "metadata-unavailable"
-            }
-
-            async fn metadata_status(&self) -> logpose_types::Result<()> {
-                Err(LogPoseError::unavailable(
-                    "etcd metadata operation failed: connection refused",
-                ))
-            }
-
-            async fn create_collection(
-                &self,
-                _request: CreateCollectionRequest,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::internal("unsupported".to_owned()))
-            }
-
-            async fn open_collection(
-                &self,
-                name: &str,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                Err(LogPoseError::not_found(ResourceKind::Collection, name))
-            }
-
-            async fn list_collections(
-                &self,
-            ) -> logpose_types::Result<Vec<logpose_catalog::CollectionDescriptor>> {
-                Err(LogPoseError::internal(
-                    "list_collections should not run when metadata is unavailable".to_owned(),
-                ))
-            }
-
-            async fn write(
-                &self,
-                collection_name: &str,
-                _operations: Vec<WriteOperation>,
-            ) -> logpose_types::Result<CommitAck> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                Err(LogPoseError::not_found(
-                    ResourceKind::Collection,
-                    collection_name,
-                ))
-            }
-
-            async fn inspect(
-                &self,
-                collection_name: &str,
-                target: InspectTarget,
-            ) -> logpose_types::Result<InspectReport> {
-                let _ = collection_name;
-                Ok(InspectReport {
-                    target: match target {
-                        InspectTarget::Manifest => "manifest".to_owned(),
-                        InspectTarget::Wal => "wal".to_owned(),
-                        InspectTarget::Maintenance => "maintenance".to_owned(),
-                        InspectTarget::Segment(segment_id) => format!("segment:{segment_id}"),
-                    },
-                    payload: json!({}),
-                })
-            }
-        }
-
-        let data = Arc::new(LogPoseDataService::new(Arc::new(
-            MetadataUnavailableStorageEngine,
-        )));
-        let catalog_root = std::env::temp_dir().join(format!(
-            "logpose-service-metadata-unavailable-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
+        let root = temp_root("metadata-unavailable");
+        let engine =
+            Engine::open_local(&root, EngineConfig::default()).expect("engine should open");
+        let data = Arc::new(
+            LogPoseDataService::with_etcd(
+                engine.clone(),
+                EtcdMetadataConfig {
+                    endpoints: vec!["http://127.0.0.1:1".to_owned()],
+                    timeout_ms: 250,
+                    ..EtcdMetadataConfig::default()
+                },
+            )
+            .expect("the etcd catalog should build"),
+        );
         let control = LogPoseControlService::new(
             data,
-            local_catalog_store(&catalog_root).expect("catalog store should open"),
+            Arc::new(engine),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );
@@ -1926,126 +1815,20 @@ mod tests {
 
         assert!(!status.control_plane_ready);
         assert!(!status.data_plane_ready);
+        assert_eq!(status.storage_engine, "local+etcd-metadata");
         assert_eq!(status.collection_count, 0);
         assert!(status.collections.is_empty());
+        drop(control);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Stats behind a read barrier check the barrier against the current snapshot and then read
-    /// the current state. A flush that lands between the two is not an error: the state it
-    /// publishes is newer, so it satisfies the barrier too, while the checked snapshot's
-    /// generation is no longer retained.
+    /// Stats behind a read barrier come from one published state that satisfies it: a newer
+    /// state (here after a flush) passes, a barrier ahead of the collection fails, and a
+    /// barrier together with an exact snapshot is refused.
     #[tokio::test]
-    async fn stats_behind_a_read_barrier_survive_a_flush_between_check_and_read() {
-        /// A local engine that, once armed, writes and flushes right after it hands out a
-        /// snapshot.
-        struct FlushAfterSnapshot {
-            inner: logpose_storage::LocalStorageEngine,
-            armed: std::sync::atomic::AtomicBool,
-        }
-
-        impl logpose_storage::CollectionReader for FlushAfterSnapshot {
-            fn read_view<'a>(
-                &'a self,
-                collection: &'a CollectionRef,
-                options: logpose_storage::ReadOptions,
-            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
-            {
-                self.inner.read_view(collection, options)
-            }
-        }
-
-        #[async_trait]
-        impl StorageEngine for FlushAfterSnapshot {
-            async fn engine_name(&self) -> &'static str {
-                "flush-after-snapshot"
-            }
-
-            async fn create_collection(
-                &self,
-                request: CreateCollectionRequest,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                self.inner.create_collection(request).await
-            }
-
-            async fn open_collection(
-                &self,
-                name: &str,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                self.inner.open_collection(name).await
-            }
-
-            async fn write(
-                &self,
-                collection_name: &str,
-                operations: Vec<WriteOperation>,
-            ) -> logpose_types::Result<CommitAck> {
-                self.inner.write(collection_name, operations).await
-            }
-
-            async fn write_batch(
-                &self,
-                collection_name: &str,
-                operations: Vec<ClientOp>,
-            ) -> logpose_types::Result<CommitAck> {
-                self.inner.write_batch(collection_name, operations).await
-            }
-
-            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                let snapshot = self.inner.snapshot(collection_name).await?;
-                if self.armed.swap(false, Ordering::SeqCst) {
-                    let put = WriteOperation::Put(logpose_types::PutRecord {
-                        id: logpose_types::RecordId::new("late"),
-                        vector: vec![0.0, 1.0],
-                        metadata: json!({}),
-                    });
-                    self.inner.write(collection_name, vec![put]).await?;
-                    self.inner.flush(collection_name).await?;
-                }
-                Ok(snapshot)
-            }
-
-            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                self.inner.flush(collection_name).await
-            }
-
-            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                self.inner.compact(collection_name).await
-            }
-
-            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                self.inner.stats(collection_name).await
-            }
-
-            async fn stats_descriptor(
-                &self,
-                descriptor: &logpose_catalog::CollectionDescriptor,
-                snapshot: Option<Snapshot>,
-            ) -> logpose_types::Result<CollectionStats> {
-                self.inner.stats_descriptor(descriptor, snapshot).await
-            }
-
-            async fn inspect(
-                &self,
-                collection_name: &str,
-                target: InspectTarget,
-            ) -> logpose_types::Result<InspectReport> {
-                self.inner.inspect(collection_name, target).await
-            }
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "logpose-service-barrier-flush-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        let storage = Arc::new(FlushAfterSnapshot {
-            inner: logpose_storage::LocalStorageEngine::new(&root).expect("engine should open"),
-            armed: std::sync::atomic::AtomicBool::new(false),
-        });
-        let service = LogPoseDataService::new(Arc::clone(&storage) as Arc<dyn StorageEngine>);
+    async fn stats_behind_a_read_barrier_describe_one_state_that_satisfies_it() {
+        let root = temp_root("barrier-stats");
+        let service = LogPoseDataService::local(&root).expect("service should open");
         service
             .create_collection(CreateCollectionRequest::new(
                 "documents",
@@ -2054,165 +1837,61 @@ mod tests {
             ))
             .await
             .expect("collection should be created");
-        let put = record_from_put(logpose_types::PutRecord {
-            id: logpose_types::RecordId::new("first"),
-            vector: vec![1.0, 0.0],
-            metadata: json!({}),
-        })
-        .expect("record");
         let ack = service
-            .upsert("documents", vec![put])
+            .upsert(
+                "documents",
+                vec![Record::new("first").with_vector("vector", vec![1.0, 0.0])],
+            )
+            .await
+            .expect("write should succeed");
+        service.flush("documents").await.expect("flush");
+        service
+            .upsert(
+                "documents",
+                vec![Record::new("second").with_vector("vector", vec![0.0, 1.0])],
+            )
             .await
             .expect("write should succeed");
 
-        storage.armed.store(true, Ordering::SeqCst);
         let stats = service
             .stats_for_read("documents", None, Some(ack.snapshot.clone()))
             .await
-            .expect("a flush after the barrier check does not expire the read");
+            .expect("a newer state satisfies the barrier");
         assert!(stats.manifest_generation > ack.snapshot.manifest_generation);
-        assert!(stats.visible_seq_no > ack.snapshot.visible_seq_no);
+        assert_eq!(stats.visible_seq_no, ack.snapshot.visible_seq_no + 1);
         assert_eq!(stats.live_record_count, 2);
 
+        let ahead = Snapshot {
+            manifest_generation: stats.manifest_generation,
+            visible_seq_no: stats.visible_seq_no + 1,
+        };
+        let error = service
+            .stats_for_read("documents", None, Some(ahead))
+            .await
+            .expect_err("a barrier ahead of the collection is not satisfied");
+        assert!(
+            matches!(error, LogPoseError::ReadBarrierNotSatisfied { .. }),
+            "{error}"
+        );
+        let error = service
+            .stats_for_read(
+                "documents",
+                Some(ack.snapshot.clone()),
+                Some(ack.snapshot.clone()),
+            )
+            .await
+            .expect_err("a snapshot and a barrier together are refused");
+        assert!(error.to_string().contains("read_barrier"), "{error}");
+
         drop(service);
-        drop(storage);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The runtime status sums each local collection's maintenance status (runtime state the
-    /// engine keeps): collections with jobs waiting and how many, collections with a job
-    /// running, and collections whose last job failed, telling apart collections of the same
-    /// name in different databases.
-    #[tokio::test]
-    async fn runtime_status_aggregates_every_local_collections_maintenance_backlog() {
-        /// A local engine that reports a chosen maintenance status per collection.
-        struct FixedMaintenance {
-            inner: LocalStorageEngine,
-            statuses: std::collections::BTreeMap<String, MaintenanceStatus>,
-        }
-
-        impl logpose_storage::CollectionReader for FixedMaintenance {
-            fn read_view<'a>(
-                &'a self,
-                collection: &'a CollectionRef,
-                options: logpose_storage::ReadOptions,
-            ) -> logpose_storage::BoxFuture<'a, logpose_types::Result<logpose_storage::ReadView>>
-            {
-                self.inner.read_view(collection, options)
-            }
-        }
-
-        #[async_trait]
-        impl StorageEngine for FixedMaintenance {
-            async fn engine_name(&self) -> &'static str {
-                "fixed-maintenance"
-            }
-
-            async fn create_collection(
-                &self,
-                request: CreateCollectionRequest,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                self.inner.create_collection(request).await
-            }
-
-            async fn create_collection_with_assignment(
-                &self,
-                request: CreateCollectionRequest,
-                assignment: CollectionAssignment,
-                leader_fence: Option<LeadershipFence>,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                self.inner
-                    .create_collection_with_assignment(request, assignment, leader_fence)
-                    .await
-            }
-
-            async fn open_collection(
-                &self,
-                name: &str,
-            ) -> logpose_types::Result<logpose_catalog::CollectionDescriptor> {
-                self.inner.open_collection(name).await
-            }
-
-            async fn has_local_collection(&self, name: &str) -> logpose_types::Result<bool> {
-                self.inner.has_local_collection(name).await
-            }
-
-            async fn local_collection_matches_descriptor(
-                &self,
-                descriptor: &logpose_catalog::CollectionDescriptor,
-            ) -> logpose_types::Result<bool> {
-                self.inner
-                    .local_collection_matches_descriptor(descriptor)
-                    .await
-            }
-
-            async fn list_collections(
-                &self,
-            ) -> logpose_types::Result<Vec<logpose_catalog::CollectionDescriptor>> {
-                self.inner.list_collections().await
-            }
-
-            async fn collection_assignment_descriptor(
-                &self,
-                descriptor: &logpose_catalog::CollectionDescriptor,
-            ) -> logpose_types::Result<CollectionAssignment> {
-                self.inner
-                    .collection_assignment_descriptor(descriptor)
-                    .await
-            }
-
-            async fn write(
-                &self,
-                collection_name: &str,
-                operations: Vec<WriteOperation>,
-            ) -> logpose_types::Result<CommitAck> {
-                self.inner.write(collection_name, operations).await
-            }
-
-            async fn snapshot(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                self.inner.snapshot(collection_name).await
-            }
-
-            async fn flush(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                self.inner.flush(collection_name).await
-            }
-
-            async fn compact(&self, collection_name: &str) -> logpose_types::Result<Snapshot> {
-                self.inner.compact(collection_name).await
-            }
-
-            async fn stats(&self, collection_name: &str) -> logpose_types::Result<CollectionStats> {
-                self.inner.stats(collection_name).await
-            }
-
-            async fn maintenance_status_descriptor(
-                &self,
-                descriptor: &logpose_catalog::CollectionDescriptor,
-            ) -> logpose_types::Result<MaintenanceStatus> {
-                Ok(self
-                    .statuses
-                    .get(&descriptor.lookup_name())
-                    .cloned()
-                    .unwrap_or_default())
-            }
-
-            async fn inspect(
-                &self,
-                collection_name: &str,
-                target: InspectTarget,
-            ) -> logpose_types::Result<InspectReport> {
-                self.inner.inspect(collection_name, target).await
-            }
-        }
-
-        let root = std::env::temp_dir().join(format!(
-            "logpose-service-maintenance-backlog-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
+    /// The runtime status sums each local collection's maintenance status: collections with
+    /// jobs waiting and how many, collections with a job running, and collections whose last
+    /// job failed.
+    #[test]
+    fn the_maintenance_backlog_sums_every_local_collections_status() {
         let status =
             |pending: &[&str], in_progress: Option<&str>, error: Option<&str>| MaintenanceStatus {
                 pending: pending.iter().map(|label| (*label).to_owned()).collect(),
@@ -2225,27 +1904,27 @@ mod tests {
                 }),
                 completed_runs: 0,
             };
-        let storage = Arc::new(FixedMaintenance {
-            inner: LocalStorageEngine::new(root.join("data")).expect("engine should open"),
-            statuses: [
-                (
-                    "default/documents".to_owned(),
-                    status(&["flush", "compact"], None, Some("disk full")),
-                ),
-                (
-                    "analytics/documents".to_owned(),
-                    status(&["compact"], Some("flush"), None),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        });
-        let data = Arc::new(LogPoseDataService::new(
-            Arc::clone(&storage) as Arc<dyn StorageEngine>
-        ));
+        let backlog = maintenance_backlog(&[
+            status(&["flush", "compact"], None, Some("disk full")),
+            status(&["compact"], Some("flush"), None),
+            status(&[], None, None),
+        ]);
+        assert_eq!(backlog.collections_with_pending, 2);
+        assert_eq!(backlog.pending_operations, 3);
+        assert_eq!(backlog.collections_in_progress, 1);
+        assert_eq!(backlog.collections_with_errors, 1);
+    }
+
+    /// The runtime status covers every local collection, telling apart collections of the same
+    /// name in different databases, and reads each one's maintenance status from its handle.
+    #[tokio::test]
+    async fn runtime_status_reports_every_local_collection() {
+        let root = temp_root("runtime-status");
+        let data = Arc::new(LogPoseDataService::local(&root).expect("service should open"));
+        let engine = data.engine().clone();
         let control = LogPoseControlService::new(
             data,
-            local_catalog_store(root.join("catalog")).expect("catalog store should open"),
+            Arc::new(engine),
             LogPoseConfig::default(),
             BuildInfo::current(),
         );
@@ -2265,14 +1944,19 @@ mod tests {
             .runtime_status()
             .await
             .expect("runtime status should load");
+        assert_eq!(runtime.storage_engine, "local");
         assert_eq!(runtime.collection_count, 2);
-        assert_eq!(runtime.maintenance.collections_with_pending, 2);
-        assert_eq!(runtime.maintenance.pending_operations, 3);
-        assert_eq!(runtime.maintenance.collections_in_progress, 1);
-        assert_eq!(runtime.maintenance.collections_with_errors, 1);
+        assert_eq!(
+            runtime
+                .collections
+                .iter()
+                .map(|placement| placement.database_name.as_str())
+                .collect::<Vec<_>>(),
+            ["analytics", "default"]
+        );
+        assert_eq!(runtime.maintenance, MaintenanceBacklog::default());
 
         drop(control);
-        drop(storage);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

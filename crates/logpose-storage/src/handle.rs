@@ -61,7 +61,7 @@ impl CollectionMeta {
     }
 }
 
-/// Versions of the current manifest generation kept for exact legacy snapshots.
+/// Versions of the current manifest generation kept for exact snapshot reads.
 const RECENT_VERSIONS: usize = 8;
 
 const STATE_OPEN: u8 = 0;
@@ -156,7 +156,7 @@ pub struct CollectionHandle {
     token_context: Arc<TokenContext>,
     /// The writer's primary-key index size, for the cache budget.
     pk_index_bytes: AtomicU64,
-    /// The latest versions of the current manifest generation, newest last, so an exact legacy
+    /// The latest versions of the current manifest generation, newest last, so an exact
     /// snapshot taken moments ago still resolves while writes continue. Cleared whenever the
     /// manifest generation changes, so it never holds a retired memtable or segment.
     recent: Mutex<VecDeque<Arc<Version>>>,
@@ -352,7 +352,7 @@ impl CollectionHandle {
         self.pk_index_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// The version an exact legacy `Snapshot` names, if one is still retained: one of the
+    /// The version an exact `Snapshot` names, if one is still retained: one of the
     /// latest versions of the current manifest generation, or a token-pinned one.
     pub(crate) fn version_for(&self, snapshot: &Snapshot) -> Option<Arc<Version>> {
         let recent = self
