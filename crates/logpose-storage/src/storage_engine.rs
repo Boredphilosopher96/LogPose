@@ -206,21 +206,13 @@ pub trait StorageEngine: Send + Sync {
         self.stats(&descriptor.lookup_name()).await
     }
 
-    /// Return persisted maintenance state without reconstructing full collection stats.
+    /// Return the collection's maintenance status (runtime state) without reconstructing full
+    /// collection stats.
     async fn maintenance_status_descriptor(
         &self,
         descriptor: &CollectionDescriptor,
     ) -> Result<MaintenanceStatus> {
         Ok(self.stats_descriptor(descriptor, None).await?.maintenance)
-    }
-
-    /// Resume persisted maintenance state for a descriptor when the runtime can serve it locally.
-    async fn recover_maintenance_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<()> {
-        let _ = descriptor;
-        Ok(())
     }
 
     /// Return collection-level statistics for a specific read snapshot.

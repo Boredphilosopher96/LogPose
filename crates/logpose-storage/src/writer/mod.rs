@@ -20,14 +20,17 @@
 //! writers share one fsync. A group becomes visible only after its own fsync returned (I14), and
 //! acknowledgements are sent only after the `Version` that includes them is stored (I1).
 //!
-//! Control messages (maintenance job begin and commit, quiesce for a drop, shutdown) are
-//! polled first with a biased select, and each one drains the pipeline before it is handled:
-//! a continuous stream of writes can delay a flush or compaction publish by at most one group.
-//! A flush begins by freezing the active memtable (and rotating the WAL, so the frozen
-//! memtable's operations end in an older file than every later write); its commit installs the
-//! new segment, reconciles the frozen memtable's late deletions onto it, and forwards the
-//! primary-key index. A compaction's commit reconciles the deletions that reached its inputs
-//! while it ran onto its output (and writes the output's DV file), then swaps the output in.
+//! Control messages (scheduler permits, job builds that finished, explicit flushes and
+//! compactions, quiesce for a drop, shutdown) are polled first with a biased select, and each
+//! one drains the pipeline before it is handled: a continuous stream of writes can delay a
+//! flush or compaction publish by at most one group. Maintenance itself is in `jobs.rs`: a
+//! flush trigger freezes the active memtable once the pipeline is drained (rotating the WAL, so
+//! the frozen memtable's operations end in an older file than every later write), with
+//! `max_frozen` memtables frozen writes stall, and each flush or compaction the size-tiered
+//! policy plans waits for a scheduler permit. A flush's commit installs the new segment,
+//! reconciles the frozen memtable's late deletions onto it, and forwards the primary-key index.
+//! A compaction's commit reconciles the deletions that reached its inputs while it ran onto its
+//! output (and writes the output's DV file), then swaps the output in.
 //!
 //! A failed group append poisons the collection. The WAL layer rolls the file back to the last
 //! synced group; the group's writes fail with [`LogPoseError::WalWriteFailed`] carrying the
@@ -38,7 +41,10 @@
 
 mod apply;
 #[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
 mod dv_tests;
+mod jobs;
 mod pk_index;
 mod prepare;
 #[cfg(test)]
@@ -48,17 +54,16 @@ pub(crate) use apply::{LogicalState, replay_frame};
 pub(crate) use pk_index::{PkIndex, row_map};
 
 use crate::{
-    dv::{DeletionVector, DvFile, dv_path, write_dv_file},
+    compaction::Policy,
+    dv::DeletionVector,
     engine::CoreRef,
-    fs_util::crash_point,
     handle::{CollectionHandle, PoisonKind},
-    maintenance::{MaintenanceOperation, should_compact, should_flush},
-    manifest::{
-        DvRef, MANIFEST_FORMAT_VERSION, Manifest, ManifestSegment, manifest_path, publish_manifest,
-    },
+    maintenance::should_flush,
+    manifest::{DvRef, Manifest, ManifestSegment},
     memtable::MemtableData,
-    paths::{SEGMENTS_DIR, segment_path},
+    paths::segment_path,
     runtime::run_cpu,
+    scheduler::{Permit, RequestId},
     segment::SegmentHandle,
     version::{Version, VersionId},
 };
@@ -67,7 +72,7 @@ use logpose_types::{
     record::{ClientOp, PrimaryKey},
     schema::{CollectionSchema, ScalarFieldSpec, SchemaError},
 };
-use logpose_vfs::{CrashPoint, is_crashed};
+use logpose_vfs::is_crashed;
 use logpose_wal::{
     WalError, WalFrame, WalWriter,
     codec::{CheckpointPayload, RowImage, WalPayload},
@@ -75,7 +80,7 @@ use logpose_wal::{
 use pk_index::{Forwarding, PK_REWRITE_SLICE, RewriteRows};
 use prepare::{FetchedRows, Pending, PreparedRequests, prepares_inline};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -83,6 +88,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
+
+/// How often a writer ticks: the memtable age trigger, the write-stall timeout, retries after a
+/// failed job, the compaction policy over deletion counts, and primary-key rewrite slices.
+pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Group commit settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +209,12 @@ impl WriteRequest {
     }
 }
 
+/// A write request with the engine-clock time it was submitted, for the write-stall timeout.
+pub(crate) struct Queued {
+    pub(crate) request: WriteRequest,
+    pub(crate) enqueued_at: Duration,
+}
+
 /// A maintenance job that publishes a manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum JobKind {
@@ -207,8 +222,23 @@ pub(crate) enum JobKind {
     Compact,
 }
 
+impl JobKind {
+    /// The label maintenance status reports.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Flush => "flush",
+            Self::Compact => "compact",
+        }
+    }
+}
+
+/// One maintenance job of a collection; never reused within the writer's life.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct JobId(pub(crate) u64);
+
 /// What a maintenance job starts from.
 pub(crate) struct JobStart {
+    pub(crate) job: JobId,
     /// The published (hence durable) state the job works from.
     pub(crate) version: Arc<Version>,
     /// The unit id the job's output must use. Allocated for this job alone and never issued
@@ -247,8 +277,8 @@ pub(crate) struct DvWrite {
     pub(crate) deletes: DeletionVector,
 }
 
-/// The inputs of a compaction, captured at its begin: every segment, ascending, with `D0`, its
-/// deletion vector at the begin.
+/// The inputs of a compaction, captured at its begin: the planned segments, ascending, each with
+/// `D0`, its deletion vector at the begin.
 pub(crate) struct CompactStart {
     pub(crate) inputs: Vec<(Arc<SegmentHandle>, DeletionVector)>,
 }
@@ -290,25 +320,42 @@ pub(crate) struct CompactedSegment {
     pub(crate) sources: Arc<[RowAddr]>,
 }
 
-/// Messages polled before client requests.
+/// Where the outcome of an explicit flush or compaction goes.
+pub(crate) type SnapshotReply = oneshot::Sender<Result<Snapshot>>;
+
+/// Messages polled before client requests. Every one but `Shutdown` drains the pipeline before
+/// it is handled, so the writer's private state equals the published (durable) state.
 pub(crate) enum ControlMsg {
-    /// Start a maintenance job once no other job of the collection is active. The writer drains
-    /// the pipeline and, for a flush, freezes the active memtable (rotating the WAL) unless an
-    /// earlier flush left one frozen; the reply is the published (hence durable) state the job
-    /// works from.
+    /// The scheduler granted the permit job `job` asked for. The writer begins the job: it
+    /// captures the job's inputs from the drained state and starts its build on a job thread.
+    PermitGranted { job: JobId, permit: Permit },
+    /// A job's build finished (the design's `FlushDone` and `CompactionDone`). The writer
+    /// commits it: publishes its manifest, then the `Version` over it. `wrote_files` says
+    /// whether it may have created files, which are removed if it does not commit. `reply`
+    /// receives the outcome of a job a test stepped by hand.
+    JobDone {
+        job: JobId,
+        result: Result<JobCommit>,
+        wrote_files: bool,
+        reply: Option<SnapshotReply>,
+    },
+    /// Flush every operation visible now: freeze the active memtable and flush the frozen
+    /// memtables until the checkpoint reaches it. `reply`, if any, gets the version after the
+    /// last flush (the engine's memtable-budget trigger sends none).
+    Flush { reply: Option<SnapshotReply> },
+    /// Compact the collection's segments into one (as many as one job can hold), once no
+    /// background compaction runs.
+    Compact { reply: SnapshotReply },
+    /// Begin a job without a permit, for a test to build and commit by hand. A flush waits for
+    /// a running flush; a compaction takes every unreserved segment.
+    #[cfg_attr(not(test), allow(dead_code))]
     BeginJob {
         kind: JobKind,
         reply: oneshot::Sender<Result<JobStart>>,
     },
-    /// Commit the active job: publish its manifest, then the `Version` over it.
-    CommitJob {
-        commit: Box<JobCommit>,
-        reply: oneshot::Sender<Result<Snapshot>>,
-    },
-    /// The active job ended without committing. `wrote_files` says whether it may have created
-    /// files, which are then removed: no durable manifest names them.
-    EndJob { wrote_files: bool },
-    /// Reply once the pipeline is drained and no job is active (a drop waits for this after it
+    /// A job ended without committing (its ticket was dropped).
+    EndJob { job: JobId, wrote_files: bool },
+    /// Reply once the pipeline is drained and no job runs (a drop waits for this after it
     /// marked the handle dropped, so nothing is written afterwards). A std channel, because a
     /// drop blocks its caller and may be called from anywhere.
     Quiesce {
@@ -320,13 +367,13 @@ pub(crate) enum ControlMsg {
 
 /// The sending halves, held by the collection handle.
 pub(crate) struct WriterChannels {
-    pub(crate) requests: mpsc::Sender<WriteRequest>,
+    pub(crate) requests: mpsc::Sender<Queued>,
     pub(crate) control: mpsc::UnboundedSender<ControlMsg>,
 }
 
 /// The receiving halves, owned by the writer task.
 pub(crate) struct WriterInbox {
-    requests: mpsc::Receiver<WriteRequest>,
+    requests: mpsc::Receiver<Queued>,
     control: mpsc::UnboundedReceiver<ControlMsg>,
 }
 
@@ -372,6 +419,12 @@ pub(crate) fn spawn(
     let group = core.group_commit;
     core.register_writer(handle.control_sender());
     handle.set_pk_index_bytes(seed.state.pk.approximate_bytes());
+    let policy = Policy::new(
+        core.compaction,
+        handle.descriptor().compaction_threshold_segments,
+        core.scheduler.pool_bytes(),
+        crate::compaction::RowShape::of(&seed.state.schema),
+    );
     let writer = Writer {
         core,
         handle,
@@ -388,10 +441,17 @@ pub(crate) fn spawn(
         next_seq_no: seed.next_seq_no,
         next_version_id: seed.version_id.0 + 1,
         pending_checkpoint: None,
-        active_job: None,
-        waiting_jobs: VecDeque::new(),
+        jobs: BTreeMap::new(),
+        next_job: 0,
+        reserved: BTreeSet::new(),
+        flush_waiters: Vec::new(),
+        compact_waiters: Vec::new(),
+        manual_flushes: Vec::new(),
         quiesce_waiters: Vec::new(),
-        requested: [false; 2],
+        freeze_pending: false,
+        held: None,
+        retry_at: None,
+        policy,
     };
     runtime.spawn(writer.run());
 }
@@ -424,7 +484,7 @@ enum Flow {
 struct Writer {
     core: CoreRef,
     handle: Arc<CollectionHandle>,
-    requests: mpsc::Receiver<WriteRequest>,
+    requests: mpsc::Receiver<Queued>,
     control: mpsc::UnboundedReceiver<ControlMsg>,
     config: GroupCommitConfig,
     /// `None` while a group's I/O runs, and after the writer lost it.
@@ -448,26 +508,58 @@ struct Writer {
     next_version_id: u64,
     /// A checkpoint frame to prepend to the next group, written after a flush commit.
     pending_checkpoint: Option<WalFrame>,
-    active_job: Option<ActiveJob>,
-    waiting_jobs: VecDeque<(JobKind, oneshot::Sender<Result<JobStart>>)>,
+    /// Maintenance jobs waiting for a permit or running. At most one flush; at most
+    /// `max_jobs_per_collection` compactions, with disjoint inputs.
+    jobs: BTreeMap<JobId, Job>,
+    next_job: u64,
+    /// Segments some compaction job planned or running holds.
+    reserved: BTreeSet<UnitId>,
+    /// Explicit flushes: the sequence number each waits for the checkpoint to reach.
+    flush_waiters: Vec<(SeqNo, Option<SnapshotReply>)>,
+    /// Explicit compactions waiting for their job (or for background compactions to end).
+    compact_waiters: Vec<SnapshotReply>,
+    /// Hand-stepped flushes waiting for the running flush to end.
+    manual_flushes: Vec<oneshot::Sender<Result<JobStart>>>,
     quiesce_waiters: Vec<std::sync::mpsc::SyncSender<()>>,
-    /// Whether a flush (0) or compaction (1) was already requested from the scheduler.
-    requested: [bool; 2],
+    /// A flush trigger fired: freeze the active memtable once the pipeline is drained.
+    freeze_pending: bool,
+    /// The oldest request taken off the channel while writes stall, so its age can be checked.
+    held: Option<Queued>,
+    /// After a failed job, no background job is requested before this engine-clock time.
+    retry_at: Option<Duration>,
+    policy: Policy,
 }
 
-/// The maintenance job that holds the collection's job slot.
-#[derive(Clone, Debug)]
-struct ActiveJob {
+/// A maintenance job of the collection.
+struct Job {
     kind: JobKind,
+    /// The segments a compaction merges, reserved from planning until the job ends.
+    inputs: Vec<UnitId>,
+    /// The explicit compactions this job answers (empty for a background job).
+    waiters: Vec<SnapshotReply>,
+    phase: Phase,
+}
+
+enum Phase {
+    /// Waiting for the scheduler's permit.
+    Waiting(RequestId),
+    /// Begun: building, or committing.
+    Running(Running),
+}
+
+/// A job that began.
+struct Running {
     unit: UnitId,
     /// DV files the job may write, besides its unit's segment.
     dv_files: Vec<PathBuf>,
     /// Whether the job's files are still the job's to clean up. Cleared once a commit made them
     /// live, or made their durability unknown.
     owns_files: bool,
+    /// The scheduler permit; `None` for a job a test steps by hand. Released when the job ends.
+    permit: Option<Permit>,
 }
 
-impl ActiveJob {
+impl Running {
     /// Every file an attempt of this job may have created.
     fn files(&self, dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = vec![segment_path(dir, self.unit)];
@@ -479,7 +571,19 @@ impl ActiveJob {
 impl Writer {
     async fn run(mut self) {
         let mut inflight: Option<InFlight> = None;
+        let mut ticker = tokio::time::interval(TICK_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            if self.freeze_pending {
+                // Freeze only with nothing prepared but unpublished, so the frozen memtable
+                // holds exactly the operations in WAL files that end before the rotation.
+                if let Some(io) = inflight.take() {
+                    self.finish(io).await;
+                }
+                self.freeze_pending = false;
+                self.freeze_if_due().await;
+            }
+            let stalled = self.stalled();
             tokio::select! {
                 biased;
                 message = self.control.recv() => {
@@ -501,9 +605,14 @@ impl Writer {
                     }
                     self.rewrite_slice();
                 }
-                request = self.requests.recv() => {
+                _ = ticker.tick() => {
+                    self.tick();
+                    self.rewrite_slice();
+                }
+                request = next_request(&mut self.held, &mut self.requests), if !stalled => {
                     let Some(request) = request else { break };
-                    let requests = self.collect(request).await;
+                    self.handle.arm_maintenance();
+                    let requests = self.collect(request.request).await;
                     if let Some(error) = self.refusal() {
                         for request in requests {
                             let _ = request.ack().send(Err(error.clone_error()));
@@ -561,7 +670,7 @@ impl Writer {
         };
         while !full(&group, bytes) {
             match self.requests.try_recv() {
-                Ok(request) => {
+                Ok(Queued { request, .. }) => {
                     bytes += request.approximate_bytes();
                     group.push(request);
                 }
@@ -572,7 +681,7 @@ impl Writer {
             let deadline = tokio::time::Instant::now() + self.config.commit_delay;
             while group.len() < self.config.min_group_requests && !full(&group, bytes) {
                 match tokio::time::timeout_at(deadline, self.requests.recv()).await {
-                    Ok(Some(request)) => {
+                    Ok(Some(Queued { request, .. })) => {
                         bytes += request.approximate_bytes();
                         group.push(request);
                     }
@@ -822,7 +931,7 @@ impl Writer {
                         snapshot: snapshot.clone(),
                     }));
                 }
-                self.after_publish(&version);
+                self.after_publish();
             }
             Ok((wal, Err(failure))) => {
                 drop(wal);
@@ -929,699 +1038,7 @@ impl Writer {
         // The WAL writer and the private state may now be ahead of anything durable; nothing
         // is built from them again.
         self.wal = None;
-        self.fail_waiting_jobs();
-    }
-
-    /// After a publish: ask the scheduler for a flush or compaction when a threshold is reached,
-    /// and report the primary-key index's size for the cache budget.
-    fn after_publish(&mut self, version: &Version) {
-        if let Some(state) = &self.state {
-            self.handle.set_pk_index_bytes(state.pk.approximate_bytes());
-        }
-        let descriptor = self.handle.descriptor();
-        let flush_running = self
-            .active_job
-            .as_ref()
-            .is_some_and(|job| job.kind == JobKind::Flush);
-        let mut operations = Vec::new();
-        let wants_flush = should_flush(descriptor, &self.core.memtable, version, self.clock_now())
-            || (!version.frozen.is_empty() && !flush_running);
-        if !self.requested[0] && wants_flush {
-            self.requested[0] = true;
-            operations.push(MaintenanceOperation::Flush);
-        } else if !self.requested[1] && should_compact(descriptor, version) {
-            self.requested[1] = true;
-            operations.push(MaintenanceOperation::Compact);
-        }
-        if operations.is_empty() {
-            return;
-        }
-        // Queueing persists the maintenance status, which is blocking I/O.
-        let core = self.core.clone();
-        let handle = Arc::clone(&self.handle);
-        let queued = self
-            .core
-            .runtime()
-            .io
-            .execute(move || core.enqueue_maintenance(&handle, operations));
-        if queued.is_err() {
-            self.requested = [false; 2];
-        }
-    }
-
-    fn clock_now(&self) -> Duration {
-        self.core.tokens.clock.now()
-    }
-
-    /// Rewrite one slice of primary-key entries that still point into retired units. Only
-    /// between groups: never while a prepared group could still be taken back.
-    fn rewrite_slice(&mut self) {
-        if let Some(state) = self.state.as_mut()
-            && state.pk.rewriting()
-        {
-            state.pk.rewrite_slice(PK_REWRITE_SLICE);
-        }
-    }
-
-    /// A checkpoint frame for the durable manifest.
-    fn checkpoint_frame(&self) -> Result<WalFrame> {
-        checkpoint_frame(&self.manifest)
-    }
-
-    async fn handle_control(&mut self, message: ControlMsg) -> Flow {
-        match message {
-            ControlMsg::BeginJob { kind, reply } => {
-                if let Some(error) = self.refusal() {
-                    let _ = reply.send(Err(error.clone_error()));
-                } else if self.active_job.is_some() {
-                    self.waiting_jobs.push_back((kind, reply));
-                } else {
-                    self.start_job(kind, reply).await;
-                }
-            }
-            ControlMsg::CommitJob { commit, reply } => {
-                let result = self.commit_job(*commit).await;
-                let _ = reply.send(result);
-                self.end_job(true).await;
-            }
-            ControlMsg::EndJob { wrote_files } => self.end_job(wrote_files).await,
-            ControlMsg::Quiesce { reply } => {
-                // A drop voids every outstanding maintenance request: waiting jobs fail below,
-                // and a job that has not begun is refused. Should the drop not commit, the
-                // next publish over a threshold requests again, instead of a flag left set by a
-                // request that never began blocking every later one.
-                self.requested = [false; 2];
-                if self.active_job.is_none() {
-                    let _ = reply.try_send(());
-                } else {
-                    self.quiesce_waiters.push(reply);
-                }
-                if self.handle.is_dropped() {
-                    self.fail_waiting_jobs();
-                }
-            }
-            ControlMsg::Shutdown => return Flow::Stop,
-        }
-        Flow::Continue
-    }
-
-    /// Allocate a unit id; never issued again.
-    fn allocate_unit(&mut self) -> Result<UnitId> {
-        let next = self
-            .next_unit_id
-            .checked_add(1)
-            .ok_or_else(|| LogPoseError::internal("the collection has used every unit id"))?;
-        let unit = UnitId(self.next_unit_id);
-        self.next_unit_id = next;
-        Ok(unit)
-    }
-
-    /// Make `kind` the active job and reply with the state it works from and its unit id.
-    async fn start_job(&mut self, kind: JobKind, reply: oneshot::Sender<Result<JobStart>>) {
-        match kind {
-            JobKind::Flush => self.requested[0] = false,
-            JobKind::Compact => self.requested[1] = false,
-        }
-        let unit = match self.allocate_unit() {
-            Ok(unit) => unit,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
-        self.active_job = Some(ActiveJob {
-            kind,
-            unit,
-            dv_files: Vec::new(),
-            owns_files: true,
-        });
-        let work = match kind {
-            JobKind::Flush => self.begin_flush().await,
-            JobKind::Compact => Ok(self.begin_compaction()),
-        };
-        let work = match work {
-            Ok(work) => work,
-            Err(error) => {
-                self.active_job = None;
-                let _ = reply.send(Err(error));
-                Box::pin(self.start_next_job()).await;
-                return;
-            }
-        };
-        let start = JobStart {
-            version: self.handle.current(),
-            unit,
-            work,
-        };
-        if reply.send(Ok(start)).is_err() {
-            // The job is gone before it wrote anything.
-            self.active_job = None;
-            Box::pin(self.start_next_job()).await;
-        }
-    }
-
-    /// Capture a flush's inputs. Unless an earlier flush left a memtable frozen, freeze the
-    /// active one first: rotate the WAL so the new file starts at the next sequence number,
-    /// move the active memtable into `frozen`, start a new one with a fresh unit id, and
-    /// publish. The pipeline is drained, so the private state equals the published one.
-    async fn begin_flush(&mut self) -> Result<JobWork> {
-        let needs_freeze = self
-            .state
-            .as_ref()
-            .is_some_and(|state| state.frozen.is_empty() && state.active.has_ops());
-        if needs_freeze {
-            self.rotate_for_flush().await?;
-            let unit = self.allocate_unit()?;
-            let now = self.clock_now();
-            let Some(state) = self.state.as_mut() else {
-                return Err(self.handle.unavailable());
-            };
-            state.freeze(unit, now);
-            let Some(version) = self.candidate() else {
-                return Err(self.handle.unavailable());
-            };
-            self.handle.publish(version);
-        }
-        let Some(state) = self.state.as_ref() else {
-            return Err(self.handle.unavailable());
-        };
-        let Some(memtable) = state.frozen.first().cloned() else {
-            return Ok(JobWork::Nothing);
-        };
-        let deleted = state
-            .deletes
-            .get(memtable.unit)
-            .cloned()
-            .unwrap_or_default();
-        let mut dvs = Vec::new();
-        for segment in state.segments.iter() {
-            let current = state.deletes.get(segment.unit);
-            let current_len = current.map_or(0, DeletionVector::len);
-            let durable_len = self
-                .manifest
-                .segments
-                .iter()
-                .find(|entry| entry.unit == segment.unit)
-                .and_then(|entry| entry.dv)
-                .map_or(0, |dv| u64::from(dv.cardinality));
-            // Bits are only ever added, so equal cardinality means an equal set.
-            if current_len != durable_len {
-                dvs.push((Arc::clone(segment), current.cloned().unwrap_or_default()));
-            }
-        }
-        let covered_seq_no = state.visible_seq_no();
-        let dir = self.handle.meta().dir.clone();
-        let mut writes = Vec::with_capacity(dvs.len());
-        for (segment, deletes) in dvs {
-            let generation = self.next_dv_gen;
-            self.next_dv_gen += 1;
-            if let Some(job) = self.active_job.as_mut() {
-                job.dv_files.push(dv_path(&dir, segment.unit, generation));
-            }
-            writes.push(DvWrite {
-                segment,
-                generation,
-                deletes,
-            });
-        }
-        Ok(JobWork::Flush(FlushStart {
-            memtable,
-            deleted,
-            dvs: writes,
-            covered_seq_no,
-        }))
-    }
-
-    /// Capture a compaction's inputs: every segment, with its deletion vector now.
-    fn begin_compaction(&self) -> JobWork {
-        let Some(state) = self.state.as_ref() else {
-            return JobWork::Nothing;
-        };
-        if state.segments.len() <= 1 {
-            return JobWork::Nothing;
-        }
-        JobWork::Compact(CompactStart {
-            inputs: state
-                .segments
-                .iter()
-                .map(|segment| {
-                    (
-                        Arc::clone(segment),
-                        state.deletes.get(segment.unit).cloned().unwrap_or_default(),
-                    )
-                })
-                .collect(),
-        })
-    }
-
-    /// Rotate the WAL so that the memtable a flush freezes ends in an older file than every
-    /// later write, and a checkpoint falls on a file boundary. The pipeline is drained, so the
-    /// private state equals the published one.
-    async fn rotate_for_flush(&mut self) -> Result<()> {
-        let checkpoint = self.checkpoint_frame()?;
-        let Some(mut wal) = self.wal.take() else {
-            return Err(self.handle.unavailable());
-        };
-        let rotated = self
-            .core
-            .runtime()
-            .io
-            .run(move || {
-                let result = wal.rotate(&checkpoint);
-                (wal, result)
-            })
-            .await;
-        match rotated {
-            Ok((wal, Ok(_))) => {
-                self.wal = Some(wal);
-                Ok(())
-            }
-            Ok((wal, Err(error))) => {
-                if wal.failure().is_none() {
-                    // The new file could not be created; the writer stays on the old one.
-                    self.wal = Some(wal);
-                    return Err(error.into());
-                }
-                // Hand over the rotation's own error: an unfenced rollback failure of the new
-                // file's checkpoint group must reach the fatal handler, exactly as it does for
-                // a rotation before a group.
-                drop(wal);
-                self.wal_failed(IoFailure::Rotate(error));
-                Err(self.handle.unavailable())
-            }
-            Err(error) => {
-                self.poison(
-                    PoisonKind::Failed {
-                        rollback_failed: false,
-                    },
-                    format!("the WAL rotation job failed: {error}"),
-                );
-                Err(error)
-            }
-        }
-    }
-
-    /// Publish the active job's manifest, then the `Version` over it; then release what the
-    /// manifest superseded.
-    ///
-    /// The manifest takes the next generation from `next_manifest_gen`, which advances on every
-    /// attempt. A publish that fails before the `CURRENT` rename abandons the job without a
-    /// state change: its generation, unit, and DV generations are burned, and its files and
-    /// partial manifest are removed right away because no durable manifest names them. A
-    /// publish that fails at or after the rename poisons the collection, and nothing is
-    /// removed.
-    async fn commit_job(&mut self, commit: JobCommit) -> Result<Snapshot> {
-        if let Some(error) = self.refusal() {
-            return Err(error.clone_error());
-        }
-        let Some(job) = self.active_job.clone() else {
-            return Err(LogPoseError::internal("no maintenance job is active"));
-        };
-        let dir = self.handle.meta().dir.clone();
-        let durable = Arc::clone(&self.manifest);
-        let Some(state) = self.state.as_ref() else {
-            return Err(self.handle.unavailable());
-        };
-        let schema = Arc::clone(&state.schema);
-        let (manifest, install) = match commit {
-            JobCommit::Flush {
-                memtable,
-                checkpoint_seq_no,
-                segment,
-                dvs,
-            } => {
-                let oldest = state.frozen.first();
-                if oldest.map(|frozen| (frozen.unit, frozen.last_seq_no))
-                    != Some((memtable, checkpoint_seq_no))
-                {
-                    return Err(LogPoseError::internal(format!(
-                        "flush of memtable {memtable} at {checkpoint_seq_no} is not the oldest \
-                         frozen memtable"
-                    )));
-                }
-                if checkpoint_seq_no < durable.checkpoint_seq_no
-                    || checkpoint_seq_no >= self.next_seq_no
-                {
-                    return Err(LogPoseError::internal(format!(
-                        "flush checkpoint {checkpoint_seq_no} is outside the log (durable \
-                         checkpoint {}, next sequence number {})",
-                        durable.checkpoint_seq_no, self.next_seq_no
-                    )));
-                }
-                let dv_by_unit = dvs.iter().copied().collect::<HashMap<_, _>>();
-                let mut segments = durable
-                    .segments
-                    .iter()
-                    .cloned()
-                    .map(|mut entry| {
-                        if let Some(dv) = dv_by_unit.get(&entry.unit) {
-                            entry.dv = Some(*dv);
-                        }
-                        entry
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(segment) = &segment {
-                    check_job_unit(&job, &segment.handle.entry)?;
-                    segments.push(segment.handle.entry.clone());
-                    segments.sort_by_key(|entry| entry.unit);
-                }
-                let superseded_dvs = durable
-                    .segments
-                    .iter()
-                    .filter(|entry| dv_by_unit.contains_key(&entry.unit))
-                    .filter_map(|entry| entry.dv.map(|dv| dv_path(&dir, entry.unit, dv.generation)))
-                    .chain(
-                        // A DV file written for a segment that is no longer in the manifest.
-                        dvs.iter()
-                            .filter(|(unit, _)| {
-                                !durable.segments.iter().any(|entry| entry.unit == *unit)
-                            })
-                            .map(|(unit, dv)| dv_path(&dir, *unit, dv.generation)),
-                    )
-                    .collect::<Vec<_>>();
-                (
-                    (segments, checkpoint_seq_no),
-                    Install::Flush {
-                        memtable,
-                        segment,
-                        superseded_dvs,
-                    },
-                )
-            }
-            JobCommit::Compact { inputs, output } => {
-                if let Some(output) = &output {
-                    check_job_unit(&job, &output.handle.entry)?;
-                }
-                let present = inputs.iter().all(|unit| {
-                    durable.segments.iter().any(|entry| entry.unit == *unit)
-                        && state.segments.iter().any(|segment| segment.unit == *unit)
-                });
-                if inputs.is_empty() || !present {
-                    return Err(LogPoseError::internal(
-                        "compaction inputs are no longer in the manifest",
-                    ));
-                }
-                // Reconcile: every deletion that reached an input while the job ran lands on
-                // the output row it was copied to. The maps are injective and the writer
-                // handles no write until the new version is published.
-                let mut reconciled = DeletionVector::default();
-                if let Some(output) = &output {
-                    for (unit, map) in inputs.iter().zip(&output.maps) {
-                        if let Some(deletes) = state.deletes.get(*unit) {
-                            for row in deletes.iter() {
-                                if let Some(&target) = map.get(row as usize)
-                                    && target != u32::MAX
-                                {
-                                    reconciled.mark(target);
-                                }
-                            }
-                        }
-                    }
-                }
-                let mut output_entry = output.as_ref().map(|output| output.handle.entry.clone());
-                if let (Some(entry), false) = (&mut output_entry, reconciled.is_empty()) {
-                    let generation = self.next_dv_gen;
-                    self.next_dv_gen += 1;
-                    let path = dv_path(&dir, entry.unit, generation);
-                    if let Some(job) = self.active_job.as_mut() {
-                        job.dv_files.push(path.clone());
-                    }
-                    let file = DvFile {
-                        unit: entry.unit,
-                        row_count: entry.row_count,
-                        generation,
-                        covered_seq_no: state.visible_seq_no(),
-                        bitmap: reconciled.to_bitmap(),
-                    };
-                    let core = self.core.clone();
-                    let segments_dir = dir.join(SEGMENTS_DIR);
-                    let written = self
-                        .core
-                        .runtime()
-                        .io
-                        .run(move || {
-                            let vfs = core.vfs.as_ref();
-                            write_dv_file(vfs, &path, &file)?;
-                            vfs.sync_dir(&segments_dir).map_err(|error| {
-                                LogPoseError::io(
-                                    format!("failed to sync '{}'", segments_dir.display()),
-                                    error,
-                                )
-                            })?;
-                            crash_point(vfs, Some(CrashPoint::CompactionAfterDvSync))
-                        })
-                        .await;
-                    match written {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) | Err(error) => {
-                            self.abandon_job_files();
-                            return Err(error);
-                        }
-                    }
-                    entry.dv = Some(DvRef {
-                        generation,
-                        cardinality: u32::try_from(reconciled.len()).unwrap_or(u32::MAX),
-                        covered_seq_no: state.visible_seq_no(),
-                    });
-                }
-                let mut segments = durable
-                    .segments
-                    .iter()
-                    .filter(|entry| !inputs.contains(&entry.unit))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(entry) = &output_entry {
-                    segments.push(entry.clone());
-                    segments.sort_by_key(|entry| entry.unit);
-                }
-                let superseded_dvs = durable
-                    .segments
-                    .iter()
-                    .filter(|entry| inputs.contains(&entry.unit))
-                    .filter_map(|entry| entry.dv.map(|dv| dv_path(&dir, entry.unit, dv.generation)))
-                    .collect::<Vec<_>>();
-                (
-                    (segments, durable.checkpoint_seq_no),
-                    Install::Compact {
-                        inputs,
-                        output,
-                        reconciled,
-                        superseded_dvs,
-                    },
-                )
-            }
-        };
-        let (segments, checkpoint) = manifest;
-        let generation = self.next_manifest_gen;
-        // Orphan cleanup starts the counter above every generation on disk, so a leftover named
-        // with the last generation exhausts it.
-        let Some(next_manifest_gen) = generation.checked_add(1) else {
-            return Err(LogPoseError::internal(
-                "the collection has used every manifest generation",
-            ));
-        };
-        self.next_manifest_gen = next_manifest_gen;
-        let manifest = Manifest {
-            format_version: MANIFEST_FORMAT_VERSION,
-            collection_id: durable.collection_id.clone(),
-            generation,
-            epoch: durable.epoch,
-            checkpoint_seq_no: checkpoint,
-            schema: schema.as_ref().clone(),
-            next_unit_id: self.next_unit_id,
-            next_dv_gen: self.next_dv_gen,
-            segments,
-            totals: durable.totals,
-        }
-        .with_totals();
-
-        let core = self.core.clone();
-        let to_publish = manifest.clone();
-        let publish_dir = dir.clone();
-        let published = self
-            .core
-            .runtime()
-            .io
-            .run(move || publish_manifest(core.vfs.as_ref(), &publish_dir, &to_publish))
-            .await;
-        match published {
-            Ok(Ok(())) => {}
-            Ok(Err(failure)) => {
-                if failure.current_unknown {
-                    // The rename may be visible in the page cache but not on disk: nothing may
-                    // be built on either manifest, and no file of either may be removed, until
-                    // a reopen's durability barrier settles it.
-                    self.disown_job_files();
-                    self.poison(
-                        PoisonKind::ReadOnly,
-                        format!(
-                            "publishing manifest {} failed: {}",
-                            manifest.generation, failure.error
-                        ),
-                    );
-                } else {
-                    // `CURRENT` is unchanged, so no durable manifest names the partial manifest
-                    // or the job's files: remove them before the job hears of the failure.
-                    self.core.gc.remove([manifest_path(&dir, generation)]);
-                    self.abandon_job_files();
-                }
-                return Err(failure.error);
-            }
-            Err(error) => {
-                self.disown_job_files();
-                self.poison(
-                    PoisonKind::ReadOnly,
-                    format!("the manifest publish job failed: {error}"),
-                );
-                return Err(error);
-            }
-        }
-
-        // The manifest is durable: install it.
-        self.disown_job_files();
-        let superseded_generation = self.previous_generation.replace(durable.generation);
-        self.manifest = Arc::new(manifest);
-        let Some(state) = self.state.as_mut() else {
-            return Err(self.handle.unavailable());
-        };
-        let (retired, superseded_dvs, checkpointed) = match install {
-            Install::Flush {
-                memtable,
-                segment,
-                superseded_dvs,
-            } => {
-                state.install_flush(memtable, segment);
-                // Tell a WAL tailer what is safe to discard; it rides along with the next group.
-                self.pending_checkpoint = checkpoint_frame(&self.manifest).ok();
-                (Vec::new(), superseded_dvs, Some(checkpoint))
-            }
-            Install::Compact {
-                inputs,
-                output,
-                reconciled,
-                superseded_dvs,
-            } => {
-                let retired = state.install_compaction(&inputs, output, reconciled);
-                (retired, superseded_dvs, None)
-            }
-        };
-        let Some(version) = self.candidate() else {
-            return Err(self.handle.unavailable());
-        };
-        let version = self.handle.publish(version);
-        // Older versions still hold the retired segments until readers and tokens let go.
-        drop(retired);
-        self.core.gc.remove(superseded_dvs);
-        if let Some(superseded) = superseded_generation {
-            self.core.gc.remove([manifest_path(&dir, superseded)]);
-        }
-        if let Some(checkpoint) = checkpointed {
-            self.remove_checkpointed_wal(checkpoint).await;
-        }
-        self.after_publish(&version);
-        Ok(version.snapshot())
-    }
-
-    /// The active job's files are no longer its to remove.
-    fn disown_job_files(&mut self) {
-        if let Some(job) = self.active_job.as_mut() {
-            job.owns_files = false;
-        }
-    }
-
-    /// Remove every file the active job may have written: no durable manifest names them.
-    fn abandon_job_files(&mut self) {
-        if let Some(job) = self.active_job.as_mut()
-            && job.owns_files
-        {
-            job.owns_files = false;
-            self.core.gc.remove(job.files(&self.handle.meta().dir));
-        }
-    }
-
-    /// Delete the WAL files a durable manifest with checkpoint `checkpoint` made obsolete, on
-    /// the I/O pool. Only after that manifest is durable: every operation in them is in a
-    /// segment or a DV file. A failure only delays the removal to the next checkpoint or open.
-    async fn remove_checkpointed_wal(&mut self, checkpoint: SeqNo) {
-        let Some(mut wal) = self.wal.take() else {
-            return;
-        };
-        let removed = self
-            .core
-            .runtime()
-            .io
-            .run(move || {
-                let result = wal.remove_checkpointed(checkpoint);
-                (wal, result)
-            })
-            .await;
-        match removed {
-            Ok((wal, result)) => {
-                self.wal = Some(wal);
-                if let Err(error) = result {
-                    tracing::warn!(
-                        collection = %self.handle.descriptor().lookup_name(),
-                        %error,
-                        "failed to remove checkpointed WAL files; the next checkpoint retries"
-                    );
-                }
-            }
-            Err(error) => self.poison(
-                PoisonKind::Failed {
-                    rollback_failed: false,
-                },
-                format!("the WAL cleanup job failed: {error}"),
-            ),
-        }
-    }
-
-    /// The active job is over; remove what it wrote if no manifest names it, and start the next
-    /// waiting job.
-    async fn end_job(&mut self, wrote_files: bool) {
-        if let Some(job) = self.active_job.take()
-            && job.owns_files
-            && wrote_files
-        {
-            self.core.gc.remove(job.files(&self.handle.meta().dir));
-        }
-        self.start_next_job().await;
-    }
-
-    async fn start_next_job(&mut self) {
-        while self.active_job.is_none() {
-            let Some((kind, reply)) = self.waiting_jobs.pop_front() else {
-                for waiter in self.quiesce_waiters.drain(..) {
-                    let _ = waiter.try_send(());
-                }
-                return;
-            };
-            if let Some(error) = self.refusal() {
-                let _ = reply.send(Err(error.clone_error()));
-                continue;
-            }
-            Box::pin(self.start_job(kind, reply)).await;
-        }
-    }
-
-    fn fail_waiting_jobs(&mut self) {
-        for (_, reply) in self.waiting_jobs.drain(..) {
-            let _ = reply.send(Err(self.handle.unavailable()));
-        }
-    }
-
-    /// Fail everything still queued and stop.
-    fn stop(&mut self) {
-        self.requests.close();
-        while let Ok(request) = self.requests.try_recv() {
-            let _ = request.ack().send(Err(shutting_down()));
-        }
-        for (_, reply) in self.waiting_jobs.drain(..) {
-            let _ = reply.send(Err(shutting_down()));
-        }
-        for waiter in self.quiesce_waiters.drain(..) {
-            let _ = waiter.try_send(());
-        }
-        self.wal = None;
+        self.fail_waiters();
     }
 }
 
@@ -1838,15 +1255,26 @@ fn shutting_down() -> LogPoseError {
     LogPoseError::unavailable("the storage engine is shutting down")
 }
 
-/// Fail unless `segment` is the active job's unit.
-fn check_job_unit(job: &ActiveJob, segment: &ManifestSegment) -> Result<()> {
-    if segment.unit != job.unit {
+/// Fail unless `segment` is the unit job `kind` was allocated.
+fn check_job_unit(kind: JobKind, unit: UnitId, segment: &ManifestSegment) -> Result<()> {
+    if segment.unit != unit {
         return Err(LogPoseError::internal(format!(
-            "the {:?} job was allocated unit {} but committed unit {}",
-            job.kind, job.unit, segment.unit
+            "the {kind:?} job was allocated unit {unit} but committed unit {}",
+            segment.unit
         )));
     }
     Ok(())
+}
+
+/// The request a stalled writer held back, or the next one from the channel.
+async fn next_request(
+    held: &mut Option<Queued>,
+    requests: &mut mpsc::Receiver<Queued>,
+) -> Option<Queued> {
+    match held.take() {
+        Some(request) => Some(request),
+        None => requests.recv().await,
+    }
 }
 
 /// A checkpoint frame naming `manifest`'s generation and checkpoint.

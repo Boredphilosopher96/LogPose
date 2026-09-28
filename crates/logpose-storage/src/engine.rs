@@ -5,15 +5,16 @@ use crate::{
     BlobStore,
     cache::{ArtifactClass, BudgetInputs, BufferCache, CacheConfig, DEFAULT_FLOORS},
     clock::{Clock, SystemClock},
+    compaction::CompactionConfig,
     durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     error::io_message,
     gc::GcQueue,
     handle::{CollectionHandle, TokenContext},
-    maintenance::MaintenanceOperation,
     memtable::MemtableConfig,
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
+    scheduler::MaintenanceScheduler,
     tokens::TokenConfig,
     version::Version,
     writer::{ControlMsg, GroupCommitConfig},
@@ -60,6 +61,8 @@ pub struct EngineConfig {
     pub memtable: MemtableConfig,
     /// Share of `memory_limit` reserved for flush and compaction builds. Default 0.2.
     pub maintenance_fraction: f64,
+    /// The size-tiered compaction policy.
+    pub compaction: CompactionConfig,
     /// Per-class buffer cache floors, as fractions of the cache budget.
     pub cache_floors: [f32; ArtifactClass::COUNT],
     /// Check expensive invariants as the engine runs (a key with two live rows fails recovery
@@ -91,6 +94,7 @@ impl Default for EngineConfig {
             memory_limit: 4 << 30,
             memtable: MemtableConfig::default(),
             maintenance_fraction: 0.2,
+            compaction: CompactionConfig::default(),
             cache_floors: DEFAULT_FLOORS,
             strict_invariants: cfg!(debug_assertions),
             blob_store: None,
@@ -112,6 +116,7 @@ impl fmt::Debug for EngineConfig {
             .field("memory_limit", &self.memory_limit)
             .field("memtable", &self.memtable)
             .field("maintenance_fraction", &self.maintenance_fraction)
+            .field("compaction", &self.compaction)
             .field("cache_floors", &self.cache_floors)
             .field("strict_invariants", &self.strict_invariants)
             .field("blob_store", &self.blob_store.is_some())
@@ -197,9 +202,14 @@ pub(crate) struct EngineCore {
     /// Control channels of every writer task started, so that shutdown reaches each one,
     /// including those of collections that are being dropped or failed to register.
     writers: Mutex<Vec<tokio::sync::mpsc::UnboundedSender<ControlMsg>>>,
-    /// Threads that run legacy flush and compaction jobs, which interleave CPU and blocking
-    /// I/O and so can run on neither the I/O pool nor a rayon pool.
+    /// Threads that run flush and compaction builds, which interleave CPU and blocking I/O and
+    /// so can run on neither the I/O pool nor a rayon pool. One per scheduler slot, so a
+    /// granted job always starts at once.
     pub(crate) jobs: IoPool,
+    /// Engine-wide maintenance permits: flush priority and the maintenance-memory pool.
+    pub(crate) scheduler: MaintenanceScheduler,
+    /// The size-tiered compaction policy.
+    pub(crate) compaction: CompactionConfig,
     /// Background file removals (segment files of released versions, superseded manifests,
     /// abandoned job outputs).
     pub(crate) gc: GcQueue,
@@ -247,9 +257,12 @@ impl Engine {
         create_dir_all_synced(vfs.as_ref(), &root)?;
         let root_lock = lock_root_exclusively(vfs.as_ref(), &root)?;
         let runtime = Runtime::new(config.runtime)?;
+        let maintenance_bytes = fraction_of(config.memory_limit, config.maintenance_fraction);
+        let scheduler =
+            MaintenanceScheduler::new(config.runtime.maintenance_threads, maintenance_bytes);
         let jobs = IoPool::new(
             "logpose-job",
-            config.runtime.maintenance_threads,
+            scheduler.slots(),
             config.runtime.io_queue_depth,
         )?;
         let writers = tokio::runtime::Builder::new_multi_thread()
@@ -269,7 +282,7 @@ impl Engine {
             memory_limit: config.memory_limit,
             pk_index_bytes: 0,
             memtable_bytes: memtable_budget,
-            maintenance_bytes: fraction_of(config.memory_limit, config.maintenance_fraction),
+            maintenance_bytes,
         }
         .cache_budget();
         let core = Arc::new_cyclic(|weak| EngineCore {
@@ -295,6 +308,8 @@ impl Engine {
             on_fatal: config.on_fatal,
             writers: Mutex::new(Vec::new()),
             jobs,
+            scheduler,
+            compaction: config.compaction,
             tasks: Arc::new(TaskTracker::default()),
             shutdown: AtomicBool::new(false),
             _root_lock: root_lock,
@@ -413,13 +428,10 @@ impl Engine {
         self.shared.core.runtime.io.run(move || f(&core)).await?
     }
 
-    /// Run `f` on the legacy maintenance job threads.
-    pub(crate) async fn job<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&CoreRef) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let core = self.core();
-        self.shared.core.jobs.run(move || f(&core)).await?
+    /// The engine-wide maintenance scheduler. Tests pause it to observe the order of grants.
+    #[must_use]
+    pub fn scheduler(&self) -> &MaintenanceScheduler {
+        &self.shared.core.scheduler
     }
 
     /// Run CPU-bound `f` on the query pool.
@@ -850,25 +862,20 @@ impl Drop for Reservation<'_> {
 }
 
 impl CoreRef {
-    /// The flush triggers no write drives: a memtable older than `max_age` in a collection that
-    /// stopped writing, and the engine-wide memtable budget (active memtables plus retired ones
-    /// that only pinned snapshots hold), which flushes the largest active memtable first.
+    /// The engine-wide memtable budget (active and frozen memtables plus retired ones that only
+    /// pinned snapshots hold): past it, flush the largest active memtable. Each writer runs the
+    /// per-collection triggers (size, operations, age) itself.
     pub(crate) fn memtable_tick(&self) {
-        let now = self.tokens.clock.now();
         let handles = self.open_handles();
         let mut total = self.pinned_retired_bytes();
         let mut largest: Option<(u64, &Arc<CollectionHandle>)> = None;
         for handle in &handles {
-            if handle.is_dropped() || handle.is_poisoned() {
+            if handle.is_dropped() || handle.is_poisoned() || !handle.maintenance_armed() {
                 continue;
             }
             let version = handle.current();
             let active = &version.active;
-            let bytes = version.counters.memtable_bytes;
-            total += bytes;
-            if active.has_ops() && now.saturating_sub(active.created_at) >= self.memtable.max_age {
-                self.enqueue_maintenance(handle, vec![MaintenanceOperation::Flush]);
-            }
+            total += version.counters.memtable_bytes;
             if active.has_ops() && largest.is_none_or(|(size, _)| active.bytes().total() > size) {
                 largest = Some((active.bytes().total(), handle));
             }
@@ -876,7 +883,7 @@ impl CoreRef {
         if total > self.memtable_budget()
             && let Some((_, handle)) = largest
         {
-            self.enqueue_maintenance(handle, vec![MaintenanceOperation::Flush]);
+            handle.request_flush();
         }
     }
 

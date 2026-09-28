@@ -1,7 +1,7 @@
 //! On-disk layout: where the local engine keeps each root, descriptor, WAL, manifest, segment,
 //! and deletion-vector file.
 //!
-//! A collection directory holds `descriptor.json`, `placement.json`, `maintenance.json`,
+//! A collection directory holds `descriptor.json`, `placement.json`,
 //! `CURRENT`, `manifests/<generation:020>.mf`, `wal/<first seq no:020>.wal`, and
 //! `segments/`: one segment v2 file per segment unit, `<unit:08x>.seg`, and its deletion-vector
 //! files, `<unit:08x>.dv.<generation:016x>`. Unit ids and DV generations are never reused, so no

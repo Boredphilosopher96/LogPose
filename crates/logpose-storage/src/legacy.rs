@@ -240,7 +240,7 @@ impl EngineCore {
             live_record_count: usize::try_from(version.counters.live_rows()).unwrap_or(usize::MAX),
             deleted_record_count: usize::try_from(version.counters.deleted_rows)
                 .unwrap_or(usize::MAX),
-            maintenance: self.maintenance_status(handle),
+            maintenance: handle.maintenance_status(),
             query_units,
         })
     }
@@ -301,7 +301,7 @@ impl EngineCore {
             }
             InspectTarget::Maintenance => Ok(InspectReport {
                 target: "maintenance".to_owned(),
-                payload: serde_json::to_value(self.maintenance_status(handle))
+                payload: serde_json::to_value(handle.maintenance_status())
                     .map_err(crate::error::json_message)?,
             }),
             InspectTarget::Segment(segment_id) => {
