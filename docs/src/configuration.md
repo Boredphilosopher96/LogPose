@@ -66,7 +66,8 @@ max_tokens_per_collection = 64   # the default
 - `token_ttl_ms` is how long a token lives after its last use; every read
   through it extends it. Reads through an expired token, and scroll pages after
   their cursor's token expired, fail with `FAILED_PRECONDITION` and reason
-  `SNAPSHOT_EXPIRED`.
+  `SNAPSHOT_EXPIRED`. A scroll's last page releases the pin the scroll made, so
+  only unfinished scrolls hold pins.
 - `max_tokens_per_collection` caps the pinned states per collection, since each
   keeps the files of its state on disk. A pin past it fails with
   `RESOURCE_EXHAUSTED` and reason `TOO_MANY_SNAPSHOTS`.

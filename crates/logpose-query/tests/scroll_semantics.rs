@@ -8,7 +8,9 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{Cursor, FilterExpr, ScrollOrder, ScrollRequest, count_view, scroll};
-use logpose_storage::{IndexPolicy, Projection, SchemaChange, read::Direction};
+use logpose_storage::{
+    IndexPolicy, Projection, ReadOptions, SchemaChange, SnapshotToken, read::Direction,
+};
 use logpose_types::{
     DistanceMetric,
     record::{ClientOp, PrimaryKey, Record},
@@ -277,4 +279,66 @@ async fn tampered_cursors_are_rejected() {
     }
     assert!(text[..text.len() - 1].parse::<Cursor>().is_err());
     assert!(format!("{text}A").parse::<Cursor>().is_err());
+}
+
+/// Scroll every row by key, four per page, from `token`'s state if given; the number of pages.
+async fn scroll_to_end(fixture: &Fixture, token: Option<SnapshotToken>) -> usize {
+    let mut cursor = None;
+    let mut pages = 0;
+    let mut token = token;
+    loop {
+        let page = scroll(
+            &fixture.engine,
+            &fixture.reference,
+            ScrollRequest {
+                filter: None,
+                order: ScrollOrder::Pk,
+                limit: 4,
+                projection: Projection::scalars(),
+                cursor: cursor.take(),
+                token: token.take(),
+            },
+        )
+        .await
+        .expect("scroll page");
+        pages += 1;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return pages,
+        }
+    }
+}
+
+#[tokio::test]
+async fn finished_scrolls_release_the_snapshots_they_pinned() {
+    let fixture = fixture().await;
+    let records = (0..10)
+        .map(|index| {
+            to_record(
+                &format!("k{index:04}"),
+                Row {
+                    g: Some(1),
+                    h: None,
+                },
+            )
+        })
+        .collect();
+    fixture.upsert(records).await;
+    // More finished scrolls than a collection may hold pins (64 by default).
+    for _ in 0..100 {
+        assert_eq!(scroll_to_end(&fixture, None).await, 3);
+    }
+    assert_eq!(fixture.handle.pinned_snapshots(), 0);
+
+    // A scroll through the caller's own token leaves that token pinned.
+    let pinned = fixture
+        .view_with(ReadOptions {
+            pin: true,
+            ..ReadOptions::default()
+        })
+        .await;
+    let token = pinned.token().cloned().expect("a pinned view has a token");
+    assert_eq!(scroll_to_end(&fixture, Some(token.clone())).await, 3);
+    assert_eq!(fixture.handle.pinned_snapshots(), 1);
+    assert!(fixture.handle.release_snapshot(&token));
 }

@@ -529,8 +529,8 @@ async fn a_scroll_that_fits_in_one_page_pins_nothing() {
     assert!(second.next.is_none());
     assert_eq!(
         fixture.handle.pinned_snapshots(),
-        1,
-        "the cursor's token only"
+        0,
+        "the last page releases the scroll's pin"
     );
 }
 

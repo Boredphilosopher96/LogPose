@@ -7,7 +7,8 @@
 //!   page of a scroll that has more pins its view under a snapshot token, which every later page
 //!   reads, so every live row appears exactly once across pages even under concurrent writes.
 //!   A page reads one row past its limit to learn whether more follow, so a scroll that fits in
-//!   one page pins nothing and returns no cursor.
+//!   one page pins nothing and returns no cursor, and the last page of a scroll releases the
+//!   snapshot the scroll pinned (not a token the caller passed).
 //! - **Order by a field** yields each unit's rows in `(value, key)` order, from the field's
 //!   sorted index when the unit has one and from its column otherwise, and merges them. Ties
 //!   are broken by key ascending in both directions, and rows without a value come last.
@@ -63,6 +64,9 @@ pub enum CursorKey {
 pub struct Cursor {
     /// The snapshot every page reads.
     pub token: SnapshotToken,
+    /// Whether the scroll pinned `token` itself (rather than reading a token the caller
+    /// passed), so its last page releases it.
+    pub owned: bool,
     /// The scroll's order.
     pub order: ScrollOrder,
     /// [`filter_digest`] of the scroll's filter; a page with another filter is refused.
@@ -261,6 +265,11 @@ pub fn scroll_options(request: &ScrollRequest) -> Result<ReadOptions> {
 pub async fn scroll_page(view: &ReadView, request: ScrollRequest) -> Result<ScrollPage> {
     let digest = filter_digest(request.filter.as_ref());
     let after = request.cursor.as_ref().map(|cursor| cursor.after.clone());
+    // A first page read through no token pins the view itself (when a later page follows).
+    let owned = request
+        .cursor
+        .as_ref()
+        .map_or(view.token().is_none(), |cursor| cursor.owned);
     let limit = request.limit.max(1) as usize;
     let mut entries = scroll_entries(
         view,
@@ -284,12 +293,19 @@ pub async fn scroll_page(view: &ReadView, request: ScrollRequest) -> Result<Scro
             })?;
             Some(Cursor {
                 token,
+                owned,
                 order: request.order.clone(),
                 filter: digest,
                 after: cursor_key(last, &request.order),
             })
         }
-        _ => None,
+        _ => {
+            // The last page: nothing reads the scroll's own snapshot after it.
+            if request.cursor.is_some() && owned {
+                view.release();
+            }
+            None
+        }
     };
     Ok(ScrollPage {
         rows,
@@ -501,14 +517,16 @@ impl fmt::Display for InvalidCursor {
 impl std::error::Error for InvalidCursor {}
 
 /// Version byte of the cursor encoding.
-const CURSOR_VERSION: u8 = 1;
+const CURSOR_VERSION: u8 = 2;
 
 impl fmt::Display for Cursor {
-    /// Unpadded base64url of: a version byte, the token's bytes, the filter digest, the order,
-    /// the last row's position, and a CRC-32C of everything before it.
+    /// Unpadded base64url of: a version byte, the token's bytes, whether the scroll owns the
+    /// token, the filter digest, the order, the last row's position, and a CRC-32C of
+    /// everything before it.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut bytes = vec![CURSOR_VERSION];
         bytes.extend_from_slice(&self.token.to_bytes());
+        bytes.push(u8::from(self.owned));
         bytes.extend_from_slice(&self.filter.to_le_bytes());
         match &self.order {
             ScrollOrder::Pk => bytes.push(0),
@@ -555,6 +573,11 @@ impl FromStr for Cursor {
             return Err(InvalidCursor);
         }
         let token = SnapshotToken::from_bytes(reader.take(TOKEN_BYTES)?).ok_or(InvalidCursor)?;
+        let owned = match reader.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err(InvalidCursor),
+        };
         let filter = u32::from_le_bytes(reader.array()?);
         let order = match reader.byte()? {
             0 => ScrollOrder::Pk,
@@ -582,6 +605,7 @@ impl FromStr for Cursor {
         }
         Ok(Self {
             token,
+            owned,
             order,
             filter,
             after,

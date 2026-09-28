@@ -830,16 +830,18 @@ records are left after it, the server pins the state it read and returns a
 the next page. Every page reads exactly that state, so every record matching
 the filter appears exactly once across the pages, whatever is written,
 flushed, or compacted meanwhile, and `snapshot` is the same on every page. The
-last page has `next_cursor: null`, and a scroll that fits in one page pins
-nothing.
+last page has `next_cursor: null` and releases the pin (a pin the scroll made,
+not a `snapshot_token` the first page was given), and a scroll that fits in
+one page pins nothing.
 
 - A cursor is opaque. It must be sent with the same `filter` and `order_by` as
   the first page, and without `snapshot_token`; anything else is
   `INVALID_ARGUMENT` at `cursor` (or `snapshot_token`), as is a cursor that is
   not one.
-- Its pin expires `snapshots.token_ttl_ms` (five minutes by default) after the
-  last page. A page after that fails with `FAILED_PRECONDITION` (reason
-  `SNAPSHOT_EXPIRED`, HTTP 409): start the scroll again.
+- An unfinished scroll's pin expires `snapshots.token_ttl_ms` (five minutes by
+  default) after its latest page. A page after that, or a repeat of the last
+  page, fails with `FAILED_PRECONDITION` (reason `SNAPSHOT_EXPIRED`, HTTP 409):
+  start the scroll again.
 - Ordering by a field puts records without a value last in both directions and
   breaks ties by primary key. `order_by` takes a declared scalar field that is
   not an array or JSON; primary key order (ascending) is what an empty
