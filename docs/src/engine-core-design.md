@@ -1841,6 +1841,88 @@ PR 6 replaces the JSON manifest with manifest v2 and the `CURRENT` protocol, bur
   - PR 12: `ReadOptions { pin }` and tokens in the API (proto, OpenAPI).
   - The scheduler PR: deleting `maintenance.json`.
 
+### Implementation Notes (PR 10)
+
+PR 10 replaces the delta log and v1 segments with memtables, deletion vectors, a writer-private primary-key index, and segment v2 files. Flush writes the storage-owned sections only; index sections arrive with PR 12. Where this list differs from, or is more specific than, the sections above ([Flush](#flush), [Compaction](#compaction), [Recovery on Open](#recovery-on-open)), it is the current contract. It supersedes the "transitional v1 entries", "historical reads", and "pinned-memory limit" bullets of the PR 6 notes.
+
+- **Layout.**
+  - New modules: `dv.rs` (`CowBitmap`, `DeletionVector`, `DeletionMap`, the DV file codec), `memtable/` (`MemtableData`, the vector arena, typed columns, scalar postings, `MemtableConfig`), `segment.rs` (`SegmentHandle`, segment file writing, tiers, manifest entries), `writer/pk_index.rs`, and `legacy.rs` (the `StorageEngine` read paths over a `Version`). `writer/apply.rs` holds `LogicalState`, which live writes and WAL replay share.
+  - Deleted: `segment_v1/`, `resolve.rs`, `stats.rs`, the v1 HNSW and flat sidecars in `logpose-index`, `ManifestSegment.legacy`, the `indexes/` and `tmp/` directories, and `UnitFiles`.
+  - `RowId` and `RowAddr { unit, row }` move to `logpose-types`.
+- **On-disk format.**
+  - A collection directory holds `manifests/`, `wal/`, and `segments/` only. `segments/<unit:08x>.seg` is a segment v2 file.
+  - `segments/<unit:08x>.dv.<generation:016x>` is a DV file: a 40-byte header (`LPDV\0\0\2\0`, unit, row count, generation, `covered_seq_no`, bitmap length), the bitmap in the portable roaring format (canonical form required), and a CRC-32C of everything before it.
+  - A manifest entry now carries `footer_crc`, `dv: Option<DvRef { generation, cardinality }>`, per-field `vectors` and `zones` from the segment's stats, and a real `tier` (base 32,768 rows, ratio 4).
+  - Directories written by earlier builds do not open.
+- **`Version`.**
+  - It holds `segments: Arc<[Arc<SegmentHandle>]>`, the `frozen` memtables, the `active` memtable, `deletes: DeletionMap` (an `imbl::OrdMap<UnitId, DeletionVector>`), and `VersionCounters { total_rows, deleted_rows, segment_count, memtable_rows, memtable_bytes }`.
+  - `check_invariants` checks that units are ordered and contiguous, that every segment matches its manifest entry, that DV bits are in range, I13 (sequence ranges), and I5 (one live row per key, through each segment's key column). Recovery runs it on the recovered version when `strict_invariants` is on, and the engine tests run it after each step.
+- **`SegmentHandle`.**
+  - There is one per segment unit. It owns the open file, its `SegmentReader` attached to the buffer cache, and the manifest entry. It replaces PR 6's `FileHandle` path list; the GC `FileHandle` now names one file.
+  - Opening checks the unit, collection id, file length, footer CRC, row count, sequence range, and schema version against the manifest. Any mismatch is `Corrupt { kind: Segment }`.
+  - A caller mistake inside the reader, such as a row or section index out of range, is the new `SegmentError::OutOfRange`, not corruption.
+- **Memtables.**
+  - `MemtableData` is built from `imbl` persistent structures, so publishing a `Version` clones it in O(1) while the writer keeps appending. Each put appends a slot holding its key and sequence number; a delete appends nothing and only sets a bit. Vectors live in an arena of 16-row blocks per vector field, scalar fields in typed columns, and dynamic metadata as JSON. Each indexed scalar field has postings `imbl::OrdMap<ScalarKey, CowBitmap>`, inverted or sorted as its `IndexFlavor` says.
+  - `CowBitmap` is the two-tier bitmap of deviation 8: a shared `base` and a `recent` tier of at most 4,096 entries, so the first insert after a clone copies at most about 8 KiB.
+  - `apply_schema` drops the structures of removed fields and adds columns for new ones, which earlier slots read as null. The schema refuses to drop a collection's last vector field. Memtables and flush still handle rows without a vector, which dropping one of several vector fields produces.
+  - Size accounting charges each slot 64 bytes of overhead plus its key, vectors, columns, and dynamic bytes, and each posting entry 16 bytes. `MemtableConfig { max_bytes: 64 MiB, max_rows: 1M, max_age: 10 min, global_fraction: 0.125 }` is `EngineConfig::memtable`.
+- **Deletion vectors.**
+  - An upsert, update, or delete of a key whose live row is at `RowAddr { unit, row }` sets that bit in `deletes[unit]`, whether the unit is a memtable or a segment. A memtable's deleted slots never reach disk, because flush drops them.
+  - A segment's bits are durable in the WAL until the next flush. That flush writes a new DV file for every segment whose cardinality differs from its durable `DvRef`. Bits are only ever added to a unit, so equal cardinality means an equal set.
+  - Superseded DV files are removed once the manifest that replaces them is durable, like WAL files.
+  - `CollectionStats::deleted_record_count` is the total cardinality of the version's deletion vectors: rows that are stored but superseded. Flush removes them from memtables and compaction from segments.
+- **Primary-key index.**
+  - It is a `HashMap<PrimaryKey, RowAddr>` with the standard hasher, private to the writer and never published (deviation 2).
+  - A flush or compaction installs a forwarding table from the retired unit to its target unit and row map. A FIFO rewrite task then repoints stale entries in slices of 65,536 rows. Slices run between groups, and only when no group's undo journal is open.
+  - A group that the WAL refuses rolls back through a per-group undo journal, alongside the `LogicalState` savepoint.
+  - With `strict_invariants`, a forwarding violation (an entry pointing into a retired unit that has no forwarding) fails the write. Without it, the violation is counted and the key reads as absent.
+- **Writes.**
+  - `ClientOp::Update` is implemented. `prepare` resolves each updated key through the primary-key index. A memtable row's image is read directly. Segment rows are read on the I/O pool before the group is prepared (`fetch_update_rows`). The patch is merged into the record, and the result is logged as a full row image.
+  - An update of a missing key fails that request with `NotFound` for the new `ResourceKind::Record`.
+  - An upsert of an existing key and a delete mark the old row's DV bit in `apply`, which replay shares.
+- **Flush.**
+  - The steps and crash points are in `flush.rs`. The active memtable is frozen at begin, the segment is built on a job thread, and the segment file is written. Each DV file follows, with `FlushAfterDvSync` after each. Then `segments/` is synced and the job commits. Deletions that land on the frozen memtable while the job runs are mapped onto the new segment's rows at commit.
+  - At most one memtable is frozen. While a flush runs, writes that cross a threshold keep filling the active memtable; there is no write stall yet.
+  - A flush of a memtable with no live slot writes no segment and only advances the checkpoint.
+  - `flush_collection` loops until the checkpoint reaches the `visible_seq_no` it saw when called.
+  - Triggers: the active memtable's operation count (`flush_threshold_ops`, which replaces the WAL-byte trigger), its bytes (the smaller of `max_bytes` and `flush_threshold_bytes`), `max_rows`, and `max_age`. The engine tick also flushes the largest active memtable when the engine-wide memtable bytes plus pinned retired bytes exceed `memory_limit * global_fraction`.
+- **Compaction.**
+  - It keeps working over segment v2, with the final protocol described in `compaction.rs`: `D0` capture, a build that bypasses the cache, reconciliation of deletions that arrive while the job runs, the output's DV file (`CompactionAfterDvSync`), and forwarding.
+  - It still takes every segment as input once there are `compaction_threshold_segments` of them. The size-tiered policy and the maintenance reservation are PR 11.
+- **Recovery.**
+  - `recover_segments` opens every manifest segment and loads its DV file. The file's unit, generation, row count, and cardinality must match the `DvRef`, or recovery fails with `Corrupt { kind: DeletionVector }`.
+  - It then rebuilds the primary-key index from each segment's keys minus its deletion vector. If a key has two live rows, the older one is marked deleted and a warning is logged. With `strict_invariants`, recovery fails instead.
+  - WAL replay runs `apply` into a fresh active memtable. Its unit is the first one orphan cleanup found unused.
+  - Orphan cleanup also removes DV files whose generation the manifest does not reference, and it reports the next DV generation.
+- **Snapshots.**
+  - An exact `Snapshot` resolves only to the exact `(generation, visible_seq_no)` it names. That is the current version, one of the last eight versions of the current generation (a ring on the handle, cleared when the generation changes), or a version a token pins. Anything else is `SnapshotExpired`. With deletion vectors, a `Version` cannot serve an earlier sequence number (deviation 3).
+  - A snapshot that is ahead of the collection, or below the current checkpoint, is still `INVALID_ARGUMENT`.
+- **Pinned memory and the cache budget.**
+  - A token's retired bytes are the bytes of the memtables its version holds that the current version no longer holds. The reaper expires the oldest pins that hold retired memtables.
+  - `TokenConfig::memory_limit` is now `Option<u64>`. `None`, the default, means a quarter of the memtable reservation.
+  - `EngineConfig` gains `memory_limit` (4 GiB), `memtable`, `maintenance_fraction` (0.2), `cache_floors` (which replaces `cache: CacheConfig`), and `strict_invariants` (default: on in debug builds).
+  - The buffer cache budget is `BudgetInputs::cache_budget()` over the sum of every writer's reported primary-key index size. The engine tick, which also runs the token reaper and the age and global memtable triggers, recomputes it.
+- **Legacy read adapter.**
+  - `legacy.rs` serves the `StorageEngine` reads from one `Version`'s live rows, flattened to v1 records.
+  - Segments report `index_kind = "exact"`: candidates come from an exact scan of the selected segments' live rows. The planner treats `exact` units like `hnsw` ones, so it keeps choosing ANN plans, and those plans do not change when the index sections land. The memtables are one mutable unit, `mutable-delta`. Per-segment planner statistics are computed once per process and cached on the handle.
+  - `inspect` reports `wal` as the memtables' slots, and `segment` as the segment's header, sections, and rows with their `deleted` flags.
+  - Segment read failures map to `Corrupt { kind: Segment }` or `Io`.
+- **Errors.** No `LogPoseError` variant is added. `CorruptionKind::DeletionVector` (`deletion_vector`) and `ResourceKind::Record` (`record`) are new values of existing fields.
+- **Licensing.** `imbl` and `imbl-sized-chunks` are MPL-2.0. `deny.toml` allows MPL-2.0 for those two crates only: it is a weak, file-level copyleft, and they are used unmodified.
+- **Tests.**
+  - `dv.rs`: bitmap tiers and copy-on-write, codec round trip, and every flipped byte detected.
+  - `memtable/tests.rs`: push and read-back per type, postings, schema changes, and size accounting.
+  - `pk_index.rs`: forwarding, FIFO chains, rewrite slices, and rollback.
+  - `writer/apply/tests.rs`: apply, replay, and savepoints.
+  - `writer/dv_tests.rs`: an upsert of a flushed key marks its segment row until the next flush writes the DV file; `Update` over segment, memtable, and frozen-memtable rows, and `NotFound` without a live row; deletions that land while a flush builds; compaction reconciliation worked cases (a key upserted during the job, upserted then deleted, a delete in the second input, a row compacted twice) with forwarding and recovery; a crash at `CompactionAfterDvSync`; and schema changes of the vector field.
+  - `recovery/tests.rs`: a crash at every operation of a flush that writes a DV file, under every tear mode, and at `FlushAfterDvSync`, each followed by a check that the rebuilt primary-key index resolves every key; typed `DeletionVector` and `Segment` corruption for damaged files at open.
+  - `gc/tests.rs`: readers pin tokens and read through them while flushes, compactions, the reaper, and GC run, and never lose a segment file.
+  - `integration_storage.rs`: ANN over segments sees only live rows, and a corrupted section surfaces as typed corruption.
+  - The crash-recovery suite gains `FlushAfterDvSync`. The randomized harness models physical rows for `deleted_record_count` and follows the exact-snapshot rule.
+- **Left for later.**
+  - PR 11: the size-tiered policy, the maintenance-memory reservation, scheduler priorities, and a write stall when a second memtable would freeze.
+  - PR 12: index sections (SQ8, HNSW, scalar) in `SegmentBuilder`, and the `CollectionReader` read path over memtable postings and segment key sections, which retires the exact-scan ANN in `legacy.rs`.
+
 ## Buffer Cache
 
 ### Budget and Classes

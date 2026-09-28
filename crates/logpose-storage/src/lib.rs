@@ -9,8 +9,14 @@
 //! - `runtime`: the `IoPool`, the `query` and `maintenance` rayon pools, and `run_cpu`.
 //! - `handle`, `version`: `CollectionHandle`, publication, and the immutable `Version`.
 //! - `writer`: each collection's single writer task, group commit on the WAL, the `apply`
-//!   function shared with replay, and poisoning after a failed WAL write.
-//! - `legacy_view`: the v1 record view of v2 rows, for the legacy read paths.
+//!   function shared with replay, the writer-private primary-key index, and poisoning after a
+//!   failed WAL write.
+//! - `memtable`: the active and frozen memtables (vector arenas, typed columns, and scalar
+//!   postings over append-only slots).
+//! - `dv`: deletion vectors, their two-tier copy-on-write bitmaps, and DV files.
+//! - `segment`: the engine's handle on one segment v2 file, and writing one.
+//! - `legacy`, `legacy_view`: the v1 read paths (scans, lookups, ANN by exact scan, stats,
+//!   inspect) over v2 units, and the v1 record view of v2 rows.
 //! - `storage_engine`: the trait and its public request, inspection and blob-store types.
 //! - `local_engine`: the trait implementation over `Engine`.
 //! - `collections`, `catalog`: collection, database and principal descriptor files.
@@ -21,11 +27,10 @@
 //! - `manifest`: manifest v2 and the `CURRENT` publish protocol.
 //! - `gc`: version-refcounted segment files, the file-removal queue, and orphan cleanup.
 //! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
-//! - `segment_v1`: the v1 segment file format.
-//! - `segment_v2`: the v2 segment file format, builder, and reader (not yet wired in).
-//! - `cache`: the buffer cache of segment section bytes that segment v2 readers load through.
+//! - `segment_v2`: the segment file format, builder, and reader.
+//! - `cache`: the buffer cache of segment section bytes that segment readers load through.
 //! - `flush`, `compaction`, `maintenance`: maintenance jobs and each collection's queue.
-//! - `resolve`, `stats`, `metric`: latest-visible resolution, statistics and scoring.
+//! - `metric`: scoring.
 //! - `durable_fs`, `fs_util`, `root_lock`, `error`: filesystem and error helpers.
 
 #[cfg(test)]
@@ -39,26 +44,27 @@ mod clock;
 mod collections;
 mod compaction;
 mod durable_fs;
+mod dv;
 mod engine;
 mod error;
 mod flush;
 mod fs_util;
 mod gc;
 mod handle;
+mod legacy;
 mod legacy_view;
 mod local_engine;
 mod maintenance;
 mod manifest;
+mod memtable;
 mod metric;
 mod paths;
 mod recovery;
-mod resolve;
 mod root_lock;
 mod runtime;
-mod segment_v1;
+mod segment;
 pub mod segment_v2;
 mod state;
-mod stats;
 mod storage_engine;
 #[cfg(test)]
 mod test_support;
@@ -70,6 +76,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use engine::{Engine, EngineConfig, FatalHandler};
 pub use handle::{CollectionHandle, CollectionMeta};
 pub use local_engine::LocalStorageEngine;
+pub use memtable::MemtableConfig;
 pub use runtime::{IoPool, Runtime, RuntimeConfig, run_cpu};
 pub use storage_engine::{
     BlobStore, CreateCollectionRequest, InspectReport, InspectTarget, StorageEngine,

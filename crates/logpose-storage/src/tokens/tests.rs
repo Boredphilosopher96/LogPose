@@ -4,17 +4,16 @@
 use super::*;
 use crate::{
     CreateCollectionRequest, Engine, EngineConfig, LocalStorageEngine, ManualClock, StorageEngine,
-    handle::CollectionMeta,
-    manifest::Manifest,
-    test_support::put,
-    version::{DeltaLog, DeltaOp, DeltaRecord},
+    handle::CollectionMeta, manifest::Manifest, memtable::MemtableData, test_support::put,
+    version::VersionCounters,
 };
 use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
-    DeleteRecord, DistanceMetric, RecordId, VisibleRecord, WriteOperation, legacy::legacy_schema,
+    DeleteRecord, DistanceMetric, RecordId, SeqNo, UnitId, VisibleRecord, WriteOperation,
+    legacy::legacy_schema, record::Record,
 };
 use logpose_vfs::FaultVfs;
-use logpose_wal::{BootId, codec::WirePk};
+use logpose_wal::{BootId, codec::RowImage};
 use std::path::PathBuf;
 
 const TTL: Duration = Duration::from_secs(10);
@@ -23,7 +22,7 @@ fn config(max_per_collection: usize) -> TokenConfig {
     TokenConfig {
         ttl: TTL,
         max_per_collection,
-        memory_limit: u64::MAX,
+        memory_limit: Some(u64::MAX),
         reaper_interval: Duration::from_secs(3600),
     }
 }
@@ -39,24 +38,28 @@ fn test_meta(name: &str) -> Arc<CollectionMeta> {
     Arc::new(CollectionMeta::new(descriptor, None))
 }
 
-/// Batches of one delete each for `seq_nos`.
-fn delta(seq_nos: impl IntoIterator<Item = SeqNo>) -> DeltaLog {
-    let mut log = DeltaLog::default();
-    for seq_no in seq_nos {
-        log.append(vec![DeltaRecord {
-            seq_no,
-            op: DeltaOp::Delete(WirePk::String(format!("key-{seq_no}"))),
-        }]);
+/// A memtable `unit` holding `rows` slots from sequence number `first`.
+fn memtable(unit: u32, first: SeqNo, rows: u32) -> Arc<MemtableData> {
+    let schema = Arc::new(legacy_schema(2, DistanceMetric::Dot).expect("schema"));
+    let mut memtable = MemtableData::new(UnitId(unit), Arc::clone(&schema), first, Duration::ZERO);
+    for row in 0..rows {
+        let record = Record::new(format!("key-{unit}-{row}")).with_vector("vector", vec![1.0, 0.0]);
+        let image = RowImage::from_record(&schema, record).expect("image");
+        memtable
+            .push(first + SeqNo::from(row), &image)
+            .expect("push");
     }
-    log
+    Arc::new(memtable)
 }
 
-fn version(
+/// A version of generation `generation` over `memtables` (frozen ones first, the active one
+/// last).
+fn version_over(
     meta: &Arc<CollectionMeta>,
     id: u64,
     generation: u64,
     checkpoint: SeqNo,
-    delta: DeltaLog,
+    mut memtables: Vec<Arc<MemtableData>>,
 ) -> Arc<Version> {
     let schema = legacy_schema(2, DistanceMetric::Dot).expect("schema");
     let manifest = Manifest {
@@ -64,14 +67,41 @@ fn version(
         checkpoint_seq_no: checkpoint,
         ..Manifest::empty(meta.id.clone(), schema.clone())
     };
-    Arc::new(Version::build(
-        VersionId(id),
-        Arc::clone(meta),
-        Arc::new(schema),
-        Arc::new(manifest),
-        delta,
-        Arc::from(Vec::new()),
-    ))
+    let active = memtables
+        .pop()
+        .unwrap_or_else(|| memtable(0, checkpoint + 1, 0));
+    Arc::new(Version {
+        id: VersionId(id),
+        meta: Arc::clone(meta),
+        schema: Arc::new(schema),
+        visible_seq_no: active.last_seq_no,
+        manifest_generation: generation,
+        checkpoint_seq_no: checkpoint,
+        counters: VersionCounters::default(),
+        segments: Arc::from(Vec::new()),
+        frozen: Arc::from(memtables),
+        active,
+        deletes: Default::default(),
+        manifest: Arc::new(manifest),
+    })
+}
+
+/// A version of generation `generation` whose active memtable holds `rows` slots after
+/// `checkpoint`.
+fn version(
+    meta: &Arc<CollectionMeta>,
+    id: u64,
+    generation: u64,
+    checkpoint: SeqNo,
+    rows: u32,
+) -> Arc<Version> {
+    version_over(
+        meta,
+        id,
+        generation,
+        checkpoint,
+        vec![memtable(0, checkpoint + 1, rows)],
+    )
 }
 
 fn new_registry(meta: &Arc<CollectionMeta>) -> TokenRegistry {
@@ -132,7 +162,7 @@ fn base64url_matches_the_rfc_4648_vectors() {
 fn expiry_slides_with_every_use_and_an_unused_token_expires() {
     let meta = test_meta("slide");
     let registry = new_registry(&meta);
-    let pinned = version(&meta, 3, 1, 0, delta(1..=2));
+    let pinned = version(&meta, 3, 1, 0, 2);
     let token = registry
         .pin(Arc::clone(&pinned), Duration::ZERO, &config(4), false)
         .expect("pin");
@@ -153,7 +183,7 @@ fn released_unknown_and_foreign_tokens_are_expired() {
     let registry = new_registry(&meta);
     let token = registry
         .pin(
-            version(&meta, 1, 0, 0, delta([])),
+            version(&meta, 1, 0, 0, 0),
             Duration::ZERO,
             &config(4),
             false,
@@ -166,7 +196,7 @@ fn released_unknown_and_foreign_tokens_are_expired() {
     let other = test_meta("other");
     let foreign = new_registry(&other)
         .pin(
-            version(&other, 1, 0, 0, delta([])),
+            version(&other, 1, 0, 0, 0),
             Duration::ZERO,
             &config(4),
             false,
@@ -185,21 +215,11 @@ fn the_per_collection_limit_refuses_new_pins_until_one_expires() {
     let config = config(2);
     for id in 0..2 {
         registry
-            .pin(
-                version(&meta, id, 0, 0, delta([])),
-                Duration::ZERO,
-                &config,
-                false,
-            )
+            .pin(version(&meta, id, 0, 0, 0), Duration::ZERO, &config, false)
             .expect("under the limit");
     }
     let error = registry
-        .pin(
-            version(&meta, 5, 0, 0, delta([])),
-            Duration::ZERO,
-            &config,
-            false,
-        )
+        .pin(version(&meta, 5, 0, 0, 0), Duration::ZERO, &config, false)
         .expect_err("over the limit");
     assert!(
         matches!(error, LogPoseError::TooManySnapshots { .. }),
@@ -207,11 +227,11 @@ fn the_per_collection_limit_refuses_new_pins_until_one_expires() {
     );
     // Expired pins never count against the limit.
     registry
-        .pin(version(&meta, 6, 0, 0, delta([])), TTL, &config, false)
+        .pin(version(&meta, 6, 0, 0, 0), TTL, &config, false)
         .expect("the two expired pins are dropped first");
     assert_eq!(registry.len(), 1);
     let error = registry
-        .pin(version(&meta, 7, 0, 0, delta([])), TTL, &config, true)
+        .pin(version(&meta, 7, 0, 0, 0), TTL, &config, true)
         .expect_err("over the memory limit");
     assert!(error.to_string().contains("pinned-memory limit"), "{error}");
 }
@@ -222,16 +242,11 @@ fn reaping_drops_exactly_the_expired_pins() {
     let registry = new_registry(&meta);
     let config = config(8);
     let old = registry
-        .pin(
-            version(&meta, 1, 0, 0, delta([])),
-            Duration::ZERO,
-            &config,
-            false,
-        )
+        .pin(version(&meta, 1, 0, 0, 0), Duration::ZERO, &config, false)
         .expect("pin");
     let young = registry
         .pin(
-            version(&meta, 2, 0, 0, delta([])),
+            version(&meta, 2, 0, 0, 0),
             Duration::from_secs(5),
             &config,
             false,
@@ -248,75 +263,67 @@ fn reaping_drops_exactly_the_expired_pins() {
 }
 
 #[test]
-fn an_exact_snapshot_finds_the_pinned_version_that_covers_it() {
+fn an_exact_snapshot_finds_only_the_pinned_version_it_names() {
     let meta = test_meta("find");
     let registry = new_registry(&meta);
     let config = config(8);
     registry
-        .pin(
-            version(&meta, 1, 2, 4, delta(5..=9)),
-            Duration::ZERO,
-            &config,
-            false,
-        )
+        .pin(version(&meta, 1, 2, 4, 5), Duration::ZERO, &config, false)
         .expect("pin");
     let snapshot = |manifest_generation, visible_seq_no| Snapshot {
         manifest_generation,
         visible_seq_no,
     };
     let found = registry
-        .find(&snapshot(2, 7), Duration::ZERO, TTL)
-        .expect("covered");
+        .find(&snapshot(2, 9), Duration::ZERO, TTL)
+        .expect("named");
     assert_eq!(found.id, VersionId(1));
     for missing in [
-        snapshot(2, 3),
+        snapshot(2, 7),
+        snapshot(2, 4),
         snapshot(2, 10),
-        snapshot(1, 7),
-        snapshot(3, 7),
+        snapshot(1, 9),
+        snapshot(3, 9),
     ] {
         assert!(
             registry.find(&missing, Duration::ZERO, TTL).is_none(),
-            "{missing:?}"
+            "{missing:?}: a version cannot serve an older sequence number"
         );
     }
     assert!(
-        registry.find(&snapshot(2, 7), TTL, TTL).is_none(),
+        registry.find(&snapshot(2, 9), TTL, TTL).is_none(),
         "expired"
     );
 }
 
-/// Retired bytes count each batch at or below the current checkpoint once, however many pins
-/// share it, and never count what the current version still holds.
+/// Retired bytes count each memtable the current version no longer holds once, at the largest
+/// prefix any pin holds, however many pins share it.
 #[test]
-fn retired_bytes_count_each_shared_batch_once() {
+fn retired_bytes_count_each_retired_memtable_once() {
     let meta = test_meta("retired");
-    let full = delta(1..=20);
-    let bytes = |after, through| full.bytes_in(after, through);
-    // Two pins over checkpoint 0 (prefixes of one another) and one over checkpoint 8.
-    let a = version(&meta, 1, 0, 0, full.after(0).clone());
-    let prefix = {
-        let mut log = DeltaLog::default();
-        for batch in full.batches().take(6) {
-            log.append(batch.to_vec());
-        }
-        log
-    };
-    let b = version(&meta, 2, 0, 0, prefix);
-    let c = version(&meta, 3, 1, 8, full.after(8));
-    assert_eq!(retired_bytes(&[], 20), 0);
+    let first = memtable(1, 1, 5);
+    let prefix = memtable(1, 1, 2);
+    let second = memtable(2, 6, 3);
+    let live = memtable(3, 9, 4);
+    let bytes = |memtable: &Arc<MemtableData>| memtable.bytes().total();
+    let a = version_over(&meta, 1, 0, 0, vec![Arc::clone(&prefix)]);
+    let b = version_over(&meta, 2, 0, 0, vec![Arc::clone(&first)]);
+    let c = version_over(&meta, 3, 1, 5, vec![Arc::clone(&second), Arc::clone(&live)]);
+    let current = version_over(&meta, 4, 2, 8, vec![Arc::clone(&live)]);
+    assert_eq!(retired_bytes(&[], &current), 0);
     assert_eq!(
-        retired_bytes(&[Arc::clone(&b)], 0),
+        retired_bytes(&[Arc::clone(&current)], &current),
         0,
-        "nothing is retired yet"
+        "nothing the current version holds is retired"
     );
-    assert_eq!(retired_bytes(&[Arc::clone(&b)], 12), bytes(0, 6));
+    assert_eq!(retired_bytes(&[Arc::clone(&a)], &current), bytes(&prefix));
     assert_eq!(
-        retired_bytes(&[Arc::clone(&a), Arc::clone(&b), Arc::clone(&c)], 12),
-        bytes(0, 12),
-        "the union of (0, 12] and (8, 12]"
+        retired_bytes(&[Arc::clone(&a), Arc::clone(&b), Arc::clone(&c)], &current),
+        bytes(&first) + bytes(&second),
+        "unit 1 once, at its largest prefix, plus unit 2"
     );
-    assert_eq!(retired_bytes(&[Arc::clone(&c)], 12), bytes(8, 12));
-    assert_eq!(retired_bytes(&[a, b, c], 20), bytes(0, 20));
+    assert!(bytes(&first) > bytes(&prefix));
+    assert_eq!(retired_bytes(&[c], &current), bytes(&second));
 }
 
 // Engine-level behavior.
@@ -427,8 +434,8 @@ async fn reads_through_a_token_return_exactly_the_pinned_state() {
     );
 }
 
-/// An exact snapshot of the current generation reads the current version up to its sequence
-/// number; after a flush it is gone unless pinned.
+/// An exact snapshot of the current generation stays readable while its version is one of the
+/// latest of that generation; after a flush it is gone unless pinned.
 #[tokio::test]
 async fn an_unpinned_snapshot_expires_once_its_generation_is_superseded() {
     let clock = Arc::new(ManualClock::new());
@@ -513,7 +520,7 @@ async fn the_pinned_memory_limit_refuses_new_pins_and_expires_the_oldest() {
     let clock = Arc::new(ManualClock::new());
     let fault = FaultVfs::new(25);
     let limit = TokenConfig {
-        memory_limit: 64,
+        memory_limit: Some(64),
         ..config(8)
     };
     let engine = open(&fault, engine_config(&clock, limit)).await;
@@ -528,7 +535,7 @@ async fn the_pinned_memory_limit_refuses_new_pins_and_expires_the_oldest() {
     engine
         .flush(NAME)
         .await
-        .expect("flush retires both pins' deltas");
+        .expect("flush retires the memtable both pins hold");
     let handle = engine
         .engine()
         .collection(&logpose_types::CollectionRef::new_default(NAME))

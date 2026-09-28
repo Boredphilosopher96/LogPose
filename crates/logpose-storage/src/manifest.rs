@@ -11,19 +11,17 @@
 //! `SchemaChange` frames the manifest's schema already reflects. It also records the id
 //! counters (`next_unit_id`, `next_dv_gen`), so ids are never reissued across restarts.
 //!
-//! Until segment v2 is written (PR 10), segments are v1 files: each [`ManifestSegment`] carries
-//! the v1 details in `legacy`, and the v2-only fields are empty (`dv: None`, no `vectors` or
-//! `zones`, `footer_crc = 0` meaning unchecked).
+//! Each [`ManifestSegment`] describes one segment v2 file (`segments/<unit:08x>.seg`): its
+//! length and footer CRC (checked when the segment is opened), row count, sequence range, size
+//! tier, per-field summaries, and the deletion-vector file generation in force for it, if any.
 
 use crate::{durable_fs::read_file, fs_util::crash_point};
 use logpose_types::{
-    CollectionId, CorruptionKind, LogPoseError, QueryUnitArtifactStats, Result, ScalarFieldStats,
-    SeqNo, UnitId, schema::CollectionSchema,
+    CollectionId, CorruptionKind, LogPoseError, Result, SeqNo, UnitId, schema::CollectionSchema,
 };
 use logpose_vfs::{CrashPoint, OpenMode, Vfs};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     io::{ErrorKind, IoSlice},
     path::{Path, PathBuf},
 };
@@ -76,9 +74,9 @@ pub(crate) struct ManifestSegment {
     pub(crate) unit: UnitId,
     /// Length of the segment file in bytes.
     pub(crate) file_len: u64,
-    /// The segment v2 footer CRC; 0 for a v1 segment (unchecked).
+    /// The segment's footer CRC, checked when the segment is opened.
     pub(crate) footer_crc: u32,
-    /// Rows (entries, for a v1 segment) in the file.
+    /// Rows in the file, deleted ones included.
     pub(crate) row_count: u32,
     /// Schema version the segment was written with. `u64`, like `CollectionSchema` and the
     /// segment v2 header.
@@ -86,18 +84,14 @@ pub(crate) struct ManifestSegment {
     pub(crate) min_seq_no: SeqNo,
     pub(crate) max_seq_no: SeqNo,
     pub(crate) origin: SegmentOrigin,
-    /// Size tier for compaction; 0 until the size-tiered policy lands.
+    /// Size tier of the segment's row count when it was written.
     pub(crate) tier: u8,
-    /// Deletion vector file, if the segment has deleted rows. Always `None` for v1 segments.
+    /// The deletion vector file in force, if the segment had deleted rows at a checkpoint.
     pub(crate) dv: Option<DvRef>,
-    /// Per vector field summary. Empty for v1 segments.
+    /// Per vector field summary.
     pub(crate) vectors: Vec<VectorSummary>,
-    /// Per scalar field zone map. Empty for v1 segments.
+    /// Per scalar field zone map.
     pub(crate) zones: Vec<FieldZone>,
-    /// The v1 segment details the legacy read paths use. Transitional: PR 10 removes it with
-    /// v1 segments.
-    #[serde(with = "legacy_json")]
-    pub(crate) legacy: Option<SegmentMeta>,
 }
 
 /// How a segment was made.
@@ -182,52 +176,46 @@ impl Manifest {
         self
     }
 
-    pub(crate) fn max_segment_seq_no(&self) -> SeqNo {
-        self.segments
-            .iter()
-            .map(|segment| segment.max_seq_no)
-            .max()
-            .unwrap_or(0)
-    }
-
     /// The units of every segment.
     pub(crate) fn units(&self) -> impl Iterator<Item = UnitId> + '_ {
         self.segments.iter().map(|segment| segment.unit)
     }
 
-    /// The v1 details of every segment, ascending by unit.
-    pub(crate) fn legacy_segments(&self) -> impl DoubleEndedIterator<Item = &SegmentMeta> + '_ {
-        self.segments
-            .iter()
-            .filter_map(|segment| segment.legacy.as_ref())
-    }
-
-    /// The manifest as JSON for `inspect`: every field, with each segment's v1 details inlined
-    /// next to its v2 fields.
+    /// The manifest as JSON for `inspect`.
     pub(crate) fn inspect_json(&self) -> serde_json::Value {
         let segments = self
             .segments
             .iter()
             .map(|segment| {
-                let mut entry = segment
-                    .legacy
-                    .as_ref()
-                    .and_then(|legacy| serde_json::to_value(legacy).ok())
-                    .and_then(|value| match value {
-                        serde_json::Value::Object(map) => Some(map),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                entry.insert("unit".to_owned(), segment.unit.to_string().into());
-                entry.insert("file_len".to_owned(), segment.file_len.into());
-                entry.insert("row_count".to_owned(), segment.row_count.into());
-                entry.insert("schema_version".to_owned(), segment.schema_version.into());
-                entry.insert(
-                    "origin".to_owned(),
-                    serde_json::to_value(&segment.origin).unwrap_or_default(),
-                );
-                entry.insert("tier".to_owned(), segment.tier.into());
-                serde_json::Value::Object(entry)
+                serde_json::json!({
+                    "unit": segment.unit.to_string(),
+                    "segment_id": segment.unit.to_string(),
+                    "file_len": segment.file_len,
+                    "footer_crc": segment.footer_crc,
+                    "row_count": segment.row_count,
+                    "deleted_rows": segment.dv.map_or(0, |dv| dv.cardinality),
+                    "schema_version": segment.schema_version,
+                    "min_seq_no": segment.min_seq_no,
+                    "max_seq_no": segment.max_seq_no,
+                    "origin": serde_json::to_value(&segment.origin).unwrap_or_default(),
+                    "tier": segment.tier,
+                    "dv": segment.dv.map(|dv| serde_json::json!({
+                        "generation": dv.generation,
+                        "cardinality": dv.cardinality,
+                        "covered_seq_no": dv.covered_seq_no,
+                    })),
+                    "vectors": segment.vectors.iter().map(|vector| serde_json::json!({
+                        "field_id": vector.field_id,
+                        "has_graph": vector.has_graph,
+                        "has_sq8": vector.has_sq8,
+                        "non_null": vector.non_null,
+                    })).collect::<Vec<_>>(),
+                    "zones": segment.zones.iter().map(|zone| serde_json::json!({
+                        "field_id": zone.field_id,
+                        "null_count": zone.null_count,
+                        "distinct_estimate": zone.distinct_estimate,
+                    })).collect::<Vec<_>>(),
+                })
             })
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -490,89 +478,6 @@ fn write_new_synced(vfs: &dyn Vfs, path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn io_error(what: &str, path: &Path, error: std::io::Error) -> LogPoseError {
     LogPoseError::io(format!("{what} '{}'", path.display()), error)
-}
-
-/// The v1 details of a segment, for the legacy read paths. Transitional until PR 10.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SegmentMeta {
-    /// The unit id as eight hex digits; the query layer's unit id.
-    pub(crate) segment_id: String,
-    /// `<unit>.lps` inside `segments/`.
-    pub(crate) file_name: String,
-    pub(crate) min_seq_no: SeqNo,
-    pub(crate) max_seq_no: SeqNo,
-    pub(crate) put_count: usize,
-    pub(crate) delete_count: usize,
-    pub(crate) dimensions: usize,
-    pub(crate) checksum: u32,
-    #[serde(default)]
-    pub(crate) approx_bytes: usize,
-    #[serde(default = "default_index_kind")]
-    pub(crate) index_kind: String,
-    #[serde(default)]
-    pub(crate) scalar_fields: BTreeMap<String, ScalarFieldStats>,
-    #[serde(default)]
-    pub(crate) artifacts: Vec<QueryUnitArtifactStats>,
-    #[serde(default)]
-    pub(crate) component_bytes: BTreeMap<String, usize>,
-    pub(crate) remote: Option<RemoteArtifact>,
-}
-
-fn default_index_kind() -> String {
-    "hnsw".to_owned()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct RemoteArtifact {
-    pub(crate) key: String,
-    pub(crate) status: RemoteSyncState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RemoteSyncState {
-    PendingUpload,
-    UploadSkipped,
-}
-
-pub(crate) fn segment_artifact_file_name<'a>(
-    segment: &'a SegmentMeta,
-    kind: &str,
-) -> Option<&'a str> {
-    segment
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.kind == kind)
-        .map(|artifact| artifact.file_name.as_str())
-}
-
-/// `legacy` as JSON bytes inside the postcard payload: the v1 statistics hold untagged JSON
-/// values, which postcard cannot decode.
-mod legacy_json {
-    use super::SegmentMeta;
-    use serde::{
-        Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _,
-    };
-
-    pub(super) fn serialize<S: Serializer>(
-        value: &Option<SegmentMeta>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let bytes = value
-            .as_ref()
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(S::Error::custom)?;
-        bytes.serialize(serializer)
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<SegmentMeta>, D::Error> {
-        Option::<Vec<u8>>::deserialize(deserializer)?
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(D::Error::custom))
-            .transpose()
-    }
 }
 
 #[cfg(test)]

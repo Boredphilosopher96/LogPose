@@ -431,16 +431,17 @@ impl<S: SectionSource> SegmentReader<S> {
     }
 
     fn section_via(&self, index: usize, via: Via) -> Result<Arc<AlignedBytes>, SegmentError> {
-        let unit = self.section_unit(index).ok_or_else(|| {
-            SegmentError::corrupt(Region::SectionTable, format!("no section {index}"))
-        })?;
+        let unit = self
+            .section_unit(index)
+            .ok_or_else(|| SegmentError::out_of_range(format!("section {index}")))?;
         self.load_via(&unit, via).map(|(bytes, _)| bytes)
     }
 
     fn entry(&self, index: usize) -> Result<SectionEntry, SegmentError> {
-        self.sections.get(index).copied().ok_or_else(|| {
-            SegmentError::corrupt(Region::SectionTable, format!("no section {index}"))
-        })
+        self.sections
+            .get(index)
+            .copied()
+            .ok_or_else(|| SegmentError::out_of_range(format!("section {index}")))
     }
 
     fn required(&self, kind: SectionKind) -> Result<(usize, SectionEntry), SegmentError> {
@@ -763,10 +764,9 @@ impl<S: SectionSource> SegmentReader<S> {
         if !matches!(unit.part, Part::VectorPrefix { .. })
             || self.sections.get(index) != Some(&unit.entry)
         {
-            return Err(SegmentError::corrupt(
-                region,
-                "not a vector prefix unit of this segment",
-            ));
+            return Err(SegmentError::out_of_range(format!(
+                "section {index} as a vector prefix unit of this segment"
+            )));
         }
         let prefix = VectorPrefix::decode_verified(
             bytes,
@@ -810,13 +810,13 @@ impl<S: SectionSource> SegmentReader<S> {
     /// I/O errors, or [`SegmentError::Checksum`] for the page.
     pub fn vector_page(&self, handle: &VectorHandle, page: u32) -> Result<Vec<f32>, SegmentError> {
         let unit = handle.page_unit(page).ok_or_else(|| {
-            SegmentError::corrupt(
+            SegmentError::out_of_range(format!(
+                "{}",
                 Region::VectorPage {
                     index: handle.index,
                     page,
-                },
-                "no such page",
-            )
+                }
+            ))
         })?;
         let (bytes, _) = self.load(&unit)?;
         Ok(f32s_from_le(&bytes))
@@ -833,12 +833,10 @@ impl<S: SectionSource> SegmentReader<S> {
         row: u32,
     ) -> Result<Option<Vec<f32>>, SegmentError> {
         if row >= handle.prefix.row_count() {
-            return Err(SegmentError::corrupt(
-                Region::VectorPrefix {
-                    index: handle.index,
-                },
-                format!("row {row} is out of range"),
-            ));
+            return Err(SegmentError::out_of_range(format!(
+                "row {row} of vector section {}",
+                handle.index
+            )));
         }
         if handle.prefix.nulls().contains(row) {
             return Ok(None);
@@ -894,10 +892,9 @@ impl<S: SectionSource> SegmentReader<S> {
         if !matches!(unit.part, Part::DynamicIndex { .. })
             || self.sections.get(index) != Some(&unit.entry)
         {
-            return Err(SegmentError::corrupt(
-                region,
-                "not a dynamic index unit of this segment",
-            ));
+            return Err(SegmentError::out_of_range(format!(
+                "section {index} as a dynamic index unit of this segment"
+            )));
         }
         let blocks = DynamicIndex::decode_verified(bytes, self.header.row_count, unit.entry.length)
             .map_err(|error| error.at(region))?;
@@ -961,7 +958,7 @@ impl<S: SectionSource> SegmentReader<S> {
         let (unit, rows) = handle
             .block_unit(block)
             .zip(handle.blocks.block_rows(block))
-            .ok_or_else(|| SegmentError::corrupt(region, "no such block"))?;
+            .ok_or_else(|| SegmentError::out_of_range(format!("{region}")))?;
         let (bytes, _) = self.load_via(&unit, via)?;
         DynamicBlock::decode(&bytes, rows).map_err(|error| error.at(region))
     }
@@ -980,7 +977,7 @@ impl<S: SectionSource> SegmentReader<S> {
             .blocks
             .block(block)
             .zip(handle.blocks.block_rows(block))
-            .ok_or_else(|| SegmentError::corrupt(region, "no such block"))?;
+            .ok_or_else(|| SegmentError::out_of_range(format!("{region}")))?;
         let bytes = usize_from_u64(location.offset)
             .ok()
             .and_then(|start| section.get(start..start + usize_from(location.len)))
@@ -1009,6 +1006,99 @@ impl<S: SectionSource> SegmentReader<S> {
             self.entry(index)?,
             self.read_section(index)?.to_vec(),
         )))
+    }
+
+    /// The rows `rows` (each below the row count) as WAL row images, in the
+    /// order given. Loads through the cache: the key column, one vector page
+    /// per row and field, each scalar column once, and the dynamic blocks
+    /// the rows fall in.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::OutOfRange`] for a row past the end, and I/O or
+    /// corruption errors.
+    pub fn row_images(&self, rows: &[u32]) -> Result<Vec<RowImage>, SegmentError> {
+        if let Some(row) = rows.iter().find(|row| **row >= self.header.row_count) {
+            return Err(SegmentError::out_of_range(format!(
+                "row {row} of a segment of {} rows",
+                self.header.row_count
+            )));
+        }
+        let via = Via::Cache;
+        let pks = self.pk_column_via(via)?;
+        let mut vector_fields: Vec<_> =
+            self.schema.vectors().iter().map(|field| field.id).collect();
+        vector_fields.sort_unstable();
+        let mut vectors = Vec::new();
+        for field in vector_fields {
+            if let Some(handle) = self.vector_via(field, via)? {
+                vectors.push((field, handle));
+            }
+        }
+        let mut scalar_fields: Vec<_> = self.schema.fields().iter().map(|field| field.id).collect();
+        scalar_fields.sort_unstable();
+        let mut columns = Vec::new();
+        for field in scalar_fields {
+            if let Some(column) = self.scalar_column_via(field, via)? {
+                columns.push((field, column));
+            }
+        }
+        let dynamic = self.dynamic_via(via)?;
+        let mut blocks = std::collections::BTreeMap::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let index = usize_from(row);
+            let pk = pks.get(index).ok_or_else(|| {
+                SegmentError::corrupt(Region::File, format!("pk of row {row} is missing"))
+            })?;
+            let mut image = RowImage {
+                pk: WirePk::from(pk),
+                vectors: Vec::new(),
+                scalars: Vec::new(),
+                dynamic: None,
+            };
+            for (field, handle) in &vectors {
+                if let Some(vector) = self.vector_row(handle, row)? {
+                    image.vectors.push((*field, F32Bytes::from_f32s(&vector)));
+                }
+            }
+            for (field, column) in &columns {
+                let value = column.value(index)?;
+                if !value.is_null() {
+                    let bytes = ValueBytes::encode(&value)
+                        .map_err(|error| SegmentError::Encode(error.to_string()))?;
+                    image.scalars.push((*field, bytes));
+                }
+            }
+            if let Some(handle) = &dynamic {
+                let block = row / super::dynamic::DYNAMIC_BLOCK_ROWS;
+                let loaded = match blocks.entry(block) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(self.dynamic_block_via(handle, block, via)?)
+                    }
+                };
+                if let Some(raw) = loaded.raw(row) {
+                    image.dynamic = Some(ValueBytes::from_encoded(raw.to_vec()));
+                }
+            }
+            out.push(image);
+        }
+        Ok(out)
+    }
+
+    /// Primary keys and sequence numbers in row order, read without
+    /// inserting anything into the cache: the engine rebuilds its
+    /// primary-key index from them at open, once per segment.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors.
+    pub fn keys_uncached(&self) -> Result<(PkColumn, Vec<SeqNo>), SegmentError> {
+        Ok((
+            self.pk_column_via(Via::Bypass)?,
+            self.row_meta_via(Via::Bypass)?,
+        ))
     }
 
     /// Read every row back as a WAL row image. Used by compaction-style

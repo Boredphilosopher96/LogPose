@@ -242,10 +242,12 @@ fn project_manifest_contract(value: Value, segment_id: &str) -> Value {
                 .map(|segment| {
                     json!({
                         "segment_id": segment["segment_id"],
-                        "index_kind": segment["index_kind"],
-                        "dimensions": segment["dimensions"],
-                        "put_count": segment["put_count"],
-                        "delete_count": segment["delete_count"],
+                        "row_count": segment["row_count"],
+                        "deleted_rows": segment["deleted_rows"],
+                        "min_seq_no": segment["min_seq_no"],
+                        "max_seq_no": segment["max_seq_no"],
+                        "tier": segment["tier"],
+                        "dv": segment["dv"],
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -262,23 +264,17 @@ fn project_segment_contract(value: Value, segment_id: &str) -> Value {
         "payload": {
             "segment": {
                 "segment_id": segment["payload"]["segment"]["segment_id"],
-                "index_kind": segment["payload"]["segment"]["index_kind"],
-                "dimensions": segment["payload"]["segment"]["dimensions"],
-                "put_count": segment["payload"]["segment"]["put_count"],
-                "delete_count": segment["payload"]["segment"]["delete_count"],
+                "file_name": segment["payload"]["segment"]["file_name"],
+                "row_count": segment["payload"]["segment"]["row_count"],
+                "deleted_rows": segment["payload"]["segment"]["deleted_rows"],
+                "live_rows": segment["payload"]["segment"]["live_rows"],
             },
-            "flat_index": {
-                "segment_id": segment["payload"]["flat_index"]["segment_id"],
-                "index_kind": segment["payload"]["flat_index"]["index_kind"],
-                "entry_count": segment["payload"]["flat_index"]["entry_count"],
-                "put_count": segment["payload"]["flat_index"]["put_count"],
-                "delete_count": segment["payload"]["flat_index"]["delete_count"],
-            },
-            "hnsw_index": {
-                "index_kind": segment["payload"]["hnsw_index"]["index_kind"],
-                "dimensions": segment["payload"]["hnsw_index"]["dimensions"],
-                "node_count": segment["payload"]["hnsw_index"]["node_count"],
-            },
+            "section_kinds": segment["payload"]["sections"]
+                .as_array()
+                .expect("segment sections should be an array")
+                .iter()
+                .map(|section| section["kind"].clone())
+                .collect::<Vec<_>>(),
             "records": project_records(&segment["payload"]["records"]),
         }
     })
@@ -305,8 +301,9 @@ fn project_records(value: &Value) -> Vec<Value> {
         .map(|record| {
             json!({
                 "seq_no": record["seq_no"],
-                "op": record["op"]["op"],
-                "id": record["op"]["id"],
+                "op": record["op"],
+                "id": record["id"],
+                "deleted": record["deleted"],
             })
         })
         .collect()

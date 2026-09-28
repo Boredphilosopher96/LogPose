@@ -38,11 +38,13 @@ expression: snapshot
       "generation": 1,
       "segments": [
         {
-          "delete_count": 0,
-          "dimensions": 2,
-          "index_kind": "hnsw",
-          "put_count": 3,
-          "segment_id": "[segment_id]"
+          "deleted_rows": 0,
+          "dv": null,
+          "max_seq_no": 3,
+          "min_seq_no": 1,
+          "row_count": 3,
+          "segment_id": "[segment_id]",
+          "tier": 0
         }
       ]
     },
@@ -87,40 +89,41 @@ expression: snapshot
     "collection_name": "colors",
     "database_name": "default",
     "payload": {
-      "flat_index": {
-        "delete_count": 0,
-        "entry_count": 3,
-        "index_kind": "flat",
-        "put_count": 3,
-        "segment_id": "[segment_id]"
-      },
-      "hnsw_index": {
-        "dimensions": 2,
-        "index_kind": "hnsw",
-        "node_count": 3
-      },
       "records": [
         {
+          "deleted": false,
           "id": "alpha",
           "op": "put",
           "seq_no": 1
         },
         {
+          "deleted": false,
           "id": "beta",
           "op": "put",
           "seq_no": 2
         },
         {
+          "deleted": false,
           "id": "gamma",
           "op": "put",
           "seq_no": 3
         }
       ],
+      "section_kinds": [
+        "SchemaSnapshot",
+        "RowMeta",
+        "PkColumn",
+        "PkSorted",
+        "PkFilter",
+        "Stats",
+        "VectorF32",
+        "DynamicJson"
+      ],
       "segment": {
-        "delete_count": 0,
-        "dimensions": 2,
-        "index_kind": "hnsw",
-        "put_count": 3,
+        "deleted_rows": 0,
+        "file_name": "[segment_id].seg",
+        "live_rows": 3,
+        "row_count": 3,
         "segment_id": "[segment_id]"
       }
     },
@@ -133,16 +136,19 @@ expression: snapshot
       "checkpoint_seq_no": 0,
       "records": [
         {
+          "deleted": false,
           "id": "alpha",
           "op": "put",
           "seq_no": 1
         },
         {
+          "deleted": false,
           "id": "beta",
           "op": "put",
           "seq_no": 2
         },
         {
+          "deleted": false,
           "id": "gamma",
           "op": "put",
           "seq_no": 3

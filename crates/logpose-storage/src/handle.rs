@@ -18,11 +18,12 @@ use logpose_types::{
     Result, SeqNo, Snapshot, record::ClientOp,
 };
 use std::{
+    collections::VecDeque,
     fmt,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -57,6 +58,9 @@ impl CollectionMeta {
         }
     }
 }
+
+/// Versions of the current manifest generation kept for exact legacy snapshots.
+const RECENT_VERSIONS: usize = 8;
 
 const STATE_OPEN: u8 = 0;
 const STATE_DROPPED: u8 = 1;
@@ -97,11 +101,16 @@ impl TokenContext {
         }
     }
 
+    /// The engine-wide pinned-memory limit.
+    pub(crate) fn memory_limit(&self) -> u64 {
+        self.config.memory_limit.unwrap_or(u64::MAX)
+    }
+
     /// Whether pinned snapshots, engine-wide, hold more retired memory than the limit.
     fn memory_exceeded(&self) -> bool {
         self.core
             .upgrade()
-            .is_some_and(|core| core.pinned_retired_bytes() > self.config.memory_limit)
+            .is_some_and(|core| core.pinned_retired_bytes() > self.memory_limit())
     }
 }
 
@@ -142,6 +151,12 @@ pub struct CollectionHandle {
     /// Pinned snapshots.
     tokens: TokenRegistry,
     token_context: Arc<TokenContext>,
+    /// The writer's primary-key index size, for the cache budget.
+    pk_index_bytes: AtomicU64,
+    /// The latest versions of the current manifest generation, newest last, so an exact legacy
+    /// snapshot taken moments ago still resolves while writes continue. Cleared whenever the
+    /// manifest generation changes, so it never holds a retired memtable or segment.
+    recent: Mutex<VecDeque<Arc<Version>>>,
 }
 
 impl CollectionHandle {
@@ -166,6 +181,8 @@ impl CollectionHandle {
             writer,
             jobs: Mutex::new(jobs),
             status_file: Mutex::new(0),
+            pk_index_bytes: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -265,18 +282,41 @@ impl CollectionHandle {
         self.tokens.len()
     }
 
-    /// Bytes of retired delta batches that only this collection's pinned snapshots hold.
+    /// Bytes of retired memtables that only this collection's pinned snapshots hold.
     #[must_use]
     pub fn pinned_retired_bytes(&self) -> u64 {
-        self.tokens
-            .retired_bytes(self.current.load().checkpoint_seq_no)
+        self.tokens.retired_bytes(&self.current())
     }
 
-    /// The token-pinned version an exact legacy `Snapshot` names, if one is pinned.
-    pub(crate) fn pinned_version_for(&self, snapshot: &Snapshot) -> Option<Arc<Version>> {
-        let context = &self.token_context;
-        self.tokens
-            .find(snapshot, context.clock.now(), context.config.ttl)
+    /// The writer's last report of its primary-key index's size.
+    pub(crate) fn pk_index_bytes(&self) -> u64 {
+        self.pk_index_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Report the primary-key index's size; only the writer calls this.
+    pub(crate) fn set_pk_index_bytes(&self, bytes: u64) {
+        self.pk_index_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The version an exact legacy `Snapshot` names, if one is still retained: one of the
+    /// latest versions of the current manifest generation, or a token-pinned one.
+    pub(crate) fn version_for(&self, snapshot: &Snapshot) -> Option<Arc<Version>> {
+        let recent = self
+            .recent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|version| {
+                version.manifest_generation == snapshot.manifest_generation
+                    && version.visible_seq_no == snapshot.visible_seq_no
+            })
+            .cloned();
+        recent.or_else(|| {
+            let context = &self.token_context;
+            self.tokens
+                .find(snapshot, context.clock.now(), context.config.ttl)
+        })
     }
 
     pub(crate) fn tokens(&self) -> &TokenRegistry {
@@ -397,8 +437,24 @@ impl CollectionHandle {
     /// version that includes it; the writer acknowledges only after this returns.
     pub(crate) fn publish(&self, version: Version) -> Arc<Version> {
         let version = Arc::new(version);
-        self.current.store(Arc::clone(&version));
+        let previous = self.current.swap(Arc::clone(&version));
         self.visible.send_replace(version.visible_seq_no);
+        let dropped = {
+            let mut recent = self.recent.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut dropped = Vec::new();
+            if previous.manifest_generation != version.manifest_generation {
+                dropped.extend(recent.drain(..));
+            } else {
+                recent.push_back(previous);
+                while recent.len() > RECENT_VERSIONS {
+                    dropped.extend(recent.pop_front());
+                }
+            }
+            dropped
+        };
+        // Dropping a version may drop the last reference to a retired unit: never under the
+        // lock.
+        drop(dropped);
         version
     }
 

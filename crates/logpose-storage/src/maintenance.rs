@@ -14,6 +14,7 @@ use crate::{
     error::json_message,
     fs_util::{atomic_write_in_existing_dir, read_json},
     handle::CollectionHandle,
+    memtable::MemtableConfig,
     version::Version,
 };
 use logpose_catalog::CollectionDescriptor;
@@ -22,6 +23,7 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, MutexGuard, PoisonError},
+    time::Duration,
 };
 
 /// A background maintenance job.
@@ -95,10 +97,27 @@ impl MaintenanceState {
     }
 }
 
-/// Whether the delta of `version` has reached a flush threshold.
-pub(crate) fn should_flush(descriptor: &CollectionDescriptor, version: &Version) -> bool {
-    version.counters.memtable_rows >= descriptor.flush_threshold_ops as u64
-        || version.counters.memtable_bytes >= descriptor.flush_threshold_bytes as u64
+/// Whether the active memtable of `version` has reached a flush trigger at engine-clock time
+/// `now`: the collection's operation count (every upsert, update, delete, and schema change
+/// counts, so a delete-heavy workload that adds no slots still checkpoints), its byte
+/// threshold or the engine's (whichever is lower), the engine's slot count, or its age.
+pub(crate) fn should_flush(
+    descriptor: &CollectionDescriptor,
+    config: &MemtableConfig,
+    version: &Version,
+    now: Duration,
+) -> bool {
+    let active = &version.active;
+    if !active.has_ops() {
+        return false;
+    }
+    let max_bytes = config
+        .max_bytes
+        .min(descriptor.flush_threshold_bytes as u64);
+    active.op_count() >= descriptor.flush_threshold_ops as u64
+        || active.bytes().total() >= max_bytes
+        || active.slot_count() >= config.max_rows
+        || now.saturating_sub(active.created_at) >= config.max_age
 }
 
 /// Whether `version` has enough segments to compact.
@@ -267,7 +286,12 @@ impl CoreRef {
             let version = handle.current();
             let descriptor = handle.descriptor();
             let mut operations = Vec::new();
-            if should_flush(descriptor, &version) {
+            if should_flush(
+                descriptor,
+                &self.memtable,
+                &version,
+                self.tokens.clock.now(),
+            ) {
                 operations.push(MaintenanceOperation::Flush);
             }
             if should_compact(descriptor, &version) {

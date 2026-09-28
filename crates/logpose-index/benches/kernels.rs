@@ -6,12 +6,9 @@ use logpose_index::{
     kernels::{self, scalar},
     sq8::{Sq8Metric, Sq8Params},
 };
-use logpose_types as _;
 use pulp as _;
 use rayon as _;
 use roaring as _;
-use serde as _;
-use serde_json as _;
 use std::time::Duration;
 use thiserror as _;
 

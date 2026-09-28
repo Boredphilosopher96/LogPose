@@ -10,12 +10,11 @@ use crate::{
     handle::{CollectionHandle, CollectionMeta},
     maintenance::MaintenanceState,
     manifest::{Manifest, publish_manifest},
-    recovery::DurableStart,
-    version::DeltaLog,
-    writer::{LogicalState, checkpoint_frame},
+    recovery::{DurableStart, new_state},
+    writer::{PkIndex, checkpoint_frame},
 };
 use logpose_catalog::CollectionDescriptor;
-use logpose_types::{CollectionAssignment, CollectionRef, MaintenanceStatus, Result};
+use logpose_types::{CollectionAssignment, CollectionRef, MaintenanceStatus, Result, UnitId};
 use logpose_wal::{WalRecovery, WalWriter};
 use std::{
     path::{Path, PathBuf},
@@ -71,7 +70,7 @@ impl EngineCore {
 
     fn create_collection_directories(&self, descriptor: &CollectionDescriptor) -> Result<()> {
         create_dir_all_synced(self.vfs.as_ref(), &descriptor.root_path)?;
-        for child in ["manifests", "wal", "segments", "indexes", "tmp"] {
+        for child in ["manifests", "wal", "segments"] {
             self.vfs
                 .create_dir_all(&descriptor.root_path.join(child))
                 .map_err(|error| io_message("failed to create collection directories", error))?;
@@ -154,15 +153,23 @@ impl CoreRef {
             }
         };
         let meta = Arc::new(CollectionMeta::new(descriptor, assignment.cloned()));
-        let state = LogicalState {
-            schema: Arc::new(manifest.schema.clone()),
-            delta: DeltaLog::default(),
-        };
+        // The active memtable takes the first unit id.
+        let state = new_state(
+            Arc::new(manifest.schema.clone()),
+            UnitId(manifest.next_unit_id),
+            manifest.checkpoint_seq_no + 1,
+            self.tokens.clock.now(),
+            Arc::from(Vec::new()),
+            Default::default(),
+            PkIndex::default(),
+            self.strict_invariants,
+        );
         let handle = self.start_collection(
             meta,
             DurableStart {
                 next_manifest_gen: manifest.generation + 1,
-                next_unit_id: manifest.next_unit_id,
+                next_unit_id: manifest.next_unit_id + 1,
+                next_dv_gen: manifest.next_dv_gen,
                 manifest: Arc::new(manifest),
                 previous_generation: None,
             },

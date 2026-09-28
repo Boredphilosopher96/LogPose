@@ -100,6 +100,14 @@ pub enum SegmentError {
     /// Reading or writing the underlying file failed.
     #[error("segment I/O failed: {0}")]
     Io(Arc<io::Error>),
+    /// The caller asked for a section, page, block, or row the segment does
+    /// not have. A bug in the caller, never a defect of the file, so it is
+    /// not corruption.
+    #[error("segment access out of range: {what}")]
+    OutOfRange {
+        /// What was asked for.
+        what: String,
+    },
     /// A cached load did not finish: the loader panicked, or its executor
     /// shut down before running it. Nothing was cached; a retry loads again.
     #[error("a segment load was aborted before it finished")]
@@ -220,6 +228,10 @@ impl SegmentError {
             self,
             Self::Checksum { .. } | Self::Corrupt { .. } | Self::UnsupportedVersion { .. }
         )
+    }
+
+    pub(super) fn out_of_range(what: impl Into<String>) -> Self {
+        Self::OutOfRange { what: what.into() }
     }
 
     pub(super) fn corrupt(region: Region, detail: impl Into<String>) -> Self {

@@ -35,17 +35,19 @@ LogPose is still a local filesystem engine.
 - the WAL is a directory of `wal/<first sequence number>.wal` files (the WAL v2 format); a torn tail left by a crash is truncated when the collection is recovered, while damage followed by a later durable group, any damage in an older file, and a sequence gap are reported as corruption instead
 - a failed append or fsync truncates the active WAL file back to its last synced group, fails the group's writes with an outcome (`not applied`, or `unknown` when that rollback failed too), and makes the collection read-only until the engine is reopened; when the rollback failed, a `wal/FSYNC_FAILED` marker refuses a reopen in the same boot
 - storage roots written by earlier builds (a `wal/active.wal` file) are not readable and fail to open as corrupt; there is no migration
-- flush and compaction publish immutable segment files plus planner-visible index sidecars
+- writes land in an in-memory memtable; an upsert, update, or delete of an existing key sets a bit in the deletion vector of the unit (memtable or segment) holding its previous row, so every key has at most one live row
+- flush writes the memtable's live rows as one immutable segment file (`segments/<unit>.seg`, the segment v2 format) and each grown deletion vector as a new `segments/<unit>.dv.<generation>` file; compaction rewrites segments without their deleted rows; segments carry no vector index sections yet, so ANN over a segment is served by an exact scan of its live rows
+- storage roots written by builds before segment v2 (v1 `.lps` segments and `indexes/` sidecars) do not open; there is no migration
 - a default database descriptor is now persisted under `storage_root/databases/default/descriptor.json`
 - operator-facing namespaces are database-first: collection identities are `database/collection` outside the default database and just `collection` inside it
-- collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, `segments/`, and `indexes/`
-- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory, except that a manifest generation is created under its final name and fsynced with its directory before `CURRENT` is renamed to name it; new segment and index files fsync their directories before the manifest that references them is published, and a new WAL file is synced, with its directory, before any write lands in it
+- collection state persists through `descriptor.json`, `placement.json`, `maintenance.json`, `CURRENT`, `manifests/`, `wal/`, and `segments/`
+- every durable file is published by writing a temp file, fsyncing it, renaming it into place, and fsyncing the parent directory, except that a manifest generation is created under its final name and fsynced with its directory before `CURRENT` is renamed to name it; new segment and deletion-vector files fsync their directories before the manifest that references them is published, and a new WAL file is synced, with its directory, before any write lands in it
 - one engine owns a `storage_root` at a time: opening the storage engine takes an exclusive lock on `storage_root/LOCK` and keeps every collection's state resident, so the server opens one engine and shares it between the data plane and the catalog, and a second engine (in another process or the same one) fails at startup with an "already in use by another engine" error
 - a flush rotates the WAL to a new file before it writes its segment, so its checkpoint falls on a file boundary; once the manifest with that checkpoint is durable, the WAL files it covers are deleted, since no read goes back to the WAL
 - segment files are deleted once no durable manifest and no in-memory version (including one a snapshot token pins) references them; opening a collection first syncs its directories, then removes every file the durable manifest does not reference
 - all storage and WAL file I/O goes through the `Vfs` trait in `crates/logpose-vfs`: `StdVfs` in production, and `FaultVfs`, an in-memory filesystem that models lost unsynced data, torn writes, failed fsyncs and volatile directory entries, in crash tests
-- the planner can choose exact execution, HNSW-backed ANN over immutable units, or hybrid exact-plus-ANN merge
-- mutable data remains on the exact path; ANN is currently limited to immutable HNSW units
+- the planner can choose exact execution, ANN over immutable units, or hybrid exact-plus-ANN merge
+- mutable data remains on the exact path; until segments carry vector index sections, an immutable unit's ANN candidates come from an exact scan of its live rows
 
 ## Node Roles And Placement
 

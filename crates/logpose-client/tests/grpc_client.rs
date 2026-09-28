@@ -165,9 +165,18 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     client
         .write(
             &qualified,
-            vec![WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("beta"),
-            })],
+            vec![
+                WriteOperation::Delete(DeleteRecord {
+                    id: RecordId::new("beta"),
+                }),
+                // A live memtable row keeps a mutable unit for the hybrid plan below: the delete
+                // alone only sets the segment row's deletion bit.
+                WriteOperation::Put(PutRecord {
+                    id: RecordId::new("gamma"),
+                    vector: vec![0.0, 1.0],
+                    metadata: json!({"kind": "keep"}),
+                }),
+            ],
         )
         .await
         .expect("delete should succeed");
@@ -179,9 +188,9 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
     assert!(compact.manifest_generation >= flush.manifest_generation);
 
     let stats = client.stats(&qualified).await.expect("stats should reload");
-    assert_eq!(stats.live_record_count, 1);
+    assert_eq!(stats.live_record_count, 2);
     assert_eq!(stats.deleted_record_count, 1);
-    assert_eq!(stats.mutable_op_count, 1);
+    assert_eq!(stats.mutable_op_count, 2);
     assert_eq!(stats.segment_count, 1);
     assert_eq!(stats.maintenance.completed_runs, 0);
     assert!(stats.maintenance.in_progress.is_none());
@@ -191,23 +200,17 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .iter()
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be present");
-    assert_eq!(immutable.index_kind, "hnsw");
+    assert_eq!(immutable.index_kind, "exact");
     assert!(
         immutable
             .artifact_stats
             .iter()
-            .any(|artifact| artifact.file_name.ends_with(".flat.json"))
-    );
-    assert!(
-        immutable
-            .artifact_stats
-            .iter()
-            .any(|artifact| artifact.file_name.ends_with(".hnsw.bin"))
+            .any(|artifact| artifact.file_name.ends_with(".seg"))
     );
     assert!(
         immutable
             .component_bytes
-            .get("ann_graph")
+            .get("segment")
             .copied()
             .unwrap_or_default()
             > 0

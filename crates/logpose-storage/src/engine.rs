@@ -3,12 +3,14 @@
 
 use crate::{
     BlobStore,
-    cache::{BufferCache, CacheConfig},
+    cache::{ArtifactClass, BudgetInputs, BufferCache, CacheConfig, DEFAULT_FLOORS},
     clock::{Clock, SystemClock},
     durable_fs::{create_dir_all_synced, path_exists, sync_dir},
     error::io_message,
     gc::GcQueue,
     handle::{CollectionHandle, TokenContext},
+    maintenance::MaintenanceOperation,
+    memtable::MemtableConfig,
     recovery::RecoveredCollection,
     root_lock::lock_root_exclusively,
     runtime::{IoPool, Runtime, RuntimeConfig, run_cpu},
@@ -50,9 +52,21 @@ pub type FatalHandler = Arc<dyn Fn(&LogPoseError) + Send + Sync>;
 pub struct EngineConfig {
     /// Thread pool sizes.
     pub runtime: RuntimeConfig,
-    /// Buffer cache budget and class floors.
-    pub cache: CacheConfig,
-    /// Remote blob store that flushed segments are marked for upload to, if any.
+    /// The engine-wide memory budget (`storage.memory_limit`). The buffer cache gets what the
+    /// primary-key indexes, the memtable reservation, the query working reserve, and the
+    /// maintenance reservation leave (see [`BudgetInputs`]). Default 4 GiB.
+    pub memory_limit: u64,
+    /// Memtable flush triggers and the engine-wide memtable reservation.
+    pub memtable: MemtableConfig,
+    /// Share of `memory_limit` reserved for flush and compaction builds. Default 0.2.
+    pub maintenance_fraction: f64,
+    /// Per-class buffer cache floors, as fractions of the cache budget.
+    pub cache_floors: [f32; ArtifactClass::COUNT],
+    /// Check expensive invariants as the engine runs (a key with two live rows fails recovery
+    /// instead of being repaired; a violated primary-key forwarding fails the write). Default:
+    /// on in debug builds.
+    pub strict_invariants: bool,
+    /// Reserved for the blob storage integration; not used by the local engine yet.
     pub blob_store: Option<Arc<dyn BlobStore>>,
     /// Group commit settings of every collection's writer.
     pub group: GroupCommitConfig,
@@ -74,7 +88,11 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             runtime: RuntimeConfig::default(),
-            cache: CacheConfig::default(),
+            memory_limit: 4 << 30,
+            memtable: MemtableConfig::default(),
+            maintenance_fraction: 0.2,
+            cache_floors: DEFAULT_FLOORS,
+            strict_invariants: cfg!(debug_assertions),
             blob_store: None,
             group: GroupCommitConfig::default(),
             wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
@@ -91,7 +109,11 @@ impl fmt::Debug for EngineConfig {
         formatter
             .debug_struct("EngineConfig")
             .field("runtime", &self.runtime)
-            .field("cache", &self.cache)
+            .field("memory_limit", &self.memory_limit)
+            .field("memtable", &self.memtable)
+            .field("maintenance_fraction", &self.maintenance_fraction)
+            .field("cache_floors", &self.cache_floors)
+            .field("strict_invariants", &self.strict_invariants)
             .field("blob_store", &self.blob_store.is_some())
             .field("group", &self.group)
             .field("wal_file_bytes", &self.wal_file_bytes)
@@ -149,7 +171,14 @@ impl Drop for EngineShared {
 pub(crate) struct EngineCore {
     pub(crate) root: PathBuf,
     pub(crate) vfs: Arc<dyn Vfs>,
-    pub(crate) blob_store: Option<Arc<dyn BlobStore>>,
+    /// Memtable flush triggers and the engine-wide memtable reservation.
+    pub(crate) memtable: MemtableConfig,
+    /// See [`EngineConfig::strict_invariants`].
+    pub(crate) strict_invariants: bool,
+    /// See [`EngineConfig::memory_limit`].
+    memory_limit: u64,
+    /// See [`EngineConfig::maintenance_fraction`].
+    maintenance_fraction: f64,
     /// Collections keyed by `(database, name)`. Populated at open; changed only by create and
     /// drop. Critical sections are map operations only.
     collections: RwLock<BTreeMap<CollectionRef, CollectionSlot>>,
@@ -232,17 +261,33 @@ impl Engine {
         let clock = config
             .clock
             .unwrap_or_else(|| Arc::new(SystemClock::new()) as Arc<dyn Clock>);
-        let token_config = config.tokens;
+        let mut token_config = config.tokens;
+        let memtable_budget = fraction_of(config.memory_limit, config.memtable.global_fraction);
+        // A quarter of the memtable budget unless configured.
+        token_config.memory_limit.get_or_insert(memtable_budget / 4);
+        let budget = BudgetInputs {
+            memory_limit: config.memory_limit,
+            pk_index_bytes: 0,
+            memtable_bytes: memtable_budget,
+            maintenance_bytes: fraction_of(config.memory_limit, config.maintenance_fraction),
+        }
+        .cache_budget();
         let core = Arc::new_cyclic(|weak| EngineCore {
             gc: GcQueue::new(weak.clone()),
             tokens: Arc::new(TokenContext::new(clock, token_config, weak.clone())),
             root,
             vfs,
-            blob_store: config.blob_store,
+            memtable: config.memtable,
+            strict_invariants: config.strict_invariants,
+            memory_limit: config.memory_limit,
+            maintenance_fraction: config.maintenance_fraction,
             collections: RwLock::new(BTreeMap::new()),
             unreadable: OnceLock::new(),
             runtime,
-            cache: BufferCache::new(config.cache),
+            cache: BufferCache::new(CacheConfig {
+                budget,
+                floors: config.cache_floors,
+            }),
             writer_runtime: writers.handle().clone(),
             group_commit: config.group,
             wal_file_bytes: config.wal_file_bytes,
@@ -260,7 +305,8 @@ impl Engine {
             writers: Some(writers),
         });
         core.recover_collections()?;
-        spawn_token_reaper(&core, config.tokens.reaper_interval);
+        core.refresh_cache_budget();
+        spawn_token_reaper(&core, token_config.reaper_interval);
         Ok(Self { shared })
     }
 
@@ -397,8 +443,16 @@ impl fmt::Debug for Engine {
     }
 }
 
-/// Start the engine-wide snapshot-token reaper on the writer runtime. It holds the engine only
-/// while a pass runs, and stops once the engine shuts down.
+/// `fraction` of `bytes`, rounded down.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn fraction_of(bytes: u64, fraction: f64) -> u64 {
+    (bytes as f64 * fraction.clamp(0.0, 1.0)) as u64
+}
+
+/// Start the engine-wide background tick on the writer runtime: every reaper interval it reaps
+/// snapshot tokens, recomputes the cache budget from the primary-key indexes' sizes, and runs
+/// the memtable age and global-budget flush triggers. It holds the engine only while a pass
+/// runs, and stops once the engine shuts down.
 fn spawn_token_reaper(core: &Arc<EngineCore>, interval: std::time::Duration) {
     let weak = Arc::downgrade(core);
     let interval = interval.max(std::time::Duration::from_millis(1));
@@ -415,6 +469,8 @@ fn spawn_token_reaper(core: &Arc<EngineCore>, interval: std::time::Duration) {
                 break;
             }
             core.reap_snapshots();
+            core.refresh_cache_budget();
+            core.memtable_tick();
         }
     });
 }
@@ -447,7 +503,7 @@ impl EngineCore {
         for handle in &handles {
             dropped.extend(handle.tokens().reap(now));
         }
-        let limit = self.tokens.config.memory_limit;
+        let limit = self.tokens.memory_limit();
         loop {
             let total = handles
                 .iter()
@@ -461,7 +517,7 @@ impl EngineCore {
                 .filter_map(|handle| {
                     handle
                         .tokens()
-                        .oldest_retired(handle.current().checkpoint_seq_no)
+                        .oldest_retired(&handle.current())
                         .map(|(order, token)| (order, handle, token))
                 })
                 .min_by_key(|(order, _, _)| *order);
@@ -485,6 +541,36 @@ impl EngineCore {
             self.gc.release_on(&self.runtime.maintenance, dropped);
         }
         count
+    }
+
+    /// The engine-wide buffer cache.
+    pub(crate) fn buffer_cache(&self) -> &BufferCache {
+        &self.cache
+    }
+
+    /// Bytes of the engine-wide memtable reservation.
+    pub(crate) fn memtable_budget(&self) -> u64 {
+        fraction_of(self.memory_limit, self.memtable.global_fraction)
+    }
+
+    /// Recompute the cache budget from the current primary-key index sizes (every writer
+    /// reports its index's size after each publish) and apply it if it changed.
+    pub(crate) fn refresh_cache_budget(&self) {
+        let pk_index_bytes = self
+            .open_handles()
+            .iter()
+            .map(|handle| handle.pk_index_bytes())
+            .sum();
+        let budget = BudgetInputs {
+            memory_limit: self.memory_limit,
+            pk_index_bytes,
+            memtable_bytes: self.memtable_budget(),
+            maintenance_bytes: fraction_of(self.memory_limit, self.maintenance_fraction),
+        }
+        .cache_budget();
+        if budget != self.cache.budget() {
+            self.cache.set_budget(budget);
+        }
     }
 
     pub(crate) fn collections_root(&self) -> PathBuf {
@@ -764,6 +850,36 @@ impl Drop for Reservation<'_> {
 }
 
 impl CoreRef {
+    /// The flush triggers no write drives: a memtable older than `max_age` in a collection that
+    /// stopped writing, and the engine-wide memtable budget (active memtables plus retired ones
+    /// that only pinned snapshots hold), which flushes the largest active memtable first.
+    pub(crate) fn memtable_tick(&self) {
+        let now = self.tokens.clock.now();
+        let handles = self.open_handles();
+        let mut total = self.pinned_retired_bytes();
+        let mut largest: Option<(u64, &Arc<CollectionHandle>)> = None;
+        for handle in &handles {
+            if handle.is_dropped() || handle.is_poisoned() {
+                continue;
+            }
+            let version = handle.current();
+            let active = &version.active;
+            let bytes = version.counters.memtable_bytes;
+            total += bytes;
+            if active.has_ops() && now.saturating_sub(active.created_at) >= self.memtable.max_age {
+                self.enqueue_maintenance(handle, vec![MaintenanceOperation::Flush]);
+            }
+            if active.has_ops() && largest.is_none_or(|(size, _)| active.bytes().total() > size) {
+                largest = Some((active.bytes().total(), handle));
+            }
+        }
+        if total > self.memtable_budget()
+            && let Some((_, handle)) = largest
+        {
+            self.enqueue_maintenance(handle, vec![MaintenanceOperation::Flush]);
+        }
+    }
+
     fn drop_collection(&self, reference: &CollectionRef) -> Result<()> {
         let slot = {
             let mut collections = self.write_collections();

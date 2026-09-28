@@ -17,12 +17,10 @@
 //! never ran because the engine shut down, is redone by orphan cleanup at the next open.
 
 use crate::{
+    dv::parse_dv_file_name,
     engine::{CoreRef, EngineCore},
     manifest::{CURRENT_TEMP_FILE, Manifest, manifests_dir, parse_manifest_file_name},
-    paths::{
-        FLAT_SIDECAR_EXTENSION, HNSW_SIDECAR_EXTENSION, INDEXES_DIR, SEGMENTS_DIR, TMP_DIR,
-        V1_SEGMENT_EXTENSION, parse_unit_file_name,
-    },
+    paths::{SEGMENTS_DIR, parse_segment_file_name},
 };
 use logpose_types::{LogPoseError, Result, UnitId};
 use logpose_vfs::{CrashPoint, Vfs, parent_dir};
@@ -37,29 +35,28 @@ use std::{
     },
 };
 
-/// The files of one segment, shared by the writer's `live_files` and every `Version` that
-/// contains the segment. Removed from disk when the last reference drops after the writer
-/// marked it obsolete.
+/// The file of one segment, owned by its `SegmentHandle`, which the writer's state and every
+/// `Version` that contains the segment share. Removed from disk when the last reference drops
+/// after the writer marked it obsolete.
 pub(crate) struct FileHandle {
     unit: UnitId,
-    paths: Vec<PathBuf>,
+    path: PathBuf,
     obsolete: AtomicBool,
     gc: GcQueue,
 }
 
 impl FileHandle {
-    pub(crate) fn new(unit: UnitId, paths: Vec<PathBuf>, gc: GcQueue) -> Self {
+    pub(crate) fn new(unit: UnitId, path: PathBuf, gc: GcQueue) -> Self {
         Self {
             unit,
-            paths,
+            path,
             obsolete: AtomicBool::new(false),
             gc,
         }
     }
 
-    /// The segment's unit.
-    pub(crate) fn unit(&self) -> UnitId {
-        self.unit
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Mark the files for removal once the last reference drops. Called only by the writer,
@@ -73,7 +70,7 @@ impl FileHandle {
 impl Drop for FileHandle {
     fn drop(&mut self) {
         if self.obsolete.load(Ordering::Acquire) {
-            self.gc.remove(std::mem::take(&mut self.paths));
+            self.gc.remove([std::mem::take(&mut self.path)]);
         }
     }
 }
@@ -304,12 +301,7 @@ pub(crate) fn durability_barrier(vfs: &dyn Vfs, dir: &Path) -> Result<()> {
         })
     };
     sync(dir)?;
-    for child in [
-        manifests_dir(dir),
-        dir.join(SEGMENTS_DIR),
-        dir.join(INDEXES_DIR),
-        dir.join(TMP_DIR),
-    ] {
+    for child in [manifests_dir(dir), dir.join(SEGMENTS_DIR)] {
         if exists(vfs, &child)? {
             sync(&child)?;
         }
@@ -326,6 +318,8 @@ pub(crate) struct OrphanCleanup {
     pub(crate) next_manifest_gen: u64,
     /// The first unit id above every unit id seen on disk, removed files included.
     pub(crate) next_unit_id: u32,
+    /// The first DV generation above every generation seen on disk, removed files included.
+    pub(crate) next_dv_gen: u64,
     /// Every removed path.
     pub(crate) removed: Vec<PathBuf>,
 }
@@ -334,29 +328,36 @@ pub(crate) struct OrphanCleanup {
 /// does not reference, before the writer starts, so no id the counters hand out again can
 /// collide with a leftover:
 ///
-/// 1. `segments/` and `indexes/`: every segment or sidecar whose unit is not in `manifest`,
-///    and every `.tmp`; `tmp/`: everything.
+/// 1. `segments/`: every `.seg` whose unit is not in `manifest`, every `.dv.<generation>`
+///    whose unit and generation `manifest` does not name, and every `.tmp`.
 /// 2. `manifests/`: every generation but the current one and the newest one below it
 ///    (generations can have gaps after a failed publish), including those above the current.
 /// 3. `CURRENT.tmp`.
 /// 4. `sync_dir` of every changed directory, then `crash_point(RecoveryAfterOrphanCleanup)`.
 ///
-/// It also reports the first unit id and manifest generation above every one seen on disk, so
-/// the writer never reissues a name a leftover of a failed attempt used, even when the reopen
-/// happens in the same process (the counters in `manifest` alone would reissue them, which is
-/// safe only because the leftovers are gone).
+/// It also reports the first unit id, DV generation, and manifest generation above every one
+/// seen on disk, so the writer never reissues a name a leftover of a failed attempt used, even
+/// when the reopen happens in the same process (the counters in `manifest` alone would reissue
+/// them, which is safe only because the leftovers are gone).
 ///
 /// WAL files at or below the checkpoint are removed by the caller through the WAL writer.
-/// Safe only after [`durability_barrier`]: it deletes relative to `manifest`.
+/// Files it does not recognize are left alone. Safe only after [`durability_barrier`]: it
+/// deletes relative to `manifest`.
 pub(crate) fn remove_orphans(
     vfs: &dyn Vfs,
     dir: &Path,
     manifest: &Manifest,
 ) -> Result<OrphanCleanup> {
     let live = manifest.units().collect::<HashSet<_>>();
+    let live_dvs = manifest
+        .segments
+        .iter()
+        .filter_map(|segment| segment.dv.map(|dv| (segment.unit, dv.generation)))
+        .collect::<HashSet<_>>();
     let mut cleanup = OrphanCleanup {
         next_manifest_gen: manifest.generation + 1,
         next_unit_id: manifest.next_unit_id,
+        next_dv_gen: manifest.next_dv_gen,
         ..OrphanCleanup::default()
     };
     let mut changed = BTreeSet::new();
@@ -376,26 +377,23 @@ pub(crate) fn remove_orphans(
         Ok(())
     };
 
-    let unit_dirs: [(&str, &[&str]); 3] = [
-        (SEGMENTS_DIR, &[V1_SEGMENT_EXTENSION]),
-        (
-            INDEXES_DIR,
-            &[FLAT_SIDECAR_EXTENSION, HNSW_SIDECAR_EXTENSION],
-        ),
-        (TMP_DIR, &[]),
-    ];
-    for (child, extensions) in unit_dirs {
-        for name in files_in(vfs, &dir.join(child))? {
-            if let Some(unit) = unit_prefix(&name) {
-                cleanup.next_unit_id = cleanup.next_unit_id.max(unit.0.saturating_add(1));
-            }
-            let orphan = child == TMP_DIR
-                || name.ends_with(".tmp")
-                || parse_unit_file_name(&name, extensions)
-                    .is_some_and(|unit| !live.contains(&unit));
-            if orphan {
-                remove(dir.join(child).join(name), &mut cleanup)?;
-            }
+    let segments = dir.join(SEGMENTS_DIR);
+    for name in files_in(vfs, &segments)? {
+        if let Some(unit) = unit_prefix(&name) {
+            cleanup.next_unit_id = cleanup.next_unit_id.max(unit.0.saturating_add(1));
+        }
+        let orphan = if name.ends_with(".tmp") {
+            true
+        } else if let Some(unit) = parse_segment_file_name(&name) {
+            !live.contains(&unit)
+        } else if let Some((unit, generation)) = parse_dv_file_name(&name) {
+            cleanup.next_dv_gen = cleanup.next_dv_gen.max(generation.saturating_add(1));
+            !live_dvs.contains(&(unit, generation))
+        } else {
+            false
+        };
+        if orphan {
+            remove(segments.join(name), &mut cleanup)?;
         }
     }
 
@@ -433,8 +431,7 @@ pub(crate) fn remove_orphans(
     Ok(cleanup)
 }
 
-/// The unit a file name in `segments/`, `indexes/` or `tmp/` starts with: eight lowercase hex
-/// digits and a dot.
+/// The unit a file name in `segments/` starts with: eight lowercase hex digits and a dot.
 fn unit_prefix(name: &str) -> Option<UnitId> {
     let (digits, rest) = name.split_at_checked(8)?;
     if !rest.starts_with('.')

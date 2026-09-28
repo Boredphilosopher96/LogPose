@@ -1,21 +1,30 @@
 //! Preparing a group: validate each request against the writer's schema at its point in the
 //! stream, turn it into row operations and one WAL frame, and apply it to the writer's private
-//! state. Pure CPU work over owned data, so it can run on the query pool.
+//! state. Pure CPU work over owned data, so it can run on the query pool: the old rows partial
+//! updates merge that live in segments were fetched on the I/O pool beforehand
+//! ([`FetchedRows`]); rows in memtables are read directly.
 
 use super::{
     Ack, SchemaChange, WriteRequest,
     apply::{Change, LogicalState, apply},
 };
 use logpose_types::{
-    LogPoseError, Result, SeqNo,
-    record::{ClientOp, PrimaryKey},
+    LogPoseError, ResourceKind, Result, RowAddr, SeqNo,
+    record::{ClientOp, PartialUpdate, PrimaryKey},
     schema::CollectionSchema,
 };
 use logpose_wal::{
     MAX_FRAME_PAYLOAD, WalFrame,
     codec::{RowImage, RowOp, SchemaChangePayload, WalPayload, WirePk, WriteBatchPayload},
 };
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+/// Old rows of partial updates that live in segments, read on the I/O pool before the group is
+/// prepared, by address. A failed read fails only the updates that need that row.
+pub(crate) type FetchedRows = HashMap<RowAddr, std::result::Result<RowImage, LogPoseError>>;
 
 /// A request that got sequence numbers and a frame, waiting for its group's fsync.
 pub(crate) struct Pending {
@@ -33,6 +42,10 @@ pub(crate) struct PreparedRequests {
     pub(crate) pending: Vec<Pending>,
     /// Row operations in the accepted requests, for the batching threshold.
     pub(crate) rows: usize,
+    /// Set when applying a validated request failed, which only an engine invariant violation
+    /// can cause: the private state may be partly changed, so the writer poisons the
+    /// collection. Requests after it were refused.
+    pub(crate) fatal: Option<String>,
 }
 
 /// Groups with fewer rows than this, and fewer approximate bytes than [`INLINE_PREPARE_BYTES`],
@@ -56,18 +69,27 @@ pub(crate) fn prepare(
     state: &mut LogicalState,
     mut next_seq_no: SeqNo,
     requests: Vec<WriteRequest>,
+    fetched: &FetchedRows,
 ) -> (PreparedRequests, SeqNo) {
     let mut prepared = PreparedRequests::default();
     for request in requests {
+        if let Some(reason) = &prepared.fatal {
+            let _ = request.ack().send(Err(LogPoseError::internal(format!(
+                "an earlier write of the group violated an engine invariant: {reason}"
+            ))));
+            continue;
+        }
         match request {
             WriteRequest::Batch { ops, ack } => {
                 let applied_ops = ops.len();
-                match batch_frame(&state.schema, next_seq_no, ops) {
+                match batch_frame(state, next_seq_no, ops, fetched) {
                     Ok((frame, change)) => {
                         let last_seq_no = frame.last_seq_no();
                         if let Err(error) = apply(state, next_seq_no, change) {
-                            // Unreachable: the batch was validated against this schema.
+                            // The batch was validated against this schema, so only a violated
+                            // invariant gets here.
                             let _ = ack.send(Err(LogPoseError::internal(error.to_string())));
+                            prepared.fatal = Some(error.to_string());
                             continue;
                         }
                         prepared.frames.push(frame);
@@ -89,6 +111,7 @@ pub(crate) fn prepare(
                     Ok((frame, schema)) => {
                         if let Err(error) = apply(state, next_seq_no, Change::Schema(schema)) {
                             let _ = ack.send(Err(LogPoseError::internal(error.to_string())));
+                            prepared.fatal = Some(error.to_string());
                             continue;
                         }
                         prepared.frames.push(frame);
@@ -109,11 +132,13 @@ pub(crate) fn prepare(
     (prepared, next_seq_no)
 }
 
-/// Validate a client batch and build its frame. Nothing is applied yet.
+/// Validate a client batch and build its frame. Nothing is applied yet; the state is only read
+/// (to merge partial updates with the rows they change).
 fn batch_frame(
-    schema: &CollectionSchema,
+    state: &mut LogicalState,
     first_seq_no: SeqNo,
     ops: Vec<ClientOp>,
+    fetched: &FetchedRows,
 ) -> Result<(WalFrame, Change)> {
     if ops.is_empty() {
         return Err(LogPoseError::invalid_field(
@@ -121,6 +146,7 @@ fn batch_frame(
             "write batch must include at least one operation",
         ));
     }
+    let schema = Arc::clone(&state.schema);
     let mut seen = HashSet::with_capacity(ops.len());
     let mut row_ops = Vec::with_capacity(ops.len());
     for (index, op) in ops.into_iter().enumerate() {
@@ -131,7 +157,16 @@ fn batch_frame(
                 format!("write batch includes duplicate record id '{pk}'"),
             ));
         }
-        row_ops.push(row_op(schema, op).map_err(|error| invalid_record(index, &pk, error))?);
+        let op = match op {
+            ClientOp::Update(update) => RowOp::Put(
+                merge_update(state, &schema, update, fetched).map_err(|error| match error {
+                    Merge::Invalid(error) => invalid_record(index, &pk, error),
+                    Merge::Failed(error) => error,
+                })?,
+            ),
+            other => row_op(&schema, other).map_err(|error| invalid_record(index, &pk, error))?,
+        };
+        row_ops.push(op);
     }
     let count = row_ops.len() as SeqNo;
     let payload = WalPayload::WriteBatch(WriteBatchPayload {
@@ -152,7 +187,7 @@ fn batch_frame(
     ))
 }
 
-/// Validate one client operation and turn it into a blind write.
+/// Validate an upsert or a delete and turn it into a blind write.
 fn row_op(schema: &CollectionSchema, op: ClientOp) -> std::result::Result<RowOp, String> {
     match op {
         ClientOp::Upsert(record) => RowImage::from_record(schema, record)
@@ -164,13 +199,61 @@ fn row_op(schema: &CollectionSchema, op: ClientOp) -> std::result::Result<RowOp,
                 .map_err(|error| error.to_string())?;
             Ok(RowOp::Delete(pk.into()))
         }
-        // A partial update must read the old row, which lives in the delta or in a v1 segment.
-        // The writer-private primary-key index that makes that O(1) lands with the memtable
-        // (PR 10); until then partial updates are refused rather than served by a scan.
-        ClientOp::Update(_) => {
-            Err("partial updates are unsupported until the memtable lands".to_owned())
-        }
+        ClientOp::Update(_) => Err("a partial update needs the row it changes".to_owned()),
     }
+}
+
+/// Why a partial update could not be merged.
+enum Merge {
+    /// The update does not fit the schema, or the merged row does not.
+    Invalid(String),
+    /// The key has no live row, or its row could not be read.
+    Failed(LogPoseError),
+}
+
+/// Merge a partial update with the key's live row into the full row image a blind `Put` logs.
+/// The old row is read with the current schema, so values of dropped fields are gone and
+/// `$extra` keys the schema declares or retires are removed from the merged row (they are not
+/// promoted into the typed field).
+fn merge_update(
+    state: &mut LogicalState,
+    schema: &CollectionSchema,
+    update: PartialUpdate,
+    fetched: &FetchedRows,
+) -> std::result::Result<RowImage, Merge> {
+    let update = schema
+        .validate_update(update)
+        .map_err(|error| Merge::Invalid(error.to_string()))?;
+    let addr = state
+        .resolve(&update.pk)
+        .map_err(|error| Merge::Failed(LogPoseError::internal(error.to_string())))?
+        .ok_or_else(|| {
+            Merge::Failed(LogPoseError::not_found(
+                ResourceKind::Record,
+                update.pk.to_string(),
+            ))
+        })?;
+    let old = match state.memtable(addr.unit) {
+        Some(memtable) => memtable
+            .row_image(addr.row)
+            .map_err(|error| Merge::Failed(LogPoseError::internal(error)))?,
+        None => match fetched.get(&addr) {
+            Some(Ok(image)) => image.clone(),
+            Some(Err(error)) => return Err(Merge::Failed(error.clone())),
+            None => {
+                return Err(Merge::Failed(LogPoseError::internal(format!(
+                    "the row {addr} a partial update changes was not fetched"
+                ))));
+            }
+        },
+    };
+    let mut record = old
+        .to_record(schema)
+        .map_err(|error| Merge::Failed(LogPoseError::internal(error.to_string())))?;
+    update
+        .apply_to(&mut record)
+        .map_err(|error| Merge::Invalid(error.to_string()))?;
+    RowImage::from_record(schema, record).map_err(|error| Merge::Invalid(error.to_string()))
 }
 
 fn invalid_record(index: usize, pk: &PrimaryKey, error: String) -> LogPoseError {

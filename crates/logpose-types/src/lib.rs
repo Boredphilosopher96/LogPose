@@ -302,6 +302,25 @@ impl fmt::Display for UnitId {
     }
 }
 
+/// Dense row id inside one unit: a memtable slot or a segment row.
+pub type RowId = u32;
+
+/// Global address of a row: its unit and its row id there. Stable for the life of the unit
+/// (I10): segments are immutable and memtable slots are append-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct RowAddr {
+    /// The memtable or segment holding the row.
+    pub unit: UnitId,
+    /// The row inside the unit.
+    pub row: RowId,
+}
+
+impl fmt::Display for RowAddr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.unit, self.row)
+    }
+}
+
 /// Identifier for a collection.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct CollectionId(pub Uuid);
@@ -572,7 +591,7 @@ pub struct MaintenanceStatus {
 /// One physical artifact that backs a queryable unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryUnitArtifactStats {
-    /// Stable artifact role such as raw segment, flat exact sidecar, or ann graph.
+    /// Stable artifact role, such as `segment` or `mutable_delta`.
     pub kind: String,
     /// Operator-visible file name when the artifact is persisted on disk.
     pub file_name: String,
