@@ -168,6 +168,67 @@ fn charges_every_entry_against_its_class() {
 }
 
 #[test]
+fn resident_lookups_hit_without_loading() {
+    let cache = cache(1 << 20);
+    let file = FileId::next();
+    assert!(cache.get_resident(&key(file, 0)).is_none());
+    assert_eq!(
+        cache.stats().misses,
+        0,
+        "a resident-only miss counts nothing"
+    );
+    insert(&cache, key(file, 0), ArtifactClass::ScalarColumns);
+    let pinned = cache.get_resident(&key(file, 0)).expect("resident");
+    assert_eq!(pinned.len(), UNIT);
+    assert_eq!(cache.stats().hits, 1);
+    assert_consistent(&cache);
+}
+
+#[test]
+fn decoded_forms_attached_on_first_use_are_charged_once() {
+    let cache = cache(1 << 20);
+    let file = FileId::next();
+    insert(&cache, key(file, 0), ArtifactClass::ScalarColumns);
+    let before = cache.stats().used_by(ArtifactClass::ScalarColumns);
+    let bytes = hit(&cache, key(file, 0), ArtifactClass::ScalarColumns);
+    let decoded = bytes
+        .decoded(|raw| Ok::<_, ()>((raw.len(), 4_096)))
+        .expect("decodes");
+    assert_eq!(*decoded, UNIT);
+    cache.charge_decoded(&key(file, 0));
+    cache.charge_decoded(&key(file, 0));
+    assert_eq!(
+        cache.stats().used_by(ArtifactClass::ScalarColumns),
+        before + 4_096,
+        "charged once"
+    );
+    assert_consistent(&cache);
+    drop(bytes);
+    cache.set_budget(0);
+    assert_eq!(cache.used(), 0, "eviction returns the decoded charge too");
+    assert_consistent(&cache);
+}
+
+#[test]
+fn a_late_decoded_charge_evicts_over_budget() {
+    let cache = cache(budget_for(2) + 100);
+    let file = FileId::next();
+    insert(&cache, key(file, 0), ArtifactClass::DynamicJson);
+    insert(&cache, key(file, 1), ArtifactClass::DynamicJson);
+    let bytes = hit(&cache, key(file, 1), ArtifactClass::DynamicJson);
+    bytes
+        .decoded(|raw| Ok::<_, ()>((raw.len(), 1_000)))
+        .expect("decodes");
+    cache.charge_decoded(&key(file, 1));
+    assert!(
+        cache.used() <= cache.budget(),
+        "the unpinned entry is evicted"
+    );
+    assert!(cache.residency(&key(file, 1)), "the pinned one stays");
+    assert_consistent(&cache);
+}
+
+#[test]
 fn evicts_down_to_the_budget() {
     let cache = cache(budget_for(4));
     let file = FileId::next();
@@ -1066,8 +1127,17 @@ fn assert_consistent(cache: &BufferCache) {
     for shard in inner.shards.iter() {
         for (key, entry) in &super::lock(shard).entries {
             assert_eq!(*key, entry.key);
-            assert_eq!(entry.charge, charge_for(entry.bytes.len()));
-            charges[entry.class.index()] += entry.charge;
+            let charge = entry.charge.load(std::sync::atomic::Ordering::Relaxed);
+            let decoded = if entry
+                .decoded_charged
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                entry.bytes.decoded_heap_bytes()
+            } else {
+                0
+            };
+            assert_eq!(charge, charge_for(entry.bytes.len()) + decoded);
+            charges[entry.class.index()] += charge;
             resident.insert(*key, entry.class);
         }
     }

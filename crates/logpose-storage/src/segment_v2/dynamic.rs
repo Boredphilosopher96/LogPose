@@ -24,7 +24,7 @@ use super::{
 use crate::segment_v2::column::VarBuf;
 use logpose_types::value::codec;
 use serde_json::{Map, Value as JsonValue};
-use std::ops::Range;
+use std::{ops::Range, sync::OnceLock};
 
 pub(crate) const DYNAMIC_ENCODING_BLOCKS: u16 = 1;
 /// Rows per `DynamicJson` block.
@@ -233,6 +233,9 @@ pub struct DynamicBlock {
     first_row: u32,
     offsets: Vec<u32>,
     bytes: Vec<u8>,
+    /// Every key any row of the block has, sorted, computed on first use; `None` inside when a
+    /// row does not parse (then no key can be ruled out).
+    keys: OnceLock<Option<Box<[Box<str>]>>>,
 }
 
 impl DynamicBlock {
@@ -247,7 +250,55 @@ impl DynamicBlock {
             first_row: rows.start,
             offsets,
             bytes: data,
+            keys: OnceLock::new(),
         })
+    }
+
+    /// Whether some row of the block may have the top-level key `key`: `false` only when no
+    /// row has it, so a filter on the key can skip the block's rows. The block's key set is
+    /// read once, from the key names only (values are skipped, not decoded).
+    #[must_use]
+    pub fn may_have_key(&self, key: &str) -> bool {
+        let keys = self.keys.get_or_init(|| {
+            let mut keys = std::collections::BTreeSet::new();
+            for index in 0..self.offsets.len().saturating_sub(1) {
+                let bytes = range_at(&self.offsets, index).and_then(|r| self.bytes.get(r))?;
+                if bytes.is_empty() {
+                    continue;
+                }
+                for name in codec::json_object_keys(bytes).ok()? {
+                    if !keys.contains(name) {
+                        keys.insert(Box::<str>::from(name));
+                    }
+                }
+            }
+            Some(keys.into_iter().collect())
+        });
+        keys.as_ref()
+            .is_none_or(|keys| keys.binary_search_by(|name| (**name).cmp(key)).is_ok())
+    }
+
+    /// The value of `row`'s top-level key `key`, `None` when the row has no such key (or no
+    /// dynamic object), decoding only that member.
+    ///
+    /// # Errors
+    ///
+    /// `Malformed` for a row outside the block or bytes that do not parse.
+    pub(crate) fn member(&self, row: u32, key: &str) -> DecodeResult<Option<JsonValue>> {
+        if !self.rows().contains(&row) {
+            return Err(Malformed::new(format!("row {row} is not in this block")));
+        }
+        let Some(bytes) = self.raw(row) else {
+            return Ok(None);
+        };
+        codec::decode_json_member(bytes, key)
+            .map_err(|error| Malformed::new(format!("dynamic value: {error}")))
+    }
+
+    /// Heap bytes the decoded block holds, which the buffer cache charges beside its bytes.
+    #[must_use]
+    pub fn heap_bytes(&self) -> u64 {
+        (self.offsets.capacity() * 4 + self.bytes.capacity()) as u64
     }
 
     /// Rows covered by this block.

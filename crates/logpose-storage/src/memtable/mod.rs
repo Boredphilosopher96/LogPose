@@ -400,6 +400,13 @@ impl MemtableData {
     }
 
     /// The `$extra` object stored at `slot` (before shadowing), or `None`.
+    /// The encoded `$extra` object of `slot`, if it has one.
+    pub(crate) fn dynamic_raw(&self, slot: RowId) -> Option<&[u8]> {
+        self.dynamic
+            .get(slot as usize)
+            .and_then(|bytes| bytes.as_deref())
+    }
+
     pub(crate) fn dynamic_object(
         &self,
         slot: RowId,

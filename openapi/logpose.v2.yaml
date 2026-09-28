@@ -1709,12 +1709,10 @@ components:
       enum: [none, plan, profile]
     QueryPlanKind:
       type: string
-      description: "The plan a query used, summarized over its units: `unfiltered_exact_scan` and `predicate_first_exact` when every unit was scanned exactly (without and with a filter), `vector_first_ann` when segments walked their graphs, `cooperative_filtered_ann` when they walked them under a filter (ACORN-1 style or admit-only), `hybrid_exact_ann_merge` when graph walks merged with memtable scans, and `ordered_scan` for a query without a vector. `vector_first_exact` and `tiny_population_exact_fallback` are no longer produced."
+      description: "The plan a query used, summarized over its units: `unfiltered_exact_scan` and `predicate_first_exact` when every unit was scanned exactly (without and with a filter), `vector_first_ann` when segments walked their graphs, `cooperative_filtered_ann` when they walked them under a filter (ACORN-1 style or admit-only), `hybrid_exact_ann_merge` when graph walks merged with memtable scans, and `ordered_scan` for a query without a vector. `plan` holds the full operator tree."
       enum:
         - unfiltered_exact_scan
         - predicate_first_exact
-        - vector_first_exact
-        - tiny_population_exact_fallback
         - vector_first_ann
         - cooperative_filtered_ann
         - hybrid_exact_ann_merge
@@ -1865,6 +1863,13 @@ components:
             - type: integer
               minimum: 1
               maximum: 4096
+        rerank_factor:
+          description: Candidates per result each segment reranks exactly in f32, 1 to 64, with a vector only. Defaults to 4. Higher values trade latency for recall.
+          oneOf:
+            - type: "null"
+            - type: integer
+              minimum: 1
+              maximum: 64
         explain:
           $ref: "#/components/schemas/ExplainMode"
         snapshot:
@@ -1917,6 +1922,64 @@ components:
           type: integer
         merge_micros:
           type: integer
+    PlanOperator:
+      type: string
+      description: "An operator of a query plan: `segment_source` (a segment or memtable and its residency), `bitmap_probe` (the filter compiled to the unit's bitmap, with the exact cardinality), `mask_deletes` (deleted rows removed), `exact_scan` (every allowed row scored over SQ8 codes or in f32), `graph_scan` (a graph walk, admit-only or ACORN-1 style), `top_k` (the best candidates by distance), `rerank` (exact f32 scores of approximate candidates), `merge` (the global heap merge), `ordered_scan` (rows in a field's or the key's order, without a vector), and `project` (the final rows read)."
+      enum:
+        - segment_source
+        - bitmap_probe
+        - mask_deletes
+        - exact_scan
+        - graph_scan
+        - top_k
+        - rerank
+        - merge
+        - ordered_scan
+        - project
+    PlanOperatorStats:
+      type: object
+      description: Work of one plan operator, estimated by the planner's cost model or counted by execution.
+      required: [rows, distances, hops, resident_bytes, cold_bytes, micros]
+      properties:
+        rows:
+          type: integer
+          description: Rows the operator produces.
+        distances:
+          type: integer
+          description: Distance computations (SQ8 or f32).
+        hops:
+          type: integer
+          description: Graph adjacency lists read.
+        resident_bytes:
+          type: integer
+          description: Bytes read from resident sections.
+        cold_bytes:
+          type: integer
+          description: Bytes read from disk through the buffer cache.
+        micros:
+          type: number
+          description: "Estimated: the cost model's price. Actual: measured time in profile mode, 0 otherwise."
+    PlanNode:
+      type: object
+      description: One operator of a query plan and its inputs.
+      required: [operator, detail, estimated, actual]
+      properties:
+        operator:
+          $ref: "#/components/schemas/PlanOperator"
+        detail:
+          type: string
+          description: The operator's parameters, such as `unit=0000002a` or `acorn ef=64->128`.
+        reason:
+          type: string
+          description: Why the planner chose this operator, for per-unit strategies.
+        estimated:
+          $ref: "#/components/schemas/PlanOperatorStats"
+        actual:
+          $ref: "#/components/schemas/PlanOperatorStats"
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanNode"
     QueryDiagnostics:
       type: object
       required:
@@ -1967,6 +2030,12 @@ components:
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/QueryStageTimings"
+        plan:
+          description: The plan as an operator tree with estimated and actual work per operator.
+          $ref: "#/components/schemas/PlanNode"
+        plan_text:
+          type: string
+          description: The plan rendered as text, one operator per line.
     QueryResponse:
       type: object
       required: [top_k, returned, snapshot, hits]

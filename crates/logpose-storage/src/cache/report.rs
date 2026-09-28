@@ -105,6 +105,11 @@ impl PinSet {
         self.pins.insert(key, bytes);
     }
 
+    /// Add every pin of `other`.
+    pub fn extend(&mut self, other: PinSet) {
+        self.pins.extend(other.pins);
+    }
+
     /// The pinned bytes of `key`.
     #[must_use]
     pub fn get(&self, key: &CacheKey) -> Option<&Arc<AlignedBytes>> {

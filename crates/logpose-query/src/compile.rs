@@ -49,6 +49,7 @@ use logpose_storage::{
     SectionNeed, UnitView,
     cache::PinSet,
     read::{ScalarKey, value_index_keys},
+    segment_v2::DYNAMIC_BLOCK_ROWS,
 };
 use logpose_types::{
     LogPoseError, ScalarMetadataValue,
@@ -117,6 +118,19 @@ impl Cond {
         }
     }
 
+    /// The condition's name in `EXPLAIN`.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::IsNull => "is_null",
+            Self::Exists => "exists",
+            Self::AnyOf(keys) if keys.len() == 1 => "eq",
+            Self::AnyOf(_) => "in",
+            Self::NoneOf(keys) if keys.len() == 1 => "ne",
+            Self::NoneOf(_) => "not_in",
+            Self::Range(..) => "range",
+        }
+    }
+
     /// Whether an index can answer the condition: any index for everything but ranges,
     /// which need a sorted one.
     fn needs_sorted(&self) -> bool {
@@ -158,6 +172,21 @@ enum JsonCond {
     /// `(operator, operand)` pairs that must all hold, the operator one of `gt`, `gte`, `lt`,
     /// `lte`.
     Range(Vec<(&'static str, ScalarMetadataValue)>),
+}
+
+impl JsonCond {
+    /// The condition's name in `EXPLAIN`.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Exists => "exists",
+            Self::IsNull => "is_null",
+            Self::AnyOf(values) if values.len() == 1 => "eq",
+            Self::AnyOf(_) => "in",
+            Self::NoneOf(values) if values.len() == 1 => "ne",
+            Self::NoneOf(_) => "not_in",
+            Self::Range(_) => "range",
+        }
+    }
 }
 
 trait BoundsExt {
@@ -234,6 +263,14 @@ impl CompiledFilter {
     ) -> logpose_types::Result<RoaringBitmap> {
         let live = unit.live();
         Evaluator { unit, pins }.eval(&self.root, &live)
+    }
+
+    /// A one-line description of the filter as `unit` evaluates it: each comparison with the
+    /// field and the access path (`index`, `sorted index`, `column`, `$extra`, or `key`), for
+    /// `EXPLAIN`.
+    #[must_use]
+    pub fn describe(&self, unit: &UnitView<'_>) -> String {
+        describe(&self.root, unit, &self.schema)
     }
 
     /// Whether one row satisfies the filter: the reference semantics the per-unit evaluation
@@ -626,6 +663,45 @@ fn json_kind(json: &JsonValue) -> &'static str {
     }
 }
 
+fn describe(node: &Node, unit: &UnitView<'_>, schema: &CollectionSchema) -> String {
+    let list = |children: &[Node]| {
+        children
+            .iter()
+            .map(|child| describe(child, unit, schema))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let field_name = |field: FieldId| {
+        schema
+            .field_by_id(field)
+            .map_or_else(|| field.to_string(), |field| field.name().to_owned())
+    };
+    match node {
+        Node::And(children) => format!("and({})", list(children)),
+        Node::Or(children) => format!("or({})", list(children)),
+        Node::Not(child) => format!("not({})", describe(child, unit, schema)),
+        Node::Typed { field, cond } => {
+            let path = if cond.is_empty_range() {
+                "nothing"
+            } else if unit.has_scalar_index(*field, true) {
+                "sorted index"
+            } else if !cond.needs_sorted() && unit.has_scalar_index(*field, false) {
+                "index"
+            } else {
+                "column"
+            };
+            format!("{} {} via {path}", cond.name(), field_name(*field))
+        }
+        Node::Json { target, cond } => match target {
+            JsonTarget::Dynamic(name) => format!("{} $extra.{name} via $extra", cond.name()),
+            JsonTarget::Field(field) => {
+                format!("{} {} via column", cond.name(), field_name(*field))
+            }
+        },
+        Node::Key(cond) => format!("{} key via key column", cond.name()),
+    }
+}
+
 fn collect_needs(node: &Node, unit: &UnitView<'_>, needs: &mut Vec<SectionNeed>) {
     match node {
         Node::And(children) | Node::Or(children) => {
@@ -776,11 +852,23 @@ impl Evaluator<'_, '_> {
                             }
                             return Ok(rows);
                         }
+                        // A row without the key never matches, so a block none of whose
+                        // rows has it is skipped whole; otherwise only the key's member of
+                        // each row is decoded.
                         let dynamic = self.unit.dynamic(self.pins)?;
+                        let mut block = None;
+                        let mut skip = false;
                         for row in domain {
-                            let object = dynamic.object(row)?;
-                            let value = object.as_ref().and_then(|object| object.get(name));
-                            if json_matches(value, cond) {
+                            let row_block = row / DYNAMIC_BLOCK_ROWS;
+                            if block != Some(row_block) {
+                                block = Some(row_block);
+                                skip = !dynamic.block_may_have(row, name)?;
+                            }
+                            if skip {
+                                continue;
+                            }
+                            let value = dynamic.member(row, name)?;
+                            if json_matches(value.as_ref(), cond) {
                                 rows.insert(row);
                             }
                         }

@@ -754,6 +754,8 @@ impl GrpcLogPoseService {
                     top_k: usize::try_from(request.top_k).unwrap_or(usize::MAX),
                     output_fields: request.output_fields,
                     ef: (request.ef != 0).then_some(request.ef as usize),
+                    rerank_factor: (request.rerank_factor != 0)
+                        .then_some(request.rerank_factor as usize),
                     explain: explain_mode_from_proto(request.explain)?,
                     read: ReadConsistency {
                         snapshot: request.snapshot.map(snapshot_from_proto),
@@ -921,17 +923,47 @@ fn query_diagnostics_to_proto(
             .map(|(key, value)| (key, value as u64))
             .collect(),
         stage_timings: diagnostics.stage_timings.map(query_stage_timings_to_proto),
+        plan: diagnostics.plan.map(|plan| plan_node_to_proto(*plan)),
+        plan_text: diagnostics.plan_text,
     })
+}
+
+fn plan_node_to_proto(node: logpose_query::PlanNode) -> proto::PlanNode {
+    use logpose_query::Operator;
+    let operator = match node.operator {
+        Operator::SegmentSource => proto::PlanOperator::SegmentSource,
+        Operator::BitmapProbe => proto::PlanOperator::BitmapProbe,
+        Operator::MaskDeletes => proto::PlanOperator::MaskDeletes,
+        Operator::ExactScan => proto::PlanOperator::ExactScan,
+        Operator::GraphScan => proto::PlanOperator::GraphScan,
+        Operator::TopK => proto::PlanOperator::TopK,
+        Operator::Rerank => proto::PlanOperator::Rerank,
+        Operator::Merge => proto::PlanOperator::Merge,
+        Operator::OrderedScan => proto::PlanOperator::OrderedScan,
+        Operator::Project => proto::PlanOperator::Project,
+    };
+    let stats = |stats: logpose_query::OperatorStats| proto::PlanOperatorStats {
+        rows: stats.rows,
+        distances: stats.distances,
+        hops: stats.hops,
+        resident_bytes: stats.resident_bytes,
+        cold_bytes: stats.cold_bytes,
+        micros: stats.micros,
+    };
+    proto::PlanNode {
+        operator: operator as i32,
+        detail: node.detail,
+        reason: node.reason.unwrap_or_default(),
+        estimated: Some(stats(node.estimated)),
+        actual: Some(stats(node.actual)),
+        children: node.children.into_iter().map(plan_node_to_proto).collect(),
+    }
 }
 
 fn query_plan_kind_to_proto(plan: QueryPlanKind) -> proto::QueryPlanKind {
     match plan {
         QueryPlanKind::UnfilteredExactScan => proto::QueryPlanKind::UnfilteredExactScan,
         QueryPlanKind::PredicateFirstExact => proto::QueryPlanKind::PredicateFirstExact,
-        QueryPlanKind::VectorFirstExact => proto::QueryPlanKind::VectorFirstExact,
-        QueryPlanKind::TinyPopulationExactFallback => {
-            proto::QueryPlanKind::TinyPopulationExactFallback
-        }
         QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
         QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
         QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,
@@ -1193,9 +1225,38 @@ mod tests {
                 rerank_micros: 55,
                 merge_micros: 66,
             }),
+            plan: Some(Box::new(
+                logpose_query::PlanNode::new(logpose_query::Operator::Merge, "units=1").over(
+                    logpose_query::PlanNode::new(logpose_query::Operator::GraphScan, "acorn")
+                        .with_reason("cheapest")
+                        .with_stats(
+                            logpose_query::OperatorStats {
+                                distances: 900,
+                                ..logpose_query::OperatorStats::default()
+                            },
+                            logpose_query::OperatorStats {
+                                distances: 950,
+                                micros: 12.5,
+                                ..logpose_query::OperatorStats::default()
+                            },
+                        ),
+                ),
+            )),
+            plan_text: "Merge units=1".to_owned(),
         };
 
         let proto = query_diagnostics_to_proto(diagnostics).expect("conversion should succeed");
+        let plan = proto.plan.as_ref().expect("plan");
+        assert_eq!(plan.operator, proto::PlanOperator::Merge as i32);
+        let walk = &plan.children[0];
+        assert_eq!(walk.operator, proto::PlanOperator::GraphScan as i32);
+        assert_eq!(walk.reason, "cheapest");
+        assert_eq!(
+            walk.estimated.as_ref().map(|stats| stats.distances),
+            Some(900)
+        );
+        assert_eq!(walk.actual.as_ref().map(|stats| stats.micros), Some(12.5));
+        assert_eq!(proto.plan_text, "Merge units=1");
         assert_eq!(
             proto::QueryPlanKind::try_from(proto.chosen_plan).expect("plan should decode"),
             proto::QueryPlanKind::CooperativeFilteredAnn

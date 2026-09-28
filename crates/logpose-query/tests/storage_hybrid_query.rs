@@ -1,5 +1,5 @@
 //! Storage-backed queries whose segments carry graphs and SQ8 codes: the per-unit strategy
-//! the staged planner picks, and results equal to an exact scan.
+//! the cost model picks, and results equal to an exact scan.
 
 use async_trait as _;
 use criterion as _;
@@ -24,9 +24,9 @@ use std::{
 };
 use thiserror as _;
 
-/// Rows per test collection: above the exact-scan limit of the default tuning (2,048), so a
-/// segment with a graph walks it.
-const ROWS: usize = 3_000;
+/// Rows per test collection: enough that an unfiltered walk costs less than an exact scan of
+/// the segment, while an exact scan of a quarter of it still costs less than a walk.
+const ROWS: usize = 20_000;
 const DIMS: usize = 16;
 
 /// A deterministic unit-variance vector for `seed`.
@@ -149,7 +149,8 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
         .await
         .expect("flush should succeed");
 
-    // 750 `keep` rows are within the exact-scan limit: an exact scan over SQ8 codes.
+    // 5,000 `keep` rows: an exact scan over SQ8 codes costs less than a walk admitting a
+    // quarter of the rows it visits.
     let selective = query(
         &engine,
         request("documents", 5, Some(FilterExpr::eq("kind", "keep"))),
@@ -162,9 +163,22 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
     let diagnostics = selective.diagnostics.expect("diagnostics");
     assert_eq!(diagnostics.chosen_plan, QueryPlanKind::PredicateFirstExact);
     assert_eq!(diagnostics.unit_scan_mix.get("exact_sq8"), Some(&1));
-    assert_eq!(diagnostics.candidates_after_filter, 750);
+    assert_eq!(diagnostics.candidates_after_filter, 5_000);
+    let plan = diagnostics.plan.expect("plan");
+    let scan = plan
+        .walk()
+        .into_iter()
+        .find(|node| node.operator == logpose_query::Operator::ExactScan)
+        .expect("an exact scan");
+    assert!(
+        scan.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cheapest")),
+        "{:?}",
+        scan.reason
+    );
 
-    // 2,250 rows that are not `keep` exceed it: an admit-only walk (selectivity 0.75).
+    // 15,000 rows that are not `keep`: an admit-only walk (selectivity 0.75).
     let broad = query(
         &engine,
         request("documents", 5, Some(FilterExpr::ne("kind", "keep"))),

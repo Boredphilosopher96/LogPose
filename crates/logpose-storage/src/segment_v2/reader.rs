@@ -214,6 +214,22 @@ impl<S> SegmentReader<S> {
             .as_ref()
             .is_some_and(|link| link.cache.residency(&unit.key(link.file)))
     }
+
+    /// The bytes of `unit` if they are resident in the attached cache, counted as a hit;
+    /// never loads (see [`BufferCache::get_resident`](crate::cache::BufferCache::get_resident)).
+    #[must_use]
+    pub fn resident(&self, unit: &SegmentUnit) -> Option<Arc<AlignedBytes>> {
+        let link = self.cache.as_ref()?;
+        link.cache.get_resident(&unit.key(link.file))
+    }
+
+    /// Charge the decoded form attached to `unit`'s cached bytes on first use (see
+    /// [`BufferCache::charge_decoded`](crate::cache::BufferCache::charge_decoded)).
+    pub fn charge_decoded(&self, unit: &SegmentUnit) {
+        if let Some(link) = &self.cache {
+            link.cache.charge_decoded(&unit.key(link.file));
+        }
+    }
 }
 
 impl<S: SectionSource> SegmentReader<S> {

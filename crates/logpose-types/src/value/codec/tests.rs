@@ -527,3 +527,35 @@ fn mutated_bytes_never_panic_and_accepted_bytes_are_canonical() {
         }
     }
 }
+
+/// Looking up one member agrees with decoding the whole object, for present, absent, first,
+/// and last keys, with nested values skipped on the way.
+#[test]
+fn member_lookup_agrees_with_full_decoding() {
+    let mut rng = Rng(0x5eed_0004);
+    for case in 0..2_000 {
+        let JsonValue::Object(object) = canonical_json(json!({
+            "a": rng.json(3),
+            "m": rng.json(3),
+            "nested": { "x": [1, {"y": "z"}], "w": 2.5 },
+            "z": rng.json(2),
+        })) else {
+            unreachable!("an object literal")
+        };
+        let bytes = encode_json(&JsonValue::Object(object.clone())).expect("json should encode");
+        for key in ["a", "m", "nested", "z", "", "b", "zz", "n"] {
+            assert_eq!(
+                decode_json_member(&bytes, key).expect("member lookup"),
+                object.get(key).cloned(),
+                "case {case} key {key}"
+            );
+        }
+        assert_eq!(
+            json_object_keys(&bytes).expect("keys"),
+            ["a", "m", "nested", "z"],
+            "case {case}"
+        );
+    }
+    let array = encode_json(&json!([1])).expect("json should encode");
+    assert!(decode_json_member(&array, "a").is_err());
+}

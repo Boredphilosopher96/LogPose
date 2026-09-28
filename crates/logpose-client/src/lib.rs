@@ -41,9 +41,10 @@ use logpose_config as _;
 #[cfg(test)]
 use logpose_core as _;
 pub use logpose_query::{
-    CountRecordsRequest, CountRecordsResponse, ExplainMode, FilterExpr, OrderBy, QueryDiagnostics,
-    QueryHit, QueryPlanKind, QueryRequest, QueryResponse, QueryStageTimings, RangeBounds,
-    ReadConsistency, ScrollRecordsRequest, ScrollRecordsResponse, SortDirection, VectorQuery,
+    CountRecordsRequest, CountRecordsResponse, ExplainMode, FilterExpr, Operator, OperatorStats,
+    OrderBy, PlanNode, QueryDiagnostics, QueryHit, QueryPlanKind, QueryRequest, QueryResponse,
+    QueryStageTimings, RangeBounds, ReadConsistency, ScrollRecordsRequest, ScrollRecordsResponse,
+    SortDirection, VectorQuery,
 };
 pub use logpose_storage::{CreateCollectionRequest, InspectReport, InspectTarget};
 use logpose_types::{
@@ -771,6 +772,9 @@ impl LogPoseClient {
                     ef: request
                         .ef
                         .map_or(0, |ef| u32::try_from(ef).unwrap_or(u32::MAX)),
+                    rerank_factor: request
+                        .rerank_factor
+                        .map_or(0, |factor| u32::try_from(factor).unwrap_or(u32::MAX)),
                     explain: explain_mode_to_proto(request.explain) as i32,
                     snapshot: read.snapshot.map(snapshot_to_proto),
                     read_barrier: read.read_barrier.map(snapshot_to_proto),
@@ -1153,6 +1157,56 @@ fn query_diagnostics_from_proto(diagnostics: proto::QueryDiagnostics) -> Result<
         stage_timings: diagnostics
             .stage_timings
             .map(query_stage_timings_from_proto),
+        plan: diagnostics
+            .plan
+            .map(plan_node_from_proto)
+            .transpose()?
+            .map(Box::new),
+        plan_text: diagnostics.plan_text,
+    })
+}
+
+fn plan_node_from_proto(node: proto::PlanNode) -> Result<PlanNode> {
+    let operator = match proto::PlanOperator::try_from(node.operator).map_err(|_| {
+        ClientError::InvalidResponse(format!("unknown plan operator '{}'", node.operator))
+    })? {
+        proto::PlanOperator::Unspecified => {
+            return Err(ClientError::InvalidResponse(
+                "plan operator must be set".to_owned(),
+            ));
+        }
+        proto::PlanOperator::SegmentSource => Operator::SegmentSource,
+        proto::PlanOperator::BitmapProbe => Operator::BitmapProbe,
+        proto::PlanOperator::MaskDeletes => Operator::MaskDeletes,
+        proto::PlanOperator::ExactScan => Operator::ExactScan,
+        proto::PlanOperator::GraphScan => Operator::GraphScan,
+        proto::PlanOperator::TopK => Operator::TopK,
+        proto::PlanOperator::Rerank => Operator::Rerank,
+        proto::PlanOperator::Merge => Operator::Merge,
+        proto::PlanOperator::OrderedScan => Operator::OrderedScan,
+        proto::PlanOperator::Project => Operator::Project,
+    };
+    let stats = |stats: Option<proto::PlanOperatorStats>| {
+        stats.map_or_else(OperatorStats::default, |stats| OperatorStats {
+            rows: stats.rows,
+            distances: stats.distances,
+            hops: stats.hops,
+            resident_bytes: stats.resident_bytes,
+            cold_bytes: stats.cold_bytes,
+            micros: stats.micros,
+        })
+    };
+    Ok(PlanNode {
+        operator,
+        detail: node.detail,
+        reason: (!node.reason.is_empty()).then_some(node.reason),
+        estimated: stats(node.estimated),
+        actual: stats(node.actual),
+        children: node
+            .children
+            .into_iter()
+            .map(plan_node_from_proto)
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -1165,10 +1219,6 @@ fn query_plan_kind_from_proto(kind: i32) -> Result<QueryPlanKind> {
         )),
         proto::QueryPlanKind::UnfilteredExactScan => Ok(QueryPlanKind::UnfilteredExactScan),
         proto::QueryPlanKind::PredicateFirstExact => Ok(QueryPlanKind::PredicateFirstExact),
-        proto::QueryPlanKind::VectorFirstExact => Ok(QueryPlanKind::VectorFirstExact),
-        proto::QueryPlanKind::TinyPopulationExactFallback => {
-            Ok(QueryPlanKind::TinyPopulationExactFallback)
-        }
         proto::QueryPlanKind::VectorFirstAnn => Ok(QueryPlanKind::VectorFirstAnn),
         proto::QueryPlanKind::CooperativeFilteredAnn => Ok(QueryPlanKind::CooperativeFilteredAnn),
         proto::QueryPlanKind::HybridExactAnnMerge => Ok(QueryPlanKind::HybridExactAnnMerge),
@@ -1339,6 +1389,23 @@ mod tests {
                 rerank_micros: 55,
                 merge_micros: 66,
             }),
+            plan: Some(proto::PlanNode {
+                operator: proto::PlanOperator::Project as i32,
+                detail: "k=1".to_owned(),
+                reason: String::new(),
+                estimated: Some(proto::PlanOperatorStats {
+                    rows: 1,
+                    ..proto::PlanOperatorStats::default()
+                }),
+                actual: None,
+                children: vec![proto::PlanNode {
+                    operator: proto::PlanOperator::ExactScan as i32,
+                    detail: "sq8".to_owned(),
+                    reason: "cheapest".to_owned(),
+                    ..proto::PlanNode::default()
+                }],
+            }),
+            plan_text: "Project k=1".to_owned(),
         })
         .expect("conversion should succeed");
 
@@ -1371,6 +1438,12 @@ mod tests {
                     rerank_micros: 55,
                     merge_micros: 66,
                 }),
+                plan: Some(Box::new(
+                    PlanNode::new(Operator::Project, "k=1")
+                        .with_stats(OperatorStats::rows(1), OperatorStats::default())
+                        .over(PlanNode::new(Operator::ExactScan, "sq8").with_reason("cheapest")),
+                )),
+                plan_text: "Project k=1".to_owned(),
             }
         );
     }

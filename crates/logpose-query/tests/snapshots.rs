@@ -437,7 +437,7 @@ async fn corrupted_index_sections_are_typed_index_corruption() {
                 &view,
                 &SearchRequest {
                     tuning: logpose_query::SearchTuning {
-                        exact_max_matches: 0,
+                        force: logpose_query::Force::Walk,
                         ..logpose_query::SearchTuning::default()
                     },
                     ..SearchRequest::new(rng.vector(8), 5)

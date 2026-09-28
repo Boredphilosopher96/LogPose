@@ -592,6 +592,7 @@ async fn query_collection(
                 top_k: body.top_k,
                 output_fields: body.output_fields,
                 ef: body.ef,
+                rerank_factor: body.rerank_factor,
                 explain: body.explain,
                 read: ReadConsistency {
                     snapshot: body.snapshot,
@@ -860,6 +861,8 @@ struct QueryCollectionBody {
     #[serde(default)]
     ef: Option<usize>,
     #[serde(default)]
+    rerank_factor: Option<usize>,
+    #[serde(default)]
     explain: ExplainMode,
     #[serde(default)]
     snapshot: Option<Snapshot>,
@@ -1047,6 +1050,16 @@ mod tests {
                     rerank_micros: 55,
                     merge_micros: 66,
                 }),
+                plan: Some(Box::new(
+                    logpose_query::PlanNode::new(logpose_query::Operator::Project, "k=1").over(
+                        logpose_query::PlanNode::new(
+                            logpose_query::Operator::GraphScan,
+                            "unit=00000001 acorn ef=64",
+                        )
+                        .with_reason("cheapest"),
+                    ),
+                )),
+                plan_text: "Project k=1".to_owned(),
             }),
             snapshot_token: None,
         }
@@ -1100,6 +1113,16 @@ mod tests {
         );
         assert_eq!(payload["diagnostics"]["stage_timings"]["rerank_micros"], 55);
         assert_eq!(payload["diagnostics"]["stage_timings"]["merge_micros"], 66);
+        assert_eq!(payload["diagnostics"]["plan"]["operator"], "project");
+        assert_eq!(
+            payload["diagnostics"]["plan"]["children"][0]["operator"],
+            "graph_scan"
+        );
+        assert_eq!(
+            payload["diagnostics"]["plan"]["children"][0]["reason"],
+            "cheapest"
+        );
+        assert_eq!(payload["diagnostics"]["plan_text"], "Project k=1");
     }
 
     #[test]
@@ -3083,6 +3106,13 @@ mod tests {
                 "profile mode should include {stage}"
             );
         }
+        // The plan tree: Project over Merge over the memtable's exact scan and filter.
+        assert_eq!(diagnostics["plan"]["operator"], "project");
+        assert_eq!(diagnostics["plan"]["children"][0]["operator"], "merge");
+        let text = diagnostics["plan_text"].as_str().expect("plan text");
+        assert!(text.starts_with("Project k=1"), "{text}");
+        assert!(text.contains("ExactScan"), "{text}");
+        assert!(text.contains("BitmapProbe eq kind via"), "{text}");
     }
 
     #[tokio::test]
