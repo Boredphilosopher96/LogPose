@@ -374,28 +374,27 @@ impl EtcdCatalogStore {
                 "the default database cannot be dropped",
             ));
         }
-        if let Some(stored) = self
-            .etcd
-            .list_descriptors()
-            .await?
-            .into_iter()
-            .find(|stored| stored.descriptor.database_name == database_name)
-        {
-            return Err(LogPoseError::failed_precondition(format!(
-                "database '{database_name}' still holds collection '{}'; drop its collections first",
-                stored.descriptor.name
-            )));
-        }
+        self.ensure_database_has_no_collections(database_name)
+            .await?;
         let descriptor_key = self.etcd.database_descriptor_key(database_name);
         let policy_key = self.etcd.database_policy_key(database_name);
         let leadership_key = self.etcd.leadership_key();
         let leadership_value = self
             .etcd
             .leadership_value(leader_node_id, leader_lease_id)?;
+        // The emptiness check above is only advisory: a collection created after it would be
+        // left in a dropped database. The range compare makes the delete itself fail while any
+        // collection key exists below the database.
         let txn = Txn::new()
             .when([
                 Compare::value(leadership_key, CompareOp::Equal, leadership_value),
                 Compare::version(descriptor_key.clone(), CompareOp::Greater, 0),
+                Compare::version(
+                    self.etcd.database_collections_prefix(database_name),
+                    CompareOp::Equal,
+                    0,
+                )
+                .with_prefix(),
             ])
             .and_then([
                 TxnOp::delete(policy_key, Some(DeleteOptions::new())),
@@ -406,12 +405,45 @@ impl EtcdCatalogStore {
         if response.succeeded() {
             return Ok(());
         }
-        // Tell a missing database from a lost leadership.
+        // Tell a missing database, or a collection created concurrently, from a lost
+        // leadership.
         self.get_database(database_name).await?;
+        self.ensure_database_has_no_collections(database_name)
+            .await?;
         Err(LogPoseError::NotLeader {
             node: leader_node_id.to_owned(),
             leader_node: None,
         })
+    }
+
+    /// Fail with `FAILED_PRECONDITION` when any collection metadata key (descriptor,
+    /// assignment, or owner, pending or ready) exists in `database_name`.
+    async fn ensure_database_has_no_collections(&self, database_name: &str) -> Result<()> {
+        let prefix = self.etcd.database_collections_prefix(database_name);
+        let mut client = self.etcd.client().await?;
+        let response = client
+            .get(
+                prefix.clone(),
+                Some(
+                    GetOptions::new()
+                        .with_prefix()
+                        .with_keys_only()
+                        .with_limit(1),
+                ),
+            )
+            .await
+            .map_err(etcd_message)?;
+        let Some(kv) = response.kvs().first() else {
+            return Ok(());
+        };
+        let collection = String::from_utf8_lossy(kv.key())
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default()
+            .to_owned();
+        Err(LogPoseError::failed_precondition(format!(
+            "database '{database_name}' still holds collection '{collection}'; drop its collections first"
+        )))
     }
 }
 
@@ -774,6 +806,11 @@ impl EtcdPlacementStore {
             "{}/clusters/{}/collections/{collection_name}/assignment",
             self.key_prefix, self.cluster_name
         )
+    }
+
+    /// The prefix of every metadata key of the collections in `database_name`.
+    fn database_collections_prefix(&self, database_name: &str) -> String {
+        format!("{}{database_name}/", self.collections_prefix())
     }
 
     fn descriptor_key(&self, collection_name: &str) -> String {

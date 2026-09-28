@@ -198,6 +198,71 @@ async fn etcd_schema_changes_reach_the_catalog_other_nodes_describe() {
 }
 
 #[tokio::test]
+async fn etcd_drop_database_refuses_while_any_collection_metadata_remains() {
+    let Some(endpoints) =
+        etcd_endpoints_or_skip("etcd_drop_database_refuses_while_any_collection_metadata_remains")
+            .await
+    else {
+        return;
+    };
+    let key_prefix = unique_etcd_prefix("drop-database");
+    cleanup_prefix(&endpoints, &key_prefix).await;
+    let cluster_name = "core-etcd-drop-database";
+    let state = Arc::new(AppState::new(test_config(
+        "drop-db-node",
+        unique_temp_dir("etcd-drop-db-node"),
+        &endpoints,
+        &key_prefix,
+        cluster_name,
+    )));
+    let auth = RequestAuth::default();
+    state
+        .put_database_with_auth(&auth, logpose_catalog::DatabaseDescriptor::new("analytics"))
+        .await
+        .expect("database should be created");
+    // A collection whose creation has written only its first metadata key, as a create racing
+    // the drop has.
+    let orphan =
+        format!("{key_prefix}/clusters/{cluster_name}/collections/analytics/late/assignment");
+    let mut client = Client::connect(endpoints.clone(), None)
+        .await
+        .expect("etcd should be reachable");
+    client
+        .put(orphan.clone(), "{}", Some(PutOptions::new()))
+        .await
+        .expect("raw metadata key should be written");
+
+    let error = state
+        .drop_database_with_auth(&auth, "analytics")
+        .await
+        .expect_err("a database with collection metadata must not be dropped");
+    assert!(
+        matches!(error, LogPoseError::FailedPrecondition { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("late"), "{error}");
+    state
+        .database_with_auth(&auth, "analytics")
+        .await
+        .expect("the refused drop keeps the database");
+
+    client
+        .delete(orphan, None)
+        .await
+        .expect("raw metadata key should be removed");
+    state
+        .drop_database_with_auth(&auth, "analytics")
+        .await
+        .expect("an empty database is dropped");
+    assert!(matches!(
+        state.database_with_auth(&auth, "analytics").await,
+        Err(LogPoseError::NotFound { .. })
+    ));
+
+    cleanup_prefix(&endpoints, &key_prefix).await;
+}
+
+#[tokio::test]
 async fn etcd_metadata_backend_shares_database_policies_across_nodes() {
     let Some(endpoints) =
         etcd_endpoints_or_skip("etcd_metadata_backend_shares_database_policies_across_nodes").await
