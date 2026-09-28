@@ -40,6 +40,56 @@ pub struct LogPoseConfig {
     /// Snapshot tokens: how long a pinned state lives and how many a collection holds.
     #[serde(default)]
     pub snapshots: SnapshotConfig,
+    /// Vector index construction parameters for segments written by flush and compaction.
+    #[serde(default)]
+    pub index: IndexConfig,
+}
+
+/// Default for [`IndexConfig::hnsw_m`].
+pub const DEFAULT_HNSW_M: usize = 16;
+/// Default for [`IndexConfig::hnsw_ef_construction`].
+pub const DEFAULT_HNSW_EF_CONSTRUCTION: usize = 128;
+/// Largest accepted [`IndexConfig::hnsw_m`].
+pub const MAX_HNSW_M: usize = 1024;
+/// Largest accepted [`IndexConfig::hnsw_ef_construction`].
+pub const MAX_HNSW_EF_CONSTRUCTION: usize = 4096;
+
+/// HNSW graph construction parameters, applied to every collection on the node.
+///
+/// They affect only graphs built after a change: existing segments keep their graphs until
+/// compaction rewrites them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexConfig {
+    /// Links per node on upper graph layers; layer 0 allows twice as many.
+    pub hnsw_m: usize,
+    /// Beam width used to find neighbor candidates while building a graph.
+    pub hnsw_ef_construction: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            hnsw_m: DEFAULT_HNSW_M,
+            hnsw_ef_construction: DEFAULT_HNSW_EF_CONSTRUCTION,
+        }
+    }
+}
+
+impl IndexConfig {
+    fn validate(&self) -> Result<()> {
+        if !(2..=MAX_HNSW_M).contains(&self.hnsw_m) {
+            return Err(LogPoseError::invalid_config(format!(
+                "invalid LOGPOSE_CONFIG: index.hnsw_m must be 2 to {MAX_HNSW_M}"
+            )));
+        }
+        if !(1..=MAX_HNSW_EF_CONSTRUCTION).contains(&self.hnsw_ef_construction) {
+            return Err(LogPoseError::invalid_config(format!(
+                "invalid LOGPOSE_CONFIG: index.hnsw_ef_construction must be 1 to {MAX_HNSW_EF_CONSTRUCTION}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Default for [`SnapshotConfig::token_ttl_ms`]: 5 minutes.
@@ -203,6 +253,7 @@ impl Default for LogPoseConfig {
             auth: AuthConfig::default(),
             limits: LimitsConfig::default(),
             snapshots: SnapshotConfig::default(),
+            index: IndexConfig::default(),
         }
     }
 }
@@ -224,6 +275,7 @@ impl LogPoseConfig {
         self.auth.validate()?;
         self.limits.validate()?;
         self.snapshots.validate()?;
+        self.index.validate()?;
         Ok(())
     }
 
@@ -312,6 +364,45 @@ token_ttl_ms = 1500
         config.snapshots.token_ttl_ms = 0;
         let error = config.validate().expect_err("a zero TTL is invalid");
         assert!(error.to_string().contains("snapshots.token_ttl_ms"));
+    }
+
+    #[test]
+    fn index_settings_default_to_m16_and_parse_from_toml() {
+        assert_eq!(
+            LogPoseConfig::default().index,
+            IndexConfig {
+                hnsw_m: 16,
+                hnsw_ef_construction: 128,
+            }
+        );
+        let config = LogPoseConfig::from_toml_str(
+            r#"node_name = "edge-a"
+rest_host = "127.0.0.1"
+rest_port = 8080
+grpc_host = "127.0.0.1"
+grpc_port = 50051
+log_filter = "info"
+storage_root = ".logpose"
+
+[index]
+hnsw_ef_construction = 200
+"#,
+        )
+        .expect("index settings should parse");
+        assert_eq!(config.index.hnsw_m, 16);
+        assert_eq!(config.index.hnsw_ef_construction, 200);
+    }
+
+    #[test]
+    fn rejects_out_of_range_index_settings() {
+        let mut config = LogPoseConfig::default();
+        config.index.hnsw_m = 1;
+        let error = config.validate().expect_err("m below 2 is invalid");
+        assert!(error.to_string().contains("index.hnsw_m"));
+        let mut config = LogPoseConfig::default();
+        config.index.hnsw_ef_construction = 0;
+        let error = config.validate().expect_err("a zero beam width is invalid");
+        assert!(error.to_string().contains("index.hnsw_ef_construction"));
     }
 
     #[test]

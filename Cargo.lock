@@ -1333,12 +1333,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "logpose-api-grpc",
+ "logpose-config",
+ "logpose-core",
  "logpose-query",
  "logpose-storage",
  "logpose-types",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

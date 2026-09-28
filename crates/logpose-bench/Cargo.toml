@@ -13,9 +13,15 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+logpose-api-grpc = { path = "../logpose-api-grpc" }
 logpose-query = { path = "../logpose-query" }
 logpose-storage = { path = "../logpose-storage" }
 logpose-types = { path = "../logpose-types" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+logpose-config = { path = "../logpose-config" }
+logpose-core = { path = "../logpose-core" }

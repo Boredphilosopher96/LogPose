@@ -4,7 +4,7 @@
 use etcd_client as _;
 use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
-use logpose_config::LogPoseConfig;
+use logpose_config::{IndexConfig, LogPoseConfig};
 use logpose_query::{
     CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
     ScrollRecordsResponse, WithSchema,
@@ -13,7 +13,8 @@ use logpose_service::{
     FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
 use logpose_storage::{
-    CreateCollectionRequest, Engine, EngineConfig, InspectReport, InspectTarget, TokenConfig,
+    CreateCollectionRequest, Engine, EngineConfig, IndexPolicy, InspectReport, InspectTarget,
+    TokenConfig,
 };
 use logpose_storage_etcd::EtcdCatalogStore;
 use logpose_types::{
@@ -109,6 +110,7 @@ impl AppState {
             &config.storage_root,
             EngineConfig {
                 resolver: Some(logpose_query::resolver()),
+                index: index_policy(&config.index),
                 tokens: TokenConfig {
                     ttl: std::time::Duration::from_millis(config.snapshots.token_ttl_ms),
                     max_per_collection: config.snapshots.max_tokens_per_collection,
@@ -946,6 +948,14 @@ impl AppState {
     }
 }
 
+/// The engine's index policy with the configured HNSW construction parameters.
+fn index_policy(config: &IndexConfig) -> IndexPolicy {
+    let mut policy = IndexPolicy::default();
+    policy.hnsw.m = config.hnsw_m;
+    policy.hnsw.ef_construction = config.hnsw_ef_construction;
+    policy
+}
+
 fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {
     format!("{}/{}", placement.database_name, placement.collection_name)
 }
@@ -1013,6 +1023,21 @@ mod tests {
     use logpose_storage::CreateCollectionRequest;
     use logpose_types::DistanceMetric;
     use tempfile::TempDir;
+
+    #[test]
+    fn default_index_config_keeps_the_engine_default_index_policy() {
+        assert_eq!(
+            index_policy(&IndexConfig::default()),
+            IndexPolicy::default()
+        );
+        let tuned = index_policy(&IndexConfig {
+            hnsw_m: 24,
+            hnsw_ef_construction: 200,
+        });
+        assert_eq!(tuned.hnsw.m, 24);
+        assert_eq!(tuned.hnsw.ef_construction, 200);
+        assert_eq!(tuned.graph_min_rows, IndexPolicy::default().graph_min_rows);
+    }
 
     #[test]
     fn rejects_reserved_anonymous_local_node_name_at_runtime_bootstrap() {

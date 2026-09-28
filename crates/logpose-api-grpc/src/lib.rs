@@ -30,8 +30,10 @@ use logpose_types::{
     MaintenanceStatus, NodeRole, NodeRuntimeStatus, QueryUnitStats, ScalarFieldStats, Snapshot,
 };
 use std::{net::SocketAddr, sync::Arc};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, Streaming, transport::Server};
+use tonic::{
+    Request, Response, Status, Streaming,
+    transport::{Server, server::TcpIncoming},
+};
 use tonic_health::server::health_reporter;
 use tracing::info;
 
@@ -94,10 +96,20 @@ pub async fn serve_with_listener(
                 .max_decoding_message_size(message_limit)
                 .max_encoding_message_size(message_limit),
         )
-        .serve_with_incoming(TcpListenerStream::new(listener))
+        .serve_with_incoming(incoming(listener))
         .await?;
 
     Ok(())
+}
+
+/// Accepted connections with `TCP_NODELAY` set.
+///
+/// Without it, Nagle's algorithm holds the small frames that finish a reply (the
+/// trailers after the data frame) until the client acknowledges the previous
+/// segment, and a client that delays its acknowledgements then stalls the reply by
+/// about 40 ms. `Server::tcp_nodelay` applies only to listeners tonic binds itself.
+fn incoming(listener: tokio::net::TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 /// gRPC service implementation over the shared application state.
@@ -1160,6 +1172,25 @@ mod tests {
     use tempfile::TempDir;
     use tonic::metadata::MetadataValue;
     use tonic_types::StatusExt;
+
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        use tokio_stream::StreamExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener has an address");
+        let mut accepted = incoming(listener);
+        let _client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        let stream = accepted
+            .next()
+            .await
+            .expect("a connection is accepted")
+            .expect("the accept succeeds");
+        assert!(stream.nodelay().expect("nodelay is readable"));
+    }
 
     #[test]
     fn query_diagnostics_to_proto_preserves_ann_fields() {
