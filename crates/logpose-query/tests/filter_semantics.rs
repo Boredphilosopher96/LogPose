@@ -271,10 +271,7 @@ fn within(key: &Key, bounds: &RangeBounds) -> bool {
     let test = |bound: &Option<Value>, holds: fn(Ordering) -> bool| {
         bound.as_ref().is_none_or(|bound| {
             let bound = operand_key(bound);
-            same_kind(key, &bound)
-                && key
-                    .partial_cmp(&bound)
-                    .is_some_and(|ordering| holds(ordering))
+            same_kind(key, &bound) && key.partial_cmp(&bound).is_some_and(holds)
         })
     };
     test(&bounds.gt, |o| o == Ordering::Greater)
@@ -596,9 +593,7 @@ async fn check(fixture: &Fixture, model: &BTreeMap<String, Row>, rng: &mut Rng, 
             .filter(|(key, row)| model_matches(&filter, key, row))
             .map(|(key, _)| PrimaryKey::from(key.as_str()))
             .collect::<Vec<_>>();
-        let count = count_view(&view, Some(&filter))
-            .await
-            .unwrap_or_else(|error| panic!("count {filter:?}: {error}"));
+        let count = count_view(&view, Some(&filter)).await.expect("count");
         let (rows, _) = scroll_view(
             &view,
             Some(&filter),
@@ -613,17 +608,18 @@ async fn check(fixture: &Fixture, model: &BTreeMap<String, Row>, rng: &mut Rng, 
             .into_iter()
             .map(|row| row.record.pk)
             .collect::<Vec<_>>();
-        if scrolled != expected {
-            let diff = model
-                .iter()
-                .filter(|(key, _)| {
-                    let pk = PrimaryKey::from(key.as_str());
-                    scrolled.contains(&pk) != expected.contains(&pk)
-                })
-                .take(3)
-                .collect::<Vec<_>>();
-            panic!("scroll {filter:?}: rows the engine and the model disagree on: {diff:?}");
-        }
+        let disagreeing = model
+            .iter()
+            .filter(|(key, _)| {
+                let pk = PrimaryKey::from(key.as_str());
+                scrolled.contains(&pk) != expected.contains(&pk)
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        assert!(
+            disagreeing.is_empty() && scrolled == expected,
+            "scroll {filter:?}: rows the engine and the model disagree on: {disagreeing:?}"
+        );
         assert_eq!(count, expected.len() as u64, "count {filter:?}");
         // The reference semantics the crate documents agree with the model too.
         let compiled = CompiledFilter::compile(&schema, &filter).expect("compile");
