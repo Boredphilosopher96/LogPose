@@ -9,8 +9,9 @@
 //! - **I14**: at or past every state a concurrent reader observed before the crash, and every
 //!   observed state must itself have been such a prefix;
 //! - **I11**: the same as a clean recovery of the same disk image, when that recovery is itself
-//!   crashed at any of its operations (in any tear mode) and rerun: rows, sequence number,
-//!   schema, manifest generation, checkpoint, and the set of files on disk;
+//!   crashed at any of its operations (in any tear mode) and rerun, or crashed again and again
+//!   (each recovery one operation further than the last) before a clean one: rows, sequence
+//!   number, schema, manifest generation, checkpoint, and every file's name and bytes;
 //! - usable: it takes a write and a flush afterwards.
 //!
 //! Scenarios: one group commit of concurrent batches, a flush, a compaction with concurrent
@@ -621,6 +622,38 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
                         }
                         coverage.recovery_crashes += 1;
                     }
+                }
+                // Crashes compound: each recovery crashes one operation later than the last,
+                // on what the last one left, before a clean one.
+                let copy = image.fork();
+                let mut session = ctx
+                    .session
+                    .attach(Arc::clone(&copy))
+                    .unwrap_or_else(|error| fail(detail(error)));
+                for j in 0..recovery_ops {
+                    copy.set_plan(FaultPlan {
+                        crash_after_ops: Some(copy.mutating_ops() + j),
+                        tear: TearMode::ALL[(k + j) as usize % TearMode::ALL.len()],
+                        ..FaultPlan::default()
+                    });
+                    session.open_and_drop();
+                    copy.crash();
+                    coverage.recovery_crashes += 1;
+                }
+                copy.set_plan(FaultPlan::default());
+                session.open().unwrap_or_else(|error| {
+                    fail(detail(format!(
+                        "I11: recovery after {recovery_ops} compounding recovery crashes does not \
+                         reopen: {error}"
+                    )))
+                });
+                let rerun = digest(&session).unwrap_or_else(|error| fail(detail(error)));
+                if rerun != reference {
+                    fail(detail(format!(
+                        "I11: recovery after {recovery_ops} compounding recovery crashes differs \
+                         from a clean recovery: {}",
+                        difference(&rerun, &reference)
+                    )));
                 }
             }
 
