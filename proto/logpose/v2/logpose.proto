@@ -925,17 +925,23 @@ message InspectCollectionReply {
   JsonValue payload = 4;
 }
 
+// Runtime maintenance state of a collection since the node opened it; nothing of it is
+// persisted.
 message MaintenanceStatus {
+  // Jobs (`flush`, `compact`, `index`) waiting for a maintenance permit.
   repeated string pending = 1;
+  // `flush` while a flush runs, otherwise `compact` while a compaction runs, otherwise `index`
+  // while an index build (a segment's vector graphs) runs.
   optional string in_progress = 2;
   // The last failed job, cleared once a job of the same kind completes.
   MaintenanceError last_error = 3;
+  // Flushes, compactions, and index builds that completed since the node opened the collection.
   uint64 completed_runs = 4;
 }
 
 // A failed maintenance job.
 message MaintenanceError {
-  // The job that failed, `flush` or `compact`.
+  // The job that failed, `flush`, `compact`, or `index`.
   string job = 1;
   // What failed.
   string message = 2;
