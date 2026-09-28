@@ -123,13 +123,8 @@ impl CoreRef {
             file_len: written.file_len,
             footer_crc: written.footer_crc,
         };
-        let open = segment.index_from_file(
-            file,
-            path,
-            reference,
-            self.buffer_cache(),
-            self.gc.clone(),
-        )?;
+        let open =
+            segment.index_from_file(file, path, reference, self.buffer_cache(), self.gc.clone())?;
         Ok(JobCommit::Index {
             segment: segment.unit,
             index: IndexedSegment {

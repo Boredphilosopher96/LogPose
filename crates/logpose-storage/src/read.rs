@@ -769,17 +769,22 @@ async fn load_units(
         } else {
             file.reader().fetch(&load.unit, io)
         };
-        pending.push((file.path().to_path_buf(), load.sidecar, load.unit.class(), key, fetch));
+        pending.push((
+            file.path().to_path_buf(),
+            load.sidecar,
+            load.unit.class(),
+            key,
+            fetch,
+        ));
     }
     for (path, sidecar, class, key, fetch) in pending {
-        let (bytes, fetched): (Arc<AlignedBytes>, Fetched) =
-            fetch.await.map_err(|error| {
-                if sidecar {
-                    index_error(&path, error)
-                } else {
-                    segment_error(&path, error)
-                }
-            })?;
+        let (bytes, fetched): (Arc<AlignedBytes>, Fetched) = fetch.await.map_err(|error| {
+            if sidecar {
+                index_error(&path, error)
+            } else {
+                segment_error(&path, error)
+            }
+        })?;
         report.record(class, fetched);
         pins.insert(key, bytes);
     }

@@ -229,7 +229,11 @@ impl SegmentHandle {
     /// The file holding the section of `kind` for `field`: the index sidecar for a vector
     /// graph, the segment file for everything else. `None` for a graph the segment has not
     /// gained yet.
-    pub(crate) fn section_file(&self, kind: SectionKind, field: Option<FieldId>) -> Option<&OpenFile> {
+    pub(crate) fn section_file(
+        &self,
+        kind: SectionKind,
+        field: Option<FieldId>,
+    ) -> Option<&OpenFile> {
         match (kind, field) {
             (SectionKind::VectorGraph, Some(field)) => self.graph_file(field),
             (SectionKind::VectorGraph, None) => None,

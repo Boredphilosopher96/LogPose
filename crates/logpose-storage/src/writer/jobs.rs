@@ -795,13 +795,10 @@ impl Writer {
                 wrote_files,
                 reply,
             } => {
-                let cancelled = self
-                    .jobs
-                    .get(&job)
-                    .is_some_and(|entry| match &entry.phase {
-                        Phase::Running(running) => running.cancelled(),
-                        Phase::Waiting(_) => false,
-                    });
+                let cancelled = self.jobs.get(&job).is_some_and(|entry| match &entry.phase {
+                    Phase::Running(running) => running.cancelled(),
+                    Phase::Waiting(_) => false,
+                });
                 let outcome = match result {
                     // A cancelled index build ends without a change, whatever it built.
                     _ if cancelled => Outcome::Abandoned,
@@ -1782,7 +1779,10 @@ impl Writer {
         let mut explicit_failed = Vec::new();
         if let Some(explicit) = self.explicit.as_mut() {
             if let (Outcome::Committed(_), JobKind::Compact) = (&outcome, entry.kind)
-                && entry.inputs.iter().any(|unit| explicit.scope.contains(unit))
+                && entry
+                    .inputs
+                    .iter()
+                    .any(|unit| explicit.scope.contains(unit))
             {
                 for unit in &entry.inputs {
                     explicit.scope.remove(unit);

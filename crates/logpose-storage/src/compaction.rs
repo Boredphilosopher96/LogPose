@@ -474,7 +474,10 @@ impl Policy {
     /// two inputs an explicit compaction always takes may not.
     pub(crate) fn fits_pool(&self, plan: &CompactionPlan) -> bool {
         plan.build_bytes <= self.pool_bytes
-            && plan.live_rows.saturating_mul(self.shape.graph_bytes_per_row()) <= self.pool_bytes
+            && plan
+                .live_rows
+                .saturating_mul(self.shape.graph_bytes_per_row())
+                <= self.pool_bytes
     }
 
     /// Background jobs over `segments` that avoid `reserved`, at most `slots` of them. Each job
@@ -586,8 +589,7 @@ impl Policy {
         let mut small = segments
             .iter()
             .filter(|segment| {
-                !reserved.contains(&segment.unit)
-                    && segment.live() < u64::from(self.graph_min_rows)
+                !reserved.contains(&segment.unit) && segment.live() < u64::from(self.graph_min_rows)
             })
             .copied()
             .collect::<Vec<_>>();

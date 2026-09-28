@@ -552,8 +552,8 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
     let context = |detail: String| format!("scenario {}: {detail}", scenario.name);
     // A clean run counts the body's operations.
     let ops = {
-        let mut ctx = Ctx::with_indexes(seed, scenario.indexed)
-            .unwrap_or_else(|error| fail(context(error)));
+        let mut ctx =
+            Ctx::with_indexes(seed, scenario.indexed).unwrap_or_else(|error| fail(context(error)));
         (scenario.setup)(&mut ctx).unwrap_or_else(|error| fail(context(format!("setup: {error}"))));
         let start = ctx.fault().mutating_ops();
         (scenario.body)(&mut ctx).unwrap_or_else(|error| fail(context(format!("body: {error}"))));

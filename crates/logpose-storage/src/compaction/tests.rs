@@ -277,7 +277,11 @@ fn outputs_stay_small_enough_for_their_index_build() {
     let plan = policy
         .plan_explicit(&segments, &BTreeSet::new())
         .expect("a plan");
-    assert_eq!(units(&plan), [1, 2], "a third segment's graph would not fit the pool");
+    assert_eq!(
+        units(&plan),
+        [1, 2],
+        "a third segment's graph would not fit the pool"
+    );
 }
 
 /// An explicit compaction merges the segments with the fewest live rows first, so repeated

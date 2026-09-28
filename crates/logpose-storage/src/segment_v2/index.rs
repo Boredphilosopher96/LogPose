@@ -167,7 +167,11 @@ impl SegmentBuilder {
                 }
             }
             for vector in vectors {
-                if !schema.vectors().iter().any(|field| field.id == vector.field) {
+                if !schema
+                    .vectors()
+                    .iter()
+                    .any(|field| field.id == vector.field)
+                {
                     continue;
                 }
                 sections.extend(sq8_section(vector, policy)?);
@@ -929,10 +933,12 @@ mod tests {
         assert!(graph.nodes.is_identity());
 
         // Cancelled: a typed error, nothing built.
-        let cancelled =
-            build_graph_section(graph_input(values, &[100, 101]), HnswParams::default(), 2, &|| {
-                true
-            });
+        let cancelled = build_graph_section(
+            graph_input(values, &[100, 101]),
+            HnswParams::default(),
+            2,
+            &|| true,
+        );
         assert!(matches!(cancelled, Err(SegmentError::Cancelled)));
     }
 }

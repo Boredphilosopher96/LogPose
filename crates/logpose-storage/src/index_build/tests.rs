@@ -7,8 +7,8 @@
 //! segments and indexes what is left.
 
 use crate::{
-    CollectionHandle, CompactionConfig, CreateCollectionRequest, Engine, EngineConfig,
-    IndexPolicy, JobKind, ManualClock, RuntimeConfig,
+    CollectionHandle, CompactionConfig, CreateCollectionRequest, Engine, EngineConfig, IndexPolicy,
+    JobKind, ManualClock, RuntimeConfig,
     dv::parse_dv_file_name,
     manifest::parse_manifest_file_name,
     paths::{index_path, parse_index_file_name, parse_segment_file_name, segment_path},
@@ -216,14 +216,12 @@ fn assert_no_orphans(vfs: &dyn Vfs, handle: &CollectionHandle, context: &str) {
             .is_some_and(|unit| manifest.units().any(|live| live == unit))
             || parse_dv_file_name(&entry.name).is_some_and(|(unit, generation)| {
                 manifest.segments.iter().any(|segment| {
-                    segment.unit == unit
-                        && segment.dv.is_some_and(|dv| dv.generation == generation)
+                    segment.unit == unit && segment.dv.is_some_and(|dv| dv.generation == generation)
                 })
             })
             || parse_index_file_name(&entry.name).is_some_and(|(unit, sidecar)| {
                 manifest.segments.iter().any(|segment| {
-                    segment.unit == unit
-                        && segment.index.is_some_and(|index| index.unit == sidecar)
+                    segment.unit == unit && segment.index.is_some_and(|index| index.unit == sidecar)
                 })
             });
         assert!(named, "{context}: orphan segments/{}", entry.name);
@@ -301,7 +299,10 @@ fn an_index_build_adds_the_graph_a_flush_no_longer_builds() {
     let engine = open(fault.process(), config());
     let handle = open_handle(&engine);
     assert_eq!(rows(&handle), expected);
-    assert!(graphs(&engine)[0].1, "the sidecar is opened with its segment");
+    assert!(
+        graphs(&engine)[0].1,
+        "the sidecar is opened with its segment"
+    );
     engine.wait_for_gc();
     assert_no_orphans(fault.process().as_ref(), &handle, "after reopen");
 }
@@ -351,7 +352,10 @@ fn a_crash_at_every_op_of_an_index_build_recovers_the_same_rows_without_orphans(
     index_by_hand(&engine, &handle);
     engine.wait_for_gc();
     let ops = clean.mutating_ops() - before;
-    assert!(ops >= 8, "an index build writes, syncs, and publishes: {ops} ops");
+    assert!(
+        ops >= 8,
+        "an index build writes, syncs, and publishes: {ops} ops"
+    );
     drop(handle);
     drop(engine);
 
@@ -503,13 +507,19 @@ fn a_compaction_cancels_the_index_build_of_its_input() {
         .expect("begin compaction");
     assert!(compaction.has_work());
     // The cancelled build ends without a change.
-    index.commit().expect("a cancelled build answers with the current state");
+    index
+        .commit()
+        .expect("a cancelled build answers with the current state");
     assert_eq!(handle.current().indexed_segments(), (0, 0));
     compaction.commit().expect("commit compaction");
     assert_eq!(rows(&handle), expected);
     assert_eq!(handle.current().counters.segment_count, 1);
     engine.wait_for_gc();
-    assert_no_orphans(fault.process().as_ref(), &handle, "after the cancelled build");
+    assert_no_orphans(
+        fault.process().as_ref(),
+        &handle,
+        "after the cancelled build",
+    );
     index_by_hand(&engine, &handle);
     assert_eq!(handle.current().indexed_segments(), (1, 1));
     graph_finds_rows(&engine, 200);
@@ -551,7 +561,10 @@ fn a_retired_segment_takes_its_sidecar_along_once_no_version_reads_it() {
     assert!(handle.release_snapshot(&pinned));
     engine.reap_snapshots();
     engine.wait_for_gc();
-    assert!(!exists(vfs.as_ref(), &sidecar), "the sidecar left with its segment");
+    assert!(
+        !exists(vfs.as_ref(), &sidecar),
+        "the sidecar left with its segment"
+    );
     assert_no_orphans(vfs.as_ref(), &handle, "after the compaction");
 }
 
@@ -625,7 +638,10 @@ fn an_explicit_compaction_converges_and_indexes_before_it_answers() {
     handle.compact_blocking().expect("compact");
     let version = handle.current();
     let segments = version.counters.segment_count;
-    assert_eq!(segments, 2, "the compaction merged as far as the pool allows");
+    assert_eq!(
+        segments, 2,
+        "the compaction merged as far as the pool allows"
+    );
     assert_eq!(
         engine.scheduler().stats().compactions_granted,
         2,
@@ -676,10 +692,14 @@ fn a_quiet_collection_merges_small_segments_and_indexes_the_rest() {
     engine
         .tick_writer(&handle, Duration::from_secs(30))
         .expect("tick");
-    wait_for("the quiet merge and index build", Duration::from_secs(30), || {
-        let version = handle.current();
-        version.counters.segment_count == 1 && version.indexed_segments() == (1, 1)
-    });
+    wait_for(
+        "the quiet merge and index build",
+        Duration::from_secs(30),
+        || {
+            let version = handle.current();
+            version.counters.segment_count == 1 && version.indexed_segments() == (1, 1)
+        },
+    );
     assert_eq!(rows(&handle), expected);
     engine.wait_for_gc();
     assert_no_orphans(fault.process().as_ref(), &handle, "after the quiet merge");

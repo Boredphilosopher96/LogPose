@@ -318,8 +318,7 @@ impl MaintenanceScheduler {
                         continue;
                     }
                     compaction_seen = true;
-                    if state.running_compactions < shared.compaction_slots && fits(waiting.bytes)
-                    {
+                    if state.running_compactions < shared.compaction_slots && fits(waiting.bytes) {
                         chosen = Some(*key);
                         break;
                     }
