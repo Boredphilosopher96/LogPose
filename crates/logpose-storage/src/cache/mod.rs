@@ -45,14 +45,14 @@ mod tests;
 
 pub use bytes::AlignedBytes;
 pub use flight::{Fetch, InlineExecutor, LoadExecutor, LoadJob, Loader};
-pub use key::{ArtifactClass, CacheKey, CacheUnit, DEFAULT_FLOORS, FileId};
+pub use key::{ArtifactClass, CacheKey, CacheUnit, DEFAULT_FLOORS, FileId, KeyHasher, KeyMap};
 pub use report::{CacheStats, ClassFetch, FetchReport, Fetched, PinSet};
 pub use warm::{WARM_UP_FILL, WARM_UP_IN_FLIGHT, WarmUpItem, WarmUpReport};
 
 use crate::segment_v2::SegmentError;
 use flight::{Flight, FlightResult, Loaded};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -179,8 +179,8 @@ pub(crate) struct Inner {
 
 #[derive(Default)]
 struct Shard {
-    entries: HashMap<CacheKey, Arc<Entry>>,
-    loading: HashMap<CacheKey, Arc<Flight>>,
+    entries: KeyMap<Arc<Entry>>,
+    loading: KeyMap<Arc<Flight>>,
 }
 
 struct Entry {
@@ -508,9 +508,11 @@ impl fmt::Debug for BufferCache {
 
 impl Inner {
     fn shard(&self, key: &CacheKey) -> &Mutex<Shard> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = KeyHasher::default();
         key.hash(&mut hasher);
-        let index = usize::try_from(hasher.finish() % SHARDS as u64).unwrap_or(0);
+        // The multiply leaves the best-mixed bits at the top.
+        let index = usize::try_from(hasher.finish() >> (64 - SHARDS.trailing_zeros())).unwrap_or(0)
+            % SHARDS;
         &self.shards[index]
     }
 

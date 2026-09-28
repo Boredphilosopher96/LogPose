@@ -14,9 +14,10 @@
 //!   [`Residency`](logpose_storage::Residency)).
 //!
 //! On the calibration host, walks are memory-latency bound: an evaluated node costs about
-//! 250 ns (its code is a random read) and an expanded list about 1 µs (32 visited marks),
-//! while an exact scan costs 45 ns per row when the filter is dense (the codes stream) and up
-//! to 165 ns when it is sparse (each row is a random read).
+//! 240 ns (a random read of its code, its visited mark, and its queue offers) and an expanded
+//! list about 1 µs (32 visited marks), while an exact scan, scoring 64 rows per kernel call,
+//! costs about 40 ns per row when the filter is dense (the codes stream) and about 100 ns when
+//! it is sparse (each row is a random read).
 //!
 //! Per segment the planner prices an exact scan of the filter bitmap `B` (`n` rows) and, when
 //! the segment has a graph, an admit-only walk and an ACORN-1 style walk, and runs the
@@ -145,12 +146,12 @@ pub struct CostModel {
 /// in one segment, `M = 16`, release build). `cold_ns_per_byte` is not measured (the harness
 /// runs warm); it assumes about 1 GB/s through the buffer cache.
 pub const CALIBRATED: CostModel = CostModel {
-    sq8_ns: 30.0,
+    sq8_ns: 25.0,
     f32_ns: 30.0,
     resident_ns_per_byte: 0.12,
-    random_read_ns: 90.0,
+    random_read_ns: 45.0,
     random_line_ns: 15.0,
-    offer_ns: 85.0,
+    offer_ns: 140.0,
     hop_ns: 50.0,
     link_ns: 30.0,
     check_ns: 15.0,
@@ -560,20 +561,25 @@ mod tests {
         let walk = unfiltered.chosen.micros;
         assert!(
             (250.0..360.0).contains(&walk),
-            "unfiltered walk {walk}us, measured 304"
+            "unfiltered walk {walk}us, measured 290"
         );
         let scan = unfiltered.exact.micros;
+        assert!((3_500.0..5_000.0).contains(&scan), "full scan {scan}us");
+        let price = |matched| {
+            model
+                .decide(&shape(100_000, matched), Force::Auto)
+                .exact
+                .micros
+        };
+        let sparse = price(1_000);
         assert!(
-            (4_000.0..5_500.0).contains(&scan),
-            "full scan {scan}us, measured 4,940"
+            (80.0..140.0).contains(&sparse),
+            "1% scan {sparse}us, measured 100"
         );
-        let sparse = model
-            .decide(&shape(100_000, 1_000), Force::Auto)
-            .exact
-            .micros;
+        let tenth = price(10_000);
         assert!(
-            (120.0..220.0).contains(&sparse),
-            "1% scan {sparse}us, measured 160"
+            (750.0..1_100.0).contains(&tenth),
+            "10% scan {tenth}us, measured 800 to 950"
         );
     }
 
@@ -601,8 +607,8 @@ mod tests {
         let model = CostModel::default();
         for (rows, lowest, highest) in [
             (100_000_u64, 0.05, 0.3),
-            (1_000_000, 0.005, 0.05),
-            (10_000_000, 0.0005, 0.01),
+            (1_000_000, 0.01, 0.08),
+            (10_000_000, 0.002, 0.03),
         ] {
             let switch = boundary(rows, 41, rows, Choice::ExactScan);
             let selectivity = switch as f64 / rows as f64;

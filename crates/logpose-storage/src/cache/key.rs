@@ -1,6 +1,10 @@
 //! Cache keys, file identities, and artifact classes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasherDefault, Hasher},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Artifact classes in priority order from D8, highest first. Eviction
 /// starts from the bottom.
@@ -118,3 +122,59 @@ impl CacheKey {
         }
     }
 }
+
+/// A fast hasher for [`CacheKey`]s (multiply-rotate over the key's integers). Keys are
+/// engine-assigned integers (file ids, section indexes, page and block numbers), never
+/// client input, so the flooding resistance of the default hasher buys nothing, while its
+/// cost shows on every hit: a query pins dozens of units.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyHasher(u64);
+
+impl KeyHasher {
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::MULTIPLIER);
+    }
+}
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.add(value as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A map keyed by [`CacheKey`] with [`KeyHasher`].
+pub type KeyMap<V> = HashMap<CacheKey, V, BuildHasherDefault<KeyHasher>>;
