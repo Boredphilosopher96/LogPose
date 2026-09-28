@@ -520,6 +520,22 @@ impl<S: SectionSource> SegmentReader<S> {
         self.row_meta_via(Via::Cache)
     }
 
+    /// Sequence numbers in row order, decoded once per cache load: the decoded form rides with
+    /// the cached section.
+    ///
+    /// # Errors
+    ///
+    /// I/O or corruption errors.
+    pub fn row_meta_shared(&self) -> Result<Arc<Vec<SeqNo>>, SegmentError> {
+        let (index, entry) = self.required(SectionKind::RowMeta)?;
+        let region = section_region(index, &entry);
+        self.section_via(index, Via::Cache)?.decoded(|raw| {
+            self.decode_row_meta(raw, &entry)
+                .map(|seqs| (seqs, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
+    }
+
     fn row_meta_via(&self, via: Via) -> Result<Vec<SeqNo>, SegmentError> {
         let (index, entry) = self.required(SectionKind::RowMeta)?;
         let region = section_region(index, &entry);
@@ -569,6 +585,19 @@ impl<S: SectionSource> SegmentReader<S> {
     /// I/O or corruption errors.
     pub fn pk_column(&self) -> Result<PkColumn, SegmentError> {
         self.pk_column_via(Via::Cache)
+    }
+
+    /// [`pk_column`](Self::pk_column), decoded once per cache load.
+    fn pk_column_shared(&self) -> Result<Arc<PkColumn>, SegmentError> {
+        let (index, entry) = self.required(SectionKind::PkColumn)?;
+        let region = section_region(index, &entry);
+        self.check_pk_encoding(&entry, region)?;
+        let rows = usize_from(self.header.row_count);
+        self.section_via(index, Via::Cache)?.decoded(|raw| {
+            PkColumn::decode(raw, entry.encoding, rows)
+                .map(|column| (column, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
     }
 
     fn pk_column_via(&self, via: Via) -> Result<PkColumn, SegmentError> {
@@ -684,6 +713,23 @@ impl<S: SectionSource> SegmentReader<S> {
         self.scalar_column_via(field, Via::Cache)
     }
 
+    /// [`scalar_column`](Self::scalar_column), decoded once per cache load.
+    fn scalar_column_shared(
+        &self,
+        field: FieldId,
+    ) -> Result<Option<Arc<ScalarColumn>>, SegmentError> {
+        let Some(index) = self.find_section(SectionKind::ScalarColumn, Some(field)) else {
+            return Ok(None);
+        };
+        let entry = self.entry(index)?;
+        self.section_via(index, Via::Cache)?
+            .decoded(|raw| {
+                self.decode_scalar(index, &entry, raw)
+                    .map(|column| (column, raw.len() as u64 * 2))
+            })
+            .map(Some)
+    }
+
     fn scalar_column_via(
         &self,
         field: FieldId,
@@ -695,6 +741,23 @@ impl<S: SectionSource> SegmentReader<S> {
         let bytes = self.section_via(index, via)?;
         self.decode_scalar(index, &self.entry(index)?, &bytes)
             .map(Some)
+    }
+
+    /// Decode the verified payload of `field`'s `ScalarColumn` section (from a pinned cache
+    /// unit).
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::OutOfRange`] if the segment has no column for `field`, or corruption.
+    pub fn decode_scalar_column(
+        &self,
+        field: FieldId,
+        bytes: &[u8],
+    ) -> Result<ScalarColumn, SegmentError> {
+        let index = self
+            .find_section(SectionKind::ScalarColumn, Some(field))
+            .ok_or_else(|| SegmentError::out_of_range(format!("column of field {field}")))?;
+        self.decode_scalar(index, &self.entry(index)?, bytes)
     }
 
     /// Decode a verified `ScalarColumn` payload.
@@ -867,6 +930,42 @@ impl<S: SectionSource> SegmentReader<S> {
         self.dynamic_via(Via::Cache)
     }
 
+    /// The dynamic block index, decoded once per cache load.
+    fn dynamic_shared(&self) -> Result<Option<Arc<DynamicHandle>>, SegmentError> {
+        let Some(unit) = self.dynamic_index_unit() else {
+            return Ok(None);
+        };
+        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
+        bytes
+            .decoded(|raw| {
+                self.dynamic_handle(&unit, raw)
+                    .map(|handle| (handle, raw.len() as u64))
+            })
+            .map(Some)
+    }
+
+    /// Block `block` of the dynamic section, decoded once per cache load.
+    fn dynamic_block_shared(
+        &self,
+        handle: &DynamicHandle,
+        block: u32,
+    ) -> Result<Arc<DynamicBlock>, SegmentError> {
+        let region = Region::DynamicBlock {
+            index: handle.index,
+            block,
+        };
+        let (unit, rows) = handle
+            .block_unit(block)
+            .zip(handle.blocks.block_rows(block))
+            .ok_or_else(|| SegmentError::out_of_range(format!("{region}")))?;
+        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
+        bytes.decoded(|raw| {
+            DynamicBlock::decode(raw, rows)
+                .map(|block| (block, raw.len() as u64))
+                .map_err(|error| error.at(region))
+        })
+    }
+
     fn dynamic_via(&self, via: Via) -> Result<Option<DynamicHandle>, SegmentError> {
         let Some(unit) = self.dynamic_index_unit() else {
             return Ok(None);
@@ -1018,6 +1117,20 @@ impl<S: SectionSource> SegmentReader<S> {
     /// [`SegmentError::OutOfRange`] for a row past the end, and I/O or
     /// corruption errors.
     pub fn row_images(&self, rows: &[u32]) -> Result<Vec<RowImage>, SegmentError> {
+        self.row_images_projected(rows, true)
+    }
+
+    /// [`row_images`](Self::row_images), leaving out vector fields (and their page loads)
+    /// unless `vectors` is set.
+    ///
+    /// # Errors
+    ///
+    /// As [`row_images`](Self::row_images).
+    pub fn row_images_projected(
+        &self,
+        rows: &[u32],
+        vectors: bool,
+    ) -> Result<Vec<RowImage>, SegmentError> {
         if let Some(row) = rows.iter().find(|row| **row >= self.header.row_count) {
             return Err(SegmentError::out_of_range(format!(
                 "row {row} of a segment of {} rows",
@@ -1025,9 +1138,12 @@ impl<S: SectionSource> SegmentReader<S> {
             )));
         }
         let via = Via::Cache;
-        let pks = self.pk_column_via(via)?;
-        let mut vector_fields: Vec<_> =
-            self.schema.vectors().iter().map(|field| field.id).collect();
+        let pks = self.pk_column_shared()?;
+        let mut vector_fields: Vec<_> = if vectors {
+            self.schema.vectors().iter().map(|field| field.id).collect()
+        } else {
+            Vec::new()
+        };
         vector_fields.sort_unstable();
         let mut vectors = Vec::new();
         for field in vector_fields {
@@ -1039,11 +1155,11 @@ impl<S: SectionSource> SegmentReader<S> {
         scalar_fields.sort_unstable();
         let mut columns = Vec::new();
         for field in scalar_fields {
-            if let Some(column) = self.scalar_column_via(field, via)? {
+            if let Some(column) = self.scalar_column_shared(field)? {
                 columns.push((field, column));
             }
         }
-        let dynamic = self.dynamic_via(via)?;
+        let dynamic = self.dynamic_shared()?;
         let mut blocks = std::collections::BTreeMap::new();
         let mut out = Vec::with_capacity(rows.len());
         for &row in rows {
@@ -1075,7 +1191,7 @@ impl<S: SectionSource> SegmentReader<S> {
                 let loaded = match blocks.entry(block) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(self.dynamic_block_via(handle, block, via)?)
+                        entry.insert(self.dynamic_block_shared(handle, block)?)
                     }
                 };
                 if let Some(raw) = loaded.raw(row) {
@@ -1403,6 +1519,29 @@ impl<S: SectionSource + Clone + 'static> SegmentReader<S> {
         let file_len = self.file_len;
         let owned = unit.clone();
         let load = move || owned.load(&source, file_len);
+        match &self.cache {
+            Some(link) => {
+                let mode = if unit.cacheable() {
+                    CacheMode::Normal
+                } else {
+                    CacheMode::Bypass
+                };
+                link.cache
+                    .get_or_load(unit.key(link.file), unit.class(), mode, executor, load)
+            }
+            None => Fetch::detached(executor, unit.class(), Box::new(load)),
+        }
+    }
+
+    /// [`fetch`](Self::fetch), with a loader that also decodes a whole index
+    /// or key section and attaches the decoded form before the cache charges it
+    /// ([`SegmentUnit::load_decoded`]). Other units load as with `fetch`.
+    pub fn fetch_decoded(&self, unit: &SegmentUnit, executor: &dyn LoadExecutor) -> Fetch {
+        let source = self.source.clone();
+        let file_len = self.file_len;
+        let rows = self.header.row_count;
+        let owned = unit.clone();
+        let load = move || owned.load_decoded(&source, file_len, rows);
         match &self.cache {
             Some(link) => {
                 let mode = if unit.cacheable() {

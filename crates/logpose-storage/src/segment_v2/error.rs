@@ -230,6 +230,34 @@ impl SegmentError {
         )
     }
 
+    /// The corruption kind of this error: [`CorruptionKind::Index`] for a
+    /// defect in an index section (`VectorSq8`, `VectorGraph`,
+    /// `ScalarInverted`, `ScalarSorted`), [`CorruptionKind::Segment`]
+    /// otherwise.
+    #[must_use]
+    pub fn corruption_kind(&self) -> CorruptionKind {
+        let region = match self {
+            Self::Checksum { region } | Self::Corrupt { region, .. } => *region,
+            _ => return CorruptionKind::Segment,
+        };
+        match region {
+            Region::Section { kind, .. }
+                if matches!(
+                    SectionKind::from_code(kind),
+                    Some(
+                        SectionKind::VectorSq8
+                            | SectionKind::VectorGraph
+                            | SectionKind::ScalarInverted
+                            | SectionKind::ScalarSorted
+                    )
+                ) =>
+            {
+                CorruptionKind::Index
+            }
+            _ => CorruptionKind::Segment,
+        }
+    }
+
     pub(super) fn out_of_range(what: impl Into<String>) -> Self {
         Self::OutOfRange { what: what.into() }
     }
@@ -245,7 +273,7 @@ impl SegmentError {
 impl From<SegmentError> for LogPoseError {
     fn from(error: SegmentError) -> Self {
         if error.is_corruption() {
-            return LogPoseError::corrupt(CorruptionKind::Segment, error.to_string());
+            return LogPoseError::corrupt(error.corruption_kind(), error.to_string());
         }
         match error {
             SegmentError::Io(source) => LogPoseError::Io {

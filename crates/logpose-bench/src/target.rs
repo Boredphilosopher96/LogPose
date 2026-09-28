@@ -7,7 +7,7 @@
 
 use crate::dataset::Metric;
 use anyhow::{Context, Result, anyhow, ensure};
-use logpose_query::{ExplainMode, FilterExpr, QueryRequest, query_exact};
+use logpose_query::{ExplainMode, FilterExpr, QueryRequest, query};
 use logpose_storage::{CreateCollectionRequest, LocalStorageEngine, StorageEngine};
 use logpose_types::{DistanceMetric, PutRecord, RecordId, WriteOperation};
 use serde_json::{Map, Value};
@@ -88,7 +88,7 @@ pub trait BenchTarget: Send + Sync {
 /// How long to wait for background maintenance to settle.
 const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The current in-process engine: `LocalStorageEngine` plus `query_exact`.
+/// The current in-process engine: `LocalStorageEngine` plus `logpose_query::query`.
 ///
 /// Queries run with [`ExplainMode::Plan`] so the report can show which plan
 /// the planner chose; plan diagnostics are cheap to produce.
@@ -257,7 +257,7 @@ impl BenchTarget for LocalEngineTarget {
     fn search(&self, request: &SearchRequest<'_>) -> Result<SearchResponse> {
         let response = self
             .runtime
-            .block_on(query_exact(
+            .block_on(query(
                 &self.engine,
                 QueryRequest {
                     collection_name: self.collection()?.to_owned(),
@@ -268,6 +268,8 @@ impl BenchTarget for LocalEngineTarget {
                     filters: Vec::new(),
                     predicate: request.filter.cloned(),
                     explain: ExplainMode::Plan,
+                    snapshot_token: None,
+                    pin: false,
                 },
             ))
             .context("running query")?;

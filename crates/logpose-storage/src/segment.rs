@@ -13,13 +13,13 @@ use crate::{
     manifest::{FieldZone, ManifestSegment, SegmentOrigin, VectorSummary},
     paths::segment_path,
     segment_v2::{
-        PkColumn, SegmentBuilder, SegmentError, SegmentReader, SegmentRow, StatValue, VfsSource,
-        WrittenSegment,
+        PkColumn, SectionKind, SegmentBuilder, SegmentError, SegmentReader, SegmentRow, StatValue,
+        VfsSource, WrittenSegment,
     },
 };
 use logpose_types::{
     CollectionId, CorruptionKind, LogPoseError, Result, SeqNo, UnitId,
-    schema::{CollectionSchema, FieldRef},
+    schema::{CollectionSchema, FieldId, FieldRef},
     value::{Timestamp, Value},
 };
 use logpose_vfs::{OpenMode, Vfs, VfsFile};
@@ -28,7 +28,7 @@ use std::{
     fmt,
     io::{self, BufWriter, IoSlice, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 /// One segment of a collection, open for reads.
@@ -41,8 +41,6 @@ pub(crate) struct SegmentHandle {
     // handle enqueues the removal.
     reader: SegmentReader<VfsSource>,
     file: FileHandle,
-    /// Planner statistics of the legacy read adapter, computed on first use.
-    pub(crate) legacy_stats: OnceLock<Arc<crate::legacy::UnitStats>>,
 }
 
 impl SegmentHandle {
@@ -111,7 +109,6 @@ impl SegmentHandle {
             file: FileHandle::new(entry.unit, path, gc),
             entry,
             reader,
-            legacy_stats: OnceLock::new(),
         })
     }
 
@@ -197,11 +194,16 @@ pub(crate) fn segment_corrupt(path: &Path, message: String) -> LogPoseError {
 }
 
 /// Map a segment error on the file at `path` to the typed taxonomy: stored-byte defects are
-/// `Corrupt { kind: Segment }` with the file and region, I/O is `Io`, and anything else is a
+/// `Corrupt { kind: Segment }`, or `Corrupt { kind: Index }` in an index section, with the file
+/// and region, I/O is `Io`, and anything else is a
 /// bug in the engine (`Internal`).
 pub(crate) fn segment_error(path: &Path, error: SegmentError) -> LogPoseError {
     if error.is_corruption() {
-        return segment_corrupt(path, error.to_string());
+        return LogPoseError::Corrupt {
+            kind: error.corruption_kind(),
+            location: Some(path.display().to_string()),
+            message: format!("segment '{}': {error}", path.display()),
+        };
     }
     match error {
         SegmentError::Io(source) => LogPoseError::Io {
@@ -252,6 +254,19 @@ pub(crate) fn write_segment(
     Ok((file, written))
 }
 
+impl crate::engine::CoreRef {
+    /// Build `builder`'s index sections (the engine's [`IndexPolicy`](crate::segment_v2::IndexPolicy))
+    /// on the maintenance pool. Flush and compaction call this before writing a segment.
+    pub(crate) fn build_indexes(&self, builder: &mut SegmentBuilder) -> Result<()> {
+        let policy = self.index;
+        self.runtime()
+            .maintenance
+            .install(|| builder.build_index_sections(&policy))
+            .map(|_| ())
+            .map_err(LogPoseError::from)
+    }
+}
+
 /// Tier 0 holds segments below this many rows; tier `t >= 1` holds
 /// `[BASE_ROWS * RATIO^(t-1), BASE_ROWS * RATIO^t)`.
 const TIER_BASE_ROWS: u64 = 32_768;
@@ -281,12 +296,18 @@ pub(crate) fn manifest_entry(
     let header = &written.header;
     let mut vectors = Vec::new();
     let mut zones = Vec::new();
+    let has_section = |kind: SectionKind, field: FieldId| {
+        written
+            .sections
+            .iter()
+            .any(|entry| entry.kind == kind.code() && entry.field == Some(field))
+    };
     for stats in &written.stats.fields {
         match schema.field_by_id(stats.field) {
             Some(FieldRef::Vector(_)) => vectors.push(VectorSummary {
                 field_id: stats.field.0,
-                has_graph: false,
-                has_sq8: false,
+                has_graph: has_section(SectionKind::VectorGraph, stats.field),
+                has_sq8: has_section(SectionKind::VectorSq8, stats.field),
                 non_null: header.row_count.saturating_sub(stats.null_count),
             }),
             Some(FieldRef::Scalar(_)) => zones.push(FieldZone {

@@ -143,10 +143,38 @@ fn a_compaction_larger_than_the_pool_is_declined() {
     );
     assert_eq!(scheduler.stats().declined, 1);
     assert!(drain(&received).is_empty());
-    // A flush reserves nothing, whatever it is asked for.
+    // A flush is never declined, whatever it reserves.
     ask(&scheduler, JobKind::Flush, 1_000_000, "flush", &granted).expect("request");
     let flush = drain(&received);
-    assert_eq!(flush[0].1.bytes(), 0);
+    assert_eq!(flush[0].1.bytes(), 1_000_000);
+}
+
+/// A flush reserves its build without waiting for the pool (it may overcommit it), and
+/// compactions wait while it runs; compaction reservations alone never exceed the pool.
+#[test]
+fn a_running_flush_reservation_holds_back_compactions_but_never_waits() {
+    let scheduler = MaintenanceScheduler::new(3, 100);
+    let (granted, received) = mpsc::channel();
+    ask(&scheduler, JobKind::Compact, 60, "compaction", &granted).expect("request");
+    let compaction = drain(&received);
+    ask(&scheduler, JobKind::Flush, 70, "flush", &granted).expect("request");
+    let flush = drain(&received);
+    assert_eq!(
+        labels(&flush),
+        ["flush"],
+        "a flush never waits for the pool"
+    );
+    let stats = scheduler.stats();
+    assert_eq!((stats.reserved_bytes, stats.flush_reserved_bytes), (60, 70));
+    drop(compaction);
+    ask(&scheduler, JobKind::Compact, 40, "waits", &granted).expect("request");
+    assert!(drain(&received).is_empty(), "70 + 40 exceeds the pool");
+    drop(flush);
+    let waits = drain(&received);
+    assert_eq!(labels(&waits), ["waits"]);
+    let stats = scheduler.stats();
+    assert_eq!((stats.reserved_bytes, stats.flush_reserved_bytes), (40, 0));
+    assert!(stats.peak_reserved_bytes <= stats.pool_bytes);
 }
 
 #[test]

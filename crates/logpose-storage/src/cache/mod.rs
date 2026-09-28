@@ -172,6 +172,9 @@ pub(crate) struct Inner {
     shards: Box<[Mutex<Shard>]>,
     clocks: [Mutex<VecDeque<Weak<Entry>>>; ArtifactClass::COUNT],
     counters: Counters,
+    /// Usage below which inserts skip their sweep, after a pass ended
+    /// overcommitted; 0 when the last pass reached the budget.
+    sweep_resume_at: AtomicU64,
 }
 
 #[derive(Default)]
@@ -241,6 +244,7 @@ impl BufferCache {
                 shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
                 clocks: Default::default(),
                 counters: Counters::default(),
+                sweep_resume_at: AtomicU64::new(0),
             }),
         }
     }
@@ -542,7 +546,7 @@ impl Inner {
                         key: flight.key,
                         class: flight.class,
                         bytes: Arc::clone(&loaded.bytes),
-                        charge: charge_for(loaded.bytes.len()),
+                        charge: charge_for(loaded.bytes.len()) + loaded.bytes.decoded_heap_bytes(),
                         referenced: AtomicBool::new(false),
                     });
                     self.used[entry.class.index()].fetch_add(entry.charge, Ordering::Relaxed);
@@ -558,8 +562,22 @@ impl Inner {
         }
         flight.complete(outcome);
         if inserted.is_some() {
-            self.evict_to_budget();
+            self.evict_after_insert();
         }
+    }
+
+    /// The sweep an insert runs, with hysteresis: after a pass that ended
+    /// overcommitted (only pinned entries were left to evict), inserts skip
+    /// sweeping until usage grows by a sixty-fourth of the budget past where
+    /// that pass ended. Without it, a query stage that pins a large set makes
+    /// every insert rescan every ring (O(entries) per insert). Usage may
+    /// therefore exceed `budget + pinned` by up to that margin until the next
+    /// sweep; `trim` and `set_budget` always sweep.
+    fn evict_after_insert(&self) {
+        if self.used_total() < self.sweep_resume_at.load(Ordering::Relaxed) {
+            return;
+        }
+        self.evict_to_budget();
     }
 
     /// Evict until within budget, or until nothing is evictable.
@@ -570,6 +588,7 @@ impl Inner {
             let used = self.used_total();
             if used <= budget {
                 self.counters.overcommit_bytes.store(0, Ordering::Relaxed);
+                self.sweep_resume_at.store(0, Ordering::Relaxed);
                 return;
             }
             let Some(class) = self.victim_class(budget, &exhausted) else {
@@ -577,6 +596,8 @@ impl Inner {
                 self.counters
                     .overcommit_bytes
                     .store(used - budget, Ordering::Relaxed);
+                self.sweep_resume_at
+                    .store(used.saturating_add(budget / 64), Ordering::Relaxed);
                 return;
             };
             if !self.evict_one(class) {

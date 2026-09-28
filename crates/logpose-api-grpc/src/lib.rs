@@ -399,6 +399,9 @@ impl GrpcLogPoseService {
                     filters,
                     predicate,
                     explain: explain_mode_from_proto(request.explain)?,
+                    snapshot_token: (!request.snapshot_token.is_empty())
+                        .then_some(request.snapshot_token),
+                    pin: request.pin,
                 },
             )
             .await?;
@@ -430,6 +433,7 @@ impl GrpcLogPoseService {
                 .transpose()?,
             database_name,
             collection_name: request.collection_name,
+            snapshot_token: response.snapshot_token.unwrap_or_default(),
         })
     }
 
@@ -2668,6 +2672,8 @@ mod tests {
             predicate: None,
             explain: proto::ExplainMode::None as i32,
             database_name: default_database_name(),
+            snapshot_token: String::new(),
+            pin: false,
         }
     }
 

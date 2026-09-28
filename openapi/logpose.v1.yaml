@@ -1014,6 +1014,7 @@ components:
       enum: [none, plan, profile]
     QueryPlanKind:
       type: string
+      description: "The plan a search used, summarized over its units: `unfiltered_exact_scan` and `predicate_first_exact` when every unit was scanned exactly (without and with a filter), `vector_first_ann` when segments walked their graphs, `cooperative_filtered_ann` when they walked them under a filter (ACORN-1 style or admit-only), and `hybrid_exact_ann_merge` when graph walks merged with memtable scans. `vector_first_exact` and `tiny_population_exact_fallback` are no longer produced."
       enum:
         - unfiltered_exact_scan
         - predicate_first_exact
@@ -1087,9 +1088,19 @@ components:
           type: integer
           minimum: 1
         snapshot:
+          description: Read exactly this state. It must be the current state, one of the latest states of the current manifest generation, or a state a snapshot token pins; any other fails with `SNAPSHOT_EXPIRED`. Repeatable reads pin a token instead.
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/Snapshot"
+        snapshot_token:
+          description: Read exactly the state this snapshot token pins, and extend the token's expiry. An expired, released, or unknown token fails with `SNAPSHOT_EXPIRED` (409); a malformed one is `INVALID_ARGUMENT`. Cannot be combined with `snapshot`.
+          oneOf:
+            - type: "null"
+            - type: string
+        pin:
+          type: boolean
+          default: false
+          description: Pin the state the query reads under a snapshot token, returned as `snapshot_token`, for repeatable reads. Fails with `TOO_MANY_SNAPSHOTS` (429) past the pin limits.
         read_barrier:
           description: Lower-bound snapshot that the server must already satisfy or reject. Cannot be combined with `snapshot`.
           oneOf:
@@ -1181,6 +1192,7 @@ components:
             - type: string
         unit_scan_mix:
           type: object
+          description: "Units per strategy: `memtable_scan`, `exact_sq8`, `exact_f32`, `graph_admit`, `graph_acorn`, `pruned` (zone maps excluded the filter), and `empty` (no live row matched)."
           additionalProperties:
             type: integer
         stage_timings:
@@ -1207,6 +1219,9 @@ components:
           oneOf:
             - type: "null"
             - $ref: "#/components/schemas/QueryDiagnostics"
+        snapshot_token:
+          description: The token pinning the state read, present when the request pinned or named a token.
+          type: string
     CollectionContext:
       type: object
       required: [database_name, collection_name]
@@ -1312,6 +1327,7 @@ components:
           type: string
         index_kind:
           type: string
+          description: "`raw` for the memtables; for a segment, the vector index its searches use: `hnsw` (graph over SQ8 codes), `sq8` (codes only), or `flat` (f32 only)."
         min_seq_no:
           type: integer
         max_seq_no:

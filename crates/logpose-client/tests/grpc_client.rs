@@ -105,6 +105,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query should succeed");
@@ -115,7 +117,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             .as_ref()
             .expect("diagnostics should be present")
             .chosen_plan,
-        QueryPlanKind::TinyPopulationExactFallback
+        QueryPlanKind::PredicateFirstExact
     );
     let diagnostics = query
         .diagnostics
@@ -126,13 +128,10 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .stage_timings
         .as_ref()
         .expect("profile mode should include timings");
-    assert!(timings.planning_micros > 0);
-    assert!(timings.prefilter_micros > 0);
-    assert!(timings.rerank_micros > 0);
+    assert_eq!(timings.prefilter_micros, 0);
     assert!(diagnostics.candidates_merged >= 1);
-    assert!(diagnostics.candidates_reranked >= 1);
     assert_eq!(
-        diagnostics.unit_scan_mix.get("mutable_exact").copied(),
+        diagnostics.unit_scan_mix.get("memtable_scan").copied(),
         Some(1)
     );
 
@@ -202,7 +201,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .iter()
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be present");
-    assert_eq!(immutable.index_kind, "exact");
+    // Two rows are too few for SQ8 codes or a graph.
+    assert_eq!(immutable.index_kind, "flat");
     assert!(
         immutable
             .artifact_stats
@@ -228,6 +228,8 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("hybrid query should succeed");
@@ -236,23 +238,21 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .diagnostics
         .as_ref()
         .expect("hybrid query should include diagnostics");
+    // Without a segment graph, every unit is scanned exactly.
     assert_eq!(
         hybrid_diagnostics.chosen_plan,
-        QueryPlanKind::HybridExactAnnMerge
+        QueryPlanKind::UnfilteredExactScan
     );
     assert!(hybrid_diagnostics.candidates_merged >= 1);
     assert!(hybrid_diagnostics.candidates_reranked >= 1);
     assert_eq!(
-        hybrid_diagnostics
-            .unit_scan_mix
-            .get("immutable_ann")
-            .copied(),
+        hybrid_diagnostics.unit_scan_mix.get("exact_f32").copied(),
         Some(1)
     );
     assert_eq!(
         hybrid_diagnostics
             .unit_scan_mix
-            .get("mutable_exact")
+            .get("memtable_scan")
             .copied(),
         Some(1)
     );
@@ -260,9 +260,7 @@ async fn grpc_client_runs_metadata_and_collection_workflows() {
         .stage_timings
         .as_ref()
         .expect("hybrid profile should include timings");
-    assert!(hybrid_timings.candidate_generation_micros > 0);
-    assert!(hybrid_timings.merge_micros > 0);
-    assert!(hybrid_timings.rerank_micros > 0);
+    assert_eq!(hybrid_timings.merge_micros, 0);
 
     let inspect = client
         .inspect(&qualified, InspectTarget::Manifest)
@@ -607,7 +605,7 @@ async fn grpc_client_surfaces_data_only_collection_creation_failures() {
 }
 
 #[tokio::test]
-async fn grpc_client_round_trips_cooperative_filtered_ann() {
+async fn grpc_client_round_trips_filtered_segment_scan_diagnostics() {
     let temp_root = unique_temp_dir("client-grpc-cooperative");
     let grpc_addr = reserve_local_addr();
     let rest_addr = reserve_local_addr();
@@ -662,6 +660,8 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
                 value: Some(ScalarMetadataValue::String("keep".to_owned())),
             })),
             explain: ExplainMode::Profile,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("query should succeed");
@@ -675,42 +675,27 @@ async fn grpc_client_round_trips_cooperative_filtered_ann() {
         vec!["doc-8", "doc-4"]
     );
     let diagnostics = response.diagnostics.expect("diagnostics should be present");
-    assert_eq!(
-        diagnostics.chosen_plan,
-        QueryPlanKind::CooperativeFilteredAnn
-    );
-    assert_eq!(
-        diagnostics.planner_reason,
-        "filtered ann traversal is cheaper than exact scan for this selectivity"
-    );
+    // Twelve rows make a segment without SQ8 codes or a graph: an exact f32 scan of the
+    // three rows the filter matches.
+    assert_eq!(diagnostics.chosen_plan, QueryPlanKind::PredicateFirstExact);
+    assert!(diagnostics.planner_reason.contains("exact_f32"));
     assert!((diagnostics.estimated_selectivity - 0.25).abs() <= f32::EPSILON);
-    assert_eq!(diagnostics.units_considered, 2);
+    assert!(diagnostics.units_considered >= 1);
     assert_eq!(diagnostics.units_pruned, 0);
     assert_eq!(diagnostics.units_scanned, 1);
     assert!(diagnostics.candidates_before_filter >= response.returned);
     assert!(diagnostics.candidates_after_filter >= response.returned);
     assert!(diagnostics.candidates_after_filter <= diagnostics.candidates_before_filter);
-    assert_eq!(
-        diagnostics.candidates_merged,
-        diagnostics.candidates_reranked
-    );
     assert!(diagnostics.candidates_merged >= response.returned);
     assert_eq!(diagnostics.rerank_count, 1);
-    assert_eq!(
-        diagnostics.unit_scan_mix.get("immutable_ann").copied(),
-        Some(1)
-    );
-    assert!(diagnostics.fallback_reason.is_none());
+    assert_eq!(diagnostics.unit_scan_mix.get("exact_f32").copied(), Some(1));
+    assert!(diagnostics.fallback_reason.is_some());
     let timings = diagnostics
         .stage_timings
         .as_ref()
         .expect("profile mode should include timings");
-    assert!(timings.planning_micros > 0);
     assert_eq!(timings.prefilter_micros, 0);
-    assert!(timings.candidate_generation_micros > 0);
-    assert!(timings.postfilter_micros > 0);
-    assert!(timings.rerank_micros > 0);
-    assert!(timings.merge_micros > 0);
+    assert_eq!(timings.merge_micros, 0);
 
     server.abort();
     let _ = server.await;

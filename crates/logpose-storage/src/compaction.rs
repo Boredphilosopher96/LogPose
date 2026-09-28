@@ -123,6 +123,7 @@ impl CoreRef {
         } else {
             let path = segment_path(dir, unit);
             ticket.writing_files();
+            self.build_indexes(&mut builder)?;
             let (file, written) = write_segment(vfs, &path, builder)?;
             let segments = dir.join(SEGMENTS_DIR);
             vfs.sync_dir(&segments).map_err(|error| {
@@ -207,6 +208,19 @@ impl Default for CompactionConfig {
 /// percent of structure.
 const GRAPH_BYTES_PER_ROW: u64 = 141;
 
+/// Bytes an index build holds per row and vector dimension beyond the stored rows: an f32 copy
+/// of every vector (the SQ8 training set, then the graph's input) beside the finished SQ8 code.
+const VECTOR_INDEX_BYTES_PER_DIM: u64 = 5;
+
+/// Bytes a graph build holds per row and vector field besides its input: the neighbour lists
+/// while it links, then the lists and two serialized copies while it encodes, plus the node map
+/// (`3 * 141 + 64`).
+const GRAPH_BUILD_BYTES_PER_ROW: u64 = 3 * GRAPH_BYTES_PER_ROW + 64;
+
+/// Bytes a scalar index build holds per row and indexed scalar field: its `(key, row)` pairs
+/// while it sorts them, then the encoded postings.
+const SCALAR_INDEX_BYTES_PER_ROW: u64 = 32;
+
 /// What the policy knows about one segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Candidate {
@@ -240,6 +254,8 @@ pub(crate) struct RowShape {
     pub(crate) vector_fields: u64,
     /// Sum of their dimensions.
     pub(crate) vector_dims: u64,
+    /// Scalar fields with an inverted or sorted index.
+    pub(crate) indexed_scalar_fields: u64,
 }
 
 impl RowShape {
@@ -251,27 +267,49 @@ impl RowShape {
                 .iter()
                 .map(|field| u64::from(field.dimensions))
                 .sum(),
+            indexed_scalar_fields: schema
+                .fields()
+                .iter()
+                .filter(|field| field.index.has_inverted() || field.index.has_sorted())
+                .count() as u64,
         }
+    }
+
+    /// Bytes the index-section build holds per output row beyond the rows themselves: SQ8
+    /// codes and an f32 copy of the vectors, the graph's build and encoding, and the scalar
+    /// indexes' pairs and postings. Measured with a counting allocator (`SegmentBuilder::
+    /// build_index_sections` at the default policy): 864 bytes per row at 128 dimensions
+    /// (this charges 1,127), 4,064 at 768 (4,327), and 934 at 128 dimensions with three indexed
+    /// scalar fields (1,223).
+    pub(crate) fn index_bytes_per_row(self) -> u64 {
+        self.vector_dims * VECTOR_INDEX_BYTES_PER_DIM
+            + self.vector_fields * GRAPH_BUILD_BYTES_PER_ROW
+            + self.indexed_scalar_fields * SCALAR_INDEX_BYTES_PER_ROW
     }
 }
 
 /// Memory a build of `inputs` holds: every copied row as stored (vectors, scalar columns, and
-/// keys, from the input files' bytes per row), plus the graph under construction for each
-/// vector field (`32 * 4 * 1.1` bytes per row), plus the input being read. The build reads one
-/// input at a time with every section loaded whole, deleted rows included, so the largest
-/// input's file is charged in full: a rewrite of a mostly deleted segment holds far more than
-/// its live rows.
+/// keys, from the input files' bytes per row), plus the index sections' build for each row
+/// ([`RowShape::index_bytes_per_row`]), plus the input being read. The build reads one input at
+/// a time with every section loaded whole, deleted rows included, so the largest input's file
+/// is charged in full: a rewrite of a mostly deleted segment holds far more than its live rows.
 pub(crate) fn build_bytes(inputs: &[Candidate], shape: RowShape) -> u64 {
     let output = inputs
         .iter()
         .map(|input| {
-            let per_row = input.file_len / u64::from(input.rows.max(1))
-                + shape.vector_fields * GRAPH_BYTES_PER_ROW;
+            let per_row =
+                input.file_len / u64::from(input.rows.max(1)) + shape.index_bytes_per_row();
             input.live().saturating_mul(per_row)
         })
         .fold(0_u64, u64::saturating_add);
     let largest_input = inputs.iter().map(|input| input.file_len).max().unwrap_or(0);
     output.saturating_add(largest_input)
+}
+
+/// Memory a flush of a memtable of `slots` slots and `payload` bytes holds beyond the memtable:
+/// the segment builder's copy of the rows, and the index sections' build.
+pub(crate) fn flush_build_bytes(slots: u32, payload: u64, shape: RowShape) -> u64 {
+    payload.saturating_add(u64::from(slots).saturating_mul(shape.index_bytes_per_row()))
 }
 
 /// Why a job was planned.

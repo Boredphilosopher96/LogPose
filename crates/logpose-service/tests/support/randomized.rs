@@ -357,6 +357,7 @@ impl ExpectedModel {
             snapshot,
             matches,
             diagnostics: None,
+            snapshot_token: None,
         }
     }
 
@@ -774,6 +775,8 @@ async fn assert_snapshot_expired_everywhere(
         filters: Vec::new(),
         predicate: None,
         explain: ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     };
     let error = state.query(request).await.err().unwrap_or_else(|| {
         panic_with_context(seed, trace, "a superseded snapshot was queried".to_owned())
@@ -835,6 +838,8 @@ async fn assert_snapshot_expired_everywhere(
             predicate: None,
             explain: proto::ExplainMode::None as i32,
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .err()
@@ -874,6 +879,8 @@ async fn assert_query_parity(
         filters: Vec::new(),
         predicate: keep_only.then(keep_only_predicate),
         explain: ExplainMode::None,
+        snapshot_token: None,
+        pin: false,
     };
     let actual = state.query(request.clone()).await.unwrap_or_else(|error| {
         panic_with_context(seed, trace, format!("service query failed: {error}"))
@@ -945,6 +952,8 @@ async fn assert_query_parity(
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::None as i32,
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .unwrap_or_else(|error| {
@@ -1100,6 +1109,8 @@ async fn assert_query_parity(
             predicate: keep_only.then(keep_only_proto_predicate),
             explain: proto::ExplainMode::Profile as i32,
             database_name: DEFAULT_DATABASE_NAME.to_owned(),
+            snapshot_token: String::new(),
+            pin: false,
         }))
         .await
         .unwrap_or_else(|error| {

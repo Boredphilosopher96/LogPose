@@ -1403,6 +1403,8 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("promoted owner should fail closed on pre-promotion read barriers");
@@ -1420,6 +1422,8 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect_err("promoted owner should fail closed on post-promotion read barriers too");
@@ -1437,6 +1441,8 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
             filters: Vec::new(),
             predicate: None,
             explain: ExplainMode::None,
+            snapshot_token: None,
+            pin: false,
         })
         .await
         .expect("exact snapshots should remain readable after promotion");

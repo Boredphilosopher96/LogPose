@@ -75,3 +75,11 @@ panic = "warn"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
+
+# Graph builds and distance kernels dominate the read-path tests; optimize the index crate and
+# its SIMD dependency even in dev and test builds.
+[profile.dev.package.logpose-index]
+opt-level = 3
+
+[profile.dev.package.pulp]
+opt-level = 3
