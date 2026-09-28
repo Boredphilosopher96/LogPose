@@ -77,8 +77,8 @@ default.
 
 ## Vector Index
 
-The optional `[index]` table sets the HNSW graph parameters that flush and
-compaction use when they build a segment's vector graph, for every collection
+The optional `[index]` table sets the HNSW graph parameters that the background
+index build uses when it builds a segment's vector graph, for every collection
 on the node:
 
 ```toml
@@ -93,9 +93,12 @@ hnsw_ef_construction = 128   # build-time beam width; the default
   more slowly.
 
 A change applies to graphs built after it; existing segments keep their graphs
-until compaction rewrites them. Segments with fewer than 20,000 vectors get no
-graph and are searched exactly. The search-time beam width is per query (`ef`
-on the query request).
+until compaction rewrites them. Flush and compaction write a segment without a
+graph; a background index build adds it once the segment has 20,000 vectors, or
+at any size once the collection took no write for 10 seconds (an explicit
+compaction builds every missing graph before it answers). Until then the segment
+is searched over its SQ8 codes. The search-time beam width is per query (`ef` on
+the query request).
 
 ## Storage Engine
 
@@ -105,14 +108,14 @@ The storage engine's settings are built in; `LOGPOSE_CONFIG` sets only `storage_
 | --- | --- |
 | Engine memory budget (memtables, primary-key indexes, maintenance, and the buffer cache of segment sections) | 4 GiB |
 | Memtable reservation, engine-wide | an eighth of the budget |
-| Maintenance memory for flush and compaction builds | a fifth of the budget |
+| Maintenance memory for flush, compaction, and index builds | a fifth of the budget |
 | Memtable flush triggers | 64 MiB, 1,000,000 rows, or 10 minutes |
-| Frozen memtables before writes wait | 2; a write that waits 30 seconds fails with `WRITE_STALLED` |
+| Frozen memtables before writes wait | 2; a write that waits 10 seconds fails with `WRITE_STALLED` |
 | WAL file size before rotation | 64 MiB |
 | Group commit | up to 256 requests or 16 MiB per group, no added delay |
-| Compaction tiers | 32,768 live rows times powers of four; merges of 4 to 10 segments, at most 2,000,000 rows or 8 GiB |
-| Index sections | SQ8 codes from 1,024 rows, an HNSW graph (built with the `[index]` parameters) from 20,000 distinct vectors, and the scalar indexes each typed field declares |
-| Threads | 8 I/O threads, one query thread per core, a maintenance thread per four cores, 2 writer threads |
+| Compaction tiers | 32,768 live rows times powers of four; merges of 4 to 10 segments, at most 2,000,000 rows or 8 GiB, and small enough for the output's graph build to fit the maintenance memory; after 10 seconds without writes, segments below 20,000 rows merge together |
+| Index sections | SQ8 codes from 1,024 rows and the scalar indexes each typed field declares, written with the segment; an HNSW graph (built with the `[index]` parameters) in an index sidecar that a background index build writes from 20,000 vectors, or from any number once the collection is quiet |
+| Threads | 8 I/O threads, one query thread per core, a graph-building maintenance thread per two cores, 2 writer threads |
 
 Each collection's descriptor also carries its own flush and compaction thresholds, set when it is created: `flush_threshold_ops` (10,000 operations), `flush_threshold_bytes` (64 MiB, capped by the engine's memtable size), and `compaction_threshold_segments` (4 segments of one tier).
 

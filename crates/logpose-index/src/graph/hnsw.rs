@@ -159,7 +159,18 @@ impl HnswGraph {
         source: &V,
         params: HnswParams,
     ) -> Result<Self, GraphError> {
-        build::build_parallel(source, params)
+        build::build_parallel(source, params, &|| false)
+    }
+
+    /// [`build_parallel`](Self::build_parallel) that stops early once `cancelled` returns
+    /// `true`. It is polled before every insert, so a build stops within about one insert per
+    /// thread of being cancelled, and then returns [`GraphError::Cancelled`].
+    pub fn build_parallel_cancellable<V: VectorSource + ?Sized>(
+        source: &V,
+        params: HnswParams,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, GraphError> {
+        build::build_parallel(source, params, cancelled)
     }
 
     /// Inserts `row`, which must equal [`Self::len`] (rows are dense and

@@ -120,7 +120,7 @@ impl Generator {
             if jobs.is_empty() {
                 weights.extend([(30, Kind::Flush), (20, Kind::Compact)]);
             }
-            let mut stepped = vec![JobKind::Compact];
+            let mut stepped = vec![JobKind::Compact, JobKind::Index];
             if setup.maintenance == Maintenance::Stepped {
                 stepped.push(JobKind::Flush);
             }

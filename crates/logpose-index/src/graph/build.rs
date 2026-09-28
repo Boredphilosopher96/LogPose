@@ -1,6 +1,6 @@
 //! Insertion, the neighbor-selection heuristic and the parallel builder.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use rayon::prelude::*;
@@ -358,6 +358,7 @@ fn insert_shared<V: VectorSource + ?Sized>(
 pub(super) fn build_parallel<V: VectorSource + ?Sized>(
     source: &V,
     params: HnswParams,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<HnswGraph, GraphError> {
     params.validate()?;
     let rows = source.len();
@@ -392,9 +393,13 @@ pub(super) fn build_parallel<V: VectorSource + ?Sized>(
     let mut scratch = SearchScratch::new();
     let warmup = rows.min(PARALLEL_WARMUP_ROWS) as u32;
     for row in (0..warmup).filter(|row| *row != entry) {
+        if cancelled() {
+            return Err(GraphError::Cancelled);
+        }
         insert_shared(&shared, source, &params, target(row), &mut scratch);
     }
 
+    let stop = AtomicBool::new(false);
     let pool: Vec<Mutex<SearchScratch>> = (0..=rayon::current_num_threads())
         .map(|_| Mutex::new(SearchScratch::new()))
         .collect();
@@ -402,6 +407,11 @@ pub(super) fn build_parallel<V: VectorSource + ?Sized>(
         .into_par_iter()
         .filter(|row| *row != entry)
         .for_each(|row| {
+            // Once cancelled, the remaining rows are skipped (each costs one poll).
+            if stop.load(Ordering::Relaxed) || cancelled() {
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
             let slot = rayon::current_thread_index()
                 .and_then(|index| pool.get(index))
                 .or_else(|| pool.last());
@@ -411,6 +421,9 @@ pub(super) fn build_parallel<V: VectorSource + ?Sized>(
             }
         });
 
+    if stop.load(Ordering::Relaxed) {
+        return Err(GraphError::Cancelled);
+    }
     let mut graph = shared.freeze();
     graph.set_entry(Some(entry), top as u8);
     Ok(graph)

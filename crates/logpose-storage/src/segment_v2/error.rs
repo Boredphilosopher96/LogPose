@@ -204,6 +204,10 @@ pub enum SegmentError {
     /// A value or the schema could not be encoded.
     #[error("failed to encode segment data: {0}")]
     Encode(String),
+    /// An index build was cancelled before it finished (the engine cancels a graph build whose
+    /// segment a compaction takes, or on drop and shutdown).
+    #[error("the index build was cancelled")]
+    Cancelled,
     /// An index section was added twice for the same kind and field.
     #[error("an index section of kind {kind:?} for field {field} was already added")]
     DuplicateIndexSection {
@@ -280,6 +284,7 @@ impl From<SegmentError> for LogPoseError {
                 context: "segment I/O failed".to_owned(),
                 source,
             },
+            SegmentError::Cancelled => LogPoseError::unavailable("the index build was cancelled"),
             // Every other variant rejects builder input that the engine produced itself.
             other => LogPoseError::internal(other.to_string()),
         }

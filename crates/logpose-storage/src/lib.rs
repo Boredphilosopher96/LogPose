@@ -32,7 +32,8 @@
 //! - `tokens`, `clock`: snapshot tokens, their reaper, and the injectable clock.
 //! - `segment_v2`: the segment file format, builder, and reader.
 //! - `cache`: the buffer cache of segment section bytes that segment readers load through.
-//! - `flush`, `compaction`, `maintenance`, `scheduler`: maintenance jobs, the size-tiered
+//! - `flush`, `compaction`, `index_build`, `maintenance`, `scheduler`: maintenance jobs (the
+//!   index build adds a segment's vector graphs after it is written), the size-tiered
 //!   compaction policy, flush triggers, and the engine-wide scheduler of job permits.
 //! - `stepped`: maintenance jobs whose begin, build, and commit the caller runs one at a time,
 //!   for deterministic-interleaving tests.
@@ -56,6 +57,7 @@ mod flush;
 mod fs_util;
 mod gc;
 mod handle;
+mod index_build;
 mod inspect;
 mod maintenance;
 mod manifest;

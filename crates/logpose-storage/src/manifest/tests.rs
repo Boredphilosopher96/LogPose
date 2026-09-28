@@ -35,6 +35,11 @@ fn segment(unit: u32) -> ManifestSegment {
             cardinality: 1,
             covered_seq_no: 9,
         }),
+        index: Some(crate::manifest::IndexRef {
+            unit: UnitId(unit + 7),
+            file_len: 512,
+            footer_crc: 0x0bad_cafe,
+        }),
         vectors: vec![VectorSummary {
             field_id: 1,
             has_graph: false,

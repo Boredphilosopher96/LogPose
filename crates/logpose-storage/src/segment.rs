@@ -1,20 +1,26 @@
 //! The engine's view of one segment v2 file: [`SegmentHandle`], and writing a new segment file
-//! through the `Vfs`.
+//! (or an index sidecar) through the `Vfs`.
 //!
 //! A handle owns the open file (a [`SegmentReader`] over a [`VfsSource`]), the file's buffer
 //! cache registration (dropped with the reader, which invalidates the file's cached units), and
 //! its [`FileHandle`], which removes the file once the writer marked it obsolete and the last
 //! `Version` holding it is gone (I7). Handles are shared by the writer's state and every
 //! `Version` that contains the segment.
+//!
+//! Once the segment's index build commits, the writer replaces its handle with one over the
+//! same open segment file plus the index sidecar ([`SegmentHandle::with_index`]). Versions
+//! published before hold the old handle, which shares the segment file, so the file is removed
+//! only after the last handle of either kind is gone; the sidecar has its own [`FileHandle`],
+//! which the writer marks obsolete with the segment's.
 
 use crate::{
     cache::BufferCache,
     gc::{FileHandle, GcQueue},
-    manifest::{FieldZone, ManifestSegment, SegmentOrigin, VectorSummary},
-    paths::segment_path,
+    manifest::{FieldZone, IndexRef, ManifestSegment, SegmentOrigin, VectorSummary},
+    paths::{index_path, segment_path},
     segment_v2::{
-        PkColumn, SectionKind, SegmentBuilder, SegmentError, SegmentReader, SegmentRow, StatValue,
-        VfsSource, WrittenSegment,
+        IndexSection, PkColumn, SectionKind, SegmentBuilder, SegmentError, SegmentReader,
+        SegmentRow, StatValue, VfsSource, WrittenSegment, WrittenSidecar, write_index_sidecar,
     },
 };
 use logpose_types::{
@@ -31,22 +37,43 @@ use std::{
     sync::Arc,
 };
 
-/// One segment of a collection, open for reads.
-pub(crate) struct SegmentHandle {
-    pub(crate) unit: UnitId,
-    /// The manifest entry the segment was committed with. Its `dv` is the one in force when the
-    /// handle was opened; the writer's durable manifest is the source of truth for DV files.
-    pub(crate) entry: ManifestSegment,
+/// One open file in the segment format (a segment or an index sidecar): its reader, attached to
+/// the buffer cache, and its GC handle.
+pub(crate) struct OpenFile {
     // Field order matters: the reader (and its cache registration) is released before the file
     // handle enqueues the removal.
     reader: SegmentReader<VfsSource>,
     file: FileHandle,
 }
 
+impl OpenFile {
+    pub(crate) fn reader(&self) -> &SegmentReader<VfsSource> {
+        &self.reader
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+/// One segment of a collection, open for reads.
+pub(crate) struct SegmentHandle {
+    pub(crate) unit: UnitId,
+    /// The manifest entry the segment was committed with (or gained its index sidecar with).
+    /// Its `dv` is the one in force when the handle was opened; the writer's durable manifest is
+    /// the source of truth for DV files.
+    pub(crate) entry: ManifestSegment,
+    /// The segment file, shared by every handle of the unit.
+    data: Arc<OpenFile>,
+    /// The index sidecar the manifest entry names, if any.
+    index: Option<Arc<OpenFile>>,
+}
+
 impl SegmentHandle {
-    /// Open the segment `entry` names in the collection directory `dir`: read and verify its
-    /// header, footer, section table, and schema snapshot, and check them against the manifest
-    /// entry and the collection. Loads go through `cache`.
+    /// Open the segment `entry` names in the collection directory `dir`, and its index sidecar
+    /// if the entry names one: read and verify their headers, footers, section tables, and schema
+    /// snapshots, and check them against the manifest entry and the collection. Loads go
+    /// through `cache`.
     pub(crate) fn open(
         vfs: &dyn Vfs,
         dir: &Path,
@@ -56,20 +83,23 @@ impl SegmentHandle {
         gc: GcQueue,
     ) -> Result<Self> {
         let path = segment_path(dir, entry.unit);
-        let file = vfs.open(&path, OpenMode::Read).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                segment_corrupt(
-                    &path,
-                    "the file the manifest names does not exist".to_owned(),
-                )
-            } else {
-                LogPoseError::io(format!("failed to open '{}'", path.display()), error)
-            }
-        })?;
-        Self::from_file(file, path, collection_id, entry, cache, gc)
+        let file = open_named(vfs, &path, CorruptionKind::Segment)?;
+        let index = entry.index;
+        let segment = Self::from_file(file, path, collection_id, entry, cache, gc.clone())?;
+        let Some(reference) = index else {
+            return Ok(segment);
+        };
+        let path = index_path(dir, segment.unit, reference.unit);
+        let file = open_named(vfs, &path, CorruptionKind::Index)?;
+        let sidecar = segment.index_from_file(file, path, reference, cache, gc)?;
+        Ok(Self {
+            index: Some(Arc::new(sidecar)),
+            ..segment
+        })
     }
 
-    /// Wrap an open segment file, checking it against its manifest entry.
+    /// Wrap an open segment file, checking it against its manifest entry. The handle has no
+    /// index sidecar.
     pub(crate) fn from_file(
         file: Arc<dyn VfsFile>,
         path: PathBuf,
@@ -88,6 +118,9 @@ impl SegmentHandle {
                 format!("{what} does not match the manifest"),
             ))
         };
+        if header.is_index_sidecar() {
+            return mismatch("an index sidecar's header".to_owned());
+        }
         if header.unit_id != entry.unit.0 {
             return mismatch(format!("unit id {:08x}", header.unit_id));
         }
@@ -106,10 +139,73 @@ impl SegmentHandle {
         }
         Ok(Self {
             unit: entry.unit,
-            file: FileHandle::new(entry.unit, path, gc),
+            data: Arc::new(OpenFile {
+                file: FileHandle::new(entry.unit, path, gc),
+                reader,
+            }),
             entry,
+            index: None,
+        })
+    }
+
+    /// Wrap an open index sidecar of this segment, checking it against `reference` and against
+    /// the segment's own header: a sidecar carries the header of the segment it indexes.
+    pub(crate) fn index_from_file(
+        &self,
+        file: Arc<dyn VfsFile>,
+        path: PathBuf,
+        reference: IndexRef,
+        cache: &BufferCache,
+        gc: GcQueue,
+    ) -> Result<OpenFile> {
+        let reader = SegmentReader::open(VfsSource(file))
+            .map_err(|error| index_error(&path, error))?
+            .with_cache(cache);
+        let header = reader.header();
+        let segment = self.reader().header();
+        let mismatch = |what: &str| {
+            Err(LogPoseError::Corrupt {
+                kind: CorruptionKind::Index,
+                location: Some(path.display().to_string()),
+                message: format!(
+                    "index sidecar '{}': {what} does not match its segment and manifest",
+                    path.display()
+                ),
+            })
+        };
+        if !header.is_index_sidecar() {
+            return mismatch("the header flags");
+        }
+        let same_segment = header.collection_id == segment.collection_id
+            && header.unit_id == segment.unit_id
+            && header.row_count == segment.row_count
+            && header.schema_version == segment.schema_version
+            && header.schema_hash == segment.schema_hash
+            && header.min_seq_no == segment.min_seq_no
+            && header.max_seq_no == segment.max_seq_no;
+        if !same_segment {
+            return mismatch("the header");
+        }
+        if reader.file_len() != reference.file_len
+            || reader.footer().footer_crc != reference.footer_crc
+        {
+            return mismatch("the file length or footer checksum");
+        }
+        Ok(OpenFile {
+            file: FileHandle::new(reference.unit, path, gc),
             reader,
         })
+    }
+
+    /// This segment with the index sidecar `index` and the manifest entry that names it: a new
+    /// handle over the same open segment file.
+    pub(crate) fn with_index(&self, index: Arc<OpenFile>, entry: ManifestSegment) -> Self {
+        Self {
+            unit: self.unit,
+            entry,
+            data: Arc::clone(&self.data),
+            index: Some(index),
+        }
     }
 
     pub(crate) fn row_count(&self) -> u32 {
@@ -117,22 +213,61 @@ impl SegmentHandle {
     }
 
     pub(crate) fn reader(&self) -> &SegmentReader<VfsSource> {
-        &self.reader
+        &self.data.reader
+    }
+
+    /// The index sidecar, if the segment has one.
+    pub(crate) fn index_file(&self) -> Option<&OpenFile> {
+        self.index.as_deref()
+    }
+
+    /// The segment file itself.
+    pub(crate) fn data_file(&self) -> &OpenFile {
+        &self.data
+    }
+
+    /// The file holding the section of `kind` for `field`: the index sidecar for a vector
+    /// graph, the segment file for everything else. `None` for a graph the segment has not
+    /// gained yet.
+    pub(crate) fn section_file(
+        &self,
+        kind: SectionKind,
+        field: Option<FieldId>,
+    ) -> Option<&OpenFile> {
+        match (kind, field) {
+            (SectionKind::VectorGraph, Some(field)) => self.graph_file(field),
+            (SectionKind::VectorGraph, None) => None,
+            _ => Some(&self.data),
+        }
+    }
+
+    /// The file holding `field`'s vector graph, if the segment has one: its index sidecar.
+    pub(crate) fn graph_file(&self, field: FieldId) -> Option<&OpenFile> {
+        self.index.as_deref().filter(|index| {
+            index
+                .reader()
+                .find_section(SectionKind::VectorGraph, Some(field))
+                .is_some()
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
-        self.file.path()
+        self.data.path()
     }
 
-    /// Mark the file for removal once the last holder drops it. Only the writer calls this,
-    /// only after the manifest that drops the segment is durable.
+    /// Mark the segment file, and its index sidecar if any, for removal once the last holder
+    /// drops them. Only the writer calls this, only after the manifest that drops the segment
+    /// is durable.
     pub(crate) fn mark_obsolete(&self) {
-        self.file.mark_obsolete();
+        self.data.file.mark_obsolete();
+        if let Some(index) = &self.index {
+            index.file.mark_obsolete();
+        }
     }
 
     /// Every row, read around the cache (a full scan must not evict hot data).
     pub(crate) fn read_rows(&self) -> Result<Vec<SegmentRow>> {
-        self.reader
+        self.reader()
             .read_rows()
             .map_err(|error| segment_error(self.path(), error))
     }
@@ -155,7 +290,7 @@ impl SegmentHandle {
                 Self::Segment(error)
             }
         }
-        self.reader
+        self.reader()
             .for_each_row(wanted, |row, stored| {
                 visit(row, stored).map_err(Stop::Visit)
             })
@@ -167,10 +302,41 @@ impl SegmentHandle {
 
     /// Keys and sequence numbers in row order, read around the cache.
     pub(crate) fn keys(&self) -> Result<(PkColumn, Vec<SeqNo>)> {
-        self.reader
+        self.reader()
             .keys_uncached()
             .map_err(|error| segment_error(self.path(), error))
     }
+}
+
+/// Open a file a manifest names; a missing file is corruption of `kind`.
+fn open_named(vfs: &dyn Vfs, path: &Path, kind: CorruptionKind) -> Result<Arc<dyn VfsFile>> {
+    vfs.open(path, OpenMode::Read).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            LogPoseError::Corrupt {
+                kind,
+                location: Some(path.display().to_string()),
+                message: format!(
+                    "'{}': the file the manifest names does not exist",
+                    path.display()
+                ),
+            }
+        } else {
+            LogPoseError::io(format!("failed to open '{}'", path.display()), error)
+        }
+    })
+}
+
+/// Map a segment-format error on the index sidecar at `path`: stored-byte defects are
+/// `Corrupt { kind: Index }`, the rest as [`segment_error`].
+pub(crate) fn index_error(path: &Path, error: SegmentError) -> LogPoseError {
+    if error.is_corruption() {
+        return LogPoseError::Corrupt {
+            kind: CorruptionKind::Index,
+            location: Some(path.display().to_string()),
+            message: format!("index sidecar '{}': {error}", path.display()),
+        };
+    }
+    segment_error(path, error)
 }
 
 impl fmt::Debug for SegmentHandle {
@@ -179,7 +345,8 @@ impl fmt::Debug for SegmentHandle {
             .debug_struct("SegmentHandle")
             .field("unit", &self.unit)
             .field("rows", &self.entry.row_count)
-            .field("file", &self.file)
+            .field("file", &self.data.file)
+            .field("index", &self.index.as_ref().map(|index| &index.file))
             .finish()
     }
 }
@@ -254,14 +421,43 @@ pub(crate) fn write_segment(
     Ok((file, written))
 }
 
+/// Write the index sidecar of `segment` as the new file `path` (`CreateNew`, buffered appends,
+/// `sync_all`) and return the open file with what was written. The caller syncs `segments/`
+/// before a manifest names the file.
+pub(crate) fn write_index_file(
+    vfs: &dyn Vfs,
+    path: &Path,
+    segment: &SegmentReader<VfsSource>,
+    sections: &[IndexSection],
+) -> Result<(Arc<dyn VfsFile>, WrittenSidecar)> {
+    let io_error =
+        |what: &str, error| LogPoseError::io(format!("{what} '{}'", path.display()), error);
+    let schema = segment
+        .schema_snapshot_bytes()
+        .map_err(|error| segment_error(path, error))?;
+    let file = vfs
+        .open(path, OpenMode::CreateNew)
+        .map_err(|error| io_error("failed to create", error))?;
+    let mut out = BufWriter::with_capacity(1 << 20, AppendWriter(Arc::clone(&file)));
+    let written = write_index_sidecar(segment.header(), &schema, sections, &mut out)
+        .map_err(|error| index_error(path, error))?;
+    out.flush()
+        .map_err(|error| io_error("failed to write", error))?;
+    drop(out);
+    file.sync_all()
+        .map_err(|error| io_error("failed to sync", error))?;
+    Ok((file, written))
+}
+
 impl crate::engine::CoreRef {
-    /// Build `builder`'s index sections (the engine's [`IndexPolicy`](crate::segment_v2::IndexPolicy))
-    /// on the maintenance pool. Flush and compaction call this before writing a segment.
+    /// Build `builder`'s own index sections (SQ8 codes and scalar indexes, per the engine's
+    /// [`IndexPolicy`](crate::segment_v2::IndexPolicy)) on the calling job thread. Flush and
+    /// compaction call this before writing a segment. It is one or two passes over the rows,
+    /// so it never waits behind a graph build on the maintenance pool; graphs come later from
+    /// the segment's index-build job.
     pub(crate) fn build_indexes(&self, builder: &mut SegmentBuilder) -> Result<()> {
-        let policy = self.index;
-        self.runtime()
-            .maintenance
-            .install(|| builder.build_index_sections(&policy))
+        builder
+            .build_index_sections(&self.index)
             .map(|_| ())
             .map_err(LogPoseError::from)
     }
@@ -333,6 +529,7 @@ pub(crate) fn manifest_entry(
         origin,
         tier: tier_for(u64::from(header.row_count)),
         dv: None,
+        index: None,
         vectors,
         zones,
     }

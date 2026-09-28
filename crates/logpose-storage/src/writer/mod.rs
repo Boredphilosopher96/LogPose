@@ -63,19 +63,20 @@ use crate::{
     engine::CoreRef,
     handle::{CollectionHandle, PoisonKind},
     maintenance::should_flush,
-    manifest::{DvRef, Manifest, ManifestSegment},
+    manifest::{DvRef, IndexRef, Manifest, ManifestSegment},
     memtable::MemtableData,
     paths::segment_path,
     read::{FetchPlan, ReadView, RowSetResolver, SectionNeed},
     runtime::run_cpu,
     scheduler::{Permit, RequestId},
-    segment::SegmentHandle,
+    segment::{OpenFile, SegmentHandle},
     version::{Version, VersionId},
 };
 use logpose_types::{
     CommitAck, LogPoseError, Result, RowAddr, SeqNo, Snapshot, UnitId, WriteOutcome,
     filter::FilterExpr,
     record::{ClientOp, PartialUpdate, PrimaryKey},
+    schema::FieldId,
 };
 use logpose_vfs::is_crashed;
 use logpose_wal::{
@@ -89,7 +90,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -225,6 +226,8 @@ pub enum JobKind {
     Flush,
     /// Merge segments into one, dropping their deleted rows.
     Compact,
+    /// Build a segment's vector graphs into its index sidecar.
+    Index,
 }
 
 impl JobKind {
@@ -233,6 +236,7 @@ impl JobKind {
         match self {
             Self::Flush => "flush",
             Self::Compact => "compact",
+            Self::Index => "index",
         }
     }
 }
@@ -254,11 +258,20 @@ pub(crate) struct JobStart {
 
 /// What a job is to build.
 pub(crate) enum JobWork {
-    /// Nothing: no operation since the checkpoint (flush), or fewer than two segments
-    /// (compaction).
+    /// Nothing: no operation since the checkpoint (flush), fewer than two segments
+    /// (compaction), or no segment that needs its graphs (index build).
     Nothing,
     Flush(FlushStart),
     Compact(CompactStart),
+    Index(IndexStart),
+}
+
+/// The input of an index build, captured at its begin: the segment whose graphs it builds.
+pub(crate) struct IndexStart {
+    pub(crate) segment: Arc<SegmentHandle>,
+    /// Set by the writer to stop the build early: a compaction took the segment, or the
+    /// collection is being dropped, poisoned, or shut down.
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 /// The inputs of a flush, captured at its begin.
@@ -304,6 +317,19 @@ pub(crate) enum JobCommit {
         inputs: Vec<UnitId>,
         output: Option<CompactedSegment>,
     },
+    /// An index build of `segment` into the sidecar `index`.
+    Index {
+        segment: UnitId,
+        index: IndexedSegment,
+    },
+}
+
+/// An index build's output: the open sidecar and what the manifest records of it.
+pub(crate) struct IndexedSegment {
+    pub(crate) file: Arc<OpenFile>,
+    pub(crate) reference: IndexRef,
+    /// The vector fields that got a graph.
+    pub(crate) graphs: Vec<FieldId>,
 }
 
 /// A flush output.
@@ -348,11 +374,13 @@ pub(crate) enum ControlMsg {
     /// memtables until the checkpoint reaches it. `reply`, if any, gets the version after the
     /// last flush (the engine's memtable-budget trigger sends none).
     Flush { reply: Option<SnapshotReply> },
-    /// Compact the collection's segments into one (as many as one job can hold), once no
-    /// background compaction runs.
+    /// Compact the collection's segments until they settle: merge them, smallest first, as far
+    /// as the maintenance-memory pool allows, then build every missing graph; answer once done.
+    /// Background compactions finish first.
     Compact { reply: SnapshotReply },
     /// Begin a job without a permit, for a test to build and commit by hand. A flush waits for
-    /// a running flush; a compaction takes every unreserved segment.
+    /// a running flush; a compaction takes what one explicit compaction job would; an index
+    /// build takes the largest segment that has SQ8 codes and no index sidecar.
     #[cfg_attr(not(test), allow(dead_code))]
     BeginJob {
         kind: JobKind,
@@ -430,12 +458,16 @@ pub(crate) fn spawn(
     let group = core.group_commit;
     core.register_writer(handle.control_sender());
     handle.set_pk_index_bytes(seed.state.pk.approximate_bytes());
-    let policy = Policy::new(
-        core.compaction,
-        handle.descriptor().compaction_threshold_segments,
-        core.scheduler.pool_bytes(),
-        crate::compaction::RowShape::of(&seed.state.schema),
-    );
+    let policy = Policy {
+        graph_min_rows: core.index.graph_min_rows,
+        ..Policy::new(
+            core.compaction,
+            handle.descriptor().compaction_threshold_segments,
+            core.scheduler.pool_bytes(),
+            crate::compaction::RowShape::of(&seed.state.schema),
+        )
+    };
+    let last_write_at = core.tokens.clock.now();
     let writer = Writer {
         core,
         handle,
@@ -456,13 +488,15 @@ pub(crate) fn spawn(
         next_job: 0,
         reserved: BTreeSet::new(),
         flush_waiters: Vec::new(),
-        compact_waiters: Vec::new(),
+        explicit: None,
         manual_flushes: Vec::new(),
         quiesce_waiters: Vec::new(),
         freeze_pending: false,
         held: None,
         flush_retry: jobs::Backoff::flush(),
         compaction_retry: jobs::Backoff::compaction(),
+        index_retry: jobs::Backoff::compaction(),
+        last_write_at,
         policy,
     };
     runtime.spawn(writer.run());
@@ -528,8 +562,8 @@ struct Writer {
     reserved: BTreeSet<UnitId>,
     /// Explicit flushes: the sequence number each waits for the checkpoint to reach.
     flush_waiters: Vec<(SeqNo, Option<SnapshotReply>)>,
-    /// Explicit compactions waiting for their job (or for background compactions to end).
-    compact_waiters: Vec<SnapshotReply>,
+    /// The explicit compaction in progress, if any.
+    explicit: Option<jobs::ExplicitCompaction>,
     /// Hand-stepped flushes waiting for the running flush to end.
     manual_flushes: Vec<oneshot::Sender<Result<JobStart>>>,
     quiesce_waiters: Vec<std::sync::mpsc::SyncSender<()>>,
@@ -544,6 +578,11 @@ struct Writer {
     /// When background compactions may be planned again after failed ones; independent of
     /// `flush_retry`, so a failing compaction never holds back a flush.
     compaction_retry: jobs::Backoff,
+    /// When background index builds may be planned again after failed ones.
+    index_retry: jobs::Backoff,
+    /// Engine-clock time of the last write request; the collection is quiet once
+    /// `CompactionConfig::quiet_after` passed since.
+    last_write_at: Duration,
     policy: Policy,
 }
 
@@ -552,8 +591,11 @@ struct Job {
     kind: JobKind,
     /// The segments a compaction merges, reserved from planning until the job ends.
     inputs: Vec<UnitId>,
-    /// The explicit compactions this job answers (empty for a background job).
-    waiters: Vec<SnapshotReply>,
+    /// The segment an index build indexes. Not reserved: a compaction that takes it cancels
+    /// the build instead.
+    target: Option<UnitId>,
+    /// Whether the job is a step of the explicit compaction, whose waiters its failure fails.
+    explicit: bool,
     phase: Phase,
 }
 
@@ -567,21 +609,32 @@ enum Phase {
 /// A job that began.
 struct Running {
     unit: UnitId,
-    /// DV files the job may write, besides its unit's segment.
+    /// The file the job's output goes to: its unit's segment, or an index build's sidecar.
+    output: PathBuf,
+    /// DV files the job may write, besides its output.
     dv_files: Vec<PathBuf>,
     /// Whether the job's files are still the job's to clean up. Cleared once a commit made them
     /// live, or made their durability unknown.
     owns_files: bool,
     /// The scheduler permit; `None` for a job a test steps by hand. Released when the job ends.
     permit: Option<Permit>,
+    /// An index build's cancellation flag.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Running {
     /// Every file an attempt of this job may have created.
-    fn files(&self, dir: &std::path::Path) -> Vec<PathBuf> {
-        let mut files = vec![segment_path(dir, self.unit)];
+    fn files(&self) -> Vec<PathBuf> {
+        let mut files = vec![self.output.clone()];
         files.extend(self.dv_files.iter().cloned());
         files
+    }
+
+    /// Whether the writer cancelled the job (an index build).
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -629,6 +682,7 @@ impl Writer {
                 request = next_request(&mut self.held, &mut self.requests), if !stalled => {
                     let Some(request) = request else { break };
                     self.handle.arm_maintenance();
+                    self.last_write_at = self.clock_now();
                     self.handle_request(request.request, &mut inflight).await;
                 }
             }
@@ -1156,6 +1210,11 @@ enum Install {
         reconciled: DeletionVector,
         superseded_dvs: Vec<PathBuf>,
     },
+    Index {
+        segment: UnitId,
+        file: Arc<OpenFile>,
+        entry: ManifestSegment,
+    },
 }
 
 impl LogicalState {
@@ -1280,6 +1339,24 @@ impl LogicalState {
         }
         self.segments = Arc::from(kept);
         retired
+    }
+
+    /// Install a durable index build: `segment` gains its sidecar `file`, as a new handle over
+    /// the same segment file with the manifest `entry` that names the sidecar. Published
+    /// versions keep the old handle.
+    fn install_index(&mut self, segment: UnitId, file: Arc<OpenFile>, entry: ManifestSegment) {
+        let segments = self
+            .segments
+            .iter()
+            .map(|handle| {
+                if handle.unit == segment {
+                    Arc::new(handle.with_index(Arc::clone(&file), entry.clone()))
+                } else {
+                    Arc::clone(handle)
+                }
+            })
+            .collect::<Vec<_>>();
+        self.segments = Arc::from(segments);
     }
 
     /// A `Version` over this state and the durable `manifest`.

@@ -1,8 +1,9 @@
 //! Deterministic job interleaving: every position of each phase of a job (begin, build,
 //! commit) relative to a short write sequence, with the phases of two jobs interleaved with
 //! each other too. The writes move, update, and delete keys whose rows are in the job's inputs
-//! (compaction inputs, the frozen memtable), so every case of deletion-vector reconciliation
-//! and of a flush landing during a compaction comes up. After every step the published state
+//! (compaction inputs, the frozen memtable, the segment an index build indexes), so every case
+//! of deletion-vector reconciliation, of a flush landing during a compaction, and of an index
+//! build racing the compaction that takes its segment comes up. After every step the published state
 //! equals the model and satisfies its invariants; at the end, a clean reopen and a crash both
 //! recover it.
 
@@ -64,6 +65,8 @@ fn interleavings(sequences: &[Vec<Event>]) -> Vec<Vec<Event>> {
 /// A scenario: a setup, the writes, and the jobs whose phases interleave with them.
 struct Interleaving {
     name: &'static str,
+    /// Whether segments get SQ8 codes and graphs.
+    indexed: bool,
     setup: fn(&mut Ctx) -> Result<(), String>,
     writes: fn(&Ctx, usize) -> Vec<ClientOp>,
     write_count: usize,
@@ -86,13 +89,22 @@ fn run(scenario: &Interleaving) -> usize {
                 scenario.name
             )
         };
-        let mut ctx = Ctx::new(index as u64).unwrap_or_else(|error| fail(error));
+        let mut ctx =
+            Ctx::with_indexes(index as u64, scenario.indexed).unwrap_or_else(|error| fail(error));
         (scenario.setup)(&mut ctx).unwrap_or_else(|error| fail(format!("setup: {error}")));
         for (step, event) in events.iter().enumerate() {
             let result = match event {
                 Event::Write(n) => {
                     let ops = (scenario.writes)(&ctx, *n);
                     ctx.write(ops)
+                }
+                // An index build begun while a compaction holds every segment has nothing to
+                // do; its later phases are then skipped.
+                Event::Begin(JobKind::Index) => ctx.begin_if_due(JobKind::Index).map(drop),
+                Event::Build(JobKind::Index) | Event::Commit(JobKind::Index)
+                    if !ctx.has_job(JobKind::Index) =>
+                {
+                    Ok(())
                 }
                 Event::Begin(kind) => ctx.begin(*kind),
                 Event::Build(kind) => ctx.build(*kind),
@@ -156,6 +168,7 @@ fn flush_writes(ctx: &Ctx, n: usize) -> Vec<ClientOp> {
 #[test]
 fn every_position_of_a_compaction_among_writes_reconciles_deletions() {
     let count = run(&Interleaving {
+        indexed: false,
         name: "compaction",
         setup: three_segments,
         writes: compaction_writes,
@@ -168,6 +181,7 @@ fn every_position_of_a_compaction_among_writes_reconciles_deletions() {
 #[test]
 fn every_position_of_a_flush_among_writes_maps_late_deletions() {
     let count = run(&Interleaving {
+        indexed: false,
         name: "flush",
         setup: rows_in_a_segment_and_the_memtable,
         writes: flush_writes,
@@ -182,6 +196,7 @@ fn every_position_of_a_flush_among_writes_maps_late_deletions() {
 #[test]
 fn every_interleaving_of_a_flush_during_a_compaction_keeps_the_model() {
     let count = run(&Interleaving {
+        indexed: false,
         name: "flush during compaction",
         setup: |ctx| {
             three_segments(ctx)?;
@@ -196,4 +211,35 @@ fn every_interleaving_of_a_flush_during_a_compaction_keeps_the_model() {
         jobs: &[JobKind::Compact, JobKind::Flush],
     });
     assert_eq!(count, 560);
+}
+
+/// Every position of an index build's begin, build, and commit among four writes that delete,
+/// move, and update rows of the segment it indexes.
+#[test]
+fn every_position_of_an_index_build_among_writes_keeps_the_model() {
+    let count = run(&Interleaving {
+        indexed: true,
+        name: "index build",
+        setup: three_segments,
+        writes: compaction_writes,
+        write_count: 4,
+        jobs: &[JobKind::Index],
+    });
+    assert_eq!(count, 35);
+}
+
+/// An index build and a compaction interleaved with each other and a write: a compaction
+/// begun first leaves the build nothing to index, one begun during the build cancels it, and
+/// one begun after its commit retires the segment with its sidecar.
+#[test]
+fn every_interleaving_of_an_index_build_and_a_compaction_keeps_the_model() {
+    let count = run(&Interleaving {
+        indexed: true,
+        name: "index build and compaction",
+        setup: three_segments,
+        writes: compaction_writes,
+        write_count: 1,
+        jobs: &[JobKind::Index, JobKind::Compact],
+    });
+    assert_eq!(count, 140);
 }

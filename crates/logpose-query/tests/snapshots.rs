@@ -400,21 +400,12 @@ async fn corrupted_index_sections_are_typed_index_corruption() {
         let mut rng = Rng::new(33);
         rows(&fixture, &mut rng, 0, 200).await;
         fixture.flush().await;
+        // The graph lands in the segment's index sidecar, which the compaction builds.
+        fixture.compact().await;
         let dir = fixture.close();
         let root = dir.path().to_path_buf();
 
-        let segment = find_segment(&root);
-        let (offset, length) = {
-            let reader = SegmentReader::open(FileSource::open(&segment).expect("open"))
-                .expect("segment opens");
-            let section = reader
-                .sections()
-                .iter()
-                .find(|section| section.section_kind() == Some(kind))
-                .copied()
-                .expect("the segment has the index section");
-            (section.offset, section.length)
-        };
+        let (segment, offset, length) = find_section(&root, kind);
         let mut bytes = fs::read(&segment).expect("read segment");
         let at = usize::try_from(offset + length / 2).expect("fits");
         bytes[at] ^= 0x5a;
@@ -466,19 +457,32 @@ async fn corrupted_index_sections_are_typed_index_corruption() {
     }
 }
 
-fn find_segment(root: &std::path::Path) -> std::path::PathBuf {
+/// The segment or index sidecar file under `root` holding a section of `kind`, with the
+/// section's offset and length.
+fn find_section(root: &std::path::Path, kind: SectionKind) -> (std::path::PathBuf, u64, u64) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).expect("read dir") {
             let path = entry.expect("entry").path();
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|extension| extension == "seg") {
-                return path;
+            } else if name.is_some_and(|name| name.ends_with(".seg") || name.contains(".idx.")) {
+                let reader = SegmentReader::open(FileSource::open(&path).expect("open"))
+                    .expect("the file opens");
+                if let Some(section) = reader
+                    .sections()
+                    .iter()
+                    .find(|section| section.section_kind() == Some(kind))
+                {
+                    return (path, section.offset, section.length);
+                }
             }
         }
     }
-    unreachable!("no segment under {}", root.display())
+    unreachable!("no {kind:?} section under {}", root.display())
 }
 
 /// A scroll that fits in one page pins nothing: it returns no cursor, so nobody could use or

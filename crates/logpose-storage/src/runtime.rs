@@ -2,8 +2,9 @@
 //! and [`run_cpu`] to await rayon work from async code.
 //!
 //! Tokio workers only orchestrate. Blocking syscalls run on the `IoPool`, latency-sensitive CPU
-//! work on the `query` pool, and long-running flush and compaction CPU work on the smaller
-//! `maintenance` pool so that it cannot starve queries.
+//! work on the `query` pool, and the long-running graph builds of index-build jobs on the
+//! smaller `maintenance` pool, so that they cannot take every core from queries. Flush and
+//! compaction encode on their own job threads.
 
 use crate::cache::{LoadExecutor, LoadJob};
 use logpose_types::{LogPoseError, Result};
@@ -28,7 +29,10 @@ pub struct RuntimeConfig {
     pub io_queue_depth: usize,
     /// Threads of the `query` rayon pool. Default `available_parallelism`.
     pub query_threads: usize,
-    /// Threads of the `maintenance` rayon pool. Default `max(1, available_parallelism / 4)`.
+    /// Threads of the `maintenance` rayon pool, which builds vector graphs; also sizes the
+    /// scheduler's job slots. Default `max(1, available_parallelism / 2)`: a graph build is the
+    /// longest maintenance job and the one a bulk load waits for last, and queries keep a pool
+    /// of their own.
     pub maintenance_threads: usize,
     /// Worker threads of the tokio runtime the collections' writer tasks run on. Writer tasks
     /// only orchestrate (their CPU and I/O work goes to the pools above), so a few suffice.
@@ -43,7 +47,7 @@ impl Default for RuntimeConfig {
             io_threads: 8,
             io_queue_depth: 1024,
             query_threads: parallelism,
-            maintenance_threads: (parallelism / 4).max(1),
+            maintenance_threads: (parallelism / 2).max(1),
             writer_threads: 2,
         }
     }
@@ -55,7 +59,7 @@ pub struct Runtime {
     pub io: IoPool,
     /// Latency-sensitive CPU work: query scoring, bitmap compilation, batch preparation.
     pub query: rayon::ThreadPool,
-    /// Long-running CPU work: flush and compaction encoding and index builds.
+    /// Long-running CPU work: the vector graph builds of index-build jobs.
     pub maintenance: rayon::ThreadPool,
 }
 

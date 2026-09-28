@@ -97,6 +97,43 @@ impl UnitRef<'_> {
 }
 
 impl Version {
+    /// The names of the files in `segments/` this version reads: every segment's file and its
+    /// index sidecar, if it has one. For tests that check that no file a live version reads is
+    /// removed (I7).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn segment_file_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for segment in self.segments.iter() {
+            for path in std::iter::once(segment.path())
+                .chain(segment.index_file().map(crate::segment::OpenFile::path))
+            {
+                if let Some(name) = path.file_name() {
+                    names.push(name.to_string_lossy().into_owned());
+                }
+            }
+        }
+        names
+    }
+
+    /// How many segments have their index sidecar (their index build committed), and how many
+    /// have a vector graph. For tests and diagnostics.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn indexed_segments(&self) -> (usize, usize) {
+        let sidecars = self
+            .segments
+            .iter()
+            .filter(|segment| segment.entry.index.is_some())
+            .count();
+        let graphs = self
+            .segments
+            .iter()
+            .filter(|segment| segment.entry.vectors.iter().any(|vector| vector.has_graph))
+            .count();
+        (sidecars, graphs)
+    }
+
     /// Segments ascending by unit, then frozen memtables oldest first, then the active
     /// memtable. By I5 no read depends on the order.
     pub(crate) fn units(&self) -> impl Iterator<Item = UnitRef<'_>> + '_ {
@@ -188,6 +225,19 @@ impl Version {
             .eq(self.manifest.units())
         {
             return fail("segments do not match the manifest's segments".to_owned());
+        }
+        for (segment, entry) in self.segments.iter().zip(&self.manifest.segments) {
+            // A segment's index sidecar and graph summaries are the manifest's (its DV file is
+            // the manifest's alone: flushes write new ones without replacing the handle).
+            if segment.entry.index != entry.index
+                || segment.index_file().is_some() != entry.index.is_some()
+                || segment.entry.vectors != entry.vectors
+            {
+                return fail(format!(
+                    "segment {} does not match the manifest's index sidecar",
+                    segment.unit
+                ));
+            }
         }
         let rows = self
             .units()

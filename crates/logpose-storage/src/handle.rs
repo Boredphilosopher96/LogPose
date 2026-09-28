@@ -150,7 +150,7 @@ pub struct CollectionHandle {
     /// Maintenance status, runtime state the writer keeps current.
     status: Mutex<MaintenanceStatus>,
     /// Rows and bytes flushes and compactions wrote, for write amplification.
-    written: [AtomicU64; 4],
+    written: [AtomicU64; 5],
     /// Pinned snapshots.
     tokens: TokenRegistry,
     token_context: Arc<TokenContext>,
@@ -533,7 +533,7 @@ impl CollectionHandle {
         change(&mut self.status.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
-    /// Rows and bytes that flushes and compactions wrote since the engine opened.
+    /// Rows and bytes that flushes, compactions, and index builds wrote since the engine opened.
     #[must_use]
     pub fn maintenance_written(&self) -> MaintenanceWritten {
         let load = |index: usize| self.written[index].load(Ordering::Relaxed);
@@ -542,6 +542,7 @@ impl CollectionHandle {
             flush_bytes: load(1),
             compaction_rows: load(2),
             compaction_bytes: load(3),
+            index_bytes: load(4),
         }
     }
 
@@ -550,6 +551,10 @@ impl CollectionHandle {
         let base = match kind {
             JobKind::Flush => 0,
             JobKind::Compact => 2,
+            JobKind::Index => {
+                self.written[4].fetch_add(bytes, Ordering::Relaxed);
+                return;
+            }
         };
         self.written[base].fetch_add(rows, Ordering::Relaxed);
         self.written[base + 1].fetch_add(bytes, Ordering::Relaxed);
@@ -763,6 +768,8 @@ pub struct MaintenanceWritten {
     pub compaction_rows: u64,
     /// Segment bytes compactions wrote.
     pub compaction_bytes: u64,
+    /// Index sidecar bytes index builds wrote.
+    pub index_bytes: u64,
 }
 
 /// A running maintenance job's build. Handing it the build's result sends it to the writer to

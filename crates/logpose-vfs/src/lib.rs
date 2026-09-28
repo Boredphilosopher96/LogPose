@@ -133,6 +133,10 @@ pub enum CrashPoint {
     CompactionAfterOutputSync,
     /// After a compaction wrote and synced its output deletion-vector file.
     CompactionAfterDvSync,
+    /// After an index build wrote and synced its index sidecar.
+    IndexAfterSidecarSync,
+    /// After an index build synced the segment directory holding its sidecar.
+    IndexAfterSegmentsDirSync,
     /// After garbage collection removed a file.
     GcAfterRemove,
     /// After recovery repaired a torn WAL tail.
@@ -143,7 +147,7 @@ pub enum CrashPoint {
 
 impl CrashPoint {
     /// Every crash point, in declaration order.
-    pub const ALL: [CrashPoint; 17] = [
+    pub const ALL: [CrashPoint; 19] = [
         CrashPoint::WalAfterAppend,
         CrashPoint::WalAfterSync,
         CrashPoint::WalAfterRollback,
@@ -158,6 +162,8 @@ impl CrashPoint {
         CrashPoint::CurrentAfterDirSync,
         CrashPoint::CompactionAfterOutputSync,
         CrashPoint::CompactionAfterDvSync,
+        CrashPoint::IndexAfterSidecarSync,
+        CrashPoint::IndexAfterSegmentsDirSync,
         CrashPoint::GcAfterRemove,
         CrashPoint::RecoveryAfterTailRepair,
         CrashPoint::RecoveryAfterOrphanCleanup,
