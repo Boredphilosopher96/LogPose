@@ -2490,6 +2490,28 @@ mod tests {
             body["records"],
             json!([{"id": i64::MIN, "n": 5, "v": [0.0, 0.0]}])
         );
+
+        // A key deleted after it was flushed has no row to update.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/delete"),
+            Some(json!({"keys": [i64::MAX]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("{extremes}/records/update"),
+            Some(json!({"records": [{"id": i64::MAX, "n": 1}]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            body["details"]["metadata"]["resource_name"],
+            i64::MAX.to_string()
+        );
     }
 
     #[tokio::test]
