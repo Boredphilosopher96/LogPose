@@ -29,11 +29,11 @@ use serde as _;
 use thiserror as _;
 use tracing as _;
 use twox_hash as _;
-use uuid as _;
 
 mod actions;
 mod crash;
 mod generate;
+mod golden;
 mod interleave;
 mod model;
 mod random;
