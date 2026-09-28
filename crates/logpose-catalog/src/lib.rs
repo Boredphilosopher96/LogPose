@@ -307,8 +307,20 @@ mod tests {
     }
 
     fn schema() -> CollectionSchema {
-        logpose_types::legacy::legacy_schema(2, logpose_types::DistanceMetric::Dot)
-            .expect("schema should build")
+        logpose_types::schema::CollectionSchema::new(
+            logpose_types::schema::PrimaryKeySpec {
+                name: "id".to_owned(),
+                key_type: logpose_types::schema::PrimaryKeyType::String,
+            },
+            vec![logpose_types::schema::VectorFieldSpec {
+                name: "vector".to_owned(),
+                dimensions: 2,
+                metric: logpose_types::DistanceMetric::Dot,
+            }],
+            Vec::new(),
+            true,
+        )
+        .expect("schema should build")
     }
 
     #[test]
