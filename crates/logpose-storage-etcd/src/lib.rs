@@ -35,8 +35,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// the engine holds the data of the collections this node serves. A create writes pending
 /// metadata, then the local collection, then marks the metadata ready (rolling it back if the
 /// local create fails); a drop removes the local collection first and the metadata last, so a
-/// failure in between leaves only metadata, which a retry removes. Every mutation is fenced by
-/// the control-plane leader's lease.
+/// failure in between leaves only metadata, which a retry removes. Creates and drops are fenced
+/// by the control-plane leader's lease; publishing an altered schema is not fenced, but it only
+/// ever moves the catalog's schema version forward.
 #[derive(Clone)]
 pub struct EtcdCollectionCatalog {
     engine: Engine,
