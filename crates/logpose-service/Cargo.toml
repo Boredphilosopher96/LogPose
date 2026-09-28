@@ -19,7 +19,6 @@ logpose-types = { path = "../logpose-types" }
 tokio.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 axum.workspace = true
 http-body-util = "~0.1"
 logpose-api-grpc = { path = "../logpose-api-grpc" }

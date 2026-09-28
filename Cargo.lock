@@ -1476,7 +1476,6 @@ dependencies = [
 name = "logpose-service"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "axum",
  "http-body-util",
  "logpose-api-grpc",
@@ -1503,7 +1502,6 @@ name = "logpose-storage"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "async-trait",
  "bytemuck",
  "crc32c",
  "imbl",
@@ -1532,7 +1530,6 @@ name = "logpose-storage-etcd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "clap",
  "etcd-client",
  "logpose-auth",

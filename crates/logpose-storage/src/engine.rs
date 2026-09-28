@@ -2,7 +2,7 @@
 //! collection create and drop.
 
 use crate::{
-    BlobStore,
+    CreateCollectionRequest,
     cache::{ArtifactClass, BudgetInputs, BufferCache, CacheConfig, DEFAULT_FLOORS},
     clock::{Clock, SystemClock},
     compaction::CompactionConfig,
@@ -25,7 +25,7 @@ use logpose_catalog::CollectionDescriptor;
 use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, LogPoseError, ResourceKind, Result,
 };
-use logpose_vfs::{Vfs, VfsLock};
+use logpose_vfs::{Vfs, VfsLock, std_vfs};
 use logpose_wal::{BootId, DEFAULT_WAL_FILE_BYTES, WalConfig};
 use std::{
     collections::BTreeMap,
@@ -71,8 +71,6 @@ pub struct EngineConfig {
     /// instead of being repaired; a violated primary-key forwarding fails the write). Default:
     /// on in debug builds.
     pub strict_invariants: bool,
-    /// Reserved for the blob storage integration; not used by the local engine yet.
-    pub blob_store: Option<Arc<dyn BlobStore>>,
     /// Group commit settings of every collection's writer.
     pub group: GroupCommitConfig,
     /// Size at which a collection's active WAL file is rotated. Default 64 MiB.
@@ -105,7 +103,6 @@ impl Default for EngineConfig {
             compaction: CompactionConfig::default(),
             cache_floors: DEFAULT_FLOORS,
             strict_invariants: cfg!(debug_assertions),
-            blob_store: None,
             group: GroupCommitConfig::default(),
             wal_file_bytes: DEFAULT_WAL_FILE_BYTES,
             boot_id: None,
@@ -129,7 +126,6 @@ impl fmt::Debug for EngineConfig {
             .field("compaction", &self.compaction)
             .field("cache_floors", &self.cache_floors)
             .field("strict_invariants", &self.strict_invariants)
-            .field("blob_store", &self.blob_store.is_some())
             .field("group", &self.group)
             .field("wal_file_bytes", &self.wal_file_bytes)
             .field("boot_id", &self.boot_id)
@@ -343,6 +339,15 @@ impl Engine {
         Ok(Self { shared })
     }
 
+    /// [`Engine::open`] on the real filesystem.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::open`].
+    pub fn open_local(root: impl AsRef<Path>, config: EngineConfig) -> Result<Self> {
+        Self::open(std_vfs(), root, config)
+    }
+
     /// Block until every queued background file removal has run, including the removals of
     /// files that only snapshot pins the reaper just dropped were holding.
     pub fn wait_for_gc(&self) {
@@ -410,6 +415,17 @@ impl Engine {
         handles
     }
 
+    /// Descriptors of every registered collection (open or failed), with their live schemas,
+    /// ordered by `(database, name)`. Reads no file.
+    ///
+    /// # Errors
+    ///
+    /// A collection directory with an unreadable descriptor, which the listing would otherwise
+    /// silently omit.
+    pub fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        self.shared.core.list_descriptors()
+    }
+
     /// A validated descriptor for `request` under this engine's root, with default thresholds,
     /// for [`create_collection`](Self::create_collection) (callers may change its thresholds
     /// first).
@@ -419,16 +435,33 @@ impl Engine {
     /// The collection already exists, or the request is invalid.
     pub fn plan_collection_descriptor(
         &self,
-        request: &crate::CreateCollectionRequest,
+        request: &CreateCollectionRequest,
     ) -> Result<CollectionDescriptor> {
         self.core().plan_collection_descriptor(request)
     }
 
-    /// Durably create a collection from a validated descriptor and register it.
+    /// Durably create a collection from a validated descriptor and register it, on the I/O
+    /// pool. `assignment`, when given, is persisted as the collection's placement.
     ///
-    /// Blocking. Fails if a collection with the same `(database, name)` exists or is being
-    /// created or dropped concurrently.
-    pub fn create_collection(
+    /// # Errors
+    ///
+    /// A collection with the same `(database, name)` exists or is being created or dropped
+    /// concurrently, the descriptor is invalid, or the files cannot be written.
+    pub async fn create_collection(
+        &self,
+        descriptor: CollectionDescriptor,
+        assignment: Option<CollectionAssignment>,
+    ) -> Result<Arc<CollectionHandle>> {
+        self.io(move |core| core.create_collection(descriptor, assignment.as_ref()))
+            .await
+    }
+
+    /// [`Engine::create_collection`] for threads outside any async runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::create_collection`].
+    pub fn create_collection_blocking(
         &self,
         descriptor: CollectionDescriptor,
         assignment: Option<&CollectionAssignment>,
@@ -437,11 +470,26 @@ impl Engine {
     }
 
     /// Drop a collection: refuse new calls on it, wait for its in-flight write and maintenance
-    /// job, durably retire its directory, and remove its files.
+    /// job, durably retire its directory, and remove its files, on the I/O pool.
     ///
-    /// Blocking. Readers that already pinned a `Version` finish normally unless they need a
-    /// file that the drop removed.
-    pub fn drop_collection(&self, reference: &CollectionRef) -> Result<()> {
+    /// Readers that already pinned a `Version` finish normally unless they need a file that
+    /// the drop removed.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown collection, `FailedPrecondition` while it is being created,
+    /// and the I/O errors of retiring its directory (the collection then still exists).
+    pub async fn drop_collection(&self, reference: &CollectionRef) -> Result<()> {
+        let reference = reference.clone();
+        self.io(move |core| core.drop_collection(&reference)).await
+    }
+
+    /// [`Engine::drop_collection`] for threads outside any async runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`Engine::drop_collection`].
+    pub fn drop_collection_blocking(&self, reference: &CollectionRef) -> Result<()> {
         self.core().drop_collection(reference)
     }
 

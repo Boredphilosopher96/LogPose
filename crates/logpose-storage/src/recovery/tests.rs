@@ -7,11 +7,10 @@ use crate::{
     dv::{dv_path, parse_dv_file_name},
     manifest::{CURRENT_FILE, manifest_path},
     paths::{parse_segment_file_name, segment_path},
-    test_support::{ControlledVfs, put},
+    test_support::{ControlledVfs, delete, live_records, put},
 };
 use logpose_types::{
-    CollectionRef, CorruptionKind, DeleteRecord, DistanceMetric, LogPoseError, RecordId, UnitId,
-    VisibleRecord, WriteOperation,
+    CollectionRef, CorruptionKind, DistanceMetric, LogPoseError, SeqNo, UnitId, record::Record,
 };
 use logpose_vfs::{CrashPoint, FaultPlan, FaultVfs, OpenMode, TearMode, Vfs};
 use logpose_wal::BootId;
@@ -41,7 +40,7 @@ fn create(engine: &Engine) -> Arc<CollectionHandle> {
     descriptor.flush_threshold_bytes = usize::MAX;
     descriptor.compaction_threshold_segments = usize::MAX;
     engine
-        .create_collection(descriptor, None)
+        .create_collection_blocking(descriptor, None)
         .expect("collection should be created")
 }
 
@@ -51,23 +50,17 @@ fn open_handle(engine: &Engine) -> Arc<CollectionHandle> {
         .expect("collection should be open")
 }
 
-fn write(engine: &Engine, handle: &Arc<CollectionHandle>, id: &str, x: f32) {
-    engine
-        .core()
-        .write(handle, vec![put(id, vec![x, 1.0])])
+fn write(handle: &Arc<CollectionHandle>, id: &str, x: f32) {
+    handle
+        .write_blocking(vec![put(id, vec![x, 1.0])])
         .expect("write");
 }
 
-fn rows(engine: &Engine) -> Vec<VisibleRecord> {
+fn rows(engine: &Engine) -> Vec<(SeqNo, Record)> {
     let handle = open_handle(engine);
-    handle
-        .current()
-        .check_invariants()
-        .expect("invariants hold");
-    engine
-        .core()
-        .scan_exact_internal(&handle, None, true, None)
-        .expect("scan")
+    let version = handle.current();
+    version.check_invariants().expect("invariants hold");
+    live_records(&version).expect("scan")
 }
 
 fn exists(vfs: &dyn Vfs, path: &Path) -> bool {
@@ -126,18 +119,15 @@ fn a_crash_at_every_op_of_a_flush_recovers_the_same_rows_without_orphans() {
     let prepare = |fault: &Arc<FaultVfs>| {
         let engine = open(fault.process());
         let handle = create(&engine);
-        write(&engine, &handle, "a", 1.0);
-        write(&engine, &handle, "b", 2.0);
+        write(&handle, "a", 1.0);
+        write(&handle, "b", 2.0);
         (engine, handle)
     };
     let clean = FaultVfs::new(40);
     let (engine, handle) = prepare(&clean);
     let expected = rows(&engine);
     let before = clean.mutating_ops();
-    engine
-        .core()
-        .flush_collection(&handle)
-        .expect("clean flush");
+    handle.flush_blocking().expect("clean flush");
     engine.wait_for_gc();
     let ops = clean.mutating_ops() - before;
     assert_eq!(rows(&engine), expected);
@@ -154,7 +144,7 @@ fn a_crash_at_every_op_of_a_flush_recovers_the_same_rows_without_orphans() {
                 tear,
                 ..FaultPlan::default()
             });
-            let flushed = engine.core().flush_collection(&handle).is_ok();
+            let flushed = handle.flush_blocking().is_ok();
             drop(handle);
             drop(engine);
             fault.crash();
@@ -170,10 +160,9 @@ fn a_crash_at_every_op_of_a_flush_recovers_the_same_rows_without_orphans() {
             }
             assert_no_orphans(fault.process().as_ref(), &handle, &context);
             // The collection keeps working: a new flush gets fresh names.
-            write(&engine, &handle, "c", 3.0);
-            engine
-                .core()
-                .flush_collection(&handle)
+            write(&handle, "c", 3.0);
+            handle
+                .flush_blocking()
                 .map_err(|error| format!("{context}: {error}"))
                 .expect("a flush after recovery succeeds");
             assert_eq!(rows(&engine).len(), 3, "{context}");
@@ -188,16 +177,16 @@ fn recovery_interrupted_at_any_op_converges() {
     let setup = |fault: &Arc<FaultVfs>| {
         let engine = open(fault.process());
         let handle = create(&engine);
-        write(&engine, &handle, "a", 1.0);
-        engine.core().flush_collection(&handle).expect("flush");
-        write(&engine, &handle, "b", 2.0);
+        write(&handle, "a", 1.0);
+        handle.flush_blocking().expect("flush");
+        write(&handle, "b", 2.0);
         // Stop a flush right after its CURRENT rename, before the directory sync.
         fault.set_plan(FaultPlan {
             crash_at: Some(CrashPoint::CurrentAfterRename),
             tear: TearMode::KeepRandomPrefix,
             ..FaultPlan::default()
         });
-        let _ = engine.core().flush_collection(&handle);
+        let _ = handle.flush_blocking();
         drop(handle);
         drop(engine);
         fault.crash();
@@ -239,22 +228,17 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     let controlled = ControlledVfs::wrap(fault.process());
     let engine = open(controlled.clone());
     let handle = create(&engine);
-    write(&engine, &handle, "a", 1.0);
-    engine
-        .core()
-        .flush_collection(&handle)
+    write(&handle, "a", 1.0);
+    handle
+        .flush_blocking()
         .expect("flush: generation 1, unit 2");
-    write(&engine, &handle, "b", 2.0);
+    write(&handle, "b", 2.0);
 
     controlled.fail_renames_to(CURRENT_FILE, 1);
-    engine
-        .core()
-        .flush_collection(&handle)
-        .expect_err("the rename fails");
+    handle.flush_blocking().expect_err("the rename fails");
     assert!(handle.is_poisoned());
-    let error = engine
-        .core()
-        .write(&handle, vec![put("c", vec![1.0, 1.0])])
+    let error = handle
+        .write_blocking(vec![put("c", vec![1.0, 1.0])])
         .expect_err("poisoned");
     assert!(
         matches!(error, LogPoseError::CollectionPoisoned { .. }),
@@ -281,7 +265,7 @@ fn a_failed_current_rename_poisons_then_reopens_agree_and_ids_are_never_reused()
     assert_eq!(handle.current().manifest_generation, 1);
     assert!(!exists(vfs.as_ref(), &manifest_path(&dir, 2)));
     assert!(!exists(vfs.as_ref(), &segment_path(&dir, UnitId(4))));
-    engine.core().flush_collection(&handle).expect("retry");
+    handle.flush_blocking().expect("retry");
     let retried = handle.current();
     assert_eq!(retried.manifest_generation, 3, "generation 2 is burned");
     assert_eq!(
@@ -314,18 +298,15 @@ fn a_failed_sync_then_in_process_reopen_then_crash_reopens_agree() {
         let controlled = ControlledVfs::wrap(fault.process());
         let engine = open(controlled.clone());
         let handle = create(&engine);
-        write(&engine, &handle, "a", 1.0);
-        write(&engine, &handle, "b", 2.0);
+        write(&handle, "a", 1.0);
+        write(&handle, "b", 2.0);
         let dir = handle.meta().dir.clone();
         match fail {
             0 => controlled.fail_dir_syncs(&dir, 1),
             1 => controlled.fail_file_syncs_containing("CURRENT.tmp", 1),
             _ => controlled.fail_file_syncs_containing(".mf", 1),
         }
-        engine
-            .core()
-            .flush_collection(&handle)
-            .expect_err("the sync fails");
+        handle.flush_blocking().expect_err("the sync fails");
         assert_eq!(handle.is_poisoned(), fail == 0, "{step}");
         drop(handle);
         drop(engine);
@@ -353,8 +334,8 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
     let fault = FaultVfs::new(80);
     let engine = open(fault.process());
     let handle = create(&engine);
-    write(&engine, &handle, "a", 1.0);
-    engine.core().flush_collection(&handle).expect("flush");
+    write(&handle, "a", 1.0);
+    handle.flush_blocking().expect("flush");
     let expected = rows(&engine);
     let dir = handle.meta().dir.clone();
     drop(handle);
@@ -383,8 +364,8 @@ fn orphans_left_in_a_collection_are_removed_at_open_and_live_files_kept() {
     // Unit 8, DV generation 4, and manifest generation 9 were seen, so they are never issued:
     // the recovered memtable took unit 9, the one the flush froze it for unit 10, and the
     // flush output unit 11.
-    write(&engine, &handle, "b", 2.0);
-    engine.core().flush_collection(&handle).expect("flush");
+    write(&handle, "b", 2.0);
+    handle.flush_blocking().expect("flush");
     let version = handle.current();
     assert_eq!(version.manifest_generation, 10);
     assert_eq!(version.manifest.units().last(), Some(UnitId(11)));
@@ -410,10 +391,9 @@ fn a_leftover_at_the_last_generation_fails_the_next_publish_cleanly() {
 
     let engine = open(fault.process());
     let handle = open_handle(&engine);
-    write(&engine, &handle, "a", 1.0);
-    let error = engine
-        .core()
-        .flush_collection(&handle)
+    write(&handle, "a", 1.0);
+    let error = handle
+        .flush_blocking()
         .expect_err("no manifest generation is left");
     assert!(matches!(error, LogPoseError::Internal { .. }), "{error}");
     assert!(!handle.is_poisoned());
@@ -452,19 +432,18 @@ fn named_gc_and_orphan_cleanup_crash_points_have_the_documented_outcome() {
     let fault = FaultVfs::new(95);
     let engine = open(fault.process());
     let handle = create(&engine);
-    write(&engine, &handle, "a", 1.0);
-    engine.core().flush_collection(&handle).expect("flush");
-    write(&engine, &handle, "b", 2.0);
-    engine.core().flush_collection(&handle).expect("flush");
+    write(&handle, "a", 1.0);
+    handle.flush_blocking().expect("flush");
+    write(&handle, "b", 2.0);
+    handle.flush_blocking().expect("flush");
     let expected = rows(&engine);
     fault.set_plan(FaultPlan {
         crash_at: Some(CrashPoint::GcAfterRemove),
         tear: TearMode::KeepRandomPrefix,
         ..FaultPlan::default()
     });
-    engine
-        .core()
-        .compact_collection(&handle)
+    handle
+        .compact_blocking()
         .expect("the compaction commits before its inputs are collected");
     let compacted = handle.current().manifest_generation;
     engine.wait_for_gc();
@@ -508,21 +487,13 @@ fn named_gc_and_orphan_cleanup_crash_points_have_the_documented_outcome() {
 fn with_segment_deletions(fault: &Arc<FaultVfs>) -> (Engine, Arc<CollectionHandle>) {
     let engine = open(fault.process());
     let handle = create(&engine);
-    write(&engine, &handle, "a", 1.0);
-    write(&engine, &handle, "b", 2.0);
-    write(&engine, &handle, "c", 3.0);
-    engine.core().flush_collection(&handle).expect("flush");
-    write(&engine, &handle, "a", 10.0);
-    engine
-        .core()
-        .write(
-            &handle,
-            vec![WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("b"),
-            })],
-        )
-        .expect("delete");
-    write(&engine, &handle, "d", 4.0);
+    write(&handle, "a", 1.0);
+    write(&handle, "b", 2.0);
+    write(&handle, "c", 3.0);
+    handle.flush_blocking().expect("flush");
+    write(&handle, "a", 10.0);
+    handle.write_blocking(vec![delete("b")]).expect("delete");
+    write(&handle, "d", 4.0);
     (engine, handle)
 }
 
@@ -532,22 +503,29 @@ fn with_segment_deletions(fault: &Arc<FaultVfs>) -> (Engine, Arc<CollectionHandl
 fn assert_index_resolves_every_key(engine: &Engine, context: &str) {
     let before = rows(engine);
     let handle = open_handle(engine);
-    for record in &before {
-        write(engine, &handle, record.id.as_str(), 100.0);
+    for (_, record) in &before {
+        write(&handle, &record.pk.label(), 100.0);
     }
     let after = rows(engine);
     assert_eq!(
-        after.iter().map(|record| &record.id).collect::<Vec<_>>(),
-        before.iter().map(|record| &record.id).collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|(_, record)| &record.pk)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|(_, record)| &record.pk)
+            .collect::<Vec<_>>(),
         "{context}"
     );
     assert!(
-        after.iter().all(|record| record.vector == [100.0, 1.0]),
+        after
+            .iter()
+            .all(|(_, record)| record.vectors["vector"] == [100.0, 1.0]),
         "{context}: {after:?}"
     );
-    engine
-        .core()
-        .flush_collection(&handle)
+    handle
+        .flush_blocking()
         .map_err(|error| format!("{context}: {error}"))
         .expect("flush after the upserts");
     assert_eq!(rows(engine), after, "{context}");
@@ -565,10 +543,7 @@ fn a_crash_at_every_op_of_a_flush_that_writes_a_dv_file_recovers_the_same_state(
     let expected = rows(&engine);
     let segment = handle.current().manifest.segments[0].unit;
     let before = clean.mutating_ops();
-    engine
-        .core()
-        .flush_collection(&handle)
-        .expect("clean flush");
+    handle.flush_blocking().expect("clean flush");
     engine.wait_for_gc();
     let ops = clean.mutating_ops() - before;
     assert_eq!(rows(&engine), expected);
@@ -591,7 +566,7 @@ fn a_crash_at_every_op_of_a_flush_that_writes_a_dv_file_recovers_the_same_state(
                 tear,
                 ..FaultPlan::default()
             });
-            let flushed = engine.core().flush_collection(&handle).is_ok();
+            let flushed = handle.flush_blocking().is_ok();
             drop(handle);
             drop(engine);
             fault.crash();
@@ -633,24 +608,16 @@ fn compaction_in_progress(
     let handle = create(&engine);
     for pair in [["a", "b"], ["c", "d"], ["e", "f"]] {
         for id in pair {
-            write(&engine, &handle, id, 1.0);
+            write(&handle, id, 1.0);
         }
-        engine.core().flush_collection(&handle).expect("flush");
+        handle.flush_blocking().expect("flush");
     }
     let (ticket, start) = handle
         .begin_job(crate::writer::JobKind::Compact)
         .expect("the compaction begins");
-    write(&engine, &handle, "a", 10.0);
-    engine
-        .core()
-        .write(
-            &handle,
-            vec![WriteOperation::Delete(DeleteRecord {
-                id: RecordId::new("c"),
-            })],
-        )
-        .expect("delete");
-    write(&engine, &handle, "g", 7.0);
+    write(&handle, "a", 10.0);
+    handle.write_blocking(vec![delete("c")]).expect("delete");
+    write(&handle, "g", 7.0);
     (engine, handle, ticket, start)
 }
 
@@ -787,9 +754,8 @@ fn a_crash_after_the_flush_dv_sync_replays_the_deletions() {
         crash_at: Some(CrashPoint::FlushAfterDvSync),
         ..FaultPlan::default()
     });
-    engine
-        .core()
-        .flush_collection(&handle)
+    handle
+        .flush_blocking()
         .expect_err("the crash stops the flush");
     drop(handle);
     drop(engine);
@@ -892,7 +858,7 @@ fn a_damaged_segment_or_dv_file_fails_the_open_with_its_corruption_kind() {
     for (index, (name, dv_file, damage, kind)) in (0_u64..).zip(cases) {
         let fault = FaultVfs::new(3000 + index);
         let (engine, handle) = with_segment_deletions(&fault);
-        engine.core().flush_collection(&handle).expect("flush");
+        handle.flush_blocking().expect("flush");
         let entry = handle.current().manifest.segments[0].clone();
         let dv = entry.dv.expect("the flush wrote a DV file");
         let dir = handle.meta().dir.clone();

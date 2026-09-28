@@ -6,7 +6,6 @@
 //! set, an unreachable etcd is a failure, and under CI a missing variable is too.
 
 use etcd_client::{Client, DeleteOptions, PutOptions};
-use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_auth::{
     AccessTier, AuthenticationMode, DatabaseAccessPolicy, DatabaseRole, DatabaseRoleBinding,
     Principal, PrincipalKind,
@@ -14,7 +13,6 @@ use logpose_auth::{
 use logpose_catalog::CollectionDescriptor;
 use logpose_config::{BootstrapTokenConfig, LogPoseConfig};
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::ExplainMode;
 use logpose_service as _;
 use logpose_storage::CreateCollectionRequest;
 use logpose_storage_etcd::{
@@ -22,8 +20,8 @@ use logpose_storage_etcd::{
 };
 use logpose_types::{
     CollectionAssignment, CollectionRef, CorruptionKind, DistanceMetric, EtcdMetadataConfig,
-    LogPoseError, MetadataBackend, MetadataConfig, NodeRole, PutRecord, RecordId,
-    legacy::record_from_put,
+    LogPoseError, MetadataBackend, MetadataConfig, NodeRole,
+    record::Record,
     schema::{FieldType, ScalarFieldSpec, SchemaChange},
 };
 use serde as _;
@@ -37,10 +35,16 @@ use std::{
 use tokio::time::{Instant, sleep};
 
 /// Environment variable that enables the etcd integration tests.
-#[path = "../../logpose-service/tests/support/legacy_query.rs"]
-mod legacy_query;
-
 const ETCD_ENDPOINTS_ENV: &str = "LOGPOSE_TEST_ETCD_ENDPOINTS";
+
+/// A record with key `id`, the `vector` field, and `extra` as its `$extra` object.
+fn record(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> Record {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let serde_json::Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    record
+}
 
 #[tokio::test]
 async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
@@ -87,14 +91,7 @@ async fn etcd_metadata_backend_surfaces_remote_collections_across_nodes() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("authoritative owner should serve local writes");
@@ -1295,14 +1292,7 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1377,14 +1367,7 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("beta", vec![0.0, 1.0], json!({"kind":"keep"}))],
         )
         .await
         .expect_err("promoted old owner must reject writes");
@@ -1392,14 +1375,7 @@ async fn etcd_owner_promotion_fences_the_old_owner() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("gamma"),
-                    vector: vec![0.5, 0.5],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("gamma", vec![0.5, 0.5], json!({"kind":"keep"}))],
         )
         .await
         .expect("promoted owner with local state should accept writes");
@@ -1506,14 +1482,7 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("current owner should accept writes before promotion");
@@ -1546,70 +1515,78 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("beta", vec![0.0, 1.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("promoted owner with mirrored local state should accept writes");
 
     let query = follower
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: Some(pre_promotion_ack.snapshot.clone()),
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    read_barrier: Some(pre_promotion_ack.snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("promoted owner should fail closed on pre-promotion read barriers");
     let stats = follower
         .stats_for_read("documents", None, Some(pre_promotion_ack.snapshot.clone()))
         .await
         .expect_err("promoted owner should fail closed on stats read barriers");
     let post_promotion_query = follower
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: None,
-            read_barrier: Some(post_promotion_ack.snapshot.clone()),
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    read_barrier: Some(post_promotion_ack.snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect_err("promoted owner should fail closed on post-promotion read barriers too");
     let post_promotion_stats = follower
         .stats_for_read("documents", None, Some(post_promotion_ack.snapshot.clone()))
         .await
         .expect_err("promoted owner should fail closed on post-promotion stats barriers too");
     let exact_snapshot_query = follower
-        .query(QueryRequest {
-            collection_name: "documents".to_owned(),
-            vector: vec![1.0, 0.0],
-            top_k: 2,
-            snapshot: Some(post_promotion_ack.snapshot.clone()),
-            read_barrier: None,
-            filters: Vec::new(),
-            predicate: None,
-            explain: ExplainMode::None,
-            snapshot_token: None,
-            pin: false,
-        })
+        .query_collection(
+            "documents",
+            logpose_query::QueryRequest {
+                vector: Some(logpose_query::VectorQuery {
+                    field: None,
+                    values: vec![1.0, 0.0],
+                }),
+                top_k: 2,
+                output_fields: vec!["$extra".to_owned()],
+                read: logpose_query::ReadConsistency {
+                    snapshot: Some(post_promotion_ack.snapshot.clone()),
+                    ..logpose_query::ReadConsistency::default()
+                },
+                ..logpose_query::QueryRequest::default()
+            },
+        )
         .await
+        .map(|reply| reply.value)
         .expect("exact snapshots should remain readable after promotion");
 
     assert!(
@@ -1631,9 +1608,9 @@ async fn etcd_owner_promotion_rejects_read_barriers_without_freshness_metadata()
     assert_eq!(exact_snapshot_query.snapshot, post_promotion_ack.snapshot);
     assert_eq!(
         exact_snapshot_query
-            .matches
+            .hits
             .iter()
-            .map(|candidate| candidate.id.as_str())
+            .map(|candidate| candidate.record.pk.label())
             .collect::<Vec<_>>(),
         vec!["alpha", "beta"]
     );
@@ -1683,14 +1660,7 @@ async fn etcd_missing_owner_metadata_rejects_reads_until_reconciliation() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record("alpha", vec![1.0, 0.0], json!({"kind":"keep"}))],
         )
         .await
         .expect("owner should serve writes before owner metadata is removed");
@@ -1745,7 +1715,10 @@ async fn etcd_owner_promotion_conflicts_while_descriptor_is_pending() {
     let descriptor = CollectionDescriptor::new_in_database(
         "default",
         "documents",
-        logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
+        CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+            .spec
+            .build_schema()
+            .expect("schema"),
         unique_temp_dir("etcd-owner-promotion-pending").as_path(),
     )
     .without_root_path();

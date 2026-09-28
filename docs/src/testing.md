@@ -64,7 +64,7 @@ Generative harnesses run seeded, replayable sequences of operations against real
 
 The pattern exists today at both the storage boundary and the service boundary:
 
-- generated actions drive `LocalStorageEngine`
+- generated actions drive the storage `Engine` and its `CollectionHandle` (storage harness v2, `crates/logpose-storage/tests/harness`) or the shared `AppState` with its REST and gRPC views (the service harness)
 - a model tracks expected logical visibility
 - checks run after writes, snapshots, flushes, compaction, stats reads, and reopen/recovery steps
 - failures must report the exact seed and action trace needed for replay
@@ -152,7 +152,7 @@ We are adopting the TigerBeetle-inspired structure incrementally.
 
 ## Benchmark Harness
 
-`crates/logpose-bench` is the scoreboard for engine work. It drives a pluggable `BenchTarget` (today the in-process `LocalStorageEngine` with the staged `logpose_query::query` search) through bulk ingest, flush, unfiltered and filtered top-k search, and write-to-searchable probes, and it scores every answer against a brute-force oracle computed in the harness.
+`crates/logpose-bench` is the scoreboard for engine work. It drives a pluggable `BenchTarget` (today the in-process storage `Engine` with the staged `logpose_query::query` search) through bulk ingest, flush, unfiltered and filtered top-k search, and write-to-searchable probes, and it scores every answer against a brute-force oracle computed in the harness.
 
 - datasets: a seeded clustered Gaussian generator, or SIFT-format `.fvecs` files with optional `.ivecs` ground truth to validate the oracle
 - filters: exact selectivities (0.1, 1, 10, 50, and 99 percent by default), uncorrelated or anti-correlated with the queries, expressed with the `Predicate` AST as equality flags (default) or ranges

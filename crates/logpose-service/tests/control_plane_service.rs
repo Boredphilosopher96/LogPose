@@ -1,9 +1,7 @@
 //! Integration tests for the Phase 5 control-plane surface.
 
-use async_trait as _;
 use axum as _;
 use http_body_util as _;
-use legacy_query::{LegacyQuery, QueryRequest};
 use logpose_api_grpc as _;
 use logpose_api_rest as _;
 use logpose_auth::{
@@ -12,15 +10,10 @@ use logpose_auth::{
 };
 use logpose_catalog as _;
 use logpose_core::{AppState, RequestAuth};
-use logpose_query::ExplainMode;
 use logpose_service as _;
-use logpose_storage::{
-    CreateCollectionRequest, InspectTarget, LocalStorageEngine, StorageEngine as _,
-};
+use logpose_storage::{CreateCollectionRequest, Engine, EngineConfig, InspectTarget};
 use logpose_storage_etcd as _;
-use logpose_types::{
-    CollectionAssignment, DistanceMetric, PutRecord, RecordId, legacy::record_from_put,
-};
+use logpose_types::{CollectionAssignment, DistanceMetric, record::Record};
 use rand as _;
 use serde as _;
 use std::{
@@ -34,8 +27,14 @@ use tokio as _;
 use tonic as _;
 use tower as _;
 
-#[path = "support/legacy_query.rs"]
-mod legacy_query;
+/// A record with key `id`, the `vector` field, and `extra` as its `$extra` object.
+fn record(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> Record {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let serde_json::Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    record
+}
 
 #[tokio::test]
 async fn control_plane_reports_runtime_status_and_local_placement() {
@@ -58,18 +57,8 @@ async fn control_plane_reports_runtime_status_and_local_placement() {
             &RequestAuth::default(),
             "documents",
             vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
-                record_from_put(PutRecord {
-                    id: RecordId::new("beta"),
-                    vector: vec![0.0, 1.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
+                record("alpha", vec![1.0, 0.0], serde_json::json!({"kind":"keep"})),
+                record("beta", vec![0.0, 1.0], serde_json::json!({"kind":"keep"})),
             ],
         )
         .await
@@ -244,14 +233,11 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("default-alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"namespace":"default"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "default-alpha",
+                vec![1.0, 0.0],
+                serde_json::json!({"namespace":"default"}),
+            )],
         )
         .await
         .expect("default namespace write should succeed");
@@ -259,14 +245,11 @@ async fn control_plane_distinguishes_duplicate_collection_names_across_databases
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "analytics/documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("analytics-alpha"),
-                    vector: vec![0.0, 1.0],
-                    metadata: serde_json::json!({"namespace":"analytics"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "analytics-alpha",
+                vec![0.0, 1.0],
+                serde_json::json!({"namespace":"analytics"}),
+            )],
         )
         .await
         .expect("database namespace write should succeed");
@@ -357,14 +340,11 @@ async fn control_only_nodes_reject_app_state_data_plane_operations() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "alpha",
+                vec![1.0, 0.0],
+                serde_json::json!({"kind":"keep"}),
+            )],
         )
         .await
         .expect_err("control-only nodes should reject direct data-plane writes");
@@ -482,14 +462,11 @@ async fn data_only_restarts_preserve_persisted_local_data_assignment() {
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "alpha",
+                vec![1.0, 0.0],
+                serde_json::json!({"kind":"keep"}),
+            )],
         )
         .await
         .expect("write should succeed");
@@ -549,14 +526,11 @@ async fn collection_due_a_flush_after_restart(root: PathBuf, label: &str) -> Pat
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "alpha",
+                vec![1.0, 0.0],
+                serde_json::json!({"kind":"keep"}),
+            )],
         )
         .await
         .expect("write should succeed");
@@ -653,14 +627,11 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
         .upsert_records_with_auth(
             &RequestAuth::default(),
             "documents",
-            vec![
-                record_from_put(PutRecord {
-                    id: RecordId::new("alpha"),
-                    vector: vec![1.0, 0.0],
-                    metadata: serde_json::json!({"kind":"keep"}),
-                })
-                .expect("record"),
-            ],
+            vec![record(
+                "alpha",
+                vec![1.0, 0.0],
+                serde_json::json!({"kind":"keep"}),
+            )],
         )
         .await
         .expect("write should succeed");
@@ -695,32 +666,30 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
             .upsert_records_with_auth(
                 &RequestAuth::default(),
                 "documents",
-                vec![
-                    record_from_put(PutRecord {
-                        id: RecordId::new("beta"),
-                        vector: vec![0.0, 1.0],
-                        metadata: serde_json::json!({"kind":"keep"}),
-                    })
-                    .expect("record"),
-                ],
+                vec![record(
+                    "beta",
+                    vec![0.0, 1.0],
+                    serde_json::json!({"kind":"keep"}),
+                )],
             )
             .await
             .expect_err("write should be rejected")
             .to_string(),
         restarted
-            .query(QueryRequest {
-                collection_name: "documents".to_owned(),
-                vector: vec![1.0, 0.0],
-                top_k: 1,
-                snapshot: None,
-                read_barrier: None,
-                filters: Vec::new(),
-                predicate: None,
-                explain: ExplainMode::None,
-                snapshot_token: None,
-                pin: false,
-            })
+            .query_collection(
+                "documents",
+                logpose_query::QueryRequest {
+                    vector: Some(logpose_query::VectorQuery {
+                        field: None,
+                        values: vec![1.0, 0.0],
+                    }),
+                    top_k: 1,
+                    output_fields: vec!["$extra".to_owned()],
+                    ..logpose_query::QueryRequest::default()
+                },
+            )
             .await
+            .map(|reply| reply.value)
             .expect_err("query should be rejected")
             .to_string(),
         restarted
@@ -761,14 +730,24 @@ async fn renamed_nodes_record_remote_assignment_and_reject_data_plane_operations
 #[tokio::test]
 async fn raw_local_storage_creates_surface_local_runtime_status() {
     let root = unique_temp_dir("raw-local-status");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
-    engine
-        .create_collection(CreateCollectionRequest::in_database(
+    let engine =
+        Engine::open_local(&root, EngineConfig::default()).expect("storage engine should open");
+    let descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::in_database(
             "default".to_owned(),
             "documents".to_owned(),
             2,
             DistanceMetric::Dot,
         ))
+        .expect("collection should plan");
+    engine
+        .create_collection(
+            descriptor,
+            Some(CollectionAssignment {
+                assigned_node: "local".to_owned(),
+                assigned_role: logpose_types::NodeRole::Data,
+            }),
+        )
         .await
         .expect("collection should be created");
     // One engine owns a storage root at a time; the node opens its own.
@@ -806,20 +785,23 @@ async fn raw_local_storage_creates_surface_local_runtime_status() {
 #[tokio::test]
 async fn local_control_assignments_still_reject_data_plane_operations() {
     let root = unique_temp_dir("local-control-assignment");
-    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let engine =
+        Engine::open_local(&root, EngineConfig::default()).expect("storage engine should open");
+    let descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::in_database(
+            "default".to_owned(),
+            "documents".to_owned(),
+            2,
+            DistanceMetric::Dot,
+        ))
+        .expect("collection should plan");
     engine
-        .create_collection_with_assignment(
-            CreateCollectionRequest::in_database(
-                "default".to_owned(),
-                "documents".to_owned(),
-                2,
-                DistanceMetric::Dot,
-            ),
-            CollectionAssignment {
+        .create_collection(
+            descriptor,
+            Some(CollectionAssignment {
                 assigned_node: "local-control-assignment".to_owned(),
                 assigned_role: logpose_types::NodeRole::Control,
-            },
-            None,
+            }),
         )
         .await
         .expect("collection should be created");
@@ -845,14 +827,11 @@ async fn local_control_assignments_still_reject_data_plane_operations() {
             .upsert_records_with_auth(
                 &RequestAuth::default(),
                 "documents",
-                vec![
-                    record_from_put(PutRecord {
-                        id: RecordId::new("alpha"),
-                        vector: vec![1.0, 0.0],
-                        metadata: serde_json::json!({"kind":"keep"}),
-                    })
-                    .expect("record"),
-                ],
+                vec![record(
+                    "alpha",
+                    vec![1.0, 0.0],
+                    serde_json::json!({"kind":"keep"}),
+                )],
             )
             .await
             .expect_err("write should be rejected")

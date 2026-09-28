@@ -1,8 +1,9 @@
-//! Etcd-backed metadata overlay for collection placement assignments.
+//! Etcd-backed cluster metadata: the collection catalog (descriptors, placement, and shard
+//! ownership) over a local [`Engine`], the database and principal catalog, and the coordination
+//! client for membership and control-plane leadership.
 
 #[cfg(test)]
 use anyhow as _;
-use async_trait::async_trait;
 #[cfg(test)]
 use clap as _;
 use etcd_client::{
@@ -11,34 +12,35 @@ use etcd_client::{
 };
 use logpose_auth::{DatabaseAccessPolicy, Principal};
 use logpose_catalog::{CollectionDescriptor, DatabaseDescriptor};
-use logpose_storage::{
-    BoxFuture, CollectionReader, CreateCollectionRequest, InspectReport, InspectTarget,
-    LocalStorageEngine, ReadOptions, ReadView, StorageEngine,
-};
+use logpose_storage::{CreateCollectionRequest, Engine};
 use logpose_types::{
-    CollectionAssignment, CollectionRef, CollectionStats, CommitAck, CorruptionKind,
-    DEFAULT_DATABASE_NAME, EtcdMetadataConfig, LeadershipFence, LogPoseError, MaintenanceStatus,
-    ResourceKind, Result, Snapshot, WriteOperation,
-    error::ROUTING_RETRY_AFTER,
-    filter::FilterExpr,
-    record::{ClientOp, PartialUpdate},
-    schema::{CollectionSchema, SchemaChange},
+    CollectionAssignment, CollectionRef, CorruptionKind, DEFAULT_DATABASE_NAME, EtcdMetadataConfig,
+    LeadershipFence, LogPoseError, ResourceKind, Result, error::ROUTING_RETRY_AFTER,
+    schema::CollectionSchema,
 };
 // Only a dependency so Cargo downloads the vendored protoc; see Cargo.toml.
 use protoc_bin_vendored as _;
 use serde::{Deserialize, Serialize};
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 // The metadata configuration types (`MetadataBackend`, `EtcdMetadataConfig`,
 // and `MetadataConfig`) live in `logpose-types` so that crates like
 // `logpose-config` can depend only on the foundational types crate without
 // pulling in the etcd client implementation.
 
-/// Storage engine wrapper that uses etcd for assignment metadata.
+/// The collection catalog in etcd, over the local engine that serves this node's collections.
+///
+/// Etcd is the authority on which collections exist, their descriptors, and their placement;
+/// the engine holds the data of the collections this node serves. A create writes pending
+/// metadata, then the local collection, then marks the metadata ready (rolling it back if the
+/// local create fails); a drop removes the local collection first and the metadata last, so a
+/// failure in between leaves only metadata, which a retry removes. Creates and drops are fenced
+/// by the control-plane leader's lease; publishing an altered schema is not fenced, but it only
+/// ever moves the catalog's schema version forward.
 #[derive(Clone)]
-pub struct EtcdBackedStorageEngine {
-    local: Arc<LocalStorageEngine>,
+pub struct EtcdCollectionCatalog {
+    engine: Engine,
     etcd: EtcdPlacementStore,
 }
 
@@ -77,29 +79,252 @@ impl StoredCollectionDescriptor {
     }
 }
 
-impl EtcdBackedStorageEngine {
-    /// Construct the wrapper over a local storage root, opening its engine.
+impl EtcdCollectionCatalog {
+    /// The etcd collection catalog over `engine`.
     ///
-    /// Fails if another engine holds the root; to share an open engine, use
-    /// [`EtcdBackedStorageEngine::with_local`].
-    pub fn new(root: impl AsRef<Path>, config: EtcdMetadataConfig) -> Result<Self> {
-        Self::with_local(LocalStorageEngine::new(root)?, config)
-    }
-
-    /// Construct the wrapper over an already open local engine.
-    pub fn with_local(local: LocalStorageEngine, config: EtcdMetadataConfig) -> Result<Self> {
+    /// # Errors
+    ///
+    /// An invalid etcd configuration.
+    pub fn new(engine: Engine, config: EtcdMetadataConfig) -> Result<Self> {
         Ok(Self {
-            local: Arc::new(local),
+            engine,
             etcd: EtcdPlacementStore::new(config)?,
         })
     }
 
+    /// Verify that etcd is reachable.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when etcd cannot be reached.
+    pub async fn metadata_status(&self) -> Result<()> {
+        self.etcd.metadata_status().await
+    }
+
+    /// Create a collection: authoritative metadata first, then the local collection with its
+    /// placement `assignment`, then the metadata is marked ready. Fenced by `leader_fence`.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists`, a stale assignment that needs manual reconciliation, the local
+    /// create's error (after rolling the metadata back), or etcd failures.
+    pub async fn create_collection(
+        &self,
+        request: CreateCollectionRequest,
+        assignment: CollectionAssignment,
+        leader_fence: LeadershipFence,
+    ) -> Result<CollectionDescriptor> {
+        let collection_name = request.lookup_name();
+        let reference = request.collection_ref();
+        if self.engine.collection(&reference).is_ok() {
+            return Err(LogPoseError::already_exists(
+                ResourceKind::Collection,
+                collection_name,
+            ));
+        }
+        let descriptor = self.engine.plan_collection_descriptor(&request)?;
+        let metadata_revision = match self
+            .etcd
+            .put_collection_metadata_if_absent(
+                &collection_name,
+                &descriptor,
+                &assignment,
+                &leader_fence,
+            )
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                if assignment_conflict(&error) {
+                    let local_collection_exists = self.engine.collection(&reference).is_ok();
+                    let existing_assignment = if local_collection_exists {
+                        None
+                    } else {
+                        self.etcd.get_assignment(&collection_name).await?
+                    };
+                    if matching_assignment_without_local_state(
+                        &error,
+                        local_collection_exists,
+                        existing_assignment.as_ref(),
+                        &assignment,
+                    ) {
+                        return Err(stale_assignment_requires_manual_reconciliation_error(
+                            &collection_name,
+                        ));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        match self
+            .engine
+            .create_collection(descriptor.clone(), Some(assignment))
+            .await
+        {
+            Ok(handle) => {
+                self.etcd
+                    .mark_collection_ready_if_revision_matches(
+                        &collection_name,
+                        &descriptor,
+                        metadata_revision,
+                        &leader_fence,
+                    )
+                    .await?;
+                Ok(handle.describe())
+            }
+            Err(error) => match self
+                .etcd
+                .delete_collection_metadata_if_revision_matches(
+                    &collection_name,
+                    metadata_revision,
+                    None,
+                )
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_failure_error(
+                    &collection_name,
+                    &error.to_string(),
+                    rollback_error,
+                )),
+            },
+        }
+    }
+
+    /// The descriptor of the ready collection `name` (`collection` or `database/collection`).
+    /// When this node serves the collection, the descriptor carries the local live schema
+    /// (and a catalog that lags it is healed).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, a pending descriptor that needs manual reconciliation, or etcd failures.
+    pub async fn describe(&self, name: &str) -> Result<CollectionDescriptor> {
+        match self.etcd.get_descriptor(name).await? {
+            Some(stored_descriptor) if stored_descriptor.ready => Ok(self
+                .materialize_runtime_descriptor(stored_descriptor.descriptor)
+                .await),
+            Some(_) => Err(pending_descriptor_requires_manual_reconciliation_error(
+                &canonical_collection_lookup_name(name),
+            )),
+            None => Err(LogPoseError::not_found(
+                ResourceKind::Collection,
+                canonical_collection_lookup_name(name),
+            )),
+        }
+    }
+
+    /// Descriptors of every ready collection in the cluster.
+    ///
+    /// # Errors
+    ///
+    /// Etcd failures and undecodable stored descriptors.
+    pub async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
+        let mut descriptors = Vec::new();
+        for stored_descriptor in self.etcd.list_descriptors().await? {
+            if !stored_descriptor.ready {
+                continue;
+            }
+            descriptors.push(
+                self.materialize_runtime_descriptor(stored_descriptor.descriptor)
+                    .await,
+            );
+        }
+        Ok(descriptors)
+    }
+
+    /// The authoritative placement assignment of `descriptor`'s collection. Fails closed: a
+    /// missing assignment requires reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// `ReconciliationRequired` without an assignment, or etcd failures.
+    pub async fn assignment(
+        &self,
+        descriptor: &CollectionDescriptor,
+    ) -> Result<CollectionAssignment> {
+        match self.etcd.get_assignment(&descriptor.lookup_name()).await {
+            Ok(Some(assignment)) => Ok(assignment),
+            Ok(None) => Err(LogPoseError::ReconciliationRequired {
+                collection: descriptor.lookup_name(),
+                message: format!(
+                    "collection '{}' has no authoritative assignment metadata in etcd; reconciliation is required before serving it",
+                    descriptor.lookup_name()
+                ),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drop a collection: the local collection first (the commit point for its data), then its
+    /// metadata, fenced by `leader_fence`.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` when neither exists, the local drop's error, or etcd failures.
+    pub async fn drop_collection(
+        &self,
+        collection_name: &str,
+        leader_fence: LeadershipFence,
+    ) -> Result<()> {
+        let collection_name = canonical_collection_lookup_name(collection_name);
+        let revision = self
+            .etcd
+            .collection_metadata_revision(&collection_name)
+            .await?;
+        // The local drop commits first. A drop that removed the local collection and then
+        // failed to remove the metadata leaves only metadata, which a retry removes.
+        let local = match self
+            .engine
+            .drop_collection(&collection_ref_from_lookup_name(&collection_name))
+            .await
+        {
+            Ok(()) => true,
+            Err(LogPoseError::NotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        match revision {
+            Some(revision) => {
+                self.etcd
+                    .delete_collection_metadata_if_revision_matches(
+                        &collection_name,
+                        revision,
+                        Some(&leader_fence),
+                    )
+                    .await
+            }
+            None if local => Ok(()),
+            None => Err(LogPoseError::not_found(
+                ResourceKind::Collection,
+                collection_name,
+            )),
+        }
+    }
+
+    /// Publish `schema`, a collection's live schema after a change, so every node describes
+    /// it. The engine's schema is authoritative: when this fails the change still stands, and
+    /// the owner republishes the schema the next time it describes the collection.
+    ///
+    /// # Errors
+    ///
+    /// Etcd failures.
+    pub async fn publish_schema(
+        &self,
+        collection_name: &str,
+        schema: &CollectionSchema,
+    ) -> Result<()> {
+        self.etcd
+            .publish_collection_schema(collection_name, schema)
+            .await
+    }
+
+    /// `descriptor` with this node's live schema when this node serves the collection.
     async fn materialize_runtime_descriptor(
         &self,
         descriptor: CollectionDescriptor,
-    ) -> Result<CollectionDescriptor> {
-        match self.local.open_collection(&descriptor.lookup_name()).await {
-            Ok(local_descriptor) if local_descriptor.matches_serving_identity(&descriptor) => {
+    ) -> CollectionDescriptor {
+        match self.engine.collection(&descriptor.collection_ref()) {
+            Ok(handle) if handle.descriptor().matches_serving_identity(&descriptor) => {
+                let local_descriptor = handle.describe();
                 if local_descriptor.schema.schema_version() > descriptor.schema.schema_version() {
                     // The owner serves a newer schema than the catalog holds: an alter whose
                     // catalog update failed. Heal it so other nodes describe the live schema;
@@ -112,9 +337,9 @@ impl EtcdBackedStorageEngine {
                         )
                         .await;
                 }
-                Ok(local_descriptor)
+                local_descriptor
             }
-            Ok(_) | Err(_) => Ok(descriptor),
+            Ok(_) | Err(_) => descriptor,
         }
     }
 }
@@ -445,319 +670,6 @@ impl EtcdCatalogStore {
         Err(LogPoseError::failed_precondition(format!(
             "database '{database_name}' still holds collection '{collection}'; drop its collections first"
         )))
-    }
-}
-
-impl CollectionReader for EtcdBackedStorageEngine {
-    fn read_view<'a>(
-        &'a self,
-        collection: &'a CollectionRef,
-        options: ReadOptions,
-    ) -> BoxFuture<'a, Result<ReadView>> {
-        self.local.read_view(collection, options)
-    }
-}
-
-#[async_trait]
-impl StorageEngine for EtcdBackedStorageEngine {
-    async fn engine_name(&self) -> &'static str {
-        "local+etcd-metadata"
-    }
-
-    async fn metadata_status(&self) -> Result<()> {
-        self.etcd.metadata_status().await
-    }
-
-    async fn create_collection(
-        &self,
-        _request: CreateCollectionRequest,
-    ) -> Result<CollectionDescriptor> {
-        Err(LogPoseError::internal(
-            "etcd-backed storage requires create_collection_with_assignment so authoritative metadata is written before local state"
-                .to_owned(),
-        ))
-    }
-
-    async fn create_collection_with_assignment(
-        &self,
-        request: CreateCollectionRequest,
-        assignment: CollectionAssignment,
-        leader_fence: Option<LeadershipFence>,
-    ) -> Result<CollectionDescriptor> {
-        let leader_fence = leader_fence.ok_or_else(|| {
-            LogPoseError::internal(
-                "etcd-backed collection creation requires a control-plane leadership fence",
-            )
-        })?;
-        let collection_name = request.lookup_name();
-        if self.local.open_collection(&collection_name).await.is_ok() {
-            return Err(LogPoseError::already_exists(
-                ResourceKind::Collection,
-                collection_name,
-            ));
-        }
-        let descriptor = self.local.plan_collection_descriptor(&request)?;
-        let metadata_revision = match self
-            .etcd
-            .put_collection_metadata_if_absent(
-                &collection_name,
-                &descriptor,
-                &assignment,
-                &leader_fence,
-            )
-            .await
-        {
-            Ok(revision) => revision,
-            Err(error) => {
-                if assignment_conflict(&error) {
-                    let local_collection_exists =
-                        self.local.open_collection(&collection_name).await.is_ok();
-                    let existing_assignment = if local_collection_exists {
-                        None
-                    } else {
-                        self.etcd.get_assignment(&collection_name).await?
-                    };
-                    if matching_assignment_without_local_state(
-                        &error,
-                        local_collection_exists,
-                        existing_assignment.as_ref(),
-                        &assignment,
-                    ) {
-                        return Err(stale_assignment_requires_manual_reconciliation_error(
-                            &collection_name,
-                        ));
-                    }
-                }
-                return Err(error);
-            }
-        };
-        match self
-            .local
-            .create_collection_from_descriptor_async(descriptor.clone(), Some(assignment.clone()))
-            .await
-        {
-            Ok(local_descriptor) => {
-                self.etcd
-                    .mark_collection_ready_if_revision_matches(
-                        &collection_name,
-                        &descriptor,
-                        metadata_revision,
-                        &leader_fence,
-                    )
-                    .await?;
-                Ok(local_descriptor)
-            }
-            Err(error) => match self
-                .etcd
-                .delete_collection_metadata_if_revision_matches(
-                    &collection_name,
-                    metadata_revision,
-                    None,
-                )
-                .await
-            {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(rollback_failure_error(
-                    &collection_name,
-                    &error.to_string(),
-                    rollback_error,
-                )),
-            },
-        }
-    }
-
-    async fn open_collection(&self, name: &str) -> Result<CollectionDescriptor> {
-        match self.etcd.get_descriptor(name).await? {
-            Some(stored_descriptor) if stored_descriptor.ready => {
-                self.materialize_runtime_descriptor(stored_descriptor.descriptor)
-                    .await
-            }
-            Some(_) => Err(pending_descriptor_requires_manual_reconciliation_error(
-                &canonical_collection_lookup_name(name),
-            )),
-            None => Err(LogPoseError::not_found(
-                ResourceKind::Collection,
-                canonical_collection_lookup_name(name),
-            )),
-        }
-    }
-
-    async fn has_local_collection(&self, name: &str) -> Result<bool> {
-        self.local.has_local_collection(name).await
-    }
-
-    async fn local_collection_matches_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<bool> {
-        match self.local.open_collection(&descriptor.lookup_name()).await {
-            Ok(local_descriptor) => Ok(local_descriptor.matches_serving_identity(descriptor)),
-            Err(LogPoseError::NotFound { .. }) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn list_collections(&self) -> Result<Vec<CollectionDescriptor>> {
-        let mut descriptors = Vec::new();
-        for stored_descriptor in self.etcd.list_descriptors().await? {
-            if !stored_descriptor.ready {
-                continue;
-            }
-            descriptors.push(
-                self.materialize_runtime_descriptor(stored_descriptor.descriptor)
-                    .await?,
-            );
-        }
-        Ok(descriptors)
-    }
-
-    async fn collection_assignment_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<CollectionAssignment> {
-        match self.etcd.get_assignment(&descriptor.lookup_name()).await {
-            Ok(Some(assignment)) => Ok(assignment),
-            Ok(None) => Err(LogPoseError::ReconciliationRequired {
-                collection: descriptor.lookup_name(),
-                message: format!(
-                    "collection '{}' has no authoritative assignment metadata in etcd; reconciliation is required before serving it",
-                    descriptor.lookup_name()
-                ),
-            }),
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn drop_collection(
-        &self,
-        collection_name: &str,
-        leader_fence: Option<LeadershipFence>,
-    ) -> Result<()> {
-        let leader_fence = leader_fence.ok_or_else(|| {
-            LogPoseError::internal(
-                "etcd-backed collection drops require a control-plane leadership fence",
-            )
-        })?;
-        let collection_name = canonical_collection_lookup_name(collection_name);
-        let revision = self
-            .etcd
-            .collection_metadata_revision(&collection_name)
-            .await?;
-        // The local drop commits first. A drop that removed the local collection and then
-        // failed to remove the metadata leaves only metadata, which a retry removes.
-        let local = match self.local.drop_collection(&collection_name, None).await {
-            Ok(()) => true,
-            Err(LogPoseError::NotFound { .. }) => false,
-            Err(error) => return Err(error),
-        };
-        match revision {
-            Some(revision) => {
-                self.etcd
-                    .delete_collection_metadata_if_revision_matches(
-                        &collection_name,
-                        revision,
-                        Some(&leader_fence),
-                    )
-                    .await
-            }
-            None if local => Ok(()),
-            None => Err(LogPoseError::not_found(
-                ResourceKind::Collection,
-                collection_name,
-            )),
-        }
-    }
-
-    async fn schema(&self, collection_name: &str) -> Result<Arc<CollectionSchema>> {
-        self.local.schema(collection_name).await
-    }
-
-    /// Apply the change through the local writer, then publish the new schema to the catalog
-    /// so every node describes the live schema. The engine's schema is authoritative: when the
-    /// catalog update fails the change still stands, and the owner republishes the schema the
-    /// next time it describes the collection.
-    async fn alter_schema(&self, collection_name: &str, change: SchemaChange) -> Result<CommitAck> {
-        let ack = self.local.alter_schema(collection_name, change).await?;
-        let schema = self.local.schema(collection_name).await?;
-        let _ = self
-            .etcd
-            .publish_collection_schema(collection_name, &schema)
-            .await;
-        Ok(ack)
-    }
-
-    async fn write_batch(&self, collection_name: &str, ops: Vec<ClientOp>) -> Result<CommitAck> {
-        self.local.write_batch(collection_name, ops).await
-    }
-
-    async fn delete_by_filter(
-        &self,
-        collection_name: &str,
-        filter: FilterExpr,
-    ) -> Result<CommitAck> {
-        self.local.delete_by_filter(collection_name, filter).await
-    }
-
-    async fn update_by_filter(
-        &self,
-        collection_name: &str,
-        filter: FilterExpr,
-        patch: PartialUpdate,
-    ) -> Result<CommitAck> {
-        self.local
-            .update_by_filter(collection_name, filter, patch)
-            .await
-    }
-
-    async fn write(
-        &self,
-        collection_name: &str,
-        operations: Vec<WriteOperation>,
-    ) -> Result<CommitAck> {
-        self.local.write(collection_name, operations).await
-    }
-
-    async fn snapshot(&self, collection_name: &str) -> Result<Snapshot> {
-        self.local.snapshot(collection_name).await
-    }
-
-    async fn flush(&self, collection_name: &str) -> Result<Snapshot> {
-        self.local.flush(collection_name).await
-    }
-
-    async fn compact(&self, collection_name: &str) -> Result<Snapshot> {
-        self.local.compact(collection_name).await
-    }
-
-    async fn stats(&self, collection_name: &str) -> Result<CollectionStats> {
-        self.local.stats(collection_name).await
-    }
-
-    async fn stats_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        self.local.stats_descriptor(descriptor, snapshot).await
-    }
-
-    async fn maintenance_status_descriptor(
-        &self,
-        descriptor: &CollectionDescriptor,
-    ) -> Result<MaintenanceStatus> {
-        self.local.maintenance_status_descriptor(descriptor).await
-    }
-
-    async fn stats_snapshot(
-        &self,
-        collection_name: &str,
-        snapshot: Option<Snapshot>,
-    ) -> Result<CollectionStats> {
-        self.local.stats_snapshot(collection_name, snapshot).await
-    }
-
-    async fn inspect(&self, collection_name: &str, target: InspectTarget) -> Result<InspectReport> {
-        self.local.inspect(collection_name, target).await
     }
 }
 
@@ -2030,8 +1942,11 @@ mod tests {
         let descriptor = CollectionDescriptor::new_in_database(
             "analytics",
             "documents",
-            logpose_types::legacy::legacy_schema(2, DistanceMetric::Dot).expect("schema"),
-            Path::new("/tmp/storage-etcd-tests"),
+            CreateCollectionRequest::new("documents", 2, DistanceMetric::Dot)
+                .spec
+                .build_schema()
+                .expect("schema"),
+            std::path::Path::new("/tmp/storage-etcd-tests"),
         );
 
         let pending = StoredCollectionDescriptor::pending(&descriptor);
@@ -2144,45 +2059,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn etcd_backed_storage_rejects_plain_create_collection() {
-        let root = unique_temp_dir("reject-plain-create");
-        let engine = EtcdBackedStorageEngine::new(&root, etcd_config("http://127.0.0.1:2379"))
-            .expect("engine should build");
-
-        let error = engine
-            .create_collection(CreateCollectionRequest::new(
-                "documents",
-                2,
-                DistanceMetric::Dot,
-            ))
-            .await
-            .expect_err("plain create should be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("create_collection_with_assignment")
-        );
-    }
-
-    #[tokio::test]
     async fn authoritative_assignment_reads_fail_closed_when_etcd_is_unreachable() {
         let root = unique_temp_dir("fail-closed-assignment");
-        let local = LocalStorageEngine::new(&root).expect("storage engine should open");
-        let descriptor = local
-            .create_collection(CreateCollectionRequest::new(
+        let engine = Engine::open_local(&root, logpose_storage::EngineConfig::default())
+            .expect("engine should open");
+        let descriptor = engine
+            .plan_collection_descriptor(&CreateCollectionRequest::new(
                 "documents",
                 2,
                 DistanceMetric::Dot,
             ))
+            .expect("descriptor should plan");
+        let descriptor = engine
+            .create_collection(descriptor, None)
             .await
-            .expect("local collection should be created");
-        let engine =
-            EtcdBackedStorageEngine::with_local(local.clone(), etcd_config("http://127.0.0.1:1"))
-                .expect("engine should build");
+            .expect("local collection should be created")
+            .describe();
+        let catalog = EtcdCollectionCatalog::new(engine, etcd_config("http://127.0.0.1:1"))
+            .expect("catalog should build");
 
-        let error = engine
-            .collection_assignment_descriptor(&descriptor)
+        let error = catalog
+            .assignment(&descriptor)
             .await
             .expect_err("authoritative metadata lookup should fail closed");
 

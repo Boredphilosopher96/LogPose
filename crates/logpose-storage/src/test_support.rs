@@ -1,6 +1,9 @@
 //! Helpers shared by the crate's unit tests.
 
-use logpose_types::{PutRecord, RecordId, WriteOperation};
+use logpose_types::{
+    Result, SeqNo,
+    record::{ClientOp, PrimaryKey, Record},
+};
 use logpose_vfs::{CrashPoint, DirEntry, OpenMode, Vfs, VfsFile, VfsLock};
 use serde_json::json;
 use std::{
@@ -14,12 +17,32 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) fn put(id: &str, vector: Vec<f32>) -> WriteOperation {
-    WriteOperation::Put(PutRecord {
-        id: RecordId::new(id),
-        vector,
-        metadata: json!({"key": id}),
-    })
+/// An upsert of `id` into a collection of the shape [`CreateCollectionRequest::new`] creates,
+/// with `$extra` `{"key": id}`.
+///
+/// [`CreateCollectionRequest::new`]: crate::CreateCollectionRequest::new
+pub(crate) fn put(id: &str, vector: Vec<f32>) -> ClientOp {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    record.extra.insert("key".to_owned(), json!(id));
+    ClientOp::Upsert(record)
+}
+
+/// The schema of the single-vector shape [`CreateCollectionRequest::new`] creates.
+///
+/// [`CreateCollectionRequest::new`]: crate::CreateCollectionRequest::new
+pub(crate) fn vector_schema(
+    dimensions: usize,
+    metric: logpose_types::DistanceMetric,
+) -> logpose_types::schema::CollectionSchema {
+    crate::CreateCollectionRequest::new("test", dimensions, metric)
+        .spec
+        .build_schema()
+        .expect("the single-vector schema builds")
+}
+
+/// A delete of `id`.
+pub(crate) fn delete(id: &str) -> ClientOp {
+    ClientOp::Delete(PrimaryKey::from(id))
 }
 
 pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -278,73 +301,49 @@ impl VfsFile for ControlledFile {
     }
 }
 
-/// Test-only scans of every live row, in the v1 record shape and sorted by id, read straight
-/// from a `Version` (the read path proper lives in `logpose-query`, which unit tests cannot
-/// link against this crate's types).
-impl crate::engine::EngineCore {
-    pub(crate) fn scan_exact_internal(
-        &self,
-        handle: &crate::handle::CollectionHandle,
-        at: impl Into<crate::state::ReadAt>,
-        _include_mutable: bool,
-        _segments: Option<std::collections::BTreeSet<String>>,
-    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
-        let (version, _) = self.read_state(handle, at)?;
-        scan_version(&version)
-    }
-}
-
-/// Every live row of `version` as a v1 record, sorted by id.
-pub(crate) fn scan_version(
-    version: &crate::version::Version,
-) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
+/// Every live row of `version` as its reader sees it, with the sequence number of its write,
+/// ordered by key. Read straight from the `Version` (the read path proper lives in
+/// `logpose-query`, which unit tests cannot link against this crate's types).
+pub(crate) fn live_records(version: &crate::version::Version) -> Result<Vec<(SeqNo, Record)>> {
     let mut records = version
         .live_images()
         .into_iter()
         .map(|(seq_no, image)| {
-            let put = crate::legacy_view::legacy_put(&version.schema, &image)?;
-            Ok(logpose_types::VisibleRecord {
-                id: put.id,
-                vector: put.vector,
-                metadata: put.metadata,
-                seq_no,
-            })
+            image
+                .to_record(&version.schema)
+                .map(|record| (seq_no, record))
+                .map_err(|error| logpose_types::LogPoseError::internal(error.to_string()))
         })
-        .collect::<logpose_types::Result<Vec<_>>>()?;
-    records.sort_by(|left, right| left.id.cmp(&right.id));
+        .collect::<Result<Vec<_>>>()?;
+    records.sort_by(|left, right| left.1.pk.cmp(&right.1.pk));
     Ok(records)
 }
 
-impl crate::LocalStorageEngine {
-    /// Every live record of the current state, or of an exact snapshot.
-    pub(crate) async fn scan_exact(
-        &self,
-        collection_name: &str,
-        snapshot: Option<logpose_types::Snapshot>,
-    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
-        let handle = self
-            .engine()
-            .collection(&crate::collections::collection_ref_from_lookup(
-                collection_name,
-            ))?;
-        self.engine()
-            .core()
-            .scan_exact_internal(&handle, snapshot, true, None)
-    }
+/// [`live_records`] of the state `at` names.
+pub(crate) fn scan(
+    handle: &crate::handle::CollectionHandle,
+    at: impl Into<crate::state::ReadAt>,
+) -> Result<Vec<(SeqNo, Record)>> {
+    let (version, _) = handle.read_state(at)?;
+    live_records(&version)
+}
 
-    /// Every live record of the state `token` pins, extending its expiry.
-    pub(crate) async fn scan_exact_at_token(
-        &self,
-        collection_name: &str,
-        token: crate::SnapshotToken,
-    ) -> logpose_types::Result<Vec<logpose_types::VisibleRecord>> {
-        let handle = self
-            .engine()
-            .collection(&crate::collections::collection_ref_from_lookup(
-                collection_name,
-            ))?;
-        self.engine()
-            .core()
-            .scan_exact_internal(&handle, token, true, None)
+/// A row as a reader of `schema` sees it, flattened for assertions: its key as a label, its
+/// first vector field, and its visible `$extra` keys plus typed scalar fields as one JSON
+/// object.
+pub(crate) fn flat_row(
+    schema: &logpose_types::schema::CollectionSchema,
+    image: &logpose_wal::codec::RowImage,
+) -> (String, Vec<f32>, serde_json::Value) {
+    let mut record = image.to_record(schema).expect("row should read");
+    let vector = schema
+        .vectors()
+        .first()
+        .and_then(|field| record.vectors.remove(&field.name))
+        .unwrap_or_default();
+    let mut fields = std::mem::take(&mut record.extra);
+    for (name, value) in record.fields {
+        fields.insert(name, value.into_json());
     }
+    (record.pk.label(), vector, serde_json::Value::Object(fields))
 }

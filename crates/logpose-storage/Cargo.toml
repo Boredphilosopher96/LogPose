@@ -10,7 +10,6 @@ workspace = true
 
 [dependencies]
 arc-swap = "1.7"
-async-trait.workspace = true
 bytemuck = "1.25"
 crc32c = "0.6"
 imbl = "7.0"

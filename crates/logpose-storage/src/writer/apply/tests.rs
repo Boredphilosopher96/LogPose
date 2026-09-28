@@ -1,8 +1,7 @@
 use super::*;
-use crate::{recovery::new_state, writer::PkIndex};
+use crate::{recovery::new_state, test_support::vector_schema, writer::PkIndex};
 use logpose_types::{
     DistanceMetric, UnitId,
-    legacy::legacy_schema,
     record::Record,
     schema::{FieldType, ScalarFieldSpec},
     value::Value,
@@ -11,7 +10,7 @@ use logpose_wal::codec::WirePk;
 use std::time::Duration;
 
 fn base() -> CollectionSchema {
-    legacy_schema(2, DistanceMetric::Dot).expect("schema")
+    vector_schema(2, DistanceMetric::Dot)
 }
 
 fn state(schema: CollectionSchema) -> LogicalState {

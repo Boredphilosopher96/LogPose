@@ -6,13 +6,17 @@ use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, QueryResponse, VectorQuery, scan_records,
+    ExplainMode, FilterExpr, QueryPlanKind, QueryRequest, QueryResponse, VectorQuery,
+    ops::{ScrollOrder, scroll_view},
 };
 use logpose_storage::{
-    CreateCollectionRequest, EngineConfig, IndexPolicy, LocalStorageEngine, ReadOptions,
-    StorageEngine,
+    CollectionHandle, CollectionReader, CreateCollectionRequest, Engine, EngineConfig, IndexPolicy,
+    Projection, ReadOptions,
 };
-use logpose_types::{CollectionRef, DistanceMetric, PutRecord, RecordId, WriteOperation};
+use logpose_types::{
+    CollectionRef, DistanceMetric,
+    record::{ClientOp, Record},
+};
 use rayon as _;
 use roaring as _;
 use serde as _;
@@ -20,6 +24,7 @@ use serde_json::json;
 use std::{
     fs,
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror as _;
@@ -46,8 +51,8 @@ fn query_vector() -> Vec<f32> {
     vector(987_654)
 }
 
-fn engine(root: &PathBuf) -> LocalStorageEngine {
-    LocalStorageEngine::with_config(
+fn engine(root: &PathBuf) -> Engine {
+    Engine::open_local(
         root,
         EngineConfig {
             index: IndexPolicy {
@@ -61,31 +66,48 @@ fn engine(root: &PathBuf) -> LocalStorageEngine {
     .expect("storage engine should open")
 }
 
-async fn create(engine: &LocalStorageEngine, name: &str) {
-    engine
-        .create_collection(CreateCollectionRequest::new(
+async fn create(engine: &Engine, name: &str) {
+    let descriptor = engine
+        .plan_collection_descriptor(&CreateCollectionRequest::new(
             name,
             DIMS,
             DistanceMetric::Dot,
         ))
+        .expect("collection should plan");
+    engine
+        .create_collection(descriptor, None)
         .await
         .expect("collection should be created");
 }
 
+fn handle(engine: &Engine, name: &str) -> Arc<CollectionHandle> {
+    engine
+        .collection(&CollectionRef::parse(name).expect("name"))
+        .expect("the collection should be open")
+}
+
+fn put(id: &str, vector: Vec<f32>, extra: serde_json::Value) -> ClientOp {
+    let mut record = Record::new(id).with_vector("vector", vector);
+    if let serde_json::Value::Object(extra) = extra {
+        record.extra = extra;
+    }
+    ClientOp::Upsert(record)
+}
+
 /// `ROWS` random rows, a quarter of them `keep`.
-async fn fill(engine: &LocalStorageEngine, name: &str) {
+async fn fill(engine: &Engine, name: &str) {
     let operations = (0..ROWS)
         .map(|index| {
             let kind = if index % 4 == 0 { "keep" } else { "drop" };
-            WriteOperation::Put(PutRecord {
-                id: RecordId::new(format!("doc-{index:05}")),
-                vector: vector(index as u64),
-                metadata: json!({ "kind": kind, "version": 1 }),
-            })
+            put(
+                &format!("doc-{index:05}"),
+                vector(index as u64),
+                json!({ "kind": kind, "version": 1 }),
+            )
         })
         .collect::<Vec<_>>();
-    engine
-        .write(name, operations)
+    handle(engine, name)
+        .write(operations)
         .await
         .expect("write should succeed");
 }
@@ -107,7 +129,7 @@ fn request(name: &str, top_k: usize, filter: Option<FilterExpr>) -> (CollectionR
 }
 
 async fn query(
-    engine: &LocalStorageEngine,
+    engine: &Engine,
     (collection, request): (CollectionRef, QueryRequest),
 ) -> logpose_query::Result<QueryResponse> {
     logpose_query::query(engine, &collection, request)
@@ -121,8 +143,8 @@ async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
     let engine = engine(&root);
     create(&engine, "documents").await;
     fill(&engine, "documents").await;
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
 
@@ -144,8 +166,8 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
     let engine = engine(&root);
     create(&engine, "documents").await;
     fill(&engine, "documents").await;
-    engine
-        .flush("documents")
+    handle(&engine, "documents")
+        .flush()
         .await
         .expect("flush should succeed");
 
@@ -188,19 +210,16 @@ async fn memtable_rows_merge_with_segment_walks_and_supersede_stale_rows() {
     let engine = engine(&root);
     create(&engine, "profiles").await;
     fill(&engine, "profiles").await;
-    engine
-        .flush("profiles")
+    handle(&engine, "profiles")
+        .flush()
         .await
         .expect("flush should succeed");
-    engine
-        .write(
-            "profiles",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("doc-01500"),
-                vector: query_vector().iter().map(|value| value * 3.0).collect(),
-                metadata: json!({ "kind": "drop", "version": 2 }),
-            })],
-        )
+    handle(&engine, "profiles")
+        .write(vec![put(
+            "doc-01500",
+            query_vector().iter().map(|value| value * 3.0).collect(),
+            json!({ "kind": "drop", "version": 2 }),
+        )])
         .await
         .expect("mutable update should succeed");
 
@@ -232,21 +251,24 @@ async fn small_filtered_populations_stay_exact_after_compaction_and_reopen() {
     let engine = engine(&root);
     create(&engine, "events").await;
     fill(&engine, "events").await;
-    engine.flush("events").await.expect("flush should succeed");
-    engine
-        .write(
-            "events",
-            vec![WriteOperation::Put(PutRecord {
-                id: RecordId::new("late"),
-                vector: vector(424_242),
-                metadata: json!({ "kind": "rare", "version": 1 }),
-            })],
-        )
+    handle(&engine, "events")
+        .flush()
+        .await
+        .expect("flush should succeed");
+    handle(&engine, "events")
+        .write(vec![put(
+            "late",
+            vector(424_242),
+            json!({ "kind": "rare", "version": 1 }),
+        )])
         .await
         .expect("write should succeed");
-    engine.flush("events").await.expect("flush should succeed");
-    engine
-        .compact("events")
+    handle(&engine, "events")
+        .flush()
+        .await
+        .expect("flush should succeed");
+    handle(&engine, "events")
+        .compact()
         .await
         .expect("compaction should succeed");
     drop(engine);
@@ -287,31 +309,42 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 /// Ids of every live row whose `kind` passes `keep`, by exact dot product with `query`
 /// (ties by id).
 async fn exact_ranked_ids(
-    engine: &LocalStorageEngine,
+    engine: &Engine,
     collection_name: &str,
     query: &[f32],
     keep: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    let mut scored = scan_records(
-        engine,
-        &CollectionRef::parse(collection_name).expect("name"),
-        ReadOptions::default(),
+    let view = engine
+        .read_view(
+            &CollectionRef::parse(collection_name).expect("name"),
+            ReadOptions::default(),
+        )
+        .await
+        .expect("view should open");
+    let (rows, _) = scroll_view(
+        &view,
+        None,
+        &ScrollOrder::Pk,
+        u32::MAX,
+        Projection::full(),
+        None,
     )
     .await
-    .expect("scan should succeed")
-    .into_iter()
-    .filter(|record| keep(record.metadata["kind"].as_str().unwrap_or_default()))
-    .map(|record| {
-        (
-            record.id.to_string(),
-            query
-                .iter()
-                .zip(&record.vector)
-                .map(|(left, right)| left * right)
-                .sum::<f32>(),
-        )
-    })
-    .collect::<Vec<_>>();
+    .expect("scan should succeed");
+    let mut scored = rows
+        .into_iter()
+        .filter(|row| keep(row.record.extra["kind"].as_str().unwrap_or_default()))
+        .map(|row| {
+            (
+                row.record.pk.label(),
+                query
+                    .iter()
+                    .zip(&row.record.vectors["vector"])
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>(),
+            )
+        })
+        .collect::<Vec<_>>();
     scored.sort_by(|(left_id, left_value), (right_id, right_value)| {
         right_value
             .total_cmp(left_value)

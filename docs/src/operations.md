@@ -35,6 +35,16 @@ The runtime boundary is explicit today:
 
 Operator-facing query diagnostics now include ANN-aware plan kinds, candidate generation and rerank timings, merge accounting, and fallback reasons. Query-unit artifact and component statistics are surfaced through collection stats and inspect outputs. Together, those surfaces make explain/profile and storage introspection part of the normal operational workflow rather than debugging-only escape hatches.
 
+## Storage Engine
+
+Each server process opens one storage engine on its `storage_root`, recovers every collection there at startup, and holds the root locked until it exits (see [Configuration](./configuration.md)). The engine's layout and guarantees are summarized in [Architecture](./architecture.md#storage-and-query-path).
+
+- **Flush and compaction.** Both run in the background on their own triggers. `flush` makes every acknowledged write part of a segment and moves the WAL checkpoint past it; `compact` merges a collection's segments (as many as one job's memory allows) and reclaims deleted rows. Both return the snapshot they published.
+- **Statistics.** Collection stats report the manifest generation, visible sequence number, live and deleted row counts, operations above the checkpoint, and one query unit per segment plus one for the memtables. A segment's `index_kind` is `hnsw` (graph and SQ8 codes), `sq8` (codes only), or `flat`; the memtables are `raw`. The stats' `maintenance` field shows jobs waiting for a permit, the job running, completed jobs, and the last failure with its count of consecutive failures.
+- **Inspection.** `inspect` targets are `manifest` (the current manifest), `wal` (the rows written since the checkpoint: each with its sequence number, primary key `pk`, the record as the current schema reads it, its memtable, and whether a later write deleted it), `segment` (one segment's manifest entry, section table, and rows, each with its `pk` and whether it is deleted), and `maintenance`. Inspect payloads are diagnostics, not a stable contract.
+- **Failures.** A WAL fsync failure makes the collection read-only (writes fail with `COLLECTION_POISONED`) until the server restarts; reads keep serving the last published state. A flush that fails five times in a row poisons the collection the same way, and one that fails because the device is full or read-only poisons it at once. A `wal/FSYNC_FAILED` marker refuses to reopen a collection in the same boot, because the page cache may still hold frames the disk never received. A collection whose recovery fails reports that error on every call, and the rest of the server keeps serving.
+- **Background maintenance after a restart** starts for a collection on its first use (a read, write, stats call, or inspection), so a node that only reports status for a collection never runs its jobs.
+
 ## Local Podman Chaos
 
 PR4's local multi-node chaos workflow is documented in [Podman
@@ -75,7 +85,9 @@ cluster_name = "default"
 ```
 
 With `metadata.backend = "etcd"`, LogPose now treats etcd as the authoritative
-source for collection descriptors and assignments. Collections created before
+source for collection descriptors and assignments; each node's storage engine
+holds the data of the collections it serves, and collection creates and drops
+are fenced by the control-plane leader's lease. Collections created before
 the etcd metadata path is enabled are not auto-backfilled from local
 `placement.json` files; migrate them by recreating them through the control
 plane or by explicitly backfilling metadata before flipping an existing storage
