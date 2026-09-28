@@ -570,13 +570,19 @@ impl Runner {
                 self.stats.writes_refused += 1;
                 Ok(())
             }
-            (Err(error), Err(Refusal::Invalid(_)))
-                if !matches!(error, LogPoseError::NotFound { .. }) =>
-            {
+            (Err(LogPoseError::InvalidArgument { .. }), Err(Refusal::Invalid(_))) => {
                 self.stats.writes_refused += 1;
                 Ok(())
             }
-            (Err(error), Ok((next, applied))) if armed || self.poisoned => {
+            // A crash or an injected failure can fail a valid request, but never make it
+            // invalid.
+            (Err(error), Ok((next, applied)))
+                if (armed || self.poisoned)
+                    && !matches!(
+                        error,
+                        LogPoseError::InvalidArgument { .. } | LogPoseError::NotFound { .. }
+                    ) =>
+            {
                 if self.poisoned && !armed {
                     return Ok(());
                 }
@@ -1407,11 +1413,4 @@ fn check_row(model: &Model, row: &RowData) -> Check {
         ));
     }
     Ok(())
-}
-
-impl Session {
-    pub fn clock_now(&self) -> Duration {
-        use logpose_storage::Clock;
-        self.clock.now()
-    }
 }

@@ -25,11 +25,12 @@
 use crate::{
     actions::{Checker, Runner},
     model::Model,
-    session::{Backend, Maintenance, NAME, ROOT, Session, Setup, reference},
+    session::{Backend, Maintenance, ROOT, Session, Setup, reference},
 };
 use logpose_query::{ScrollOrder, scroll_view};
-use logpose_storage::{GroupCommitConfig, JobKind, Projection, ReadOptions, SteppedJob};
-use logpose_storage::{SchemaChange, SnapshotToken};
+use logpose_storage::{
+    GroupCommitConfig, JobKind, Projection, ReadOptions, SchemaChange, SnapshotToken, SteppedJob,
+};
 use logpose_types::{
     DistanceMetric, SeqNo,
     record::{ClientOp, PrimaryKey, Record},
@@ -624,16 +625,13 @@ pub fn enumerate(scenario: &Scenario, seed: u64) -> Coverage {
             }
 
             // The recovered collection keeps working.
-            let mut after = ctx.session.handle().clone();
-            let write = ctx.upsert(15, 99.0);
-            after
-                .write_blocking(vec![write])
+            let handle = ctx.session.handle();
+            handle
+                .write_blocking(vec![ctx.upsert(15, 99.0)])
                 .unwrap_or_else(|error| fail(detail(format!("write after recovery: {error}"))));
-            after
+            handle
                 .flush_blocking()
                 .unwrap_or_else(|error| fail(detail(format!("flush after recovery: {error}"))));
-            after = Arc::clone(&after);
-            drop(after);
         }
     }
     println!("{}: {ops} body ops, {coverage:?}", scenario.name);
@@ -1040,6 +1038,3 @@ fn every_crash_point_of_writes_from_an_empty_collection_recovers_a_prefix() {
         "{coverage:?}"
     );
 }
-
-#[allow(dead_code, reason = "the name is part of the root layout")]
-const _: &str = NAME;

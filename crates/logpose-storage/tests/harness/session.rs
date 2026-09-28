@@ -287,6 +287,12 @@ impl Session {
         self.fault.as_ref().expect("a FaultVfs backend")
     }
 
+    /// The engine clock's time now.
+    pub fn clock_now(&self) -> Duration {
+        use logpose_storage::Clock as _;
+        self.clock.now()
+    }
+
     pub fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
     }
