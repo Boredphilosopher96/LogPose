@@ -47,6 +47,13 @@ fn config() -> EngineConfig {
     EngineConfig {
         boot_id: Some(BootId::new("boot")),
         strict_invariants: true,
+        // Flushes and compactions build every index section, so crashes land in index builds
+        // and reads go through them.
+        index: crate::IndexPolicy {
+            graph_min_rows: 4,
+            sq8_min_rows: 2,
+            ..crate::IndexPolicy::default()
+        },
         ..EngineConfig::default()
     }
 }
