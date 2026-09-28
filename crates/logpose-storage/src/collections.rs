@@ -268,3 +268,44 @@ impl CoreRef {
         Ok(handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logpose_types::{LogPoseError, schema::MAX_VECTOR_DIMENSIONS};
+
+    #[test]
+    fn the_single_vector_request_is_a_string_key_one_vector_and_dynamic_fields() {
+        let request = CreateCollectionRequest::new("docs", 3, DistanceMetric::L2);
+        assert_eq!(request.collection_ref(), CollectionRef::new_default("docs"));
+        let schema = request.spec.build_schema().expect("the schema builds");
+        assert_eq!(schema.primary_key().name, "id");
+        assert_eq!(schema.primary_key_type(), PrimaryKeyType::String);
+        let vectors = schema.vectors();
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].name, "vector");
+        assert_eq!(vectors[0].dimensions, 3);
+        assert_eq!(vectors[0].metric, DistanceMetric::L2);
+        assert!(schema.fields().is_empty());
+        assert!(schema.dynamic_fields());
+    }
+
+    #[test]
+    fn the_single_vector_request_rejects_out_of_range_dimensions() {
+        let too_many = usize::try_from(MAX_VECTOR_DIMENSIONS).expect("fits") + 1;
+        for dimensions in [0, too_many, usize::MAX] {
+            let error = CreateCollectionRequest::new("docs", dimensions, DistanceMetric::Dot)
+                .spec
+                .build_schema()
+                .expect_err("out-of-range dimensions are refused");
+            assert!(
+                matches!(
+                    &error,
+                    LogPoseError::InvalidArgument { field: Some(field), .. }
+                        if field == "vectors[0].dimensions"
+                ),
+                "{dimensions}: {error:?}"
+            );
+        }
+    }
+}

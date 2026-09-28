@@ -1822,6 +1822,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// With etcd metadata, a collection create is fenced by the control-plane leader's lease:
+    /// without a fence it is refused before it touches etcd or the engine.
+    #[tokio::test]
+    async fn etcd_metadata_refuses_an_unfenced_create() {
+        let root = temp_root("etcd-unfenced");
+        let engine =
+            Engine::open_local(&root, EngineConfig::default()).expect("engine should open");
+        let data = LogPoseDataService::with_etcd(
+            engine.clone(),
+            EtcdMetadataConfig {
+                endpoints: vec!["http://127.0.0.1:1".to_owned()],
+                timeout_ms: 250,
+                ..EtcdMetadataConfig::default()
+            },
+        )
+        .expect("the etcd catalog should build");
+
+        let error = data
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect_err("an unfenced create is refused");
+        assert!(error.to_string().contains("leadership fence"), "{error}");
+        assert!(
+            engine.list_collections().expect("list").is_empty(),
+            "nothing was created locally"
+        );
+        drop((data, engine));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Stats behind a read barrier come from one published state that satisfies it: a newer
     /// state (here after a flush) passes, a barrier ahead of the collection fails, and a
     /// barrier together with an exact snapshot is refused.
