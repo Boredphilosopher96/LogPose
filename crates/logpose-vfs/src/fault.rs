@@ -215,6 +215,13 @@ impl FaultVfs {
         self.lock().file_syncs
     }
 
+    /// Number of directory syncs attempted since the last reboot; the index the next one has for
+    /// [`FaultPlan::fail_sync_dir`].
+    #[must_use]
+    pub fn dir_syncs(&self) -> u64 {
+        self.lock().dir_syncs
+    }
+
     /// Crash points reached since the last reboot, in order.
     #[must_use]
     pub fn crash_points_hit(&self) -> Vec<CrashPoint> {
