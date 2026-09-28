@@ -18,7 +18,7 @@ use crate::{
     writer::{JobCommit, JobStart, JobWork},
 };
 use logpose_types::{LogPoseError, Result, Snapshot};
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 pub use crate::writer::JobKind;
 
@@ -79,6 +79,26 @@ impl Engine {
             ticket: Some(ticket),
             core,
         })
+    }
+
+    /// Run `handle`'s writer tick now, after every control message sent to the writer before
+    /// this call (the end of a job whose [`SteppedJob`] was dropped, for one), and return once
+    /// it ran. The tick is what the writer otherwise runs every 100 ms of real time: it fails
+    /// writes that stalled past their timeout, freezes a memtable past its age trigger, plans
+    /// a background job whose retry backoff has passed on the engine clock, and runs the
+    /// compaction policy. Whatever it plans is requested from the scheduler before this
+    /// returns. A test on a manual clock calls it after advancing the clock, so the retry a
+    /// failed flush was waiting for is requested at that point of the test rather than at
+    /// whichever real-time tick comes first. Blocking, for at most `timeout`.
+    ///
+    /// Test support, hidden from the documented API, like [`Engine::begin_job`].
+    ///
+    /// # Errors
+    ///
+    /// The collection's writer stopped, or did not run the tick within `timeout`.
+    #[doc(hidden)]
+    pub fn tick_writer(&self, handle: &Arc<CollectionHandle>, timeout: Duration) -> Result<()> {
+        handle.tick_writer(timeout)
     }
 }
 

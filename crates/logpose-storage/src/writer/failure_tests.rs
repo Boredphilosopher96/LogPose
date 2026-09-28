@@ -502,6 +502,60 @@ fn a_failing_compaction_backs_off_on_its_own_and_never_delays_a_flush() {
     assert_eq!(live(&handle).len(), 8);
 }
 
+/// A flush that failed leaves its memtable frozen, and the background retry waits for the
+/// flush backoff on the engine clock. `Engine::tick_writer` runs the writer's tick at once: one
+/// just short of the backoff plans nothing, and the first one past it has requested the retry
+/// by the time it returns, whichever real-time tick would have come first.
+#[test]
+fn a_tick_past_the_flush_backoff_requests_the_retry_before_it_returns() {
+    let fault = FaultVfs::new(8);
+    let vfs = ControlledVfs::wrap(fault.process());
+    let clock = Arc::new(ManualClock::new());
+    let engine = open(&vfs, config(&clock));
+    // No flush trigger: only the explicit flush and its retry flush.
+    let handle = create(&engine, usize::MAX, usize::MAX);
+    write(&handle, vec![upsert("a", 1.0), upsert("b", 2.0)]);
+    vfs.fail_file_syncs_containing(".seg", 1);
+    handle
+        .flush_blocking()
+        .expect_err("the flush fails at its segment's sync");
+    assert_eq!(failures(&handle, "flush"), 1);
+    assert_eq!(
+        handle.current().frozen.len(),
+        1,
+        "the memtable stays frozen"
+    );
+    let granted = engine.scheduler().stats().flushes_granted;
+
+    clock.advance(FLUSH_RETRY_BACKOFF - Duration::from_millis(1));
+    engine
+        .tick_writer(&handle, Duration::from_secs(30))
+        .expect("the writer ticks");
+    std::thread::sleep(TICK_INTERVAL * 2);
+    assert_eq!(
+        engine.scheduler().stats().flushes_granted,
+        granted,
+        "no retry inside the backoff"
+    );
+    assert_eq!(handle.current().frozen.len(), 1);
+
+    clock.advance(Duration::from_millis(1));
+    engine
+        .tick_writer(&handle, Duration::from_secs(30))
+        .expect("the writer ticks");
+    assert_eq!(
+        engine.scheduler().stats().flushes_granted,
+        granted + 1,
+        "the retry was granted before the tick returned"
+    );
+    wait_for("the retry to commit", || {
+        handle.current().frozen.is_empty() && engine.scheduler().stats().running == 0
+    });
+    assert_eq!(segment_rows(&handle), [2]);
+    assert_eq!(handle.maintenance_status().last_error, None);
+    assert_eq!(live(&handle), ["a", "b"]);
+}
+
 /// An explicit compaction of a collection with one segment rewrites it when it has deleted
 /// rows, so they are reclaimed; with none left, it changes nothing.
 #[test]
