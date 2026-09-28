@@ -530,6 +530,55 @@ async fn open_collection_resolves_database_collection_tuple() {
     );
 }
 
+/// A flush or compaction reply means the job is over: the maintenance status the caller
+/// reads next must not still report it running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_status_is_idle_when_flush_and_compact_reply() {
+    let root = support::unique_temp_dir("storage-maintenance-idle");
+    let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
+    engine
+        .create_collection(CreateCollectionRequest::new(
+            "documents",
+            3,
+            DistanceMetric::Dot,
+        ))
+        .await
+        .expect("collection should be created");
+
+    for round in 0..40_u32 {
+        engine
+            .write(
+                "documents",
+                vec![WriteOperation::Put(PutRecord {
+                    id: RecordId::new(format!("doc-{round}")),
+                    vector: vec![0.1, 0.2, f32::from(u8::try_from(round % 200).unwrap_or(0))],
+                    metadata: json!({"round": round}),
+                })],
+            )
+            .await
+            .expect("write should succeed");
+        engine
+            .flush("documents")
+            .await
+            .expect("flush should succeed");
+        let after_flush = engine.stats("documents").await.expect("stats");
+        assert_ne!(
+            after_flush.maintenance.in_progress.as_deref(),
+            Some("flush"),
+            "round {round}: the flush replied but still shows as running"
+        );
+        engine
+            .compact("documents")
+            .await
+            .expect("compact should succeed");
+        let after_compact = engine.stats("documents").await.expect("stats");
+        assert_eq!(
+            after_compact.maintenance.in_progress, None,
+            "round {round}: the compaction replied but still shows as running"
+        );
+    }
+}
+
 #[tokio::test]
 async fn flush_persists_visible_records_for_reopen() {
     let root = support::unique_temp_dir("storage-flush");

@@ -560,16 +560,21 @@ impl Writer {
                     },
                     Err(error) => Outcome::Failed(error),
                 };
-                if let Some(reply) = reply {
-                    let _ = reply.send(match &outcome {
+                let answer = reply.map(|reply| {
+                    let result = match &outcome {
                         Outcome::Committed(snapshot) => Ok(snapshot.clone()),
                         Outcome::Failed(error) => Err(error.clone()),
                         Outcome::Nothing | Outcome::Abandoned => {
                             Ok(self.handle.current().snapshot())
                         }
-                    });
-                }
+                    };
+                    (reply, result)
+                });
                 self.end_job(job, outcome, wrote_files).await;
+                // Answered after the job has ended, like every other waiter.
+                if let Some((reply, result)) = answer {
+                    let _ = reply.send(result);
+                }
             }
             ControlMsg::EndJob { job, wrote_files } => {
                 self.end_job(job, Outcome::Abandoned, wrote_files).await;
@@ -1386,6 +1391,9 @@ impl Writer {
             Outcome::Failed(error) => self.job_failed(entry.kind, error),
             Outcome::Abandoned => {}
         }
+        // Publish the status without this job before answering its waiters, so a caller
+        // that reads the status after its reply never sees the finished job still running.
+        self.update_status();
         match entry.kind {
             JobKind::Flush => self.settle_flush_waiters(&outcome),
             JobKind::Compact => {
