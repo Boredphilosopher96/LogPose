@@ -307,6 +307,54 @@ fn an_index_build_adds_the_graph_a_flush_no_longer_builds() {
     assert_no_orphans(fault.process().as_ref(), &handle, "after reopen");
 }
 
+/// A sidecar the manifest names that is missing or cut short fails the collection's recovery as
+/// `Corrupt { Index }`, so no search runs without the graph the manifest promises or over a torn
+/// one. (A damaged byte inside a graph section fails its CRC when a search loads it, which the
+/// query crate's corruption tests cover.)
+#[test]
+fn a_missing_or_truncated_sidecar_fails_recovery_as_index_corruption() {
+    for truncate in [false, true] {
+        let fault = FaultVfs::new(71);
+        let engine = open(fault.process(), config());
+        let handle = create(&engine, false);
+        fill(&handle, 0, 120);
+        handle.flush_blocking().expect("flush");
+        index_by_hand(&engine, &handle);
+        let entry = handle.current().manifest.segments[0].clone();
+        let index = entry.index.expect("the manifest names the sidecar");
+        let path = index_path(&handle.meta().dir, entry.unit, index.unit);
+        drop(handle);
+        drop(engine);
+
+        let vfs = fault.process();
+        if truncate {
+            let file = vfs
+                .open(&path, logpose_vfs::OpenMode::Append)
+                .expect("open the sidecar");
+            file.set_len(index.file_len - 1).expect("truncate");
+            file.sync_all().expect("sync");
+        } else {
+            vfs.remove_file(&path).expect("remove the sidecar");
+        }
+
+        let engine = open(fault.process(), config());
+        let error = engine
+            .collection(&reference())
+            .map(|_| ())
+            .expect_err("the collection must not open with its sidecar damaged");
+        assert!(
+            matches!(
+                error,
+                logpose_types::LogPoseError::Corrupt {
+                    kind: logpose_types::CorruptionKind::Index,
+                    ..
+                }
+            ),
+            "truncated {truncate}: {error}"
+        );
+    }
+}
+
 /// With background maintenance on, the writer plans the build as soon as a flush commits a
 /// segment of at least `graph_min_rows` rows, and a smaller segment gets none while the
 /// collection takes writes.
