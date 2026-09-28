@@ -28,7 +28,13 @@ pub const RETRY_AFTER_METADATA_KEY: &str = "retry-after-ms";
 /// The gRPC status code for `error`.
 #[must_use]
 pub fn grpc_code(error: &LogPoseError) -> Code {
-    match error.code() {
+    code_to_grpc(error.code())
+}
+
+/// The gRPC status code of the same name as `code`.
+#[must_use]
+pub const fn code_to_grpc(code: ErrorCode) -> Code {
+    match code {
         ErrorCode::InvalidArgument => Code::InvalidArgument,
         ErrorCode::NotFound => Code::NotFound,
         ErrorCode::AlreadyExists => Code::AlreadyExists,
@@ -39,6 +45,33 @@ pub fn grpc_code(error: &LogPoseError) -> Code {
         ErrorCode::Unavailable => Code::Unavailable,
         ErrorCode::DataLoss => Code::DataLoss,
         ErrorCode::Internal => Code::Internal,
+    }
+}
+
+/// The LogPose code a gRPC status code stands for, the inverse of [`code_to_grpc`].
+///
+/// `None` for the codes LogPose never sends itself (see [`ErrorCode`]), which a client only
+/// sees from its own transport, a proxy, or tonic.
+#[must_use]
+pub const fn code_from_grpc(code: Code) -> Option<ErrorCode> {
+    match code {
+        Code::InvalidArgument => Some(ErrorCode::InvalidArgument),
+        Code::NotFound => Some(ErrorCode::NotFound),
+        Code::AlreadyExists => Some(ErrorCode::AlreadyExists),
+        Code::FailedPrecondition => Some(ErrorCode::FailedPrecondition),
+        Code::Unauthenticated => Some(ErrorCode::Unauthenticated),
+        Code::PermissionDenied => Some(ErrorCode::PermissionDenied),
+        Code::ResourceExhausted => Some(ErrorCode::ResourceExhausted),
+        Code::Unavailable => Some(ErrorCode::Unavailable),
+        Code::DataLoss => Some(ErrorCode::DataLoss),
+        Code::Internal => Some(ErrorCode::Internal),
+        Code::Ok
+        | Code::Cancelled
+        | Code::Unknown
+        | Code::DeadlineExceeded
+        | Code::Aborted
+        | Code::OutOfRange
+        | Code::Unimplemented => None,
     }
 }
 
@@ -224,6 +257,24 @@ mod tests {
                 error.retry_after().map(|delay| delay.as_millis()),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn grpc_codes_map_back_to_the_logpose_code_of_the_same_name() {
+        for code in ErrorCode::ALL {
+            assert_eq!(code_from_grpc(code_to_grpc(code)), Some(code), "{code}");
+        }
+        for foreign in [
+            Code::Ok,
+            Code::Cancelled,
+            Code::Unknown,
+            Code::DeadlineExceeded,
+            Code::Aborted,
+            Code::OutOfRange,
+            Code::Unimplemented,
+        ] {
+            assert_eq!(code_from_grpc(foreign), None, "{foreign:?}");
         }
     }
 
