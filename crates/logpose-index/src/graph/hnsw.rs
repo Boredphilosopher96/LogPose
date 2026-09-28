@@ -72,25 +72,6 @@ impl HnswParams {
         self.ef_construction.max(self.m)
     }
 
-    /// Beam width on the entry layer: the lowest layer a descent crosses
-    /// before its beam search (layer 1 for queries and for rows inserted at
-    /// level 0).
-    ///
-    /// Greedy routing (a beam of one) is enough on the sparse top layers but
-    /// not on the entry layer. On data whose clusters are almost equidistant
-    /// (well-separated blobs in 64 or more dimensions), a single greedy path
-    /// over the entry layer stops in a cluster ranked 5th to 20th nearest to
-    /// the query's own, with no layer-0 link into it, and a layer-0 beam of
-    /// 64 rows fills with that cluster and never leaves it. A beam of `M`
-    /// rows expands several of that cluster's entry-layer rows and their
-    /// long links, which reach the right cluster, and all of them seed the
-    /// next layer. Measured on 50,000 x 128 rows in 256 such clusters
-    /// (`docs/src/engine-core-design.md`, "Implementation Notes (HNSW Entry
-    /// Beam)"), widths 4 and 8 still strand queries and 16 strands none.
-    pub(super) fn entry_beam(&self) -> usize {
-        self.m
-    }
-
     /// Level of `row`, drawn from a counter-based RNG keyed by the seed.
     ///
     /// `level = floor(-ln(u) * mL)` for `u` uniform in `(0, 1]`. With 53-bit

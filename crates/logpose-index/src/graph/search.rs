@@ -416,14 +416,38 @@ where
     }
 }
 
+/// Beam width on the entry layer: the lowest layer a descent crosses before
+/// its full beam search (layer 1 for queries and for rows inserted at level
+/// 0).
+///
+/// Greedy routing (a beam of one) is enough on the sparse top layers but not
+/// on the entry layer. On data whose clusters are almost equidistant
+/// (well-separated blobs in 64 or more dimensions), a single greedy path over
+/// the entry layer can stop in a cluster ranked 5th to 20th nearest to the
+/// query's own, with no layer-0 link into it, and a layer-0 beam of 64 rows
+/// fills with that cluster and never leaves it. A wider beam expands several
+/// of that cluster's entry-layer rows and their long links, which usually
+/// reach the right cluster, and all of them seed the next layer.
+///
+/// The width is fixed rather than tied to `M`: a larger `M` already gives
+/// every entry-layer row more links (graphs with `M` of 32 or 64 stranded
+/// no query in those measurements even without the beam), so a beam of `M`
+/// rows would only add distance work, and a smaller `M` needs the beam at
+/// least as much. The beam lowers the failure rate but does not remove it
+/// on every graph: routing between almost equidistant clusters stays
+/// probabilistic. See
+/// `docs/src/engine-core-design.md`, "Implementation Notes (HNSW Entry
+/// Beam)", for the measurements.
+pub(super) const ENTRY_BEAM: usize = 16;
+
 /// Descent through the upper layers `low..=top` (level 0 is never visited)
 /// to the entry rows of the layer below.
 ///
 /// Layers above `low` are walked greedily, as in the paper; the entry layer
-/// `low` is searched with a beam of `width` rows (see
-/// `HnswParams::entry_beam`), and every row it keeps
-/// seeds the next layer. A single greedy path can stop in the wrong cluster
-/// of clustered data, where the next layer's beam may never leave it.
+/// `low` is searched with a beam of [`ENTRY_BEAM`] rows, and every row it
+/// keeps seeds the next layer. A single greedy path can stop in the wrong
+/// cluster of clustered data, where the next layer's beam may never leave
+/// it.
 pub(super) struct Descent<'a, L: ?Sized, Q: ?Sized, F: ?Sized> {
     pub(super) links: &'a L,
     pub(super) query: &'a Q,
@@ -435,8 +459,6 @@ pub(super) struct Descent<'a, L: ?Sized, Q: ?Sized, F: ?Sized> {
     pub(super) low: usize,
     /// Top layer, where `start` sits.
     pub(super) top: usize,
-    /// Beam width on the entry layer.
-    pub(super) width: usize,
     /// Rows addressable in the graph (visited-set size).
     pub(super) rows: usize,
 }
@@ -483,7 +505,7 @@ where
             query: self.query,
             filter: &AllRows,
             mode: Mode::Admit,
-            ef: self.width.max(1),
+            ef: ENTRY_BEAM,
         };
         walk.run(state, &mut walk_stats);
         stats.distance_computations += walk_stats.distance_computations;
@@ -598,7 +620,6 @@ where
                 filter: Some(filter),
                 low: 1,
                 top: graph.max_level(),
-                width: graph.params().entry_beam(),
                 rows: graph.len(),
             };
             let closest_match = descent.run(start, state, entries, &mut stats);

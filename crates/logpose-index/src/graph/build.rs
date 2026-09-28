@@ -68,7 +68,6 @@ where
         filter: None::<&AllRows>,
         low: target.level + 1,
         top: target.top,
-        width: params.entry_beam(),
         rows: target.rows,
     };
     descent.run(start, beam, &mut build.layer, &mut stats);

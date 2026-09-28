@@ -97,8 +97,7 @@ hnsw_ef_construction = 128   # build-time beam width; the default
 ```
 
 - `hnsw_m` must be 2 to 1024. Larger values raise recall at a given search
-  `ef` and cost memory and build time. It is also the beam width on layer 1,
-  where a search's descent picks its layer-0 entry rows.
+  `ef` and cost memory and build time.
 - `hnsw_ef_construction` must be 1 to 4096. Larger values build a better graph
   more slowly.
 

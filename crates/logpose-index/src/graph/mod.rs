@@ -26,7 +26,7 @@
 //! # Search
 //!
 //! A query walks greedily from the entry point down to layer 2. Layer 1, the
-//! entry layer, is searched with a beam of `M` rows instead of a single
+//! entry layer, is searched with a beam of 16 rows instead of a single
 //! greedy path, and every row that beam keeps seeds the layer-0 beam of
 //! `ef` rows. On clustered data a single greedy path can stop in the wrong
 //! cluster, and the layer-0 beam cannot always leave it.
