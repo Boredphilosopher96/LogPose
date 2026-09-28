@@ -257,12 +257,16 @@ fn report(failure: &Failure) -> ! {
             }
         }
     };
-    // Hand-stepped runs replay exactly; with background jobs the scheduler's timing varies,
-    // so a replay usually, but not always, fails the same way.
-    let exact = if failure.setup.maintenance == Maintenance::Stepped {
+    // Hand-stepped runs on `FaultVfs` replay exactly (in practice: the engine's own flush of a
+    // memtable an abandoned flush left frozen runs in the background). With background jobs,
+    // or on the real filesystem, timing varies, so a replay usually, but not always, fails
+    // the same way.
+    let exact = if failure.setup.maintenance == Maintenance::Stepped
+        && failure.setup.backend == Backend::Fault
+    {
         ""
     } else {
-        " (background jobs: timing-dependent, may not reproduce exactly)"
+        " (timing-dependent: may not reproduce exactly)"
     };
     panic!(
         "seed {} failed ({:?}): {}\nreplay{exact}: LOGPOSE_HARNESS_FIRST_SEED={} \

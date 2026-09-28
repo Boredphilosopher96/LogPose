@@ -46,7 +46,9 @@ pub enum Backend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Maintenance {
     /// Background maintenance off: flushes and compactions run only when an action begins,
-    /// builds, and commits a job by hand, or asks for one explicitly.
+    /// builds, and commits a job by hand, or asks for one explicitly. The one exception is the
+    /// engine's own: a frozen memtable that an abandoned or failed flush left behind is
+    /// flushed by a background job right away, as it must be.
     Stepped,
     /// Tiny flush and compaction thresholds with the scheduler paused: background jobs start
     /// only when an action grants a permit (or a blocked call needs one).
@@ -194,7 +196,13 @@ impl Session {
             runtime: RuntimeConfig {
                 io_threads: 2,
                 query_threads: 1,
-                maintenance_threads: 1,
+                // Free-running maintenance gets two job slots, so a collection's flush and
+                // compactions (tiers merge independently) run at once, racing each other too.
+                maintenance_threads: if self.setup.maintenance == Maintenance::Free {
+                    2
+                } else {
+                    1
+                },
                 writer_threads: 1,
                 ..RuntimeConfig::default()
             },

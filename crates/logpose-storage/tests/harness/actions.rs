@@ -245,6 +245,8 @@ pub struct Stats {
     pub compactions_granted: u64,
     /// Segment files checked to exist for a live version (I7).
     pub files_checked: u64,
+    /// The most maintenance jobs seen running at once after an action.
+    pub peak_jobs: usize,
 }
 
 impl Stats {
@@ -271,6 +273,7 @@ impl Stats {
         self.flushes_granted += other.flushes_granted;
         self.compactions_granted += other.compactions_granted;
         self.files_checked += other.files_checked;
+        self.peak_jobs = self.peak_jobs.max(other.peak_jobs);
     }
 }
 
@@ -415,6 +418,8 @@ impl Runner {
             other => self.attempt(other, false)?,
         }
         self.drop_dead_views();
+        let running = self.session.engine().scheduler().stats().running;
+        self.stats.peak_jobs = self.stats.peak_jobs.max(running);
         self.check_state()
     }
 

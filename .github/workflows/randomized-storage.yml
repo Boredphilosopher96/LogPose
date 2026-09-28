@@ -17,10 +17,10 @@ jobs:
     env:
       # Harness v2 (crates/logpose-storage/tests/harness): each randomized test runs its fixed
       # seeds, then keeps drawing new ones until this many seconds passed. Seeds start from the
-      # run number, so every run explores new ones; a failure prints its seed and a replay
-      # command.
+      # run number times a million (a nightly run draws a few thousand), so every run explores
+      # new ones; a failure prints its seed and a replay command.
       LOGPOSE_HARNESS_SEEDS: "24"
-      LOGPOSE_HARNESS_FIRST_SEED: "${{ github.run_number }}000"
+      LOGPOSE_HARNESS_FIRST_SEED: "${{ github.run_number }}000000"
       LOGPOSE_HARNESS_SECS: ${{ github.event_name == 'schedule' && '1500' || '90' }}
       LOGPOSE_STRESS_SECS: ${{ github.event_name == 'schedule' && '900' || '60' }}
       # Recovery idempotence against a clean recovery at every crash state, in every tear mode,
