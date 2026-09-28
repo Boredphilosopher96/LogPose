@@ -1474,6 +1474,7 @@ dependencies = [
  "logpose-config",
  "logpose-core",
  "logpose-telemetry",
+ "tempfile",
  "tokio",
  "tracing",
 ]

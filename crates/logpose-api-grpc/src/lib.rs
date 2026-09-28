@@ -60,18 +60,30 @@ use proto::{
     UpsertRecordsRequest,
 };
 
-/// Serve the gRPC API until shutdown.
+/// Serve the gRPC API until the process exits.
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_until(state, std::future::pending()).await
+}
+
+/// Serve the gRPC API until `shutdown` completes, then stop accepting connections and return
+/// once every in-flight call has finished.
+pub async fn serve_until<F>(
+    state: Arc<AppState>,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Future<Output = ()> + Send,
+{
     let address = SocketAddr::from((
         state.config.grpc_host.parse::<std::net::IpAddr>()?,
         state.config.grpc_port,
     ));
 
     let listener = tokio::net::TcpListener::bind(address).await?;
-    serve_with_listener(state, listener).await
+    serve_with_listener_until(state, listener, shutdown).await
 }
 
-/// Serve the gRPC API over an existing listener.
+/// Serve the gRPC API over an existing listener until the process exits.
 ///
 /// Request messages above `limits.max_grpc_message_bytes` are rejected with
 /// `RESOURCE_EXHAUSTED` and a typed `TOO_LARGE` error.
@@ -79,6 +91,22 @@ pub async fn serve_with_listener(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_with_listener_until(state, listener, std::future::pending()).await
+}
+
+/// Serve the gRPC API over an existing listener until `shutdown` completes, then stop
+/// accepting connections and return once every in-flight call has finished.
+///
+/// Request messages above `limits.max_grpc_message_bytes` are rejected with
+/// `RESOURCE_EXHAUSTED` and a typed `TOO_LARGE` error.
+pub async fn serve_with_listener_until<F>(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Future<Output = ()> + Send,
+{
     let address = listener.local_addr()?;
     let (health_reporter, health_service) = health_reporter();
     health_reporter
@@ -96,7 +124,7 @@ pub async fn serve_with_listener(
                 .max_decoding_message_size(message_limit)
                 .max_encoding_message_size(message_limit),
         )
-        .serve_with_incoming(incoming(listener))
+        .serve_with_incoming_shutdown(incoming(listener), shutdown)
         .await?;
 
     Ok(())
