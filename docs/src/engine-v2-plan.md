@@ -439,6 +439,7 @@ Tasks:
 3. Parallel per-segment execution with a global heap merge. Delete the full sort in `rank_matches_with`.
 4. `EXPLAIN` renders the tree with estimated and actual values per operator and the reason for each strategy choice. Delete `VectorFirstExact` and the label-only plan kinds.
 5. Add a VectorDBBench client for LogPose and run it against Milvus (HNSW index) on the same machine: Cohere 1M 768-dim and OpenAI 500K 1536-dim, unfiltered and filtered (1 and 99 percent), plus a 10M case. Commit the results under `benches/baselines/`.
+   Status: the client (`logpose-bench vdb-prepare` and `vdb-run`), the Milvus driver, and the end-to-end script (`scripts/bench-milvus.sh`) are in. First results at 100K by 768 and 50K by 1,536, on synthetic embedding-like data because the public files were unreachable, are in `benches/baselines/phase5-milvus-*.md`. The 1M, 500K, and 10M runs remain, as does a rerun on a quiet machine after planner v2.
 
 Exit criteria: at recall of at least 0.95, LogPose QPS is within 20 percent of Milvus HNSW or better on every case; filtered cases hold recall where Milvus drops; results are reproducible from a script.
 

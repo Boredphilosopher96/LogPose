@@ -1,0 +1,815 @@
+{
+  "schema": "logpose-vdb-comparison/1",
+  "generated_at": "2026-09-28 11:33",
+  "generated_by": "scripts/bench-milvus.sh",
+  "dataset": {
+    "format": 1,
+    "name": "openai-50k",
+    "synthetic": true,
+    "mirrors": "VectorDBBench OpenAI 50K (1536 dims, cosine)",
+    "generator": {
+      "n": 50000,
+      "queries": 1000,
+      "dims": 1536,
+      "latent_dims": 32,
+      "clusters": 256,
+      "spread": 1.0,
+      "noise": 0.1,
+      "seed": 42
+    },
+    "metric": "cosine",
+    "n": 50000,
+    "dims": 1536,
+    "queries": 1000,
+    "k": 10,
+    "scalar_field": "rank",
+    "base_file": "base.fvecs",
+    "queries_file": "queries.fvecs",
+    "scalar_file": "rank.i64",
+    "cases": [
+      {
+        "name": "unfiltered",
+        "selectivity": null,
+        "filter_lt": null,
+        "matching_rows": 50000,
+        "ground_truth_file": "gt-unfiltered.ivecs"
+      },
+      {
+        "name": "filter-1pct",
+        "selectivity": 0.01,
+        "filter_lt": 500,
+        "matching_rows": 500,
+        "ground_truth_file": "gt-filter-1pct.ivecs"
+      },
+      {
+        "name": "filter-99pct",
+        "selectivity": 0.99,
+        "filter_lt": 49500,
+        "matching_rows": 49500,
+        "ground_truth_file": "gt-filter-99pct.ivecs"
+      }
+    ],
+    "generate_seconds": 9.321001916,
+    "oracle_seconds": 167.289023662
+  },
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "6.18.44-fc-v37",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "logical_cpus": 4,
+    "total_memory_bytes": 16877547520,
+    "git_commit": "b194119fea7aa9c4f54223f770040bf354ffac67",
+    "git_dirty": true
+  },
+  "target_recall": 0.95,
+  "resources": {
+    "logpose_server_rss_bytes": "717254656",
+    "logpose_disk_bytes": "393735588",
+    "logpose_loadavg_at_start": "12.07 17.26 17.39",
+    "milvus_container_memory": "1.775GiB / 15.72GiB",
+    "milvus_disk_bytes": "1931872497",
+    "milvus_loadavg_at_start": "11.93 11.24 13.83",
+    "milvus_image": "milvusdb/milvus:v2.6.24"
+  },
+  "milvus_missing_reason": null,
+  "systems": {
+    "logpose": {
+      "schema": "logpose-vdb-report/1",
+      "system": "logpose",
+      "system_version": "LogPose 0.1.0 (development, release)",
+      "endpoint": "http://127.0.0.1:15051",
+      "driver": "logpose-bench 0.1.0 vdb-run",
+      "started_at_unix": 1790594141,
+      "total_seconds": 526.670900865,
+      "machine": {
+        "os": "linux",
+        "arch": "x86_64",
+        "kernel": "6.18.44-fc-v37",
+        "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+        "logical_cpus": 4,
+        "total_memory_bytes": 16877547520,
+        "git_commit": "b194119fea7aa9c4f54223f770040bf354ffac67",
+        "git_dirty": true
+      },
+      "dataset": {
+        "format": 1,
+        "name": "openai-50k",
+        "synthetic": true,
+        "mirrors": "VectorDBBench OpenAI 50K (1536 dims, cosine)",
+        "generator": {
+          "n": 50000,
+          "queries": 1000,
+          "dims": 1536,
+          "latent_dims": 32,
+          "clusters": 256,
+          "spread": 1.0,
+          "noise": 0.1,
+          "seed": 42
+        },
+        "metric": "cosine",
+        "n": 50000,
+        "dims": 1536,
+        "queries": 1000,
+        "k": 10,
+        "scalar_field": "rank",
+        "base_file": "base.fvecs",
+        "queries_file": "queries.fvecs",
+        "scalar_file": "rank.i64",
+        "cases": [
+          {
+            "name": "unfiltered",
+            "selectivity": null,
+            "filter_lt": null,
+            "matching_rows": 50000,
+            "ground_truth_file": "gt-unfiltered.ivecs"
+          },
+          {
+            "name": "filter-1pct",
+            "selectivity": 0.01,
+            "filter_lt": 500,
+            "matching_rows": 500,
+            "ground_truth_file": "gt-filter-1pct.ivecs"
+          },
+          {
+            "name": "filter-99pct",
+            "selectivity": 0.99,
+            "filter_lt": 49500,
+            "matching_rows": 49500,
+            "ground_truth_file": "gt-filter-99pct.ivecs"
+          }
+        ],
+        "generate_seconds": 9.321001916,
+        "oracle_seconds": 167.289023662
+      },
+      "index": {
+        "ef_construction": 200,
+        "m": 16,
+        "quantization": "sq8 traversal with f32 rerank",
+        "scalar_index": "auto (inverted and sorted for int64)",
+        "type": "hnsw"
+      },
+      "target_recall": 0.95,
+      "load": {
+        "rows": 50000,
+        "batch_size": 1000,
+        "insert_seconds": 10.211974849,
+        "optimize_seconds": 323.460611456,
+        "total_seconds": 333.672586305,
+        "insert_rows_per_sec": 4896.212607191861,
+        "write_retries": 0
+      },
+      "cases": [
+        {
+          "name": "unfiltered",
+          "selectivity": null,
+          "filter": null,
+          "matching_rows": 50000,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 0.9879999999999984,
+              "min_recall": 0.7,
+              "queries": 1000,
+              "qps": 263.71958107899815,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 3.7884165739999967,
+                "min_ms": 2.042388,
+                "p50_ms": 3.491321,
+                "p95_ms": 5.9416720000000005,
+                "p99_ms": 9.104019,
+                "max_ms": 17.487926
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 0.9879999999999984,
+          "met_target": true,
+          "plan": {
+            "chosen_plan": "QUERY_PLAN_KIND_VECTOR_FIRST_ANN",
+            "estimated_selectivity": 1.0,
+            "fallback_reason": null,
+            "planner_reason": "unit 0000000c graph_admit: 20000 matching rows exceed the exact-scan limit 2048; selectivity 1.000; unit 0000000d graph_admit: 30000 matching rows exceed the exact-scan limit 2048; selectivity 1.000; unit 0000000a empty: no live row matches",
+            "units_scanned": 2
+          },
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.004013923,
+              "queries": 5652,
+              "qps": 282.54329464855573,
+              "latency": {
+                "count": 5652,
+                "mean_ms": 3.5354788779193256,
+                "min_ms": 1.7237349999999998,
+                "p50_ms": 3.278951,
+                "p95_ms": 5.423005,
+                "p99_ms": 8.506437,
+                "max_ms": 44.419427999999996
+              },
+              "recall": 0.9880042462844969
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.006944522,
+              "queries": 9126,
+              "qps": 456.14161572572385,
+              "latency": {
+                "count": 9126,
+                "mean_ms": 8.765077937102763,
+                "min_ms": 2.215983,
+                "p50_ms": 8.066453,
+                "p95_ms": 15.117089,
+                "p99_ms": 21.184608,
+                "max_ms": 57.269868
+              },
+              "recall": 0.9880122726276611
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.013732336,
+              "queries": 9494,
+              "qps": 474.3742866453013,
+              "latency": {
+                "count": 9494,
+                "mean_ms": 16.854267350747772,
+                "min_ms": 2.3915889999999997,
+                "p50_ms": 15.062442,
+                "p95_ms": 32.407185,
+                "p99_ms": 43.944519,
+                "max_ms": 92.613343
+              },
+              "recall": 0.9880134821992834
+            }
+          ]
+        },
+        {
+          "name": "filter-1pct",
+          "selectivity": 0.01,
+          "filter": "rank < 500",
+          "matching_rows": 500,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 1.0,
+              "min_recall": 1.0,
+              "queries": 1000,
+              "qps": 313.4293143910898,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 3.1867292810000007,
+                "min_ms": 1.43893,
+                "p50_ms": 2.891263,
+                "p95_ms": 5.389856,
+                "p99_ms": 7.583286,
+                "max_ms": 16.365696
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 1.0,
+          "met_target": true,
+          "plan": {
+            "chosen_plan": "QUERY_PLAN_KIND_PREDICATE_FIRST_EXACT",
+            "estimated_selectivity": 0.009999999776482582,
+            "fallback_reason": "no segment has a graph large enough to walk",
+            "planner_reason": "unit 0000000c exact_sq8: 208 matching rows are within the exact-scan limit 2048; unit 0000000d exact_sq8: 292 matching rows are within the exact-scan limit 2048; unit 0000000a empty: no live row matches",
+            "units_scanned": 2
+          },
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.000195028,
+              "queries": 7802,
+              "qps": 390.09619601595415,
+              "latency": {
+                "count": 7802,
+                "mean_ms": 2.5599376667521145,
+                "min_ms": 1.267833,
+                "p50_ms": 2.3798220000000003,
+                "p95_ms": 3.836675,
+                "p99_ms": 6.191986,
+                "max_ms": 25.831177
+              },
+              "recall": 1.0
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.003901011,
+              "queries": 15716,
+              "qps": 785.6467591675187,
+              "latency": {
+                "count": 15716,
+                "mean_ms": 5.087997924535497,
+                "min_ms": 1.524958,
+                "p50_ms": 4.560993,
+                "p95_ms": 9.049591,
+                "p99_ms": 12.629636,
+                "max_ms": 49.710285
+              },
+              "recall": 1.0
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.006511803,
+              "queries": 16481,
+              "qps": 823.7817847651311,
+              "latency": {
+                "count": 16481,
+                "mean_ms": 9.703376175292759,
+                "min_ms": 1.764892,
+                "p50_ms": 8.011562,
+                "p95_ms": 20.722746,
+                "p99_ms": 31.556756,
+                "max_ms": 786.8608740000001
+              },
+              "recall": 1.0
+            }
+          ]
+        },
+        {
+          "name": "filter-99pct",
+          "selectivity": 0.99,
+          "filter": "rank < 49500",
+          "matching_rows": 49500,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 0.9878999999999983,
+              "min_recall": 0.7,
+              "queries": 1000,
+              "qps": 228.38627182736104,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 4.373972453000003,
+                "min_ms": 2.435822,
+                "p50_ms": 4.193002000000001,
+                "p95_ms": 6.636672,
+                "p99_ms": 9.177817,
+                "max_ms": 18.029374
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 0.9878999999999983,
+          "met_target": true,
+          "plan": {
+            "chosen_plan": "QUERY_PLAN_KIND_COOPERATIVE_FILTERED_ANN",
+            "estimated_selectivity": 0.9900000095367432,
+            "fallback_reason": null,
+            "planner_reason": "unit 0000000c graph_admit: 19801 matching rows exceed the exact-scan limit 2048; selectivity 0.990; unit 0000000d graph_admit: 29699 matching rows exceed the exact-scan limit 2048; selectivity 0.990; unit 0000000a empty: no live row matches",
+            "units_scanned": 2
+          },
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.001188651,
+              "queries": 4882,
+              "qps": 244.08549337671062,
+              "latency": {
+                "count": 4882,
+                "mean_ms": 4.092504046292508,
+                "min_ms": 1.9307370000000001,
+                "p50_ms": 3.80458,
+                "p95_ms": 6.355996,
+                "p99_ms": 9.656681,
+                "max_ms": 27.794649
+              },
+              "recall": 0.9878328553871367
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.003871973,
+              "queries": 9085,
+              "qps": 454.1620748354307,
+              "latency": {
+                "count": 9085,
+                "mean_ms": 8.802711401981256,
+                "min_ms": 2.400009,
+                "p50_ms": 7.986584,
+                "p95_ms": 15.193616,
+                "p99_ms": 23.237789,
+                "max_ms": 85.713926
+              },
+              "recall": 0.9879361585030305
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.011501338,
+              "queries": 9673,
+              "qps": 483.3720287458824,
+              "latency": {
+                "count": 9673,
+                "mean_ms": 16.543881807195305,
+                "min_ms": 3.0417,
+                "p50_ms": 14.633347,
+                "p95_ms": 32.451108999999995,
+                "p99_ms": 44.564033,
+                "max_ms": 107.13366400000001
+              },
+              "recall": 0.9878941383231673
+            }
+          ]
+        }
+      ],
+      "server_stats": {
+        "live_record_count": 50000,
+        "manifest_generation": 8,
+        "mutable_op_count": 0,
+        "query_units": [
+          {
+            "approx_bytes": 0,
+            "component_bytes": {
+              "mutable_delta": 0
+            },
+            "index_kind": "raw",
+            "put_count": 0,
+            "tier": "mutable"
+          },
+          {
+            "approx_bytes": 157496832,
+            "component_bytes": {
+              "segment": 157496832
+            },
+            "index_kind": "hnsw",
+            "put_count": 20000,
+            "tier": "immutable"
+          },
+          {
+            "approx_bytes": 236237184,
+            "component_bytes": {
+              "segment": 236237184
+            },
+            "index_kind": "hnsw",
+            "put_count": 30000,
+            "tier": "immutable"
+          }
+        ],
+        "segment_count": 2
+      },
+      "notes": [
+        "recall is mean recall@k against exact ground truth computed by logpose-bench vdb-prepare",
+        "latency is measured by the client around each gRPC call, so it includes serialization and loopback transport",
+        "each concurrent client has its own gRPC connection and runs in the driver's tokio runtime on the same machine as the server",
+        "LogPose applies ef as max(ef, 4 * k) and widens it for filtered walks that come up short",
+        "the dataset is synthetic (embedding-like, see dataset.generator); it mirrors only the shape of the public dataset named in dataset.mirrors"
+      ]
+    },
+    "milvus": {
+      "schema": "logpose-vdb-report/1",
+      "system": "milvus",
+      "system_version": "2.6.24",
+      "endpoint": "http://127.0.0.1:19530",
+      "driver": "scripts/bench/milvus_vdb.py",
+      "started_at_unix": 1790594672,
+      "total_seconds": 508.8810017900105,
+      "machine": {
+        "os": "linux",
+        "arch": "x86_64",
+        "kernel": "6.18.44-fc-v37",
+        "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+        "logical_cpus": 4,
+        "total_memory_bytes": 16877547520,
+        "git_commit": "b194119fea7aa9c4f54223f770040bf354ffac67",
+        "git_dirty": true
+      },
+      "dataset": {
+        "format": 1,
+        "name": "openai-50k",
+        "synthetic": true,
+        "mirrors": "VectorDBBench OpenAI 50K (1536 dims, cosine)",
+        "generator": {
+          "n": 50000,
+          "queries": 1000,
+          "dims": 1536,
+          "latent_dims": 32,
+          "clusters": 256,
+          "spread": 1.0,
+          "noise": 0.1,
+          "seed": 42
+        },
+        "metric": "cosine",
+        "n": 50000,
+        "dims": 1536,
+        "queries": 1000,
+        "k": 10,
+        "scalar_field": "rank",
+        "base_file": "base.fvecs",
+        "queries_file": "queries.fvecs",
+        "scalar_file": "rank.i64",
+        "cases": [
+          {
+            "name": "unfiltered",
+            "selectivity": null,
+            "filter_lt": null,
+            "matching_rows": 50000,
+            "ground_truth_file": "gt-unfiltered.ivecs"
+          },
+          {
+            "name": "filter-1pct",
+            "selectivity": 0.01,
+            "filter_lt": 500,
+            "matching_rows": 500,
+            "ground_truth_file": "gt-filter-1pct.ivecs"
+          },
+          {
+            "name": "filter-99pct",
+            "selectivity": 0.99,
+            "filter_lt": 49500,
+            "matching_rows": 49500,
+            "ground_truth_file": "gt-filter-99pct.ivecs"
+          }
+        ],
+        "generate_seconds": 9.321001916,
+        "oracle_seconds": 167.289023662
+      },
+      "index": {
+        "type": "hnsw",
+        "m": 16,
+        "ef_construction": 200,
+        "quantization": "none (HNSW over f32)",
+        "scalar_index": "STL_SORT"
+      },
+      "target_recall": 0.95,
+      "load": {
+        "rows": 50000,
+        "batch_size": 1000,
+        "insert_seconds": 30.21743027699995,
+        "optimize_seconds": 160.47559210000327,
+        "total_seconds": 190.69302237700322,
+        "insert_rows_per_sec": 1654.6741248893554,
+        "write_retries": 0
+      },
+      "cases": [
+        {
+          "name": "unfiltered",
+          "selectivity": null,
+          "filter": null,
+          "matching_rows": 50000,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 0.9602,
+              "min_recall": 0.4,
+              "queries": 1000,
+              "qps": 107.17497598276839,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 9.314882804785157,
+                "min_ms": 5.081943003460765,
+                "p50_ms": 8.627138988231309,
+                "p95_ms": 14.040239999303594,
+                "p99_ms": 22.258199998759665,
+                "max_ms": 65.48416899750009
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 0.9602,
+          "met_target": true,
+          "plan": null,
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.010484558006283,
+              "queries": 2007,
+              "qps": 100.29742129342843,
+              "latency": {
+                "count": 2007,
+                "mean_ms": 9.949340312929342,
+                "min_ms": 3.9696750027360395,
+                "p50_ms": 9.18458099476993,
+                "p95_ms": 14.580069997464307,
+                "p99_ms": 28.66648300550878,
+                "max_ms": 80.72007799637504
+              },
+              "recall": 0.9600398604882957
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.265291869000066,
+              "queries": 1833,
+              "qps": 90.4502146748723,
+              "latency": {
+                "count": 1833,
+                "mean_ms": 44.00555568870624,
+                "min_ms": 5.602523000561632,
+                "p50_ms": 31.971827003872022,
+                "p95_ms": 116.09875300200656,
+                "p99_ms": 187.87448499642778,
+                "max_ms": 424.79464899224695
+              },
+              "recall": 0.96001091107474
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.217207959998632,
+              "queries": 2275,
+              "qps": 112.52790219605349,
+              "latency": {
+                "count": 2275,
+                "mean_ms": 70.92341673449143,
+                "min_ms": 6.336140009807423,
+                "p50_ms": 54.37723400245886,
+                "p95_ms": 197.91902000724804,
+                "p99_ms": 284.3461930024205,
+                "max_ms": 368.2141830067849
+              },
+              "recall": 0.9598681318681326
+            }
+          ]
+        },
+        {
+          "name": "filter-1pct",
+          "selectivity": 0.01,
+          "filter": "rank < 500",
+          "matching_rows": 500,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 1.0,
+              "min_recall": 1.0,
+              "queries": 1000,
+              "qps": 50.82076914327517,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 19.65632749181532,
+                "min_ms": 4.693941009463742,
+                "p50_ms": 9.617552990675904,
+                "p95_ms": 71.10105799802113,
+                "p99_ms": 143.82343599572778,
+                "max_ms": 277.1124339924427
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 1.0,
+          "met_target": true,
+          "plan": null,
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.009013889997732,
+              "queries": 1049,
+              "qps": 52.426371722615606,
+              "latency": {
+                "count": 1049,
+                "mean_ms": 19.054980822691242,
+                "min_ms": 4.449792992090806,
+                "p50_ms": 10.00173699867446,
+                "p95_ms": 68.59196299046744,
+                "p99_ms": 130.7090780028375,
+                "max_ms": 309.5598729996709
+              },
+              "recall": 1.0
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.056912069994723,
+              "queries": 1929,
+              "qps": 96.17632032628777,
+              "latency": {
+                "count": 1929,
+                "mean_ms": 41.48921928959608,
+                "min_ms": 4.478654998820275,
+                "p50_ms": 30.06496699526906,
+                "p95_ms": 111.19023400533479,
+                "p99_ms": 219.71261998987757,
+                "max_ms": 303.1601929978933
+              },
+              "recall": 1.0
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.155538738996256,
+              "queries": 2560,
+              "qps": 127.0122338653741,
+              "latency": {
+                "count": 2560,
+                "mean_ms": 62.743016579366895,
+                "min_ms": 4.633142991224304,
+                "p50_ms": 49.60113599372562,
+                "p95_ms": 160.0094919995172,
+                "p99_ms": 249.70641199615784,
+                "max_ms": 358.6269529914716
+              },
+              "recall": 1.0
+            }
+          ]
+        },
+        {
+          "name": "filter-99pct",
+          "selectivity": 0.99,
+          "filter": "rank < 49500",
+          "matching_rows": 49500,
+          "sweep": [
+            {
+              "ef": 16,
+              "recall": 0.9592999999999999,
+              "min_recall": 0.4,
+              "queries": 1000,
+              "qps": 69.80884618528711,
+              "latency": {
+                "count": 1000,
+                "mean_ms": 14.30876408192853,
+                "min_ms": 5.120541987707838,
+                "p50_ms": 10.190572997089475,
+                "p95_ms": 37.79853800369892,
+                "p99_ms": 72.58527498925105,
+                "max_ms": 174.47167800855823
+              }
+            }
+          ],
+          "chosen_ef": 16,
+          "chosen_recall": 0.9592999999999999,
+          "met_target": true,
+          "plan": null,
+          "concurrency": [
+            {
+              "clients": 1,
+              "duration_seconds": 20.00754264499119,
+              "queries": 1926,
+              "qps": 96.26369585583097,
+              "latency": {
+                "count": 1926,
+                "mean_ms": 10.368060105419689,
+                "min_ms": 4.877172003034502,
+                "p50_ms": 8.92075699812267,
+                "p95_ms": 18.69101799093187,
+                "p99_ms": 38.572841993300244,
+                "max_ms": 77.73371099028736
+              },
+              "recall": 0.9589304257528604
+            },
+            {
+              "clients": 4,
+              "duration_seconds": 20.079349206993356,
+              "queries": 2995,
+              "qps": 149.15822067365028,
+              "latency": {
+                "count": 2995,
+                "mean_ms": 26.75887061760509,
+                "min_ms": 5.177014987566508,
+                "p50_ms": 23.066732988809235,
+                "p95_ms": 55.427738989237696,
+                "p99_ms": 84.43439399707131,
+                "max_ms": 150.02416601055302
+              },
+              "recall": 0.9591318864774602
+            },
+            {
+              "clients": 8,
+              "duration_seconds": 20.09052634399268,
+              "queries": 3123,
+              "qps": 155.44640028476988,
+              "latency": {
+                "count": 3123,
+                "mean_ms": 51.30704280978777,
+                "min_ms": 5.236983997747302,
+                "p50_ms": 46.376391997910105,
+                "p95_ms": 101.83809799491428,
+                "p99_ms": 152.84458400856238,
+                "max_ms": 293.4304200025508
+              },
+              "recall": 0.9591418507845015
+            }
+          ]
+        }
+      ],
+      "server_stats": {
+        "collection": {
+          "row_count": 50000
+        },
+        "vector_index": {
+          "M": "16",
+          "efConstruction": "200",
+          "metric_type": "COSINE",
+          "index_type": "HNSW",
+          "field_name": "embedding",
+          "index_name": "embedding",
+          "total_rows": 50000,
+          "indexed_rows": 50000,
+          "pending_index_rows": 0,
+          "state": "Finished"
+        },
+        "scalar_index": {
+          "index_type": "STL_SORT",
+          "field_name": "rank",
+          "index_name": "rank",
+          "total_rows": 50000,
+          "indexed_rows": 50000,
+          "pending_index_rows": 0,
+          "state": "Finished"
+        }
+      },
+      "notes": [
+        "recall is mean recall@k against exact ground truth computed by logpose-bench vdb-prepare",
+        "latency is measured by the client around each pymilvus search call, so it includes Python serialization and loopback transport",
+        "each concurrent client is its own Python process with its own connection, on the same machine as the server",
+        "searches use the collection's default consistency level; the scalar field has a STL_SORT index",
+        "the dataset is synthetic (embedding-like, see dataset.generator); it mirrors only the shape of the public dataset named in dataset.mirrors"
+      ]
+    }
+  }
+}

@@ -62,6 +62,52 @@ Evidence at one bench-shaped segment (6,700 rows of 128 dimensions, 32 clusters,
 
 No single change reaches high recall. The fix applies all three: levels are drawn from the same deterministic hash but mapped to a geometric distribution with `mL = 1 / ln(M)`, layer 0 holds up to 2M neighbors, and both linking and pruning use the diversity heuristic with pruned connections kept (Malkov and Yashunin, Algorithm 4). The defaults also rose to M = 16, `ef_construction` = 128, and `ef_search` = 64. The heuristic also treats an exact copy of an already kept neighbor as redundant and breaks distance ties toward the newer node, so bursts of identical vectors stay reachable instead of forming islands. The sidecar version moved to 2. The reader rejects sidecars written by the old builder, and ANN queries score those segments exactly instead of failing, until a compaction that merges them writes current sidecars. The HNSW v2 work in the engine v2 plan still replaces this index wholesale.
 
+## phase5-milvus-cohere-100k and phase5-milvus-openai-50k
+
+LogPose against Milvus standalone on the same machine, VectorDBBench style (engine v2 plan, Phase 5 task 5). Each shape has a `.json` file (both systems' raw reports plus run resources) and a generated `.md` summary with one table per case. Reproduce both from the workspace root:
+
+```bash
+LOGPOSE_BENCH_DATA=$HOME/.cache/logpose-bench scripts/bench-milvus.sh cohere-100k openai-50k
+```
+
+The script needs Docker and Python 3. It builds `logpose-server` and `logpose-bench` in release mode, prepares each dataset with `logpose-bench vdb-prepare` (cached under `LOGPOSE_BENCH_DATA`), runs a fresh `logpose-server` and then a fresh `milvusdb/milvus:v2.6.24` standalone container (never both at once), and writes the two files per shape here. `SKIP_MILVUS=1` runs LogPose alone. `scripts/bench-milvus.sh tiny` is a two-minute smoke run.
+
+What the run does, for both systems:
+
+- Data: synthetic embedding-like vectors (a 256-cluster Gaussian mixture in 32 latent dimensions, randomly projected to 768 or 1,536 dimensions, plus noise), with the row count, dimensionality, 1,000 queries, and cosine metric of VectorDBBench Cohere 100K and OpenAI 50K. The public VectorDBBench files (`assets.zilliz.com`) and Hugging Face were blocked by the egress policy of the machine that ran it, so these are not the public datasets. Unlike an isotropic Gaussian, this data needs an `ef` of about 24 to 48 for recall@10 of 0.95 on an HNSW graph, which is where real embeddings land.
+- Ground truth: exact top 10 computed by `vdb-prepare`, for unfiltered search and for `rank < t` filters matching 1 and 99 percent of rows, where `rank` is a seeded random permutation (uncorrelated with the vectors). Both drivers score against the same files.
+- Index: HNSW with M = 16 and efConstruction = 200 on both (LogPose through the new `[index]` config table). LogPose traverses SQ8 codes and reranks with f32; Milvus searches f32. The `rank` field has LogPose's automatic inverted and sorted index and a Milvus `STL_SORT` index.
+- Load: 1,000-row insert batches, then everything needed until the data is indexed and searchable (LogPose: flush, compact, wait for maintenance; Milvus: flush, compact, wait for the index, refresh the load).
+- Search: per case, a serial pass over all 1,000 queries at each `ef` of the sweep until mean recall@10 reaches 0.95, then 20-second runs with 1, 4, and 8 concurrent clients at that `ef`, each client on its own connection. LogPose is driven by `logpose-bench vdb-run` over gRPC; Milvus by `scripts/bench/milvus_vdb.py` over `pymilvus`, one process per client.
+
+Results of the committed run, at the `ef` where each system first reached recall@10 of 0.95 (QPS at 1 / 4 / 8 clients, p99 in ms at 1 client):
+
+| Dataset | Case | LogPose recall | LogPose QPS | LogPose p99 | Milvus recall | Milvus QPS | Milvus p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cohere-100k | unfiltered | 0.976 | 150 / 165 / 187 | 15.9 | 0.971 | 78 / 164 / 170 | 54.2 |
+| cohere-100k | filter 1% | 1.000 | 431 / 494 / 655 | 6.2 | 1.000 | 94 / 163 / 207 | 36.3 |
+| cohere-100k | filter 99% | 0.977 | 158 / 285 / 515 | 15.6 | 0.971 | 74 / 83 / 101 | 65.0 |
+| openai-50k | unfiltered | 0.988 | 283 / 456 / 474 | 8.5 | 0.960 | 100 / 91 / 113 | 28.7 |
+| openai-50k | filter 1% | 1.000 | 390 / 786 / 824 | 6.2 | 1.000 | 52 / 96 / 127 | 130.7 |
+| openai-50k | filter 99% | 0.988 | 244 / 454 / 483 | 9.7 | 0.959 | 96 / 149 / 155 | 38.6 |
+
+| Dataset | LogPose load (insert + optimize) | Milvus load (insert + optimize) |
+| --- | --- | --- |
+| cohere-100k | 691 s (250 + 441), 7 inserts retried after write stalls | 220 s (22 + 198) |
+| openai-50k | 334 s (10 + 324) | 191 s (30 + 161) |
+
+Read these numbers with their caveats before quoting them:
+
+- The machine was not quiet. It is a shared 4-vCPU Xeon VM (16 GB) where other jobs were compiling Rust throughout: the 1-minute load average was 10 to 27 when each system started (recorded per system in the `.md` files). Both systems ran under the same kind of contention, but not identical contention, and absolute numbers are far below what either reaches on idle hardware. Rerun on a dedicated machine before drawing conclusions from ratios.
+- The Milvus client is Python. VectorDBBench drives Milvus the same way, but each search pays `pymilvus` serialization of a 768 or 1,536-float list, and on this loaded machine even a 2,000-row smoke collection took Milvus about 6 ms per search at the median. That fixed per-request cost, not the graph search, dominates Milvus latency at 50K and 100K rows; the LogPose driver is Rust.
+- In these two files LogPose's `ef` column says 16, but LogPose always searches with at least `4 * k` = 40 candidates, so those rows ran at 40. Since this run, `vdb-run` reports the beam width that actually ran. Milvus ran at the `ef` shown (16 or 24).
+- LogPose loads slowly. Each memtable flush builds its segment's HNSW graph inline with efConstruction 200, so on cohere-100k the flushes fell behind the inserts and the writer stalled writes seven times (the driver waits for the server's retry hint and retries). The explicit compaction then rebuilds the graph for the merged segment. Milvus acknowledges inserts into a growing segment and builds indexes in the background.
+- LogPose's explicit compaction did not reach one segment: it stops where one job's maintenance-memory reservation ends. cohere-100k was left with an 80,000-row HNSW segment plus two 10,000-row segments that are below the 20,000-row graph threshold and are scanned exactly on every query; openai-50k with 20,000 and 30,000-row HNSW segments. Every query visits every segment and merges.
+- LogPose unfiltered QPS barely scales from 1 to 8 clients on cohere-100k while the 99 percent filter case does; that difference was not investigated and may be contention noise.
+- The 1 percent filter matches 1,000 or 500 rows. LogPose plans it as an exact scan of the matching rows (`PREDICATE_FIRST_EXACT`), which is why it is its fastest case; Milvus also searches small filtered sets by brute force.
+- The planner used here is the pre-v2 planner (`VECTOR_FIRST_ANN` and `COOPERATIVE_FILTERED_ANN` plans). These files should be regenerated once planner v2 lands.
+- Provenance: both files were produced by binaries built from commit `eb8dbbf` plus the insert-retry change later committed as `855bee0`; the `git_commit` fields in the reports name whatever `HEAD` was checked out when each report was written, and the working tree was dirty during the run.
+
 ## Reading The Numbers
 
 - `recall` compares each answer with a brute-force oracle that the harness computes itself, independent of the engine.
