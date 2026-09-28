@@ -1275,6 +1275,61 @@ mod tests {
     }
 
     #[test]
+    fn rest_filters_mean_the_same_through_proto() {
+        let schema = CreateCollectionSpec {
+            name: "products".to_owned(),
+            primary_key: PrimaryKeySpec {
+                name: "sku".to_owned(),
+                key_type: PrimaryKeyType::Int64,
+            },
+            vectors: vec![VectorFieldSpec {
+                name: "embedding".to_owned(),
+                dimensions: 3,
+                metric: DistanceMetric::Dot,
+            }],
+            fields: vec![
+                ScalarFieldSpec::new("tenant", FieldType::String),
+                ScalarFieldSpec::new("price", FieldType::Float64),
+                ScalarFieldSpec::new("tags", FieldType::Array(ElementType::String)),
+                ScalarFieldSpec::new("at", FieldType::Timestamp),
+                ScalarFieldSpec::new("n", FieldType::Int64),
+                ScalarFieldSpec::new("doc", FieldType::Json),
+            ],
+            dynamic_fields: true,
+        }
+        .to_schema()
+        .expect("schema");
+        let filters = [
+            json!({ "and": [
+                { "eq": { "tenant": "acme" } },
+                { "range": { "price": { "gte": 10, "lt": 50.5 } } },
+                { "contains": { "tags": "outdoor" } },
+                { "not": { "exists": "$extra.archived" } }
+            ] }),
+            json!({ "or": [
+                { "ne": { "sku": 7 } },
+                { "in": { "sku": [1, 2, 3] } },
+                { "not_in": { "tenant": ["a", "b"] } },
+                { "contains_any": { "tags": ["x", "y"] } },
+                { "is_null": "price" }
+            ] }),
+            json!({ "range": { "at": { "gt": "2026-01-01T00:00:00Z", "lte": 1_900_000_000_000_000_i64 } } }),
+            json!({ "range": { "n": { "gt": 2.5, "lt": 9 } } }),
+            json!({ "in": { "color": ["red", 3, true, 2.5] } }),
+            json!({ "range": { "$extra.rank": { "gte": "b", "lt": 4 } } }),
+            json!({ "eq": { "doc": "scalar" } }),
+            json!({ "not": { "not": { "or": [{ "eq": { "n": 1 } }, { "exists": "doc" }] } } }),
+        ];
+        for json in filters {
+            let filter = FilterExpr::from_json(&schema, json.clone(), "filter")
+                .unwrap_or_else(|error| unreachable!("{json}: {error}"));
+            let decoded =
+                filter_from_proto(filter_to_proto(filter.clone()), "filter").expect("decode");
+            assert_eq!(decoded, filter, "{json}");
+        }
+    }
+
+    #[test]
     fn values_round_trip_through_proto() {
         let values = [
             Value::Null,
