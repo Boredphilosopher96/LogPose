@@ -4,7 +4,7 @@
 use etcd_client as _;
 use logpose_auth::{AccessTier, AuthenticationMode, DatabaseRole, Principal};
 use logpose_catalog::{CatalogStore, DatabaseDescriptor};
-use logpose_config::LogPoseConfig;
+use logpose_config::{IndexConfig, LogPoseConfig};
 use logpose_query::{
     CountRecordsRequest, CountRecordsResponse, QueryRequest, QueryResponse, ScrollRecordsRequest,
     ScrollRecordsResponse, WithSchema,
@@ -13,8 +13,8 @@ use logpose_service::{
     FetchedRecords, LogPoseControlService, LogPoseDataService, Result as ServiceResult,
 };
 use logpose_storage::{
-    CreateCollectionRequest, EngineConfig, InspectReport, InspectTarget, LocalStorageEngine,
-    TokenConfig,
+    CreateCollectionRequest, EngineConfig, IndexPolicy, InspectReport, InspectTarget,
+    LocalStorageEngine, TokenConfig,
 };
 use logpose_storage_etcd::{EtcdBackedStorageEngine, EtcdCatalogStore};
 use logpose_types::{
@@ -110,6 +110,7 @@ impl AppState {
             &config.storage_root,
             EngineConfig {
                 resolver: Some(logpose_query::resolver()),
+                index: index_policy(&config.index),
                 tokens: TokenConfig {
                     ttl: std::time::Duration::from_millis(config.snapshots.token_ttl_ms),
                     max_per_collection: config.snapshots.max_tokens_per_collection,
@@ -947,6 +948,14 @@ impl AppState {
             Err(error) => Err(error),
         }
     }
+}
+
+/// The engine's index policy with the configured HNSW construction parameters.
+fn index_policy(config: &IndexConfig) -> IndexPolicy {
+    let mut policy = IndexPolicy::default();
+    policy.hnsw.m = config.hnsw_m;
+    policy.hnsw.ef_construction = config.hnsw_ef_construction;
+    policy
 }
 
 fn placement_identity(placement: &logpose_types::CollectionPlacement) -> String {

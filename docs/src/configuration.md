@@ -75,4 +75,26 @@ max_tokens_per_collection = 64   # the default
 Both values must be greater than 0. Either key may be omitted to keep its
 default.
 
+## Vector Index
+
+The optional `[index]` table sets the HNSW graph parameters that flush and
+compaction use when they build a segment's vector graph, for every collection
+on the node:
+
+```toml
+[index]
+hnsw_m = 16                  # links per node on upper layers, 2x on layer 0; the default
+hnsw_ef_construction = 128   # build-time beam width; the default
+```
+
+- `hnsw_m` must be 2 to 1024. Larger values raise recall at a given search
+  `ef` and cost memory and build time.
+- `hnsw_ef_construction` must be 1 to 4096. Larger values build a better graph
+  more slowly.
+
+A change applies to graphs built after it; existing segments keep their graphs
+until compaction rewrites them. Segments with fewer than 20,000 vectors get no
+graph and are searched exactly. The search-time beam width is per query (`ef`
+on the query request).
+
 `node_name` must not be `local`. That token is reserved for anonymous local placement metadata created by raw storage-engine workflows.
