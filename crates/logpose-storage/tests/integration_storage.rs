@@ -1688,8 +1688,11 @@ async fn background_maintenance_handles_inflight_writes_without_losing_visibilit
     assert_eq!(stats.maintenance.last_error, None);
 }
 
+/// Maintenance status is runtime state: nothing about it is persisted. A reopened collection
+/// plans whatever its recovered state is due (here, a replayed memtable over a flush trigger
+/// lowered while the engine was down) once it has a data-plane access.
 #[tokio::test]
-async fn reopening_resumes_persisted_background_maintenance() {
+async fn reopening_plans_the_maintenance_the_recovered_state_is_due() {
     let root = support::unique_temp_dir("storage-resume-background-maintenance");
     let engine = LocalStorageEngine::new(&root).expect("storage engine should open");
 
@@ -1713,27 +1716,32 @@ async fn reopening_resumes_persisted_background_maintenance() {
         )
         .await
         .expect("write should succeed");
-
-    let maintenance_path = descriptor.root_path.join("maintenance.json");
-    fs::write(
-        &maintenance_path,
-        serde_json::to_vec_pretty(&json!({
-            "pending": [],
-            "in_progress": "flush",
-            "last_error": null,
-            "completed_runs": 0
-        }))
-        .expect("status should serialize"),
-    )
-    .expect("maintenance status should be updated");
-
     drop(engine);
-    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
-    reopened
-        .open_collection("events")
-        .await
-        .expect("open should succeed");
+    assert!(
+        !descriptor.root_path.join("maintenance.json").exists(),
+        "maintenance status is never persisted"
+    );
 
+    let descriptor_path = descriptor.root_path.join("descriptor.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&descriptor_path).expect("descriptor should read"))
+            .expect("descriptor should parse");
+    stored["flush_threshold_ops"] = json!(1);
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&stored).expect("descriptor should serialize"),
+    )
+    .expect("descriptor should be written");
+
+    let reopened = LocalStorageEngine::new(&root).expect("storage engine should open");
+    let stats = reopened
+        .stats("events")
+        .await
+        .expect("stats should succeed");
+    assert_eq!(
+        stats.maintenance,
+        logpose_types::MaintenanceStatus::default()
+    );
     wait_for_condition(&reopened, "events", |stats| {
         stats.mutable_op_count == 0
             && stats.segment_count == 1
