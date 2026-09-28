@@ -1904,7 +1904,7 @@ PR 10 replaces the delta log and v1 segments with memtables, deletion vectors, a
   - The buffer cache budget is `BudgetInputs::cache_budget()` over the sum of every writer's reported primary-key index size. The engine tick, which also runs the token reaper and the age and global memtable triggers, recomputes it.
 - **Legacy read adapter.**
   - `legacy.rs` serves the `StorageEngine` reads from one `Version`'s live rows, flattened to v1 records.
-  - Segments report `index_kind = "hnsw"`, so the planner keeps choosing ANN, but candidates come from an exact scan of the selected segments' live rows. The memtables are one mutable unit, `mutable-delta`. Per-segment planner statistics are computed once per process and cached on the handle.
+  - Segments report `index_kind = "exact"`: candidates come from an exact scan of the selected segments' live rows. The planner treats `exact` units like `hnsw` ones, so it keeps choosing ANN plans, and those plans do not change when the index sections land. The memtables are one mutable unit, `mutable-delta`. Per-segment planner statistics are computed once per process and cached on the handle.
   - `inspect` reports `wal` as the memtables' slots, and `segment` as the segment's header, sections, and rows with their `deleted` flags.
   - Segment read failures map to `Corrupt { kind: Segment }` or `Io`.
 - **Errors.** No `LogPoseError` variant is added. `CorruptionKind::DeletionVector` (`deletion_vector`) and `ResourceKind::Record` (`record`) are new values of existing fields.

@@ -590,8 +590,8 @@ async fn flush_persists_visible_records_for_reopen() {
         .find(|unit| unit.tier == "immutable")
         .expect("immutable unit should be reported");
     assert_eq!(
-        immutable.index_kind, "hnsw",
-        "a segment serves ANN candidates (by exact scan until index sections land)"
+        immutable.index_kind, "exact",
+        "a segment serves ANN candidates by exact scan until index sections land"
     );
     assert!(
         immutable

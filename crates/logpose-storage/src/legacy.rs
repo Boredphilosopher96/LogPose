@@ -40,6 +40,9 @@ pub(crate) type MetadataFilter = Arc<dyn for<'a> Fn(&'a Value) -> bool + Send + 
 /// The query-unit id of the memtables, which the legacy planner treats as one mutable unit.
 const MUTABLE_UNIT_ID: &str = "mutable-delta";
 
+/// The `index_kind` of a segment unit: it serves ANN candidates by an exact scan.
+const EXACT_SCAN_INDEX_KIND: &str = "exact";
+
 /// Planner statistics of one segment, over every row it stores (deleted ones included, so the
 /// statistics stay a conservative superset as rows are deleted).
 #[derive(Debug)]
@@ -431,9 +434,9 @@ fn mutable_unit_stats(version: &Version) -> Result<QueryUnitStats> {
     })
 }
 
-/// The query unit of one segment. `index_kind` is `hnsw` because the segment serves ANN
-/// candidates (by exact scan until the vector index sections land), so the legacy planner
-/// keeps choosing its ANN plans.
+/// The query unit of one segment. `index_kind` is `exact`: the segment serves ANN candidates,
+/// but by an exact scan of its live rows until the vector index sections land (PR 12). The
+/// planner treats it as an ANN unit, so query plans do not change when the index arrives.
 fn segment_unit_stats(version: &Version, segment: &Arc<SegmentHandle>) -> Result<QueryUnitStats> {
     let stats = match segment.legacy_stats.get() {
         Some(stats) => Arc::clone(stats),
@@ -460,7 +463,7 @@ fn segment_unit_stats(version: &Version, segment: &Arc<SegmentHandle>) -> Result
     Ok(QueryUnitStats {
         unit_id: segment.unit.to_string(),
         tier: "immutable".to_owned(),
-        index_kind: "hnsw".to_owned(),
+        index_kind: EXACT_SCAN_INDEX_KIND.to_owned(),
         min_seq_no: segment.entry.min_seq_no,
         max_seq_no: segment.entry.max_seq_no,
         put_count: usize::try_from(u64::from(segment.row_count()).saturating_sub(deleted))
