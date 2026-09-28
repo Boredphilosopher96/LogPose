@@ -364,8 +364,9 @@ pub struct GraphInput {
 /// before every insert.
 ///
 /// The build holds `input.values` (one f32 copy of the field), a map from each distinct vector
-/// to its rows while it deduplicates, and the graph's link lists; with duplicates it moves the
-/// distinct vectors into a second, smaller buffer and drops the first.
+/// to its rows while it deduplicates, and the graph's link lists; with null rows or duplicates it
+/// moves the distinct vectors to the front of that buffer in place, never into a second one (the
+/// index build's memory reservation charges one f32 copy).
 ///
 /// # Errors
 ///
@@ -418,13 +419,7 @@ pub fn build_graph_section(
     let data = if identity {
         values
     } else {
-        let mut data = Vec::with_capacity(node_rows.len() * width);
-        for rows_of_node in &node_rows {
-            let at = rows_of_node[0] as usize * width;
-            data.extend_from_slice(&values[at..at + width]);
-        }
-        drop(values);
-        data
+        distinct_in_place(values, width, &node_rows)
     };
     let graph_metric = match metric {
         DistanceMetric::L2 => F32Metric::L2Squared,
@@ -445,6 +440,25 @@ pub fn build_graph_section(
         u64::from(rows),
         payload,
     )))
+}
+
+/// `values` (row-major, `width` values a row) with each node's vector, its first row's, moved
+/// to position `node` and the rest truncated: the graph's input, in the buffer the rows came in,
+/// so the build never holds a second copy of the vectors. Nodes are numbered in order of first
+/// appearance, so node `i`'s first row `r_i` is at least `i` and grows with `i`: every copy
+/// moves a vector towards the front, onto a slot no later node reads from. Truncated, not
+/// shrunk: a shrinking `realloc` may copy, and the spare capacity is within what the index
+/// build reserved.
+fn distinct_in_place(mut values: Vec<f32>, width: usize, node_rows: &[Vec<u32>]) -> Vec<f32> {
+    for (node, rows_of_node) in node_rows.iter().enumerate() {
+        let from = rows_of_node[0] as usize * width;
+        let to = node * width;
+        if from != to {
+            values.copy_within(from..from + width, to);
+        }
+    }
+    values.truncate(node_rows.len() * width);
+    values
 }
 
 fn encode_graph_section(
@@ -861,6 +875,56 @@ mod tests {
         let trained = Sq8Params::train(&training, 2).expect("trains");
         assert_eq!(parsed.params().min(), trained.min());
         assert_eq!(parsed.params().max(), trained.max());
+    }
+
+    /// Moving the distinct vectors to the front in place gives what copying them out would,
+    /// whatever null rows and duplicates come before them.
+    #[test]
+    fn distinct_vectors_move_to_the_front_in_place() {
+        // Rows: null, a, a, null, b, a, c, null, b, d (width 3).
+        let vector = |id: u32| {
+            let base = f32::from(u16::try_from(id).expect("small"));
+            [base, base + 0.5, -base]
+        };
+        let layout: [Option<u32>; 10] = [
+            None,
+            Some(1),
+            Some(1),
+            None,
+            Some(2),
+            Some(1),
+            Some(3),
+            None,
+            Some(2),
+            Some(4),
+        ];
+        let values = layout
+            .iter()
+            .flat_map(|id| id.map_or([0.0; 3], vector))
+            .collect::<Vec<_>>();
+        let mut node_rows: Vec<Vec<u32>> = Vec::new();
+        let mut node_of = HashMap::new();
+        for (row, id) in (0_u32..).zip(layout) {
+            let Some(id) = id else { continue };
+            let node = *node_of.entry(id).or_insert(node_rows.len());
+            if node == node_rows.len() {
+                node_rows.push(Vec::new());
+            }
+            node_rows[node].push(row);
+        }
+        let copied = node_rows
+            .iter()
+            .flat_map(|rows| {
+                let at = rows[0] as usize * 3;
+                values[at..at + 3].to_vec()
+            })
+            .collect::<Vec<_>>();
+        let moved = distinct_in_place(values, 3, &node_rows);
+        assert_eq!(moved, copied);
+        assert_eq!(
+            moved,
+            [1, 2, 3, 4].into_iter().flat_map(vector).collect::<Vec<_>>()
+        );
     }
 
     fn graph_input(values: Vec<f32>, nulls: &[u32]) -> GraphInput {
