@@ -1402,6 +1402,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_collection_route_checks_database_access() {
+        let state = Arc::new(AppState::new(auth_test_config("rest-auth-routes")));
+        state
+            .control
+            .set_database_access_policy(read_only_policy("default", "reader"))
+            .await
+            .expect("database policy should persist");
+        state
+            .control
+            .create_collection(CreateCollectionRequest::new(
+                "documents",
+                2,
+                DistanceMetric::Dot,
+            ))
+            .await
+            .expect("collection should be created");
+        let app = router(state);
+        let record = json!({"id": "alpha", "vector": [1.0, 0.0]});
+        let requests = [
+            ("GET", String::new(), None, true),
+            ("GET", "/placement".to_owned(), None, false),
+            ("GET", "/stats".to_owned(), None, true),
+            ("GET", "/inspect?target=wal".to_owned(), None, true),
+            (
+                "POST",
+                "/records/get".to_owned(),
+                Some(json!({"keys": ["alpha"]})),
+                true,
+            ),
+            (
+                "POST",
+                "/query".to_owned(),
+                Some(json!({"vector": [1.0, 0.0], "top_k": 1})),
+                true,
+            ),
+            (
+                "POST",
+                "/records/upsert".to_owned(),
+                Some(json!({"records": [record]})),
+                false,
+            ),
+            (
+                "POST",
+                "/records/update".to_owned(),
+                Some(json!({"records": [record]})),
+                false,
+            ),
+            (
+                "POST",
+                "/records/delete".to_owned(),
+                Some(json!({"keys": ["alpha"]})),
+                false,
+            ),
+            (
+                "PATCH",
+                String::new(),
+                Some(json!({"add_field": {"name": "color", "type": "string"}})),
+                false,
+            ),
+            ("POST", "/flush".to_owned(), None, false),
+            ("POST", "/compact".to_owned(), None, false),
+            ("DELETE", String::new(), None, false),
+        ];
+        let paths = route_paths();
+        for (method, suffix, body, readable) in requests {
+            let route = suffix.split('?').next().unwrap_or_default();
+            assert!(
+                paths.contains(&format!("{COLLECTION}{route}")),
+                "{method} {suffix} is a collection route"
+            );
+            let uri = format!("{DOCS}{suffix}");
+            let (status, _, response) = send(&app, method, &uri, body.clone(), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {suffix} without a token: {response}"
+            );
+            let (status, _, response) = send(&app, method, &uri, body, Some("reader-secret")).await;
+            if !readable {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {suffix} by a read-only principal: {response}"
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {suffix} by a read-only principal: {response}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn data_endpoints_run_the_collection_workflow() {
         let app = router(Arc::new(AppState::new(test_config("rest-workflow"))));
         let (status, body) = call(
