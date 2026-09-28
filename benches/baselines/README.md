@@ -70,11 +70,11 @@ LogPose against Milvus standalone on the same machine, VectorDBBench style (engi
 LOGPOSE_BENCH_DATA=$HOME/.cache/logpose-bench scripts/bench-milvus.sh cohere-100k openai-50k
 ```
 
-The script needs Docker and Python 3. It builds `logpose-server` and `logpose-bench` in release mode, prepares each dataset with `logpose-bench vdb-prepare` (cached under `LOGPOSE_BENCH_DATA`), runs a fresh `logpose-server` and then a fresh `milvusdb/milvus:v2.6.24` standalone container (never both at once), and writes the two files per shape here. `SKIP_MILVUS=1` runs LogPose alone. `scripts/bench-milvus.sh tiny` is a two-minute smoke run. The header of the script lists every setting.
+The script runs on Linux and needs `flock` from util-linux, Docker, and Python 3. It builds `logpose-server` and `logpose-bench` in release mode, prepares each dataset with `logpose-bench vdb-prepare` (cached under `LOGPOSE_BENCH_DATA`), runs a fresh `logpose-server` and then a fresh `milvusdb/milvus:v2.6.24` standalone container (never both at once), and writes the two files per shape here. `SKIP_MILVUS=1` runs LogPose alone. `scripts/bench-milvus.sh tiny` is a two-minute smoke run. The header of the script lists every setting.
 
 ### Running Two Benchmarks At Once
 
-Each run works in its own directory, `LOGPOSE_BENCH_DATA/runs/<run id>`, which holds the server data, the Milvus volume, copies of the binaries it built, the raw reports, and the server logs. Runs share only the dataset cache and the Python venv, and they prepare those one at a time. A run holds an exclusive lock on its directory until it exits, and it refuses to start when the lock is taken or when one of its ports is already in use. After starting `logpose-server` it checks that the server process is still alive and that the server itself listens on both ports, so a run can never talk to another run's server. Its Milvus container is named `logpose-bench-milvus-<run id>`.
+Each run works in its own directory, `LOGPOSE_BENCH_DATA/runs/<run id>`, which holds the server data, the Milvus volume, copies of the binaries it built, the raw reports, and the server logs. Runs share only the dataset cache and the Python venv, and they prepare those one at a time. A run holds an exclusive lock on its directory until it exits, and it refuses to start when the lock is taken or when one of its ports is already in use. After starting `logpose-server` it checks that the server process is still alive and that the server itself listens on both ports, so a run can never talk to another run's server. Its Milvus container is named `logpose-bench-milvus-<run id>` and labeled with the run directory, and a run only ever removes a container with its own label. A run that is killed outright (SIGKILL) cannot clean up, but it does not leave the lock held: the next run with the same run id and `LOGPOSE_BENCH_DATA` stops the `logpose-server` and removes the Milvus container that the killed run left behind.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -97,7 +97,7 @@ LOGPOSE_BENCH_RUN_ID=after OUTPUT_DIR=$HOME/bench-ab/after \
   SKIP_MILVUS=1 scripts/bench-milvus.sh cohere-100k
 ```
 
-With Milvus, also give the second run `LOGPOSE_BENCH_MILVUS_PORT` and `LOGPOSE_BENCH_MILVUS_HEALTH_PORT` (for example 29530 and 29091). Overlapping runs compete for CPU, memory, and disk, so their numbers are only comparable with each other; do not mix them with runs on a quiet machine.
+With Milvus, also give the second run `LOGPOSE_BENCH_MILVUS_PORT` and `LOGPOSE_BENCH_MILVUS_HEALTH_PORT` (for example 29530 and 29091). If the change alters how `logpose-bench vdb-prepare` generates a shape, also give each run its own `LOGPOSE_BENCH_DATA`: a run regenerates a cached dataset that was prepared with other parameters, in place, under the other run. Overlapping runs compete for CPU, memory, and disk, so their numbers are only comparable with each other; do not mix them with runs on a quiet machine.
 
 What the run does, for both systems:
 
