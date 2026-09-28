@@ -110,3 +110,9 @@ its key is missing, the node reports the claim as lost at once, then registers
 or campaigns again in the same tick. Losing membership also gives up
 leadership, so a node that is not a registered member never keeps leading.
 `timeout_ms` also bounds each keep-alive round trip.
+
+A node that restarts after a crash finds the leader key its previous process
+wrote, held by that process's lease, and campaigns once the lease expires, up
+to `leadership_ttl_secs` later. Meanwhile it serves reads and writes, and
+database, policy, and collection creates and drops fail with `NOT_LEADER` and
+a one-second retry hint but no `leader_node`, since no node leads until then.

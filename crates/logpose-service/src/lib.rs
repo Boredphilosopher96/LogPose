@@ -1684,10 +1684,17 @@ impl LogPoseControlService {
                     lease_id,
                 }));
             }
-            if coordination.leader_node.is_some() || Instant::now() >= deadline {
+            // A leader key naming this node while it does not lead was left by a previous
+            // process of this node, and holds until that process's lease expires. No node
+            // leads meanwhile, so there is no leader to name: naming this node would send a
+            // client that follows the hint straight back here.
+            let leader_node = coordination
+                .leader_node
+                .filter(|leader| *leader != self.config.node_name);
+            if leader_node.is_some() || Instant::now() >= deadline {
                 return Err(LogPoseError::NotLeader {
                     node: self.config.node_name.clone(),
-                    leader_node: coordination.leader_node,
+                    leader_node,
                 });
             }
             sleep(Duration::from_millis(25)).await;

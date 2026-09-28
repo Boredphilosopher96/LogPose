@@ -2382,6 +2382,25 @@ async fn etcd_restarted_node_waits_out_its_stale_leader_key_then_leads() {
     );
     assert_eq!(waiting.leader_node.as_deref(), Some("leader-a"));
 
+    // Until that lease expires no node leads. A control-plane mutation must not name this
+    // node as the leader to redirect to: a client following the hint would loop back here.
+    let error = state
+        .put_database_with_auth(
+            &RequestAuth::default(),
+            logpose_catalog::DatabaseDescriptor::new("while-waiting"),
+        )
+        .await
+        .expect_err("a node waiting out its stale leader key should refuse control mutations");
+    let LogPoseError::NotLeader { node, leader_node } = &error else {
+        unreachable!("expected NOT_LEADER, got {error:?}");
+    };
+    assert_eq!(node, "leader-a");
+    assert_eq!(
+        leader_node.as_deref(),
+        None,
+        "the stale key of this node's previous process is not a leader to redirect to"
+    );
+
     revoke_lease_out_of_band(&endpoints, stale_lease_id).await;
 
     let (_, leadership_lease_id) = wait_for_local_leadership(&state).await;
