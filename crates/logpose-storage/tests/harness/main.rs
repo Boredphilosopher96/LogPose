@@ -34,6 +34,8 @@ use uuid as _;
 mod actions;
 mod crash;
 mod generate;
+mod interleave;
 mod model;
 mod random;
 mod session;
+mod stress;

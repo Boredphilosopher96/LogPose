@@ -161,7 +161,7 @@ impl Drop for Ctx {
 }
 
 impl Ctx {
-    fn new(seed: u64) -> Result<Self, String> {
+    pub fn new(seed: u64) -> Result<Self, String> {
         let session = Session::create(setup(), seed)?;
         let model = Runner::new_model(&session);
         Ok(Self {
@@ -173,11 +173,11 @@ impl Ctx {
         })
     }
 
-    fn fault(&self) -> Arc<FaultVfs> {
+    pub fn fault(&self) -> Arc<FaultVfs> {
         self.session.fault().clone()
     }
 
-    fn last(&self) -> &Model {
+    pub fn last(&self) -> &Model {
         self.history
             .last()
             .expect("the history starts with the created collection")
@@ -338,7 +338,7 @@ impl Ctx {
         fault.set_plan(plan);
     }
 
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         self.jobs.clear();
         self.token = None;
         self.session.close();
@@ -652,7 +652,7 @@ fn fail(message: String) -> ! {
 
 /// Rows `k00..k05` in a segment, then `k06`, `k07` in the memtable, a segment row deleted and
 /// one updated (deletion bits for the next flush's DV file).
-fn rows_in_a_segment_and_the_memtable(ctx: &mut Ctx) -> Step {
+pub fn rows_in_a_segment_and_the_memtable(ctx: &mut Ctx) -> Step {
     let ops = (0..6)
         .map(|index| ctx.upsert(index, index as f32))
         .collect();
@@ -665,7 +665,7 @@ fn rows_in_a_segment_and_the_memtable(ctx: &mut Ctx) -> Step {
 }
 
 /// Three segments of four rows each.
-fn three_segments(ctx: &mut Ctx) -> Step {
+pub fn three_segments(ctx: &mut Ctx) -> Step {
     for segment in 0..3 {
         let ops = (0..4)
             .map(|row| ctx.upsert(segment * 4 + row, (segment * 4 + row) as f32))
