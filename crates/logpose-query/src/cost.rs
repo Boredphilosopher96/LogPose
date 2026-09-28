@@ -673,7 +673,11 @@ mod tests {
             model.decide(&shape, Force::Auto).chosen.choice
         };
         for matched in (1..=100).map(|percent| percent * 10_000) {
-            assert_ne!(choice_at(128, matched), Choice::GraphAcorn, "{matched} rows");
+            assert_ne!(
+                choice_at(128, matched),
+                Choice::GraphAcorn,
+                "{matched} rows"
+            );
         }
         assert_eq!(choice_at(768, 50_000), Choice::GraphAcorn);
     }
