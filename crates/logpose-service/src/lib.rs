@@ -701,7 +701,13 @@ impl LogPoseDataService {
         self.storage
             .update_by_filter(&lookup_name, filter, patch.into_update(placeholder))
             .await
-            .map_err(|error| error.with_field_prefix("patch"))
+            .map_err(|error| match &error {
+                // Filter errors already name their node below `filter`.
+                LogPoseError::InvalidArgument {
+                    field: Some(field), ..
+                } if field == "filter" || field.starts_with("filter.") => error,
+                _ => error.with_field_prefix("patch"),
+            })
     }
 
     /// Search a collection (or scan it in order): see [`logpose_query::query`].

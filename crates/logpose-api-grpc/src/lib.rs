@@ -4335,11 +4335,22 @@ mod tests {
             vectors: [("embedding".to_owned(), vec![1.0])].into_iter().collect(),
             ..RecordPatch::default()
         };
+        let price_patch = RecordPatch {
+            fields: [("price".to_owned(), TypedValue::Float64(0.5))]
+                .into_iter()
+                .collect(),
+            ..RecordPatch::default()
+        };
         for (request, field) in [
             (no_patch, "patch"),
             (
                 items_update(FilterExpr::eq("sku", 1), vector_patch),
                 "patch.embedding",
+            ),
+            // A filter error names the filter, not the patch.
+            (
+                items_update(FilterExpr::eq("sku", "one"), price_patch),
+                "filter.eq.sku",
             ),
         ] {
             let error = service
