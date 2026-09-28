@@ -245,7 +245,7 @@ async fn run_async(args: &RunArgs, prepared: Arc<Prepared>) -> Result<VdbReport>
         "recall is mean recall@k against exact ground truth computed by logpose-bench vdb-prepare".to_owned(),
         "latency is measured by the client around each gRPC call, so it includes serialization and loopback transport".to_owned(),
         "each concurrent client has its own gRPC connection and runs in the driver's tokio runtime on the same machine as the server".to_owned(),
-        "LogPose applies ef as max(ef, 4 * k) and widens it for filtered walks that come up short".to_owned(),
+        "LogPose searches with at least 4 * k candidates, so sweep values below that run (and are reported) as 4 * k; filtered walks that come up short widen ef further".to_owned(),
     ];
     if prepared.manifest.synthetic {
         notes.push(
@@ -314,6 +314,16 @@ mod tests {
     }
 
     #[test]
+    fn sweep_values_below_the_candidate_floor_run_at_the_floor() -> anyhow::Result<()> {
+        assert_eq!(
+            logpose::effective_sweep(&[16, 24, 32, 48, 64], 10)?,
+            vec![40, 48, 64]
+        );
+        assert!(logpose::effective_sweep(&[], 10).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn choose_ef_takes_the_first_that_meets_the_target() -> anyhow::Result<()> {
         let sweep = vec![point(16, 0.8), point(32, 0.96), point(64, 0.99)];
         assert_eq!(logpose::choose_ef(&sweep, 0.95)?, (32, 0.96, true));
@@ -370,7 +380,8 @@ mod tests {
                 "{} recall {}",
                 case.name, case.chosen_recall
             );
-            assert_eq!(case.chosen_ef, 16);
+            // k is 5, so the sweep starts at the 4 * k candidate floor.
+            assert_eq!(case.chosen_ef, 20);
             assert_eq!(case.sweep.len(), 1);
             assert_eq!(case.concurrency.len(), 2);
             for run in &case.concurrency {

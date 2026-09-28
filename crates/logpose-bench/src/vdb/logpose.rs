@@ -491,17 +491,17 @@ async fn run_case(
     let k = prepared.manifest.k;
     let dataset = &prepared.dataset;
     let queries = dataset.query_count();
-    ensure!(!config.ef_sweep.is_empty(), "the ef sweep is empty");
+    let efs = effective_sweep(&config.ef_sweep, k)?;
     let mut client = Client::connect(config).await?;
 
     for warm in 0..config.warmup.min(queries) {
         client
-            .search_ids(dataset.query(warm), filter.as_ref(), k, config.ef_sweep[0])
+            .search_ids(dataset.query(warm), filter.as_ref(), k, efs[0])
             .await?;
     }
 
-    let mut sweep = Vec::with_capacity(config.ef_sweep.len());
-    for ef in &config.ef_sweep {
+    let mut sweep = Vec::with_capacity(efs.len());
+    for ef in &efs {
         let mut latencies = Vec::with_capacity(queries);
         let mut recalls = Vec::with_capacity(queries);
         let started = Instant::now();
@@ -585,6 +585,22 @@ async fn run_case(
         plan,
         concurrency,
     })
+}
+
+/// The sweep as LogPose runs it: the server searches with at least `RERANK_FACTOR * k`
+/// candidates whatever `ef` asks for, so smaller values are raised to that floor and
+/// repeats dropped. The report then names the beam width that actually ran.
+pub fn effective_sweep(sweep: &[u32], k: usize) -> Result<Vec<u32>> {
+    let floor = u32::try_from(k.saturating_mul(logpose_query::search::RERANK_FACTOR))?;
+    let mut efs = Vec::with_capacity(sweep.len());
+    for ef in sweep {
+        let ef = (*ef).max(floor);
+        if !efs.contains(&ef) {
+            efs.push(ef);
+        }
+    }
+    ensure!(!efs.is_empty(), "the ef sweep is empty");
+    Ok(efs)
 }
 
 /// The smallest swept ef that meets `target`, or the ef with the best recall.
