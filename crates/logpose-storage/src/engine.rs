@@ -264,7 +264,8 @@ impl Engine {
         Ok(Self { shared })
     }
 
-    /// Block until every queued background file removal has run.
+    /// Block until every queued background file removal has run, including the removals of
+    /// files that only snapshot pins the reaper just dropped were holding.
     pub fn wait_for_gc(&self) {
         self.shared.core.gc.wait_idle();
     }
@@ -481,7 +482,7 @@ impl EngineCore {
         if !dropped.is_empty() {
             // A released version may be the last holder of a retired delta; free it off the
             // async runtime. Its segment files are then enqueued for removal.
-            self.runtime.maintenance.spawn(move || drop(dropped));
+            self.gc.release_on(&self.runtime.maintenance, dropped);
         }
         count
     }

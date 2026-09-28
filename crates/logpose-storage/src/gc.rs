@@ -107,8 +107,25 @@ struct GcState {
     pending: Vec<PathBuf>,
     /// Whether a drain job is queued or running.
     draining: bool,
+    /// Releases handed to a pool by [`GcQueue::release_on`] that have not run yet. Each may
+    /// drop the last reference to a `Version` and so enqueue removals.
+    releasing: usize,
     /// Files removed since the engine opened (a test and diagnostics counter).
     removed: u64,
+}
+
+/// Counts one [`GcQueue::release_on`] job until it has dropped what it releases, even if the
+/// drop panics or the pool discards the job.
+struct Releasing(GcQueue);
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.releasing -= 1;
+        if state.releasing == 0 && !state.draining {
+            self.0.shared.idle.notify_all();
+        }
+    }
 }
 
 impl GcQueue {
@@ -139,10 +156,23 @@ impl GcQueue {
         }
     }
 
-    /// Block until every queued removal has run (or was dropped because the engine shut down).
+    /// Drop `value` (released pins' `Version`s, which may be the last holders of large retired
+    /// state and of obsolete files) on `pool` instead of the caller's thread. [`Self::wait_idle`]
+    /// waits for the drop and for the removals it enqueues.
+    pub(crate) fn release_on(&self, pool: &rayon::ThreadPool, value: impl Send + 'static) {
+        self.lock().releasing += 1;
+        let releasing = Releasing(self.clone());
+        pool.spawn(move || {
+            drop(value);
+            drop(releasing);
+        });
+    }
+
+    /// Block until every queued removal has run (or was dropped because the engine shut down),
+    /// including those the releases queued by [`Self::release_on`] enqueue.
     pub(crate) fn wait_idle(&self) {
         let mut state = self.lock();
-        while state.draining {
+        while state.draining || state.releasing > 0 {
             state = self
                 .shared
                 .idle

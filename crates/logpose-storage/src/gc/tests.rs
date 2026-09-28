@@ -420,3 +420,58 @@ fn an_abandoned_job_leaves_no_files_behind() {
         "the retry got a fresh unit"
     );
 }
+
+/// The reaper releases the versions of the pins it drops on the maintenance pool, off the
+/// caller's thread. Waiting for the collector waits for those releases too, so the files a
+/// reaped pin alone held are gone once it returns.
+#[test]
+fn waiting_for_gc_covers_the_versions_the_reaper_releases_in_the_background() {
+    use crate::{RuntimeConfig, clock::ManualClock};
+    use std::time::Duration;
+
+    let fault = FaultVfs::new(35);
+    let clock = Arc::new(ManualClock::new());
+    let engine = Engine::open(
+        fault.process(),
+        ROOT,
+        EngineConfig {
+            clock: Some(Arc::clone(&clock) as Arc<dyn crate::Clock>),
+            runtime: RuntimeConfig {
+                maintenance_threads: 1,
+                ..RuntimeConfig::default()
+            },
+            ..config()
+        },
+    )
+    .expect("engine should open");
+    let handle = create(&engine, "reaped");
+    let core = engine.core();
+    write(&engine, &handle, "a");
+    core.flush_collection(&handle).expect("flush");
+    write(&engine, &handle, "b");
+    core.flush_collection(&handle).expect("flush");
+    let inputs = handle.current().manifest.units().collect::<Vec<_>>();
+    let _token = handle.pin_snapshot().expect("pin");
+    core.compact_collection(&handle).expect("compact");
+
+    // Occupy the maintenance pool, so the reaper's release waits behind this job.
+    let (unblock, blocked) = std::sync::mpsc::channel::<()>();
+    core.runtime().maintenance.spawn(move || {
+        let _ = blocked.recv();
+    });
+    clock.advance(Duration::from_secs(3600));
+    assert_eq!(engine.reap_snapshots(), 1);
+    let unblocker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(unblock);
+    });
+    engine.wait_for_gc();
+    let vfs = fault.process();
+    for unit in &inputs {
+        assert!(
+            !unit_files_exist(vfs.as_ref(), &handle, *unit),
+            "the reaped pin was the last holder of {unit}"
+        );
+    }
+    unblocker.join().expect("unblocker should join");
+}
