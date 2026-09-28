@@ -357,7 +357,7 @@ impl fmt::Display for WriteOutcome {
 /// One invalid request field.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FieldViolation {
-    /// Path of the field in the request, such as `operations[2].vector`.
+    /// Path of the field in the request, such as `records[2].price`.
     pub field: String,
     /// What is wrong with it.
     pub description: String,
