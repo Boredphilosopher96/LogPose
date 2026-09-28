@@ -203,6 +203,12 @@ impl SegmentBuilder {
         &self.schema
     }
 
+    /// The vector and scalar buffers index builds read (see
+    /// [`build_index_sections`](Self::build_index_sections)).
+    pub(super) fn index_inputs(&self) -> (&[VectorBuf], &[ColumnBuf]) {
+        (&self.vectors, &self.columns)
+    }
+
     /// Rows pushed so far.
     #[must_use]
     pub fn row_count(&self) -> u32 {

@@ -12,6 +12,7 @@
 //! A loader returns bytes only after they verified, so everything in the
 //! cache is known good and a hit decodes without checking a CRC again.
 
+use super::index::attach_decoded;
 use super::{
     dynamic::{DYNAMIC_ENCODING_BLOCKS, DynamicBlockRef, DynamicIndex, IndexError},
     error::{Region, SegmentError},
@@ -210,6 +211,30 @@ impl SegmentUnit {
                 Ok(bytes)
             }
         }
+    }
+}
+
+impl SegmentUnit {
+    /// [`load`](Self::load), then, for a whole index section, decode it and
+    /// attach the decoded form (see [`attach_decoded`]) so the cache charges
+    /// it and every hit reuses it. A payload that verifies but does not
+    /// decode is [`SegmentError::Corrupt`] in the section.
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load), plus decode failures.
+    pub fn load_decoded<S: SectionSource + ?Sized>(
+        &self,
+        source: &S,
+        file_len: u64,
+        row_count: u32,
+    ) -> Result<AlignedBytes, SegmentError> {
+        let bytes = self.load(source, file_len)?;
+        if matches!(self.part, Part::Whole) {
+            attach_decoded(self.entry.section_kind(), row_count, &bytes)
+                .map_err(|detail| SegmentError::corrupt(self.region(), detail))?;
+        }
+        Ok(bytes)
     }
 }
 

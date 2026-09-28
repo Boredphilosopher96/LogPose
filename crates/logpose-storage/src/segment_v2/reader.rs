@@ -697,6 +697,23 @@ impl<S: SectionSource> SegmentReader<S> {
             .map(Some)
     }
 
+    /// Decode the verified payload of `field`'s `ScalarColumn` section (from a pinned cache
+    /// unit).
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::OutOfRange`] if the segment has no column for `field`, or corruption.
+    pub fn decode_scalar_column(
+        &self,
+        field: FieldId,
+        bytes: &[u8],
+    ) -> Result<ScalarColumn, SegmentError> {
+        let index = self
+            .find_section(SectionKind::ScalarColumn, Some(field))
+            .ok_or_else(|| SegmentError::out_of_range(format!("column of field {field}")))?;
+        self.decode_scalar(index, &self.entry(index)?, bytes)
+    }
+
     /// Decode a verified `ScalarColumn` payload.
     fn decode_scalar(
         &self,
@@ -1018,6 +1035,20 @@ impl<S: SectionSource> SegmentReader<S> {
     /// [`SegmentError::OutOfRange`] for a row past the end, and I/O or
     /// corruption errors.
     pub fn row_images(&self, rows: &[u32]) -> Result<Vec<RowImage>, SegmentError> {
+        self.row_images_projected(rows, true)
+    }
+
+    /// [`row_images`](Self::row_images), leaving out vector fields (and their page loads)
+    /// unless `vectors` is set.
+    ///
+    /// # Errors
+    ///
+    /// As [`row_images`](Self::row_images).
+    pub fn row_images_projected(
+        &self,
+        rows: &[u32],
+        vectors: bool,
+    ) -> Result<Vec<RowImage>, SegmentError> {
         if let Some(row) = rows.iter().find(|row| **row >= self.header.row_count) {
             return Err(SegmentError::out_of_range(format!(
                 "row {row} of a segment of {} rows",
@@ -1026,8 +1057,11 @@ impl<S: SectionSource> SegmentReader<S> {
         }
         let via = Via::Cache;
         let pks = self.pk_column_via(via)?;
-        let mut vector_fields: Vec<_> =
-            self.schema.vectors().iter().map(|field| field.id).collect();
+        let mut vector_fields: Vec<_> = if vectors {
+            self.schema.vectors().iter().map(|field| field.id).collect()
+        } else {
+            Vec::new()
+        };
         vector_fields.sort_unstable();
         let mut vectors = Vec::new();
         for field in vector_fields {
@@ -1370,6 +1404,29 @@ impl<S: SectionSource + Clone + 'static> SegmentReader<S> {
         let file_len = self.file_len;
         let owned = unit.clone();
         let load = move || owned.load(&source, file_len);
+        match &self.cache {
+            Some(link) => {
+                let mode = if unit.cacheable() {
+                    CacheMode::Normal
+                } else {
+                    CacheMode::Bypass
+                };
+                link.cache
+                    .get_or_load(unit.key(link.file), unit.class(), mode, executor, load)
+            }
+            None => Fetch::detached(executor, unit.class(), Box::new(load)),
+        }
+    }
+
+    /// [`fetch`](Self::fetch), with a loader that also decodes a whole index
+    /// section and attaches the decoded form before the cache charges it
+    /// ([`SegmentUnit::load_decoded`]). Other units load as with `fetch`.
+    pub fn fetch_decoded(&self, unit: &SegmentUnit, executor: &dyn LoadExecutor) -> Fetch {
+        let source = self.source.clone();
+        let file_len = self.file_len;
+        let rows = self.header.row_count;
+        let owned = unit.clone();
+        let load = move || owned.load_decoded(&source, file_len, rows);
         match &self.cache {
             Some(link) => {
                 let mode = if unit.cacheable() {

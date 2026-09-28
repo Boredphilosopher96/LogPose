@@ -104,6 +104,7 @@ impl CoreRef {
         } else {
             let path = segment_path(dir, unit);
             ticket.writing_files();
+            self.build_indexes(&mut builder)?;
             let (file, written) = write_segment(vfs, &path, builder)?;
             let segments = dir.join(SEGMENTS_DIR);
             vfs.sync_dir(&segments).map_err(|error| {

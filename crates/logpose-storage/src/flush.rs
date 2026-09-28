@@ -109,6 +109,7 @@ impl CoreRef {
             }
             let path = segment_path(dir, unit);
             ticket.writing_files();
+            self.build_indexes(&mut builder)?;
             let (file, written) = write_segment(vfs, &path, builder)?;
             crash_point(vfs, Some(CrashPoint::FlushAfterSegmentSync))?;
             let entry = manifest_entry(

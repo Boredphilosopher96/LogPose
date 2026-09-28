@@ -20,9 +20,12 @@
 //! | `DynamicJson` | `$extra` in 4096-row blocks ([`dynamic`]) |
 //!
 //! `VectorSq8`, `VectorGraph`, `ScalarInverted`, and `ScalarSorted`
-//! payloads are opaque here: [`SegmentBuilder::add_index_section`] stores
-//! whatever `logpose-index` produces and [`SegmentReader::index_section`]
-//! returns it CRC-checked. Readers ignore section kinds they do not know.
+//! payloads are opaque to the format: [`SegmentBuilder::add_index_section`]
+//! stores any payload and [`SegmentReader::index_section`] returns it
+//! CRC-checked. [`SegmentBuilder::build_index_sections`] ([`index`]) builds
+//! them from the pushed rows with `logpose-index`, and
+//! [`SegmentReader::fetch_decoded`] loads one and attaches its decoded form.
+//! Readers ignore section kinds they do not know.
 //!
 //! [`SegmentReader`] reads through a [`SectionSource`] (a positioned-read
 //! file abstraction), opens with two small reads at the ends of the file,
@@ -36,6 +39,7 @@ pub mod column;
 pub mod dynamic;
 mod error;
 pub mod format;
+pub mod index;
 mod le;
 pub mod pk;
 pub mod reader;
@@ -55,6 +59,9 @@ pub use column::{ColumnEncoding, ScalarColumn};
 pub use dynamic::{DYNAMIC_BLOCK_ROWS, DynamicBlock, DynamicBlockRef, DynamicIndex};
 pub use error::{Region, SegmentError};
 pub use format::{FORMAT_VERSION, Footer, NO_FIELD, SectionEntry, SectionKind, SegmentHeader};
+pub use index::{
+    DecodedScalarIndex, INDEX_ENCODING_V1, IndexBuildReport, IndexPolicy, NodeMap, SegmentGraph,
+};
 pub use pk::{PkColumn, PkFilter, PkSorted, canonical_pk_hash};
 pub use reader::{DynamicHandle, SegmentReader, SegmentRow, VectorHandle};
 pub use source::{FileSource, MemorySource, SectionSource, VfsSource};
