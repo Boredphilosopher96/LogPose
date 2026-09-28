@@ -121,8 +121,17 @@ async fn route_not_found(method: Method, uri: Uri) -> ApiError {
     ))
 }
 
-/// Serve the REST API until shutdown.
+/// Serve the REST API until the process exits.
 pub async fn serve(state: Arc<AppState>) -> Result<(), std::io::Error> {
+    serve_until(state, std::future::pending()).await
+}
+
+/// Serve the REST API until `shutdown` completes, then stop accepting connections and return
+/// once every in-flight request has been answered.
+pub async fn serve_until<F>(state: Arc<AppState>, shutdown: F) -> Result<(), std::io::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let address = SocketAddr::from((
         state
             .config
@@ -135,15 +144,30 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), std::io::Error> {
     ));
 
     let listener = tokio::net::TcpListener::bind(address).await?;
-    serve_with_listener(state, listener).await
+    serve_with_listener_until(state, listener, shutdown).await
 }
 
-/// Serve the REST API over an existing listener.
+/// Serve the REST API over an existing listener until the process exits.
 pub async fn serve_with_listener(
     state: Arc<AppState>,
     listener: tokio::net::TcpListener,
 ) -> Result<(), std::io::Error> {
-    axum::serve(nodelay(listener), router(state)).await
+    serve_with_listener_until(state, listener, std::future::pending()).await
+}
+
+/// Serve the REST API over an existing listener until `shutdown` completes, then stop
+/// accepting connections and return once every in-flight request has been answered.
+pub async fn serve_with_listener_until<F>(
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    shutdown: F,
+) -> Result<(), std::io::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(nodelay(listener), router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 /// The listener, setting `TCP_NODELAY` on every accepted connection.
@@ -638,7 +662,7 @@ fn bounded_json<T: Serialize>(
     let limit = state.config.limits.max_rest_body_bytes;
     if bytes.len() > limit {
         return Err(ApiError(LogPoseError::TooLarge {
-            what: format!("{what}; ask for fewer results or output fields"),
+            what: what.to_owned(),
             size: u64::try_from(bytes.len()).ok(),
             limit: u64::try_from(limit).unwrap_or(u64::MAX),
         }));
@@ -3474,7 +3498,20 @@ mod tests {
             let (status, error) = call(&app, "POST", &format!("{ITEMS}/{path}"), Some(body)).await;
             assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{path}: {error}");
             assert_eq!(error["details"]["reason"], "TOO_LARGE", "{path}: {error}");
-            assert_eq!(error["details"]["metadata"]["limit_bytes"], "4096");
+            let metadata = &error["details"]["metadata"];
+            assert_eq!(metadata["limit_bytes"], "4096");
+            let what = match path {
+                "query" => "query response",
+                "records/scroll" => "scroll response",
+                _ => "get records response",
+            };
+            assert_eq!(metadata["what"], what, "{path}: {error}");
+            let size = metadata["size_bytes"].as_str().expect("size_bytes");
+            assert_eq!(
+                error["message"],
+                format!("{what} of {size} bytes exceeds the 4096-byte limit"),
+                "{path}: {error}"
+            );
         }
         // A small enough answer is served.
         let (status, body) = call(

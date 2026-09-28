@@ -43,6 +43,7 @@ Each server process opens one storage engine on its `storage_root`, recovers eve
 - **Statistics.** Collection stats report the manifest generation, visible sequence number, live and deleted row counts, operations above the checkpoint, and one query unit per segment plus one for the memtables. A segment's `index_kind` is `hnsw` (graph and SQ8 codes), `sq8` (codes only), or `flat`; the memtables are `raw`. The stats' `maintenance` field shows jobs waiting for a permit, the job running, completed jobs, and the last failure with its count of consecutive failures.
 - **Inspection.** `inspect` targets are `manifest` (the current manifest), `wal` (the rows written since the checkpoint: each with its sequence number, primary key `pk`, the record as the current schema reads it, its memtable, and whether a later write deleted it), `segment` (one segment's manifest entry, section table, and rows, each with its `pk` and whether it is deleted), and `maintenance`. Inspect payloads are diagnostics, not a stable contract.
 - **Failures.** A WAL fsync failure makes the collection read-only (writes fail with `COLLECTION_POISONED`) until the server restarts; reads keep serving the last published state. A flush that fails five times in a row poisons the collection the same way, and one that fails because the device is full or read-only poisons it at once. An explicit flush whose own failure poisons the collection returns that failure, and the other requests waiting then fail with `COLLECTION_POISONED`, whose reason names it. A `wal/FSYNC_FAILED` marker refuses to reopen a collection in the same boot, because the page cache may still hold frames the disk never received. A collection whose recovery fails reports that error on every call, and the rest of the server keeps serving.
+- **Stopping.** `SIGTERM` or `SIGINT` (Ctrl-C) stops the server cleanly: both listeners stop accepting connections and requests in flight finish, for up to `drain_timeout_ms` (default 20 seconds), after which the connections still open are closed. With etcd metadata the node then revokes its membership and leadership leases, so another node can lead at once. Last the storage engine closes (an index build in progress stops, and maintenance that has not started runs after the next start), and the process exits with status 0. A second signal exits at once, with status 1, without waiting. A crash or `SIGKILL` loses no acknowledged write either: the next start recovers every collection from its WAL.
 - **Background maintenance after a restart** starts for a collection on its first use (a read, write, stats call, or inspection), so a node that only reports status for a collection never runs its jobs.
 
 ## Local Podman Chaos
@@ -110,3 +111,9 @@ its key is missing, the node reports the claim as lost at once, then registers
 or campaigns again in the same tick. Losing membership also gives up
 leadership, so a node that is not a registered member never keeps leading.
 `timeout_ms` also bounds each keep-alive round trip.
+
+A node that restarts after a crash finds the leader key its previous process
+wrote, held by that process's lease, and campaigns once the lease expires, up
+to `leadership_ttl_secs` later. Meanwhile it serves reads and writes, and
+database, policy, and collection creates and drops fail with `NOT_LEADER` and
+a one-second retry hint but no `leader_node`, since no node leads until then.
