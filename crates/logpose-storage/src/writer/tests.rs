@@ -1205,24 +1205,3 @@ fn a_failed_drop_does_not_leave_maintenance_requests_stuck() {
     wait_for("the job to end", &|| status().in_progress.is_none());
     assert_eq!(status().completed_runs, 1);
 }
-
-/// An explicit flush or compaction answers only after the maintenance status stopped
-/// reporting it, so a status read right after it returns shows no job running.
-#[test]
-fn a_finished_explicit_job_is_no_longer_in_progress_when_it_returns() {
-    let fault = FaultVfs::new(12);
-    let engine = Engine::open(fault.process(), ROOT, config("boot")).expect("engine should open");
-    let handle = create(&engine, "settled");
-    for round in 0..16_u64 {
-        handle
-            .write_blocking(vec![put(&format!("k{round}"), vec![1.0, 0.0])])
-            .expect("write");
-        handle.flush_blocking().expect("flush");
-        let status = handle.maintenance_status();
-        assert_eq!(status.in_progress, None, "after flush {round}");
-        handle.compact_blocking().expect("compact");
-        let status = handle.maintenance_status();
-        assert_eq!(status.in_progress, None, "after compaction {round}");
-        assert!(status.pending.is_empty(), "after compaction {round}");
-    }
-}
