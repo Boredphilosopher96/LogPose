@@ -1,8 +1,8 @@
 //! What fetches report: per-access outcomes, [`FetchReport`] for `EXPLAIN`,
 //! [`PinSet`] for the compute stage, and [`CacheStats`] for metrics.
 
-use super::{AlignedBytes, ArtifactClass, CacheKey};
-use std::{collections::HashMap, sync::Arc};
+use super::{AlignedBytes, ArtifactClass, CacheKey, KeyMap};
+use std::sync::Arc;
 
 /// How one access was served.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +90,7 @@ impl FetchReport {
 /// Dropping the set releases every pin.
 #[derive(Clone, Debug, Default)]
 pub struct PinSet {
-    pins: HashMap<CacheKey, Arc<AlignedBytes>>,
+    pins: KeyMap<Arc<AlignedBytes>>,
 }
 
 impl PinSet {
@@ -103,6 +103,11 @@ impl PinSet {
     /// Pin `bytes` under `key`, replacing any earlier pin of the key.
     pub fn insert(&mut self, key: CacheKey, bytes: Arc<AlignedBytes>) {
         self.pins.insert(key, bytes);
+    }
+
+    /// Add every pin of `other`.
+    pub fn extend(&mut self, other: PinSet) {
+        self.pins.extend(other.pins);
     }
 
     /// The pinned bytes of `key`.

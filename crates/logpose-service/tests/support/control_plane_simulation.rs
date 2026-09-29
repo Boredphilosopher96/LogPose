@@ -855,6 +855,7 @@ async fn assert_data_matches(
             top_k: expected_record_count as u64,
             output_fields: vec!["$extra".to_owned()],
             ef: 0,
+            rerank_factor: 0,
             explain: proto::ExplainMode::None as i32,
             snapshot: None,
             read_barrier: None,

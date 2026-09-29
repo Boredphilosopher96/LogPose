@@ -20,7 +20,9 @@ use std::{
 /// [`AlignedBytes::decoded`]. It lives exactly as long as the buffer, so a
 /// cached unit decodes once per cache load instead of once per access. The
 /// cache charges an attachment's heap size when it is attached before the
-/// insert (loaders do that).
+/// insert (loaders do that), and through
+/// [`BufferCache::charge_decoded`](super::BufferCache::charge_decoded) when it
+/// is attached on first use.
 #[derive(Clone, Default)]
 pub struct AlignedBytes {
     words: Box<[u64]>,
@@ -141,6 +143,44 @@ impl AlignedBytes {
             });
         }
         Ok(value)
+    }
+
+    /// The decoded form of type `T` by reference, decoding and attaching it first when none
+    /// is attached (as [`decoded`](Self::decoded)); the second value is whether this call
+    /// attached it. `Ok(None)` when a decoded form of another type is attached.
+    ///
+    /// # Errors
+    ///
+    /// `decode`'s error; nothing is attached then.
+    pub fn decoded_ref<T, E>(
+        &self,
+        decode: impl FnOnce(&[u8]) -> Result<(T, u64), E>,
+    ) -> Result<Option<(&T, bool)>, E>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut attached_now = false;
+        if self.decoded.get().is_none() {
+            let (value, heap_bytes) = decode(self.as_bytes())?;
+            attached_now = self
+                .decoded
+                .set(Decoded {
+                    value: Arc::new(value),
+                    heap_bytes,
+                })
+                .is_ok();
+        }
+        Ok(self
+            .decoded
+            .get()
+            .and_then(|decoded| decoded.value.downcast_ref::<T>())
+            .map(|value| (value, attached_now)))
+    }
+
+    /// Whether a decoded form is attached.
+    #[must_use]
+    pub fn has_decoded(&self) -> bool {
+        self.decoded.get().is_some()
     }
 
     /// Heap bytes of the attached decoded form; 0 without one.

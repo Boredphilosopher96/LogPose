@@ -924,6 +924,7 @@ async fn assert_snapshot_expired_everywhere(
             top_k: EXACT_QUERY_TOP_K as u64,
             output_fields: vec!["$extra".to_owned()],
             ef: 0,
+            rerank_factor: 0,
             explain: proto::ExplainMode::None as i32,
             snapshot: Some(proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
@@ -1033,6 +1034,7 @@ async fn assert_query_parity(
             top_k: EXACT_QUERY_TOP_K as u64,
             output_fields: vec!["$extra".to_owned()],
             ef: 0,
+            rerank_factor: 0,
             explain: proto::ExplainMode::None as i32,
             snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
@@ -1183,6 +1185,7 @@ async fn assert_query_parity(
             top_k: EXACT_QUERY_TOP_K as u64,
             output_fields: vec!["$extra".to_owned()],
             ef: 0,
+            rerank_factor: 0,
             explain: proto::ExplainMode::Profile as i32,
             snapshot: request.snapshot.clone().map(|snapshot| proto::Snapshot {
                 manifest_generation: snapshot.manifest_generation,
@@ -2311,10 +2314,6 @@ fn proto_plan_kind(plan: QueryPlanKind) -> proto::QueryPlanKind {
     match plan {
         QueryPlanKind::UnfilteredExactScan => proto::QueryPlanKind::UnfilteredExactScan,
         QueryPlanKind::PredicateFirstExact => proto::QueryPlanKind::PredicateFirstExact,
-        QueryPlanKind::VectorFirstExact => proto::QueryPlanKind::VectorFirstExact,
-        QueryPlanKind::TinyPopulationExactFallback => {
-            proto::QueryPlanKind::TinyPopulationExactFallback
-        }
         QueryPlanKind::VectorFirstAnn => proto::QueryPlanKind::VectorFirstAnn,
         QueryPlanKind::CooperativeFilteredAnn => proto::QueryPlanKind::CooperativeFilteredAnn,
         QueryPlanKind::HybridExactAnnMerge => proto::QueryPlanKind::HybridExactAnnMerge,

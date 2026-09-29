@@ -16,6 +16,7 @@
 //! A [`Cursor`] travels to clients as opaque text ([`Cursor`]'s `Display` and `FromStr`): the
 //! token, the order, a digest of the filter, and the last row's position, with a checksum.
 
+use crate::explain::{Operator, OperatorStats, PlanNode};
 use crate::{QueryError, Result, compile::CompiledFilter};
 use logpose_storage::{
     CollectionReader, FetchPlan, Projection, ReadOptions, ReadView, RowData, SectionNeed,
@@ -33,7 +34,15 @@ use logpose_types::{
 };
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use std::{cmp::Ordering, fmt, ops::Bound, str::FromStr, sync::Arc};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    fmt,
+    ops::Bound,
+    str::FromStr,
+    sync::Arc,
+    time::Instant,
+};
 
 /// The order of a scroll.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,7 +280,7 @@ pub async fn scroll_page(view: &ReadView, request: ScrollRequest) -> Result<Scro
         .as_ref()
         .map_or(view.token().is_none(), |cursor| cursor.owned);
     let limit = request.limit.max(1) as usize;
-    let mut entries = scroll_entries(
+    let (mut entries, _) = scroll_entries(
         view,
         request.filter.as_ref(),
         &request.order,
@@ -327,11 +336,37 @@ pub async fn scroll_view(
     projection: Projection,
     after: Option<&CursorKey>,
 ) -> Result<(Vec<RowData>, Option<CursorKey>)> {
-    let entries = scroll_entries(view, filter, order, limit.max(1) as usize, after).await?;
+    let (rows, last, _) =
+        scroll_view_explained(view, filter, order, limit, projection, after).await?;
+    Ok((rows, last))
+}
+
+/// [`scroll_view`], with the plan it ran: `Project` over `Merge` over one `OrderedScan` per
+/// unit, each over the unit's filter bitmap.
+///
+/// # Errors
+///
+/// As [`scroll_view`].
+pub async fn scroll_view_explained(
+    view: &ReadView,
+    filter: Option<&FilterExpr>,
+    order: &ScrollOrder,
+    limit: u32,
+    projection: Projection,
+    after: Option<&CursorKey>,
+) -> Result<(Vec<RowData>, Option<CursorKey>, PlanNode)> {
+    let limit = limit.max(1) as usize;
+    let (entries, merge) = scroll_entries(view, filter, order, limit, after).await?;
     let addrs = entries.iter().map(|entry| entry.addr).collect::<Vec<_>>();
     let rows = view.rows(&addrs, projection).await?;
     let last = entries.last().map(|entry| cursor_key(entry, order));
-    Ok((rows, last))
+    let plan = PlanNode::new(Operator::Project, format!("limit={limit}"))
+        .with_stats(
+            OperatorStats::rows(limit as u64),
+            OperatorStats::rows(rows.len() as u64),
+        )
+        .over(merge);
+    Ok((rows, last, plan))
 }
 
 /// The cursor key of `entry` in `order`.
@@ -344,14 +379,18 @@ fn cursor_key(entry: &Entry, order: &ScrollOrder) -> CursorKey {
     }
 }
 
-/// The next `limit` entries of `view` after `after` in `order`.
+/// The next `limit` entries of `view` after `after` in `order`, and the plan's merge node.
+///
+/// Each unit yields at most `limit` entries in `(value, key)` order after the cursor (see
+/// [`unit_by_key`] and [`unit_by_field`]); a heap merge of the units' sorted lists takes the
+/// first `limit`, which are the first `limit` of the whole view because the order is total.
 async fn scroll_entries(
     view: &ReadView,
     filter: Option<&FilterExpr>,
     order: &ScrollOrder,
     limit: usize,
     after: Option<&CursorKey>,
-) -> Result<Vec<Entry>> {
+) -> Result<(Vec<Entry>, PlanNode)> {
     let filter = filter
         .map(|filter| CompiledFilter::compile(view.schema(), filter))
         .transpose()?
@@ -365,11 +404,13 @@ async fn scroll_entries(
     };
     let mut plan = FetchPlan::default();
     let mut units = Vec::new();
+    let mut pruned = 0;
     for unit in view.units() {
         if filter
             .as_ref()
             .is_some_and(|filter| !filter.may_match(&unit))
         {
+            pruned += 1;
             continue;
         }
         units.push(unit.id());
@@ -413,18 +454,25 @@ async fn scroll_entries(
             return Err(invalid_cursor("the cursor does not fit the scroll's order"));
         }
     };
-    let entries = view
+    let described = filter.clone();
+    let scans = view
         .run(move |view| {
             view.units()
                 .into_par_iter()
                 .filter(|unit| units.contains(&unit.id()))
-                .map(|unit| {
+                .map(|unit| -> logpose_types::Result<(Vec<Entry>, PlanNode)> {
+                    let started = Instant::now();
                     let allowed = match &filter {
                         Some(filter) => filter.evaluate(&unit, &pins)?,
                         None => unit.live(),
                     };
-                    match ordered_field {
-                        None => unit_by_key(&unit, &pins, &allowed, after_entry.as_ref(), limit),
+                    let probe_micros = started.elapsed().as_secs_f64() * 1e6;
+                    let scan_started = Instant::now();
+                    let (entries, how) = match ordered_field {
+                        None => (
+                            unit_by_key(&unit, &pins, &allowed, after_entry.as_ref(), limit)?,
+                            "key order".to_owned(),
+                        ),
                         Some((field, direction)) => unit_by_field(
                             &unit,
                             &pins,
@@ -433,20 +481,153 @@ async fn scroll_entries(
                             direction,
                             after_entry.as_ref(),
                             limit,
-                        ),
-                    }
+                        )?,
+                    };
+                    let node = ordered_node(
+                        &unit,
+                        described.as_deref(),
+                        &allowed,
+                        &how,
+                        limit,
+                        entries.len(),
+                        probe_micros,
+                        scan_started.elapsed().as_secs_f64() * 1e6,
+                    );
+                    Ok((entries, node))
                 })
-                .collect::<Vec<logpose_types::Result<Vec<Entry>>>>()
+                .collect::<Vec<_>>()
         })
         .await?;
     let direction = ordered_field.map(|(_, direction)| direction);
-    let mut merged = Vec::new();
-    for entries in entries {
-        merged.extend(entries?);
+    let mut lists = Vec::with_capacity(scans.len());
+    let mut nodes = Vec::with_capacity(scans.len());
+    for scan in scans {
+        let (entries, node) = scan?;
+        lists.push(entries);
+        nodes.push(node);
     }
-    merged.sort_by(|left, right| compare_entries(left, right, direction));
-    merged.truncate(limit);
-    Ok(merged)
+    let merge_started = Instant::now();
+    let merged = merge_entries(lists, direction, limit);
+    let mut merge = PlanNode::new(
+        Operator::Merge,
+        format!("units={} pruned={pruned} limit={limit}", nodes.len()),
+    )
+    .with_stats(
+        OperatorStats::rows(limit as u64),
+        OperatorStats {
+            rows: merged.len() as u64,
+            micros: merge_started.elapsed().as_secs_f64() * 1e6,
+            ..OperatorStats::default()
+        },
+    );
+    merge.children = nodes;
+    Ok((merged, merge))
+}
+
+/// A unit's `OrderedScan` over its filter nodes.
+#[allow(clippy::too_many_arguments)]
+fn ordered_node(
+    unit: &UnitView<'_>,
+    filter: Option<&CompiledFilter>,
+    allowed: &RoaringBitmap,
+    how: &str,
+    limit: usize,
+    produced: usize,
+    probe_micros: f64,
+    scan_micros: f64,
+) -> PlanNode {
+    let live = u64::from(unit.live_count());
+    let matched = allowed.len();
+    let kind = if unit.is_memtable() {
+        "memtable"
+    } else {
+        "segment"
+    };
+    let mut node = PlanNode::new(
+        Operator::SegmentSource,
+        format!("unit={:08x} {kind} rows={}", unit.id().0, unit.row_count()),
+    )
+    .with_stats(OperatorStats::rows(live), OperatorStats::rows(live));
+    if let Some(filter) = filter {
+        node = PlanNode::new(Operator::BitmapProbe, filter.describe(unit))
+            .with_stats(
+                OperatorStats::rows(matched),
+                OperatorStats {
+                    rows: matched,
+                    micros: probe_micros,
+                    ..OperatorStats::default()
+                },
+            )
+            .over(node);
+    }
+    let deleted = u64::from(unit.row_count()).saturating_sub(live);
+    node = PlanNode::new(Operator::MaskDeletes, format!("deleted={deleted}"))
+        .with_stats(OperatorStats::rows(matched), OperatorStats::rows(matched))
+        .over(node);
+    PlanNode::new(
+        Operator::OrderedScan,
+        format!("unit={:08x} {how} limit={limit}", unit.id().0),
+    )
+    .with_stats(
+        OperatorStats::rows(matched.min(limit as u64)),
+        OperatorStats {
+            rows: produced as u64,
+            micros: scan_micros,
+            ..OperatorStats::default()
+        },
+    )
+    .over(node)
+}
+
+/// An entry with the scroll's direction, ordered as the scroll orders rows (then by address,
+/// which only equal keys from different units could need).
+struct Ordered(Entry, Option<Direction>);
+
+impl PartialEq for Ordered {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ordered {}
+
+impl PartialOrd for Ordered {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ordered {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_entries(&self.0, &other.0, self.1)
+            .then(self.0.addr.unit.cmp(&other.0.addr.unit))
+            .then(self.0.addr.row.cmp(&other.0.addr.row))
+    }
+}
+
+/// A k-way heap merge of sorted entry lists to their first `limit`.
+fn merge_entries(lists: Vec<Vec<Entry>>, direction: Option<Direction>, limit: usize) -> Vec<Entry> {
+    let mut iters = lists
+        .into_iter()
+        .map(std::iter::IntoIterator::into_iter)
+        .collect::<Vec<_>>();
+    let mut heap = BinaryHeap::with_capacity(iters.len());
+    for (index, iter) in iters.iter_mut().enumerate() {
+        if let Some(first) = iter.next() {
+            heap.push(Reverse((Ordered(first, direction), index)));
+        }
+    }
+    let mut out = Vec::with_capacity(limit.min(4_096));
+    while out.len() < limit {
+        let Some(Reverse((Ordered(entry, _), index))) = heap.pop() else {
+            break;
+        };
+        if let Some(next) = iters[index].next() {
+            heap.push(Reverse((Ordered(next, direction), index)));
+        }
+        out.push(entry);
+    }
+    out
 }
 
 /// The field a scroll or query orders by: a declared scalar field that is not an array or JSON.
@@ -739,7 +920,8 @@ fn key_value(key: &ScalarKey) -> Value {
     }
 }
 
-/// Up to `limit` rows of `unit` in key order after `after`.
+/// Up to `limit` rows of `unit` in key order after `after`: a binary search in the unit's
+/// key order, then rows until `limit` of them are allowed.
 fn unit_by_key(
     unit: &UnitView<'_>,
     pins: &PinSet,
@@ -763,8 +945,13 @@ fn unit_by_key(
         .collect())
 }
 
-/// Up to `limit` rows of `unit` in `(value, key)` order after `after` (plus the rest of the
-/// last value's ties, so the merge sees every tie).
+/// Up to `limit` rows of `unit` in `(value, key)` order after `after`, and how they were read.
+///
+/// With a sorted index, the scan seeks to the cursor's value and continues from there, one
+/// group of equal values at a time; the cursor's own group (and the null tail) seeks by key
+/// ([`group_after`]), so a page never re-reads the rows of a large tie group that earlier pages
+/// returned. Without one, a bounded heap of `limit` entries over the column keeps the page's
+/// rows: one pass over the allowed rows, no sort of all of them.
 fn unit_by_field(
     unit: &UnitView<'_>,
     pins: &PinSet,
@@ -773,91 +960,163 @@ fn unit_by_field(
     direction: Direction,
     after: Option<&Entry>,
     limit: usize,
-) -> logpose_types::Result<Vec<Entry>> {
+) -> logpose_types::Result<(Vec<Entry>, String)> {
     let pks = unit.pks(pins)?;
-    let entry = |key: Option<ScalarKey>, row: RowId| -> logpose_types::Result<Entry> {
-        Ok(Entry {
-            key,
-            pk: pks.pk_at(row).ok_or_else(|| {
-                LogPoseError::internal(format!("row {row} of unit {} has no key", unit.id()))
-            })?,
-            addr: RowAddr {
-                unit: unit.id(),
-                row,
-            },
+    let entry = |key: Option<ScalarKey>, pk: PrimaryKey, row: RowId| Entry {
+        key,
+        pk,
+        addr: RowAddr {
+            unit: unit.id(),
+            row,
+        },
+    };
+    let pk_of = |row: RowId| -> logpose_types::Result<PrimaryKey> {
+        pks.pk_at(row).ok_or_else(|| {
+            LogPoseError::internal(format!("row {row} of unit {} has no key", unit.id()))
         })
     };
-    let is_after = |candidate: &Entry| {
-        after.is_none_or(|after| {
-            compare_entries(candidate, after, Some(direction)) == Ordering::Greater
-        })
-    };
-    let mut out = Vec::new();
-    if let Some(index) = unit.scalar_index(field, true, pins)? {
-        let in_null_tail = after.is_some_and(|after| after.key.is_none());
-        if !in_null_tail {
-            let start = after
-                .and_then(|after| after.key.as_ref())
-                .map_or(Bound::Unbounded, Bound::Included);
-            if let Some(ordered) = index.ordered(start, direction) {
-                let mut group: Vec<Entry> = Vec::new();
-                let mut group_key: Option<ScalarKey> = None;
-                for (key, row) in ordered {
-                    if !allowed.contains(row) {
-                        continue;
-                    }
-                    if group_key.as_ref() != Some(&key) {
-                        flush_group(&mut group, &mut out, &is_after);
-                        if out.len() >= limit {
-                            break;
-                        }
-                        group_key = Some(key.clone());
-                    }
-                    group.push(entry(Some(key), row)?);
-                }
-                flush_group(&mut group, &mut out, &is_after);
-            }
-        }
-        if out.len() < limit {
-            let mut nulls = Vec::new();
-            for row in &(index.nulls() & allowed) {
-                let candidate = entry(None, row)?;
-                if is_after(&candidate) {
-                    nulls.push(candidate);
-                }
-            }
-            nulls.sort_by(|left, right| left.pk.cmp(&right.pk));
-            out.extend(nulls);
-        }
-    } else {
+    let Some(index) = unit.scalar_index(field, true, pins)? else {
+        // No sorted index: a bounded heap over the column.
         let column = unit.column(field, pins)?;
+        let mut heap: BinaryHeap<Ordered> = BinaryHeap::with_capacity(limit.min(4_096) + 1);
         for row in allowed {
             let key = column
                 .value(row)?
                 .and_then(|value| value_index_keys(&value).into_iter().next());
-            let candidate = entry(key, row)?;
-            if is_after(&candidate) {
-                out.push(candidate);
+            // Compare by value first: a row whose value is past the heap's worst never needs
+            // its key read.
+            if heap.len() >= limit
+                && heap.peek().is_some_and(|worst| {
+                    compare_ordered(
+                        (key.as_ref(), &worst.0.pk),
+                        (worst.0.key.as_ref(), &worst.0.pk),
+                        direction,
+                    ) == Ordering::Greater
+                })
+            {
+                continue;
+            }
+            let candidate = entry(key, pk_of(row)?, row);
+            if after.is_some_and(|after| {
+                compare_entries(&candidate, after, Some(direction)) != Ordering::Greater
+            }) {
+                continue;
+            }
+            let candidate = Ordered(candidate, Some(direction));
+            if heap.len() < limit {
+                heap.push(candidate);
+            } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+                heap.pop();
+                heap.push(candidate);
             }
         }
-        out.sort_by(|left, right| compare_entries(left, right, Some(direction)));
-    }
-    let keep = out
-        .get(limit.saturating_sub(1))
-        .map(|last| last.key.clone());
-    if let Some(last_key) = keep {
-        // Keep the whole tie group of the last row kept.
-        let mut end = limit;
-        while end < out.len() && out[end].key == last_key {
-            end += 1;
+        let entries = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ordered| ordered.0)
+            .collect();
+        return Ok((entries, "column heap".to_owned()));
+    };
+    let mut out: Vec<Entry> = Vec::new();
+    let in_null_tail = after.is_some_and(|after| after.key.is_none());
+    if !in_null_tail {
+        // The cursor's own group first, seeking by key within it.
+        let mut start = Bound::Unbounded;
+        if let Some(after) = after
+            && let Some(key) = &after.key
+        {
+            let group = index.equals(key) & allowed;
+            for (pk, row) in group_after(&pks, &group, Some(&after.pk), limit, unit.row_count()) {
+                out.push(entry(Some(key.clone()), pk, row));
+            }
+            start = Bound::Excluded(key);
         }
-        out.truncate(end);
+        // Then later groups in value order, each ordered by key; a group larger than what
+        // the page still needs keeps only its smallest keys.
+        if out.len() < limit
+            && let Some(ordered) = index.ordered(start, direction)
+        {
+            let mut group = RoaringBitmap::new();
+            let mut group_key: Option<ScalarKey> = None;
+            let flush = |group: &mut RoaringBitmap,
+                         key: Option<ScalarKey>,
+                         out: &mut Vec<Entry>|
+             -> logpose_types::Result<()> {
+                let wanted = limit - out.len();
+                for (pk, row) in group_after(&pks, group, None, wanted, unit.row_count()) {
+                    out.push(entry(key.clone(), pk, row));
+                }
+                group.clear();
+                Ok(())
+            };
+            for (key, row) in ordered {
+                if group_key.as_ref() != Some(&key) {
+                    if !group.is_empty() {
+                        flush(&mut group, group_key.take(), &mut out)?;
+                        if out.len() >= limit {
+                            break;
+                        }
+                    }
+                    group_key = Some(key);
+                }
+                if allowed.contains(row) {
+                    group.insert(row);
+                }
+            }
+            if out.len() < limit && !group.is_empty() {
+                flush(&mut group, group_key.take(), &mut out)?;
+            }
+        }
     }
-    Ok(out)
+    if out.len() < limit {
+        // Rows without a value come last, by key.
+        let nulls = index.nulls() & allowed;
+        let after_pk = after.filter(|_| in_null_tail).map(|after| &after.pk);
+        for (pk, row) in group_after(&pks, &nulls, after_pk, limit - out.len(), unit.row_count()) {
+            out.push(entry(None, pk, row));
+        }
+    }
+    out.truncate(limit);
+    Ok((out, "sorted index".to_owned()))
 }
 
-/// Move a group of equal-valued rows, ordered by key, past the cursor into `out`.
-fn flush_group(group: &mut Vec<Entry>, out: &mut Vec<Entry>, is_after: &impl Fn(&Entry) -> bool) {
-    group.sort_by(|left, right| left.pk.cmp(&right.pk));
-    out.extend(group.drain(..).filter(|entry| is_after(entry)));
+/// The first `limit` rows of `group` by key, strictly after `after`. Two ways, whichever
+/// reads fewer rows: walk the unit's key order from `after` testing membership (about
+/// `limit * rows / |group|` rows for a large group), or collect the group's keys into a
+/// bounded heap (`|group|` rows).
+fn group_after(
+    pks: &logpose_storage::read::PkRef<'_>,
+    group: &RoaringBitmap,
+    after: Option<&PrimaryKey>,
+    limit: usize,
+    rows: u32,
+) -> Vec<(PrimaryKey, RowId)> {
+    let size = group.len();
+    if size == 0 || limit == 0 {
+        return Vec::new();
+    }
+    let walk = (limit as u64).saturating_mul(u64::from(rows)) / size;
+    if walk < size {
+        return pks
+            .ascending_after(after)
+            .filter(|(_, row)| group.contains(*row))
+            .take(limit)
+            .collect();
+    }
+    let mut heap: BinaryHeap<(PrimaryKey, RowId)> = BinaryHeap::with_capacity(limit.min(4_096) + 1);
+    for row in group {
+        let Some(pk) = pks.pk_at(row) else {
+            continue;
+        };
+        if after.is_some_and(|after| &pk <= after) {
+            continue;
+        }
+        if heap.len() < limit {
+            heap.push((pk, row));
+        } else if heap.peek().is_some_and(|worst| pk < worst.0) {
+            heap.pop();
+            heap.push((pk, row));
+        }
+    }
+    heap.into_sorted_vec()
 }

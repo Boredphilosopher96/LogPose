@@ -527,3 +527,70 @@ fn mutated_bytes_never_panic_and_accepted_bytes_are_canonical() {
         }
     }
 }
+
+/// Looking up one member agrees with decoding the whole object, for present, absent, first,
+/// and last keys, with nested values skipped on the way.
+#[test]
+fn member_lookup_agrees_with_full_decoding() {
+    let mut rng = Rng(0x5eed_0004);
+    for case in 0..2_000 {
+        let JsonValue::Object(object) = canonical_json(json!({
+            "a": rng.json(3),
+            "m": rng.json(3),
+            "nested": { "x": [1, {"y": "z"}], "w": 2.5 },
+            "z": rng.json(2),
+        })) else {
+            unreachable!("an object literal")
+        };
+        let bytes = encode_json(&JsonValue::Object(object.clone())).expect("json should encode");
+        for key in ["a", "m", "nested", "z", "", "b", "zz", "n"] {
+            assert_eq!(
+                decode_json_member(&bytes, key).expect("member lookup"),
+                object.get(key).cloned(),
+                "case {case} key {key}"
+            );
+        }
+        assert_eq!(
+            json_object_keys(&bytes).expect("keys"),
+            ["a", "m", "nested", "z"],
+            "case {case}"
+        );
+    }
+    let array = encode_json(&json!([1])).expect("json should encode");
+    assert!(decode_json_member(&array, "a").is_err());
+}
+
+/// Member lookup agrees with the full decoder on random objects whose keys are random strings
+/// (multi-byte, NUL, prefixes of one another, empty) and whose values nest, for every key the
+/// object has and for random absent ones; the key list agrees with the decoded object's keys.
+#[test]
+fn member_lookup_agrees_with_full_decoding_for_random_keys() {
+    let mut rng = Rng(0x5eed_0005);
+    for case in 0..3_000 {
+        let object = (0..rng.below(8))
+            .map(|_| (rng.string(), rng.json(3)))
+            .collect::<serde_json::Map<_, _>>();
+        let bytes = encode_json(&JsonValue::Object(object)).expect("json should encode");
+        let JsonValue::Object(decoded) = decode_json(&bytes).expect("json should decode") else {
+            unreachable!("an object encodes as an object")
+        };
+        for key in decoded.keys() {
+            assert_eq!(
+                decode_json_member(&bytes, key).expect("member lookup"),
+                decoded.get(key).cloned(),
+                "case {case} key {key:?}"
+            );
+        }
+        for _ in 0..4 {
+            let key = rng.string();
+            assert_eq!(
+                decode_json_member(&bytes, &key).expect("member lookup"),
+                decoded.get(&key).cloned(),
+                "case {case} key {key:?}"
+            );
+        }
+        let mut keys = decoded.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(json_object_keys(&bytes).expect("keys"), keys, "case {case}");
+    }
+}

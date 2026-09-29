@@ -257,6 +257,58 @@ pub fn decode_json(bytes: &[u8]) -> Result<JsonValue, CodecError> {
     Ok(json)
 }
 
+/// The value of the member `key` of the encoded JSON object `bytes` (a row's `$extra`), or
+/// `None` when the object has no such key, without decoding the other members: keys are
+/// stored in increasing order, so the scan stops at the first key past `key`, and the values
+/// before it are skipped, not built.
+///
+/// # Errors
+///
+/// A [`CodecError`] when the bytes up to the member are malformed or are not an object.
+pub fn decode_json_member(bytes: &[u8], key: &str) -> Result<Option<JsonValue>, CodecError> {
+    let mut reader = Reader::new(bytes);
+    let tag = reader.byte()?;
+    if tag != JSON_OBJECT {
+        return Err(CodecError::UnknownTag { tag, offset: 0 });
+    }
+    let count = reader.len()?;
+    for _ in 0..count {
+        let len = reader.len()?;
+        let name = reader.take(len)?;
+        match name.cmp(key.as_bytes()) {
+            std::cmp::Ordering::Less => reader.skip_json(1)?,
+            std::cmp::Ordering::Equal => return reader.json(1).map(Some),
+            std::cmp::Ordering::Greater => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// The member names of the encoded JSON object `bytes`, in their stored (increasing) order,
+/// without decoding the values.
+///
+/// # Errors
+///
+/// A [`CodecError`] when the bytes are malformed or are not an object.
+pub fn json_object_keys(bytes: &[u8]) -> Result<Vec<&str>, CodecError> {
+    let mut reader = Reader::new(bytes);
+    let tag = reader.byte()?;
+    if tag != JSON_OBJECT {
+        return Err(CodecError::UnknownTag { tag, offset: 0 });
+    }
+    let count = reader.len()?;
+    let mut keys = Vec::with_capacity(count.min(MAX_PREALLOCATED_ITEMS));
+    for _ in 0..count {
+        let len = reader.len()?;
+        let offset = reader.pos;
+        let name = reader.take(len)?;
+        keys.push(std::str::from_utf8(name).map_err(|_| CodecError::InvalidUtf8 { offset })?);
+        reader.skip_json(1)?;
+    }
+    reader.finish()?;
+    Ok(keys)
+}
+
 fn check_depth(depth: usize) -> Result<(), CodecError> {
     if depth > MAX_NESTING_DEPTH {
         Err(CodecError::TooDeep {
@@ -532,6 +584,40 @@ impl<'a> Reader<'a> {
             items.push(item);
         }
         Ok(Value::Array(items))
+    }
+
+    /// Step over one JSON node without building it.
+    fn skip_json(&mut self, depth: usize) -> Result<(), CodecError> {
+        check_depth(depth)?;
+        let offset = self.pos;
+        let tag = self.byte()?;
+        match tag {
+            JSON_NULL | JSON_FALSE | JSON_TRUE => {}
+            JSON_I64 | JSON_U64 => {
+                self.varint()?;
+            }
+            JSON_FLOAT => {
+                self.take(8)?;
+            }
+            JSON_STRING => {
+                let len = self.len()?;
+                self.take(len)?;
+            }
+            JSON_ARRAY => {
+                for _ in 0..self.len()? {
+                    self.skip_json(depth + 1)?;
+                }
+            }
+            JSON_OBJECT => {
+                for _ in 0..self.len()? {
+                    let len = self.len()?;
+                    self.take(len)?;
+                    self.skip_json(depth + 1)?;
+                }
+            }
+            _ => return Err(CodecError::UnknownTag { tag, offset }),
+        }
+        Ok(())
     }
 
     fn json(&mut self, depth: usize) -> Result<JsonValue, CodecError> {

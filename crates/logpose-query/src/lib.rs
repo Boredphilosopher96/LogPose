@@ -6,10 +6,14 @@
 //!
 //! - [`compile`]: filters checked against the schema and compiled to per-unit bitmaps, through
 //!   scalar indexes where a unit has one and column or `$extra` scans otherwise.
-//! - [`search`](mod@search): staged vector search: per-unit strategy from the exact filter
-//!   cardinality (exact scan, ACORN-1 style walk, or admit-only walk over SQ8 codes), a
-//!   resumable cursor that widens `ef` for short or anti-correlated results, an exact f32
-//!   rerank, and a global top-k merge.
+//! - [`search`](mod@search): planned, staged vector search: per-unit strategy priced by the
+//!   [`cost`] model from the exact filter cardinality (exact scan, ACORN-1 style walk, or
+//!   admit-only walk over SQ8 codes), units searched in parallel, a resumable cursor that widens
+//!   `ef` for short or anti-correlated results and yields to an exact scan past its price, an
+//!   exact f32 rerank, and a global heap merge.
+//! - [`cost`]: the cost model, in distance computations, graph hops, and bytes touched.
+//! - [`explain`]: the plan as an operator tree with estimated and actual work, which
+//!   `EXPLAIN` returns.
 //! - [`ops`]: get, count, scroll by key, and order by a field, with opaque scroll cursors.
 //! - [`resolver`](mod@resolver): the [`RowSetResolver`](logpose_storage::RowSetResolver) the
 //!   engine uses for delete-by-filter and update-by-filter.
@@ -18,6 +22,8 @@
 //! decision D11) on top of them.
 
 pub mod compile;
+pub mod cost;
+pub mod explain;
 pub mod ops;
 pub mod resolver;
 pub mod search;
@@ -26,6 +32,8 @@ pub mod search;
 mod tests;
 
 pub use compile::CompiledFilter;
+pub use cost::{CostModel, ExactCause, Force};
+pub use explain::{Operator, OperatorStats, PlanNode};
 pub use logpose_storage::read::Direction;
 pub use logpose_types::filter::{FilterExpr, RangeBounds};
 pub use ops::{
@@ -34,8 +42,8 @@ pub use ops::{
 };
 pub use resolver::{QueryResolver, resolver};
 pub use search::{
-    SearchHit, SearchOutcome, SearchRequest, SearchTuning, UnitReport, UnitStrategy, metric_value,
-    search,
+    MAX_RERANK_FACTOR, SearchHit, SearchOutcome, SearchRequest, SearchTimings, SearchTuning,
+    UnitReport, UnitStrategy, metric_value, search,
 };
 
 use logpose_catalog as _;
@@ -186,6 +194,9 @@ pub struct QueryRequest {
     pub output_fields: Vec<String>,
     /// Beam width of graph walks, 1 to [`MAX_EF`]; only with a vector.
     pub ef: Option<usize>,
+    /// Candidates per result each unit reranks exactly in f32, 1 to [`MAX_RERANK_FACTOR`]
+    /// (default 4); only with a vector.
+    pub rerank_factor: Option<usize>,
     /// Planner diagnostics to return.
     pub explain: ExplainMode,
     /// Which state the query reads.
@@ -199,9 +210,9 @@ pub enum ExplainMode {
     /// Do not emit plan diagnostics.
     #[default]
     None,
-    /// Emit chosen plan and planner estimates.
+    /// Emit the plan tree with estimated and actual work per operator.
     Plan,
-    /// Emit chosen plan plus per-stage timings.
+    /// Emit the plan plus measured times per operator and per stage.
     Profile,
 }
 
@@ -213,10 +224,6 @@ pub enum QueryPlanKind {
     UnfilteredExactScan,
     /// Every unit was scanned exactly over its filter bitmap.
     PredicateFirstExact,
-    /// Not produced by the staged planner; kept for wire compatibility.
-    VectorFirstExact,
-    /// Not produced by the staged planner; kept for wire compatibility.
-    TinyPopulationExactFallback,
     /// Graph walks over segments, no filter, no memtable rows.
     VectorFirstAnn,
     /// Filtered graph walks (ACORN-1 style or admit-only) over segments.
@@ -232,15 +239,16 @@ pub enum QueryPlanKind {
 pub struct QueryStageTimings {
     /// Planning and the first fetch (filter sections and vector indexes).
     pub planning_micros: u64,
-    /// Not measured separately: filters compile inside candidate generation.
+    /// Filter bitmaps (`BitmapProbe` and `MaskDeletes`), CPU time summed over units.
     pub prefilter_micros: u64,
-    /// Per-unit filter bitmaps and candidate generation (an ordered scan: the whole scan).
+    /// The per-unit stage: filter bitmaps, scans, and walks, units in parallel (an ordered
+    /// scan: the whole scan).
     pub candidate_generation_micros: u64,
     /// Reading the result rows.
     pub postfilter_micros: u64,
-    /// The second fetch (f32 pages) and the exact rerank.
+    /// The exact f32 rerank, with any fetch of vector pages.
     pub rerank_micros: u64,
-    /// Not measured separately: the global merge is part of the rerank.
+    /// The global heap merge of the units' results.
     pub merge_micros: u64,
 }
 
@@ -279,6 +287,13 @@ pub struct QueryDiagnostics {
     /// Stage timings when profile mode is requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_timings: Option<QueryStageTimings>,
+    /// The plan as an operator tree, with estimated and actual work per operator (times only
+    /// in profile mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Box<PlanNode>>,
+    /// The plan tree rendered as text, one operator per line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plan_text: String,
 }
 
 /// One query result.
@@ -540,6 +555,20 @@ pub async fn query(
             return Err(invalid("ef", format!("ef must be 1 to {MAX_EF}")));
         }
     }
+    if let Some(factor) = request.rerank_factor {
+        if request.vector.is_none() {
+            return Err(invalid(
+                "rerank_factor",
+                "rerank_factor applies only to a vector search",
+            ));
+        }
+        if factor == 0 || factor > MAX_RERANK_FACTOR {
+            return Err(invalid(
+                "rerank_factor",
+                format!("rerank_factor must be 1 to {MAX_RERANK_FACTOR}"),
+            ));
+        }
+    }
     let view = open_view(reader, collection, &request.read).await?;
     let schema = Arc::clone(view.schema());
     let projection = Projection::resolve(&schema, &request.output_fields)?;
@@ -577,7 +606,12 @@ pub async fn query(
                 filter: request.filter.clone(),
                 ef: request.ef,
                 projection: rows,
-                tuning: SearchTuning::default(),
+                tuning: SearchTuning {
+                    rerank_factor: request
+                        .rerank_factor
+                        .unwrap_or(SearchTuning::default().rerank_factor),
+                    ..SearchTuning::default()
+                },
             };
             let outcome = search::search(&view, &search_request).await?;
             let metric = schema.vector_field(&field).map(|field| field.metric);
@@ -625,7 +659,7 @@ pub async fn query(
                 },
             };
             let limit = u32::try_from(request.top_k).unwrap_or(u32::MAX);
-            let (rows, _) = ops::scroll_view(
+            let (rows, _, plan) = ops::scroll_view_explained(
                 &view,
                 request.filter.as_ref(),
                 &scroll_order,
@@ -649,7 +683,13 @@ pub async fn query(
                     .collect(),
                 diagnostics: match request.explain {
                     ExplainMode::None => None,
-                    explain => Some(scan_diagnostics(&view, &scroll_order, explain, micros)),
+                    explain => Some(scan_diagnostics(
+                        &view,
+                        &scroll_order,
+                        explain,
+                        micros,
+                        plan,
+                    )),
                 },
                 snapshot_token: view.token().map(ToString::to_string),
             }
@@ -771,6 +811,7 @@ fn scan_diagnostics(
     order: &ScrollOrder,
     explain: ExplainMode,
     micros: u64,
+    plan: PlanNode,
 ) -> QueryDiagnostics {
     let order = match order {
         ScrollOrder::Pk => "primary key".to_owned(),
@@ -794,7 +835,66 @@ fn scan_diagnostics(
             candidate_generation_micros: micros,
             ..QueryStageTimings::default()
         }),
+        plan_text: String::new(),
+        plan: Some(Box::new(plan)),
     }
+    .with_rendered_plan(explain)
+}
+
+impl QueryDiagnostics {
+    /// Render the plan into `plan_text`; outside profile mode, drop measured times so the plan
+    /// depends only on the data.
+    fn with_rendered_plan(mut self, explain: ExplainMode) -> Self {
+        let profile = explain == ExplainMode::Profile;
+        if let Some(plan) = &mut self.plan {
+            if !profile {
+                clear_times(plan);
+            }
+            self.plan_text = plan.render(profile);
+        }
+        self
+    }
+}
+
+fn clear_times(node: &mut PlanNode) {
+    node.actual.micros = 0.0;
+    node.estimated.micros = 0.0;
+    for child in &mut node.children {
+        clear_times(child);
+    }
+}
+
+/// Why no unit walked a graph, from the causes of the units' exact scans.
+fn fallback_reason(units: &[search::UnitReport], filtered: bool) -> String {
+    let mut causes = units
+        .iter()
+        .filter_map(|unit| unit.exact_cause)
+        .collect::<Vec<_>>();
+    causes.sort_unstable_by_key(|cause| *cause as u8);
+    causes.dedup();
+    if causes.is_empty() {
+        return "no unit had live rows matching the filter".to_owned();
+    }
+    causes
+        .into_iter()
+        .map(|cause| match cause {
+            ExactCause::Memtable => "memtable rows are scanned exactly",
+            ExactCause::NoGraph => {
+                "a segment has no graph yet (its index build has not run, or it is too small \
+                 for one)"
+            }
+            ExactCause::FitsBudget => "a segment's matching rows fit the candidates it contributes",
+            ExactCause::Cheaper if filtered => {
+                "an exact scan was cheaper than a walk at the filter's selectivity"
+            }
+            ExactCause::Cheaper => "an exact scan was cheaper than a walk for the segment's size",
+            ExactCause::WalkAbandoned => {
+                "a walk reached the exact scan's price and the segment was scanned exactly"
+            }
+            ExactCause::Forced => "exact scans were forced",
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn diagnostics(outcome: &SearchOutcome, filtered: bool, explain: ExplainMode) -> QueryDiagnostics {
@@ -853,15 +953,18 @@ fn diagnostics(outcome: &SearchOutcome, filtered: bool, explain: ExplainMode) ->
         candidates_reranked: outcome.reranked,
         candidates_merged: merged,
         rerank_count: usize::from(outcome.reranked > 0),
-        fallback_reason: (!graph).then(|| "no segment has a graph large enough to walk".to_owned()),
+        fallback_reason: (!graph).then(|| fallback_reason(&outcome.units, filtered)),
         unit_scan_mix: mix,
-        stage_timings: (explain == ExplainMode::Profile).then(|| QueryStageTimings {
-            planning_micros: outcome.micros[0],
-            prefilter_micros: 0,
-            candidate_generation_micros: outcome.micros[1],
-            postfilter_micros: outcome.micros[3],
-            rerank_micros: outcome.micros[2],
-            merge_micros: 0,
+        stage_timings: (explain == ExplainMode::Profile).then_some(QueryStageTimings {
+            planning_micros: outcome.timings.planning,
+            prefilter_micros: outcome.timings.prefilter,
+            candidate_generation_micros: outcome.timings.candidates,
+            postfilter_micros: outcome.timings.project,
+            rerank_micros: outcome.timings.rerank,
+            merge_micros: outcome.timings.merge,
         }),
+        plan: Some(Box::new(outcome.plan.clone())),
+        plan_text: String::new(),
     }
+    .with_rendered_plan(explain)
 }

@@ -3,7 +3,6 @@
 
 #![allow(missing_docs)]
 
-use async_trait as _;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use logpose_catalog as _;
 use logpose_index as _;

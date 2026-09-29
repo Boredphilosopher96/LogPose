@@ -2,7 +2,6 @@
 //! flushing, pinned tokens read exactly their state, filter writes resolve against the
 //! writer's latest state, and damaged index sections are typed corruption.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -424,7 +423,7 @@ async fn corrupted_index_sections_are_typed_index_corruption() {
                 &view,
                 &SearchRequest {
                     tuning: logpose_query::SearchTuning {
-                        exact_max_matches: 0,
+                        force: logpose_query::Force::Walk,
                         ..logpose_query::SearchTuning::default()
                     },
                     ..SearchRequest::new(rng.vector(8), 5)

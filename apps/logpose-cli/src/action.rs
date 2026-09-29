@@ -731,6 +731,7 @@ pub fn query_request_from_action(
         top_k: action.top_k,
         output_fields: action.output_fields.clone(),
         ef: action.ef,
+        rerank_factor: None,
         explain: query_explain_mode_from_action(action),
         read: ReadConsistency {
             snapshot: query_snapshot_from_action(action)?,

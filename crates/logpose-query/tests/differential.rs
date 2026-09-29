@@ -9,12 +9,11 @@
 //! exact metric value of the query against that row; hits best first. Segments without vector
 //! indexes must return the exact top k; indexed ones must keep recall.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    FilterExpr, SearchRequest, SearchTuning, UnitStrategy, count_view, metric_value, search,
+    FilterExpr, Force, SearchRequest, SearchTuning, UnitStrategy, count_view, metric_value, search,
 };
 use logpose_storage::{IndexPolicy, Projection};
 use logpose_types::{
@@ -351,7 +350,14 @@ impl Scenario {
         let filter = (self.rng.below(3) != 0).then(|| random_filter(&mut self.rng));
         let k = 1 + self.rng.below(15) as usize;
         let tuning = SearchTuning {
-            exact_max_matches: [0, 1, 8, 64, 2048][self.rng.below(5) as usize],
+            force: [
+                Force::Walk,
+                Force::Auto,
+                Force::Exact,
+                Force::Admit,
+                Force::Acorn,
+            ][self.rng.below(5) as usize],
+            parallel: self.rng.below(2) == 0,
             rerank_factor: [1, 4][self.rng.below(2) as usize],
             ef_escalation: self.rng.below(2) == 0,
             ..SearchTuning::default()

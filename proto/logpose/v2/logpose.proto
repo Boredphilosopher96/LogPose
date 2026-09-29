@@ -803,6 +803,9 @@ message QueryCollectionRequest {
   // Pin the state the query reads under a snapshot token, returned in the reply, for repeatable
   // reads. Fails with RESOURCE_EXHAUSTED (reason TOO_MANY_SNAPSHOTS) past the pin limits.
   bool pin = 13;
+  // Candidates per result each segment reranks exactly in f32, 1 to 64, with a vector only; 0
+  // uses the default (4).
+  uint32 rerank_factor = 14;
 }
 
 // One result: the record, projected, and its score.
@@ -814,11 +817,11 @@ message QueryHit {
 }
 
 enum QueryPlanKind {
+  reserved 3, 4;
+  reserved "QUERY_PLAN_KIND_VECTOR_FIRST_EXACT", "QUERY_PLAN_KIND_TINY_POPULATION_EXACT_FALLBACK";
   QUERY_PLAN_KIND_UNSPECIFIED = 0;
   QUERY_PLAN_KIND_UNFILTERED_EXACT_SCAN = 1;
   QUERY_PLAN_KIND_PREDICATE_FIRST_EXACT = 2;
-  QUERY_PLAN_KIND_VECTOR_FIRST_EXACT = 3;
-  QUERY_PLAN_KIND_TINY_POPULATION_EXACT_FALLBACK = 4;
   QUERY_PLAN_KIND_VECTOR_FIRST_ANN = 5;
   QUERY_PLAN_KIND_COOPERATIVE_FILTERED_ANN = 6;
   QUERY_PLAN_KIND_HYBRID_EXACT_ANN_MERGE = 7;
@@ -834,6 +837,59 @@ message QueryStageTimings {
   uint64 merge_micros = 6;
 }
 
+// An operator of a query plan (EXPLAIN).
+enum PlanOperator {
+  PLAN_OPERATOR_UNSPECIFIED = 0;
+  // One unit (segment or memtable) and its residency.
+  PLAN_OPERATOR_SEGMENT_SOURCE = 1;
+  // The filter compiled to the unit's bitmap of matching rows.
+  PLAN_OPERATOR_BITMAP_PROBE = 2;
+  // Deleted rows removed from the bitmap.
+  PLAN_OPERATOR_MASK_DELETES = 3;
+  // Every allowed row scored exactly (SQ8 codes or f32).
+  PLAN_OPERATOR_EXACT_SCAN = 4;
+  // A graph walk over the allowed rows (admit-only or ACORN-1 style).
+  PLAN_OPERATOR_GRAPH_SCAN = 5;
+  // The best rows of its input by distance.
+  PLAN_OPERATOR_TOP_K = 6;
+  // Exact f32 scores of approximate candidates.
+  PLAN_OPERATOR_RERANK = 7;
+  // The global heap merge of the units' results.
+  PLAN_OPERATOR_MERGE = 8;
+  // Rows read in a field's or the key's order (a query without a vector).
+  PLAN_OPERATOR_ORDERED_SCAN = 9;
+  // The final rows read and projected.
+  PLAN_OPERATOR_PROJECT = 10;
+}
+
+// Work of one plan operator: estimated by the planner's cost model or counted by execution.
+message PlanOperatorStats {
+  // Rows the operator produces.
+  uint64 rows = 1;
+  // Distance computations (SQ8 or f32).
+  uint64 distances = 2;
+  // Graph adjacency lists read.
+  uint64 hops = 3;
+  // Bytes read from resident sections.
+  uint64 resident_bytes = 4;
+  // Bytes read from disk through the buffer cache.
+  uint64 cold_bytes = 5;
+  // Estimated: the cost model's price. Actual: measured time (profile mode only; 0 otherwise).
+  double micros = 6;
+}
+
+// One operator of a query plan and its inputs.
+message PlanNode {
+  PlanOperator operator = 1;
+  // Its parameters, such as `unit=0000002a` or `acorn ef=64->128`.
+  string detail = 2;
+  // Why the planner chose this operator (per-unit strategies); empty otherwise.
+  string reason = 3;
+  PlanOperatorStats estimated = 4;
+  PlanOperatorStats actual = 5;
+  repeated PlanNode children = 6;
+}
+
 message QueryDiagnostics {
   QueryPlanKind chosen_plan = 1;
   string planner_reason = 2;
@@ -846,9 +902,15 @@ message QueryDiagnostics {
   uint64 candidates_reranked = 9;
   uint64 candidates_merged = 10;
   uint64 rerank_count = 11;
+  // Why no segment walked a graph (unset when one did): each cause of the units' exact scans,
+  // such as a segment without a graph yet or an exact scan priced below a walk.
   optional string fallback_reason = 12;
   map<string, uint64> unit_scan_mix = 13;
   QueryStageTimings stage_timings = 14;
+  // The plan as an operator tree with estimated and actual work per operator.
+  PlanNode plan = 15;
+  // The plan rendered as text, one operator per line.
+  string plan_text = 16;
 }
 
 message QueryCollectionReply {

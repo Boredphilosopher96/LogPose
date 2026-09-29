@@ -214,6 +214,22 @@ impl<S> SegmentReader<S> {
             .as_ref()
             .is_some_and(|link| link.cache.residency(&unit.key(link.file)))
     }
+
+    /// The bytes of `unit` if they are resident in the attached cache, counted as a hit;
+    /// never loads (see [`BufferCache::get_resident`](crate::cache::BufferCache::get_resident)).
+    #[must_use]
+    pub fn resident(&self, unit: &SegmentUnit) -> Option<Arc<AlignedBytes>> {
+        let link = self.cache.as_ref()?;
+        link.cache.get_resident(&unit.key(link.file))
+    }
+
+    /// Charge the decoded form attached to `unit`'s cached bytes on first use (see
+    /// [`BufferCache::charge_decoded`](crate::cache::BufferCache::charge_decoded)).
+    pub fn charge_decoded(&self, unit: &SegmentUnit) {
+        if let Some(link) = &self.cache {
+            link.cache.charge_decoded(&unit.key(link.file));
+        }
+    }
 }
 
 impl<S: SectionSource> SegmentReader<S> {
@@ -437,6 +453,41 @@ impl<S: SectionSource> SegmentReader<S> {
         self.load_via(&unit, via).map(|(bytes, _)| bytes)
     }
 
+    /// The decoded form of `unit`'s cached bytes, decoding and attaching it on first use
+    /// ([`AlignedBytes::decoded`]); a form this call attached is charged to the cache once
+    /// ([`charge_decoded`](Self::charge_decoded)), as the read path's are.
+    fn unit_decoded<T>(
+        &self,
+        unit: &SegmentUnit,
+        decode: impl FnOnce(&[u8]) -> Result<(T, u64), SegmentError>,
+    ) -> Result<Arc<T>, SegmentError>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        let (bytes, _) = self.load_via(unit, Via::Cache)?;
+        let fresh = !bytes.has_decoded();
+        let value = bytes.decoded(decode)?;
+        if fresh {
+            self.charge_decoded(unit);
+        }
+        Ok(value)
+    }
+
+    /// [`unit_decoded`](Self::unit_decoded) of section `index`.
+    fn section_decoded<T>(
+        &self,
+        index: usize,
+        decode: impl FnOnce(&[u8]) -> Result<(T, u64), SegmentError>,
+    ) -> Result<Arc<T>, SegmentError>
+    where
+        T: std::any::Any + Send + Sync,
+    {
+        let unit = self
+            .section_unit(index)
+            .ok_or_else(|| SegmentError::out_of_range(format!("section {index}")))?;
+        self.unit_decoded(&unit, decode)
+    }
+
     fn entry(&self, index: usize) -> Result<SectionEntry, SegmentError> {
         self.sections
             .get(index)
@@ -529,7 +580,7 @@ impl<S: SectionSource> SegmentReader<S> {
     pub fn row_meta_shared(&self) -> Result<Arc<Vec<SeqNo>>, SegmentError> {
         let (index, entry) = self.required(SectionKind::RowMeta)?;
         let region = section_region(index, &entry);
-        self.section_via(index, Via::Cache)?.decoded(|raw| {
+        self.section_decoded(index, |raw| {
             self.decode_row_meta(raw, &entry)
                 .map(|seqs| (seqs, raw.len() as u64))
                 .map_err(|error| error.at(region))
@@ -593,7 +644,7 @@ impl<S: SectionSource> SegmentReader<S> {
         let region = section_region(index, &entry);
         self.check_pk_encoding(&entry, region)?;
         let rows = usize_from(self.header.row_count);
-        self.section_via(index, Via::Cache)?.decoded(|raw| {
+        self.section_decoded(index, |raw| {
             PkColumn::decode(raw, entry.encoding, rows)
                 .map(|column| (column, raw.len() as u64))
                 .map_err(|error| error.at(region))
@@ -722,12 +773,13 @@ impl<S: SectionSource> SegmentReader<S> {
             return Ok(None);
         };
         let entry = self.entry(index)?;
-        self.section_via(index, Via::Cache)?
-            .decoded(|raw| {
-                self.decode_scalar(index, &entry, raw)
-                    .map(|column| (column, raw.len() as u64 * 2))
+        self.section_decoded(index, |raw| {
+            self.decode_scalar(index, &entry, raw).map(|column| {
+                let heap = column.heap_bytes();
+                (column, heap)
             })
-            .map(Some)
+        })
+        .map(Some)
     }
 
     fn scalar_column_via(
@@ -935,13 +987,11 @@ impl<S: SectionSource> SegmentReader<S> {
         let Some(unit) = self.dynamic_index_unit() else {
             return Ok(None);
         };
-        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
-        bytes
-            .decoded(|raw| {
-                self.dynamic_handle(&unit, raw)
-                    .map(|handle| (handle, raw.len() as u64))
-            })
-            .map(Some)
+        self.unit_decoded(&unit, |raw| {
+            self.dynamic_handle(&unit, raw)
+                .map(|handle| (handle, raw.len() as u64))
+        })
+        .map(Some)
     }
 
     /// Block `block` of the dynamic section, decoded once per cache load.
@@ -958,10 +1008,12 @@ impl<S: SectionSource> SegmentReader<S> {
             .block_unit(block)
             .zip(handle.blocks.block_rows(block))
             .ok_or_else(|| SegmentError::out_of_range(format!("{region}")))?;
-        let (bytes, _) = self.load_via(&unit, Via::Cache)?;
-        bytes.decoded(|raw| {
+        self.unit_decoded(&unit, |raw| {
             DynamicBlock::decode(raw, rows)
-                .map(|block| (block, raw.len() as u64))
+                .map(|block| {
+                    let heap = block.heap_bytes();
+                    (block, heap)
+                })
                 .map_err(|error| error.at(region))
         })
     }

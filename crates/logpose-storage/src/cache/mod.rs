@@ -45,14 +45,14 @@ mod tests;
 
 pub use bytes::AlignedBytes;
 pub use flight::{Fetch, InlineExecutor, LoadExecutor, LoadJob, Loader};
-pub use key::{ArtifactClass, CacheKey, CacheUnit, DEFAULT_FLOORS, FileId};
+pub use key::{ArtifactClass, CacheKey, CacheUnit, DEFAULT_FLOORS, FileId, KeyHasher, KeyMap};
 pub use report::{CacheStats, ClassFetch, FetchReport, Fetched, PinSet};
 pub use warm::{WARM_UP_FILL, WARM_UP_IN_FLIGHT, WarmUpItem, WarmUpReport};
 
 use crate::segment_v2::SegmentError;
 use flight::{Flight, FlightResult, Loaded};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -179,15 +179,20 @@ pub(crate) struct Inner {
 
 #[derive(Default)]
 struct Shard {
-    entries: HashMap<CacheKey, Arc<Entry>>,
-    loading: HashMap<CacheKey, Arc<Flight>>,
+    entries: KeyMap<Arc<Entry>>,
+    loading: KeyMap<Arc<Flight>>,
 }
 
 struct Entry {
     key: CacheKey,
     class: ArtifactClass,
     bytes: Arc<AlignedBytes>,
-    charge: u64,
+    /// Bytes charged to the class: the buffer, [`ENTRY_OVERHEAD`], and the decoded form once
+    /// it is charged.
+    charge: AtomicU64,
+    /// Whether the decoded form's heap bytes are part of `charge`: set at insert when a loader
+    /// attached one, and by [`BufferCache::charge_decoded`] for one attached on first use.
+    decoded_charged: AtomicBool,
     referenced: AtomicBool,
 }
 
@@ -287,6 +292,43 @@ impl BufferCache {
     #[must_use]
     pub fn residency(&self, key: &CacheKey) -> bool {
         lock(self.inner.shard(key)).entries.contains_key(key)
+    }
+
+    /// The bytes of `key` if it is resident, as a hit, without loading anything: for compute
+    /// stages, which must not do I/O, to pin units that are already in memory. A unit that is
+    /// not resident (or still loading) is `None` and counts nothing; the caller fetches it.
+    #[must_use]
+    pub fn get_resident(&self, key: &CacheKey) -> Option<Arc<AlignedBytes>> {
+        let shard = lock(self.inner.shard(key));
+        let entry = shard.entries.get(key)?;
+        entry.referenced.store(true, Ordering::Relaxed);
+        let bytes = Arc::clone(&entry.bytes);
+        drop(shard);
+        self.inner.counters.hits.fetch_add(1, Ordering::Relaxed);
+        Some(bytes)
+    }
+
+    /// Charge the decoded form attached to `key`'s bytes after they were cached (a scalar
+    /// column, a dynamic block, or a vector prefix decodes on first use) to its class, once, and
+    /// evict if that took the cache over budget. Nothing happens for a key that is not resident,
+    /// whose decoded form is already charged, or whose bytes carry none.
+    pub fn charge_decoded(&self, key: &CacheKey) {
+        let mut charged = false;
+        {
+            let shard = lock(self.inner.shard(key));
+            if let Some(entry) = shard.entries.get(key) {
+                let extra = entry.bytes.decoded_heap_bytes();
+                if entry.bytes.has_decoded() && !entry.decoded_charged.swap(true, Ordering::Relaxed)
+                {
+                    entry.charge.fetch_add(extra, Ordering::Relaxed);
+                    self.inner.used[entry.class.index()].fetch_add(extra, Ordering::Relaxed);
+                    charged = extra > 0;
+                }
+            }
+        }
+        if charged {
+            self.inner.evict_after_insert();
+        }
     }
 
     /// Counters and usage.
@@ -414,7 +456,8 @@ impl BufferCache {
             shard.loading.retain(|key, _| key.file != file);
             shard.entries.retain(|key, entry| {
                 if key.file == file {
-                    inner.used[entry.class.index()].fetch_sub(entry.charge, Ordering::Relaxed);
+                    inner.used[entry.class.index()]
+                        .fetch_sub(entry.charge.load(Ordering::Relaxed), Ordering::Relaxed);
                     removed += 1;
                     false
                 } else {
@@ -465,9 +508,11 @@ impl fmt::Debug for BufferCache {
 
 impl Inner {
     fn shard(&self, key: &CacheKey) -> &Mutex<Shard> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = KeyHasher::default();
         key.hash(&mut hasher);
-        let index = usize::try_from(hasher.finish() % SHARDS as u64).unwrap_or(0);
+        // The multiply leaves the best-mixed bits at the top.
+        let index = usize::try_from(hasher.finish() >> (64 - SHARDS.trailing_zeros())).unwrap_or(0)
+            % SHARDS;
         &self.shards[index]
     }
 
@@ -542,16 +587,20 @@ impl Inner {
             if current {
                 shard.loading.remove(&flight.key);
                 if let Ok(loaded) = &outcome {
+                    let decoded = loaded.bytes.decoded_heap_bytes();
+                    let charge = charge_for(loaded.bytes.len()) + decoded;
                     let entry = Arc::new(Entry {
                         key: flight.key,
                         class: flight.class,
                         bytes: Arc::clone(&loaded.bytes),
-                        charge: charge_for(loaded.bytes.len()) + loaded.bytes.decoded_heap_bytes(),
+                        charge: AtomicU64::new(charge),
+                        decoded_charged: AtomicBool::new(loaded.bytes.has_decoded()),
                         referenced: AtomicBool::new(false),
                     });
-                    self.used[entry.class.index()].fetch_add(entry.charge, Ordering::Relaxed);
+                    self.used[entry.class.index()].fetch_add(charge, Ordering::Relaxed);
                     if let Some(old) = shard.entries.insert(flight.key, Arc::clone(&entry)) {
-                        self.used[old.class.index()].fetch_sub(old.charge, Ordering::Relaxed);
+                        self.used[old.class.index()]
+                            .fetch_sub(old.charge.load(Ordering::Relaxed), Ordering::Relaxed);
                     }
                     inserted = Some(entry);
                 }
@@ -689,12 +738,13 @@ impl Inner {
                 continue;
             }
             shard.entries.remove(&entry.key);
-            self.used[class.index()].fetch_sub(entry.charge, Ordering::Relaxed);
+            let charge = entry.charge.load(Ordering::Relaxed);
+            self.used[class.index()].fetch_sub(charge, Ordering::Relaxed);
             drop(shard);
             self.counters.evictions.fetch_add(1, Ordering::Relaxed);
             self.counters
                 .evicted_bytes
-                .fetch_add(entry.charge, Ordering::Relaxed);
+                .fetch_add(charge, Ordering::Relaxed);
             return true;
         }
     }

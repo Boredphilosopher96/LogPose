@@ -13,7 +13,6 @@
 //! `json` field is a declared field: `exists` when it has a value, `is_null` when it has none.
 //! A dynamic key is present or absent: `exists` when present, `is_null` when present and null.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;

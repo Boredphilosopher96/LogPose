@@ -28,7 +28,7 @@ use crate::{
     engine::{CoreRef, Engine, EngineCore},
     handle::CollectionHandle,
     memtable::{IndexFlavor, MemScalarIndex, MemtableData, index_keys},
-    segment::{SegmentHandle, index_error, segment_error},
+    segment::{OpenFile, SegmentHandle, index_error, segment_error},
     segment_v2::{
         DecodedScalarIndex, DynamicBlock, DynamicHandle, PkColumn, PkFilter, PkSorted,
         ScalarColumn, SectionKind, SegmentGraph, SegmentUnit, VectorHandle,
@@ -385,52 +385,7 @@ impl ReadView {
             let Some(segment) = segments.get(unit) else {
                 continue;
             };
-            let reader = segment.reader();
-            let mut section = |kind: SectionKind, field: Option<FieldId>, decoded: bool| {
-                let Some(file) = segment.section_file(kind, field) else {
-                    return;
-                };
-                let source = file.reader();
-                if let Some(unit) = source
-                    .find_section(kind, field)
-                    .and_then(|index| source.section_unit(index))
-                {
-                    first.push(Load {
-                        segment: Arc::clone(segment),
-                        unit,
-                        decoded,
-                        sidecar: kind == SectionKind::VectorGraph,
-                    });
-                }
-            };
-            match need {
-                SectionNeed::Pk => {
-                    section(SectionKind::PkColumn, None, true);
-                    section(SectionKind::PkSorted, None, true);
-                    section(SectionKind::PkFilter, None, true);
-                }
-                SectionNeed::ScalarIndex(field) => {
-                    section(SectionKind::ScalarInverted, Some(*field), true);
-                    section(SectionKind::ScalarSorted, Some(*field), true);
-                }
-                SectionNeed::Column(field) => {
-                    section(SectionKind::ScalarColumn, Some(*field), false)
-                }
-                SectionNeed::VectorIndex(field) => {
-                    section(SectionKind::VectorSq8, Some(*field), true);
-                    section(SectionKind::VectorGraph, Some(*field), true);
-                }
-                SectionNeed::DynamicBlocks(_) => {
-                    if let Some(unit) = reader.dynamic_index_unit() {
-                        first.push(Load::data(segment, unit));
-                    }
-                }
-                SectionNeed::VectorRows(field, _) => {
-                    if let Some(unit) = reader.vector_prefix_unit(*field) {
-                        first.push(Load::data(segment, unit));
-                    }
-                }
-            }
+            first.extend(stage_one_units(segment, need));
         }
         load_units(&core, first, &mut pins, &mut report).await?;
 
@@ -440,49 +395,43 @@ impl ReadView {
             let Some(segment) = segments.get(unit) else {
                 continue;
             };
-            let view = UnitView {
-                kind: UnitKind::Segment(segment),
-                deleted: None,
-            };
-            match need {
-                SectionNeed::VectorRows(field, rows) => {
-                    let Some(handle) = view.vector_handle(*field, &pins)? else {
-                        continue;
-                    };
-                    let page_rows = handle.prefix().page_rows().max(1);
-                    let mut last = None;
-                    for row in rows {
-                        let page = row / page_rows;
-                        if last == Some(page) {
-                            continue;
-                        }
-                        last = Some(page);
-                        if let Some(unit) = handle.page_unit(page) {
-                            second.push(Load::data(segment, unit));
-                        }
-                    }
-                }
-                SectionNeed::DynamicBlocks(rows) => {
-                    let Some(handle) = view.dynamic_handle(&pins)? else {
-                        continue;
-                    };
-                    let mut last = None;
-                    for row in rows {
-                        let block = row / crate::segment_v2::DYNAMIC_BLOCK_ROWS;
-                        if last == Some(block) {
-                            continue;
-                        }
-                        last = Some(block);
-                        if let Some(unit) = handle.block_unit(block) {
-                            second.push(Load::data(segment, unit));
-                        }
-                    }
-                }
-                _ => {}
-            }
+            second.extend(stage_two_units(segment, need, &pins)?);
         }
         load_units(&core, second, &mut pins, &mut report).await?;
         Ok((pins, report))
+    }
+
+    /// Pin what `plan` needs from what the buffer cache already holds, without any I/O, and
+    /// return the needs it could not pin completely: a compute stage (which must never do I/O)
+    /// calls this to go on without handing control back when its next inputs are resident, and
+    /// hands the returned needs to [`fetch`](Self::fetch) otherwise. Pins of resident units
+    /// count as hits in the report. Memtable needs are always satisfied.
+    ///
+    /// # Errors
+    ///
+    /// Typed corruption of a pinned vector prefix or dynamic block index.
+    pub fn fetch_resident(&self, plan: &FetchPlan) -> Result<(PinSet, FetchReport, FetchPlan)> {
+        let mut pins = PinSet::new();
+        let mut report = FetchReport::default();
+        let mut missing = FetchPlan::default();
+        if plan.is_empty() {
+            return Ok((pins, report, missing));
+        }
+        let segments = self.segments_by_unit();
+        for (unit, need) in &plan.needs {
+            let Some(segment) = segments.get(unit) else {
+                continue;
+            };
+            let mut complete = pin_resident(stage_one_units(segment, need), &mut pins, &mut report);
+            if complete {
+                let second = stage_two_units(segment, need, &pins)?;
+                complete = pin_resident(second, &mut pins, &mut report);
+            }
+            if !complete {
+                missing.push(*unit, need.clone());
+            }
+        }
+        Ok((pins, report, missing))
     }
 
     fn segments_by_unit(&self) -> HashMap<UnitId, &Arc<SegmentHandle>> {
@@ -591,6 +540,104 @@ impl ReadView {
             .collect()
     }
 
+    /// The sections [`project`](Self::project) reads for the rows at `addrs`: per segment,
+    /// its keys, every scalar column, the dynamic blocks of the rows, and (with
+    /// `projection.vectors`) their vector pages. `None` when the projection needs what no fetch
+    /// pins (sequence numbers, which segment row metadata holds around the cache); read those
+    /// rows with [`rows`](Self::rows).
+    #[must_use]
+    pub fn projection_needs(&self, addrs: &[RowAddr], projection: Projection) -> Option<FetchPlan> {
+        let segments = self.segments_by_unit();
+        let mut rows_by_unit: BTreeMap<UnitId, RoaringBitmap> = BTreeMap::new();
+        for addr in addrs {
+            if segments.contains_key(&addr.unit) {
+                rows_by_unit.entry(addr.unit).or_default().insert(addr.row);
+            }
+        }
+        if projection.seq_no && !rows_by_unit.is_empty() {
+            return None;
+        }
+        let mut plan = FetchPlan::default();
+        for (unit, rows) in rows_by_unit {
+            let Some(segment) = segments.get(&unit) else {
+                continue;
+            };
+            let schema = segment.reader().schema();
+            plan.push(unit, SectionNeed::Pk);
+            for field in schema.fields() {
+                plan.push(unit, SectionNeed::Column(field.id));
+            }
+            if projection.vectors {
+                for field in schema.vectors() {
+                    plan.push(unit, SectionNeed::VectorRows(field.id, rows.clone()));
+                }
+            }
+            plan.push(unit, SectionNeed::DynamicBlocks(rows));
+        }
+        Some(plan)
+    }
+
+    /// Build the rows at `addrs` from `pins` (which hold [`projection_needs`](Self::projection_needs)
+    /// of the same rows) without I/O, in the order given: the synchronous form of
+    /// [`rows`](Self::rows) for a compute stage whose rows are resident.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` for an address outside the view or a section not in `pins`, or typed
+    /// corruption.
+    pub fn project(
+        &self,
+        addrs: &[RowAddr],
+        projection: Projection,
+        pins: &PinSet,
+    ) -> Result<Vec<RowData>> {
+        let schema = Arc::clone(self.schema());
+        let units = self
+            .units()
+            .into_iter()
+            .map(|unit| (unit.id(), unit))
+            .collect::<HashMap<_, _>>();
+        let mut out = Vec::with_capacity(addrs.len());
+        // Each segment's accessors are resolved once, not once per row.
+        let mut readers: HashMap<UnitId, SegmentRows<'_>> = HashMap::new();
+        for addr in addrs {
+            let unit = units.get(&addr.unit).ok_or_else(|| {
+                LogPoseError::internal(format!("unit {} is not in the read view", addr.unit))
+            })?;
+            let image = match unit.kind {
+                UnitKind::Memtable(memtable) => {
+                    let mut image = memtable
+                        .row_image(addr.row)
+                        .map_err(LogPoseError::internal)?;
+                    if !projection.vectors {
+                        image.vectors.clear();
+                    }
+                    out.push(RowData {
+                        addr: *addr,
+                        seq_no: memtable.seq_no(addr.row).unwrap_or_default(),
+                        record: to_record(&schema, &image)?,
+                    });
+                    continue;
+                }
+                UnitKind::Segment(segment) => {
+                    let rows = match readers.entry(addr.unit) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(unit.segment_rows(segment, projection, pins)?)
+                        }
+                    };
+                    rows.image(addr.row)?
+                }
+            };
+            out.push(RowData {
+                addr: *addr,
+                seq_no: 0,
+                record: to_record(&schema, &image)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// The live row of each key, or `None`: each key is looked up newest unit first
     /// (memtables by their key map, segments by key filter then key order), and the first
     /// live hit wins. By I5 at most one unit holds a live row of a key.
@@ -676,36 +723,40 @@ impl ReadView {
         else {
             return Residency::Resident;
         };
-        let kinds: Vec<(SectionKind, Option<FieldId>)> = match need {
-            SectionNeed::Pk => vec![
-                (SectionKind::PkColumn, None),
-                (SectionKind::PkSorted, None),
-                (SectionKind::PkFilter, None),
-            ],
-            SectionNeed::ScalarIndex(field) => vec![
-                (SectionKind::ScalarInverted, Some(*field)),
-                (SectionKind::ScalarSorted, Some(*field)),
-            ],
-            SectionNeed::Column(field) => vec![(SectionKind::ScalarColumn, Some(*field))],
-            SectionNeed::VectorIndex(field) => vec![
-                (SectionKind::VectorSq8, Some(*field)),
-                (SectionKind::VectorGraph, Some(*field)),
-            ],
-            SectionNeed::DynamicBlocks(_) => vec![(SectionKind::DynamicJson, None)],
-            SectionNeed::VectorRows(field, _) => vec![(SectionKind::VectorF32, Some(*field))],
-        };
+        // The units a fetch of the need would load: whole sections, directories, and (when
+        // their directory is resident, so they can be located without I/O) pages and blocks.
+        // A directory that is itself cold stands for its whole section.
         let mut cold = 0;
-        for (kind, field) in kinds {
-            let Some(file) = segment.section_file(kind, field) else {
+        let mut pins = PinSet::new();
+        let mut directory_cold = false;
+        for load in stage_one_units(segment, need) {
+            let Some(reader) = load.file().map(OpenFile::reader) else {
                 continue;
             };
-            let reader = file.reader();
-            if let Some(unit) = reader
-                .find_section(kind, field)
-                .and_then(|index| reader.section_unit(index))
-                && !reader.residency(&unit)
-            {
-                cold += unit.len_hint().unwrap_or(0);
+            match reader.resident(&load.unit) {
+                Some(bytes) => {
+                    if let Some(key) = reader.unit_key(&load.unit) {
+                        pins.insert(key, bytes);
+                    }
+                }
+                None => {
+                    directory_cold = true;
+                    cold += load.unit.len_hint().unwrap_or_else(|| {
+                        reader
+                            .sections()
+                            .get(load.unit.section_index())
+                            .map_or(0, |entry| entry.length)
+                    });
+                }
+            }
+        }
+        if !directory_cold && let Ok(loads) = stage_two_units(segment, need, &pins) {
+            for load in loads {
+                if let Some(reader) = load.file().map(OpenFile::reader)
+                    && !reader.residency(&load.unit)
+                {
+                    cold += load.unit.len_hint().unwrap_or(0);
+                }
             }
         }
         if cold == 0 {
@@ -736,6 +787,145 @@ impl Load {
             sidecar: false,
         }
     }
+
+    /// The file holding the unit; `None` for a sidecar unit of a segment without one.
+    fn file(&self) -> Option<&OpenFile> {
+        if self.sidecar {
+            self.segment.index_file()
+        } else {
+            Some(self.segment.data_file())
+        }
+    }
+}
+
+/// The units a fetch of `need` loads first: whole sections (from the segment file, or vector
+/// graphs from its index sidecar), vector prefixes, and dynamic block indexes.
+fn stage_one_units(segment: &Arc<SegmentHandle>, need: &SectionNeed) -> Vec<Load> {
+    let reader = segment.reader();
+    let mut units = Vec::new();
+    let mut section = |kind: SectionKind, field: Option<FieldId>, decoded: bool| {
+        let Some(file) = segment.section_file(kind, field) else {
+            return;
+        };
+        let source = file.reader();
+        if let Some(unit) = source
+            .find_section(kind, field)
+            .and_then(|index| source.section_unit(index))
+        {
+            units.push(Load {
+                segment: Arc::clone(segment),
+                unit,
+                decoded,
+                sidecar: kind == SectionKind::VectorGraph,
+            });
+        }
+    };
+    match need {
+        SectionNeed::Pk => {
+            section(SectionKind::PkColumn, None, true);
+            section(SectionKind::PkSorted, None, true);
+            section(SectionKind::PkFilter, None, true);
+        }
+        SectionNeed::ScalarIndex(field) => {
+            section(SectionKind::ScalarInverted, Some(*field), true);
+            section(SectionKind::ScalarSorted, Some(*field), true);
+        }
+        SectionNeed::Column(field) => section(SectionKind::ScalarColumn, Some(*field), false),
+        SectionNeed::VectorIndex(field) => {
+            section(SectionKind::VectorSq8, Some(*field), true);
+            section(SectionKind::VectorGraph, Some(*field), true);
+        }
+        SectionNeed::DynamicBlocks(_) => {
+            if let Some(unit) = reader.dynamic_index_unit() {
+                units.push(Load::data(segment, unit));
+            }
+        }
+        SectionNeed::VectorRows(field, _) => {
+            if let Some(unit) = reader.vector_prefix_unit(*field) {
+                units.push(Load::data(segment, unit));
+            }
+        }
+    }
+    units
+}
+
+/// The units a fetch of `need` loads second, located through the stage-one units in `pins`:
+/// the vector pages and dynamic blocks holding the need's rows (all in the segment file).
+fn stage_two_units(
+    segment: &Arc<SegmentHandle>,
+    need: &SectionNeed,
+    pins: &PinSet,
+) -> Result<Vec<Load>> {
+    let view = UnitView {
+        kind: UnitKind::Segment(segment),
+        deleted: None,
+    };
+    let mut units = Vec::new();
+    match need {
+        SectionNeed::VectorRows(field, rows) => {
+            if let Some(handle) = view.vector_handle(*field, pins)? {
+                let page_rows = handle.prefix().page_rows().max(1);
+                let mut last = None;
+                for row in rows {
+                    let page = row / page_rows;
+                    if last == Some(page) {
+                        continue;
+                    }
+                    last = Some(page);
+                    if let Some(unit) = handle.page_unit(page) {
+                        units.push(Load::data(segment, unit));
+                    }
+                }
+            }
+        }
+        SectionNeed::DynamicBlocks(rows) => {
+            if let Some(handle) = view.dynamic_handle(pins)? {
+                let mut last = None;
+                for row in rows {
+                    let block = row / crate::segment_v2::DYNAMIC_BLOCK_ROWS;
+                    if last == Some(block) {
+                        continue;
+                    }
+                    last = Some(block);
+                    if let Some(unit) = handle.block_unit(block) {
+                        units.push(Load::data(segment, unit));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(units)
+}
+
+/// Pin the resident ones of `units`; `false` when any is not resident.
+fn pin_resident(
+    units: impl IntoIterator<Item = Load>,
+    pins: &mut PinSet,
+    report: &mut FetchReport,
+) -> bool {
+    let mut complete = true;
+    for load in units {
+        let Some(reader) = load.file().map(OpenFile::reader) else {
+            complete = false;
+            continue;
+        };
+        let Some(key) = reader.unit_key(&load.unit) else {
+            complete = false;
+            continue;
+        };
+        if pins.contains(&key) {
+            continue;
+        }
+        match reader.resident(&load.unit) {
+            Some(bytes) => {
+                report.record(load.unit.class(), Fetched::Hit);
+                pins.insert(key, bytes);
+            }
+            None => complete = false,
+        }
+    }
+    complete
 }
 
 /// Load `units` concurrently on the I/O pool (the cache dispatches every miss before the first
@@ -1148,14 +1338,33 @@ impl<'v> UnitView<'v> {
             return Ok(ColumnRef(ColumnInner::Missing));
         };
         let reader = segment.reader();
+        let fresh = !bytes.has_decoded();
         let column = bytes
             .decoded(|raw| {
-                reader
-                    .decode_scalar_column(field, raw)
-                    .map(|column| (column, raw.len() as u64 * 2))
+                reader.decode_scalar_column(field, raw).map(|column| {
+                    let heap = column.heap_bytes();
+                    (column, heap)
+                })
             })
             .map_err(|error| segment_error(segment.path(), error))?;
+        if fresh {
+            self.charge_section(SectionKind::ScalarColumn, Some(field));
+        }
         Ok(ColumnRef(ColumnInner::Segment(column)))
+    }
+
+    /// Charge the decoded form of a whole section to the cache after it was attached on
+    /// first use.
+    fn charge_section(&self, kind: SectionKind, field: Option<FieldId>) {
+        if let UnitKind::Segment(segment) = self.kind {
+            let reader = segment.reader();
+            if let Some(unit) = reader
+                .find_section(kind, field)
+                .and_then(|index| reader.section_unit(index))
+            {
+                reader.charge_decoded(&unit);
+            }
+        }
     }
 
     fn dynamic_handle(&self, pins: &PinSet) -> Result<Option<Arc<DynamicHandle>>> {
@@ -1167,59 +1376,39 @@ impl<'v> UnitView<'v> {
             return Ok(None);
         };
         let bytes = self.pinned_key(reader.unit_key(&unit), pins, "the dynamic block index")?;
-        bytes
+        let fresh = !bytes.has_decoded();
+        let handle = bytes
             .decoded(|raw| {
                 reader
                     .dynamic_handle(&unit, raw)
                     .map(|handle| (handle, raw.len() as u64))
             })
-            .map(Some)
-            .map_err(|error| segment_error(segment.path(), error))
+            .map_err(|error| segment_error(segment.path(), error))?;
+        if fresh {
+            reader.charge_decoded(&unit);
+        }
+        Ok(Some(handle))
     }
 
     /// `$extra` of the unit's rows. Segment rows read only blocks fetched with
-    /// [`SectionNeed::DynamicBlocks`].
+    /// [`SectionNeed::DynamicBlocks`]; each block is looked up (and decoded, once per cache
+    /// load) only when a row of it is read.
     ///
     /// # Errors
     ///
     /// `Internal` if the block index was not fetched, or typed corruption.
-    pub fn dynamic(&self, pins: &PinSet) -> Result<DynamicRef<'v>> {
+    pub fn dynamic<'p>(&self, pins: &'p PinSet) -> Result<DynamicRef<'p>>
+    where
+        'v: 'p,
+    {
         match self.kind {
             UnitKind::Memtable(memtable) => Ok(DynamicRef(DynamicInner::Memtable(memtable))),
             UnitKind::Segment(segment) => match self.dynamic_handle(pins)? {
-                Some(handle) => {
-                    let mut blocks = HashMap::new();
-                    for block in 0..handle.blocks().block_count() {
-                        let Some(unit) = handle.block_unit(block) else {
-                            continue;
-                        };
-                        let Some(key) = segment.reader().unit_key(&unit) else {
-                            continue;
-                        };
-                        let Some(bytes) = pins.get(&key) else {
-                            continue;
-                        };
-                        let Some(rows) = handle.blocks().block_rows(block) else {
-                            continue;
-                        };
-                        let region = crate::segment_v2::Region::DynamicBlock {
-                            index: handle.section_index(),
-                            block,
-                        };
-                        let decoded = bytes
-                            .decoded(|raw| {
-                                DynamicBlock::decode(raw, rows)
-                                    .map(|block| (block, raw.len() as u64))
-                                    .map_err(|error| error.at(region))
-                            })
-                            .map_err(|error| segment_error(segment.path(), error))?;
-                        blocks.insert(block, decoded);
-                    }
-                    Ok(DynamicRef(DynamicInner::Segment {
-                        unit: segment.unit,
-                        blocks,
-                    }))
-                }
+                Some(handle) => Ok(DynamicRef(DynamicInner::Segment {
+                    segment,
+                    handle,
+                    pins,
+                })),
                 None => Ok(DynamicRef(DynamicInner::Empty)),
             },
         }
@@ -1289,6 +1478,48 @@ impl<'v> UnitView<'v> {
             None => None,
         };
         Ok(VectorIndexRef { graph, sq8 })
+    }
+
+    /// The accessors [`ReadView::project`] reads a segment's rows through, from `pins`.
+    fn segment_rows<'p>(
+        &self,
+        segment: &'v SegmentHandle,
+        projection: Projection,
+        pins: &'p PinSet,
+    ) -> Result<SegmentRows<'p>>
+    where
+        'v: 'p,
+    {
+        let schema = segment.reader().schema();
+        let mut vectors = Vec::new();
+        if projection.vectors {
+            let mut fields = schema
+                .vectors()
+                .iter()
+                .map(|field| field.id)
+                .collect::<Vec<_>>();
+            fields.sort_unstable();
+            for field in fields {
+                vectors.push((field, self.vector_rows(field, pins)?));
+            }
+        }
+        let mut fields = schema
+            .fields()
+            .iter()
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        let mut columns = Vec::with_capacity(fields.len());
+        for field in fields {
+            columns.push((field, self.column(field, pins)?));
+        }
+        Ok(SegmentRows {
+            unit: segment.unit,
+            pks: self.pks(pins)?,
+            columns,
+            vectors,
+            dynamic: self.dynamic(pins)?,
+        })
     }
 
     fn vector_handle(&self, field: FieldId, pins: &PinSet) -> Result<Option<Arc<VectorHandle>>> {
@@ -1539,23 +1770,68 @@ impl ColumnRef<'_> {
 }
 
 /// `$extra` of one unit.
-pub struct DynamicRef<'v>(DynamicInner<'v>);
+pub struct DynamicRef<'p>(DynamicInner<'p>);
 
-enum DynamicInner<'v> {
+enum DynamicInner<'p> {
     /// A memtable's objects.
-    Memtable(&'v MemtableData),
-    /// A segment's decoded blocks (only fetched ones).
+    Memtable(&'p MemtableData),
+    /// A segment's blocks, looked up in the pins per row.
     Segment {
-        /// The unit.
-        unit: UnitId,
-        /// Decoded blocks by block number.
-        blocks: HashMap<u32, Arc<DynamicBlock>>,
+        /// The segment.
+        segment: &'p SegmentHandle,
+        /// The decoded block index.
+        handle: Arc<DynamicHandle>,
+        /// The pins holding the fetched blocks.
+        pins: &'p PinSet,
     },
     /// No row of the unit has dynamic keys.
     Empty,
 }
 
-impl DynamicRef<'_> {
+impl<'p> DynamicRef<'p> {
+    /// The decoded block holding `row` of a segment.
+    fn block(
+        segment: &'p SegmentHandle,
+        handle: &DynamicHandle,
+        pins: &'p PinSet,
+        row: RowId,
+    ) -> Result<&'p DynamicBlock> {
+        let block = row / crate::segment_v2::DYNAMIC_BLOCK_ROWS;
+        let reader = segment.reader();
+        let unit = handle
+            .block_unit(block)
+            .ok_or_else(|| LogPoseError::internal(format!("row {row} has no dynamic block")))?;
+        let bytes = reader
+            .unit_key(&unit)
+            .and_then(|key| pins.get(&key))
+            .ok_or_else(|| not_fetched(segment.unit, "a dynamic block"))?;
+        let rows = handle
+            .blocks()
+            .block_rows(block)
+            .ok_or_else(|| LogPoseError::internal(format!("row {row} has no dynamic block")))?;
+        let region = crate::segment_v2::Region::DynamicBlock {
+            index: handle.section_index(),
+            block,
+        };
+        let (decoded, fresh) = bytes
+            .decoded_ref(|raw| {
+                DynamicBlock::decode(raw, rows)
+                    .map(|block| {
+                        let heap = block.heap_bytes();
+                        (block, heap)
+                    })
+                    .map_err(|error| error.at(region))
+            })
+            .map_err(|error| segment_error(segment.path(), error))?
+            .ok_or_else(|| {
+                LogPoseError::internal("a dynamic block carries another decoded form")
+            })?;
+        if fresh {
+            reader.charge_decoded(&unit);
+        }
+        Ok(decoded)
+    }
+
     /// The `$extra` object of `row` as stored (callers apply shadowing), or `None`.
     ///
     /// # Errors
@@ -1566,17 +1842,129 @@ impl DynamicRef<'_> {
             DynamicInner::Memtable(memtable) => {
                 memtable.dynamic_object(row).map_err(LogPoseError::internal)
             }
-            DynamicInner::Segment { unit, blocks } => {
-                let block = row / crate::segment_v2::DYNAMIC_BLOCK_ROWS;
-                let block = blocks
-                    .get(&block)
-                    .ok_or_else(|| not_fetched(*unit, "a dynamic block"))?;
-                block.object(row).map_err(|error| {
+            DynamicInner::Segment {
+                segment,
+                handle,
+                pins,
+            } => Self::block(segment, handle, pins, row)?
+                .object(row)
+                .map_err(|error| {
                     LogPoseError::corrupt(logpose_types::CorruptionKind::Segment, error.0)
-                })
-            }
+                }),
             DynamicInner::Empty => Ok(None),
         }
+    }
+
+    /// The value of `row`'s `$extra` key `key` as stored (callers apply shadowing), or `None`
+    /// when the row has no such key; only that member is decoded.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` if the row's block was not fetched, or typed corruption.
+    pub fn member(&self, row: RowId, key: &str) -> Result<Option<serde_json::Value>> {
+        match &self.0 {
+            DynamicInner::Memtable(memtable) => match memtable.dynamic_raw(row) {
+                Some(bytes) => {
+                    logpose_types::value::codec::decode_json_member(bytes, key).map_err(|error| {
+                        LogPoseError::internal(format!(
+                            "slot {row} has invalid dynamic bytes: {error}"
+                        ))
+                    })
+                }
+                None => Ok(None),
+            },
+            DynamicInner::Segment {
+                segment,
+                handle,
+                pins,
+            } => Self::block(segment, handle, pins, row)?
+                .member(row, key)
+                .map_err(|error| {
+                    LogPoseError::corrupt(logpose_types::CorruptionKind::Segment, error.0)
+                }),
+            DynamicInner::Empty => Ok(None),
+        }
+    }
+
+    /// Whether any row stored with `row` (its segment block) may have the `$extra` key `key`:
+    /// `false` means no row of the block has it, so a filter that needs the key can skip them
+    /// all. Always `true` for memtables.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` if the row's block was not fetched, or typed corruption.
+    pub fn block_may_have(&self, row: RowId, key: &str) -> Result<bool> {
+        match &self.0 {
+            DynamicInner::Memtable(_) => Ok(true),
+            DynamicInner::Segment {
+                segment,
+                handle,
+                pins,
+            } => Ok(Self::block(segment, handle, pins, row)?.may_have_key(key)),
+            DynamicInner::Empty => Ok(false),
+        }
+    }
+
+    /// The encoded `$extra` object of `row` (the binary value codec), or `None`.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` if the row's block was not fetched, or typed corruption.
+    pub fn raw(&self, row: RowId) -> Result<Option<&'p [u8]>> {
+        match &self.0 {
+            DynamicInner::Memtable(memtable) => Ok(memtable.dynamic_raw(row)),
+            DynamicInner::Segment {
+                segment,
+                handle,
+                pins,
+            } => Ok(Self::block(segment, handle, pins, row)?.raw(row)),
+            DynamicInner::Empty => Ok(None),
+        }
+    }
+}
+
+/// A segment's accessors for building row images (see [`ReadView::project`]).
+struct SegmentRows<'p> {
+    unit: UnitId,
+    pks: PkRef<'p>,
+    columns: Vec<(FieldId, ColumnRef<'p>)>,
+    vectors: Vec<(FieldId, VectorRowsRef<'p>)>,
+    dynamic: DynamicRef<'p>,
+}
+
+impl SegmentRows<'_> {
+    /// The stored image of `row`, as
+    /// [`SegmentReader::row_images_projected`](crate::segment_v2::SegmentReader::row_images_projected)
+    /// reads it: the key, every scalar column in field order, the `$extra` object, and the
+    /// vectors when the projection asks for them.
+    fn image(&self, row: RowId) -> Result<logpose_wal::codec::RowImage> {
+        use logpose_wal::codec::{F32Bytes, RowImage, ValueBytes, WirePk};
+        let pk = self.pks.pk_at(row).ok_or_else(|| {
+            LogPoseError::internal(format!("row {row} of unit {} has no key", self.unit))
+        })?;
+        let mut image = RowImage {
+            pk: WirePk::from(pk),
+            vectors: Vec::new(),
+            scalars: Vec::new(),
+            dynamic: None,
+        };
+        for (field, vectors) in &self.vectors {
+            if let Some(vector) = vectors.get(row)? {
+                image.vectors.push((*field, F32Bytes::from_f32s(&vector)));
+            }
+        }
+        for (field, column) in &self.columns {
+            if let Some(value) = column.value(row)? {
+                let bytes = ValueBytes::encode(&value).map_err(|error| {
+                    LogPoseError::internal(format!("a stored value does not encode: {error}"))
+                })?;
+                image.scalars.push((*field, bytes));
+            }
+        }
+        if let Some(raw) = self.dynamic.raw(row)? {
+            image.dynamic = Some(ValueBytes::from_encoded(raw.to_vec()));
+        }
+        Ok(image)
     }
 }
 

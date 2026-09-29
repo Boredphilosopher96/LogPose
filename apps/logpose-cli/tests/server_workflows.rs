@@ -1082,25 +1082,27 @@ fn profiled_query_surfaces_filtered_scan_diagnostics() {
     assert!(candidates_after_filter >= 2);
     assert!(candidates_after_filter <= candidates_before_filter);
     assert!(profiled_query_response["diagnostics"]["fallback_reason"].is_string());
-    assert_eq!(profiled_query_response["diagnostics"]["rerank_count"], 1);
-    assert!(
-        profiled_query_response["diagnostics"]["candidates_reranked"]
-            .as_u64()
-            .is_some_and(|count| count == candidates_after_filter)
+    // An exact f32 scan scores its rows once, so nothing is reranked.
+    assert_eq!(profiled_query_response["diagnostics"]["rerank_count"], 0);
+    assert_eq!(
+        profiled_query_response["diagnostics"]["candidates_reranked"],
+        0
     );
+    // Each unit hands its best `top_k` (and ties) to the merge.
     assert!(
         profiled_query_response["diagnostics"]["candidates_merged"]
             .as_u64()
-            .is_some_and(|count| count == candidates_after_filter)
+            .is_some_and(|count| (2..=candidates_after_filter).contains(&count))
     );
     assert!(
         profiled_query_response["diagnostics"]["unit_scan_mix"]["exact_f32"]
             .as_u64()
             .is_some_and(|count| count == 1)
     );
-    assert_eq!(
-        profiled_query_response["diagnostics"]["stage_timings"]["prefilter_micros"],
-        Value::from(0)
+    assert!(
+        profiled_query_response["diagnostics"]["stage_timings"]["prefilter_micros"]
+            .as_u64()
+            .is_some()
     );
     assert!(
         profiled_query_response["diagnostics"]["stage_timings"]["planning_micros"]

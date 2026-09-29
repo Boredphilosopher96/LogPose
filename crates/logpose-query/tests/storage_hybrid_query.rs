@@ -1,7 +1,6 @@
 //! Storage-backed queries whose segments carry graphs and SQ8 codes: the per-unit strategy
-//! the staged planner picks, and results equal to an exact scan.
+//! the cost model picks, and results equal to an exact scan.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
@@ -24,9 +23,9 @@ use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 use thiserror as _;
 
-/// Rows per test collection: above the exact-scan limit of the default tuning (2,048), so a
-/// segment with a graph walks it.
-const ROWS: usize = 3_000;
+/// Rows per test collection: enough that an unfiltered walk costs less than an exact scan of
+/// the segment, while an exact scan of a quarter of it still costs less than a walk.
+const ROWS: usize = 20_000;
 const DIMS: usize = 16;
 
 /// A deterministic unit-variance vector for `seed`.
@@ -159,6 +158,7 @@ async fn unfiltered_queries_walk_segment_graphs_and_rerank_exactly() {
     assert_eq!(diagnostics.unit_scan_mix.get("graph_admit"), Some(&1));
     assert_eq!(diagnostics.rerank_count, 1);
     assert!(diagnostics.stage_timings.is_some());
+    assert_eq!(diagnostics.fallback_reason, None, "the graph was walked");
 }
 
 #[tokio::test]
@@ -172,13 +172,23 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
         .flush()
         .await
         .expect("flush should succeed");
+    // Before its index build the segment has no graph: the fallback says so.
+    let before = query(&engine, request("documents", 5, None))
+        .await
+        .expect("query should succeed");
+    let reason = before
+        .diagnostics
+        .and_then(|diagnostics| diagnostics.fallback_reason)
+        .expect("a fallback reason");
+    assert!(reason.contains("no graph yet"), "{reason}");
     // A flushed segment gets its graph from an index build, which the compaction runs.
     handle(&engine, "documents")
         .compact()
         .await
         .expect("compaction should succeed");
 
-    // 750 `keep` rows are within the exact-scan limit: an exact scan over SQ8 codes.
+    // 5,000 `keep` rows: an exact scan over SQ8 codes costs less than a walk admitting a
+    // quarter of the rows it visits.
     let selective = query(
         &engine,
         request("documents", 5, Some(FilterExpr::eq("kind", "keep"))),
@@ -191,9 +201,28 @@ async fn filters_pick_exact_scans_or_filtered_walks_by_matching_rows() {
     let diagnostics = selective.diagnostics.expect("diagnostics");
     assert_eq!(diagnostics.chosen_plan, QueryPlanKind::PredicateFirstExact);
     assert_eq!(diagnostics.unit_scan_mix.get("exact_sq8"), Some(&1));
-    assert_eq!(diagnostics.candidates_after_filter, 750);
+    assert_eq!(diagnostics.candidates_after_filter, 5_000);
+    let plan = diagnostics.plan.expect("plan");
+    let scan = plan
+        .walk()
+        .into_iter()
+        .find(|node| node.operator == logpose_query::Operator::ExactScan)
+        .expect("an exact scan");
+    assert!(
+        scan.reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cheapest")),
+        "{:?}",
+        scan.reason
+    );
+    // The segment has a graph: the fallback names the price, not a missing graph.
+    let reason = diagnostics.fallback_reason.expect("a fallback reason");
+    assert_eq!(
+        reason,
+        "an exact scan was cheaper than a walk at the filter's selectivity"
+    );
 
-    // 2,250 rows that are not `keep` exceed it: an admit-only walk (selectivity 0.75).
+    // 15,000 rows that are not `keep`: an admit-only walk (selectivity 0.75).
     let broad = query(
         &engine,
         request("documents", 5, Some(FilterExpr::ne("kind", "keep"))),

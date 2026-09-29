@@ -3,13 +3,12 @@
 //! order by, and search compared with the model. Exact paths (segments without vector index
 //! sections) must match exactly; indexed segments (graphs and SQ8 codes) must keep recall.
 
-use async_trait as _;
 use criterion as _;
 use logpose_catalog as _;
 use logpose_index as _;
 use logpose_query::{
-    FilterExpr, RangeBounds, ScrollOrder, ScrollRequest, SearchRequest, SearchTuning, count_view,
-    metric_value, scroll, scroll_view, search,
+    FilterExpr, Force, RangeBounds, ScrollOrder, ScrollRequest, SearchRequest, SearchTuning,
+    count_view, metric_value, scroll, scroll_view, search,
 };
 use logpose_storage::{IndexPolicy, Projection, read::Direction};
 use logpose_types::{
@@ -576,7 +575,11 @@ impl Scenario {
                 &SearchRequest {
                     filter: filter.clone(),
                     tuning: SearchTuning {
-                        exact_max_matches: if self.indexed { 16 } else { usize::MAX },
+                        force: if self.indexed {
+                            Force::Walk
+                        } else {
+                            Force::Exact
+                        },
                         ..SearchTuning::default()
                     },
                     ..SearchRequest::new(query.clone(), k)

@@ -443,6 +443,19 @@ Tasks:
 
 Exit criteria: at recall of at least 0.95, LogPose QPS is within 20 percent of Milvus HNSW or better on every case; filtered cases hold recall where Milvus drops; results are reproducible from a script.
 
+Status (Phase 5a, tasks 1 to 4): landed. Plans are operator trees whose per-segment strategy is the cheapest under a cost model in distance computations, graph hops, and resident, random, and cold bytes, calibrated on the benchmark host (`calibrate_cost_model` in `crates/logpose-query/tests/recall.rs`); the exact-scan limit and the ACORN selectivity threshold are gone (the 0.45 and 0.6 constants went with the v1 planner). Units run in parallel with a global heap merge, large exact scans split into parallel morsels, and a walk that reaches the exact scan's price scans exactly instead. `EXPLAIN` returns the tree with estimated and actual work per operator and each strategy's reason; `vector_first_exact` and `tiny_population_exact_fallback` are gone. The engine design's [Phase 5 notes](engine-core-design.md#implementation-notes-phase-5-planner) have the details. Task 5 (VectorDBBench against Milvus) is separate and open.
+
+Measured on the 4-core development host at 100,000 x 128 (one compacted segment, top 10, `ef = 64`, single client, warm cache), with the before and after builds run interleaved because the host was shared and loaded (load average 8 to 30); QPS is the median of three rounds (single rounds varied by up to 30 percent with the host's load), recall over 200 queries:
+
+| Case (100,000 x 128, `ef = 64`) | QPS before | QPS after | Change | Recall@10 before | Recall@10 after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Unfiltered | 1,403 | 1,726 | +23 % | 0.985 | 0.985 |
+| Uniform 10 % filter | 386 | 772 | 2.0 x | 0.990 | 1.000 |
+| Uniform 1 % filter | 1,696 | 1,825 | +8 % | 1.000 | 1.000 |
+| Anti-correlated 10 % filter | 108 | 767 | 7.1 x | 0.979 | 1.000 |
+
+The unfiltered case is limited by the walk itself (about 250 µs, memory-latency bound on this host) and the one query-pool hop left per query (about 100 µs of wake-up latency on this host, which the old path paid for its first of three hops too). The uniform 1 percent case gains least: it was already an exact scan of 1,000 rows. Filtered cases gain most where the cost model scans exactly (in parallel morsels) instead of walking, and anti-correlated filters no longer escalate a walk past the exact scan's price, which is also why their recall is now exact.
+
 ### Phase 6 API V2
 
 Runs alongside the engine phases. Each slice lands when its engine support exists.

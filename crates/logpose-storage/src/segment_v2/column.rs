@@ -607,6 +607,10 @@ struct Strings {
 }
 
 impl Strings {
+    fn heap_bytes(&self) -> u64 {
+        (self.offsets.capacity() * 4 + self.bytes.capacity()) as u64
+    }
+
     fn decode(cursor: &mut Cursor<'_>, count: usize, len: usize) -> DecodeResult<Self> {
         let start = cursor.position();
         let offsets = cursor.u32s(count + 1)?;
@@ -656,6 +660,19 @@ enum Block {
     },
 }
 
+impl Block {
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Self::Int(values) => values.capacity() as u64 * 8,
+            Self::Float(values) => values.capacity() as u64 * 8,
+            Self::Bool(bits) => bits.serialized_size() as u64,
+            Self::Dict { dict, codes } => dict.heap_bytes() + codes.capacity() as u64 * 4,
+            Self::Plain(strings) | Self::Json(strings) => strings.heap_bytes(),
+            Self::Array { offsets, child } => offsets.capacity() as u64 * 4 + child.heap_bytes(),
+        }
+    }
+}
+
 /// One decoded `ScalarColumn` section.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScalarColumn {
@@ -667,6 +684,12 @@ pub struct ScalarColumn {
 }
 
 impl ScalarColumn {
+    /// Heap bytes the decoded column holds, which the buffer cache charges beside its bytes.
+    #[must_use]
+    pub fn heap_bytes(&self) -> u64 {
+        self.nulls.serialized_size() as u64 + self.block.heap_bytes()
+    }
+
     /// Decode and validate a payload for a field of `field_type`.
     pub(crate) fn decode(
         bytes: &[u8],

@@ -480,6 +480,48 @@ impl Sq8Query {
             out,
         });
     }
+
+    /// Estimates the metric between the query and the code of each of `rows` in `codes`, a
+    /// buffer of [`Self::dims`]-byte codes in row order, writing one value per row to `out`,
+    /// in one dispatch: scattered rows (a filter's matches) pay the per-call setup once per
+    /// batch instead of once per row. A row whose code lies outside `codes` estimates as
+    /// `f32::INFINITY`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rows.len() != out.len()`.
+    pub fn estimate_rows(&self, codes: &[u8], rows: &[u32], out: &mut [f32]) {
+        assert_eq!(rows.len(), out.len(), "one output per row");
+        kernels::arch().dispatch(EstimateRows {
+            query: self,
+            codes,
+            rows,
+            out,
+        });
+    }
+}
+
+struct EstimateRows<'a> {
+    query: &'a Sq8Query,
+    codes: &'a [u8],
+    rows: &'a [u32],
+    out: &'a mut [f32],
+}
+
+impl WithSimd for EstimateRows<'_> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) {
+        let dims = self.query.dims();
+        for (row, slot) in self.rows.iter().zip(self.out) {
+            let start = *row as usize * dims;
+            *slot = match self.codes.get(start..start + dims) {
+                Some(code) => estimate_with(simd, self.query, code),
+                None => f32::INFINITY,
+            };
+        }
+    }
 }
 
 struct Estimate<'a> {
@@ -1014,6 +1056,17 @@ mod tests {
                 prepared.estimate_many(&codes, &mut out);
                 for (code, value) in codes.chunks_exact(dims).zip(&out) {
                     assert_eq!(value.to_bits(), prepared.estimate(code).to_bits());
+                }
+                // Scattered rows, repeated rows, and a row past the codes.
+                let picked = [22_u32, 0, 7, 7, 23, 3];
+                let mut scattered = vec![f32::NAN; picked.len()];
+                prepared.estimate_rows(&codes, &picked, &mut scattered);
+                for (row, value) in picked.iter().zip(&scattered) {
+                    let expected = codes
+                        .chunks_exact(dims)
+                        .nth(*row as usize)
+                        .map_or(f32::INFINITY, |code| prepared.estimate(code));
+                    assert_eq!(value.to_bits(), expected.to_bits(), "row {row}");
                 }
             }
         }
